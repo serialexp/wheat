@@ -1,8 +1,8 @@
-# Server-Native Source-Control Store — Strategic Design Notes
+# Wheat — Server-Native Source Control
 
-Status: exploration — the strategic dilemma and existing seams are documented; no canonical model, store format, or implementation commitment has been decided
+Status: partial — bounded Git-free walking skeleton underway; core change/revision/application semantics and a local prototype CLI exist, while the store format, protocol, Git adapter, and product commitment remain undecided
 Owner: bart
-Last updated: 2026-09-02
+Last updated: 2026-09-03
 
 ## Implementation status
 
@@ -28,6 +28,19 @@ described here.
   stack identity, review relocation, merge gates, CI observations,
   attestations, and publication receipts already preserve server-side state
   that cannot be represented faithfully by refs and commit OIDs alone.
+- [x] **Bounded walking skeleton — pure core.** `wheat-core` defines native
+  stable change IDs, immutable revisions, dependency graphs, deterministic
+  views, applications, structured durable conflicts, and compare-and-swap
+  publication with no Git or gix dependency.
+- [x] **Bounded walking skeleton — executable workflow corpus.** Focused tests
+  cover `A -> B -> C` descendant reapplication, independent roots, sibling
+  branches, multi-parent joins, topological ordering, persistent conflict and
+  scoped resolution, application to unrelated target views, rollback after
+  invalid creation, stable identities, and stale revision/publication rejection.
+- [x] **Bounded walking skeleton — local CLI shell.** The standalone `wheat`
+  binary initializes a prototype repository, persists its model locally, and
+  exposes structurally parsed status, log, change creation/revision, conflict
+  inspection, and resolution commands.
 
 ### Outstanding
 
@@ -50,25 +63,35 @@ described here.
   through ordinary Git, what may be a lossy projection, and whether
   `git-remote-gothab` initially delegates to Git or materializes Git objects
   from a native service.
-- [ ] **Phase 1 — narrow vertical prototype.** Persist one logical change and
-  multiple revisions independently of Git, project them deterministically to
-  Git, attach review and CI to native identity, and prove identity survives an
-  amend or rebase.
-- [ ] **Phase 1 — conflict and concurrency prototype.** Demonstrate durable
-  unresolved conflicts and concurrent human/agent publication without making
-  a mutable Git ref the source of truth.
-- [ ] **Phase 1 — lifecycle prototype.** Exercise authorization, audit,
-  indexing, snapshot/restore, retention, and deletion against the native
-  publication model rather than adding them after the format is fixed.
-- [ ] **Phase 2 — physical store design.** Only after the logical contract and
-  prototype are understood, specify object encoding, indexes, manifests,
-  deltas, sharding, replication, compaction, and garbage collection.
-- [ ] **Phase 2 — native protocol design.** Specify a resumable, versioned
-  client/server protocol independently of Git pack negotiation while retaining
-  a bounded compatibility adapter for Git clients.
-- [ ] **Open question — native client.** Decide whether and when Gothab needs a
-  native working-copy client; do not let that client pre-emptively define the
-  canonical server model.
+- [ ] **Phase 1 — qualify the native model and store prototype.** Replace the
+  walking skeleton's deliberately simple whole-file transformations and YAML
+  state snapshot with a qualified content model, intrinsic content ownership,
+  transactional persistence, dependency validation, and property tests, still
+  without Git objects, refs, footers, or gix in the core.
+- [ ] **Phase 1 — complete the reference CLI and local workflow.** Extend the
+  current local CLI with workspace capture, composition, explicit publication,
+  richer conflict resolution, and black-box ergonomics tests; the current
+  exact-edit commands exercise the model but are not a daily-use client.
+- [ ] **Phase 1 — complete the conflict and concurrency corpus.** Extend the
+  current chain/branch/join/conflict/CAS tests to concurrent human/agent
+  mutations, independent simultaneous conflicts, retries, dependency movement,
+  and property-tested deterministic outcomes without a mutable Git ref as truth.
+- [ ] **Phase 1 — lifecycle and content-retention prototype.** Exercise
+  publication, crash recovery, content manifests, shared-content retention,
+  snapshot/restore, and deletion as native store invariants rather than adding
+  them after the format is fixed.
+- [ ] **Phase 2 — physical store qualification.** Benchmark and refine object
+  encoding, indexes, manifests, deltas, sharding, replication, compaction, and
+  garbage collection against deep stacks and wide agent fan-out.
+- [ ] **Phase 2 — native protocol and remote CLI.** Specify a resumable,
+  versioned client/server protocol and run the same workflow corpus through the
+  reference CLI against an ephemeral repository daemon.
+- [ ] **Phase 3 — separate gix compatibility adapter.** Import Git into native
+  objects and project selected native views to disposable Git repositories or
+  synthesized packs without allowing Git identities to become authoritative.
+- [ ] **Phase 3 — repository-daemon integration.** Let gitd (or its successor)
+  serve native repositories through the native protocol and Git projections
+  through the gix adapter, with one explicitly canonical store per repository.
 - [ ] **Open question — migration.** Determine whether existing repositories
   are imported once, dual-written, lazily promoted, or remain permanently
   Git-canonical until an explicit conversion.
@@ -233,11 +256,13 @@ server-derived model begins with durable shared truths:
 - How is the same logical state projected to Git without allowing projection
   artifacts to redefine it?
 
-Local ergonomics still matter and a future client may require additional
-primitives. The ordering proposed for investigation is that shared server
-semantics establish the canonical contract, while clients provide operations
-against that contract. Git compatibility is one client adapter, not the
-constraint from which the server model is derived.
+Local ergonomics still matter enough to be a simultaneous design constraint.
+The server's shared semantics establish the canonical contract, but a standalone
+reference CLI must prove that a client can use that contract coherently and
+without excessive round trips. If both the client and server workflows cannot be
+expressed ergonomically against the same model, that is evidence that the model
+is wrong rather than something the forge UI should conceal. Git compatibility
+is one client adapter, not the constraint from which the server model is derived.
 
 ## Separate three decisions
 
@@ -381,6 +406,273 @@ control and incentives.
 These options are not mutually exclusive over time. For example, B can make C
 less invasive, and evidence from C can justify or reject D.
 
+## Target architecture for the parallel effort
+
+The parallel effort is only useful if the desired behavior is native to a new
+repository format. A layer of native IDs in PostgreSQL over Git-canonical
+commits would converge on the architecture Gothab already approximates with PR
+identity, `Change-Id` footers, managed refs, and stacked reconciliation. It
+would add a second transitional system without testing the central thesis.
+
+The new core must therefore be able to create, revise, apply, compose, retain,
+and publish logical changes with no Git repository present. Existing stacked
+reconciliation is requirements evidence and a workflow corpus, not
+implementation scaffolding that constrains the new format.
+
+The first bounded prototype began on 2026-09-03. Its semantics are intentionally
+narrow: changes have stable random identities; revisions are immutable authored
+transformations; an application records a revision against an exact target view;
+views are deterministic snapshots plus a change frontier; structured conflict is
+a durable application result; and publication is compare-and-swap on view
+identity. Dependency closures are composed explicitly and current changes are
+applied in deterministic topological order, so independent roots remain visible,
+sibling applications retain their declared targets, and multi-parent joins have
+a constructed target view. Conflict resolution is scoped to one exact current
+application and may alter only that application's conflict paths. Whole-file
+edits and an unlocked, non-fsynced YAML state snapshot are disposable test
+representations, not proposed storage or wire formats.
+
+### Crate and dependency boundaries
+
+The VCS and CLI are named **Wheat**. Crate names use the `wheat-*` prefix;
+the installed reference-client binary is `wheat`. Dependency direction is the
+contract:
+
+```text
+wheat-core
+  pure identities, values, algorithms, conflict semantics, and store traits
+  no gix, PostgreSQL, S3, Axum, gitd, or existing PR-model dependency
+
+wheat-store
+  native persistent repository and content-manifest format
+  depends on wheat-core
+
+wheat-protocol
+  versioned native wire types and workflow-level operations
+  depends on wheat-core wire/domain values, not the store implementation
+
+wheat-client
+  local workspace plus remote-protocol client behavior
+  depends on wheat-core and wheat-protocol
+
+wheat-cli
+  standalone reference binary installed as `wheat`; executable specification
+  depends on wheat-client
+
+wheat-git
+  Git import/export/projection compatibility boundary
+  depends on wheat-core and gix
+
+gothab-gitd (or successor repository daemon)
+  native protocol host plus Git compatibility service
+  depends on model/store/protocol and optionally the gix adapter
+```
+
+The native crates must not expose `gix::ObjectId`, Git refs, Git commit headers,
+pack concepts, or commit-message footers as core identities. If the native model
+cannot compile without gix, Git semantics have leaked back across the boundary.
+Gix remains useful and already proven in Gothab for deterministic import,
+projection, tree/commit construction, pack serving, and compatibility tests.
+
+The CLI's remote mode must not depend directly on the production store crate.
+Otherwise tests can accidentally use local capabilities absent from the wire
+protocol. An in-memory or small local store adapter may implement the same model
+for offline tests and local workflows.
+
+### Native change workflow
+
+The initial public operations should express the intended workflow rather than
+translate Git commands one for one:
+
+```text
+create_change(base_view) -> ChangeId
+revise_change(change, predecessor_revision, transformation) -> RevisionId
+declare_dependencies(revision, changes) -> DependencyGraph
+apply_revision(revision, target_view) -> Clean | Conflicted
+compose_changes(target_view, dependency_graph) -> IntegrationViewId
+publish_view(expected_current_view, integration_view) -> PublicationId
+```
+
+For a stack `A -> B -> C`, revising `A1` to `A2` must retain all logical
+identities and automatically derive applications of `B` and `C` on the changed
+parent results. A conflict is a durable successful application outcome, not a
+half-completed rebase or an error state that prevents unrelated work.
+
+A revision may preserve both the transformation that can be reapplied and its
+materialized result:
+
+```text
+Revision {
+    change_id,
+    predecessors,
+    authored_against,
+    transformation,
+    resulting_tree,
+}
+
+apply(transformation, authored_against.tree) == resulting_tree
+```
+
+This is a design hypothesis, not a settled encoding. Transformations may be
+file/tree edits, merge terms, or another representation found through the
+workflow corpus. They are not promised to commute or apply cleanly to every
+base. Application to a different target returns an exact clean result or a
+structured conflict.
+
+### Operations are not logical changes
+
+An observed filesystem mutation and a reviewable logical change have different
+cardinality. One agent task can contain many edit, write, formatter, generator,
+and shell-process mutations. Conversely, one broad process invocation may
+change files for several independent concerns that are later split.
+
+The default client behavior should treat tool or filesystem mutations as
+immutable causal operations that amend the current logical change:
+
+```text
+Change
+  -> immutable Revision
+       -> one or more mutation effects since its predecessor
+
+ProcessMutation
+  -> file effect 1
+  -> file effect 2
+  -> ...
+```
+
+A formatter or script changing thousands of files is one causal process
+operation with many exact effects. Whether those effects constitute one logical
+change depends on intent. The model must permit whole-operation, per-file, or
+range-level reassignment when splitting work, without rewriting the fact that
+one process originally produced them. Applying elsewhere uses recorded effects,
+not blind command replay; a reproducible command/tool/version recipe may be
+retained as explanatory metadata.
+
+Agent edit operations map conveniently to mutation effects, but perfect
+character-level attribution is explicitly not a foundational requirement.
+Revision-, file-, or hunk-level links to agent sessions can be added according
+to demonstrated product need without turning every repository into a CRDT or
+charging every operation for permanent character identity.
+
+### Shared content is intrinsic to the format
+
+Git's repository-local ODB model forced Gothab to add blob extraction,
+alternates, locator state, ownership manifests, push-journal pins, and
+convergence around it. The native format must instead refer directly from trees,
+revisions, conflicts, and retained views to globally addressed immutable
+content:
+
+```text
+TreeEntry::File { content: ContentId, mode }
+RepositoryView { root_tree, change_frontier, content_manifest }
+```
+
+`ContentId` is native and algorithm-tagged. Git SHA-1/SHA-256 blob IDs are
+projection identities computed by the compatibility adapter, not native content
+identity.
+
+The repository format owns **what** content a view and all retained native
+objects require. The object router owns **where** durable and cached copies live.
+Bucket, backend, and gitd-host placement must not enter native repository
+identity.
+
+Every published view must commit to an immutable, incrementally transitionable
+content manifest. Required content includes at least visible tree closure,
+retained revisions, unresolved conflict terms, snapshots/archives under policy,
+and compatibility projections while leased. Publication ordering must guarantee
+that a crash may over-retain bytes but cannot expose a view whose required
+content is reclaimable:
+
+1. write immutable content, trees, transformations, revisions, and conflicts;
+2. construct the proposed repository view and content-manifest transition;
+3. durably retain newly required content;
+4. compare-and-publish the view under fencing;
+5. expose it to readers;
+6. release removed content conservatively and asynchronously;
+7. derive Git and other disposable projections.
+
+This makes sharing, deduplication, and safe retention indelible properties of
+the format instead of a separate post-receive repair effort.
+
+### Git compatibility and repository daemon
+
+`wheat-git` owns the complete impedance mismatch:
+
+- import Git blobs/trees/commits into native content, trees, changes, and views;
+- create native changes where Git supplies no trustworthy identity;
+- use explicit mapping when a Git projection can unambiguously identify an
+  existing native revision;
+- generate deterministic Git blobs, trees, commits, refs, and packs from clean
+  native applications;
+- retain native-to-projected-ID mappings outside the native store's identity
+  model;
+- report information loss instead of treating an editable footer as canonical.
+
+Gitd can initially serve a disposable projected bare repository/cache. Later it
+may synthesize packs directly from native views through the adapter. In
+parallel, it (or a renamed successor) serves the native protocol directly from
+the native store:
+
+```text
+native client -> native protocol -> repository daemon -> native store
+Git client    -> smart Git       -> repository daemon -> gix adapter
+                                                   -> native store
+```
+
+A repository using the native format has one canonical store. Git objects and
+refs are projections or import inputs, never a silent dual authority. Existing
+routing, mutation admission, fencing, publication recovery, locator placement,
+and migration work supplies invariants to preserve, but its Git-specific schema
+and control flow are not copied into the format by default.
+
+## Reference CLI as executable specification
+
+A standalone CLI is part of Phase 1, not polish after server integration. It
+exists to prove that the same model is ergonomic from both sides. Internal Rust
+APIs can hide chatty protocols, concepts no user can name, and conflict states
+that only a forge UI can repair.
+
+The CLI should support two modes with matching semantics where applicable:
+
+- **Local mode:** a native repository/workspace backed by a local test store,
+  suitable for fast experiments and offline work.
+- **Remote mode:** the same workflows through the real versioned protocol,
+  exercising authentication, resumability, latency, concurrency, and server
+  authority.
+
+The CLI should make these questions easy to answer without manually assembling
+change, revision, application, view, and tree IDs:
+
+- What logical change am I editing?
+- What does it depend on, and what depends on it?
+- What changed since its preceding revision?
+- What is its current application result on the target view?
+- Why is it conflicted, and can I resolve or delegate it?
+- Which descendants were automatically updated?
+- Which exact result did CI/review evaluate?
+- What is published, remote-only, or still local?
+
+A first black-box workflow should cover:
+
+1. initialize a native repository and publish a base view;
+2. create dependent changes `A -> B -> C`;
+3. revise `A` and observe stable identities plus automatic `B`/`C`
+   applications;
+4. persist a conflict in `B` without aborting the operation;
+5. resolve it and continue applying `C`;
+6. apply one revision to two unrelated target views;
+7. synchronize the graph through the native protocol;
+8. export a selected clean view to Git and pass `git fsck`;
+9. import an ordinary Git change while exposing lost native identity honestly.
+
+The same corpus should run against in-memory/local and client/server backends.
+Pure model property tests cover deterministic application and graph invariants;
+CLI black-box tests cover usability and output; protocol tests cover interruption,
+stale publication, concurrent revision, server restart, incremental transfer,
+and authentication failure. If the workflow requires force-pushes, temporary
+branches, footer repair, or routine use of opaque application IDs, the native
+abstraction has not replaced Git's workflow.
+
 ## Prototype acceptance questions
 
 A prototype should answer architectural questions, not merely serialize a new
@@ -402,8 +694,13 @@ object type. A useful narrow slice would need to demonstrate:
    projection, and derived-task boundaries.
 9. Snapshot/restore, indexing, retention, and deletion operate from native
    identities and cannot prematurely reclaim required content.
-10. The path does not require a native local client to establish the server's
-    core semantics.
+10. A standalone CLI can perform the complete workflow against both a local
+    store and the real remote protocol without access to internal server APIs.
+11. Git import/export passes interoperability and integrity tests through a
+    separate gix adapter, while the same workflow remains usable with no Git
+    repository present.
+12. Required content and its safe retention are indelible properties of native
+    views/publications rather than a graph walk and sidecar repair after the fact.
 
 If the slice demonstrates only stable IDs stored beside ordinary Git commits,
 it has not yet tested the central thesis; Gothab already has several variants
@@ -494,6 +791,13 @@ that a migration cannot silently change.
 - [`stacked-pull-request-reconciliation.md`](stacked-pull-request-reconciliation.md)
   — durable stack/review identity currently reconstructed around Git commits
   and refs.
+- [Jujutsu architecture](https://docs.jj-vcs.dev/latest/technical/architecture/)
+  — snapshot revisions, stable change identity, operation views, backend seams,
+  and automatic descendant rewriting as useful requirements evidence rather
+  than a storage format to copy blindly.
+- [Zed DeltaDB](https://zed.dev/blog/sequoia-backs-zed) — adjacent
+  operation-level provenance and collaborative-editing work; informative, but
+  perfect character-level provenance is not a requirement for this effort.
 - [ERSC: “An update on ERSC availability”](https://ersc.io/blog/ersc-availability)
   — public description of its substrate-first direction.
 - [ERSC: “Martin joins ERSC”](https://ersc.io/blog/martin-joins-ersc) — public
