@@ -8,9 +8,11 @@ mod id;
 mod model;
 mod repository;
 
-pub use id::{ChangeId, ContentId, ParseContentIdError, RevisionId, ViewId};
+pub use id::{
+    ApplicationId, ChangeId, ConflictId, ContentId, ParseContentIdError, RevisionId, ViewId,
+};
 pub use model::{
     Application, ApplicationResult, ChangeRevision, Conflict, ConflictResolution, DependencyGraph,
     FileEdit, PathConflict, RepositoryView, Transformation, Tree,
 };
-pub use repository::{Repository, RepositoryError, RevisionOutcome};
+pub use repository::{Repository, RepositoryError, RevisionOutcome, TargetPolicyResult};

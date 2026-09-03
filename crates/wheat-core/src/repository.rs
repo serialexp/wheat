@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Application, ApplicationResult, ChangeId, ChangeRevision, Conflict, ConflictResolution,
-    DependencyGraph, PathConflict, RepositoryView, RevisionId, Transformation, Tree, ViewId,
+    Application, ApplicationId, ApplicationResult, ChangeId, ChangeRevision, Conflict,
+    ConflictResolution, DependencyGraph, PathConflict, RepositoryView, RevisionId, Transformation,
+    Tree, ViewId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15,8 +16,17 @@ pub struct RevisionOutcome {
     pub reapplied: Vec<ChangeId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetPolicyResult {
+    Allowed,
+    Rejected { unresolved_conflicts: usize },
+    UnknownView,
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum RepositoryError {
+    #[error("view {0} does not exist")]
+    UnknownView(ViewId),
     #[error("change {0} does not exist")]
     UnknownChange(ChangeId),
     #[error("revision {0} does not exist")]
@@ -41,7 +51,7 @@ pub struct Repository {
     revisions: BTreeMap<RevisionId, ChangeRevision>,
     current_revisions: BTreeMap<ChangeId, RevisionId>,
     dependencies: DependencyGraph,
-    applications: Vec<Application>,
+    applications: BTreeMap<ApplicationId, Application>,
     current_applications: BTreeMap<ChangeId, Application>,
     base_view: ViewId,
     working_view: ViewId,
@@ -60,7 +70,7 @@ impl Repository {
             revisions: BTreeMap::new(),
             current_revisions: BTreeMap::new(),
             dependencies: DependencyGraph::default(),
-            applications: Vec::new(),
+            applications: BTreeMap::new(),
             current_applications: BTreeMap::new(),
             base_view: id,
             working_view: id,
@@ -105,6 +115,65 @@ impl Repository {
         })
     }
 
+    pub fn conflicts_in_view(
+        &self,
+        view: ViewId,
+    ) -> Result<impl Iterator<Item = &Conflict>, RepositoryError> {
+        let view = self
+            .views
+            .get(&view)
+            .ok_or(RepositoryError::UnknownView(view))?;
+        Ok(view
+            .unresolved_conflicts
+            .iter()
+            .filter_map(|conflict| self.conflict(*conflict)))
+    }
+
+    pub fn conflicts_for_change(
+        &self,
+        view: ViewId,
+        change: ChangeId,
+    ) -> Result<impl Iterator<Item = &Conflict>, RepositoryError> {
+        let view = self
+            .views
+            .get(&view)
+            .ok_or(RepositoryError::UnknownView(view))?;
+        let application = view
+            .applications
+            .get(&change)
+            .and_then(|id| self.applications.get(id));
+        Ok(application
+            .into_iter()
+            .filter_map(|application| match &application.result {
+                ApplicationResult::Conflicted { conflict, .. } => Some(conflict),
+                ApplicationResult::Clean { .. } => None,
+            }))
+    }
+
+    pub fn conflicts_for_path<'a>(
+        &'a self,
+        view: ViewId,
+        path: &'a str,
+    ) -> Result<impl Iterator<Item = &'a Conflict> + 'a, RepositoryError> {
+        Ok(self.conflicts_in_view(view)?.filter(move |conflict| {
+            conflict
+                .paths
+                .iter()
+                .any(|candidate| candidate.path == path)
+        }))
+    }
+
+    #[must_use]
+    pub fn evaluate_no_unresolved_conflicts(&self, view: ViewId) -> TargetPolicyResult {
+        match self.views.get(&view) {
+            Some(view) if view.unresolved_conflicts.is_empty() => TargetPolicyResult::Allowed,
+            Some(view) => TargetPolicyResult::Rejected {
+                unresolved_conflicts: view.unresolved_conflicts.len(),
+            },
+            None => TargetPolicyResult::UnknownView,
+        }
+    }
+
     #[must_use]
     pub fn current_application(&self, change: ChangeId) -> Option<&Application> {
         self.current_applications.get(&change)
@@ -121,7 +190,7 @@ impl Repository {
 
     #[must_use]
     pub fn application(&self, revision: RevisionId, target: ViewId) -> Option<&Application> {
-        self.applications.iter().rev().find(|application| {
+        self.applications.values().find(|application| {
             application.revision_id == revision && application.target_view == target
         })
     }
@@ -131,8 +200,19 @@ impl Repository {
         revision: RevisionId,
     ) -> impl Iterator<Item = &Application> {
         self.applications
-            .iter()
+            .values()
             .filter(move |application| application.revision_id == revision)
+    }
+
+    fn conflict(&self, id: crate::ConflictId) -> Option<&Conflict> {
+        self.applications
+            .values()
+            .find_map(|application| match &application.result {
+                ApplicationResult::Conflicted { conflict, .. } if conflict.id == id => {
+                    Some(conflict)
+                }
+                _ => None,
+            })
     }
 
     pub fn apply_revision(
@@ -144,11 +224,11 @@ impl Repository {
             .revisions
             .get(&revision)
             .ok_or(RepositoryError::UnknownRevision(revision))?;
-        Ok(Application {
-            revision_id: revision.id,
-            target_view: target.id,
-            result: apply_transformation(&target.tree, target.id, &revision.transformation),
-        })
+        Ok(Application::new(
+            revision.id,
+            target.id,
+            apply_transformation(&target.tree, target.id, &revision.transformation),
+        ))
     }
 
     pub fn create_change(
@@ -294,12 +374,13 @@ impl Repository {
             let target = self.dependency_view(change)?;
             let revision_id = self.current_revisions[&change];
             let revision = &self.revisions[&revision_id];
-            let application = Application {
+            let application = Application::new(
                 revision_id,
-                target_view: target.id,
-                result: apply_transformation(&target.tree, target.id, &revision.transformation),
-            };
-            self.applications.push(application.clone());
+                target.id,
+                apply_transformation(&target.tree, target.id, &revision.transformation),
+            );
+            self.applications
+                .insert(application.id, application.clone());
             self.current_applications.insert(change, application);
         }
         let working = self.compose(&all)?;
@@ -327,17 +408,32 @@ impl Repository {
         let mut tree = self.views[&self.base_view].tree.clone();
         let mut frontier = BTreeMap::new();
         let mut target_id = self.base_view;
+        let mut applications = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
         for change in self.topological_order(selected) {
             let revision_id = self
                 .current_revision(change)
                 .ok_or(RepositoryError::UnknownChange(change))?;
             let revision = &self.revisions[&revision_id];
             let result = apply_transformation(&tree, target_id, &revision.transformation);
+            let application = Application::new(revision_id, target_id, result.clone());
+            if let ApplicationResult::Conflicted { conflict, .. } = &result {
+                conflicts.insert(conflict.id);
+            }
             tree = result.materialized_tree().clone();
             frontier.insert(change, revision_id);
-            target_id = RepositoryView::new(tree.clone(), frontier.clone()).id;
+            applications.insert(change, application.id);
+            self.applications.insert(application.id, application);
+            let intermediate = RepositoryView::from_manifest(
+                tree.clone(),
+                frontier.clone(),
+                applications.clone(),
+                conflicts.clone(),
+            );
+            target_id = intermediate.id;
+            self.views.insert(intermediate.id, intermediate);
         }
-        let view = RepositoryView::new(tree, frontier);
+        let view = RepositoryView::from_manifest(tree, frontier, applications, conflicts);
         self.views.insert(view.id, view.clone());
         Ok(view)
     }
@@ -437,10 +533,7 @@ fn apply_transformation(
     } else {
         ApplicationResult::Conflicted {
             partial_tree: result,
-            conflict: Conflict {
-                base_view,
-                paths: conflicts,
-            },
+            conflict: Conflict::new(base_view, conflicts),
         }
     }
 }

@@ -106,6 +106,82 @@ fn conflict_is_durable_and_resolution_continues_descendant_application() {
         Some(&content("c1"))
     );
     assert_eq!(repository.conflicts().count(), 0);
+    assert!(repository.working_view().unresolved_conflicts.is_empty());
+}
+
+#[test]
+fn conflicted_view_is_self_describing_and_queryable() {
+    let mut base = Tree::new();
+    base.insert("shared".into(), content("base"));
+    let mut repository = Repository::new(base);
+    let (a, a1) = repository
+        .create_change([], edit("shared", Some("base"), Some("a1")))
+        .unwrap();
+    let (b, b1) = repository
+        .create_change([a], edit("shared", Some("a1"), Some("b1")))
+        .unwrap();
+    repository
+        .revise_change(a, a1.revision_id, edit("shared", Some("base"), Some("a2")))
+        .unwrap();
+
+    let view = repository.working_view();
+    assert_eq!(view.unresolved_conflicts.len(), 1);
+    assert_eq!(view.applications.len(), 2);
+    assert!(view.required_content.contains(&content("a2")));
+    assert_eq!(repository.conflicts_in_view(view.id).unwrap().count(), 1);
+    assert_eq!(
+        repository.conflicts_for_change(view.id, b).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        repository
+            .conflicts_for_path(view.id, "shared")
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        repository.evaluate_no_unresolved_conflicts(view.id),
+        wheat_core::TargetPolicyResult::Rejected {
+            unresolved_conflicts: 1,
+        }
+    );
+    assert_eq!(repository.current_revision(b), Some(b1.revision_id));
+}
+
+#[test]
+fn view_identity_covers_the_application_and_conflict_manifest() {
+    let tree = BTreeMap::from([("file".into(), content("visible"))]);
+    let change = wheat_core::ChangeId::new();
+    let revision = wheat_core::RevisionId::new();
+    let frontier = BTreeMap::from([(change, revision)]);
+    let plain = wheat_core::RepositoryView::new(tree.clone(), frontier.clone());
+    let conflict = wheat_core::Conflict::new(
+        plain.id,
+        vec![wheat_core::PathConflict {
+            path: "file".into(),
+            expected: Some(content("old")),
+            actual: Some(content("visible")),
+            proposed: Some(content("new")),
+        }],
+    );
+    let application = wheat_core::Application::new(
+        revision,
+        plain.id,
+        ApplicationResult::Conflicted {
+            partial_tree: tree.clone(),
+            conflict: conflict.clone(),
+        },
+    );
+    let manifested = wheat_core::RepositoryView::from_manifest(
+        tree,
+        frontier,
+        BTreeMap::from([(change, application.id)]),
+        std::collections::BTreeSet::from([conflict.id]),
+    );
+
+    assert_ne!(plain.id, manifested.id);
+    assert_eq!(plain.tree, manifested.tree);
 }
 
 #[test]
@@ -170,6 +246,29 @@ fn sibling_branches_are_applied_to_their_declared_parent_not_each_other() {
         repository.current_application(c).unwrap().result,
         ApplicationResult::Clean { .. }
     ));
+    let working = repository.working_view().id;
+    assert_eq!(
+        repository.view(working).unwrap().unresolved_conflicts.len(),
+        1
+    );
+    assert_eq!(repository.conflicts_in_view(working).unwrap().count(), 1);
+    assert_eq!(
+        repository
+            .conflicts_for_path(working, "shared")
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        [b, c]
+            .into_iter()
+            .map(|change| repository
+                .conflicts_for_change(working, change)
+                .unwrap()
+                .count())
+            .sum::<usize>(),
+        1
+    );
 }
 
 #[test]

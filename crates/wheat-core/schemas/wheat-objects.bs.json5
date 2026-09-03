@@ -1,0 +1,252 @@
+{
+  // Canonical immutable-object encoding for the Wheat prototype.
+  //
+  // Object identity is BLAKE3-256 over the complete encoded WheatObject bytes.
+  // The first uint16 is (object kind << 8) | encoding version. Assigning a new
+  // wire tag for an incompatible encoding keeps old bytes and identities valid.
+  // Arrays that model maps or sets MUST be sorted and unique before encoding;
+  // BinSchema defines framing, while wheat-core validates those invariants.
+  meta: {
+    title: "Wheat Immutable Repository Objects",
+    description: "Canonical encodings for trees, changes, revisions, applications, conflicts, views, and content manifests.",
+    version: "0.1.0",
+  },
+  config: {
+    endianness: "big_endian",
+    bit_order: "msb_first",
+  },
+  types: {
+    WheatObject: {
+      type: "discriminated_union",
+      discriminator: { peek: "uint16", endianness: "big_endian" },
+      variants: [
+        { type: "TreeV1", when: "value == 0x0101" },
+        { type: "ChangeV1", when: "value == 0x0201" },
+        { type: "RevisionV1", when: "value == 0x0301" },
+        { type: "ApplicationV1", when: "value == 0x0401" },
+        { type: "ConflictV1", when: "value == 0x0501" },
+        { type: "ViewV1", when: "value == 0x0601" },
+        { type: "ContentManifestV1", when: "value == 0x0701" },
+      ],
+    },
+
+    Uuid128: {
+      sequence: [
+        { name: "bytes", type: "bytes", kind: "fixed", length: 16 },
+      ],
+    },
+    Digest256: {
+      sequence: [
+        { name: "bytes", type: "bytes", kind: "fixed", length: 32 },
+      ],
+    },
+    ContentId: {
+      sequence: [
+        // 1 = BLAKE3-256. The algorithm tag is part of every reference.
+        { name: "algorithm", type: "uint8" },
+        { name: "digest", type: "Digest256" },
+      ],
+    },
+    ChangeId: { sequence: [{ name: "uuid", type: "Uuid128" }] },
+    RevisionId: { sequence: [{ name: "uuid", type: "Uuid128" }] },
+    TreeId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ApplicationId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ConflictId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ViewId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ContentManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
+
+    TreeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0101 },
+        {
+          name: "entries",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "TreeEntry" },
+        },
+      ],
+    },
+    TreeEntry: {
+      sequence: [
+        {
+          name: "path",
+          type: "string",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          encoding: "utf8",
+        },
+        { name: "mode", type: "uint8" },
+        { name: "content", type: "ContentId" },
+      ],
+    },
+
+    ChangeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0201 },
+        { name: "change_id", type: "ChangeId" },
+      ],
+    },
+
+    RevisionV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0301 },
+        { name: "revision_id", type: "RevisionId" },
+        { name: "change_id", type: "ChangeId" },
+        {
+          name: "predecessors",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "RevisionId" },
+        },
+        {
+          name: "dependencies",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ChangeId" },
+        },
+        { name: "authored_against", type: "ViewId" },
+        { name: "transformation", type: "TransformationV1" },
+        { name: "resulting_tree", type: "TreeId" },
+      ],
+    },
+    TransformationV1: {
+      sequence: [
+        {
+          name: "edits",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "FileEditV1" },
+        },
+      ],
+    },
+    FileEditV1: {
+      sequence: [
+        {
+          name: "path",
+          type: "string",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          encoding: "utf8",
+        },
+        { name: "expected", type: "optional", value_type: "ContentId" },
+        { name: "replacement", type: "optional", value_type: "ContentId" },
+      ],
+    },
+
+    ApplicationV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0401 },
+        { name: "revision_id", type: "RevisionId" },
+        { name: "target_view", type: "ViewId" },
+        { name: "result", type: "ApplicationResultV1" },
+      ],
+    },
+    ApplicationResultV1: {
+      type: "discriminated_union",
+      discriminator: { peek: "uint8" },
+      variants: [
+        { type: "CleanApplicationV1", when: "value == 0" },
+        { type: "ConflictedApplicationV1", when: "value == 1" },
+      ],
+    },
+    CleanApplicationV1: {
+      sequence: [
+        { name: "result_kind", type: "uint8", const: 0 },
+        { name: "resulting_tree", type: "TreeId" },
+      ],
+    },
+    ConflictedApplicationV1: {
+      sequence: [
+        { name: "result_kind", type: "uint8", const: 1 },
+        { name: "partial_tree", type: "TreeId" },
+        { name: "conflict", type: "ConflictId" },
+      ],
+    },
+
+    ConflictV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0501 },
+        { name: "target_view", type: "ViewId" },
+        {
+          name: "paths",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "PathConflictV1" },
+        },
+      ],
+    },
+    PathConflictV1: {
+      sequence: [
+        {
+          name: "path",
+          type: "string",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          encoding: "utf8",
+        },
+        { name: "expected", type: "optional", value_type: "ContentId" },
+        { name: "actual", type: "optional", value_type: "ContentId" },
+        { name: "proposed", type: "optional", value_type: "ContentId" },
+      ],
+    },
+
+    ViewV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0601 },
+        { name: "tree", type: "TreeId" },
+        {
+          name: "revisions",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "SelectedRevisionV1" },
+        },
+        {
+          name: "applications",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "SelectedApplicationV1" },
+        },
+        {
+          name: "unresolved_conflicts",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ConflictId" },
+        },
+        { name: "required_content", type: "ContentManifestId" },
+      ],
+    },
+    SelectedRevisionV1: {
+      sequence: [
+        { name: "change_id", type: "ChangeId" },
+        { name: "revision_id", type: "RevisionId" },
+      ],
+    },
+    SelectedApplicationV1: {
+      sequence: [
+        { name: "change_id", type: "ChangeId" },
+        { name: "application_id", type: "ApplicationId" },
+      ],
+    },
+
+    ContentManifestV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0701 },
+        {
+          name: "content",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ContentId" },
+        },
+      ],
+    },
+  },
+}

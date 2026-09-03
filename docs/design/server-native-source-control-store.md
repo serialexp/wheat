@@ -45,6 +45,11 @@ described here.
   retains content by native `ContentId` outside `wheat-core`, verifies bytes on
   read, deduplicates identical content, distinguishes missing from corrupt
   objects, and lets the CLI retrieve retained content after reopening.
+- [x] **Bounded walking skeleton — self-describing views.** View identity now
+  covers immutable application identities, unresolved conflict identities, and
+  required visible content as well as the tree and revision selection. Core
+  queries enumerate conflicts by view, change, and path, and a pure policy
+  predicate evaluates whether a view has zero unresolved conflicts.
 
 ### Outstanding
 
@@ -67,9 +72,10 @@ described here.
   through ordinary Git, what may be a lossy projection, and whether
   `git-remote-gothab` initially delegates to Git or materializes Git objects
   from a native service.
-- [ ] **Phase 1 — qualify the native model and store prototype.** Replace the
-  walking skeleton's deliberately simple whole-file transformations and YAML
-  state snapshot with content manifests and reachability, transactional
+- [ ] **Phase 1 — qualify the native model and store prototype.** Generate and
+  integrate the new BinSchema canonical-object encoding; replace the walking
+  skeleton's deliberately simple whole-file transformations and YAML state
+  snapshot with complete content manifests and reachability, transactional
   metadata/content publication, dependency validation, and property tests. The
   prototype now retains verified content bytes, but does not yet prove ownership,
   recovery, or safe reclamation; Git and gix remain outside the core.
@@ -446,9 +452,38 @@ The next bounded slice adds byte retention without changing those identities.
 `wheat-store` writes content under its native digest, verifies every read,
 deduplicates repeated bytes, and reports missing and corrupt objects separately.
 The CLI stores expected, proposed, and resolved bytes before committing metadata
-and can retrieve them after reopening. This is not yet intrinsic ownership: no
-view manifest pins its closure, no recovery reconciles metadata with content, and
-there is no garbage collector or working-copy materialization.
+and can retrieve them after reopening.
+
+Views are now self-describing for the current prototype semantics: `ViewId` covers
+the exact application selected for each change, the unresolved conflict IDs, and
+the visible tree's required content IDs. `ApplicationId` covers revision, target,
+and clean or conflicted result; `ConflictId` covers its target view and structured
+terms. This lets repository code count or enumerate conflicts for an exact view,
+change, or path and evaluate a pure no-unresolved-conflicts predicate without
+replaying history. This is still not complete intrinsic ownership: the required
+content set covers the visible tree but not every retained revision/conflict term,
+no recovery reconciles metadata with content, and there is no garbage collector
+or working-copy materialization.
+
+A first canonical-object schema now lives at
+`crates/wheat-core/schemas/wheat-objects.bs.json5`. It uses BinSchema to give every
+field explicit binary framing rather than maintaining handwritten delimiter
+encodings. Immutable tree, change, revision, application, conflict, view, and
+content-manifest objects each begin with a two-byte `(object kind, encoding
+version)` tag and are hashed over their complete canonical encoded bytes. Native
+content references carry an algorithm tag; all map/set-shaped arrays must be
+sorted and unique before encoding and are validated by `wheat-core`. Incompatible
+future encodings receive a new object/version tag, so existing bytes and IDs do
+not change in place.
+
+The schema exposed a BinSchema Rust generator defect: a discriminated-union
+variant containing nested structs emitted `ctx.extend_with_parent(...)` inside a
+context-free encoder. The generator is now fixed at the source and has a focused
+regression test, allowing Wheat to retain the natural top-level object union and
+nested clean/conflicted application-result union instead of designing around the
+tooling. The schema validates, generates Rust, and the generated crate compiles
+against the patched local BinSchema checkout; production codegen and replacement
+of handwritten IDs remain outstanding.
 
 ### Crate and dependency boundaries
 

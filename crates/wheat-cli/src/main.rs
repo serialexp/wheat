@@ -7,8 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use wheat_core::{
-    ApplicationResult, ChangeId, ConflictResolution, ContentId, FileEdit, Repository, RevisionId,
-    Transformation, Tree,
+    ChangeId, ConflictResolution, ContentId, FileEdit, Repository, RevisionId, Transformation, Tree,
 };
 use wheat_store::ContentStore;
 
@@ -109,10 +108,11 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init => initialize(&cli.repository),
         Command::Status => with_repository(&cli.repository, false, |repository| {
-            println!("working view: {}", repository.working_view().id);
+            let working = repository.working_view();
+            println!("working view: {}", working.id);
             println!("published view: {}", repository.published_view().id);
             println!("changes: {}", repository.current_revisions().count());
-            println!("conflicts: {}", repository.conflicts().count());
+            println!("conflicts: {}", working.unresolved_conflicts.len());
             Ok(())
         }),
         Command::Log => with_repository(&cli.repository, false, |repository| {
@@ -122,14 +122,9 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Command::Conflicts => with_repository(&cli.repository, false, |repository| {
-            for application in repository.conflicts() {
-                let ApplicationResult::Conflicted { conflict, .. } = &application.result else {
-                    unreachable!()
-                };
-                println!(
-                    "revision {} on {}",
-                    application.revision_id, application.target_view
-                );
+            let working = repository.working_view().id;
+            for conflict in repository.conflicts_in_view(working)? {
+                println!("conflict {} on {}", conflict.id, conflict.base_view);
                 for path in &conflict.paths {
                     println!(
                         "  {} expected={:?} actual={:?} proposed={:?}",

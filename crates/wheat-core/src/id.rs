@@ -42,6 +42,33 @@ macro_rules! uuid_id {
 uuid_id!(ChangeId);
 uuid_id!(RevisionId);
 
+macro_rules! digest_id {
+    ($name:ident) => {
+        #[derive(
+            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            pub(crate) fn of_canonical_bytes(bytes: &[u8]) -> Self {
+                Self(*blake3::hash(bytes).as_bytes())
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                for byte in self.0 {
+                    write!(formatter, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+digest_id!(ApplicationId);
+digest_id!(ConflictId);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ContentId([u8; 32]);
 
