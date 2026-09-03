@@ -10,9 +10,11 @@ use wheat_core::{
     ApplicationResult, ChangeId, ConflictResolution, ContentId, FileEdit, Repository, RevisionId,
     Transformation, Tree,
 };
+use wheat_store::ContentStore;
 
 const STATE_DIR: &str = ".wheat";
 const STATE_FILE: &str = "repository.yaml";
+const CONTENT_DIR: &str = "objects";
 
 #[derive(Debug, Parser)]
 #[command(name = "wheat", about = "Wheat source control prototype")]
@@ -34,6 +36,8 @@ enum Command {
     Log,
     /// Inspect durable conflicts.
     Conflicts,
+    /// Print retained content by its native identity.
+    Cat { content: String },
     /// Create or revise a logical change.
     #[command(subcommand)]
     Change(ChangeCommand),
@@ -135,6 +139,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }),
+        Command::Cat { content } => {
+            let id = ContentId::from_str(&content).context("invalid content ID")?;
+            let bytes = content_store(&cli.repository).get(id)?;
+            use std::io::Write as _;
+            std::io::stdout().write_all(&bytes)?;
+            Ok(())
+        }
         Command::Change(ChangeCommand::New(arguments)) => {
             with_repository(&cli.repository, true, |repository| {
                 let dependencies = arguments
@@ -142,8 +153,8 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|value| ChangeId::from_str(value).context("invalid dependency change ID"))
                     .collect::<Result<Vec<_>>>()?;
-                let (change, outcome) =
-                    repository.create_change(dependencies, arguments.edit.into())?;
+                let transformation = transformation(&cli.repository, arguments.edit)?;
+                let (change, outcome) = repository.create_change(dependencies, transformation)?;
                 println!("change {change}");
                 println!("revision {}", outcome.revision_id);
                 print_reapplied(&outcome.reapplied);
@@ -155,8 +166,8 @@ fn main() -> Result<()> {
                 let change = ChangeId::from_str(&arguments.change).context("invalid change ID")?;
                 let predecessor = RevisionId::from_str(&arguments.predecessor)
                     .context("invalid predecessor revision ID")?;
-                let outcome =
-                    repository.revise_change(change, predecessor, arguments.edit.into())?;
+                let transformation = transformation(&cli.repository, arguments.edit)?;
+                let outcome = repository.revise_change(change, predecessor, transformation)?;
                 println!("revision {}", outcome.revision_id);
                 print_reapplied(&outcome.reapplied);
                 Ok(())
@@ -176,7 +187,8 @@ fn main() -> Result<()> {
                 .clone();
             match arguments.value {
                 Some(value) => {
-                    tree.insert(arguments.path, ContentId::of(value.as_bytes()));
+                    let content = content_store(&cli.repository).put(value.as_bytes())?;
+                    tree.insert(arguments.path, content);
                 }
                 None if arguments.delete => {
                     tree.remove(&arguments.path);
@@ -194,22 +206,25 @@ fn main() -> Result<()> {
     }
 }
 
-impl From<EditArgs> for Transformation {
-    fn from(arguments: EditArgs) -> Self {
-        Self {
-            edits: vec![FileEdit {
-                path: arguments.path,
-                expected: arguments
-                    .expected
-                    .as_deref()
-                    .map(|value| ContentId::of(value.as_bytes())),
-                replacement: arguments
-                    .value
-                    .as_deref()
-                    .map(|value| ContentId::of(value.as_bytes())),
-            }],
-        }
-    }
+fn transformation(root: &Path, arguments: EditArgs) -> Result<Transformation> {
+    let store = content_store(root);
+    let expected = arguments
+        .expected
+        .as_deref()
+        .map(|value| store.put(value.as_bytes()))
+        .transpose()?;
+    let replacement = arguments
+        .value
+        .as_deref()
+        .map(|value| store.put(value.as_bytes()))
+        .transpose()?;
+    Ok(Transformation {
+        edits: vec![FileEdit {
+            path: arguments.path,
+            expected,
+            replacement,
+        }],
+    })
 }
 
 fn initialize(root: &Path) -> Result<()> {
@@ -252,6 +267,10 @@ fn save(path: &Path, repository: &Repository) -> Result<()> {
 
 fn state_path(root: &Path) -> PathBuf {
     root.join(STATE_DIR).join(STATE_FILE)
+}
+
+fn content_store(root: &Path) -> ContentStore {
+    ContentStore::new(root.join(STATE_DIR).join(CONTENT_DIR))
 }
 
 fn print_reapplied(changes: &[ChangeId]) {

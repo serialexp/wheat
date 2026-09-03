@@ -35,6 +35,16 @@ fn initializes_mutates_and_reopens_local_repository() {
         String::from_utf8_lossy(&created.stderr)
     );
     assert!(String::from_utf8_lossy(&created.stdout).contains("change "));
+    let content_id = wheat_core::ContentId::of(b"world").to_string();
+    let object = directory
+        .path()
+        .join(".wheat/objects")
+        .join(&content_id[..2])
+        .join(&content_id[2..]);
+    assert!(object.is_file());
+    let retained = wheat(directory.path(), &["cat", &content_id]);
+    assert!(retained.status.success());
+    assert_eq!(retained.stdout, b"world");
 
     let reopened = wheat(directory.path(), &["status"]);
     assert!(reopened.status.success());

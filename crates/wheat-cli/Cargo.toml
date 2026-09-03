@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde_yaml = { workspace = true }
 wheat-core = { path = "../wheat-core" }
+wheat-store = { path = "../wheat-store" }
 
 [dev-dependencies]
 tempfile = "3"

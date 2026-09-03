@@ -61,6 +61,33 @@ impl fmt::Display for ContentId {
     }
 }
 
+impl FromStr for ContentId {
+    type Err = ParseContentIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err(ParseContentIdError);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+            let encoded = std::str::from_utf8(chunk).map_err(|_| ParseContentIdError)?;
+            bytes[index] = u8::from_str_radix(encoded, 16).map_err(|_| ParseContentIdError)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParseContentIdError;
+
+impl fmt::Display for ParseContentIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("content ID must be 64 hexadecimal characters")
+    }
+}
+
+impl std::error::Error for ParseContentIdError {}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ViewId([u8; 32]);
 

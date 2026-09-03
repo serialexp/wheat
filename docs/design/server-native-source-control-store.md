@@ -41,6 +41,10 @@ described here.
   binary initializes a prototype repository, persists its model locally, and
   exposes structurally parsed status, log, change creation/revision, conflict
   inspection, and resolution commands.
+- [x] **Bounded walking skeleton — retained content bytes.** `wheat-store`
+  retains content by native `ContentId` outside `wheat-core`, verifies bytes on
+  read, deduplicates identical content, distinguishes missing from corrupt
+  objects, and lets the CLI retrieve retained content after reopening.
 
 ### Outstanding
 
@@ -65,9 +69,10 @@ described here.
   from a native service.
 - [ ] **Phase 1 — qualify the native model and store prototype.** Replace the
   walking skeleton's deliberately simple whole-file transformations and YAML
-  state snapshot with a qualified content model, intrinsic content ownership,
-  transactional persistence, dependency validation, and property tests, still
-  without Git objects, refs, footers, or gix in the core.
+  state snapshot with content manifests and reachability, transactional
+  metadata/content publication, dependency validation, and property tests. The
+  prototype now retains verified content bytes, but does not yet prove ownership,
+  recovery, or safe reclamation; Git and gix remain outside the core.
 - [ ] **Phase 1 — complete the reference CLI and local workflow.** Extend the
   current local CLI with workspace capture, composition, explicit publication,
   richer conflict resolution, and black-box ergonomics tests; the current
@@ -80,6 +85,11 @@ described here.
   publication, crash recovery, content manifests, shared-content retention,
   snapshot/restore, and deletion as native store invariants rather than adding
   them after the format is fixed.
+- [ ] **Defer until publication targets exist — native target invariants.** Make
+  rules such as “`main` never points to a view with unresolved conflicts” part
+  of the repository's fenced target-advance operation, while allowing other
+  targets to publish conflicted views; the forge presents and administers these
+  policies but is not their sole enforcement boundary.
 - [ ] **Phase 2 — physical store qualification.** Benchmark and refine object
   encoding, indexes, manifests, deltas, sharding, replication, compaction, and
   garbage collection against deep stacks and wide agent fan-out.
@@ -429,8 +439,16 @@ applied in deterministic topological order, so independent roots remain visible,
 sibling applications retain their declared targets, and multi-parent joins have
 a constructed target view. Conflict resolution is scoped to one exact current
 application and may alter only that application's conflict paths. Whole-file
-edits and an unlocked, non-fsynced YAML state snapshot are disposable test
+edits and an unlocked, non-fsynced YAML metadata snapshot are disposable test
 representations, not proposed storage or wire formats.
+
+The next bounded slice adds byte retention without changing those identities.
+`wheat-store` writes content under its native digest, verifies every read,
+deduplicates repeated bytes, and reports missing and corrupt objects separately.
+The CLI stores expected, proposed, and resolved bytes before committing metadata
+and can retrieve them after reopening. This is not yet intrinsic ownership: no
+view manifest pins its closure, no recovery reconciles metadata with content, and
+there is no garbage collector or working-copy materialization.
 
 ### Crate and dependency boundaries
 
@@ -497,6 +515,18 @@ For a stack `A -> B -> C`, revising `A1` to `A2` must retain all logical
 identities and automatically derive applications of `B` and `C` on the changed
 parent results. A conflict is a durable successful application outcome, not a
 half-completed rebase or an error state that prevents unrelated work.
+
+Publication targets should ultimately be native, policy-constrained repository
+objects rather than untyped forge-owned branch labels. For example, `main` may
+carry a repository invariant that it can point only to a complete view with zero
+unresolved conflicts, while feature and agent targets remain free to publish
+conflicted views for browsing, review, assignment, and collaborative resolution.
+Every mutation path—including the native CLI/API, merge queue, recovery, and Git
+compatibility adapter—must pass through the same fenced target-advance operation.
+The active policy on the current target governs an update; a proposed view cannot
+weaken its own protection merely by changing a versioned policy file. This is a
+later publication-model requirement, not part of the current content-retention
+slice.
 
 A revision may preserve both the transformation that can be reapplied and its
 materialized result:
