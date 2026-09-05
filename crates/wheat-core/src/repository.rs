@@ -4,11 +4,24 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Application, ApplicationId, ApplicationResult, CanonicalObject, Change, ChangeId,
-    ChangeMetadata, ChangeRevision, Conflict, ConflictId, ConflictResolution, DependencyGraph,
-    ObjectId, PathConflict, RepositoryClosure, RepositoryState, RepositoryStateId, RepositoryView,
-    RevisionId, RevisionMetadata, Transformation, Tree, ViewId,
+    Application, ApplicationId, ApplicationRecord, ApplicationResult, CanonicalObject, Change,
+    ChangeId, ChangeMetadata, ChangeRevision, Conflict, ConflictId, ConflictResolution,
+    DependencyGraph, ObjectId, PathConflict, RepositoryClosure, RepositoryState, RepositoryStateId,
+    RepositoryStateRecord, RepositoryView, RevisionId, RevisionMetadata, RevisionRecord,
+    Transformation, Tree, ViewId,
 };
+
+mod reconstruction;
+
+/// Persisted and materialized objects required to reconstruct an executable repository.
+#[derive(Clone, Debug)]
+pub struct RepositoryParts {
+    pub state: RepositoryStateRecord,
+    pub changes: Vec<Change>,
+    pub views: Vec<RepositoryView>,
+    pub revisions: Vec<(RevisionRecord, Tree)>,
+    pub applications: Vec<(ApplicationRecord, Tree, Option<Conflict>)>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionOutcome {

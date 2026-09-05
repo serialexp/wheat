@@ -1,19 +1,14 @@
 use std::{
-    fs,
+    fmt::Write as _,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use wheat_core::{
-    ChangeId, ConflictResolution, ContentId, FileEdit, Repository, RevisionId, Transformation, Tree,
-};
-use wheat_store::ContentStore;
-
-const STATE_DIR: &str = ".wheat";
-const STATE_FILE: &str = "repository.yaml";
-const CONTENT_DIR: &str = "objects";
+use wheat_core::{ChangeId, ConflictResolution, ContentId, FileEdit, RevisionId, Transformation};
+mod local;
+use local::{content_store, initialize, with_repository};
 
 #[derive(Debug, Parser)]
 #[command(name = "wheat", about = "Wheat source control prototype")]
@@ -107,29 +102,34 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => initialize(&cli.repository),
-        Command::Status => with_repository(&cli.repository, false, |repository| {
+        Command::Status => with_repository(&cli.repository, false, |repository, output| {
             let working = repository.working_view();
-            println!("working view: {}", working.id);
-            println!("published view: {}", repository.published_view().id);
-            println!("changes: {}", repository.current_revisions().count());
-            println!("conflicts: {}", working.unresolved_conflicts.len());
+            writeln!(output, "working view: {}", working.id)?;
+            writeln!(output, "published view: {}", repository.published_view().id)?;
+            writeln!(
+                output,
+                "changes: {}",
+                repository.current_revisions().count()
+            )?;
+            writeln!(output, "conflicts: {}", working.unresolved_conflicts.len())?;
             Ok(())
         }),
-        Command::Log => with_repository(&cli.repository, false, |repository| {
+        Command::Log => with_repository(&cli.repository, false, |repository, output| {
             for (change, revision) in repository.current_revisions() {
-                println!("{change} {revision}");
+                writeln!(output, "{change} {revision}")?;
             }
             Ok(())
         }),
-        Command::Conflicts => with_repository(&cli.repository, false, |repository| {
+        Command::Conflicts => with_repository(&cli.repository, false, |repository, output| {
             let working = repository.working_view().id;
             for conflict in repository.conflicts_in_view(working)? {
-                println!("conflict {} on {}", conflict.id, conflict.base_view);
+                writeln!(output, "conflict {} on {}", conflict.id, conflict.base_view)?;
                 for path in &conflict.paths {
-                    println!(
+                    writeln!(
+                        output,
                         "  {} expected={:?} actual={:?} proposed={:?}",
                         path.path, path.expected, path.actual, path.proposed
-                    );
+                    )?;
                 }
             }
             Ok(())
@@ -142,7 +142,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Change(ChangeCommand::New(arguments)) => {
-            with_repository(&cli.repository, true, |repository| {
+            with_repository(&cli.repository, true, |repository, output| {
                 let dependencies = arguments
                     .dependencies
                     .iter()
@@ -150,54 +150,56 @@ fn main() -> Result<()> {
                     .collect::<Result<Vec<_>>>()?;
                 let transformation = transformation(&cli.repository, arguments.edit)?;
                 let (change, outcome) = repository.create_change(dependencies, transformation)?;
-                println!("change {change}");
-                println!("revision {}", outcome.revision_id);
-                print_reapplied(&outcome.reapplied);
+                writeln!(output, "change {change}")?;
+                writeln!(output, "revision {}", outcome.revision_id)?;
+                print_reapplied(output, &outcome.reapplied)?;
                 Ok(())
             })
         }
         Command::Change(ChangeCommand::Revise(arguments)) => {
-            with_repository(&cli.repository, true, |repository| {
+            with_repository(&cli.repository, true, |repository, output| {
                 let change = ChangeId::from_str(&arguments.change).context("invalid change ID")?;
                 let predecessor = RevisionId::from_str(&arguments.predecessor)
                     .context("invalid predecessor revision ID")?;
                 let transformation = transformation(&cli.repository, arguments.edit)?;
                 let outcome = repository.revise_change(change, predecessor, transformation)?;
-                println!("revision {}", outcome.revision_id);
-                print_reapplied(&outcome.reapplied);
+                writeln!(output, "revision {}", outcome.revision_id)?;
+                print_reapplied(output, &outcome.reapplied)?;
                 Ok(())
             })
         }
-        Command::Resolve(arguments) => with_repository(&cli.repository, true, |repository| {
-            let revision =
-                RevisionId::from_str(&arguments.revision).context("invalid revision ID")?;
-            let target = repository
-                .conflicted_application(revision)
-                .context("revision is not the current conflicted application")?
-                .target_view;
-            let mut tree = repository
-                .view(target)
-                .expect("application target view exists")
-                .tree
-                .clone();
-            match arguments.value {
-                Some(value) => {
-                    let content = content_store(&cli.repository).put(value.as_bytes())?;
-                    tree.insert(arguments.path, content);
+        Command::Resolve(arguments) => {
+            with_repository(&cli.repository, true, |repository, output| {
+                let revision =
+                    RevisionId::from_str(&arguments.revision).context("invalid revision ID")?;
+                let target = repository
+                    .conflicted_application(revision)
+                    .context("revision is not the current conflicted application")?
+                    .target_view;
+                let mut tree = repository
+                    .view(target)
+                    .expect("application target view exists")
+                    .tree
+                    .clone();
+                match arguments.value {
+                    Some(value) => {
+                        let content = content_store(&cli.repository).put(value.as_bytes())?;
+                        tree.insert(arguments.path, content);
+                    }
+                    None if arguments.delete => {
+                        tree.remove(&arguments.path);
+                    }
+                    None => bail!("a value or --delete is required"),
                 }
-                None if arguments.delete => {
-                    tree.remove(&arguments.path);
-                }
-                None => bail!("a value or --delete is required"),
-            }
-            let outcome = repository.resolve_conflict(ConflictResolution {
-                conflict_revision: revision,
-                resolved_tree: tree,
-            })?;
-            println!("revision {}", outcome.revision_id);
-            print_reapplied(&outcome.reapplied);
-            Ok(())
-        }),
+                let outcome = repository.resolve_conflict(ConflictResolution {
+                    conflict_revision: revision,
+                    resolved_tree: tree,
+                })?;
+                writeln!(output, "revision {}", outcome.revision_id)?;
+                print_reapplied(output, &outcome.reapplied)?;
+                Ok(())
+            })
+        }
     }
 }
 
@@ -222,57 +224,9 @@ fn transformation(root: &Path, arguments: EditArgs) -> Result<Transformation> {
     })
 }
 
-fn initialize(root: &Path) -> Result<()> {
-    let path = state_path(root);
-    if path.exists() {
-        bail!("Wheat repository already exists at {}", path.display());
-    }
-    fs::create_dir_all(path.parent().expect("state path has parent"))?;
-    save(&path, &Repository::new(Tree::new()))?;
-    println!(
-        "initialized Wheat repository in {}",
-        path.parent().unwrap().display()
-    );
-    Ok(())
-}
-
-fn with_repository(
-    root: &Path,
-    persist: bool,
-    operation: impl FnOnce(&mut Repository) -> Result<()>,
-) -> Result<()> {
-    let path = state_path(root);
-    let bytes =
-        fs::read(&path).with_context(|| format!("not a Wheat repository: {}", root.display()))?;
-    let mut repository: Repository =
-        serde_yaml::from_slice(&bytes).context("invalid Wheat repository state")?;
-    repository
-        .validate()
-        .context("invalid Wheat repository invariants")?;
-    operation(&mut repository)?;
-    if persist {
-        save(&path, &repository)?;
-    }
-    Ok(())
-}
-
-fn save(path: &Path, repository: &Repository) -> Result<()> {
-    let temporary = path.with_extension("yaml.tmp");
-    fs::write(&temporary, serde_yaml::to_string(repository)?)?;
-    fs::rename(temporary, path)?;
-    Ok(())
-}
-
-fn state_path(root: &Path) -> PathBuf {
-    root.join(STATE_DIR).join(STATE_FILE)
-}
-
-fn content_store(root: &Path) -> ContentStore {
-    ContentStore::new(root.join(STATE_DIR).join(CONTENT_DIR))
-}
-
-fn print_reapplied(changes: &[ChangeId]) {
+fn print_reapplied(output: &mut String, changes: &[ChangeId]) -> Result<()> {
     for change in changes {
-        println!("reapplied {change}");
+        writeln!(output, "reapplied {change}")?;
     }
+    Ok(())
 }

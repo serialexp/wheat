@@ -6,6 +6,7 @@
 
 mod collection;
 mod collection_builders;
+mod hydration;
 mod id;
 mod model;
 mod persisted;
@@ -22,6 +23,7 @@ pub use collection_builders::{
     build_application_map, build_conflict_set, build_content_set, build_retained_set,
     build_revision_map,
 };
+pub use hydration::{hydrate_application, hydrate_revision};
 pub use id::{
     ApplicationId, ApplicationMapId, ChangeId, ChangeObjectId, ConflictId, ConflictSetId,
     ContentId, ContentManifestId, ContentSetId, ObjectId, ParseContentIdError, ParseDigestIdError,
@@ -35,7 +37,8 @@ pub use model::{
 };
 pub use persisted::{ContentManifestRecord, RepositoryStateRecord, ViewRecord};
 pub use repository::{
-    ChangeProposal, Repository, RepositoryError, RevisionOutcome, TargetPolicyResult,
+    ChangeProposal, Repository, RepositoryError, RepositoryParts, RevisionOutcome,
+    TargetPolicyResult,
 };
 pub use root_builders::{
     build_content_manifest_record, build_repository_state_record, build_view_record,

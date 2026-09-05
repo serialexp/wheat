@@ -20,6 +20,7 @@ mod merkle_tree;
 mod object_store_adapter;
 mod publication;
 mod radix;
+mod repository_hydration;
 mod repository_publication;
 mod repository_reader;
 mod repository_transition;
