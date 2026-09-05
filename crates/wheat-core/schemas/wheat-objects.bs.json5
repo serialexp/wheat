@@ -283,53 +283,17 @@
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0601 },
         { name: "tree", type: "TreeId" },
-        {
-          name: "revisions",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "SelectedRevisionV1" },
-        },
-        {
-          name: "applications",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "SelectedApplicationV1" },
-        },
-        {
-          name: "unresolved_conflicts",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "ConflictId" },
-        },
+        { name: "revisions", type: "RevisionMapId" },
+        { name: "applications", type: "ApplicationMapId" },
+        { name: "unresolved_conflicts", type: "ConflictSetId" },
         { name: "required_content", type: "ContentManifestId" },
-      ],
-    },
-    SelectedRevisionV1: {
-      sequence: [
-        { name: "change_id", type: "ChangeId" },
-        { name: "revision_id", type: "RevisionId" },
-      ],
-    },
-    SelectedApplicationV1: {
-      sequence: [
-        { name: "change_id", type: "ChangeId" },
-        { name: "application_id", type: "ApplicationId" },
       ],
     },
 
     ContentManifestV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0701 },
-        {
-          name: "content",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "ContentId" },
-        },
+        { name: "content", type: "ContentSetId" },
       ],
     },
 
@@ -428,34 +392,10 @@
         { name: "working_view", type: "ViewId" },
         { name: "published_view", type: "ViewId" },
         { name: "required_content", type: "ContentManifestId" },
-        {
-          name: "retained_changes",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "ChangeObjectId" },
-        },
-        {
-          name: "retained_views",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "ViewId" },
-        },
-        {
-          name: "retained_revisions",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "RevisionId" },
-        },
-        {
-          name: "retained_applications",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "ApplicationId" },
-        },
+        { name: "retained_changes", type: "RetainedSetId" },
+        { name: "retained_views", type: "RetainedSetId" },
+        { name: "retained_revisions", type: "RetainedSetId" },
+        { name: "retained_applications", type: "RetainedSetId" },
       ],
     },
   },

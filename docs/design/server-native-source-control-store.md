@@ -112,9 +112,11 @@ described here.
   guarantees.
 - [~] **Phase 2 — persistent Merkle collections.** Canonical directory nodes,
   validated typed decoding, copy-on-write path edits, structural sharing, and
-  loose/generic-object-store reopen coverage now exist. Replace whole-view maps and
-  flat trees with immutable directory, revision-map, application-map, conflict-
-  index, and content-manifest nodes so a small mutation rewrites bounded paths.
+  loose/generic-object-store reopen coverage now exist. Revision/application maps,
+  conflict/content/retained sets, root-backed persisted views/manifests/state,
+  shared identity/closure builders, and verified root-only publication/readback
+  are implemented. Executable models remain hydrated; streaming import, change-ID
+  indexing, compressed radix qualification and wide-directory sharding remain.
 - [ ] **Phase 2 — indexed sealed segments and ranged reads.** Qualify loose
   objects plus immutable footer-indexed segments with a tiny identification
   prefix, paged sorted index, one-range tail directory, range coalescing, and
@@ -852,10 +854,23 @@ unaffected subtree IDs; conformance runs against both the loose filesystem and
 Apache in-memory adapters. A typed fixed-depth byte-radix revision map now also
 provides bounded-fanout, copy-on-write selection updates through the generic
 immutable store, including reopen, replacement, deletion, idempotency, and
-unaffected-branch sharing tests. The hydrated reference `Repository` currently
-adapts flat trees into directory nodes when producing a closure, while the
-application/conflict/content collection families and conversion of persisted
-views and the Git importer to root handles remain next.
+unaffected-branch sharing tests. All five typed collection families now share the
+store's copy-on-write engine. Persisted views reference revision/application maps,
+conflict sets and small content manifests wrapping content-set roots; persisted
+state references four retained-object inventories. Synchronous sink-based builders
+produce the same roots as incremental store construction and drive both executable
+identity calculation and reference closure emission, without adding root fields to
+`Repository` or caching a second closure per hydrated view.
+
+`RepositoryReader` decodes lazy typed records and verifies retained inventories
+using verified object reads before root-only publication/CAS. It checks historical
+edit/conflict content against the aggregate content set as well as raw bytes;
+HEAD/existence responses are not accepted as integrity evidence. Traversal does not
+materialize a global closure, but shared trees may be reread and logical change-ID
+resolution currently scans retained changes. Directory depth is capped at 1024
+for verification and wide nodes are decoded whole. These are reference-scale
+limitations, not a qualified large-history verifier. Streaming Git import and
+executable reconstruction/CLI authority cutover remain outstanding.
 Derived indexes such as reverse dependencies or path-to-
 conflict lookup may be immutable rebuildable segments; they accelerate queries
 but never become repository truth.

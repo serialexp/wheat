@@ -103,26 +103,17 @@ impl WheatObject {
                 let _variant_ctx = ctx.extend_with_parent(variant_fields);
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 v.tree.encode_into(encoder)?;
-                encoder.write_uint32(v.revisions.len() as u32, Endianness::BigEndian);
-                for item in &v.revisions {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint32(v.applications.len() as u32, Endianness::BigEndian);
-                for item in &v.applications {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint32(v.unresolved_conflicts.len() as u32, Endianness::BigEndian);
-                for item in &v.unresolved_conflicts {
-                    item.encode_into(encoder)?;
-                }
+                v.revisions.encode_into(encoder)?;
+                v.applications.encode_into(encoder)?;
+                v.unresolved_conflicts.encode_into(encoder)?;
                 v.required_content.encode_into(encoder)?;
             }
             WheatObject::ContentManifestV1(v) => {
+                // Build per-variant context for nested struct sub-fields
+                let variant_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                let _variant_ctx = ctx.extend_with_parent(variant_fields);
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint32(v.content.len() as u32, Endianness::BigEndian);
-                for item in &v.content {
-                    item.encode_into(encoder)?;
-                }
+                v.content.encode_into(encoder)?;
             }
             WheatObject::RepositoryStateV1(v) => {
                 // Build per-variant context for nested struct sub-fields
@@ -133,22 +124,10 @@ impl WheatObject {
                 v.working_view.encode_into(encoder)?;
                 v.published_view.encode_into(encoder)?;
                 v.required_content.encode_into(encoder)?;
-                encoder.write_uint32(v.retained_changes.len() as u32, Endianness::BigEndian);
-                for item in &v.retained_changes {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint32(v.retained_views.len() as u32, Endianness::BigEndian);
-                for item in &v.retained_views {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint32(v.retained_revisions.len() as u32, Endianness::BigEndian);
-                for item in &v.retained_revisions {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint32(v.retained_applications.len() as u32, Endianness::BigEndian);
-                for item in &v.retained_applications {
-                    item.encode_into(encoder)?;
-                }
+                v.retained_changes.encode_into(encoder)?;
+                v.retained_views.encode_into(encoder)?;
+                v.retained_revisions.encode_into(encoder)?;
+                v.retained_applications.encode_into(encoder)?;
             }
             WheatObject::RevisionMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -2619,9 +2598,9 @@ impl PathConflictV1 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewV1Input {
     pub tree: TreeId,
-    pub revisions: Vec<SelectedRevisionV1>,
-    pub applications: Vec<SelectedApplicationV1>,
-    pub unresolved_conflicts: Vec<ConflictId>,
+    pub revisions: RevisionMapId,
+    pub applications: ApplicationMapId,
+    pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentManifestId,
 }
 
@@ -2629,9 +2608,9 @@ pub struct ViewV1Input {
 pub struct ViewV1Output {
     pub wire_tag: u16,
     pub tree: TreeId,
-    pub revisions: Vec<SelectedRevisionV1>,
-    pub applications: Vec<SelectedApplicationV1>,
-    pub unresolved_conflicts: Vec<ConflictId>,
+    pub revisions: RevisionMapId,
+    pub applications: ApplicationMapId,
+    pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentManifestId,
 }
 
@@ -2657,57 +2636,18 @@ impl ViewV1Input {
     pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
 
         // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        // Collect items with sub-field values for typed array 'revisions'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.revisions {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("SelectedRevisionV1".to_string(), item_fields));
-            }
-            parent_fields.insert("revisions".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'applications'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.applications {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("SelectedApplicationV1".to_string(), item_fields));
-            }
-            parent_fields.insert("applications".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'unresolved_conflicts'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.unresolved_conflicts {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("ConflictId".to_string(), item_fields));
-            }
-            parent_fields.insert("unresolved_conflicts".to_string(), FieldValue::Items(items_data));
-        }
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(1537);
         // Encode nested struct tree with context
         self.tree.encode_into_with_context(encoder, &child_ctx)?;
-        encoder.write_u32_be(self.revisions.len() as u32);
-        for item in &self.revisions {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
-        encoder.write_u32_be(self.applications.len() as u32);
-        for item in &self.applications {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
-        encoder.write_u32_be(self.unresolved_conflicts.len() as u32);
-        for item in &self.unresolved_conflicts {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
+        // Encode nested struct revisions with context
+        self.revisions.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct applications with context
+        self.applications.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct unresolved_conflicts with context
+        self.unresolved_conflicts.encode_into_with_context(encoder, &child_ctx)?;
         // Encode nested struct required_content with context
         self.required_content.encode_into_with_context(encoder, &child_ctx)?;
         Ok(())
@@ -2727,24 +2667,9 @@ impl ViewV1Output {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1537, got {}", wire_tag)));
         }
         let tree = TreeId::decode_with_decoder(decoder)?;
-        let length = decoder.read_u32_be()? as usize;
-        let mut revisions = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = SelectedRevisionV1::decode_with_decoder(decoder)?;
-            revisions.push(item);
-        }
-        let length = decoder.read_u32_be()? as usize;
-        let mut applications = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = SelectedApplicationV1::decode_with_decoder(decoder)?;
-            applications.push(item);
-        }
-        let length = decoder.read_u32_be()? as usize;
-        let mut unresolved_conflicts = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = ConflictId::decode_with_decoder(decoder)?;
-            unresolved_conflicts.push(item);
-        }
+        let revisions = RevisionMapId::decode_with_decoder(decoder)?;
+        let applications = ApplicationMapId::decode_with_decoder(decoder)?;
+        let unresolved_conflicts = ConflictSetId::decode_with_decoder(decoder)?;
         let required_content = ContentManifestId::decode_with_decoder(decoder)?;
         Ok(Self {
             wire_tag,
@@ -2795,116 +2720,14 @@ impl From<ViewV1Input> for ViewV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SelectedRevisionV1 {
-    pub change_id: ChangeId,
-    pub revision_id: RevisionId,
-}
-
-impl SelectedRevisionV1 {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
-        // Encode nested struct change_id with context
-        self.change_id.encode_into_with_context(encoder, &child_ctx)?;
-        // Encode nested struct revision_id with context
-        self.revision_id.encode_into_with_context(encoder, &child_ctx)?;
-        Ok(())
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let change_id = ChangeId::decode_with_decoder(decoder)?;
-        let revision_id = RevisionId::decode_with_decoder(decoder)?;
-        Ok(Self {
-            change_id,
-            revision_id,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SelectedApplicationV1 {
-    pub change_id: ChangeId,
-    pub application_id: ApplicationId,
-}
-
-impl SelectedApplicationV1 {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        self.encode_into_with_context(encoder, &EncodeContext::new())
-    }
-
-    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into_with_context(&mut encoder, ctx)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
-
-        // Build parent context for nested struct encoding
-        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        let child_ctx = ctx.extend_with_parent(parent_fields);
-        let _ = &child_ctx; // Used by nested struct encoding
-        // Encode nested struct change_id with context
-        self.change_id.encode_into_with_context(encoder, &child_ctx)?;
-        // Encode nested struct application_id with context
-        self.application_id.encode_into_with_context(encoder, &child_ctx)?;
-        Ok(())
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let change_id = ChangeId::decode_with_decoder(decoder)?;
-        let application_id = ApplicationId::decode_with_decoder(decoder)?;
-        Ok(Self {
-            change_id,
-            application_id,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct ContentManifestV1Input {
-    pub content: Vec<ContentId>,
+    pub content: ContentSetId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentManifestV1Output {
     pub wire_tag: u16,
-    pub content: Vec<ContentId>,
+    pub content: ContentSetId,
 }
 
 pub type ContentManifestV1 = ContentManifestV1Output;
@@ -2929,25 +2752,12 @@ impl ContentManifestV1Input {
     pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
 
         // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        // Collect items with sub-field values for typed array 'content'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.content {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("ContentId".to_string(), item_fields));
-            }
-            parent_fields.insert("content".to_string(), FieldValue::Items(items_data));
-        }
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(1793);
-        encoder.write_u32_be(self.content.len() as u32);
-        for item in &self.content {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
+        // Encode nested struct content with context
+        self.content.encode_into_with_context(encoder, &child_ctx)?;
         Ok(())
     }
 
@@ -2964,12 +2774,7 @@ impl ContentManifestV1Output {
         if wire_tag != 1793u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1793, got {}", wire_tag)));
         }
-        let length = decoder.read_u32_be()? as usize;
-        let mut content = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = ContentId::decode_with_decoder(decoder)?;
-            content.push(item);
-        }
+        let content = ContentSetId::decode_with_decoder(decoder)?;
         Ok(Self {
             wire_tag,
             content,
@@ -3930,10 +3735,10 @@ pub struct RepositoryStateV1Input {
     pub working_view: ViewId,
     pub published_view: ViewId,
     pub required_content: ContentManifestId,
-    pub retained_changes: Vec<ChangeObjectId>,
-    pub retained_views: Vec<ViewId>,
-    pub retained_revisions: Vec<RevisionId>,
-    pub retained_applications: Vec<ApplicationId>,
+    pub retained_changes: RetainedSetId,
+    pub retained_views: RetainedSetId,
+    pub retained_revisions: RetainedSetId,
+    pub retained_applications: RetainedSetId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3943,10 +3748,10 @@ pub struct RepositoryStateV1Output {
     pub working_view: ViewId,
     pub published_view: ViewId,
     pub required_content: ContentManifestId,
-    pub retained_changes: Vec<ChangeObjectId>,
-    pub retained_views: Vec<ViewId>,
-    pub retained_revisions: Vec<RevisionId>,
-    pub retained_applications: Vec<ApplicationId>,
+    pub retained_changes: RetainedSetId,
+    pub retained_views: RetainedSetId,
+    pub retained_revisions: RetainedSetId,
+    pub retained_applications: RetainedSetId,
 }
 
 pub type RepositoryStateV1 = RepositoryStateV1Output;
@@ -3971,51 +3776,7 @@ impl RepositoryStateV1Input {
     pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
 
         // Build parent context for nested struct encoding
-        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        // Collect items with sub-field values for typed array 'retained_changes'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.retained_changes {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("ChangeObjectId".to_string(), item_fields));
-            }
-            parent_fields.insert("retained_changes".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'retained_views'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.retained_views {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("ViewId".to_string(), item_fields));
-            }
-            parent_fields.insert("retained_views".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'retained_revisions'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.retained_revisions {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("RevisionId".to_string(), item_fields));
-            }
-            parent_fields.insert("retained_revisions".to_string(), FieldValue::Items(items_data));
-        }
-        // Collect items with sub-field values for typed array 'retained_applications'
-        {
-            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for _ in &self.retained_applications {
-                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
-                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                items_data.push(("ApplicationId".to_string(), item_fields));
-            }
-            parent_fields.insert("retained_applications".to_string(), FieldValue::Items(items_data));
-        }
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(2049);
@@ -4027,22 +3788,14 @@ impl RepositoryStateV1Input {
         self.published_view.encode_into_with_context(encoder, &child_ctx)?;
         // Encode nested struct required_content with context
         self.required_content.encode_into_with_context(encoder, &child_ctx)?;
-        encoder.write_u32_be(self.retained_changes.len() as u32);
-        for item in &self.retained_changes {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
-        encoder.write_u32_be(self.retained_views.len() as u32);
-        for item in &self.retained_views {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
-        encoder.write_u32_be(self.retained_revisions.len() as u32);
-        for item in &self.retained_revisions {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
-        encoder.write_u32_be(self.retained_applications.len() as u32);
-        for item in &self.retained_applications {
-            item.encode_into_with_context(encoder, &child_ctx)?;
-        }
+        // Encode nested struct retained_changes with context
+        self.retained_changes.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct retained_views with context
+        self.retained_views.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct retained_revisions with context
+        self.retained_revisions.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct retained_applications with context
+        self.retained_applications.encode_into_with_context(encoder, &child_ctx)?;
         Ok(())
     }
 
@@ -4063,30 +3816,10 @@ impl RepositoryStateV1Output {
         let working_view = ViewId::decode_with_decoder(decoder)?;
         let published_view = ViewId::decode_with_decoder(decoder)?;
         let required_content = ContentManifestId::decode_with_decoder(decoder)?;
-        let length = decoder.read_u32_be()? as usize;
-        let mut retained_changes = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = ChangeObjectId::decode_with_decoder(decoder)?;
-            retained_changes.push(item);
-        }
-        let length = decoder.read_u32_be()? as usize;
-        let mut retained_views = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = ViewId::decode_with_decoder(decoder)?;
-            retained_views.push(item);
-        }
-        let length = decoder.read_u32_be()? as usize;
-        let mut retained_revisions = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = RevisionId::decode_with_decoder(decoder)?;
-            retained_revisions.push(item);
-        }
-        let length = decoder.read_u32_be()? as usize;
-        let mut retained_applications = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = ApplicationId::decode_with_decoder(decoder)?;
-            retained_applications.push(item);
-        }
+        let retained_changes = RetainedSetId::decode_with_decoder(decoder)?;
+        let retained_views = RetainedSetId::decode_with_decoder(decoder)?;
+        let retained_revisions = RetainedSetId::decode_with_decoder(decoder)?;
+        let retained_applications = RetainedSetId::decode_with_decoder(decoder)?;
         Ok(Self {
             wire_tag,
             base_view,

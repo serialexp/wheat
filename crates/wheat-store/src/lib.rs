@@ -21,6 +21,10 @@ mod object_store_adapter;
 mod publication;
 mod radix;
 mod repository_publication;
+mod repository_reader;
+mod repository_transition;
+mod repository_verify;
+pub use repository_reader::RepositoryReader;
 mod revision_map;
 mod sets;
 

@@ -14,10 +14,22 @@ pub enum RepositoryPublicationError {
     Content(#[from] ContentStoreError),
     #[error("repository head publication failed")]
     Head(#[from] PublicationError),
+    #[error("repository model is invalid")]
+    InvalidRepository(#[from] wheat_core::RepositoryError),
     #[error("required content {0} is missing")]
     MissingContent(wheat_core::ContentId),
     #[error("published immutable closure is incomplete at object {0}")]
     MissingObject(ObjectId),
+    #[error("invalid persisted references: {0}")]
+    InvalidReferences(&'static str),
+    #[error(transparent)]
+    Collection(#[from] crate::CollectionError),
+    #[error(transparent)]
+    Revisions(#[from] crate::RevisionMapError),
+    #[error(transparent)]
+    Applications(#[from] crate::ApplicationMapError),
+    #[error(transparent)]
+    Tree(#[from] crate::MerkleTreeError),
 }
 
 pub struct RepositoryPublisher<'a, O, P> {
@@ -44,9 +56,7 @@ where
         &self,
         repository: &Repository,
     ) -> Result<RepositoryClosure, RepositoryPublicationError> {
-        repository
-            .validate()
-            .expect("repository publication requires valid model state");
+        repository.validate()?;
         let closure = repository.canonical_closure();
         for object in &closure.objects {
             self.objects.put_if_absent(object.id, &object.bytes).await?;
@@ -71,8 +81,39 @@ where
         repository: &Repository,
     ) -> Result<RepositoryHead, RepositoryPublicationError> {
         let closure = self.prepare(repository).await?;
-        let proposed = expected.next(closure.state.id.into())?;
-        self.verify_closure(&closure).await?;
+        self.publish_root(expected, closure.state.id).await
+    }
+
+    pub async fn initialize_root(
+        &self,
+        root: wheat_core::RepositoryStateId,
+    ) -> Result<RepositoryHead, RepositoryPublicationError> {
+        crate::RepositoryReader::new(self.objects, self.content)
+            .validate_complete(root)
+            .await?;
+        let head = RepositoryHead::initial(root.into());
+        self.publications.initialize(head)?;
+        Ok(head)
+    }
+
+    pub async fn publish_root(
+        &self,
+        expected: RepositoryHead,
+        root: wheat_core::RepositoryStateId,
+    ) -> Result<RepositoryHead, RepositoryPublicationError> {
+        let proposed = expected.next(root.into())?;
+        let actual = self.publications.read()?;
+        if actual != expected {
+            return Err(PublicationError::Stale { expected, actual }.into());
+        }
+        let reader = crate::RepositoryReader::new(self.objects, self.content);
+        reader.validate_complete(root).await?;
+        reader
+            .validate_transition(
+                wheat_core::RepositoryStateId::from_digest(*expected.repository_state.as_bytes()),
+                root,
+            )
+            .await?;
         self.publications.compare_and_advance(expected, proposed)?;
         Ok(proposed)
     }
@@ -81,22 +122,8 @@ where
         &self,
         closure: &RepositoryClosure,
     ) -> Result<(), RepositoryPublicationError> {
-        let ids = closure
-            .objects
-            .iter()
-            .map(|object| object.id)
-            .collect::<Vec<_>>();
-        for (id, exists) in ids.iter().zip(self.objects.exists_many(&ids).await?) {
-            if !exists {
-                return Err(RepositoryPublicationError::MissingObject(*id));
-            }
-        }
-        for content in &closure.required_content {
-            if !self.content.contains(*content) {
-                return Err(RepositoryPublicationError::MissingContent(*content));
-            }
-            self.content.get(*content)?;
-        }
-        Ok(())
+        crate::RepositoryReader::new(self.objects, self.content)
+            .validate_complete(closure.state.id)
+            .await
     }
 }

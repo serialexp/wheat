@@ -70,6 +70,68 @@ fn decode_validated(bytes: &[u8]) -> Result<wire::WheatObject, CanonicalObjectEr
     Ok(object)
 }
 
+pub fn decode_view_record(bytes: &[u8]) -> Result<crate::ViewRecord, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::ViewV1(v) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::View,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(crate::ViewRecord {
+        tree: TreeId::from_digest(digest_domain(&v.tree.digest)?),
+        revisions: crate::RevisionMapId::from_digest(digest_domain(&v.revisions.digest)?),
+        applications: crate::ApplicationMapId::from_digest(digest_domain(&v.applications.digest)?),
+        unresolved_conflicts: crate::ConflictSetId::from_digest(digest_domain(
+            &v.unresolved_conflicts.digest,
+        )?),
+        required_content: ContentManifestId::from_digest(digest_domain(
+            &v.required_content.digest,
+        )?),
+    })
+}
+
+pub fn decode_content_manifest_record(
+    bytes: &[u8],
+) -> Result<crate::ContentManifestRecord, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::ContentManifestV1(v) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::ContentManifest,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(crate::ContentManifestRecord {
+        content: crate::ContentSetId::from_digest(digest_domain(&v.content.digest)?),
+    })
+}
+
+pub fn decode_repository_state_record(
+    bytes: &[u8],
+) -> Result<crate::RepositoryStateRecord, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::RepositoryStateV1(v) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::RepositoryState,
+            actual: object_kind(&object),
+        });
+    };
+    let retained =
+        |id: &wire::RetainedSetId| digest_domain(&id.digest).map(crate::RetainedSetId::from_digest);
+    Ok(crate::RepositoryStateRecord {
+        base_view: crate::ViewId::from_digest(digest_domain(&v.base_view.digest)?),
+        working_view: crate::ViewId::from_digest(digest_domain(&v.working_view.digest)?),
+        published_view: crate::ViewId::from_digest(digest_domain(&v.published_view.digest)?),
+        required_content: ContentManifestId::from_digest(digest_domain(
+            &v.required_content.digest,
+        )?),
+        retained_changes: retained(&v.retained_changes)?,
+        retained_views: retained(&v.retained_views)?,
+        retained_revisions: retained(&v.retained_revisions)?,
+        retained_applications: retained(&v.retained_applications)?,
+    })
+}
+
 pub fn validate_directory_component(name: &str) -> Result<(), CanonicalObjectError> {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
         return Err(CanonicalObjectError::InvalidDirectoryComponent(
@@ -482,13 +544,18 @@ pub(crate) fn tree_objects(tree: &Tree) -> Vec<(TreeId, Vec<u8>)> {
     objects
 }
 
-pub(crate) fn content_manifest_bytes(content: &BTreeSet<ContentId>) -> Vec<u8> {
+pub(crate) fn content_manifest_record_bytes(record: &crate::ContentManifestRecord) -> Vec<u8> {
     encode(wire::WheatObject::ContentManifestV1(
         wire::ContentManifestV1Input {
-            content: content.iter().copied().map(content_id).collect(),
+            content: content_set_id(record.content),
         }
         .into(),
     ))
+}
+
+pub(crate) fn content_manifest_bytes(content: &BTreeSet<ContentId>) -> Vec<u8> {
+    let content = crate::build_content_set(content.iter().copied(), |_| {});
+    content_manifest_record_bytes(&crate::ContentManifestRecord { content })
 }
 
 pub(crate) fn content_manifest_id(content: &BTreeSet<ContentId>) -> ContentManifestId {
@@ -571,53 +638,41 @@ pub(crate) fn application_bytes(application: &Application) -> Vec<u8> {
     ))
 }
 
-pub(crate) fn repository_state_bytes(state: &RepositoryState) -> Vec<u8> {
+pub(crate) fn repository_state_record_bytes(record: &crate::RepositoryStateRecord) -> Vec<u8> {
     encode(wire::WheatObject::RepositoryStateV1(
         wire::RepositoryStateV1Input {
-            base_view: view_id(state.base_view),
-            working_view: view_id(state.working_view),
-            published_view: view_id(state.published_view),
-            required_content: content_manifest_id_wire(state.required_content),
-            retained_changes: state
-                .retained_changes
-                .iter()
-                .copied()
-                .map(change_object_id)
-                .collect(),
-            retained_views: state.retained_views.iter().copied().map(view_id).collect(),
-            retained_revisions: state
-                .retained_revisions
-                .iter()
-                .copied()
-                .map(revision_id)
-                .collect(),
-            retained_applications: state
-                .retained_applications
-                .iter()
-                .copied()
-                .map(application_id)
-                .collect(),
+            base_view: view_id(record.base_view),
+            working_view: view_id(record.working_view),
+            published_view: view_id(record.published_view),
+            required_content: content_manifest_id_wire(record.required_content),
+            retained_changes: retained_set_id(record.retained_changes),
+            retained_views: retained_set_id(record.retained_views),
+            retained_revisions: retained_set_id(record.retained_revisions),
+            retained_applications: retained_set_id(record.retained_applications),
+        }
+        .into(),
+    ))
+}
+
+pub(crate) fn repository_state_bytes(state: &RepositoryState) -> Vec<u8> {
+    crate::build_repository_state_record(state, &mut |_| {}).canonical_bytes()
+}
+
+pub(crate) fn view_record_bytes(record: &crate::ViewRecord) -> Vec<u8> {
+    encode(wire::WheatObject::ViewV1(
+        wire::ViewV1Input {
+            tree: tree_id_wire(record.tree),
+            revisions: revision_map_id(record.revisions),
+            applications: application_map_id(record.applications),
+            unresolved_conflicts: conflict_set_id(record.unresolved_conflicts),
+            required_content: content_manifest_id_wire(record.required_content),
         }
         .into(),
     ))
 }
 
 pub(crate) fn view_bytes(view: &RepositoryView) -> Vec<u8> {
-    encode(wire::WheatObject::ViewV1(
-        wire::ViewV1Input {
-            tree: tree_id_wire(tree_id(&view.tree)),
-            revisions: selected_revisions(&view.frontier),
-            applications: selected_applications(&view.applications),
-            unresolved_conflicts: view
-                .unresolved_conflicts
-                .iter()
-                .copied()
-                .map(conflict_id)
-                .collect(),
-            required_content: content_manifest_id_wire(content_manifest_id(&view.required_content)),
-        }
-        .into(),
-    ))
+    crate::build_view_record(view, &mut |_| {}).canonical_bytes()
 }
 
 fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectError> {
@@ -670,33 +725,8 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 validate_optional_content_id(path.proposed.as_ref())?;
             }
         }
-        wire::WheatObject::ViewV1(view) => {
-            validate_sorted_unique_by(
-                &view.revisions,
-                |selection| selection.change_id.uuid.bytes.as_slice(),
-                "selected revisions",
-            )?;
-            validate_sorted_unique_by(
-                &view.applications,
-                |selection| selection.change_id.uuid.bytes.as_slice(),
-                "selected applications",
-            )?;
-            validate_sorted_unique_by(
-                &view.unresolved_conflicts,
-                |conflict| conflict.digest.bytes.as_slice(),
-                "unresolved conflicts",
-            )?;
-        }
-        wire::WheatObject::ContentManifestV1(manifest) => {
-            validate_sorted_unique_by(
-                &manifest.content,
-                |content| content.digest.bytes.as_slice(),
-                "content manifest",
-            )?;
-            for content in &manifest.content {
-                validate_content_id(content)?;
-            }
-        }
+        wire::WheatObject::ViewV1(_) => {}
+        wire::WheatObject::ContentManifestV1(_) => {}
         wire::WheatObject::RevisionMapNodeV1(node) => {
             if node.depth > 16 {
                 return Err(CanonicalObjectError::InvalidCollection(
@@ -765,28 +795,7 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "retained set node",
             )?;
         }
-        wire::WheatObject::RepositoryStateV1(state) => {
-            validate_sorted_unique_by(
-                &state.retained_changes,
-                |change| change.digest.bytes.as_slice(),
-                "retained changes",
-            )?;
-            validate_sorted_unique_by(
-                &state.retained_views,
-                |view| view.digest.bytes.as_slice(),
-                "retained views",
-            )?;
-            validate_sorted_unique_by(
-                &state.retained_revisions,
-                |revision| revision.digest.bytes.as_slice(),
-                "retained revisions",
-            )?;
-            validate_sorted_unique_by(
-                &state.retained_applications,
-                |application| application.digest.bytes.as_slice(),
-                "retained applications",
-            )?;
-        }
+        wire::WheatObject::RepositoryStateV1(_) => {}
     }
     Ok(())
 }
@@ -851,28 +860,6 @@ fn digest_domain(digest: &wire::Digest256) -> Result<[u8; 32], CanonicalObjectEr
         .as_slice()
         .try_into()
         .map_err(|_| CanonicalObjectError::Decode("digest is not 32 bytes".into()))
-}
-
-fn selected_revisions(revisions: &BTreeMap<ChangeId, RevisionId>) -> Vec<wire::SelectedRevisionV1> {
-    revisions
-        .iter()
-        .map(|(change, revision)| wire::SelectedRevisionV1 {
-            change_id: change_id(*change),
-            revision_id: revision_id(*revision),
-        })
-        .collect()
-}
-
-fn selected_applications(
-    applications: &BTreeMap<ChangeId, crate::ApplicationId>,
-) -> Vec<wire::SelectedApplicationV1> {
-    applications
-        .iter()
-        .map(|(change, application)| wire::SelectedApplicationV1 {
-            change_id: change_id(*change),
-            application_id: application_id(*application),
-        })
-        .collect()
 }
 
 fn actor(value: &Actor) -> wire::ActorV1 {
@@ -975,7 +962,6 @@ macro_rules! wire_digest_id {
     };
 }
 
-wire_digest_id!(change_object_id, crate::ChangeObjectId, ChangeObjectId);
 wire_digest_id!(revision_id, RevisionId, RevisionId);
 wire_digest_id!(revision_map_id, crate::RevisionMapId, RevisionMapId);
 wire_digest_id!(

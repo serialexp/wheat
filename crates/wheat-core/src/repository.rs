@@ -151,6 +151,7 @@ impl Repository {
         for revision in self.revisions.values() {
             insert_canonical_object(&mut objects, revision.id.into(), revision.canonical_bytes());
             insert_tree_object(&mut objects, revision.resulting_tree());
+            required_content.extend(revision.resulting_tree().values().copied());
         }
         for application in self.applications.values() {
             insert_canonical_object(
@@ -159,6 +160,7 @@ impl Repository {
                 application.canonical_bytes(),
             );
             insert_tree_object(&mut objects, application.result.materialized_tree());
+            required_content.extend(application.result.materialized_tree().values().copied());
             if let ApplicationResult::Conflicted { conflict, .. } = &application.result {
                 insert_canonical_object(
                     &mut objects,
@@ -178,6 +180,9 @@ impl Repository {
             insert_tree_object(&mut objects, &view.tree);
             insert_canonical_object(&mut objects, view.id.into(), view.canonical_bytes());
             required_content.extend(view.required_content.iter().copied());
+            crate::build_view_record(view, &mut |object: CanonicalObject| {
+                insert_canonical_object(&mut objects, object.id, object.bytes);
+            });
             let manifest_bytes = crate::wire::content_manifest_bytes(&view.required_content);
             let manifest_id = crate::wire::content_manifest_id(&view.required_content);
             insert_canonical_object(&mut objects, manifest_id.into(), manifest_bytes);
@@ -188,6 +193,9 @@ impl Repository {
             }
         }
 
+        crate::build_content_manifest_record(&required_content, &mut |object: CanonicalObject| {
+            insert_canonical_object(&mut objects, object.id, object.bytes);
+        });
         let aggregate_manifest_bytes = crate::wire::content_manifest_bytes(&required_content);
         let aggregate_manifest_id = crate::wire::content_manifest_id(&required_content);
         insert_canonical_object(
@@ -207,6 +215,9 @@ impl Repository {
             retained_revisions: self.revisions.keys().copied().collect(),
             retained_applications: self.applications.keys().copied().collect(),
         };
+        crate::build_repository_state_record(&state, &mut |object: CanonicalObject| {
+            insert_canonical_object(&mut objects, object.id, object.bytes);
+        });
         let state_bytes = state.canonical_bytes();
         state.id = RepositoryStateId::of_canonical_bytes(&state_bytes);
         insert_canonical_object(&mut objects, state.id.into(), state_bytes);

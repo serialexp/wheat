@@ -29,7 +29,9 @@ fn empty_repository_closure_contains_root_state_view_tree_and_manifest() {
         .map(|object| validate_canonical_object(&object.bytes).unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(closure.objects.len(), 4);
+    // Four semantic objects, four empty view collections, an empty retained
+    // root, and the 33-node retained path naming the base view.
+    assert_eq!(closure.objects.len(), 42);
     assert!(kinds.contains(&CanonicalObjectKind::RepositoryState));
     assert!(kinds.contains(&CanonicalObjectKind::View));
     assert!(kinds.contains(&CanonicalObjectKind::Tree));
