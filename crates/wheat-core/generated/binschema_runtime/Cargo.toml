@@ -1,0 +1,11 @@
+[package]
+name = "wheat-binschema-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flate2 = "1.0"
+
+[lib]
+name = "binschema_runtime"
+path = "src/lib.rs"

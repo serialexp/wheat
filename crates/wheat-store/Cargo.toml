@@ -4,11 +4,18 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1"
+libc = { workspace = true }
+object_store = { version = "0.14.1", features = ["aws"] }
 thiserror = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 
 [dev-dependencies]
+hdrhistogram = { workspace = true }
+object_store = { version = "0.14.1", features = ["aws"] }
+serde_json = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

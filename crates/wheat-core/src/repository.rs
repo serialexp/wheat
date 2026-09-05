@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Application, ApplicationId, ApplicationResult, ChangeId, ChangeRevision, Conflict,
-    ConflictResolution, DependencyGraph, PathConflict, RepositoryView, RevisionId, Transformation,
-    Tree, ViewId,
+    Application, ApplicationId, ApplicationResult, CanonicalObject, Change, ChangeId,
+    ChangeMetadata, ChangeRevision, Conflict, ConflictId, ConflictResolution, DependencyGraph,
+    ObjectId, PathConflict, RepositoryClosure, RepositoryState, RepositoryStateId, RepositoryView,
+    RevisionId, RevisionMetadata, Transformation, Tree, ViewId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +15,15 @@ pub struct RevisionOutcome {
     pub revision_id: RevisionId,
     pub resulting_view: ViewId,
     pub reapplied: Vec<ChangeId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangeProposal {
+    pub id: ChangeId,
+    pub metadata: ChangeMetadata,
+    pub dependencies: BTreeSet<ChangeId>,
+    pub revision_metadata: RevisionMetadata,
+    pub transformation: Transformation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +39,8 @@ pub enum RepositoryError {
     UnknownView(ViewId),
     #[error("change {0} does not exist")]
     UnknownChange(ChangeId),
+    #[error("change {0} already exists")]
+    DuplicateChange(ChangeId),
     #[error("revision {0} does not exist")]
     UnknownRevision(RevisionId),
     #[error("revision predecessor is not the current revision of change {0}")]
@@ -43,10 +55,13 @@ pub enum RepositoryError {
     InvalidConflictResolution,
     #[error("publication expected {expected}, but current view is {actual}")]
     StalePublication { expected: ViewId, actual: ViewId },
+    #[error("repository state violates an identity invariant: {0}")]
+    InvalidRepositoryState(&'static str),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Repository {
+    changes: BTreeMap<ChangeId, Change>,
     views: BTreeMap<ViewId, RepositoryView>,
     revisions: BTreeMap<RevisionId, ChangeRevision>,
     current_revisions: BTreeMap<ChangeId, RevisionId>,
@@ -66,6 +81,7 @@ impl Repository {
         let mut views = BTreeMap::new();
         views.insert(id, view);
         Self {
+            changes: BTreeMap::new(),
             views,
             revisions: BTreeMap::new(),
             current_revisions: BTreeMap::new(),
@@ -75,6 +91,133 @@ impl Repository {
             base_view: id,
             working_view: id,
             published_view: id,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.changes.iter().any(|(id, change)| *id != change.id) {
+            return Err(RepositoryError::InvalidRepositoryState("change identity"));
+        }
+        if self.views.iter().any(|(id, view)| {
+            *id != view.id || view.id != ViewId::of_canonical_bytes(&view.canonical_bytes())
+        }) {
+            return Err(RepositoryError::InvalidRepositoryState("view identity"));
+        }
+        if self.revisions.iter().any(|(id, revision)| {
+            *id != revision.id
+                || revision.id != RevisionId::of_canonical_bytes(&revision.canonical_bytes())
+        }) {
+            return Err(RepositoryError::InvalidRepositoryState("revision identity"));
+        }
+        if self.applications.iter().any(|(id, application)| {
+            *id != application.id
+                || application.id
+                    != ApplicationId::of_canonical_bytes(&application.canonical_bytes())
+        }) {
+            return Err(RepositoryError::InvalidRepositoryState(
+                "application identity",
+            ));
+        }
+        for application in self.applications.values() {
+            if let ApplicationResult::Conflicted { conflict, .. } = &application.result
+                && conflict.id != ConflictId::of_canonical_bytes(&conflict.canonical_bytes())
+            {
+                return Err(RepositoryError::InvalidRepositoryState("conflict identity"));
+            }
+        }
+        if !self.views.contains_key(&self.base_view)
+            || !self.views.contains_key(&self.working_view)
+            || !self.views.contains_key(&self.published_view)
+        {
+            return Err(RepositoryError::InvalidRepositoryState(
+                "repository view root",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn canonical_closure(&self) -> RepositoryClosure {
+        let mut objects = BTreeMap::<ObjectId, Vec<u8>>::new();
+        let mut required_content = BTreeSet::new();
+        let mut retained_changes = BTreeSet::new();
+
+        for change in self.changes.values() {
+            let bytes = change.canonical_bytes();
+            let id = crate::ChangeObjectId::of_canonical_bytes(&bytes);
+            retained_changes.insert(id);
+            insert_canonical_object(&mut objects, id.into(), bytes);
+        }
+        for revision in self.revisions.values() {
+            insert_canonical_object(&mut objects, revision.id.into(), revision.canonical_bytes());
+            insert_tree_object(&mut objects, revision.resulting_tree());
+        }
+        for application in self.applications.values() {
+            insert_canonical_object(
+                &mut objects,
+                application.id.into(),
+                application.canonical_bytes(),
+            );
+            insert_tree_object(&mut objects, application.result.materialized_tree());
+            if let ApplicationResult::Conflicted { conflict, .. } = &application.result {
+                insert_canonical_object(
+                    &mut objects,
+                    conflict.id.into(),
+                    conflict.canonical_bytes(),
+                );
+                for path in &conflict.paths {
+                    required_content.extend(
+                        [path.expected, path.actual, path.proposed]
+                            .into_iter()
+                            .flatten(),
+                    );
+                }
+            }
+        }
+        for view in self.views.values() {
+            insert_tree_object(&mut objects, &view.tree);
+            insert_canonical_object(&mut objects, view.id.into(), view.canonical_bytes());
+            required_content.extend(view.required_content.iter().copied());
+            let manifest_bytes = crate::wire::content_manifest_bytes(&view.required_content);
+            let manifest_id = crate::wire::content_manifest_id(&view.required_content);
+            insert_canonical_object(&mut objects, manifest_id.into(), manifest_bytes);
+        }
+        for revision in self.revisions.values() {
+            for edit in &revision.transformation.edits {
+                required_content.extend([edit.expected, edit.replacement].into_iter().flatten());
+            }
+        }
+
+        let aggregate_manifest_bytes = crate::wire::content_manifest_bytes(&required_content);
+        let aggregate_manifest_id = crate::wire::content_manifest_id(&required_content);
+        insert_canonical_object(
+            &mut objects,
+            aggregate_manifest_id.into(),
+            aggregate_manifest_bytes,
+        );
+
+        let mut state = RepositoryState {
+            id: RepositoryStateId::from_digest([0; 32]),
+            base_view: self.base_view,
+            working_view: self.working_view,
+            published_view: self.published_view,
+            required_content: aggregate_manifest_id,
+            retained_changes,
+            retained_views: self.views.keys().copied().collect(),
+            retained_revisions: self.revisions.keys().copied().collect(),
+            retained_applications: self.applications.keys().copied().collect(),
+        };
+        let state_bytes = state.canonical_bytes();
+        state.id = RepositoryStateId::of_canonical_bytes(&state_bytes);
+        insert_canonical_object(&mut objects, state.id.into(), state_bytes);
+
+        RepositoryClosure {
+            state,
+            objects: objects
+                .into_iter()
+                .map(|(id, bytes)| CanonicalObject { id, bytes })
+                .collect(),
+            required_content,
         }
     }
 
@@ -91,6 +234,11 @@ impl Repository {
     #[must_use]
     pub fn view(&self, view: ViewId) -> Option<&RepositoryView> {
         self.views.get(&view)
+    }
+
+    #[must_use]
+    pub fn change(&self, change: ChangeId) -> Option<&Change> {
+        self.changes.get(&change)
     }
 
     #[must_use]
@@ -179,6 +327,19 @@ impl Repository {
         self.current_applications.get(&change)
     }
 
+    pub fn view_for_change(
+        &mut self,
+        change: ChangeId,
+    ) -> Result<&RepositoryView, RepositoryError> {
+        if !self.current_revisions.contains_key(&change) {
+            return Err(RepositoryError::UnknownChange(change));
+        }
+        let mut closure = BTreeSet::new();
+        self.collect_ancestors(change, &mut closure)?;
+        let view = self.compose(&closure)?;
+        Ok(&self.views[&view.id])
+    }
+
     #[must_use]
     pub fn conflicted_application(&self, revision: RevisionId) -> Option<&Application> {
         let change = self.revisions.get(&revision)?.change_id;
@@ -237,6 +398,42 @@ impl Repository {
         transformation: Transformation,
     ) -> Result<(ChangeId, RevisionOutcome), RepositoryError> {
         let change = ChangeId::new();
+        let outcome = self.create_change_with_metadata(
+            change,
+            ChangeMetadata::default(),
+            dependencies,
+            RevisionMetadata::default(),
+            transformation,
+        )?;
+        Ok((change, outcome))
+    }
+
+    pub fn create_change_with_id(
+        &mut self,
+        change: ChangeId,
+        dependencies: impl IntoIterator<Item = ChangeId>,
+        transformation: Transformation,
+    ) -> Result<RevisionOutcome, RepositoryError> {
+        self.create_change_with_metadata(
+            change,
+            ChangeMetadata::default(),
+            dependencies,
+            RevisionMetadata::default(),
+            transformation,
+        )
+    }
+
+    pub fn create_change_with_metadata(
+        &mut self,
+        change: ChangeId,
+        change_metadata: ChangeMetadata,
+        dependencies: impl IntoIterator<Item = ChangeId>,
+        revision_metadata: RevisionMetadata,
+        transformation: Transformation,
+    ) -> Result<RevisionOutcome, RepositoryError> {
+        if self.current_revisions.contains_key(&change) {
+            return Err(RepositoryError::DuplicateChange(change));
+        }
         let dependencies = dependencies.into_iter().collect::<BTreeSet<_>>();
         for dependency in &dependencies {
             if !self.current_revisions.contains_key(dependency) {
@@ -245,9 +442,16 @@ impl Repository {
         }
 
         let before = self.clone();
+        self.changes.insert(
+            change,
+            Change {
+                id: change,
+                metadata: change_metadata,
+            },
+        );
         self.dependencies.add_change(change, dependencies);
-        match self.add_revision(change, None, transformation) {
-            Ok(outcome) => Ok((change, outcome)),
+        match self.add_revision(change, None, revision_metadata, transformation) {
+            Ok(outcome) => Ok(outcome),
             Err(error) => {
                 *self = before;
                 Err(error)
@@ -255,10 +459,37 @@ impl Repository {
         }
     }
 
+    pub fn import_changes(
+        &mut self,
+        changes: impl IntoIterator<Item = ChangeProposal>,
+    ) -> Result<BTreeMap<ChangeId, RevisionOutcome>, RepositoryError> {
+        let before = self.clone();
+        let result = self.import_changes_inner(changes);
+        if result.is_err() {
+            *self = before;
+        }
+        result
+    }
+
     pub fn revise_change(
         &mut self,
         change: ChangeId,
         predecessor: RevisionId,
+        transformation: Transformation,
+    ) -> Result<RevisionOutcome, RepositoryError> {
+        self.revise_change_with_metadata(
+            change,
+            predecessor,
+            RevisionMetadata::default(),
+            transformation,
+        )
+    }
+
+    pub fn revise_change_with_metadata(
+        &mut self,
+        change: ChangeId,
+        predecessor: RevisionId,
+        metadata: RevisionMetadata,
         transformation: Transformation,
     ) -> Result<RevisionOutcome, RepositoryError> {
         if self.current_revision(change) != Some(predecessor) {
@@ -268,7 +499,7 @@ impl Repository {
                 RepositoryError::UnknownChange(change)
             });
         }
-        self.add_revision(change, Some(predecessor), transformation)
+        self.add_revision(change, Some(predecessor), metadata, transformation)
     }
 
     pub fn resolve_conflict(
@@ -307,7 +538,12 @@ impl Repository {
 
         let target = self.views[&application.target_view].clone();
         let transformation = diff_trees(&target.tree, &resolution.resolved_tree);
-        self.add_revision(change, Some(resolution.conflict_revision), transformation)
+        self.add_revision(
+            change,
+            Some(resolution.conflict_revision),
+            RevisionMetadata::default(),
+            transformation,
+        )
     }
 
     pub fn publish(&mut self, expected: ViewId) -> Result<ViewId, RepositoryError> {
@@ -321,10 +557,117 @@ impl Repository {
         Ok(self.published_view)
     }
 
+    fn import_changes_inner(
+        &mut self,
+        changes: impl IntoIterator<Item = ChangeProposal>,
+    ) -> Result<BTreeMap<ChangeId, RevisionOutcome>, RepositoryError> {
+        let mut outcomes = BTreeMap::<ChangeId, RevisionOutcome>::new();
+        for proposal in changes {
+            if self.current_revisions.contains_key(&proposal.id) {
+                return Err(RepositoryError::DuplicateChange(proposal.id));
+            }
+            for dependency in &proposal.dependencies {
+                if !self.current_revisions.contains_key(dependency) {
+                    return Err(RepositoryError::UnknownDependency(*dependency));
+                }
+            }
+
+            let target = if proposal.dependencies.is_empty() {
+                self.views[&self.base_view].clone()
+            } else if proposal.dependencies.len() == 1 {
+                let dependency = proposal.dependencies.first().expect("length checked");
+                if let Some(outcome) = outcomes.get(dependency) {
+                    self.views[&outcome.resulting_view].clone()
+                } else {
+                    let mut closure = BTreeSet::new();
+                    self.collect_ancestors(*dependency, &mut closure)?;
+                    self.compose(&closure)?
+                }
+            } else {
+                let mut closure = BTreeSet::new();
+                for dependency in &proposal.dependencies {
+                    self.collect_ancestors(*dependency, &mut closure)?;
+                }
+                self.compose(&closure)?
+            };
+            let result = apply_transformation(&target.tree, target.id, &proposal.transformation);
+            let ApplicationResult::Clean { tree } = &result else {
+                return Err(RepositoryError::InvalidTransformation);
+            };
+            let mut revision = ChangeRevision {
+                id: RevisionId::from_digest([0; 32]),
+                change_id: proposal.id,
+                metadata: proposal.revision_metadata,
+                predecessor: None,
+                dependencies: proposal.dependencies.clone(),
+                authored_against: target.id,
+                transformation: proposal.transformation,
+                resulting_tree: tree.clone(),
+            };
+            revision.id = RevisionId::of_canonical_bytes(&revision.canonical_bytes());
+            let application = Application::new(revision.id, target.id, result);
+            let mut frontier = target.frontier.clone();
+            frontier.insert(proposal.id, revision.id);
+            let mut applications = target.applications.clone();
+            applications.insert(proposal.id, application.id);
+            let mut conflicts = target.unresolved_conflicts.clone();
+            if let ApplicationResult::Conflicted { conflict, .. } = &application.result {
+                conflicts.insert(conflict.id);
+            }
+            let view = RepositoryView::from_manifest(
+                application.result.materialized_tree().clone(),
+                frontier,
+                applications,
+                conflicts,
+            );
+
+            self.changes.insert(
+                proposal.id,
+                Change {
+                    id: proposal.id,
+                    metadata: proposal.metadata,
+                },
+            );
+            self.dependencies
+                .add_change(proposal.id, proposal.dependencies);
+            self.revisions.insert(revision.id, revision.clone());
+            self.current_revisions.insert(proposal.id, revision.id);
+            self.applications
+                .insert(application.id, application.clone());
+            self.current_applications.insert(proposal.id, application);
+            self.views.insert(view.id, view.clone());
+            self.working_view = view.id;
+            outcomes.insert(
+                proposal.id,
+                RevisionOutcome {
+                    revision_id: revision.id,
+                    resulting_view: view.id,
+                    reapplied: Vec::new(),
+                },
+            );
+        }
+
+        let all = self
+            .current_revisions
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let working = self.compose(&all)?;
+        self.working_view = working.id;
+        self.current_applications = working
+            .applications
+            .iter()
+            .map(|(change, application)| (*change, self.applications[application].clone()))
+            .collect();
+        self.validate()?;
+        Ok(outcomes)
+    }
+
     fn add_revision(
         &mut self,
         change: ChangeId,
         predecessor: Option<RevisionId>,
+        metadata: RevisionMetadata,
         transformation: Transformation,
     ) -> Result<RevisionOutcome, RepositoryError> {
         let target = self.dependency_view(change)?;
@@ -335,18 +678,24 @@ impl Repository {
         else {
             return Err(RepositoryError::InvalidTransformation);
         };
-        let revision_id = RevisionId::new();
-        self.revisions.insert(
-            revision_id,
-            ChangeRevision {
-                id: revision_id,
-                change_id: change,
-                predecessor,
-                authored_against: target.id,
-                transformation,
-                resulting_tree: authored_tree.clone(),
-            },
-        );
+        let dependencies = self
+            .dependencies
+            .parents(change)
+            .cloned()
+            .ok_or(RepositoryError::UnknownChange(change))?;
+        let mut revision = ChangeRevision {
+            id: RevisionId::from_digest([0; 32]),
+            change_id: change,
+            metadata,
+            predecessor,
+            dependencies,
+            authored_against: target.id,
+            transformation,
+            resulting_tree: authored_tree.clone(),
+        };
+        let revision_id = RevisionId::of_canonical_bytes(&crate::wire::revision_bytes(&revision));
+        revision.id = revision_id;
+        self.revisions.insert(revision_id, revision);
         self.current_revisions.insert(change, revision_id);
 
         let reapplied = self
@@ -498,6 +847,25 @@ impl Repository {
         }
         debug_assert_eq!(ordered.len(), selected.len(), "dependency graph is acyclic");
         ordered
+    }
+}
+
+fn insert_tree_object(objects: &mut BTreeMap<ObjectId, Vec<u8>>, tree: &Tree) {
+    for (id, bytes) in crate::wire::tree_objects(tree) {
+        insert_canonical_object(objects, id.into(), bytes);
+    }
+}
+
+fn insert_canonical_object(
+    objects: &mut BTreeMap<ObjectId, Vec<u8>>,
+    id: ObjectId,
+    bytes: Vec<u8>,
+) {
+    if let Some(existing) = objects.insert(id, bytes.clone()) {
+        assert_eq!(
+            existing, bytes,
+            "one object ID must name exactly one byte string"
+        );
     }
 }
 

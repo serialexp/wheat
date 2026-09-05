@@ -68,6 +68,13 @@ described here.
   identities of change, revision, dependency, conflict, operation,
   publication, workspace, and Git projection before choosing an on-disk or
   wire encoding.
+- [ ] **Decision gate — lock the native schema.** Until this box is checked,
+  every Wheat schema version is experimental: change `V1` types and tags in
+  place, regenerate code and fixtures, and discard prototype repositories
+  rather than carrying migrations or compatibility code. Checking this box
+  declares existing encodings persistent compatibility contracts; from that
+  point onward, incompatible changes receive new version tags and the evolution
+  rules below apply.
 - [ ] **Decision gate — compatibility contract.** Decide what must round-trip
   through ordinary Git, what may be a lossy projection, and whether
   `git-remote-gothab` initially delegates to Git or materializes Git objects
@@ -96,9 +103,30 @@ described here.
   of the repository's fenced target-advance operation, while allowing other
   targets to publish conflicted views; the forge presents and administers these
   policies but is not their sole enforcement boundary.
+- [ ] **Phase 2 — immutable-object and publication-store interfaces.** Keep
+  content-addressed reads/writes independent from the tiny mutable repository
+  head. Portable async traits, local loose-object/locked-head implementations,
+  and an Apache `object_store` adapter qualified against in-memory storage and
+  SeaweedFS now exist; Gothab/ObjectRouter, PostgreSQL, and journal/checkpoint
+  adapters remain to be built according to their actual durability and fencing
+  guarantees.
+- [~] **Phase 2 — persistent Merkle collections.** Canonical directory nodes,
+  validated typed decoding, copy-on-write path edits, structural sharing, and
+  loose/generic-object-store reopen coverage now exist. Replace whole-view maps and
+  flat trees with immutable directory, revision-map, application-map, conflict-
+  index, and content-manifest nodes so a small mutation rewrites bounded paths.
+- [ ] **Phase 2 — indexed sealed segments and ranged reads.** Qualify loose
+  objects plus immutable footer-indexed segments with a tiny identification
+  prefix, paged sorted index, one-range tail directory, range coalescing, and
+  integrity checks.
+- [ ] **Phase 2 — conservative loose-object collection.** Never collect an
+  unreachable loose object less than 24 hours after its backend modification
+  time; verify the proposed closure immediately before publication and initially
+  leave sealed-segment deletion disabled.
 - [ ] **Phase 2 — physical store qualification.** Benchmark and refine object
-  encoding, indexes, manifests, deltas, sharding, replication, compaction, and
-  garbage collection against deep stacks and wide agent fan-out.
+  encoding, index fan-out, segment sizing, deltas, sharding, replication,
+  compaction, caching, and garbage collection against deep stacks and wide agent
+  fan-out on local files and real object-storage range requests.
 - [ ] **Phase 2 — native protocol and remote CLI.** Specify a resumable,
   versioned client/server protocol and run the same workflow corpus through the
   reference CLI against an ephemeral repository daemon.
@@ -309,6 +337,14 @@ bytes, locator-based placement, ownership manifests, repository routing,
 fencing, publication receipts, and snapshots. Reuse is an implementation
 question, not a requirement that the new graph retain Git object semantics.
 
+The persistent repository must not become one serialized `Repository` value.
+That struct is a reference model and algorithm harness. Physical state separates
+immutable content-addressed objects from a tiny mutable repository head, and
+large logical collections use persistent nodes so updating one path or change
+reuses all unaffected structure. Loose objects are the write path; indexed sealed
+segments are a transparent compacted representation for efficient object-store
+storage and ranged reads.
+
 ### 3. Protocols and projections
 
 A native protocol should transfer and publish the logical model efficiently,
@@ -472,9 +508,27 @@ encodings. Immutable tree, change, revision, application, conflict, view, and
 content-manifest objects each begin with a two-byte `(object kind, encoding
 version)` tag and are hashed over their complete canonical encoded bytes. Native
 content references carry an algorithm tag; all map/set-shaped arrays must be
-sorted and unique before encoding and are validated by `wheat-core`. Incompatible
-future encodings receive a new object/version tag, so existing bytes and IDs do
-not change in place.
+sorted and unique before encoding and are validated by `wheat-core`.
+
+The schema is currently experimental. Until the **lock the native schema**
+decision gate is checked, `V1` names and tags identify the current prototype
+shape, not a compatibility promise: they may be changed in place, generated code
+and fixtures may be replaced, and prototype repositories may be discarded. Do
+not introduce `V2`, readers for obsolete layouts, or migrations merely because a
+prototype `V1` changed. Once the schema is deliberately locked, incompatible
+future encodings receive new object/version tags so persisted bytes and IDs do
+not change in place; old readers and objects are retained according to the
+compatibility and migration policy selected at that gate.
+
+The prototype identity split is now explicit: `ChangeId` remains UUIDv7 because
+it names stable collaboration identity across mutable intent, while `RevisionId`,
+`TreeId`, `ApplicationId`, `ConflictId`, `ViewId`, and `ContentManifestId` are
+BLAKE3-256 addresses of complete canonical object encodings. A revision therefore
+does not encode its own ID. `ContentId` remains an algorithm-tagged digest of raw
+file bytes. The checked-in generated Rust and its runtime are reproducible with
+`scripts/wheat-gen-schema`, which refuses code generation from any BinSchema
+checkout other than the recorded generator revision; handwritten delimiter
+hashing is no longer used by Wheat model constructors.
 
 The schema exposed a BinSchema Rust generator defect: a discriminated-union
 variant containing nested structs emitted `ctx.extend_with_parent(...)` inside a
@@ -497,8 +551,9 @@ wheat-core
   no gix, PostgreSQL, S3, Axum, gitd, or existing PR-model dependency
 
 wheat-store
-  native persistent repository and content-manifest format
-  depends on wheat-core
+  immutable-object and publication-store traits, persistent collections,
+  local loose-object/segment implementation, and content-manifest format
+  depends on wheat-core; no Gothab database or object-router dependency
 
 wheat-protocol
   versioned native wire types and workflow-level operations
@@ -514,7 +569,7 @@ wheat-cli
 
 wheat-git
   Git import/export/projection compatibility boundary
-  depends on wheat-core and gix
+  depends on wheat-core, wheat-store, and gix; Git types do not cross into core
 
 gothab-gitd (or successor repository daemon)
   native protocol host plus Git compatibility service
@@ -659,7 +714,267 @@ content is reclaimable:
 This makes sharing, deduplication, and safe retention indelible properties of
 the format instead of a separate post-receive repair effort.
 
+### Object-store-native physical layout
+
+The in-memory `Repository` is an executable model, not the persistent storage
+unit. Wheat separates two backend capabilities:
+
+```text
+ImmutableObjectStore
+  put_if_absent(ObjectId, canonical bytes)
+  get(ObjectId)
+  exists_many(ObjectId[])
+  optional ranged reads and batch reads
+
+PublicationStore
+  read repository head
+  compare-and-advance(expected generation/state, proposed generation/state)
+```
+
+The immutable store holds directory/tree nodes, revisions, transformations,
+applications, conflicts, views, content manifests, publication records, and
+immutable index segments. Raw file content uses its separately algorithm-tagged
+`ContentId` namespace and may share the same backend without being decoded as a
+`WheatObject`. The publication store owns only tiny mutable roots. Deployments
+may combine them differently:
+
+| Deployment | Immutable objects | Mutable publication head |
+|---|---|---|
+| Local CLI | Filesystem | Locked local pointer file |
+| Gothab | `ObjectRouter` over configured backends | PostgreSQL CAS |
+| Single-writer daemon | Local cache plus S3/R2 | Memory plus durable journal and checkpoints |
+| Object-store-only | Object storage | Conditional ETag/version CAS, only where semantics are strong enough |
+
+The first remote immutable adapter targets Apache Arrow's generic Rust
+`object_store` interface rather than Gothab storage types. Its S3 configuration
+accepts endpoint URL, bucket, region, access key, secret, and key prefix, and uses
+conditional create rather than overwrite for immutable objects. One shared
+conformance corpus runs against the adapter's in-memory backend and a pinned,
+throwaway SeaweedFS S3 service; the latter also publishes a complete repository
+closure before advancing a separate local publication head. This is the intended
+early abstraction test: S3-compatible backend behavior is qualified before
+adding `ObjectRouter`, locator rows, or PostgreSQL. Provider adapters must still
+verify Wheat's BLAKE3 canonical identity on reads because backend checksums are
+transport evidence, not native object identity.
+
+`scripts/wheat-object-store-bench` runs the same adapter against memory and the
+pinned SeaweedFS service and emits a JSON report under `target/`. It measures
+cold conditional creation, idempotent duplicate publication, verified reads, and
+`exists_many` for both many tiny revision objects and fewer larger tree objects,
+with configurable object counts, tree width, batch size, and concurrency. This is
+an exploratory comparison rather than a performance gate: localhost SeaweedFS is
+not production S3 latency, and results are expected to change as batching and
+segments replace per-object requests. The first run already exposes the intended
+architectural pressure: small remote objects are dominated by request/setup
+latency, while larger payload throughput is much closer to memory; the current
+`exists_many` implementation performs one HEAD per ID and therefore needs true
+concurrency or a backend-specific batch strategy before large closures.
+
+A memory-backed publication store must declare its durability. Periodic
+checkpoints alone are process-local or asynchronously durable: a crash can lose
+an acknowledged advance. A durable configuration appends and flushes a small
+fenced target-advance record before acknowledgement, updates memory, and later
+compacts the journal into an immutable checkpoint. Recovery loads the newest
+checkpoint and replays later records. Multiple writers additionally require an
+ownership epoch or another fencing mechanism; routing to one repository owner is
+an optimization, not correctness by itself.
+
+Repository publication can reduce multi-target state to one mutable CAS value:
+
+```text
+RepositoryHead { generation, repository_state_id }
+    -> immutable RepositoryState
+         -> target-map root
+         -> policy-map root
+         -> previous state/publication
+```
+
+All immutable objects are written and verified before `RepositoryHead` advances.
+The first local `PublicationStore` uses an advisory file lock, an exact
+`RepositoryHead { generation, repository_state_id }` comparison, a fixed
+versioned head encoding, and temp-write/fsync/rename/directory-fsync publication.
+Concurrent publishers therefore have one winner, stale and skipped generations
+fail without changing the head, and reopening observes either a complete old or
+complete new head.
+
+`RepositoryStateV1` and deterministic closure construction now retain every
+observable view, revision, and application plus their trees, conflicts, and
+per-view manifests. The state also references an aggregate content manifest that
+covers visible and historical trees, revision edit terms, and conflict terms.
+The local publisher writes and verifies the complete immutable closure and every
+required raw-content object before initializing or advancing the head. Missing or
+corrupt content leaves the head unchanged; a stale CAS leaves only harmless,
+retryable immutable objects. The local CLI does not use this head yet because
+canonical object-to-domain decoding and executable repository reconstruction
+remain to be implemented; it still persists the executable model as disposable
+YAML in parallel.
+
+A failed or partial upload stays unreachable; retrying writes the same bytes under
+the same ID. Bucket names, storage backend IDs, segment offsets, and locator rows
+never participate in logical object identity.
+
+#### Persistent trees and maps
+
+A view should remain small even when the repository is large:
+
+```text
+ViewV1 {
+  tree: TreeId,
+  revisions: RevisionMapId,
+  applications: ApplicationMapId,
+  unresolved_conflicts: ConflictIndexId,
+  required_content: ContentManifestId,
+}
+```
+
+Each root names an immutable Merkle collection. Trees are directory nodes (with
+deterministic shards for exceptionally wide directories), so changing
+`src/auth.rs` writes the content, its containing directory path, and a new root
+while reusing every unaffected subtree. Revision selections, application
+selections, conflict indexes, and content manifests likewise use explicit
+persistent node types rather than whole arrays in every view. A one-entry update
+therefore rewrites bounded paths and old views continue sharing unchanged nodes.
+A qualification import of `terraform-provider-aws` makes this requirement
+concrete: its 134,273-commit `main` graph is discovered in about 0.75 seconds,
+but the current flat-tree importer reaches a 16 GiB safety limit during tree
+preparation after roughly 43 seconds. It cannot safely retain one complete flat
+tree and frontier per historical commit; persistent nodes and streaming
+publication are prerequisites for imports at that scale.
+
+These collection types should be explicit in BinSchema—`RevisionMapNodeV1`,
+`ApplicationMapNodeV1`, `ConflictIndexNodeV1`, `ContentManifestNodeV1`, and
+`DirectoryNodeV1`—rather than one universal generic map whose evolution couples
+unrelated domains. The first disk-backed slice now implements canonical directory
+nodes under the unlocked tree V1 tag, a validated domain-level decoder, and an
+async `MerkleTreeStore` over the generic immutable-object boundary. Path edits
+rewrite only touched ancestor directories, prune empty directories, and preserve
+unaffected subtree IDs; conformance runs against both the loose filesystem and
+Apache in-memory adapters. A typed fixed-depth byte-radix revision map now also
+provides bounded-fanout, copy-on-write selection updates through the generic
+immutable store, including reopen, replacement, deletion, idempotency, and
+unaffected-branch sharing tests. The hydrated reference `Repository` currently
+adapts flat trees into directory nodes when producing a closure, while the
+application/conflict/content collection families and conversion of persisted
+views and the Git importer to root handles remain next.
+Derived indexes such as reverse dependencies or path-to-
+conflict lookup may be immutable rebuildable segments; they accelerate queries
+but never become repository truth.
+
+#### Loose objects and indexed sealed segments
+
+One backend key per tiny object is a correct baseline but inefficient at scale.
+Wheat therefore allows the same logical object to be stored loose or in an
+immutable sealed segment. Location is physical metadata:
+
+```text
+ObjectLocation {
+  segment_id,
+  offset,
+  stored_length,
+  logical_length,
+  codec,
+}
+```
+
+`ObjectId` remains the hash of the canonical BinSchema bytes; compaction,
+replication, and movement between loose storage, local NVMe, S3, and R2 do not
+change it. Large content normally remains a standalone object, while small
+metadata and content below a measured threshold are segment candidates.
+
+A sealed segment is footer-indexed. A tiny fixed prefix may identify the file as
+a Wheat segment, but contains no offsets and never needs backpatching. Object
+payloads are written first, followed by paged sorted indexes, a compact page
+directory/fan-out structure, and a fixed-size authoritative footer:
+
+```text
+[tiny identification prefix: magic, format family]
+[object payloads]
+[paged ObjectId -> kind, offset, stored/logical length, codec index]
+[compact index-page directory, fan-out, and optional Bloom metadata]
+[fixed footer]
+  magic, version, segment length, segment ID, object count
+  index/directory offsets and lengths, payload/index digests
+```
+
+This permits natural one-pass construction: stream payloads while recording
+locations, emit the index and directory, then append the footer. A valid footer is
+the segment's completion marker; a truncated upload is not a sealed segment. The
+first implementation may still stage to a local file before one immutable upload,
+but its format does not require backpatching and can later map to multipart object
+storage without changing logical objects.
+
+The physical segment descriptor records its stored length, so a reader can issue
+one suffix range request without a preliminary HEAD. The normal tail fetch
+(roughly 16–64 KiB, qualified by measurement) should contain the footer and the
+complete top-level page directory. A cold lookup then range-reads the relevant
+index page and object; cached directories/pages reduce later lookups to the object
+range alone, and nearby payload ranges may be coalesced. Very large indexes are
+never required in full.
+
+`wheat-store` owns range planning behind a small reader capability implemented by
+local `pread`, in-memory slices, S3/R2 range requests, or Gothab's existing
+`ObjectStore::get_range_stream`. BinSchema defines segment headers, index pages,
+records, and footers, but generated domain objects do not know their physical
+location. Segment sealing is:
+
+1. encode canonical objects and determine IDs;
+2. lay out payloads and index pages, then calculate the segment digest;
+3. upload and verify the complete immutable segment;
+4. publish an immutable segment catalog referencing it;
+5. advance the repository state/head with CAS;
+6. reclaim superseded loose objects or segments only after retention permits it.
+
+The segment catalog itself is immutable and can use fan-out metadata and Bloom
+filters to skip irrelevant segments. Plain minimum/maximum ranges do not prune
+publication-grouped segments of uniformly distributed cryptographic IDs; range
+partitioning is useful only if a later compaction level intentionally creates
+non-overlapping key ranges. Lookup checks recent loose objects and active segments
+through the catalog. Compaction publishes a new physical catalog without changing
+logical object or view identity; catalog roots remain directly addressable so
+locating them never requires the catalog being located. Sealed-segment deletion
+remains disabled until old-catalog retention, reader retry, snapshot, replication,
+and lease semantics are implemented.
+
+Loose unpublished objects use a simpler initial safety rule: an unreachable
+object is ineligible for collection until at least 24 hours after the storage
+backend's `last_modified` time. Missing or untrustworthy timestamps fail closed by
+retaining the object. Publication verifies every newly required object immediately
+before its fenced head advance; a preparation older than the grace interval must
+re-upload anything missing. Explicit in-flight pins can be added later for
+long-running workspaces, but are not required for the first collector. This
+matches Gothab's existing age-aware `list_prefix_with_meta` capability and ensures
+a concurrent reachability scan cannot delete freshly uploaded publication input.
+
 ### Git compatibility and repository daemon
+
+The first importer is intentionally asymmetric and deterministic. Every reachable
+Git commit becomes one synthetic Wheat change and one immutable revision. Root
+commits apply to the empty view; non-root commits use only their first parent as
+the semantic Wheat dependency and encode the exact first-parent-tree-to-commit-
+tree transformation. Additional merge parents remain ordered import provenance,
+so the imported merge result stays clean without pretending Git preserved its
+conflict-resolution process. Local branch names map to separately composed Wheat
+views; shared commits and content deduplicate across those views.
+
+Canonical change metadata includes title, description, creator, creation time,
+and optional foreign provenance. Revision metadata includes the full message,
+author and committer identities/timestamps, and provenance with the source object
+ID and ordered parent IDs. Git imports populate both. This prototype currently
+requires UTF-8 metadata and paths, preserves regular/executable/symlink bytes but
+not their modes, and rejects submodules until native tree entries model kind and
+mode. Imported change IDs are deterministic UUIDv5 values namespaced by Git
+commit identity, while Git OIDs remain provenance rather than native authority.
+The importer caches Git trees and blobs by object ID, stages its topologically
+ordered changes through the repository bulk-import API, and materializes each
+commit view once. Content is hashed and deduplicated during traversal, then
+published through bounded parallel durable writes rather than serially waiting
+for one fsync per blob. Interactive edits retain the conservative clone-and-
+rebuild path needed for atomic single-change mutation; imports do not replay the
+entire accumulated history after every commit. As a qualification point,
+importing the 238 reachable commits and 2,239 unique content objects in the local
+BinSchema repository completes in roughly two seconds on the development
+machine (plus roughly 0.6 seconds to enumerate and encode its complete canonical
+closure).
 
 `wheat-git` owns the complete impedance mismatch:
 
@@ -792,6 +1107,19 @@ of that pattern.
   change identity must not merely rename a hash of mutable projected content.
 - **Design bounded work.** Normal publication should scale with the logical
   delta, not repeatedly traverse or rewrite the complete repository.
+- **Keep immutable storage separate from publication coordination.** Do not make
+  S3 pretend to be PostgreSQL or make PostgreSQL carry the repository object
+  graph; adapters expose their real CAS, fencing, and durability contracts.
+- **Keep physical packaging out of identity.** Loose versus segmented placement,
+  compression, range offsets, replicas, and backend locations may change without
+  changing any logical `ObjectId` or `ViewId`.
+- **Make range lookup first-class but optional.** A backend lacking ranged reads
+  remains correct through whole-object access; capable backends may use segment
+  footers and paged indexes without changing repository semantics. Do not create
+  segments so large that whole-object fallback is operationally unsafe.
+- **Fail closed during collection.** Fresh loose objects get a minimum 24-hour
+  grace period based on backend time, and ambiguous reachability, timestamps, or
+  reader/catalog retention keeps data rather than deleting it.
 - **Assume many parallel agents.** Ordering, causality, conflict, quotas, and
   provenance must be explicit rather than inferred from one developer's branch
   discipline.

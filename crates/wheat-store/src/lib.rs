@@ -7,10 +7,38 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    thread,
 };
 
 use thiserror::Error;
 use wheat_core::ContentId;
+
+mod application_map;
+mod loose;
+mod merkle_tree;
+mod object_store_adapter;
+mod publication;
+mod radix;
+mod repository_publication;
+mod revision_map;
+mod sets;
+
+pub use application_map::{ApplicationMapCursor, ApplicationMapError, ApplicationMapStore};
+pub use loose::{
+    ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
+};
+pub use merkle_tree::{MerkleTreeError, MerkleTreeStore, TreeEdit};
+pub use object_store_adapter::{
+    ObjectStoreAdapter, ObjectStoreAdapterBuildError, S3ObjectStoreConfig,
+};
+pub use publication::{LocalPublicationStore, PublicationError, PublicationStore, RepositoryHead};
+pub use repository_publication::{RepositoryPublicationError, RepositoryPublisher};
+pub use revision_map::{RevisionMapCursor, RevisionMapError, RevisionMapStore};
+pub use sets::{
+    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetStore,
+    RetainedSetCursor, RetainedSetStore,
+};
 
 #[derive(Debug, Error)]
 pub enum ContentStoreError {
@@ -38,10 +66,78 @@ impl ContentStore {
 
     pub fn put(&self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
         let id = ContentId::of(bytes);
+        self.put_with_id(id, bytes)?;
+        Ok(id)
+    }
+
+    /// Retains already-addressed content with bounded parallel durability work.
+    /// Every claimed ID is verified before publication.
+    pub fn put_many(
+        &self,
+        contents: impl IntoIterator<Item = (ContentId, Vec<u8>)>,
+        concurrency: usize,
+    ) -> Result<(), ContentStoreError> {
+        let mut deduplicated = std::collections::BTreeMap::new();
+        for (id, bytes) in contents {
+            let actual = ContentId::of(&bytes);
+            if actual != id {
+                return Err(ContentStoreError::Corrupt {
+                    expected: id,
+                    actual,
+                });
+            }
+            if let Some(previous) = deduplicated.insert(id, bytes.clone())
+                && previous != bytes
+            {
+                return Err(ContentStoreError::Corrupt {
+                    expected: id,
+                    actual: ContentId::of(&bytes),
+                });
+            }
+        }
+        if deduplicated.is_empty() {
+            return Ok(());
+        }
+        let workers = concurrency.max(1).min(deduplicated.len());
+        let (sender, receiver) = mpsc::channel();
+        for content in deduplicated {
+            sender.send(content).expect("receiver remains alive");
+        }
+        drop(sender);
+        let receiver = Arc::new(Mutex::new(receiver));
+        thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|_| {
+                    let receiver = Arc::clone(&receiver);
+                    scope.spawn(move || -> Result<(), ContentStoreError> {
+                        loop {
+                            let next = receiver.lock().expect("worker mutex poisoned").recv();
+                            let Ok((id, bytes)) = next else {
+                                return Ok(());
+                            };
+                            self.put_with_id(id, &bytes)?;
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().expect("content worker panicked")?;
+            }
+            Ok(())
+        })
+    }
+
+    fn put_with_id(&self, id: ContentId, bytes: &[u8]) -> Result<(), ContentStoreError> {
+        if ContentId::of(bytes) != id {
+            return Err(ContentStoreError::Corrupt {
+                expected: id,
+                actual: ContentId::of(bytes),
+            });
+        }
         let path = self.path(id);
         if path.exists() {
             self.verify_existing(id, bytes)?;
-            return Ok(id);
+            return Ok(());
         }
 
         let parent = path.parent().expect("content path has parent");
@@ -65,8 +161,7 @@ impl ContentStore {
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result?;
-        Ok(id)
+        result
     }
 
     pub fn get(&self, id: ContentId) -> Result<Vec<u8>, ContentStoreError> {

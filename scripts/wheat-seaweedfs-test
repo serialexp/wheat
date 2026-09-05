@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Run Wheat's generic object_store conformance test against throwaway SeaweedFS.
+set -euo pipefail
+
+SEAWEED_IMAGE="${SEAWEED_IMAGE:-chrislusf/seaweedfs:4.42@sha256:f7cbc8bdbbf60a1aaba7d61784a3bdff3ec1e0657f6ad0b26d5b6ab2cd9d0dc6}"
+CONTAINER="wheat-seaweedfs-test-$$"
+CONFIG="$(pwd)/docker/seaweedfs/s3.json"
+
+cleanup() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "run this script from the repository root" >&2
+  exit 2
+fi
+
+docker run -d --rm --name "$CONTAINER" \
+  -p 127.0.0.1::8333 \
+  -v "$CONFIG:/etc/seaweedfs/s3.json:ro" \
+  "$SEAWEED_IMAGE" \
+  server -s3 -s3.config=/etc/seaweedfs/s3.json -dir=/data >/dev/null
+
+PORT="$(docker port "$CONTAINER" 8333/tcp | awk -F: '{print $NF}')"
+READY=false
+for _ in $(seq 1 120); do
+  if curl -s -o /dev/null "http://127.0.0.1:${PORT}/"; then
+    READY=true
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$READY" != true ]]; then
+  echo "SeaweedFS did not become ready" >&2
+  docker logs "$CONTAINER" >&2 || true
+  exit 1
+fi
+
+WHEAT_TEST_S3_ENDPOINT="http://127.0.0.1:${PORT}" \
+WHEAT_TEST_S3_BUCKET="wheat-test" \
+WHEAT_TEST_S3_REGION="us-east-1" \
+WHEAT_TEST_S3_ACCESS_KEY_ID="scrydevaccesskey" \
+WHEAT_TEST_S3_SECRET_ACCESS_KEY="scrydevsecretkey0000000000000000" \
+cargo test -p wheat-store --test object_store_adapter \
+  configured_s3_backend -- --ignored --nocapture

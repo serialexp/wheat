@@ -1,0 +1,17 @@
+[package]
+name = "wheat-git"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+gix = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+wheat-core = { path = "../wheat-core" }
+wheat-store = { path = "../wheat-store" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

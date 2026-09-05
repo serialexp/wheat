@@ -2,9 +2,100 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplicationId, ChangeId, ConflictId, ContentId, RevisionId, ViewId};
+use crate::{
+    ApplicationId, ChangeId, ConflictId, ContentId, ContentManifestId, RevisionId, ViewId,
+};
 
 pub type Tree = BTreeMap<String, ContentId>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectoryEntry {
+    File(ContentId),
+    Directory(crate::TreeId),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DirectoryNode {
+    pub entries: BTreeMap<String, DirectoryEntry>,
+}
+
+impl DirectoryNode {
+    pub fn new(
+        entries: impl IntoIterator<Item = (String, DirectoryEntry)>,
+    ) -> Result<Self, crate::CanonicalObjectError> {
+        let mut node = Self::default();
+        for (name, entry) in entries {
+            crate::validate_directory_component(&name)?;
+            if node.entries.insert(name, entry).is_some() {
+                return Err(crate::CanonicalObjectError::InvalidCollection(
+                    "duplicate directory entry",
+                ));
+            }
+        }
+        Ok(node)
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::directory_node_bytes(self)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> crate::TreeId {
+        crate::TreeId::of_canonical_bytes(&self.canonical_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Actor {
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Timestamp {
+    pub seconds: i64,
+    pub offset_minutes: i16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceProvenance {
+    pub system: String,
+    pub object_id: Vec<u8>,
+    pub parent_object_ids: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeMetadata {
+    pub title: String,
+    pub description: String,
+    pub creator: Actor,
+    pub created_at: Timestamp,
+    pub provenance: Option<SourceProvenance>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevisionMetadata {
+    pub message: String,
+    pub author: Actor,
+    pub authored_at: Timestamp,
+    pub committer: Actor,
+    pub committed_at: Timestamp,
+    pub provenance: Option<SourceProvenance>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Change {
+    pub id: ChangeId,
+    pub metadata: ChangeMetadata,
+}
+
+impl Change {
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::change_bytes(self)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileEdit {
@@ -20,12 +111,101 @@ pub struct Transformation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChangeRevision {
-    pub id: RevisionId,
-    pub change_id: ChangeId,
-    pub predecessor: Option<RevisionId>,
-    pub authored_against: ViewId,
-    pub transformation: Transformation,
-    pub resulting_tree: Tree,
+    pub(crate) id: RevisionId,
+    pub(crate) change_id: ChangeId,
+    pub(crate) metadata: RevisionMetadata,
+    pub(crate) predecessor: Option<RevisionId>,
+    pub(crate) dependencies: BTreeSet<ChangeId>,
+    pub(crate) authored_against: ViewId,
+    pub(crate) transformation: Transformation,
+    pub(crate) resulting_tree: Tree,
+}
+
+impl ChangeRevision {
+    #[must_use]
+    pub fn id(&self) -> RevisionId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn change_id(&self) -> ChangeId {
+        self.change_id
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &RevisionMetadata {
+        &self.metadata
+    }
+
+    #[must_use]
+    pub fn predecessor(&self) -> Option<RevisionId> {
+        self.predecessor
+    }
+
+    #[must_use]
+    pub fn dependencies(&self) -> &BTreeSet<ChangeId> {
+        &self.dependencies
+    }
+
+    #[must_use]
+    pub fn authored_against(&self) -> ViewId {
+        self.authored_against
+    }
+
+    #[must_use]
+    pub fn transformation(&self) -> &Transformation {
+        &self.transformation
+    }
+
+    #[must_use]
+    pub fn resulting_tree(&self) -> &Tree {
+        &self.resulting_tree
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::revision_bytes(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevisionMapChild {
+    pub edge: u8,
+    pub child: crate::RevisionMapId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevisionMapNode {
+    pub depth: u8,
+    pub value: Option<RevisionId>,
+    pub children: Vec<RevisionMapChild>,
+}
+
+impl RevisionMapNode {
+    pub fn new(
+        depth: u8,
+        value: Option<RevisionId>,
+        mut children: Vec<RevisionMapChild>,
+    ) -> Result<Self, crate::CanonicalObjectError> {
+        children.sort_by_key(|child| child.edge);
+        let node = Self {
+            depth,
+            value,
+            children,
+        };
+        crate::wire::validate_revision_map_node(&node)?;
+        Ok(node)
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::revision_map_node_bytes(self)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> crate::RevisionMapId {
+        crate::RevisionMapId::of_canonical_bytes(&self.canonical_bytes())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -45,24 +225,24 @@ pub struct Conflict {
 
 impl Conflict {
     #[must_use]
-    pub fn new(base_view: ViewId, paths: Vec<PathConflict>) -> Self {
-        let mut canonical = b"wheat-conflict-v1\0".to_vec();
-        canonical.extend_from_slice(base_view.to_string().as_bytes());
-        for path in &paths {
-            canonical.push(0xff);
-            canonical.extend_from_slice(path.path.as_bytes());
-            for term in [path.expected, path.actual, path.proposed] {
-                canonical.push(0);
-                if let Some(content) = term {
-                    canonical.extend_from_slice(content.to_string().as_bytes());
-                }
-            }
-        }
-        Self {
-            id: ConflictId::of_canonical_bytes(&canonical),
+    pub fn new(base_view: ViewId, mut paths: Vec<PathConflict>) -> Self {
+        paths.sort_by(|left, right| left.path.cmp(&right.path));
+        assert!(
+            paths.windows(2).all(|paths| paths[0].path != paths[1].path),
+            "a conflict may contain only one entry per path"
+        );
+        let mut conflict = Self {
+            id: ConflictId::from_digest([0; 32]),
             base_view,
             paths,
-        }
+        };
+        conflict.id = ConflictId::of_canonical_bytes(&crate::wire::conflict_bytes(&conflict));
+        conflict
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::conflict_bytes(self)
     }
 }
 
@@ -98,31 +278,20 @@ pub struct Application {
 impl Application {
     #[must_use]
     pub fn new(revision_id: RevisionId, target_view: ViewId, result: ApplicationResult) -> Self {
-        let mut canonical = b"wheat-application-v1\0".to_vec();
-        canonical.extend_from_slice(revision_id.to_string().as_bytes());
-        canonical.push(0);
-        canonical.extend_from_slice(target_view.to_string().as_bytes());
-        canonical.push(0);
-        match &result {
-            ApplicationResult::Clean { tree } => {
-                canonical.push(0);
-                append_tree(&mut canonical, tree);
-            }
-            ApplicationResult::Conflicted {
-                partial_tree,
-                conflict,
-            } => {
-                canonical.push(1);
-                append_tree(&mut canonical, partial_tree);
-                canonical.extend_from_slice(conflict.id.to_string().as_bytes());
-            }
-        }
-        Self {
-            id: ApplicationId::of_canonical_bytes(&canonical),
+        let mut application = Self {
+            id: ApplicationId::from_digest([0; 32]),
             revision_id,
             target_view,
             result,
-        }
+        };
+        application.id =
+            ApplicationId::of_canonical_bytes(&crate::wire::application_bytes(&application));
+        application
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::application_bytes(self)
     }
 }
 
@@ -172,46 +341,55 @@ impl RepositoryView {
         unresolved_conflicts: BTreeSet<ConflictId>,
     ) -> Self {
         let required_content = tree.values().copied().collect::<BTreeSet<_>>();
-        let mut canonical = b"wheat-view-v1\0".to_vec();
-        append_tree(&mut canonical, &tree);
-        for (change, revision) in &frontier {
-            canonical.push(0xfe);
-            canonical.extend_from_slice(change.to_string().as_bytes());
-            canonical.push(0);
-            canonical.extend_from_slice(revision.to_string().as_bytes());
-        }
-        for (change, application) in &applications {
-            canonical.push(0xfd);
-            canonical.extend_from_slice(change.to_string().as_bytes());
-            canonical.push(0);
-            canonical.extend_from_slice(application.to_string().as_bytes());
-        }
-        for conflict in &unresolved_conflicts {
-            canonical.push(0xfc);
-            canonical.extend_from_slice(conflict.to_string().as_bytes());
-        }
-        for content in &required_content {
-            canonical.push(0xfb);
-            canonical.extend_from_slice(content.to_string().as_bytes());
-        }
-        Self {
-            id: ViewId::from_canonical_bytes(&canonical),
+        let mut view = Self {
+            id: ViewId::from_digest([0; 32]),
             tree,
             frontier,
             applications,
             unresolved_conflicts,
             required_content,
-        }
+        };
+        view.id = ViewId::of_canonical_bytes(&crate::wire::view_bytes(&view));
+        view
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::view_bytes(self)
     }
 }
 
-fn append_tree(canonical: &mut Vec<u8>, tree: &Tree) {
-    for (path, content) in tree {
-        canonical.push(0xff);
-        canonical.extend_from_slice(path.as_bytes());
-        canonical.push(0);
-        canonical.extend_from_slice(content.to_string().as_bytes());
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryState {
+    pub id: crate::RepositoryStateId,
+    pub base_view: ViewId,
+    pub working_view: ViewId,
+    pub published_view: ViewId,
+    pub required_content: ContentManifestId,
+    pub retained_changes: BTreeSet<crate::ChangeObjectId>,
+    pub retained_views: BTreeSet<ViewId>,
+    pub retained_revisions: BTreeSet<RevisionId>,
+    pub retained_applications: BTreeSet<ApplicationId>,
+}
+
+impl RepositoryState {
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::repository_state_bytes(self)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalObject {
+    pub id: crate::ObjectId,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryClosure {
+    pub state: RepositoryState,
+    pub objects: Vec<CanonicalObject>,
+    pub required_content: BTreeSet<ContentId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

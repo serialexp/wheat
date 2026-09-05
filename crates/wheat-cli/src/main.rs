@@ -244,8 +244,11 @@ fn with_repository(
     let path = state_path(root);
     let bytes =
         fs::read(&path).with_context(|| format!("not a Wheat repository: {}", root.display()))?;
-    let mut repository =
+    let mut repository: Repository =
         serde_yaml::from_slice(&bytes).context("invalid Wheat repository state")?;
+    repository
+        .validate()
+        .context("invalid Wheat repository invariants")?;
     operation(&mut repository)?;
     if persist {
         save(&path, &repository)?;

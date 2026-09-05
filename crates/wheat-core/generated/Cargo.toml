@@ -1,0 +1,10 @@
+[package]
+name = "wheat-binschema-generated"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+binschema-runtime = { package = "wheat-binschema-runtime", path = "binschema_runtime" }
+
+[lib]
+path = "src/lib.rs"

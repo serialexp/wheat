@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use wheat_core::{
-    ApplicationResult, ConflictResolution, ContentId, FileEdit, Repository, RepositoryError,
-    Transformation, Tree,
+    ApplicationResult, ChangeId, ChangeMetadata, ChangeProposal, ConflictResolution, ContentId,
+    FileEdit, Repository, RepositoryError, RevisionMetadata, Transformation, Tree,
 };
 
 fn content(value: &str) -> ContentId {
@@ -17,6 +17,84 @@ fn edit(path: &str, expected: Option<&str>, replacement: Option<&str>) -> Transf
             replacement: replacement.map(content),
         }],
     }
+}
+
+fn proposal(
+    id: ChangeId,
+    dependencies: impl IntoIterator<Item = ChangeId>,
+    transformation: Transformation,
+) -> ChangeProposal {
+    ChangeProposal {
+        id,
+        metadata: ChangeMetadata::default(),
+        dependencies: dependencies.into_iter().collect(),
+        revision_metadata: RevisionMetadata::default(),
+        transformation,
+    }
+}
+
+#[test]
+fn bulk_import_materializes_each_commit_view_and_the_combined_working_view() {
+    let root = ChangeId::new();
+    let left = ChangeId::new();
+    let right = ChangeId::new();
+    let mut repository = Repository::new(Tree::new());
+
+    let outcomes = repository
+        .import_changes([
+            proposal(root, [], edit("root", None, Some("root"))),
+            proposal(left, [root], edit("left", None, Some("left"))),
+            proposal(right, [root], edit("right", None, Some("right"))),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .view(outcomes[&root].resulting_view)
+            .unwrap()
+            .tree
+            .len(),
+        1
+    );
+    assert!(
+        repository
+            .view(outcomes[&left].resulting_view)
+            .unwrap()
+            .tree
+            .contains_key("left")
+    );
+    assert!(
+        !repository
+            .view(outcomes[&left].resulting_view)
+            .unwrap()
+            .tree
+            .contains_key("right")
+    );
+    assert_eq!(repository.working_view().tree.len(), 3);
+    repository.validate().unwrap();
+}
+
+#[test]
+fn failed_bulk_import_rolls_back_the_whole_batch() {
+    let mut repository = Repository::new(Tree::new());
+    let before = repository.canonical_closure();
+    let valid = ChangeId::new();
+    let missing = ChangeId::new();
+
+    let error = repository
+        .import_changes([
+            proposal(valid, [], edit("valid", None, Some("valid"))),
+            proposal(
+                ChangeId::new(),
+                [missing],
+                edit("invalid", None, Some("invalid")),
+            ),
+        ])
+        .unwrap_err();
+
+    assert_eq!(error, RepositoryError::UnknownDependency(missing));
+    assert_eq!(repository.canonical_closure(), before);
+    assert_eq!(repository.current_revision(valid), None);
 }
 
 #[test]
@@ -152,8 +230,11 @@ fn conflicted_view_is_self_describing_and_queryable() {
 #[test]
 fn view_identity_covers_the_application_and_conflict_manifest() {
     let tree = BTreeMap::from([("file".into(), content("visible"))]);
-    let change = wheat_core::ChangeId::new();
-    let revision = wheat_core::RevisionId::new();
+    let mut source = Repository::new(Tree::new());
+    let (change, outcome) = source
+        .create_change([], edit("file", None, Some("visible")))
+        .unwrap();
+    let revision = outcome.revision_id;
     let frontier = BTreeMap::from([(change, revision)]);
     let plain = wheat_core::RepositoryView::new(tree.clone(), frontier.clone());
     let conflict = wheat_core::Conflict::new(

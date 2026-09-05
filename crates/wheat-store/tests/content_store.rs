@@ -30,3 +30,32 @@ fn distinguishes_missing_and_corrupt_content() {
         Err(ContentStoreError::Corrupt { expected, .. }) if expected == stored
     ));
 }
+
+#[test]
+fn batch_retention_is_parallel_deduplicated_and_integrity_checked() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let first = ContentId::of(b"first");
+    let second = ContentId::of(b"second");
+
+    store
+        .put_many(
+            [
+                (first, b"first".to_vec()),
+                (second, b"second".to_vec()),
+                (first, b"first".to_vec()),
+            ],
+            4,
+        )
+        .unwrap();
+    assert_eq!(store.get(first).unwrap(), b"first");
+    assert_eq!(store.get(second).unwrap(), b"second");
+
+    let error = store
+        .put_many([(first, b"not first".to_vec())], 2)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ContentStoreError::Corrupt { expected, .. } if expected == first
+    ));
+}

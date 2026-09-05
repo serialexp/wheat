@@ -27,6 +27,12 @@
         { type: "ConflictV1", when: "value == 0x0501" },
         { type: "ViewV1", when: "value == 0x0601" },
         { type: "ContentManifestV1", when: "value == 0x0701" },
+        { type: "RepositoryStateV1", when: "value == 0x0801" },
+        { type: "RevisionMapNodeV1", when: "value == 0x0901" },
+        { type: "ApplicationMapNodeV1", when: "value == 0x0a01" },
+        { type: "ConflictSetNodeV1", when: "value == 0x0b01" },
+        { type: "ContentSetNodeV1", when: "value == 0x0c01" },
+        { type: "RetainedSetNodeV1", when: "value == 0x0d01" },
       ],
     },
 
@@ -47,13 +53,22 @@
         { name: "digest", type: "Digest256" },
       ],
     },
+    // Change identity is stable collaboration identity, not object identity.
     ChangeId: { sequence: [{ name: "uuid", type: "Uuid128" }] },
-    RevisionId: { sequence: [{ name: "uuid", type: "Uuid128" }] },
+    // Every other metadata ID is the BLAKE3-256 address of the referenced
+    // object's complete canonical WheatObject encoding.
+    RevisionId: { sequence: [{ name: "digest", type: "Digest256" }] },
     TreeId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ChangeObjectId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ApplicationId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ConflictId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ContentManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    RevisionMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ApplicationMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ConflictSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ContentSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    RetainedSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
 
     TreeV1: {
       sequence: [
@@ -63,21 +78,84 @@
           type: "array",
           kind: "length_prefixed",
           length_type: "uint32",
-          items: { type: "TreeEntry" },
+          items: { type: "DirectoryEntryV1" },
         },
       ],
     },
-    TreeEntry: {
+    DirectoryEntryV1: {
       sequence: [
         {
-          name: "path",
+          name: "name",
           type: "string",
           kind: "length_prefixed",
           length_type: "uint32",
           encoding: "utf8",
         },
-        { name: "mode", type: "uint8" },
+        { name: "value", type: "DirectoryEntryValueV1" },
+      ],
+    },
+    DirectoryEntryValueV1: {
+      type: "discriminated_union",
+      discriminator: { peek: "uint8" },
+      variants: [
+        { type: "FileEntryV1", when: "value == 0" },
+        { type: "DirectoryEntryRefV1", when: "value == 1" },
+      ],
+    },
+    FileEntryV1: {
+      sequence: [
+        { name: "entry_kind", type: "uint8", const: 0 },
         { name: "content", type: "ContentId" },
+      ],
+    },
+    DirectoryEntryRefV1: {
+      sequence: [
+        { name: "entry_kind", type: "uint8", const: 1 },
+        { name: "directory", type: "TreeId" },
+      ],
+    },
+
+    ActorV1: {
+      sequence: [
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "email", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+      ],
+    },
+    TimestampV1: {
+      sequence: [
+        { name: "seconds", type: "int64" },
+        { name: "offset_minutes", type: "int16" },
+      ],
+    },
+    SourceProvenanceV1: {
+      sequence: [
+        { name: "system", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "object_id", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "parent_object_ids", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SourceObjectIdV1" } },
+      ],
+    },
+    SourceObjectIdV1: {
+      sequence: [
+        { name: "bytes", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+      ],
+    },
+    ChangeMetadataV1: {
+      sequence: [
+        { name: "title", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "description", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "creator", type: "ActorV1" },
+        { name: "created_at", type: "TimestampV1" },
+        { name: "provenance", type: "optional", value_type: "SourceProvenanceV1" },
+      ],
+    },
+    RevisionMetadataV1: {
+      sequence: [
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "author", type: "ActorV1" },
+        { name: "authored_at", type: "TimestampV1" },
+        { name: "committer", type: "ActorV1" },
+        { name: "committed_at", type: "TimestampV1" },
+        { name: "provenance", type: "optional", value_type: "SourceProvenanceV1" },
       ],
     },
 
@@ -85,15 +163,21 @@
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0201 },
         { name: "change_id", type: "ChangeId" },
+        { name: "metadata", type: "ChangeMetadataV1" },
       ],
     },
 
     RevisionV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0301 },
-        { name: "revision_id", type: "RevisionId" },
+        // RevisionId is the hash of this object, so it is not encoded inside
+        // the revision itself.
         { name: "change_id", type: "ChangeId" },
+        { name: "metadata", type: "RevisionMetadataV1" },
         {
+          // Zero or one element. Wheat validates this cardinality because the
+          // current BinSchema Rust generator cannot encode an optional field
+          // directly inside a discriminated-union variant.
           name: "predecessors",
           type: "array",
           kind: "length_prefixed",
@@ -245,6 +329,132 @@
           kind: "length_prefixed",
           length_type: "uint32",
           items: { type: "ContentId" },
+        },
+      ],
+    },
+
+    RevisionMapNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0901 },
+        { name: "depth", type: "uint8" },
+        {
+          // Zero or one element. A value is legal only at terminal depth 16.
+          name: "value",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "RevisionId" },
+        },
+        {
+          name: "children",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "RevisionMapChildV1" },
+        },
+      ],
+    },
+    RevisionMapChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "RevisionMapId" },
+      ],
+    },
+
+    ApplicationMapNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0a01 },
+        { name: "depth", type: "uint8" },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationId" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationMapChildV1" } },
+      ],
+    },
+    ApplicationMapChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ApplicationMapId" },
+      ],
+    },
+
+    ConflictSetNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0b01 },
+        { name: "depth", type: "uint8" },
+        { name: "present", type: "bool" },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ConflictSetChildV1" } },
+      ],
+    },
+    ConflictSetChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ConflictSetId" },
+      ],
+    },
+
+    ContentSetNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0c01 },
+        { name: "depth", type: "uint8" },
+        { name: "present", type: "bool" },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentSetChildV1" } },
+      ],
+    },
+    ContentSetChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ContentSetId" },
+      ],
+    },
+
+    RetainedSetNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0d01 },
+        { name: "depth", type: "uint8" },
+        { name: "present", type: "bool" },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "RetainedSetChildV1" } },
+      ],
+    },
+    RetainedSetChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "RetainedSetId" },
+      ],
+    },
+
+    RepositoryStateV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0801 },
+        { name: "base_view", type: "ViewId" },
+        { name: "working_view", type: "ViewId" },
+        { name: "published_view", type: "ViewId" },
+        { name: "required_content", type: "ContentManifestId" },
+        {
+          name: "retained_changes",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ChangeObjectId" },
+        },
+        {
+          name: "retained_views",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ViewId" },
+        },
+        {
+          name: "retained_revisions",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "RevisionId" },
+        },
+        {
+          name: "retained_applications",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ApplicationId" },
         },
       ],
     },

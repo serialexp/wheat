@@ -1,0 +1,270 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use async_trait::async_trait;
+use thiserror::Error;
+use wheat_core::{CanonicalObjectError, CanonicalObjectKind, ObjectId, validate_canonical_object};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ObjectKind {
+    Tree = 1,
+    Change = 2,
+    Revision = 3,
+    Application = 4,
+    Conflict = 5,
+    View = 6,
+    ContentManifest = 7,
+    RepositoryState = 8,
+    RevisionMapNode = 9,
+    ApplicationMapNode = 10,
+    ConflictSetNode = 11,
+    ContentSetNode = 12,
+    RetainedSetNode = 13,
+}
+
+impl From<CanonicalObjectKind> for ObjectKind {
+    fn from(value: CanonicalObjectKind) -> Self {
+        match value {
+            CanonicalObjectKind::Tree => Self::Tree,
+            CanonicalObjectKind::Change => Self::Change,
+            CanonicalObjectKind::Revision => Self::Revision,
+            CanonicalObjectKind::Application => Self::Application,
+            CanonicalObjectKind::Conflict => Self::Conflict,
+            CanonicalObjectKind::View => Self::View,
+            CanonicalObjectKind::ContentManifest => Self::ContentManifest,
+            CanonicalObjectKind::RepositoryState => Self::RepositoryState,
+            CanonicalObjectKind::RevisionMapNode => Self::RevisionMapNode,
+            CanonicalObjectKind::ApplicationMapNode => Self::ApplicationMapNode,
+            CanonicalObjectKind::ConflictSetNode => Self::ConflictSetNode,
+            CanonicalObjectKind::ContentSetNode => Self::ContentSetNode,
+            CanonicalObjectKind::RetainedSetNode => Self::RetainedSetNode,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredObject {
+    pub id: ObjectId,
+    pub kind: ObjectKind,
+    pub canonical_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Error)]
+pub enum ObjectStoreError {
+    #[error("object {0} is missing")]
+    Missing(ObjectId),
+    #[error("object {id} has kind {actual:?}, expected {expected:?}")]
+    WrongKind {
+        id: ObjectId,
+        expected: ObjectKind,
+        actual: ObjectKind,
+    },
+    #[error("object {expected} failed integrity verification (found {actual})")]
+    Corrupt {
+        expected: ObjectId,
+        actual: ObjectId,
+    },
+    #[error("invalid Wheat object: {0}")]
+    InvalidFormat(#[from] CanonicalObjectError),
+    #[error("immutable object backend failed: {0}")]
+    Backend(String),
+    #[error("immutable object store I/O failed")]
+    Io(#[from] io::Error),
+}
+
+#[async_trait]
+pub trait ImmutableObjectStore: Send + Sync {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError>;
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError>;
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct LooseObjectStore {
+    root: PathBuf,
+}
+
+impl LooseObjectStore {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub async fn put(&self, canonical_bytes: &[u8]) -> Result<ObjectId, ObjectStoreError> {
+        validate_canonical_object(canonical_bytes)?;
+        let id = ObjectId::of_canonical_bytes(canonical_bytes);
+        self.put_if_absent(id, canonical_bytes).await?;
+        Ok(id)
+    }
+
+    pub async fn get_kind(
+        &self,
+        id: ObjectId,
+        expected: ObjectKind,
+    ) -> Result<StoredObject, ObjectStoreError> {
+        let object = self.get(id).await?;
+        if object.kind != expected {
+            return Err(ObjectStoreError::WrongKind {
+                id,
+                expected,
+                actual: object.kind,
+            });
+        }
+        Ok(object)
+    }
+
+    #[must_use]
+    pub fn path(&self, id: ObjectId) -> PathBuf {
+        let encoded = id.to_string();
+        self.root.join(&encoded[..2]).join(&encoded[2..])
+    }
+
+    fn verify_bytes(
+        id: ObjectId,
+        canonical_bytes: Vec<u8>,
+    ) -> Result<StoredObject, ObjectStoreError> {
+        let actual = ObjectId::of_canonical_bytes(&canonical_bytes);
+        if actual != id {
+            return Err(ObjectStoreError::Corrupt {
+                expected: id,
+                actual,
+            });
+        }
+        let kind = validate_canonical_object(&canonical_bytes)?.into();
+        Ok(StoredObject {
+            id,
+            kind,
+            canonical_bytes,
+        })
+    }
+
+    fn verify_existing(&self, id: ObjectId, expected: &[u8]) -> Result<(), ObjectStoreError> {
+        let bytes = match fs::read(self.path(id)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ObjectStoreError::Missing(id));
+            }
+            Err(error) => return Err(ObjectStoreError::Io(error)),
+        };
+        let stored = Self::verify_bytes(id, bytes)?;
+        if stored.canonical_bytes != expected {
+            return Err(ObjectStoreError::Corrupt {
+                expected: id,
+                actual: ObjectId::of_canonical_bytes(&stored.canonical_bytes),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ImmutableObjectStore for LooseObjectStore {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        validate_canonical_object(canonical_bytes)?;
+        let actual = ObjectId::of_canonical_bytes(canonical_bytes);
+        if actual != id {
+            return Err(ObjectStoreError::Corrupt {
+                expected: id,
+                actual,
+            });
+        }
+
+        let path = self.path(id);
+        let parent = path.parent().expect("object path has parent");
+        let root_was_missing = !self.root.exists();
+        let parent_was_missing = !parent.exists();
+        fs::create_dir_all(parent)?;
+        if root_was_missing && let Some(root_parent) = self.root.parent() {
+            sync_directory(root_parent)?;
+        }
+        if parent_was_missing {
+            sync_directory(&self.root)?;
+        }
+        let temporary = temporary_path(parent, id);
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(canonical_bytes)?;
+            file.sync_all()?;
+
+            match fs::hard_link(&temporary, &path) {
+                Ok(()) => {
+                    fs::remove_file(&temporary)?;
+                    sync_directory(parent)?;
+                    Ok(())
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    match self.verify_existing(id, canonical_bytes) {
+                        Ok(()) => {
+                            fs::remove_file(&temporary)?;
+                            Ok(())
+                        }
+                        Err(ObjectStoreError::Missing(_)) => {
+                            fs::hard_link(&temporary, &path)?;
+                            fs::remove_file(&temporary)?;
+                            sync_directory(parent)?;
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(ObjectStoreError::Io(error)),
+            }
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        let bytes = match fs::read(self.path(id)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ObjectStoreError::Missing(id));
+            }
+            Err(error) => return Err(ObjectStoreError::Io(error)),
+        };
+        Self::verify_bytes(id, bytes)
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            results.push(match self.get(*id).await {
+                Ok(_) => true,
+                Err(ObjectStoreError::Missing(_)) => false,
+                Err(error) => return Err(error),
+            });
+        }
+        Ok(results)
+    }
+}
+
+fn temporary_path(parent: &Path, id: ObjectId) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{id}.{}.{}.tmp", std::process::id(), sequence))
+}
+
+fn sync_directory(path: &Path) -> Result<(), io::Error> {
+    File::open(path)?.sync_all()
+}
