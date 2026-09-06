@@ -4,6 +4,10 @@
 //! Its first parent is the semantic dependency; additional merge parents are
 //! retained only as source provenance.
 
+pub mod journal;
+mod staged_import;
+pub use staged_import::{StagedBranch, StagedImportError, StagedImportResult, stage_import};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,

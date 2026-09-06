@@ -1,0 +1,4 @@
+SELECT
+    SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END),
+    SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END)
+FROM work

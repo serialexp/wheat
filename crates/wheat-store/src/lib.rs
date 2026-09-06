@@ -15,6 +15,7 @@ use thiserror::Error;
 use wheat_core::ContentId;
 
 mod application_map;
+mod commit_writer;
 mod loose;
 mod merkle_tree;
 mod object_store_adapter;
@@ -30,6 +31,7 @@ mod revision_map;
 mod sets;
 
 pub use application_map::{ApplicationMapCursor, ApplicationMapError, ApplicationMapStore};
+pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
 pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };
