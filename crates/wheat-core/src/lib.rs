@@ -4,6 +4,7 @@
 //! crate. Its executable contract is stable logical change identity, immutable
 //! revisions, deterministic descendant reapplication, and durable conflicts.
 
+mod branch_records;
 mod collection;
 mod collection_builders;
 mod hydration;
@@ -12,9 +13,11 @@ mod model;
 mod persisted;
 mod repository;
 mod root_builders;
+mod segment_records;
 mod semantic_records;
 mod wire;
 
+pub use branch_records::{BranchManifestRecord, RepositoryEnvelopeRecord};
 pub use collection::{
     ApplicationMapChild, ApplicationMapNode, ConflictSetChild, ConflictSetNode, ContentSetChild,
     ContentSetNode, RetainedSetChild, RetainedSetNode,
@@ -25,9 +28,10 @@ pub use collection_builders::{
 };
 pub use hydration::{hydrate_application, hydrate_revision};
 pub use id::{
-    ApplicationId, ApplicationMapId, ChangeId, ChangeObjectId, ConflictId, ConflictSetId,
-    ContentId, ContentManifestId, ContentSetId, ObjectId, ParseContentIdError, ParseDigestIdError,
-    RepositoryStateId, RetainedSetId, RevisionId, RevisionMapId, TreeId, ViewId,
+    ApplicationId, ApplicationMapId, BranchManifestId, ChangeId, ChangeObjectId, ConflictId,
+    ConflictSetId, ContentId, ContentManifestId, ContentSetId, ObjectId, ParseContentIdError,
+    ParseDigestIdError, RepositoryEnvelopeId, RepositoryStateId, RetainedSetId, RevisionId,
+    RevisionMapId, TreeId, ViewId,
 };
 pub use model::{
     Actor, Application, ApplicationResult, CanonicalObject, Change, ChangeMetadata, ChangeRevision,
@@ -43,14 +47,23 @@ pub use repository::{
 pub use root_builders::{
     build_content_manifest_record, build_repository_state_record, build_view_record,
 };
+pub use segment_records::{
+    SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_NAMESPACE_CONTENT, SEGMENT_NAMESPACE_METADATA,
+    SEGMENT_PREFIX_ENCODED_SIZE, SegmentCatalogRecord, SegmentDirectory, SegmentDirectoryEntry,
+    SegmentFooter, SegmentId, SegmentIndexEntry, SegmentIndexKey, SegmentIndexPage,
+    SegmentRecordError, decode_segment_catalog_record, decode_segment_directory,
+    decode_segment_footer, decode_segment_index_page, decode_segment_prefix,
+    encode_segment_catalog_record, encode_segment_directory, encode_segment_footer,
+    encode_segment_index_page, encode_segment_prefix,
+};
 pub use semantic_records::{
     ApplicationRecord, ApplicationResultRecord, RevisionRecord, decode_application_record,
     decode_change, decode_conflict, decode_revision_record,
 };
 pub use wire::{
     CanonicalObjectError, CanonicalObjectKind, decode_application_map_node,
-    decode_conflict_set_node, decode_content_manifest_record, decode_content_set_node,
-    decode_directory_node, decode_repository_state_record, decode_retained_set_node,
-    decode_revision_map_node, decode_view_record, validate_canonical_object,
-    validate_directory_component,
+    decode_branch_manifest_record, decode_conflict_set_node, decode_content_manifest_record,
+    decode_content_set_node, decode_directory_node, decode_repository_envelope_record,
+    decode_repository_state_record, decode_retained_set_node, decode_revision_map_node,
+    decode_view_record, validate_canonical_object, validate_directory_component,
 };

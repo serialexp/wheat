@@ -6,8 +6,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::{StreamExt, stream};
 use thiserror::Error;
 use wheat_core::{CanonicalObjectError, CanonicalObjectKind, ObjectId, validate_canonical_object};
+
+const MAX_BATCH_WORKERS: usize = 16;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -27,6 +30,8 @@ pub enum ObjectKind {
     ConflictSetNode = 11,
     ContentSetNode = 12,
     RetainedSetNode = 13,
+    BranchManifest = 14,
+    RepositoryEnvelope = 15,
 }
 
 impl From<CanonicalObjectKind> for ObjectKind {
@@ -45,6 +50,8 @@ impl From<CanonicalObjectKind> for ObjectKind {
             CanonicalObjectKind::ConflictSetNode => Self::ConflictSetNode,
             CanonicalObjectKind::ContentSetNode => Self::ContentSetNode,
             CanonicalObjectKind::RetainedSetNode => Self::RetainedSetNode,
+            CanonicalObjectKind::BranchManifest => Self::BranchManifest,
+            CanonicalObjectKind::RepositoryEnvelope => Self::RepositoryEnvelope,
         }
     }
 }
@@ -86,6 +93,27 @@ pub trait ImmutableObjectStore: Send + Sync {
         id: ObjectId,
         canonical_bytes: &[u8],
     ) -> Result<(), ObjectStoreError>;
+
+    /// Durably stores a batch. Implementations may override this to parallelize
+    /// backend work; successful completion has the same durability guarantee as
+    /// awaiting every corresponding [`Self::put_if_absent`] call.
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        let concurrency = concurrency.clamp(1, MAX_BATCH_WORKERS);
+        let results = stream::iter(
+            objects
+                .iter()
+                .cloned()
+                .map(|(id, bytes)| async move { self.put_if_absent(id, &bytes).await }),
+        )
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        results.into_iter().collect()
+    }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError>;
 
@@ -234,6 +262,44 @@ impl ImmutableObjectStore for LooseObjectStore {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        // Loose writes perform blocking filesystem I/O; polling async futures on
+        // one thread cannot overlap their fsync waits. Borrow bounded batches
+        // into scoped workers and join every worker before acknowledging flush.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let handles = (0..concurrency.clamp(1, MAX_BATCH_WORKERS).min(objects.len()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((id, bytes)) = objects.get(index) else {
+                                return Ok(());
+                            };
+                            futures::executor::block_on(self.put_if_absent(*id, bytes))?;
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut result = Ok(());
+            for handle in handles {
+                let outcome = handle.join().unwrap_or_else(|_| {
+                    Err(ObjectStoreError::Backend(
+                        "loose batch worker panicked".into(),
+                    ))
+                });
+                if result.is_ok() {
+                    result = outcome;
+                }
+            }
+            result
+        })
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {

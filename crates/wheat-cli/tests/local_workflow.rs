@@ -185,7 +185,7 @@ fn corrupted_canonical_state_is_not_replaced() {
     let before = std::fs::read(&head_path).unwrap();
     let head = LocalPublicationStore::new(&head_path).read().unwrap();
     let objects = LooseObjectStore::new(dir.path().join(".wheat/objects"));
-    std::fs::write(objects.path(head.repository_state), b"corrupt").unwrap();
+    std::fs::write(objects.path(head.envelope.into()), b"corrupt").unwrap();
     let result = wheat(
         dir.path(),
         &["change", "new", "--path", "file", "--value", "one"],

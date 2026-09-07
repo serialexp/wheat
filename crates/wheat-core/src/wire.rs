@@ -31,6 +31,8 @@ pub enum CanonicalObjectError {
     },
     #[error("invalid directory component {0:?}")]
     InvalidDirectoryComponent(String),
+    #[error("invalid branch name {0:?}")]
+    InvalidBranchName(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +45,8 @@ pub enum CanonicalObjectKind {
     View,
     ContentManifest,
     RepositoryState,
+    BranchManifest,
+    RepositoryEnvelope,
     RevisionMapNode,
     ApplicationMapNode,
     ConflictSetNode,
@@ -129,6 +133,42 @@ pub fn decode_repository_state_record(
         retained_views: retained(&v.retained_views)?,
         retained_revisions: retained(&v.retained_revisions)?,
         retained_applications: retained(&v.retained_applications)?,
+    })
+}
+
+pub fn decode_branch_manifest_record(
+    bytes: &[u8],
+) -> Result<crate::BranchManifestRecord, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::BranchManifestV1(v) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::BranchManifest,
+            actual: object_kind(&object),
+        });
+    };
+    crate::BranchManifestRecord::new(v.branches.into_iter().map(|entry| {
+        (
+            entry.name,
+            crate::ViewId::from_digest(
+                digest_domain(&entry.view.digest).expect("validated digest"),
+            ),
+        )
+    }))
+}
+
+pub fn decode_repository_envelope_record(
+    bytes: &[u8],
+) -> Result<crate::RepositoryEnvelopeRecord, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::RepositoryEnvelopeV1(v) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::RepositoryEnvelope,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(crate::RepositoryEnvelopeRecord {
+        state: crate::RepositoryStateId::from_digest(digest_domain(&v.state.digest)?),
+        branches: crate::BranchManifestId::from_digest(digest_domain(&v.branches.digest)?),
     })
 }
 
@@ -638,6 +678,34 @@ pub(crate) fn application_bytes(application: &Application) -> Vec<u8> {
     ))
 }
 
+pub(crate) fn branch_manifest_record_bytes(record: &crate::BranchManifestRecord) -> Vec<u8> {
+    encode(wire::WheatObject::BranchManifestV1(
+        wire::BranchManifestV1Input {
+            branches: record
+                .branches
+                .iter()
+                .map(|(name, view)| wire::BranchManifestEntryV1 {
+                    name: name.clone(),
+                    view: view_id(*view),
+                })
+                .collect(),
+        }
+        .into(),
+    ))
+}
+
+pub(crate) fn repository_envelope_record_bytes(
+    record: &crate::RepositoryEnvelopeRecord,
+) -> Vec<u8> {
+    encode(wire::WheatObject::RepositoryEnvelopeV1(
+        wire::RepositoryEnvelopeV1Input {
+            state: repository_state_id(record.state),
+            branches: branch_manifest_id(record.branches),
+        }
+        .into(),
+    ))
+}
+
 pub(crate) fn repository_state_record_bytes(record: &crate::RepositoryStateRecord) -> Vec<u8> {
     encode(wire::WheatObject::RepositoryStateV1(
         wire::RepositoryStateV1Input {
@@ -795,7 +863,17 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "retained set node",
             )?;
         }
-        wire::WheatObject::RepositoryStateV1(_) => {}
+        wire::WheatObject::RepositoryStateV1(_) | wire::WheatObject::RepositoryEnvelopeV1(_) => {}
+        wire::WheatObject::BranchManifestV1(manifest) => {
+            validate_sorted_unique_by(
+                &manifest.branches,
+                |entry| entry.name.as_str(),
+                "branch manifest entries",
+            )?;
+            for entry in &manifest.branches {
+                crate::branch_records::validate_branch_name(&entry.name)?;
+            }
+        }
     }
     Ok(())
 }
@@ -810,6 +888,8 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ViewV1(_) => CanonicalObjectKind::View,
         wire::WheatObject::ContentManifestV1(_) => CanonicalObjectKind::ContentManifest,
         wire::WheatObject::RepositoryStateV1(_) => CanonicalObjectKind::RepositoryState,
+        wire::WheatObject::BranchManifestV1(_) => CanonicalObjectKind::BranchManifest,
+        wire::WheatObject::RepositoryEnvelopeV1(_) => CanonicalObjectKind::RepositoryEnvelope,
         wire::WheatObject::RevisionMapNodeV1(_) => CanonicalObjectKind::RevisionMapNode,
         wire::WheatObject::ApplicationMapNodeV1(_) => CanonicalObjectKind::ApplicationMapNode,
         wire::WheatObject::ConflictSetNodeV1(_) => CanonicalObjectKind::ConflictSetNode,
@@ -976,6 +1056,16 @@ wire_digest_id!(tree_id_wire, TreeId, TreeId);
 wire_digest_id!(application_id, crate::ApplicationId, ApplicationId);
 wire_digest_id!(conflict_id, crate::ConflictId, ConflictId);
 wire_digest_id!(view_id, crate::ViewId, ViewId);
+wire_digest_id!(
+    repository_state_id,
+    crate::RepositoryStateId,
+    RepositoryStateId
+);
+wire_digest_id!(
+    branch_manifest_id,
+    crate::BranchManifestId,
+    BranchManifestId
+);
 wire_digest_id!(
     content_manifest_id_wire,
     ContentManifestId,

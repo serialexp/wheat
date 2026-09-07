@@ -22,6 +22,8 @@ pub enum WheatObject {
     ConflictSetNodeV1(ConflictSetNodeV1Output),
     ContentSetNodeV1(ContentSetNodeV1Output),
     RetainedSetNodeV1(RetainedSetNodeV1Output),
+    BranchManifestV1(BranchManifestV1Output),
+    RepositoryEnvelopeV1(RepositoryEnvelopeV1Output),
 }
 
 impl WheatObject {
@@ -180,6 +182,21 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
             }
+            WheatObject::BranchManifestV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_uint32(v.branches.len() as u32, Endianness::BigEndian);
+                for item in &v.branches {
+                    item.encode_into(encoder)?;
+                }
+            }
+            WheatObject::RepositoryEnvelopeV1(v) => {
+                // Build per-variant context for nested struct sub-fields
+                let variant_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                let _variant_ctx = ctx.extend_with_parent(variant_fields);
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                v.state.encode_into(encoder)?;
+                v.branches.encode_into(encoder)?;
+            }
         }
         Ok(())
     }
@@ -218,6 +235,10 @@ impl WheatObject {
             Ok(WheatObject::ContentSetNodeV1(ContentSetNodeV1Output::decode_with_decoder(decoder)?))
         } else if value == 0x0d01 {
             Ok(WheatObject::RetainedSetNodeV1(RetainedSetNodeV1Output::decode_with_decoder(decoder)?))
+        } else if value == 0x0e01 {
+            Ok(WheatObject::BranchManifestV1(BranchManifestV1Output::decode_with_decoder(decoder)?))
+        } else if value == 0x0f01 {
+            Ok(WheatObject::RepositoryEnvelopeV1(RepositoryEnvelopeV1Output::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }
@@ -905,6 +926,98 @@ pub struct RetainedSetId {
 }
 
 impl RetainedSetId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct digest
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryStateId {
+    pub digest: Digest256,
+}
+
+impl RepositoryStateId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct digest
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchManifestId {
+    pub digest: Digest256,
+}
+
+impl BranchManifestId {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
@@ -3873,6 +3986,923 @@ impl From<RepositoryStateV1Input> for RepositoryStateV1Output {
             retained_views: i.retained_views,
             retained_revisions: i.retained_revisions,
             retained_applications: i.retained_applications,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchManifestV1Input {
+    pub branches: Vec<BranchManifestEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchManifestV1Output {
+    pub wire_tag: u16,
+    pub branches: Vec<BranchManifestEntryV1>,
+}
+
+pub type BranchManifestV1 = BranchManifestV1Output;
+
+impl BranchManifestV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'branches'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.branches {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("BranchManifestEntryV1".to_string(), item_fields));
+            }
+            parent_fields.insert("branches".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u16_be(3585);
+        encoder.write_u32_be(self.branches.len() as u32);
+        for item in &self.branches {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl BranchManifestV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 3585u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3585, got {}", wire_tag)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut branches = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = BranchManifestEntryV1::decode_with_decoder(decoder)?;
+            branches.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            branches,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        BranchManifestV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        BranchManifestV1Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        BranchManifestV1Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        BranchManifestV1Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<BranchManifestV1Output> for BranchManifestV1Input {
+    fn from(o: BranchManifestV1Output) -> Self {
+        Self {
+            branches: o.branches,
+        }
+    }
+}
+
+impl From<BranchManifestV1Input> for BranchManifestV1Output {
+    fn from(i: BranchManifestV1Input) -> Self {
+        Self {
+            wire_tag: 3585u16,
+            branches: i.branches,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchManifestEntryV1 {
+    pub name: std::string::String,
+    pub view: ViewId,
+}
+
+impl BranchManifestEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("name".to_string(), FieldValue::String(self.name.clone()));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(self.name.len() as u32);
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        // Encode nested struct view with context
+        self.view.encode_into_with_context(encoder, &child_ctx)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let view = ViewId::decode_with_decoder(decoder)?;
+        Ok(Self {
+            name,
+            view,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryEnvelopeV1Input {
+    pub state: RepositoryStateId,
+    pub branches: BranchManifestId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryEnvelopeV1Output {
+    pub wire_tag: u16,
+    pub state: RepositoryStateId,
+    pub branches: BranchManifestId,
+}
+
+pub type RepositoryEnvelopeV1 = RepositoryEnvelopeV1Output;
+
+impl RepositoryEnvelopeV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u16_be(3841);
+        // Encode nested struct state with context
+        self.state.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct branches with context
+        self.branches.encode_into_with_context(encoder, &child_ctx)?;
+        Ok(())
+    }
+
+}
+
+impl RepositoryEnvelopeV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 3841u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3841, got {}", wire_tag)));
+        }
+        let state = RepositoryStateId::decode_with_decoder(decoder)?;
+        let branches = BranchManifestId::decode_with_decoder(decoder)?;
+        Ok(Self {
+            wire_tag,
+            state,
+            branches,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        RepositoryEnvelopeV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        RepositoryEnvelopeV1Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        RepositoryEnvelopeV1Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        RepositoryEnvelopeV1Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<RepositoryEnvelopeV1Output> for RepositoryEnvelopeV1Input {
+    fn from(o: RepositoryEnvelopeV1Output) -> Self {
+        Self {
+            state: o.state,
+            branches: o.branches,
+        }
+    }
+}
+
+impl From<RepositoryEnvelopeV1Input> for RepositoryEnvelopeV1Output {
+    fn from(i: RepositoryEnvelopeV1Input) -> Self {
+        Self {
+            wire_tag: 3841u16,
+            state: i.state,
+            branches: i.branches,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentPrefixV1Input {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentPrefixV1Output {
+    pub magic: u32,
+    pub version: u16,
+}
+
+pub type SegmentPrefixV1 = SegmentPrefixV1Output;
+
+impl SegmentPrefixV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464354113);
+        encoder.write_u16_be(1);
+        Ok(())
+    }
+
+}
+
+impl SegmentPrefixV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464354113u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1464354113, got {}", magic)));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", version)));
+        }
+        Ok(Self {
+            magic,
+            version,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        SegmentPrefixV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        SegmentPrefixV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<SegmentPrefixV1Output> for SegmentPrefixV1Input {
+    fn from(_o: SegmentPrefixV1Output) -> Self {
+        Self {
+        }
+    }
+}
+
+impl From<SegmentPrefixV1Input> for SegmentPrefixV1Output {
+    fn from(_i: SegmentPrefixV1Input) -> Self {
+        Self {
+            magic: 1464354113u32,
+            version: 1u16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentIndexEntryV1 {
+    pub namespace: u8,
+    pub kind: u16,
+    pub digest: Digest256,
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl SegmentIndexEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("namespace".to_string(), FieldValue::U8(self.namespace));
+        parent_fields.insert("kind".to_string(), FieldValue::U16(self.kind));
+        parent_fields.insert("offset".to_string(), FieldValue::U64(self.offset));
+        parent_fields.insert("length".to_string(), FieldValue::U64(self.length));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(self.namespace);
+        encoder.write_u16_be(self.kind);
+        // Encode nested struct digest
+        self.digest.encode_into(encoder)?;
+        encoder.write_u64_be(self.offset);
+        encoder.write_u64_be(self.length);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let namespace = decoder.read_byte()?;
+        let kind = decoder.read_u16_be()?;
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        let offset = decoder.read_u64_be()?;
+        let length = decoder.read_u64_be()?;
+        Ok(Self {
+            namespace,
+            kind,
+            digest,
+            offset,
+            length,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentIndexPageV1 {
+    pub entries: Vec<SegmentIndexEntryV1>,
+}
+
+impl SegmentIndexPageV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'entries'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.entries {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("SegmentIndexEntryV1".to_string(), item_fields));
+            }
+            parent_fields.insert("entries".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = SegmentIndexEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
+        Ok(Self {
+            entries,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentIndexKeyV1 {
+    pub namespace: u8,
+    pub digest: Digest256,
+}
+
+impl SegmentIndexKeyV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("namespace".to_string(), FieldValue::U8(self.namespace));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(self.namespace);
+        // Encode nested struct digest
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let namespace = decoder.read_byte()?;
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            namespace,
+            digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentDirectoryEntryV1 {
+    pub first_key: SegmentIndexKeyV1,
+    pub offset: u64,
+    pub length: u64,
+    pub page_digest: Digest256,
+}
+
+impl SegmentDirectoryEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("offset".to_string(), FieldValue::U64(self.offset));
+        parent_fields.insert("length".to_string(), FieldValue::U64(self.length));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct first_key with context
+        self.first_key.encode_into_with_context(encoder, &child_ctx)?;
+        encoder.write_u64_be(self.offset);
+        encoder.write_u64_be(self.length);
+        // Encode nested struct page_digest
+        self.page_digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let first_key = SegmentIndexKeyV1::decode_with_decoder(decoder)?;
+        let offset = decoder.read_u64_be()?;
+        let length = decoder.read_u64_be()?;
+        let page_digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            first_key,
+            offset,
+            length,
+            page_digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentDirectoryV1 {
+    pub pages: Vec<SegmentDirectoryEntryV1>,
+}
+
+impl SegmentDirectoryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'pages'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.pages {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("SegmentDirectoryEntryV1".to_string(), item_fields));
+            }
+            parent_fields.insert("pages".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(self.pages.len() as u32);
+        for item in &self.pages {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut pages = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = SegmentDirectoryEntryV1::decode_with_decoder(decoder)?;
+            pages.push(item);
+        }
+        Ok(Self {
+            pages,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentFooterV1Input {
+    pub total_length: u64,
+    pub object_count: u64,
+    pub index_start: u64,
+    pub directory_offset: u64,
+    pub directory_length: u64,
+    pub body_digest: Digest256,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentFooterV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub total_length: u64,
+    pub object_count: u64,
+    pub index_start: u64,
+    pub directory_offset: u64,
+    pub directory_length: u64,
+    pub body_digest: Digest256,
+}
+
+pub type SegmentFooterV1 = SegmentFooterV1Output;
+
+impl SegmentFooterV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("total_length".to_string(), FieldValue::U64(self.total_length));
+        parent_fields.insert("object_count".to_string(), FieldValue::U64(self.object_count));
+        parent_fields.insert("index_start".to_string(), FieldValue::U64(self.index_start));
+        parent_fields.insert("directory_offset".to_string(), FieldValue::U64(self.directory_offset));
+        parent_fields.insert("directory_length".to_string(), FieldValue::U64(self.directory_length));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(1464354388);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.total_length);
+        encoder.write_u64_be(self.object_count);
+        encoder.write_u64_be(self.index_start);
+        encoder.write_u64_be(self.directory_offset);
+        encoder.write_u64_be(self.directory_length);
+        // Encode nested struct body_digest
+        self.body_digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+}
+
+impl SegmentFooterV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464354388u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1464354388, got {}", magic)));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", version)));
+        }
+        let total_length = decoder.read_u64_be()?;
+        let object_count = decoder.read_u64_be()?;
+        let index_start = decoder.read_u64_be()?;
+        let directory_offset = decoder.read_u64_be()?;
+        let directory_length = decoder.read_u64_be()?;
+        let body_digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            total_length,
+            object_count,
+            index_start,
+            directory_offset,
+            directory_length,
+            body_digest,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        SegmentFooterV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        SegmentFooterV1Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        SegmentFooterV1Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        SegmentFooterV1Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<SegmentFooterV1Output> for SegmentFooterV1Input {
+    fn from(o: SegmentFooterV1Output) -> Self {
+        Self {
+            total_length: o.total_length,
+            object_count: o.object_count,
+            index_start: o.index_start,
+            directory_offset: o.directory_offset,
+            directory_length: o.directory_length,
+            body_digest: o.body_digest,
+        }
+    }
+}
+
+impl From<SegmentFooterV1Input> for SegmentFooterV1Output {
+    fn from(i: SegmentFooterV1Input) -> Self {
+        Self {
+            magic: 1464354388u32,
+            version: 1u16,
+            total_length: i.total_length,
+            object_count: i.object_count,
+            index_start: i.index_start,
+            directory_offset: i.directory_offset,
+            directory_length: i.directory_length,
+            body_digest: i.body_digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentCatalogRecordV1Input {
+    pub generation: u64,
+    pub previous: Option<Digest256>,
+    pub segment: Digest256,
+    pub stored_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentCatalogRecordV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub generation: u64,
+    pub previous: Option<Digest256>,
+    pub segment: Digest256,
+    pub stored_length: u64,
+}
+
+pub type SegmentCatalogRecordV1 = SegmentCatalogRecordV1Output;
+
+impl SegmentCatalogRecordV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        parent_fields.insert("generation".to_string(), FieldValue::U64(self.generation));
+        parent_fields.insert("stored_length".to_string(), FieldValue::U64(self.stored_length));
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(1464353620);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.generation);
+        if let Some(ref v) = self.previous {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        // Encode nested struct segment
+        self.segment.encode_into(encoder)?;
+        encoder.write_u64_be(self.stored_length);
+        Ok(())
+    }
+
+}
+
+impl SegmentCatalogRecordV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353620u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1464353620, got {}", magic)));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", version)));
+        }
+        let generation = decoder.read_u64_be()?;
+        let has_value = decoder.read_uint8()? != 0;
+        let previous = if has_value {
+            Some(Digest256::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let segment = Digest256::decode_with_decoder(decoder)?;
+        let stored_length = decoder.read_u64_be()?;
+        Ok(Self {
+            magic,
+            version,
+            generation,
+            previous,
+            segment,
+            stored_length,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        SegmentCatalogRecordV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        SegmentCatalogRecordV1Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        SegmentCatalogRecordV1Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        SegmentCatalogRecordV1Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<SegmentCatalogRecordV1Output> for SegmentCatalogRecordV1Input {
+    fn from(o: SegmentCatalogRecordV1Output) -> Self {
+        Self {
+            generation: o.generation,
+            previous: o.previous,
+            segment: o.segment,
+            stored_length: o.stored_length,
+        }
+    }
+}
+
+impl From<SegmentCatalogRecordV1Input> for SegmentCatalogRecordV1Output {
+    fn from(i: SegmentCatalogRecordV1Input) -> Self {
+        Self {
+            magic: 1464353620u32,
+            version: 1u16,
+            generation: i.generation,
+            previous: i.previous,
+            segment: i.segment,
+            stored_length: i.stored_length,
         }
     }
 }

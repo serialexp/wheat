@@ -1,8 +1,8 @@
 # Wheat — Server-Native Source Control
 
-Status: partial — bounded Git-free walking skeleton underway; core change/revision/application semantics and a local prototype CLI exist, while the store format, protocol, Git adapter, and product commitment remain undecided
+Status: partial — native change/revision/application prototype exists; guarded edits and incremental review are agreed design direction, not implemented; store/protocol qualification and product commitment remain open
 Owner: bart
-Last updated: 2026-09-03
+Last updated: 2026-09-06
 
 ## Implementation status
 
@@ -53,6 +53,25 @@ described here.
 
 ### Outstanding
 
+- [ ] **Guarded edits — canonical model and retention.** Replace whole-file-only
+  text transformations with immutable guarded replacements while retaining exact
+  authored views/results, revision/application separation, and required historical
+  content. This is agreed direction, not implemented functionality.
+- [ ] **Guarded edits — deterministic authoring and CLI.** Specify and implement
+  unique-context selection plus two lines on each side, explicit wider guard
+  ranges, and inspectable captured preconditions for humans and agents.
+- [ ] **Guarded edits — application and conflict corpus.** Implement exact unique
+  guard matching, per-edit outcomes, and durable ambiguity/interference conflicts;
+  qualify the acceptance cases in "Guarded edits and incremental review".
+- [ ] **Guarded edits — interdiff and review continuity.** Preserve unchanged edit
+  identities across revisions, expose authored versus application changes, and
+  bind review evidence to exact edit definitions and observed applications.
+- [ ] **Decision gate — guarded-edit open questions.** Settle context expansion,
+  composition/interference, identity/lineage, text boundaries, and review policy
+  before fixing schema or application semantics; see the numbered questions below.
+- [ ] **Separate follow-up — structural review warnings.** Use language-aware
+  enclosing-scope analysis to flag broader context changes without weakening exact
+  guards or making parser behavior part of native identity/application validity.
 - [ ] **Decision gate — strategic commitment and allocation.** Decide whether
   a server-native model/store becomes a parallel product-engineering effort,
   and what ongoing capacity it receives relative to completing the Git-backed
@@ -115,12 +134,17 @@ described here.
   loose/generic-object-store reopen coverage now exist. Revision/application maps,
   conflict/content/retained sets, root-backed persisted views/manifests/state,
   shared identity/closure builders, and verified root-only publication/readback
-  are implemented. Executable models remain hydrated; streaming import, change-ID
-  indexing, compressed radix qualification and wide-directory sharding remain.
-- [ ] **Phase 2 — indexed sealed segments and ranged reads.** Qualify loose
-  objects plus immutable footer-indexed segments with a tiny identification
-  prefix, paged sorted index, one-range tail directory, range coalescing, and
-  integrity checks.
+  are implemented. A resumable disk-journaled Git importer now stages canonical
+  commits without executable hydration and publishes retained named branches.
+  Interactive executable models remain hydrated; change-ID indexing, compressed
+  radix qualification and wide-directory sharding remain.
+- [~] **Phase 2 — indexed sealed segments and ranged reads.** The local backend now
+  packs canonical metadata and small content into immutable BinSchema-defined,
+  footer-indexed segments with paged sorted indexes, authenticated directories,
+  an additive crash-safe catalog, and a rebuildable SQLite locator. Large content
+  remains standalone. Local reopen/corruption/interrupted-install tests exist;
+  remote range reads, coalescing, compaction, GC, and broader failure injection
+  remain unqualified.
 - [ ] **Phase 2 — conservative loose-object collection.** Never collect an
   unreachable loose object less than 24 hours after its backend modification
   time; verify the proposed closure immediately before publication and initially
@@ -635,11 +659,262 @@ Revision {
 apply(transformation, authored_against.tree) == resulting_tree
 ```
 
-This is a design hypothesis, not a settled encoding. Transformations may be
-file/tree edits, merge terms, or another representation found through the
-workflow corpus. They are not promised to commute or apply cleanly to every
-base. Application to a different target returns an exact clean result or a
-structured conflict.
+The revision envelope remains a design hypothesis, not a settled encoding.
+The prototype currently uses whole-file expected/replacement content IDs. The
+2026-09-06 design direction below refines text transformations into guarded edits;
+it does not discard the authored view, exact resulting tree, or distinction
+between a revision and its applications. Transformations are not promised to
+commute or apply cleanly to every base. Application to a different target returns
+an exact clean result or a structured conflict.
+
+### Guarded edits and incremental review
+
+**Agreed direction as of 2026-09-06; not implemented.** Wheat should make small,
+individually reviewable replacements native rather than reconstructing their
+identity from whole-file snapshots after each revision. This section is the
+model's source of truth; no separate interdiff design is required yet. Exact
+encoding and the open decisions below remain unsettled.
+
+#### Immutable guarded replacements
+
+A text edit has an expected fragment, replacement fragment, and exact surrounding
+context. Conceptually (not a final schema):
+
+```text
+GuardedEdit {
+    path,
+    context_before,
+    expected_fragment,
+    replacement_fragment,
+    context_after,
+}
+```
+
+All these fields participate in immutable edit identity. An authored range may
+help locate or inspect an edit, but fixed line numbers are not its application
+precondition. Whether occurrence/provenance identity is additional to this
+content-derived definition is an open question below. Unchanged edits must be
+preserved across revisions rather than regenerated with arbitrary new hunk
+boundaries. Changing the replacement, expected fragment, or required context
+changes the immutable definition and cannot silently inherit its approval.
+
+The complete `context_before + expected_fragment + context_after` must match
+exactly at one location in the target file. Only the expected fragment is
+replaced; context is preserved. No match is a conflict, and multiple matches are
+an ambiguity conflict. Nearest-position guesses, whitespace normalization, fuzzy
+matching, or fallback to weaker context must not turn a failed guard into a valid
+application. Application outcomes retain exact result content and structured
+conflicts as they do in the existing model.
+
+Context is a correctness precondition, not merely a search aid. If an edit guards
+an authorization check next to a function call and that check disappears, the
+edit conflicts even if the function call alone is still unique. An author may
+explicitly revise the guard to accept the new surroundings, but that is a new
+reviewable edit, not automatic relocation of the approved one.
+
+#### Default authoring and explicit wider guards
+
+The default is **enough surrounding context to uniquely identify the edit in its
+exact authored file, plus two additional lines on each side**, bounded by file
+edges. The expansion order/tie-break rules still need specification. Capture the
+result once at authoring time and freeze it in the edit; do not recompute it when
+applying against another view. Uniqueness is file-local, not repository-wide.
+
+The CLI must also allow an explicit larger identity/guard range containing the
+replacement range and expose the captured bytes for inspection. For example, an
+agent can replace lines 120–125 while requiring lines 108–132 to remain exactly as
+observed. Those coordinates select authored content; they do not require the
+edit to stay at those line numbers. This is particularly useful for agents that
+can deliberately capture assumptions beyond the default neighborhood. CLI flag
+syntax is not settled here.
+
+Insertions require an unambiguous guarded boundary even though their expected
+fragment is empty. Deletions retain their surrounding preconditions. File-edge,
+empty-file, line-ending, binary, and whole-file operation details are open below;
+none may introduce a silent relaxed-match path.
+
+#### Composition and revision/application separation
+
+A guard is an edit's read precondition; its replacement region is its write
+region. Two replacements can be non-overlapping yet interfere because one edits
+context required by the other. **Agreed composition rule:** Wheat consolidates
+such edits into one canonical, reviewable edit at the VCS layer, not in Gothab's
+review UI. Sharing unchanged context alone is not interference. Canonical edits
+are not an ordered script whose later steps silently bypass earlier guards.
+
+Wheat does not require a background editing daemon or assign canonical IDs to
+editor actions. Its functional baseline is to observe accumulated file
+modifications when the user explicitly adds them to a change. Agent tool calls
+and intermediate working-file states need not be captured. An optional daemon or
+editor integration may continuously preview the guarded edits that the next add
+would produce, show their current identities/review state, and warn when a nearby
+modification would consolidate previously separate edits. This is a projection of
+the same normalization algorithm, not a second source of truth or different
+functional model: canonical edits and IDs still result from explicit addition.
+If a subsequent modification reaches an existing edit's replacement or required
+guard, the preview must show that the old identity will be subsumed into a new
+combined edit, with prior review evidence no longer current for that combined
+edit. The likely editor boundary is an optional Wheat LSP server: it previews only
+open/visible buffers and may use standard diagnostics, code lenses, and commands
+plus custom requests where richer hunk rendering earns an editor extension. It is
+not required to observe external tools or unopened files. Those files receive the
+same canonical guarded-edit generation when they are explicitly added to the
+change.
+
+Adding work performs incremental normalization:
+
+1. Load the change's recorded edits and their application locations in the known
+   workspace baseline; compare that baseline with the modified files.
+2. Find the new modification ranges and relate them to existing edits, accounting
+   for shifted coordinates rather than treating old line numbers as identity.
+3. Preserve the exact definitions and IDs of unaffected existing edits. Do not
+   regenerate the entire edit set from a fresh whole-file diff.
+4. Subsuming modifications replace affected edits with a consolidated edit against
+   the change's authored base, including unchanged text between affected regions.
+   Capture its guard with the default rule while retaining explicitly requested
+   wider guard coverage. Repeat consolidation if guard growth causes further
+   interference. Assign the resulting canonical edit a new immutable identity.
+5. Remove a net edit that has been completely undone. Historical revisions retain
+   their old edits; only the new revision's selection changes.
+
+For example, an existing `E1: foo -> bar` followed by a working-file modification
+`bar -> baz` becomes `E2: foo -> baz`, not a canonical sequence of both edits.
+Returning `bar` to `foo` removes the net edit. Unrelated edits retain their IDs
+and review evidence even if their line positions shift. A consolidated edit
+requires fresh review; constituent approvals do not automatically approve it.
+No new edit identity is required before addition/normalization. Explicit wider
+guards are supplied at this boundary through the CLI, not registered in advance.
+
+Consolidation assumes an intended final result is available, as with local
+workspace additions. Independently submitted incompatible edits from concurrent
+agents still produce a conflict; Wheat must not invent their combined result.
+After explicit resolution, the resolved effect can become a consolidated edit.
+Detailed range mapping, guard-growth rules, and conflict-resolution evidence
+remain to be specified, but VCS-level consolidation and unaffected-ID preservation
+are settled requirements.
+
+Keep stable changes, immutable revisions, exact authored views/results,
+deterministic applications, and immutable published views. Dependency movement
+continues to create new applications of unchanged revisions rather than new
+descendant revisions merely to encode a rebase. A revision should preserve its
+constituent immutable edits, while an application should expose per-edit matching
+and conflict outcomes plus the exact overall tree/conflict result. The concrete
+collection representation and ordering contract remain open.
+
+This model does not promise that every agent tool call becomes a separate edit,
+that arbitrary edits commute, or that a textual match establishes semantic
+correctness. Tool mutations and logical changes remain distinct as described in
+the following section. Split/combined edits need explicit lineage rather than
+assuming that a diff renderer's hunk partition is durable identity.
+
+#### Interdiffs and individual review evidence
+
+An interdiff should distinguish preserved edits from added, removed, and modified
+edits, separately from changes in their application context. Given revisions
+`B1 = [E1, E2, E3]` and `B2 = [E1, E2, E3, E4]`, previously reviewed E1–E3 remain
+recognizable and E4 is new. Replacing E2 with a different definition E2' requires
+fresh review of E2'; it does not reset unrelated unchanged edits.
+
+Gothab owns reviewer identity, viewed/approved state, and merge policy. Wheat
+provides immutable edit definitions and exact application evidence. Review
+records need to identify the edit and the application/context actually observed.
+An unchanged edit whose guard remains uniquely valid can retain individual review
+evidence; ambiguity or guard failure cannot be represented as current valid
+approval. Historical evidence is retained rather than rewritten. Whether all
+such individual approvals suffice to authorize a new publication is a separate
+policy decision, not a conclusion of exact matching. CI remains tied to the exact
+integration state it tested.
+
+Broader review-context warnings are separate from guard validity. Language-aware
+analysis may report that an enclosing function, type, or module changed since
+review even when the edit and its guard still apply. Tree-sitter can supply syntax
+boundaries for supported languages; it does not establish semantic equivalence.
+Parser versions, unsupported languages, or missing analysis must not alter native
+edit identity or exact application results. Such warnings must remain visibly
+separate from application conflicts and from claims that an edit itself changed.
+
+Historical edit definitions, guards, application outcomes, and their required
+content must survive retention and reopen so old reviews/interdiffs remain
+reproducible. This extends the existing immutable closure/retention contract; it
+must not depend on old file bytes happening to remain cached. Ordinary Git imports
+currently synthesize one change per commit OID; inferring rewrite identity and
+preserving native edits through future Git round-trips is not already solved by
+adding guarded edits.
+
+#### Acceptance corpus
+
+Before treating the new model as implemented, exercise these cases through core
+application and persisted-store reopen, plus CLI tests for authoring controls:
+
+1. Sixteen independent guarded replacements in a 500-line file remain individually
+   identifiable; an edit outside their guards does not invalidate them.
+2. Moving an exact unique guarded block to different line numbers still permits
+   matching; missing or duplicated full guards produce explicit conflicts.
+3. Removing an authorization check inside required context conflicts even when
+   the expected replacement fragment itself still occurs uniquely.
+4. The default adds two lines on each side after uniqueness, clips at file edges,
+   and produces deterministic guards; explicit wider ranges are retained exactly.
+5. Insertions, deletions, empty files, missing final newlines, repeated text, and
+   the selected byte/line-ending rules have unambiguous outcomes.
+6. Explicit additions consolidate replacement/guard interference at the VCS layer,
+   including transitive interference after guard expansion; shared unchanged
+   context alone does not consolidate edits. Concurrent incompatible submissions
+   conflict rather than inventing a combined result. Independent replacements do
+   not depend on incidental iteration order.
+7. Adding E4 retains evidence for unchanged E1–E3; changing E2's guard or content
+   requires fresh review without resetting E1/E3. Removing, splitting, combining,
+   or reintroducing edits exercises the chosen lineage/carry-forward policy.
+8. Moving dependency A reapplies B without changing B's authored edit identities;
+   conflicts and any explicit resolution are visible rather than hidden as rebase
+   noise. Previously tested integration state is not confused with the new one.
+9. Reopen reproduces historical edit definitions, results, conflicts, and interdiff
+   inputs. Missing required historical content fails verification.
+10. A supported-language enclosing-function change can produce a separate review
+    warning while the exact edit remains applicable. Parser failure or unsupported
+    language does not change native application correctness.
+11. Without observing intermediate editor/tool actions, add `foo -> bar`, modify
+    the file to `baz`, and add again: the new revision contains `foo -> baz` with
+    a new ID. Undoing back to `foo` removes the edit. Unaffected edits retain exact
+    IDs despite line shifts, and historical revisions remain readable after reopen.
+12. An optional LSP/editor preview predicts the same canonical edit set as an
+    immediate explicit add for an open buffer. Moving a new modification into an
+    old edit's guard visibly changes the preview to a consolidated new identity;
+    stopping the LSP does not affect subsequent add semantics or repository state.
+    An externally modified or unopened file still receives guarded edits normally
+    when explicitly added, without requiring prior observation.
+
+#### Open guarded-edit decisions
+
+The following are questions for Bart, not defaults silently selected by this doc:
+
+1. **Deterministic context expansion.** Expand symmetrically, choose the smallest
+   total context with a defined tie-break, or prefer a particular side? How are
+   boundary sentinels and uniqueness handled when even whole-file text has repeated
+   candidate boundaries (especially empty insertions)? The agreed extra two lines
+   on each side are not up for reinterpretation as a relaxed matching margin.
+2. **Consolidation mechanics.** VCS-level consolidation at explicit addition and
+   preservation of unaffected edit IDs are decided above. Specify deterministic
+   range mapping from the workspace baseline to authored-base edits, transitive
+   guard-growth consolidation, and retention of explicit wider guard coverage.
+   Define application validation so canonical independent edits do not acquire
+   incidental ordering semantics.
+3. **Identity and lineage.** How do we distinguish identical definitions at distinct
+   occurrences or reintroductions? What survives an explicit file rename, split,
+   squash, or combined replacement? Which relationships are recorded rather than
+   inferred, and how do they affect review evidence?
+4. **Text and non-text boundaries.** Choose exact byte/range encoding, newline
+   treatment (including CRLF and no final newline), and file-start/end guards.
+   Specify create/delete/rename/mode and binary/whole-file operations without
+   silently normalizing text or weakening guard semantics.
+5. **Review policy and resolution evidence.** Specify removal/reintroduction and
+   cross-context approval policy, and how explicit conflict resolutions link old
+   applications to new edits. Decide which structural warnings are informational
+   versus policy gates; exact guard validity alone is not program correctness.
+6. **Bounded implementation and indexing.** Define limits for guard growth, matching
+   work, edit counts, storage/RPC batches, and history queries. Oversized or
+   ambiguous inputs must fail explicitly, never retry with weaker guards. Choose
+   canonical edit storage and application-semantics identification before schema
+   changes; permanent per-character identity is not required.
 
 ### Operations are not logical changes
 
@@ -648,8 +923,11 @@ cardinality. One agent task can contain many edit, write, formatter, generator,
 and shell-process mutations. Conversely, one broad process invocation may
 change files for several independent concerns that are later split.
 
-The default client behavior should treat tool or filesystem mutations as
-immutable causal operations that amend the current logical change:
+The earlier operation-capture sketch below is optional provenance, not a
+requirement to observe filesystem/tool mutations continuously. The agreed client
+workflow captures accumulated modifications at explicit addition to a change,
+as specified above. If a client supplies causal operation metadata, it may link
+those operations to the captured effects without making them canonical edit IDs:
 
 ```text
 Change
@@ -865,12 +1143,16 @@ identity calculation and reference closure emission, without adding root fields 
 `RepositoryReader` decodes lazy typed records and verifies retained inventories
 using verified object reads before root-only publication/CAS. It checks historical
 edit/conflict content against the aggregate content set as well as raw bytes;
-HEAD/existence responses are not accepted as integrity evidence. Traversal does not
-materialize a global closure, but shared trees may be reread and logical change-ID
-resolution currently scans retained changes. Directory depth is capped at 1024
-for verification and wide nodes are decoded whole. These are reference-scale
-limitations, not a qualified large-history verifier. Streaming Git import and
-executable reconstruction/CLI authority cutover remain outstanding.
+HEAD/existence responses are not accepted as integrity evidence. A fresh per-run
+SQLite scratch index proves retained/content membership and records context-scoped
+receipts for shared trees and selection/content radix subtrees; a byte- and
+entry-bounded authenticated-object cache avoids repeatedly decoding immutable nodes
+without carrying trust across validation calls. Directory depth remains capped at
+1024 and wide nodes are decoded whole. The resumable Git importer bypasses executable
+hydration, retains all pinned branch history, batches final inventories through a
+disk accumulator, and publishes a canonical branch envelope. SSEM and BinSchema are
+performance regression fixtures, not large-history qualification; wider/deeper
+repositories, remote ranges, and incremental cross-publication verification remain.
 Derived indexes such as reverse dependencies or path-to-
 conflict lookup may be immutable rebuildable segments; they accelerate queries
 but never become repository truth.

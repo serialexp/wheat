@@ -33,11 +33,9 @@ async fn canonical_reopen_preserves_history_and_allows_revision_and_publication(
         (head, change, second.revision_id, repo.canonical_closure())
     };
     let objects = LooseObjectStore::new(dir.path().join("objects"));
-    let root = RepositoryStateId::from_digest(*head.repository_state.as_bytes());
-    let mut reopened = RepositoryReader::new(&objects, &content)
-        .hydrate(root)
-        .await
-        .unwrap();
+    let reader = RepositoryReader::new(&objects, &content);
+    let initial_envelope = reader.envelope(head.envelope).await.unwrap();
+    let mut reopened = reader.hydrate(initial_envelope.state).await.unwrap();
     assert_eq!(reopened.canonical_closure(), closure);
     reopened
         .revise_change(change, revision, edit(None, b"three"))
@@ -46,12 +44,9 @@ async fn canonical_reopen_preserves_history_and_allows_revision_and_publication(
         .publish(head, &reopened)
         .await
         .unwrap();
-    let again = RepositoryReader::new(&objects, &content)
-        .hydrate(RepositoryStateId::from_digest(
-            *next.repository_state.as_bytes(),
-        ))
-        .await
-        .unwrap();
+    let reader = RepositoryReader::new(&objects, &content);
+    let root = reader.envelope(next.envelope).await.unwrap().state;
+    let again = reader.hydrate(root).await.unwrap();
     assert_eq!(again.working_view().tree["file"], ContentId::of(b"three"));
     assert_eq!(again.canonical_closure(), reopened.canonical_closure());
 }
@@ -78,12 +73,9 @@ async fn conflicted_stack_reopens_with_dependency_reapplication_intact() {
             .unwrap();
         (head, a, a2.revision_id, repo.canonical_closure())
     };
-    let mut repo = RepositoryReader::new(&objects, &content)
-        .hydrate(RepositoryStateId::from_digest(
-            *head.repository_state.as_bytes(),
-        ))
-        .await
-        .unwrap();
+    let reader = RepositoryReader::new(&objects, &content);
+    let root = reader.envelope(head.envelope).await.unwrap().state;
+    let mut repo = reader.hydrate(root).await.unwrap();
     assert_eq!(repo.canonical_closure(), expected);
     assert!(!repo.working_view().unresolved_conflicts.is_empty());
     // Restore the parent's old contents; the reconstructed dependency graph must reapply B.
@@ -115,13 +107,8 @@ async fn reopen_rejects_missing_historical_content_before_returning_editable_sta
         .unwrap();
     drop(repo);
     std::fs::remove_file(content.path(historical)).unwrap();
-    assert!(
-        RepositoryReader::new(&objects, &content)
-            .hydrate(RepositoryStateId::from_digest(
-                *head.repository_state.as_bytes()
-            ))
-            .await
-            .is_err()
-    );
+    let reader = RepositoryReader::new(&objects, &content);
+    let root = reader.envelope(head.envelope).await.unwrap().state;
+    assert!(reader.hydrate(root).await.is_err());
     assert_eq!(heads.read().unwrap(), head);
 }

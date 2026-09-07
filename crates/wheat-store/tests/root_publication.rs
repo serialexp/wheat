@@ -84,7 +84,11 @@ async fn reopen_and_publish_only_persisted_roots_without_repository() {
     let publisher = RepositoryPublisher::new(&reopened, &content, &heads);
     let initial = publisher.initialize_root(first).await.unwrap();
     let next = publisher.publish_root(initial, second).await.unwrap();
-    assert_eq!(next.repository_state, ObjectId::from(second));
+    let envelope = RepositoryReader::new(&reopened, &content)
+        .envelope(next.envelope)
+        .await
+        .unwrap();
+    assert_eq!(envelope.state, second);
     assert!(matches!(
         publisher.publish_root(initial, first).await,
         Err(RepositoryPublicationError::Head(

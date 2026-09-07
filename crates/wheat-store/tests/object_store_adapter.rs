@@ -4,7 +4,7 @@ use object_store::{ObjectStore as BackendObjectStore, memory::InMemory};
 use wheat_core::{ContentId, FileEdit, ObjectId, Repository, Transformation, Tree};
 use wheat_store::{
     ContentStore, ImmutableObjectStore, LocalPublicationStore, ObjectStoreAdapter,
-    ObjectStoreError, PublicationStore, RepositoryPublisher, S3ObjectStoreConfig,
+    ObjectStoreError, PublicationStore, RepositoryPublisher, RepositoryReader, S3ObjectStoreConfig,
 };
 
 fn canonical_objects() -> (Vec<u8>, Vec<u8>) {
@@ -110,9 +110,13 @@ async fn repository_closure_publishes_through_configured_s3_backend() {
         .await
         .unwrap();
     assert_eq!(heads.read().unwrap(), head);
+    let envelope = RepositoryReader::new(&objects, &content)
+        .envelope(head.envelope)
+        .await
+        .unwrap();
     assert_eq!(
         objects
-            .get(head.repository_state)
+            .get(envelope.state.into())
             .await
             .unwrap()
             .canonical_bytes,

@@ -6,7 +6,10 @@
 
 pub mod journal;
 mod staged_import;
-pub use staged_import::{StagedBranch, StagedImportError, StagedImportResult, stage_import};
+pub use staged_import::{
+    FinalizeImportError, StagedBranch, StagedImportError, StagedImportResult, finalize_import,
+    stage_import,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet},

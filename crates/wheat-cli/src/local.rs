@@ -1,7 +1,7 @@
 //! Canonical local repository authority; YAML snapshots are never read or written.
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use wheat_core::{Repository, RepositoryStateId, Tree};
+use wheat_core::{Repository, Tree};
 use wheat_store::{
     ContentStore, LocalPublicationStore, LooseObjectStore, PublicationStore, RepositoryPublisher,
     RepositoryReader,
@@ -50,9 +50,9 @@ pub fn with_repository(
         .read()
         .with_context(|| format!("cannot open Wheat repository: {}", root.display()))?;
     let runtime = runtime()?;
-    let mut repository = runtime.block_on(RepositoryReader::new(&objects, &content).hydrate(
-        RepositoryStateId::from_digest(*expected.repository_state.as_bytes()),
-    ))?;
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = runtime.block_on(reader.validate_envelope(expected.envelope))?;
+    let mut repository = runtime.block_on(reader.hydrate(envelope.state))?;
     let mut output = String::new();
     operation(&mut repository, &mut output)?;
     if persist {

@@ -17,6 +17,37 @@ fn retains_reads_and_deduplicates_content() {
 }
 
 #[test]
+fn creates_a_missing_store_root_and_fanout_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("content");
+    let store = ContentStore::new(&root);
+
+    let id = store.put(b"durable directory entries").unwrap();
+
+    assert!(root.is_dir());
+    assert!(store.path(id).parent().unwrap().is_dir());
+    assert_eq!(
+        fs::read(store.path(id)).unwrap(),
+        b"durable directory entries"
+    );
+}
+
+#[test]
+fn retry_verifies_an_already_published_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("content");
+    let store = ContentStore::new(&root);
+    let bytes = b"published before a directory sync failure";
+    let id = ContentId::of(bytes);
+    let path = store.path(id);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, bytes).unwrap();
+
+    assert_eq!(store.put(bytes).unwrap(), id);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
 fn distinguishes_missing_and_corrupt_content() {
     let directory = tempfile::tempdir().unwrap();
     let store = ContentStore::new(directory.path());

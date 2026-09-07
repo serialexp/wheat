@@ -50,7 +50,11 @@ pub(super) fn tree_edits(
         .transpose()?;
 
     let mut edits = BTreeMap::new();
-    compare_directories(git, old_tree, Some(new_tree), "", 0, content, &mut edits)?;
+    let mut batch = wheat_store::ContentWriteBatch::new(content);
+    compare_directories(git, old_tree, Some(new_tree), "", 0, &mut batch, &mut edits)?;
+    // The commit writer reads these IDs from the durable backing store.
+    // Never return edits while their content is only in the pending tail.
+    batch.commit()?;
     Ok(edits.into_values().collect())
 }
 
@@ -60,7 +64,7 @@ fn compare_directories(
     new: Option<gix::ObjectId>,
     prefix: &str,
     depth: usize,
-    content: &ContentStore,
+    content: &mut wheat_store::ContentWriteBatch<'_>,
     edits: &mut BTreeMap<String, FileEdit>,
 ) -> Result<(), StagedImportError> {
     if old == new {
@@ -106,7 +110,7 @@ fn compare_entries(
     new: Option<Entry>,
     path: &str,
     directory_depth: usize,
-    content: &ContentStore,
+    content: &mut wheat_store::ContentWriteBatch<'_>,
     edits: &mut BTreeMap<String, FileEdit>,
 ) -> Result<(), StagedImportError> {
     if matches!(
@@ -245,7 +249,7 @@ fn record_blob_edit(
     old: Option<gix::ObjectId>,
     new: Option<gix::ObjectId>,
     path: &str,
-    content: &ContentStore,
+    content: &mut wheat_store::ContentWriteBatch<'_>,
     edits: &mut BTreeMap<String, FileEdit>,
 ) -> Result<(), StagedImportError> {
     if old == new {
@@ -272,7 +276,7 @@ fn record_blob_edit(
 fn store_blob(
     git: &gix::Repository,
     oid: gix::ObjectId,
-    content: &ContentStore,
+    content: &mut wheat_store::ContentWriteBatch<'_>,
 ) -> Result<ContentId, StagedImportError> {
     let blob = git
         .find_object(oid)

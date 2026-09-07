@@ -18,6 +18,8 @@ use crate::{
     metadata,
 };
 
+mod finalize;
+pub use finalize::{FinalizeImportError, finalize_import};
 mod tree_diff;
 
 const NAMESPACE: Uuid = Uuid::from_u128(0xc245_a89b_519f_5a4b_9b36_d62b_78f5_2901);
@@ -87,8 +89,10 @@ pub async fn stage_import<O: ImmutableObjectStore>(
         }
     }
 
-    let writer = PersistedCommitWriter::new(objects, content);
+    let batch = wheat_store::BatchObjectStore::new(objects, 1024, 8 * 1024 * 1024);
+    let writer = PersistedCommitWriter::new(&batch, content);
     let empty = writer.empty_view().await?;
+    batch.flush().await.map_err(CommitWriterError::from)?;
     // A journal is only a hint: authenticate every reused object and relationship first.
     let mut after = None::<Vec<u8>>;
     loop {
@@ -141,6 +145,9 @@ pub async fn stage_import<O: ImmutableObjectStore>(
             view_id: persisted.resulting_view,
             application_id: persisted.application_id,
         };
+        // Buffered reads are not proof of durability. Flush before verification
+        // against the backing store, and only then acknowledge the journal row.
+        batch.flush().await.map_err(CommitWriterError::from)?;
         verify_mapping(objects, content, &journal, empty, &work.oid, native).await?;
         journal.complete(&work.oid, native)?;
         written += 1;
@@ -181,7 +188,7 @@ fn add_commit(
     Ok(())
 }
 
-fn pinned_branches(
+pub(super) fn pinned_branches(
     git: &gix::Repository,
 ) -> Result<BTreeMap<String, gix::ObjectId>, StagedImportError> {
     let mut out = BTreeMap::new();
@@ -203,7 +210,7 @@ fn pinned_branches(
     Ok(out)
 }
 
-fn snapshot_bytes(
+pub(super) fn snapshot_bytes(
     git: &gix::Repository,
     supplied: &Path,
     branches: &BTreeMap<String, gix::ObjectId>,

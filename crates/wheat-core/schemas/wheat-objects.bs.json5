@@ -33,6 +33,8 @@
         { type: "ConflictSetNodeV1", when: "value == 0x0b01" },
         { type: "ContentSetNodeV1", when: "value == 0x0c01" },
         { type: "RetainedSetNodeV1", when: "value == 0x0d01" },
+        { type: "BranchManifestV1", when: "value == 0x0e01" },
+        { type: "RepositoryEnvelopeV1", when: "value == 0x0f01" },
       ],
     },
 
@@ -69,6 +71,8 @@
     ConflictSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ContentSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RetainedSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    RepositoryStateId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    BranchManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
 
     TreeV1: {
       sequence: [
@@ -396,6 +400,90 @@
         { name: "retained_views", type: "RetainedSetId" },
         { name: "retained_revisions", type: "RetainedSetId" },
         { name: "retained_applications", type: "RetainedSetId" },
+      ],
+    },
+
+    BranchManifestV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0e01 },
+        { name: "branches", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "BranchManifestEntryV1" } },
+      ],
+    },
+    BranchManifestEntryV1: {
+      sequence: [
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "view", type: "ViewId" },
+      ],
+    },
+    RepositoryEnvelopeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0f01 },
+        { name: "state", type: "RepositoryStateId" },
+        { name: "branches", type: "BranchManifestId" },
+      ],
+    },
+
+    // Physical sealed-segment records. These deliberately are not variants of
+    // WheatObject: changing segment layout must never change logical identity.
+    SegmentPrefixV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484541 },
+        { name: "version", type: "uint16", const: 1 },
+      ],
+    },
+    SegmentIndexEntryV1: {
+      sequence: [
+        { name: "namespace", type: "uint8" },
+        { name: "kind", type: "uint16" },
+        { name: "digest", type: "Digest256" },
+        { name: "offset", type: "uint64" },
+        { name: "length", type: "uint64" },
+      ],
+    },
+    SegmentIndexPageV1: {
+      sequence: [
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SegmentIndexEntryV1" } },
+      ],
+    },
+    SegmentIndexKeyV1: {
+      sequence: [
+        { name: "namespace", type: "uint8" },
+        { name: "digest", type: "Digest256" },
+      ],
+    },
+    SegmentDirectoryEntryV1: {
+      sequence: [
+        { name: "first_key", type: "SegmentIndexKeyV1" },
+        { name: "offset", type: "uint64" },
+        { name: "length", type: "uint64" },
+        { name: "page_digest", type: "Digest256" },
+      ],
+    },
+    SegmentDirectoryV1: {
+      sequence: [
+        { name: "pages", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SegmentDirectoryEntryV1" } },
+      ],
+    },
+    SegmentFooterV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484654 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "total_length", type: "uint64" },
+        { name: "object_count", type: "uint64" },
+        { name: "index_start", type: "uint64" },
+        { name: "directory_offset", type: "uint64" },
+        { name: "directory_length", type: "uint64" },
+        { name: "body_digest", type: "Digest256" },
+      ],
+    },
+    SegmentCatalogRecordV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484354 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "generation", type: "uint64" },
+        { name: "previous", type: "optional", value_type: "Digest256" },
+        { name: "segment", type: "Digest256" },
+        { name: "stored_length", type: "uint64" },
       ],
     },
   },

@@ -30,12 +30,14 @@ pub enum RepositoryPublicationError {
     Applications(#[from] crate::ApplicationMapError),
     #[error(transparent)]
     Tree(#[from] crate::MerkleTreeError),
+    #[error(transparent)]
+    VerificationScratch(#[from] crate::verification_scratch::VerificationScratchError),
 }
 
 pub struct RepositoryPublisher<'a, O, P> {
-    objects: &'a O,
-    content: &'a ContentStore,
-    publications: &'a P,
+    pub(crate) objects: &'a O,
+    pub(crate) content: &'a ContentStore,
+    pub(crate) publications: &'a P,
 }
 
 impl<'a, O, P> RepositoryPublisher<'a, O, P>
@@ -70,9 +72,7 @@ where
         repository: &Repository,
     ) -> Result<RepositoryHead, RepositoryPublicationError> {
         let closure = self.prepare(repository).await?;
-        let head = RepositoryHead::initial(closure.state.id.into());
-        self.publications.initialize(head)?;
-        Ok(head)
+        self.initialize_root(closure.state.id).await
     }
 
     pub async fn publish(
@@ -88,12 +88,11 @@ where
         &self,
         root: wheat_core::RepositoryStateId,
     ) -> Result<RepositoryHead, RepositoryPublicationError> {
-        crate::RepositoryReader::new(self.objects, self.content)
-            .validate_complete(root)
-            .await?;
-        let head = RepositoryHead::initial(root.into());
-        self.publications.initialize(head)?;
-        Ok(head)
+        let branches = wheat_core::BranchManifestRecord {
+            branches: Default::default(),
+        };
+        let envelope = self.prepare_envelope(root, &branches).await?;
+        self.initialize_prepared_envelope(envelope).await
     }
 
     pub async fn publish_root(
@@ -101,21 +100,11 @@ where
         expected: RepositoryHead,
         root: wheat_core::RepositoryStateId,
     ) -> Result<RepositoryHead, RepositoryPublicationError> {
-        let proposed = expected.next(root.into())?;
-        let actual = self.publications.read()?;
-        if actual != expected {
-            return Err(PublicationError::Stale { expected, actual }.into());
-        }
         let reader = crate::RepositoryReader::new(self.objects, self.content);
-        reader.validate_complete(root).await?;
-        reader
-            .validate_transition(
-                wheat_core::RepositoryStateId::from_digest(*expected.repository_state.as_bytes()),
-                root,
-            )
-            .await?;
-        self.publications.compare_and_advance(expected, proposed)?;
-        Ok(proposed)
+        let old = reader.envelope(expected.envelope).await?;
+        let branches = reader.branch_manifest(old.branches).await?;
+        let envelope = self.prepare_envelope(root, &branches).await?;
+        self.publish_envelope(expected, envelope).await
     }
 
     async fn verify_closure(

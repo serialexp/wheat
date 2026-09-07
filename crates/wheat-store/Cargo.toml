@@ -5,16 +5,20 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
+blake3 = { workspace = true }
+futures = "0.3"
 libc = { workspace = true }
 object_store = { version = "0.14.1", features = ["aws"] }
+rusqlite = "0.32"
+tempfile = "3"
 thiserror = { workspace = true }
+tokio = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 
 [dev-dependencies]
 hdrhistogram = { workspace = true }
 object_store = { version = "0.14.1", features = ["aws"] }
 serde_json = { workspace = true }
-tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

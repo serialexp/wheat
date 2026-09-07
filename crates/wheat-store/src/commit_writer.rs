@@ -4,7 +4,7 @@ use thiserror::Error;
 use wheat_core::{
     ApplicationId, ApplicationRecord, ApplicationResultRecord, CanonicalObjectError, Change,
     ChangeId, ChangeObjectId, ChangeProposal, ContentId, ContentManifestRecord, DirectoryEntry,
-    RevisionId, RevisionRecord, TreeId, ViewId, ViewRecord, decode_view_record,
+    RevisionId, RevisionRecord, ViewId, ViewRecord, decode_view_record,
 };
 
 use crate::{
@@ -245,7 +245,13 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         let application_root = ApplicationMapStore::new(self.objects)
             .insert(parent_record.applications, proposal.id, application_id)
             .await?;
-        let content_root = self.content_set(resulting_tree).await?;
+        let content_root = crate::commit_content::update_content(
+            self.objects,
+            parent_record.required_content,
+            resulting_tree,
+            &revision.transformation.edits,
+        )
+        .await?;
         let manifest = ContentManifestRecord {
             content: content_root,
         };
@@ -285,33 +291,6 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             .into());
         }
         Ok(decode_view_record(&object.canonical_bytes)?)
-    }
-
-    // Temporary scan-per-commit implementation; traversal and set writes remain bounded.
-    async fn content_set(&self, tree: TreeId) -> Result<wheat_core::ContentSetId> {
-        let sets = ContentSetStore::new(self.objects);
-        let mut root = sets.empty_root().await?;
-        let mut stack = vec![tree];
-        let trees = MerkleTreeStore::new(self.objects);
-        let mut batch = Vec::with_capacity(1024);
-        while let Some(id) = stack.pop() {
-            for entry in trees.read_node(id).await?.entries.into_values() {
-                match entry {
-                    DirectoryEntry::Directory(child) => stack.push(child),
-                    DirectoryEntry::File(content) => {
-                        self.content.get(content)?;
-                        batch.push((content, true));
-                        if batch.len() == 1024 {
-                            root = sets.update_batch(root, batch.drain(..)).await?;
-                        }
-                    }
-                }
-            }
-        }
-        if !batch.is_empty() {
-            root = sets.update_batch(root, batch).await?;
-        }
-        Ok(root)
     }
 }
 

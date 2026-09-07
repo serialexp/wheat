@@ -6,34 +6,34 @@ use std::{
 };
 
 use thiserror::Error;
-use wheat_core::ObjectId;
+use wheat_core::RepositoryEnvelopeId;
 
 const HEAD_MAGIC: &[u8; 9] = b"WHEATHEAD";
-const HEAD_VERSION: u8 = 1;
+const HEAD_VERSION: u8 = 2;
 const ENCODED_HEAD_LEN: usize = HEAD_MAGIC.len() + 1 + 8 + 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RepositoryHead {
     pub generation: u64,
-    pub repository_state: ObjectId,
+    pub envelope: RepositoryEnvelopeId,
 }
 
 impl RepositoryHead {
     #[must_use]
-    pub fn initial(repository_state: ObjectId) -> Self {
+    pub fn initial(envelope: RepositoryEnvelopeId) -> Self {
         Self {
             generation: 0,
-            repository_state,
+            envelope,
         }
     }
 
-    pub fn next(self, repository_state: ObjectId) -> Result<Self, PublicationError> {
+    pub fn next(self, envelope: RepositoryEnvelopeId) -> Result<Self, PublicationError> {
         Ok(Self {
             generation: self
                 .generation
                 .checked_add(1)
                 .ok_or(PublicationError::InvalidGeneration)?,
-            repository_state,
+            envelope,
         })
     }
 
@@ -43,7 +43,7 @@ impl RepositoryHead {
         encoded[HEAD_MAGIC.len()] = HEAD_VERSION;
         encoded[HEAD_MAGIC.len() + 1..HEAD_MAGIC.len() + 9]
             .copy_from_slice(&self.generation.to_be_bytes());
-        encoded[HEAD_MAGIC.len() + 9..].copy_from_slice(self.repository_state.as_bytes());
+        encoded[HEAD_MAGIC.len() + 9..].copy_from_slice(self.envelope.as_bytes());
         encoded
     }
 
@@ -59,14 +59,14 @@ impl RepositoryHead {
                 .try_into()
                 .expect("fixed generation range"),
         );
-        let repository_state = ObjectId::from_digest(
+        let envelope = RepositoryEnvelopeId::from_digest(
             encoded[HEAD_MAGIC.len() + 9..]
                 .try_into()
                 .expect("fixed digest range"),
         );
         Ok(Self {
             generation,
-            repository_state,
+            envelope,
         })
     }
 }

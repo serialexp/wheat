@@ -4,6 +4,7 @@ use wheat_core::{ChangeId, ContentId, FileEdit, Repository, Transformation, Tree
 use wheat_store::{
     ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, ObjectKind,
     PublicationError, PublicationStore, RepositoryPublicationError, RepositoryPublisher,
+    RepositoryReader,
 };
 
 fn edit(path: &str, value: &[u8]) -> Transformation {
@@ -41,14 +42,15 @@ async fn publishes_complete_canonical_closure_before_head() {
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let head = publisher.initialize(&repository).await.unwrap();
     let closure = repository.canonical_closure();
+    let envelope = RepositoryReader::new(&objects, &content)
+        .envelope(head.envelope)
+        .await
+        .unwrap();
 
-    assert_eq!(
-        head.repository_state.as_bytes(),
-        closure.state.id.as_bytes()
-    );
+    assert_eq!(envelope.state.as_bytes(), closure.state.id.as_bytes());
     assert_eq!(
         objects
-            .get_kind(head.repository_state, ObjectKind::RepositoryState)
+            .get_kind(envelope.state.into(), ObjectKind::RepositoryState)
             .await
             .unwrap()
             .canonical_bytes,

@@ -41,6 +41,20 @@ impl<'a, O: ImmutableObjectStore> RepositoryReader<'a, O> {
     );
     read_record!(view, ViewId, ViewRecord, View, decode_view_record);
     read_record!(
+        branch_manifest,
+        BranchManifestId,
+        BranchManifestRecord,
+        BranchManifest,
+        decode_branch_manifest_record
+    );
+    read_record!(
+        envelope,
+        RepositoryEnvelopeId,
+        RepositoryEnvelopeRecord,
+        RepositoryEnvelope,
+        decode_repository_envelope_record
+    );
+    read_record!(
         manifest,
         ContentManifestId,
         ContentManifestRecord,
