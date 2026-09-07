@@ -40,7 +40,7 @@ pub fn initialize(root: &Path) -> Result<()> {
 pub fn with_repository(
     root: &Path,
     persist: bool,
-    operation: impl FnOnce(&mut Repository, &mut String) -> Result<()>,
+    operation: impl FnOnce(&mut Repository, &ContentStore, &mut String) -> Result<()>,
 ) -> Result<()> {
     reject_legacy(root)?;
     let objects = LooseObjectStore::new(root.join(".wheat/objects"));
@@ -54,8 +54,10 @@ pub fn with_repository(
     let envelope = runtime.block_on(reader.validate_envelope(expected.envelope))?;
     let mut repository = runtime.block_on(reader.hydrate(envelope.state))?;
     let mut output = String::new();
-    operation(&mut repository, &mut output)?;
+    operation(&mut repository, &content, &mut output)?;
     if persist {
+        let published = repository.published_view().id;
+        repository.publish(published)?;
         runtime.block_on(
             RepositoryPublisher::new(&objects, &content, &heads).publish(expected, &repository),
         )?;
@@ -73,24 +75,32 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wheat_core::Transformation;
+    use wheat_core::{ApplicationContext, RevisionEdits};
 
     #[test]
     fn concurrent_writer_cannot_overwrite_winning_head() {
         let dir = tempfile::tempdir().unwrap();
         initialize(dir.path()).unwrap();
-        let result = with_repository(dir.path(), true, |stale, output| {
-            stale.create_change([], Transformation::default())?;
+        let result = with_repository(dir.path(), true, |stale, content, output| {
+            stale.create_change(
+                [],
+                RevisionEdits::default(),
+                ApplicationContext::new(content),
+            )?;
             output.push_str("must not be printed\n");
-            with_repository(dir.path(), true, |winner, _| {
-                winner.create_change([], Transformation::default())?;
+            with_repository(dir.path(), true, |winner, content, _| {
+                winner.create_change(
+                    [],
+                    RevisionEdits::default(),
+                    ApplicationContext::new(content),
+                )?;
                 Ok(())
             })?;
             Ok(())
         });
         assert!(result.is_err());
         assert!(format!("{:#}", result.unwrap_err()).contains("publication expected"));
-        with_repository(dir.path(), false, |repository, _| {
+        with_repository(dir.path(), false, |repository, _, _| {
             assert_eq!(repository.current_revisions().count(), 1);
             Ok(())
         })

@@ -6,14 +6,17 @@ use std::{
     time::Instant,
 };
 use wheat_core::ObjectId;
-use wheat_git::{finalize_import, stage_import};
+use wheat_git::{FinalizePhase, finalize_import_with_observer, stage_import};
 use wheat_store::*;
+
+const OBJECT_KIND_COUNT: usize = 16;
+
 struct Meter {
     inner: PackedObjectStore,
     reads: AtomicU64,
     writes: AtomicU64,
     bytes: AtomicU64,
-    reads_by_kind: [AtomicU64; 15],
+    reads_by_kind: [AtomicU64; OBJECT_KIND_COUNT],
 }
 #[async_trait]
 impl ImmutableObjectStore for Meter {
@@ -104,10 +107,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resumed = stage_import(&source, &journal, &objects, &content, Some(0)).await?;
     assert_eq!(staged, resumed);
     objects.report("resume_verify", start);
-    let start = Instant::now();
-    println!("starting=finalize");
-    let head = finalize_import(&source, &journal, &objects, &content, &heads, &branch).await?;
-    objects.report("finalize", start);
+    let phase_start = std::cell::Cell::new(None::<Instant>);
+    let last_phase = std::cell::Cell::new(None::<FinalizePhase>);
+    let head = finalize_import_with_observer(
+        &source,
+        &journal,
+        &objects,
+        &content,
+        &heads,
+        &branch,
+        |phase| {
+            if let (Some(previous), Some(start)) = (last_phase.get(), phase_start.get()) {
+                objects.report(previous.as_str(), start);
+            }
+            println!("starting={}", phase.as_str());
+            last_phase.set(Some(phase));
+            phase_start.set(Some(Instant::now()));
+        },
+    )
+    .await?;
+    if let (Some(phase), Some(start)) = (last_phase.get(), phase_start.get()) {
+        objects.report(phase.as_str(), start);
+    }
     println!("generation={} envelope={}", head.generation, head.envelope);
     Ok(())
 }

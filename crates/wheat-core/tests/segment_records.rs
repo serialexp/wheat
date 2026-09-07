@@ -53,6 +53,46 @@ fn physical_records_round_trip_and_footer_is_fixed() {
 }
 
 #[test]
+fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
+    let edit_entry = SegmentIndexEntry {
+        namespace: SEGMENT_NAMESPACE_METADATA,
+        kind: SegmentIndexEntry::canonical_kind_code(CanonicalObjectKind::Edit),
+        digest: [16; 32],
+        offset: SEGMENT_PREFIX_ENCODED_SIZE as u64,
+        length: 42,
+    };
+    assert_eq!(edit_entry.kind, 16);
+    let page = SegmentIndexPage {
+        entries: vec![edit_entry],
+    };
+    let bytes = encode_segment_index_page(&page).unwrap();
+    assert_eq!(decode_segment_index_page(&bytes).unwrap(), page);
+    assert_eq!(
+        SegmentIndexEntry::canonical_kind(16),
+        Some(CanonicalObjectKind::Edit)
+    );
+
+    for kind in [0, 17, u16::MAX] {
+        let invalid = SegmentIndexPage {
+            entries: vec![SegmentIndexEntry {
+                namespace: SEGMENT_NAMESPACE_METADATA,
+                kind,
+                digest: [0; 32],
+                offset: 0,
+                length: 0,
+            }],
+        };
+        assert!(matches!(
+            encode_segment_index_page(&invalid),
+            Err(SegmentRecordError::InvalidNamespaceKind {
+                namespace: SEGMENT_NAMESPACE_METADATA,
+                kind: rejected,
+            }) if rejected == kind
+        ));
+    }
+}
+
+#[test]
 fn catalog_record_without_previous_round_trips_and_is_canonical() {
     let catalog = SegmentCatalogRecord {
         generation: 0,

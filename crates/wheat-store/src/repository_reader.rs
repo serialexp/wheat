@@ -76,5 +76,6 @@ impl<'a, O: ImmutableObjectStore> RepositoryReader<'a, O> {
         decode_application_record
     );
     read_record!(change, ChangeObjectId, Change, Change, decode_change);
+    read_record!(edit, EditId, EditRecord, Edit, decode_edit_record);
     read_record!(conflict, ConflictId, Conflict, Conflict, decode_conflict);
 }

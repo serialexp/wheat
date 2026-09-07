@@ -6,8 +6,30 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use hdrhistogram::Histogram;
 use object_store::{ObjectStore as BackendObjectStore, memory::InMemory};
 use serde_json::{Value, json};
-use wheat_core::{ChangeId, ContentId, FileEdit, ObjectId, Repository, Transformation, Tree};
-use wheat_store::{ImmutableObjectStore, ObjectStoreAdapter, S3ObjectStoreConfig};
+use wheat_core::*;
+use wheat_store::{ContentStore, ImmutableObjectStore, ObjectStoreAdapter, S3ObjectStoreConfig};
+
+fn revision_edits(path: &str, value: &[u8]) -> RevisionEdits {
+    let edit = EditRecord::new(
+        path,
+        EditOperation::ExactFile {
+            expected: None,
+            replacement: Some(FileValue {
+                content: ContentId::of(value),
+                kind: FileKind::Regular,
+            }),
+        },
+    )
+    .unwrap();
+    let id = edit.id();
+    RevisionEdits {
+        edits: [(id, edit)].into(),
+        transition: EditTransition {
+            added: [id].into(),
+            ..Default::default()
+        },
+    }
+}
 
 const DEFAULT_OBJECTS: usize = 200;
 const DEFAULT_LARGE_OBJECTS: usize = 16;
@@ -22,19 +44,18 @@ struct Corpus {
 impl Corpus {
     fn small_revisions(count: usize) -> Self {
         let mut objects = Vec::with_capacity(count);
+        let directory = tempfile::tempdir().unwrap();
+        let content = ContentStore::new(directory.path());
         for index in 0..count {
             let mut repository = Repository::new(Tree::new());
+            let value = format!("value-{index}");
+            content.put(value.as_bytes()).unwrap();
             let outcome = repository
                 .create_change_with_id(
                     ChangeId::new(),
                     [],
-                    Transformation {
-                        edits: vec![FileEdit {
-                            path: format!("src/{index:06}.rs"),
-                            expected: None,
-                            replacement: Some(ContentId::of(format!("value-{index}").as_bytes())),
-                        }],
-                    },
+                    revision_edits(&format!("src/{index:06}.rs"), value.as_bytes()),
+                    ApplicationContext::new(&content),
                 )
                 .unwrap();
             push_object(
@@ -55,7 +76,12 @@ impl Corpus {
                 .map(|entry| {
                     (
                         format!("src/{object_index:03}/{entry:06}.rs"),
-                        ContentId::of(format!("value-{object_index}-{entry}").as_bytes()),
+                        wheat_core::FileValue {
+                            content: ContentId::of(
+                                format!("value-{object_index}-{entry}").as_bytes(),
+                            ),
+                            kind: wheat_core::FileKind::Regular,
+                        },
                     )
                 })
                 .collect::<BTreeMap<_, _>>();

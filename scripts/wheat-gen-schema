@@ -44,6 +44,9 @@ regenerate() {
         "${output}/Cargo.toml"
     sed -i 's/name = "binschema-runtime"/name = "wheat-binschema-runtime"/' \
         "${output}/binschema_runtime/Cargo.toml"
+    # Canonical validation needs the decoder's final position without coupling
+    # wheat-core directly to the vendored runtime crate.
+    printf '\npub use binschema_runtime::{BitOrder, BitStreamDecoder};\n' >> "${output}/src/lib.rs"
 }
 
 if [[ "${CHECK}" -eq 1 ]]; then

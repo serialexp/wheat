@@ -35,6 +35,7 @@
         { type: "RetainedSetNodeV1", when: "value == 0x0d01" },
         { type: "BranchManifestV1", when: "value == 0x0e01" },
         { type: "RepositoryEnvelopeV1", when: "value == 0x0f01" },
+        { type: "EditV1", when: "value == 0x1001" },
       ],
     },
 
@@ -60,6 +61,7 @@
     // Every other metadata ID is the BLAKE3-256 address of the referenced
     // object's complete canonical WheatObject encoding.
     RevisionId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    EditId: { sequence: [{ name: "digest", type: "Digest256" }] },
     TreeId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ChangeObjectId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ApplicationId: { sequence: [{ name: "digest", type: "Digest256" }] },
@@ -106,10 +108,22 @@
         { type: "DirectoryEntryRefV1", when: "value == 1" },
       ],
     },
+    FileKindV1: {
+      sequence: [
+        // 0 = regular, 1 = executable, 2 = symbolic link.
+        { name: "value", type: "uint8" },
+      ],
+    },
+    FileValueV1: {
+      sequence: [
+        { name: "content", type: "ContentId" },
+        { name: "kind", type: "FileKindV1" },
+      ],
+    },
     FileEntryV1: {
       sequence: [
         { name: "entry_kind", type: "uint8", const: 0 },
-        { name: "content", type: "ContentId" },
+        { name: "value", type: "FileValueV1" },
       ],
     },
     DirectoryEntryRefV1: {
@@ -196,34 +210,29 @@
           items: { type: "ChangeId" },
         },
         { name: "authored_against", type: "ViewId" },
-        { name: "transformation", type: "TransformationV1" },
+        { name: "edits", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+        { name: "transition", type: "EditTransitionV1" },
         { name: "resulting_tree", type: "TreeId" },
       ],
     },
-    TransformationV1: {
+    EditTransitionV1: {
       sequence: [
-        {
-          name: "edits",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          items: { type: "FileEditV1" },
-        },
+        { name: "preserved", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+        { name: "added", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+        { name: "removed", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+        { name: "subsumed", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditSubsumptionV1" } },
+        { name: "resolutions", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ConflictResolutionEvidenceV1" } },
       ],
     },
-    FileEditV1: {
-      sequence: [
-        {
-          name: "path",
-          type: "string",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          encoding: "utf8",
-        },
-        { name: "expected", type: "optional", value_type: "ContentId" },
-        { name: "replacement", type: "optional", value_type: "ContentId" },
-      ],
-    },
+    EditSubsumptionV1: { sequence: [
+      { name: "source", type: "EditId" },
+      { name: "replacements", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+    ] },
+    ConflictResolutionEvidenceV1: { sequence: [
+      { name: "application", type: "ApplicationId" },
+      { name: "conflicted_edits", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+      { name: "replacement_edits", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+    ] },
 
     ApplicationV1: {
       sequence: [
@@ -231,6 +240,7 @@
         { name: "revision_id", type: "RevisionId" },
         { name: "target_view", type: "ViewId" },
         { name: "result", type: "ApplicationResultV1" },
+        { name: "applied", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "AppliedEditEntryV1" } },
       ],
     },
     ApplicationResultV1: {
@@ -260,28 +270,36 @@
         { name: "wire_tag", type: "uint16", const: 0x0501 },
         { name: "target_view", type: "ViewId" },
         {
-          name: "paths",
+          name: "edits",
           type: "array",
           kind: "length_prefixed",
           length_type: "uint32",
-          items: { type: "PathConflictV1" },
+          items: { type: "FailedEditEntryV1" },
         },
       ],
     },
-    PathConflictV1: {
-      sequence: [
-        {
-          name: "path",
-          type: "string",
-          kind: "length_prefixed",
-          length_type: "uint32",
-          encoding: "utf8",
-        },
-        { name: "expected", type: "optional", value_type: "ContentId" },
-        { name: "actual", type: "optional", value_type: "ContentId" },
-        { name: "proposed", type: "optional", value_type: "ContentId" },
-      ],
-    },
+    ByteRangeV1: { sequence: [{ name: "start", type: "uint64" }, { name: "end", type: "uint64" }] },
+    AppliedEditEntryV1: { sequence: [{ name: "edit", type: "EditId" }, { name: "evidence", type: "AppliedEditEvidenceV1" }] },
+    AppliedEditEvidenceV1: { sequence: [
+      { name: "target", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
+      { name: "read", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ByteRangeV1" } },
+      { name: "write", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ByteRangeV1" } },
+    ] },
+    FailedEditEntryV1: { sequence: [{ name: "edit", type: "EditId" }, { name: "evidence", type: "FailedEditEvidenceV1" }] },
+    FailedEditEvidenceV1: { sequence: [
+      { name: "target", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
+      { name: "reason", type: "EditFailureV1" },
+    ] },
+    EditFailureV1: { type: "discriminated_union", discriminator: { peek: "uint8" }, variants: [
+      { type: "NoMatchFailureV1", when: "value == 0" }, { type: "AmbiguousFailureV1", when: "value == 1" },
+      { type: "InterferenceFailureV1", when: "value == 2" }, { type: "KindMismatchFailureV1", when: "value == 3" },
+      { type: "ExpectedFileMismatchFailureV1", when: "value == 4" },
+    ] },
+    NoMatchFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 0 }] },
+    AmbiguousFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 1 }] },
+    InterferenceFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 2 }, { name: "with", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } }] },
+    KindMismatchFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 3 }] },
+    ExpectedFileMismatchFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 4 }] },
 
     ViewV1: {
       sequence: [
@@ -304,9 +322,9 @@
     RevisionMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0901 },
-        { name: "depth", type: "uint8" },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         {
-          // Zero or one element. A value is legal only at terminal depth 16.
+          // Zero or one element. A value is legal only after consuming all 16 key bytes.
           name: "value",
           type: "array",
           kind: "length_prefixed",
@@ -332,7 +350,7 @@
     ApplicationMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0a01 },
-        { name: "depth", type: "uint8" },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationId" } },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationMapChildV1" } },
       ],
@@ -347,7 +365,7 @@
     ConflictSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0b01 },
-        { name: "depth", type: "uint8" },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "present", type: "bool" },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ConflictSetChildV1" } },
       ],
@@ -362,7 +380,7 @@
     ContentSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0c01 },
-        { name: "depth", type: "uint8" },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "present", type: "bool" },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentSetChildV1" } },
       ],
@@ -377,7 +395,7 @@
     RetainedSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0d01 },
-        { name: "depth", type: "uint8" },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "present", type: "bool" },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "RetainedSetChildV1" } },
       ],
@@ -420,6 +438,45 @@
         { name: "wire_tag", type: "uint16", const: 0x0f01 },
         { name: "state", type: "RepositoryStateId" },
         { name: "branches", type: "BranchManifestId" },
+      ],
+    },
+
+    // Experimental standalone edit definition. V1 intentionally contains only
+    // canonical matching inputs; coordinates and lineage live elsewhere.
+    EditV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x1001 },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "operation", type: "EditOperationV1" },
+      ],
+    },
+    EditOperationV1: {
+      type: "discriminated_union",
+      discriminator: { peek: "uint8" },
+      variants: [
+        { type: "GuardedTextEditV1", when: "value == 0" },
+        { type: "ExactFileEditV1", when: "value == 1" },
+      ],
+    },
+    GuardedTextEditV1: {
+      sequence: [
+        { name: "operation_kind", type: "uint8", const: 0 },
+        { name: "kind", type: "FileKindV1" },
+        { name: "before", type: "ContentId" },
+        { name: "expected", type: "ContentId" },
+        { name: "replacement", type: "ContentId" },
+        { name: "after", type: "ContentId" },
+        { name: "start_anchor", type: "bool" },
+        { name: "end_anchor", type: "bool" },
+      ],
+    },
+    ExactFileEditV1: {
+      sequence: [
+        { name: "operation_kind", type: "uint8", const: 1 },
+        // Zero or one element. Arrays avoid the generator's unsupported optional
+        // fields directly inside discriminated-union variants.
+        { name: "expected", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
+        { name: "replacement", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
       ],
     },
 

@@ -7,6 +7,11 @@
 mod branch_records;
 mod collection;
 mod collection_builders;
+mod content_io;
+pub mod edit_application;
+pub mod edit_capture;
+mod edit_records;
+pub mod guarded;
 mod hydration;
 mod id;
 mod model;
@@ -15,6 +20,7 @@ mod repository;
 mod root_builders;
 mod segment_records;
 mod semantic_records;
+pub mod text_capture;
 mod wire;
 
 pub use branch_records::{BranchManifestRecord, RepositoryEnvelopeRecord};
@@ -26,18 +32,22 @@ pub use collection_builders::{
     build_application_map, build_conflict_set, build_content_set, build_retained_set,
     build_revision_map,
 };
+pub use content_io::{ApplicationContext, ContentIo};
+pub use edit_records::{EditOperation, EditRecord, decode_edit_record};
 pub use hydration::{hydrate_application, hydrate_revision};
 pub use id::{
     ApplicationId, ApplicationMapId, BranchManifestId, ChangeId, ChangeObjectId, ConflictId,
-    ConflictSetId, ContentId, ContentManifestId, ContentSetId, ObjectId, ParseContentIdError,
-    ParseDigestIdError, RepositoryEnvelopeId, RepositoryStateId, RetainedSetId, RevisionId,
-    RevisionMapId, TreeId, ViewId,
+    ConflictSetId, ContentId, ContentManifestId, ContentSetId, EditId, ObjectId,
+    ParseContentIdError, ParseDigestIdError, RepositoryEnvelopeId, RepositoryStateId,
+    RetainedSetId, RevisionId, RevisionMapId, TreeId, ViewId,
 };
 pub use model::{
-    Actor, Application, ApplicationResult, CanonicalObject, Change, ChangeMetadata, ChangeRevision,
-    Conflict, ConflictResolution, DependencyGraph, DirectoryEntry, DirectoryNode, FileEdit,
-    PathConflict, RepositoryClosure, RepositoryState, RepositoryView, RevisionMapChild,
-    RevisionMapNode, RevisionMetadata, SourceProvenance, Timestamp, Transformation, Tree,
+    Actor, Application, ApplicationResult, AppliedEditEvidence, ByteRange, CanonicalObject, Change,
+    ChangeMetadata, ChangeRevision, Conflict, ConflictResolution, ConflictResolutionEvidence,
+    DependencyGraph, DirectoryEntry, DirectoryNode, EditFailure, EditSubsumption, EditTransition,
+    FailedEditEvidence, FileKind, FileValue, RepositoryClosure, RepositoryState, RepositoryView,
+    RevisionEdits, RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance,
+    Timestamp, Tree,
 };
 pub use persisted::{ContentManifestRecord, RepositoryStateRecord, ViewRecord};
 pub use repository::{

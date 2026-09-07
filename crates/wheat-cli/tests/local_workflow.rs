@@ -65,7 +65,16 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
 
     let a = wheat(
         directory.path(),
-        &["change", "new", "--path", "shared", "--value", "base"],
+        &[
+            "change",
+            "new",
+            "--path",
+            "shared",
+            "--value",
+            "base",
+            "--replacement-kind",
+            "executable",
+        ],
     );
     let a_change = field(&a, "change");
     let a_revision = field(&a, "revision");
@@ -80,31 +89,55 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
             "shared",
             "--expected",
             "base",
+            "--expected-kind",
+            "executable",
             "--value",
             "child",
         ],
     );
     assert!(b.status.success(), "{}", String::from_utf8_lossy(&b.stderr));
+    let b_change = field(&b, "change");
     let b_revision = field(&b, "revision");
 
+    // Revision capture reads only the explicitly selected workspace file.
+    let shared = directory.path().join("shared");
+    std::fs::write(&shared, "revised-base").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&shared, {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::Permissions::from_mode(0o755)
+    })
+    .unwrap();
     let revised = wheat(
         directory.path(),
         &[
-            "change",
-            "revise",
+            "add",
+            "--change",
             &a_change,
             "--predecessor",
             &a_revision,
-            "--path",
             "shared",
-            "--value",
-            "revised-base",
         ],
     );
     assert!(
         revised.status.success(),
         "{}",
         String::from_utf8_lossy(&revised.stderr)
+    );
+    let revised_edits = wheat(
+        directory.path(),
+        &["edits", "--revision", &field(&revised, "revision")],
+    );
+    assert!(
+        revised_edits.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revised_edits.stderr)
+    );
+    // The predecessor's initial whole-file capture cannot be normalized into
+    // guarded components, so the incremental transition has no subsumption claim.
+    assert!(
+        String::from_utf8_lossy(&revised_edits.stdout)
+            .contains("transition preserved=0 added=1 removed=1 subsumed=0")
     );
     let conflicted = wheat(directory.path(), &["status"]);
     assert!(String::from_utf8_lossy(&conflicted.stdout).contains("conflicts: 1"));
@@ -127,6 +160,31 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     );
     let reopened = wheat(directory.path(), &["status"]);
     assert!(String::from_utf8_lossy(&reopened.stdout).contains("conflicts: 0"));
+
+    // Omitting --kind preserves the target tree's executable kind. A follow-up
+    // expecting that kind therefore applies cleanly.
+    let follow_up = wheat(
+        directory.path(),
+        &[
+            "change",
+            "new",
+            "--depends-on",
+            &b_change,
+            "--path",
+            "shared",
+            "--expected",
+            "resolved",
+            "--expected-kind",
+            "executable",
+            "--value",
+            "after-resolution",
+        ],
+    );
+    assert!(
+        follow_up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&follow_up.stderr)
+    );
 }
 
 #[test]
@@ -142,6 +200,132 @@ fn legacy_yaml_is_rejected_without_modification() {
     }
     assert_eq!(std::fs::read(path).unwrap(), b"legacy snapshot");
     assert!(!dir.path().join(".wheat/repository.head").exists());
+}
+
+#[test]
+fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let revised = wheat(dir.path(), &["change", "revise"]);
+    assert!(!revised.status.success());
+    assert!(String::from_utf8_lossy(&revised.stderr).contains("unrecognized subcommand 'revise'"));
+
+    let change_help = wheat(dir.path(), &["change", "--help"]);
+    assert!(change_help.status.success());
+    let change_help = String::from_utf8_lossy(&change_help.stdout);
+    assert!(change_help.contains("new"));
+    assert!(!change_help.contains("revise"));
+
+    let add_help = wheat(dir.path(), &["add", "--help"]);
+    assert!(add_help.status.success());
+    let add_help = String::from_utf8_lossy(&add_help.stdout);
+    assert!(add_help.contains("--change"));
+    assert!(add_help.contains("--predecessor"));
+    assert!(add_help.contains("Explicit repository-relative workspace paths"));
+}
+
+#[test]
+fn string_values_are_normalized_and_mode_only_edits_preserve_content() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(wheat(dir.path(), &["init"]).status.success());
+    let created = wheat(
+        dir.path(),
+        &["change", "new", "--path", "file", "--value", "one\r\ntwo\r"],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let normalized = b"one\ntwo\n";
+    let content_id = wheat_core::ContentId::of(normalized).to_string();
+    let retained = wheat(dir.path(), &["cat", &content_id]);
+    assert!(retained.status.success());
+    assert_eq!(retained.stdout, normalized);
+
+    let mode_only = wheat(
+        dir.path(),
+        &[
+            "change",
+            "new",
+            "--depends-on",
+            &field(&created, "change"),
+            "--path",
+            "file",
+            "--expected",
+            "one\r\ntwo\r",
+            "--expected-kind",
+            "regular",
+            "--replacement-kind",
+            "executable",
+        ],
+    );
+    assert!(
+        mode_only.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mode_only.stderr)
+    );
+    assert_eq!(wheat(dir.path(), &["cat", &content_id]).stdout, normalized);
+}
+
+#[test]
+fn symlink_string_values_preserve_carriage_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(wheat(dir.path(), &["init"]).status.success());
+    let target = "directory\r\ntarget\r";
+    let created = wheat(
+        dir.path(),
+        &[
+            "change",
+            "new",
+            "--path",
+            "link",
+            "--value",
+            target,
+            "--replacement-kind",
+            "symlink",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let content_id = wheat_core::ContentId::of(target.as_bytes()).to_string();
+    assert_eq!(
+        wheat(dir.path(), &["cat", &content_id]).stdout,
+        target.as_bytes()
+    );
+
+    let changed = wheat(
+        dir.path(),
+        &[
+            "change",
+            "new",
+            "--depends-on",
+            &field(&created, "change"),
+            "--path",
+            "link",
+            "--expected",
+            target,
+            "--expected-kind",
+            "symlink",
+            "--value",
+            "next\rtarget",
+            "--replacement-kind",
+            "symlink",
+        ],
+    );
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let replacement_id = wheat_core::ContentId::of(b"next\rtarget").to_string();
+    assert_eq!(
+        wheat(dir.path(), &["cat", &replacement_id]).stdout,
+        b"next\rtarget"
+    );
 }
 
 #[test]

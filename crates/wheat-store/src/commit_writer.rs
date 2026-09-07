@@ -1,10 +1,14 @@
 //! Direct, copy-on-write persistence of clean, first-parent commits.
 
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 use wheat_core::{
-    ApplicationId, ApplicationRecord, ApplicationResultRecord, CanonicalObjectError, Change,
-    ChangeId, ChangeObjectId, ChangeProposal, ContentId, ContentManifestRecord, DirectoryEntry,
-    RevisionId, RevisionRecord, ViewId, ViewRecord, decode_view_record,
+    ApplicationId, ApplicationRecord, ApplicationResultRecord, AppliedEditEvidence, ByteRange,
+    CanonicalObjectError, Change, ChangeId, ChangeObjectId, ChangeProposal, ContentIo,
+    ContentManifestRecord, DirectoryEntry, EditId, RevisionId, RevisionRecord, Tree, ViewId,
+    ViewRecord, decode_view_record,
+    edit_application::{ApplicationError, ApplicationLimits, ApplicationOutcome, apply_edits},
 };
 
 use crate::{
@@ -45,18 +49,12 @@ pub enum CommitWriterError {
     DuplicateChange(ChangeId),
     #[error("parent view has unresolved conflicts")]
     ConflictedParent,
-    #[error("transformation contains duplicate path {0:?}")]
-    DuplicatePath(String),
-    #[error("transformation contains invalid path {0:?}")]
+    #[error("edit application failed: {0:?}")]
+    Application(ApplicationError),
+    #[error("edit application did not produce a clean result")]
+    FailedEdits(BTreeMap<EditId, ApplicationOutcome>),
+    #[error("edit contains invalid path {0:?}")]
     InvalidPath(String),
-    #[error(
-        "transformation expectation failed at {path:?}: expected {expected:?}, found {actual:?}"
-    )]
-    ExpectedValue {
-        path: String,
-        expected: Option<ContentId>,
-        actual: Option<ContentId>,
-    },
 }
 
 type Result<T> = std::result::Result<T, CommitWriterError>;
@@ -64,12 +62,30 @@ type Result<T> = std::result::Result<T, CommitWriterError>;
 pub struct PersistedCommitWriter<'a, O> {
     objects: &'a O,
     content: &'a ContentStore,
+    limits: ApplicationLimits,
 }
 
 impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
     #[must_use]
     pub fn new(objects: &'a O, content: &'a ContentStore) -> Self {
-        Self { objects, content }
+        Self {
+            objects,
+            content,
+            limits: ApplicationLimits::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_limits(
+        objects: &'a O,
+        content: &'a ContentStore,
+        limits: ApplicationLimits,
+    ) -> Self {
+        Self {
+            objects,
+            content,
+            limits,
+        }
     }
 
     pub async fn empty_view(&self) -> Result<ViewId> {
@@ -92,22 +108,9 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         Ok(view.id())
     }
 
-    pub async fn write(
-        &self,
-        parent: ViewId,
-        mut proposal: ChangeProposal,
-    ) -> Result<PersistedCommit> {
+    pub async fn write(&self, parent: ViewId, proposal: ChangeProposal) -> Result<PersistedCommit> {
         if proposal.dependencies.len() > 1 {
             return Err(CommitWriterError::MultipleDependencies);
-        }
-        proposal
-            .transformation
-            .edits
-            .sort_by(|a, b| a.path.cmp(&b.path));
-        for pair in proposal.transformation.edits.windows(2) {
-            if pair[0].path == pair[1].path {
-                return Err(CommitWriterError::DuplicatePath(pair[0].path.clone()));
-            }
         }
         let parent_record = self.read_view(parent).await?;
         let revisions = RevisionMapStore::new(self.objects);
@@ -133,80 +136,116 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             return Err(CommitWriterError::ConflictedParent);
         }
 
-        let tree_store = MerkleTreeStore::new(self.objects);
-        let mut parsed = Vec::with_capacity(proposal.transformation.edits.len());
-        for edit in &proposal.transformation.edits {
-            let path = parse_path(&edit.path)?;
-            let actual = match tree_store.lookup(parent_record.tree, &path).await {
+        let trees = MerkleTreeStore::new(self.objects);
+        let mut target = Tree::new();
+        let mut paths = BTreeMap::<String, Vec<String>>::new();
+        for edit in proposal.edits.edits.values() {
+            if !paths.contains_key(&edit.path) {
+                paths.insert(edit.path.clone(), parse_path(&edit.path)?);
+            }
+        }
+        for (path, parsed) in &paths {
+            let actual = match trees.lookup(parent_record.tree, parsed).await {
                 Ok(value) => value,
-                // A file at an ancestor means this exact file path is absent. This is
-                // important for a same-commit file-to-directory replacement.
                 Err(MerkleTreeError::FileInPath(_)) => None,
                 Err(error) => return Err(error.into()),
             };
-            if actual != edit.expected {
-                return Err(CommitWriterError::ExpectedValue {
-                    path: edit.path.clone(),
-                    expected: edit.expected,
-                    actual,
-                });
+            if let Some(value) = actual {
+                target.insert(path.clone(), value);
             }
-            if let Some(id) = edit.expected {
-                self.content.get(id)?;
-            }
-            if let Some(id) = edit.replacement {
-                self.content.get(id)?;
-            }
-            parsed.push((path, edit.expected, edit.replacement));
+        }
+        let output = apply_edits(
+            &target,
+            proposal
+                .edits
+                .edits
+                .iter()
+                .map(|(id, edit)| (*id, edit.clone())),
+            |id| self.content.resolve(id),
+            self.limits,
+        )
+        .map_err(CommitWriterError::Application)?;
+        let failed = output
+            .outcomes
+            .iter()
+            .filter(|(_, outcome)| !matches!(outcome, ApplicationOutcome::Applied { .. }))
+            .map(|(id, outcome)| (*id, outcome.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if !failed.is_empty() {
+            return Err(CommitWriterError::FailedEdits(failed));
         }
 
-        // Remove existing leaves first so file/directory shape changes are possible.
-        let deletions = parsed
+        // Generated blobs must be durable before any metadata can refer to them.
+        for (id, bytes) in &output.generated_content {
+            self.content.store_generated(*id, bytes)?;
+        }
+
+        let mut applied = BTreeMap::new();
+        for (id, outcome) in &output.outcomes {
+            let edit = &proposal.edits.edits[id];
+            let ApplicationOutcome::Applied { read, write } = outcome else {
+                unreachable!()
+            };
+            applied.insert(
+                *id,
+                AppliedEditEvidence {
+                    target: target.get(&edit.path).copied(),
+                    read: read.clone().map(byte_range),
+                    write: write.clone().map(byte_range),
+                },
+            );
+        }
+
+        // Preserve COW behavior: mutate only touched leaves, deleting first for shape changes.
+        let mut resulting_tree = parent_record.tree;
+        let deletions = paths
             .iter()
-            .filter(|(_, old, _)| old.is_some())
-            .map(|(path, _, _)| TreeEdit {
+            .filter(|(path, _)| target.contains_key(*path))
+            .map(|(_, path)| TreeEdit {
                 path: path.clone(),
-                content: None,
+                value: None,
             })
             .collect::<Vec<_>>();
-        let mut resulting_tree = parent_record.tree;
         if !deletions.is_empty() {
-            resulting_tree = tree_store.apply_edits(resulting_tree, &deletions).await?;
+            resulting_tree = trees.apply_edits(resulting_tree, &deletions).await?;
         }
-        // A file insertion must not erase untouched descendants of a directory.
-        for (path, _, replacement) in &parsed {
-            if replacement.is_none() {
+        for (path, parsed) in &paths {
+            if !output.tree.contains_key(path) {
                 continue;
             }
-            let mut node = tree_store.read_node(resulting_tree).await?;
-            for (index, component) in path.iter().enumerate() {
+            let mut node = trees.read_node(resulting_tree).await?;
+            for (index, component) in parsed.iter().enumerate() {
                 match node.entries.get(component) {
-                    Some(DirectoryEntry::Directory(_)) if index + 1 == path.len() => {
-                        return Err(CommitWriterError::InvalidPath(path.join("/")));
+                    Some(DirectoryEntry::Directory(_)) if index + 1 == parsed.len() => {
+                        return Err(CommitWriterError::InvalidPath(path.clone()));
                     }
                     Some(DirectoryEntry::Directory(child)) => {
-                        node = tree_store.read_node(*child).await?
+                        node = trees.read_node(*child).await?
                     }
-                    Some(DirectoryEntry::File(_)) if index + 1 != path.len() => {
-                        return Err(CommitWriterError::InvalidPath(path.join("/")));
+                    Some(DirectoryEntry::File(_)) if index + 1 != parsed.len() => {
+                        return Err(CommitWriterError::InvalidPath(path.clone()));
                     }
                     _ => break,
                 }
             }
         }
-        let insertions = parsed
+        let insertions = paths
             .iter()
-            .filter_map(|(path, _, new)| {
-                new.map(|content| TreeEdit {
-                    path: path.clone(),
-                    content: Some(content),
+            .filter_map(|(path, parsed)| {
+                output.tree.get(path).copied().map(|value| TreeEdit {
+                    path: parsed.clone(),
+                    value: Some(value),
                 })
             })
             .collect::<Vec<_>>();
         if !insertions.is_empty() {
-            resulting_tree = tree_store.apply_edits(resulting_tree, &insertions).await?;
+            resulting_tree = trees.apply_edits(resulting_tree, &insertions).await?;
         }
 
+        // Persist definitions before revision/application/view metadata.
+        for (id, edit) in &proposal.edits.edits {
+            self.put((*id).into(), &edit.canonical_bytes()).await?;
+        }
         let change = Change {
             id: proposal.id,
             metadata: proposal.metadata,
@@ -222,7 +261,8 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             predecessor: None,
             dependencies: proposal.dependencies,
             authored_against: parent,
-            transformation: proposal.transformation,
+            edits: proposal.edits.edits.keys().copied().collect(),
+            transition: proposal.edits.transition,
             resulting_tree,
         };
         let revision_id = revision.id();
@@ -234,22 +274,26 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             result: ApplicationResultRecord::Clean {
                 tree: resulting_tree,
             },
+            applied: applied.clone(),
         };
         let application_id = application.id();
         self.put(application_id.into(), &application.canonical_bytes())
             .await?;
-
         let revision_root = revisions
             .insert(parent_record.revisions, proposal.id, revision_id)
             .await?;
         let application_root = ApplicationMapStore::new(self.objects)
             .insert(parent_record.applications, proposal.id, application_id)
             .await?;
+        // A view manifest is the visible resulting tree only.  Edit definitions and evidence
+        // retain their historical blobs through repository finalization, not through this root.
         let content_root = crate::commit_content::update_content(
             self.objects,
             parent_record.required_content,
             resulting_tree,
-            &revision.transformation.edits,
+            paths
+                .keys()
+                .map(|path| (target.get(path).copied(), output.tree.get(path).copied())),
         )
         .await?;
         let manifest = ContentManifestRecord {
@@ -279,7 +323,6 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         self.objects.put_if_absent(id, bytes).await?;
         Ok(())
     }
-
     async fn read_view(&self, id: ViewId) -> Result<ViewRecord> {
         let object = self.objects.get(id.into()).await?;
         if object.kind != ObjectKind::View {
@@ -294,6 +337,12 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
     }
 }
 
+fn byte_range(range: std::ops::Range<usize>) -> ByteRange {
+    ByteRange {
+        start: range.start as u64,
+        end: range.end as u64,
+    }
+}
 fn parse_path(path: &str) -> Result<Vec<String>> {
     let components = path.split('/').map(str::to_owned).collect::<Vec<_>>();
     if components.is_empty()

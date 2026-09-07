@@ -3,15 +3,16 @@
 //! These records are deliberately distinct from the materialized model types: decoding a
 //! revision or application must not require loading the trees and conflicts it references.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wheat_binschema::generated as binschema;
 
 use crate::{
-    Actor, ApplicationId, CanonicalObjectError, CanonicalObjectKind, Change, ChangeId,
-    ChangeMetadata, Conflict, ConflictId, ContentId, FileEdit, PathConflict, RevisionId,
-    RevisionMetadata, SourceProvenance, Timestamp, Transformation, TreeId, ViewId,
-    validate_canonical_object,
+    Actor, ApplicationId, AppliedEditEvidence, ByteRange, CanonicalObjectError,
+    CanonicalObjectKind, Change, ChangeId, ChangeMetadata, Conflict, ConflictId,
+    ConflictResolutionEvidence, ContentId, EditFailure, EditId, EditSubsumption, EditTransition,
+    FailedEditEvidence, FileKind, FileValue, RevisionId, RevisionMetadata, SourceProvenance,
+    Timestamp, TreeId, ViewId, validate_canonical_object,
 };
 
 const BLAKE3_256: u8 = 1;
@@ -24,7 +25,8 @@ pub struct RevisionRecord {
     pub predecessor: Option<RevisionId>,
     pub dependencies: BTreeSet<ChangeId>,
     pub authored_against: ViewId,
-    pub transformation: Transformation,
+    pub edits: BTreeSet<EditId>,
+    pub transition: EditTransition,
     pub resulting_tree: TreeId,
 }
 
@@ -32,6 +34,9 @@ impl RevisionRecord {
     /// Encode this record in the canonical Wheat object format.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.transition
+            .validate(&self.edits)
+            .expect("revision record must contain a valid edit transition");
         encode(binschema::WheatObject::RevisionV1(
             binschema::RevisionV1Input {
                 change_id: change_id_wire(self.change_id),
@@ -44,7 +49,8 @@ impl RevisionRecord {
                     .map(change_id_wire)
                     .collect(),
                 authored_against: view_id_wire(self.authored_against),
-                transformation: transformation_wire(&self.transformation),
+                edits: self.edits.iter().copied().map(edit_id_wire).collect(),
+                transition: edit_transition_wire(&self.transition),
                 resulting_tree: tree_id_wire(self.resulting_tree),
             }
             .into(),
@@ -76,6 +82,7 @@ pub struct ApplicationRecord {
     pub revision_id: RevisionId,
     pub target_view: ViewId,
     pub result: ApplicationResultRecord,
+    pub applied: BTreeMap<EditId, AppliedEditEvidence>,
 }
 
 impl ApplicationRecord {
@@ -107,6 +114,14 @@ impl ApplicationRecord {
                 revision_id: revision_id_wire(self.revision_id),
                 target_view: view_id_wire(self.target_view),
                 result,
+                applied: self
+                    .applied
+                    .iter()
+                    .map(|(edit, evidence)| binschema::AppliedEditEntryV1 {
+                        edit: edit_id_wire(*edit),
+                        evidence: applied_evidence_wire(evidence),
+                    })
+                    .collect(),
             }
             .into(),
         ))
@@ -138,7 +153,12 @@ pub fn decode_revision_record(bytes: &[u8]) -> Result<RevisionRecord, CanonicalO
             .map(change_id_domain)
             .collect::<Result<_, _>>()?,
         authored_against: view_id_domain(&revision.authored_against)?,
-        transformation: transformation_domain(revision.transformation)?,
+        edits: revision
+            .edits
+            .iter()
+            .map(edit_id_domain)
+            .collect::<Result<_, _>>()?,
+        transition: edit_transition_domain(revision.transition)?,
         resulting_tree: tree_id_domain(&revision.resulting_tree)?,
     })
 }
@@ -165,6 +185,16 @@ pub fn decode_application_record(bytes: &[u8]) -> Result<ApplicationRecord, Cano
         revision_id: revision_id_domain(&application.revision_id)?,
         target_view: view_id_domain(&application.target_view)?,
         result,
+        applied: application
+            .applied
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    edit_id_domain(&entry.edit)?,
+                    applied_evidence_domain(entry.evidence)?,
+                ))
+            })
+            .collect::<Result<_, CanonicalObjectError>>()?,
     })
 }
 
@@ -184,15 +214,20 @@ pub fn decode_change(bytes: &[u8]) -> Result<Change, CanonicalObjectError> {
 pub fn decode_conflict(bytes: &[u8]) -> Result<Conflict, CanonicalObjectError> {
     require_kind(bytes, CanonicalObjectKind::Conflict)?;
     let conflict = binschema::ConflictV1::decode(bytes).map_err(decode_error)?;
-    let paths = conflict
-        .paths
+    let edits = conflict
+        .edits
         .into_iter()
-        .map(path_conflict_domain)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|entry| {
+            Ok((
+                edit_id_domain(&entry.edit)?,
+                failed_evidence_domain(entry.evidence)?,
+            ))
+        })
+        .collect::<Result<_, CanonicalObjectError>>()?;
     Ok(Conflict {
         id: ConflictId::of_canonical_bytes(bytes),
         base_view: view_id_domain(&conflict.target_view)?,
-        paths,
+        edits,
     })
 }
 
@@ -255,36 +290,97 @@ fn revision_metadata_domain(metadata: binschema::RevisionMetadataV1) -> Revision
     }
 }
 
-fn transformation_domain(
-    transformation: binschema::TransformationV1,
-) -> Result<Transformation, CanonicalObjectError> {
-    Ok(Transformation {
-        edits: transformation
-            .edits
+fn edit_transition_domain(
+    value: binschema::EditTransitionV1,
+) -> Result<EditTransition, CanonicalObjectError> {
+    Ok(EditTransition {
+        preserved: value
+            .preserved
+            .iter()
+            .map(edit_id_domain)
+            .collect::<Result<_, _>>()?,
+        added: value
+            .added
+            .iter()
+            .map(edit_id_domain)
+            .collect::<Result<_, _>>()?,
+        removed: value
+            .removed
+            .iter()
+            .map(edit_id_domain)
+            .collect::<Result<_, _>>()?,
+        subsumed: value
+            .subsumed
             .into_iter()
-            .map(|edit| {
-                Ok(FileEdit {
-                    path: edit.path,
-                    expected: edit.expected.as_ref().map(content_id_domain).transpose()?,
-                    replacement: edit
-                        .replacement
-                        .as_ref()
-                        .map(content_id_domain)
-                        .transpose()?,
+            .map(|s| {
+                Ok(EditSubsumption {
+                    source: edit_id_domain(&s.source)?,
+                    replacements: s
+                        .replacements
+                        .iter()
+                        .map(edit_id_domain)
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect::<Result<_, CanonicalObjectError>>()?,
+        resolutions: value
+            .resolutions
+            .into_iter()
+            .map(|r| {
+                Ok(ConflictResolutionEvidence {
+                    application: application_id_domain(&r.application)?,
+                    conflicted_edits: r
+                        .conflicted_edits
+                        .iter()
+                        .map(edit_id_domain)
+                        .collect::<Result<_, _>>()?,
+                    replacement_edits: r
+                        .replacement_edits
+                        .iter()
+                        .map(edit_id_domain)
+                        .collect::<Result<_, _>>()?,
                 })
             })
             .collect::<Result<_, CanonicalObjectError>>()?,
     })
 }
 
-fn path_conflict_domain(
-    path: binschema::PathConflictV1,
-) -> Result<PathConflict, CanonicalObjectError> {
-    Ok(PathConflict {
-        path: path.path,
-        expected: path.expected.as_ref().map(content_id_domain).transpose()?,
-        actual: path.actual.as_ref().map(content_id_domain).transpose()?,
-        proposed: path.proposed.as_ref().map(content_id_domain).transpose()?,
+fn range_domain(value: binschema::ByteRangeV1) -> ByteRange {
+    ByteRange {
+        start: value.start,
+        end: value.end,
+    }
+}
+fn applied_evidence_domain(
+    value: binschema::AppliedEditEvidenceV1,
+) -> Result<AppliedEditEvidence, CanonicalObjectError> {
+    Ok(AppliedEditEvidence {
+        target: value.target.first().map(file_value_domain).transpose()?,
+        read: value.read.into_iter().next().map(range_domain),
+        write: value.write.into_iter().next().map(range_domain),
+    })
+}
+fn failed_evidence_domain(
+    value: binschema::FailedEditEvidenceV1,
+) -> Result<FailedEditEvidence, CanonicalObjectError> {
+    let reason = match value.reason {
+        binschema::EditFailureV1::NoMatchFailureV1(_) => EditFailure::NoMatch,
+        binschema::EditFailureV1::AmbiguousFailureV1(_) => EditFailure::Ambiguous,
+        binschema::EditFailureV1::InterferenceFailureV1(v) => EditFailure::Interference {
+            with: v
+                .with
+                .iter()
+                .map(edit_id_domain)
+                .collect::<Result<_, _>>()?,
+        },
+        binschema::EditFailureV1::KindMismatchFailureV1(_) => EditFailure::KindMismatch,
+        binschema::EditFailureV1::ExpectedFileMismatchFailureV1(_) => {
+            EditFailure::ExpectedFileMismatch
+        }
+    };
+    Ok(FailedEditEvidence {
+        target: value.target.first().map(file_value_domain).transpose()?,
+        reason,
     })
 }
 
@@ -296,6 +392,19 @@ fn change_id_domain(id: &binschema::ChangeId) -> Result<ChangeId, CanonicalObjec
         .try_into()
         .map_err(|_| CanonicalObjectError::Decode("change UUID is not 16 bytes".into()))?;
     Ok(ChangeId::from_bytes(bytes))
+}
+
+fn file_value_domain(value: &binschema::FileValueV1) -> Result<FileValue, CanonicalObjectError> {
+    let kind = match value.kind.value {
+        0 => FileKind::Regular,
+        1 => FileKind::Executable,
+        2 => FileKind::Symlink,
+        _ => return Err(CanonicalObjectError::Decode("invalid file kind".into())),
+    };
+    Ok(FileValue {
+        content: content_id_domain(&value.content)?,
+        kind,
+    })
 }
 
 fn content_id_domain(id: &binschema::ContentId) -> Result<ContentId, CanonicalObjectError> {
@@ -324,6 +433,12 @@ macro_rules! domain_digest_id {
 }
 
 domain_digest_id!(revision_id_domain, binschema::RevisionId, RevisionId);
+domain_digest_id!(edit_id_domain, binschema::EditId, EditId);
+domain_digest_id!(
+    application_id_domain,
+    binschema::ApplicationId,
+    ApplicationId
+);
 domain_digest_id!(tree_id_domain, binschema::TreeId, TreeId);
 domain_digest_id!(conflict_id_domain, binschema::ConflictId, ConflictId);
 domain_digest_id!(view_id_domain, binschema::ViewId, ViewId);
@@ -366,28 +481,75 @@ fn revision_metadata_wire(metadata: &RevisionMetadata) -> binschema::RevisionMet
     }
 }
 
-fn transformation_wire(transformation: &Transformation) -> binschema::TransformationV1 {
-    let mut edits = transformation
-        .edits
+fn edit_transition_wire(value: &EditTransition) -> binschema::EditTransitionV1 {
+    let mut subsumed = value
+        .subsumed
         .iter()
-        .map(|edit| binschema::FileEditV1 {
-            path: edit.path.clone(),
-            expected: edit.expected.map(content_id_wire),
-            replacement: edit.replacement.map(content_id_wire),
+        .map(|s| binschema::EditSubsumptionV1 {
+            source: edit_id_wire(s.source),
+            replacements: s.replacements.iter().copied().map(edit_id_wire).collect(),
         })
         .collect::<Vec<_>>();
-    edits.sort_by(|left, right| left.path.cmp(&right.path));
-    assert!(
-        edits.windows(2).all(|pair| pair[0].path != pair[1].path),
-        "a transformation may contain only one edit per path"
-    );
-    binschema::TransformationV1 { edits }
+    subsumed.sort_by(|a, b| a.source.digest.bytes.cmp(&b.source.digest.bytes));
+    let mut resolutions = value
+        .resolutions
+        .iter()
+        .map(|r| binschema::ConflictResolutionEvidenceV1 {
+            application: application_id_wire(r.application),
+            conflicted_edits: r
+                .conflicted_edits
+                .iter()
+                .copied()
+                .map(edit_id_wire)
+                .collect(),
+            replacement_edits: r
+                .replacement_edits
+                .iter()
+                .copied()
+                .map(edit_id_wire)
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    resolutions.sort_by(|a, b| a.application.digest.bytes.cmp(&b.application.digest.bytes));
+    binschema::EditTransitionV1 {
+        preserved: value.preserved.iter().copied().map(edit_id_wire).collect(),
+        added: value.added.iter().copied().map(edit_id_wire).collect(),
+        removed: value.removed.iter().copied().map(edit_id_wire).collect(),
+        subsumed,
+        resolutions,
+    }
+}
+fn range_wire(value: ByteRange) -> binschema::ByteRangeV1 {
+    binschema::ByteRangeV1 {
+        start: value.start,
+        end: value.end,
+    }
+}
+fn applied_evidence_wire(value: &AppliedEditEvidence) -> binschema::AppliedEditEvidenceV1 {
+    binschema::AppliedEditEvidenceV1 {
+        target: value.target.map(file_value_wire).into_iter().collect(),
+        read: value.read.map(range_wire).into_iter().collect(),
+        write: value.write.map(range_wire).into_iter().collect(),
+    }
 }
 
 fn change_id_wire(id: ChangeId) -> binschema::ChangeId {
     binschema::ChangeId {
         uuid: binschema::Uuid128 {
             bytes: id.as_bytes().to_vec(),
+        },
+    }
+}
+
+fn file_value_wire(value: FileValue) -> binschema::FileValueV1 {
+    binschema::FileValueV1 {
+        content: content_id_wire(value.content),
+        kind: binschema::FileKindV1 {
+            value: match value.kind {
+                FileKind::Regular => 0,
+                FileKind::Executable => 1,
+                FileKind::Symlink => 2,
+            },
         },
     }
 }
@@ -410,6 +572,8 @@ macro_rules! wire_digest_id {
 }
 
 wire_digest_id!(revision_id_wire, RevisionId, RevisionId);
+wire_digest_id!(edit_id_wire, EditId, EditId);
+wire_digest_id!(application_id_wire, ApplicationId, ApplicationId);
 wire_digest_id!(tree_id_wire, TreeId, TreeId);
 wire_digest_id!(conflict_id_wire, ConflictId, ConflictId);
 wire_digest_id!(view_id_wire, ViewId, ViewId);

@@ -51,8 +51,13 @@ async fn verification_indexes_changes_once_and_reuses_identical_tree_contexts() 
     let mut parent = None;
     for n in 1..=12u8 {
         let id = ChangeId::from_bytes([n; 16]);
-        repo.create_change_with_id(id, parent, Transformation::default())
-            .unwrap();
+        repo.create_change_with_id(
+            id,
+            parent,
+            RevisionEdits::default(),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
         parent = Some(id);
     }
     let closure = repo.canonical_closure();
@@ -91,8 +96,13 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
     let mut parent = None;
     for n in 1..=64u8 {
         let id = ChangeId::from_bytes([n; 16]);
-        repo.create_change_with_id(id, parent, Transformation::default())
-            .unwrap();
+        repo.create_change_with_id(
+            id,
+            parent,
+            RevisionEdits::default(),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
         parent = Some(id);
     }
     let closure = repo.canonical_closure();
@@ -117,7 +127,13 @@ async fn each_verification_reauthenticates_content_instead_of_reusing_scratch_tr
     let content = ContentStore::new(dir.path().join("content"));
     let id = content.put(b"original").unwrap();
     let objects = LooseObjectStore::new(dir.path().join("objects"));
-    let repo = Repository::new(Tree::from([("file".into(), id)]));
+    let repo = Repository::new(Tree::from([(
+        "file".into(),
+        wheat_core::FileValue {
+            content: id,
+            kind: wheat_core::FileKind::Regular,
+        },
+    )]));
     let closure = repo.canonical_closure();
     for object in closure.objects {
         objects
@@ -137,7 +153,13 @@ async fn duplicate_logical_changes_are_rejected_by_verified_index() {
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
     let mut repo = Repository::new(Tree::new());
-    let (change, _) = repo.create_change([], Transformation::default()).unwrap();
+    let (change, _) = repo
+        .create_change(
+            [],
+            RevisionEdits::default(),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
     let closure = repo.canonical_closure();
     for object in &closure.objects {
         objects

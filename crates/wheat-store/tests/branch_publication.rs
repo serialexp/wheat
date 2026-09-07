@@ -8,7 +8,13 @@ async fn named_branches_survive_reopen_and_ordinary_mutations() {
     let content = ContentStore::new(dir.path().join("content"));
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     let mut repo = Repository::new(Tree::new());
-    let (_, outcome) = repo.create_change([], Transformation::default()).unwrap();
+    let (_, outcome) = repo
+        .create_change(
+            [],
+            RevisionEdits::default(),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
     let branches = BranchManifestRecord::new([
         ("refs/heads/main", outcome.resulting_view),
         ("refs/heads/archive", repo.published_view().id),
@@ -34,7 +40,11 @@ async fn named_branches_survive_reopen_and_ordinary_mutations() {
     );
     let mut editable = reader.hydrate(record.state).await.unwrap();
     editable
-        .create_change([], Transformation::default())
+        .create_change(
+            [],
+            RevisionEdits::default(),
+            ApplicationContext::new(&content),
+        )
         .unwrap();
     let next = RepositoryPublisher::new(&reopened, &content, &heads)
         .publish(initial, &editable)

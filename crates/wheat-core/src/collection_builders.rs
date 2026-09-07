@@ -1,8 +1,7 @@
 //! Pure, synchronous builders for the canonical fixed-byte radix collections.
 //!
-//! These are reference builders: inputs are sorted in memory, then nodes are
-//! emitted in post-order (children before their parent).  The emitted shape is
-//! the same uncompressed, one-node-per-key-byte shape used by `wheat-store`.
+//! These are reference builders: inputs are sorted in memory, then maximally
+//! path-compressed nodes are emitted in post-order (children before parent).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,13 +19,13 @@ trait RadixShape {
 
     fn key_bytes(key: &Self::Key) -> &[u8];
     fn node(
-        depth: u8,
+        prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
     ) -> (Self::Id, Vec<u8>);
 }
 
-/// Builds a non-empty subtree from a sorted, key-unique entry slice.
+/// Builds a non-empty, maximally compressed subtree from sorted unique entries.
 fn build_subtree<S, F>(depth: usize, entries: &[(S::Key, S::Value)], emit: &mut F) -> S::Id
 where
     S: RadixShape,
@@ -40,28 +39,38 @@ where
             .all(|(key, _)| S::key_bytes(key).len() == key_len)
     );
 
-    let (value, children) = if depth == key_len {
+    let first = S::key_bytes(&entries[0].0);
+    let last = S::key_bytes(&entries[entries.len() - 1].0);
+    let common = first[depth..]
+        .iter()
+        .zip(&last[depth..])
+        .take_while(|(left, right)| left == right)
+        .count();
+    let end_prefix = depth + common;
+    let prefix = first[depth..end_prefix].to_vec();
+    let (value, children) = if end_prefix == key_len {
         debug_assert_eq!(entries.len(), 1);
         (Some(entries[0].1), Vec::new())
     } else {
         let mut children = Vec::new();
         let mut start = 0;
         while start < entries.len() {
-            let edge = S::key_bytes(&entries[start].0)[depth];
+            let edge = S::key_bytes(&entries[start].0)[end_prefix];
             let end = start
-                + entries[start..].partition_point(|(key, _)| S::key_bytes(key)[depth] == edge);
-            let child = build_subtree::<S, F>(depth + 1, &entries[start..end], emit);
+                + entries[start..]
+                    .partition_point(|(key, _)| S::key_bytes(key)[end_prefix] == edge);
+            let child = build_subtree::<S, F>(end_prefix + 1, &entries[start..end], emit);
             children.push((edge, child));
             start = end;
         }
         (None, children)
     };
 
-    emit_node::<S, F>(depth, value, children, emit)
+    emit_node::<S, F>(prefix, value, children, emit)
 }
 
 fn emit_node<S, F>(
-    depth: usize,
+    prefix: Vec<u8>,
     value: Option<S::Value>,
     children: Vec<(u8, S::Id)>,
     emit: &mut F,
@@ -70,9 +79,7 @@ where
     S: RadixShape,
     F: FnMut(CanonicalObject),
 {
-    // Supported keys are 16 or 32 bytes, so recursion depth always fits u8.
-    let depth = u8::try_from(depth).expect("canonical radix key length fits in u8");
-    let (canonical_id, bytes) = S::node(depth, value, children);
+    let (canonical_id, bytes) = S::node(prefix, value, children);
     emit(CanonicalObject {
         id: canonical_id.into(),
         bytes,
@@ -87,7 +94,7 @@ where
 {
     if entries.is_empty() {
         // The root is the sole empty node that is canonical collection output.
-        return emit_node::<S, F>(0, None, Vec::new(), &mut emit);
+        return emit_node::<S, F>(Vec::new(), None, Vec::new(), &mut emit);
     }
     build_subtree::<S, F>(0, &entries, &mut emit)
 }
@@ -103,12 +110,12 @@ impl RadixShape for RevisionShape {
     }
 
     fn node(
-        depth: u8,
+        prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
     ) -> (Self::Id, Vec<u8>) {
         let node = RevisionMapNode::new(
-            depth,
+            prefix,
             value,
             children
                 .into_iter()
@@ -132,12 +139,12 @@ impl RadixShape for ApplicationShape {
     }
 
     fn node(
-        depth: u8,
+        prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
     ) -> (Self::Id, Vec<u8>) {
         let node = ApplicationMapNode::new(
-            depth,
+            prefix,
             value,
             children
                 .into_iter()
@@ -163,12 +170,12 @@ macro_rules! set_shape {
             }
 
             fn node(
-                depth: u8,
+                prefix: Vec<u8>,
                 value: Option<Self::Value>,
                 children: Vec<(u8, Self::Id)>,
             ) -> (Self::Id, Vec<u8>) {
                 let node = <$node>::new(
-                    depth,
+                    prefix,
                     value.is_some(),
                     children
                         .into_iter()

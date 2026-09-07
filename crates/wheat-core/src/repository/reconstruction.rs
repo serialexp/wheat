@@ -27,8 +27,8 @@ impl Repository {
         }
 
         let mut revisions = BTreeMap::new();
-        for (record, tree) in parts.revisions {
-            let revision = crate::hydrate_revision(record, tree)?;
+        for (record, tree, edits) in parts.revisions {
+            let revision = crate::hydrate_revision(record, tree, edits)?;
             let id = revision.id();
             if revisions.insert(id, revision).is_some() {
                 return Err(RepositoryError::InvalidRepositoryState(

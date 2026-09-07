@@ -1,19 +1,34 @@
 use std::{fs, str::FromStr};
 
-use wheat_core::{ChangeId, ContentId, FileEdit, Repository, Transformation, Tree};
+use wheat_core::{
+    ApplicationContext, ChangeId, ContentId, EditOperation, EditRecord, EditTransition, FileKind,
+    FileValue, Repository, RevisionEdits, Tree,
+};
 use wheat_store::{
     ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, ObjectKind,
     PublicationError, PublicationStore, RepositoryPublicationError, RepositoryPublisher,
     RepositoryReader,
 };
 
-fn edit(path: &str, value: &[u8]) -> Transformation {
-    Transformation {
-        edits: vec![FileEdit {
-            path: path.into(),
+fn edit(path: &str, value: &[u8]) -> RevisionEdits {
+    let record = EditRecord::new(
+        path,
+        EditOperation::ExactFile {
             expected: None,
-            replacement: Some(ContentId::of(value)),
-        }],
+            replacement: Some(FileValue {
+                content: ContentId::of(value),
+                kind: FileKind::Regular,
+            }),
+        },
+    )
+    .unwrap();
+    let id = record.id();
+    RevisionEdits {
+        edits: [(id, record)].into(),
+        transition: EditTransition {
+            added: [id].into(),
+            ..EditTransition::default()
+        },
     }
 }
 
@@ -36,6 +51,7 @@ async fn publishes_complete_canonical_closure_before_head() {
             ChangeId::from_str("01890f2d-3c4b-7a68-9abc-def012345678").unwrap(),
             [],
             edit("file", b"value"),
+            ApplicationContext::new(&content),
         )
         .unwrap();
 
@@ -77,9 +93,15 @@ async fn publishes_complete_canonical_closure_before_head() {
 async fn missing_required_content_prevents_head_creation_but_leaves_retryable_objects() {
     let directory = tempfile::tempdir().unwrap();
     let (objects, content, heads) = stores(directory.path());
+    let authoring_content = ContentStore::new(directory.path().join("authoring-content"));
+    authoring_content.put(b"missing").unwrap();
     let mut repository = Repository::new(Tree::new());
     repository
-        .create_change([], edit("file", b"missing"))
+        .create_change(
+            [],
+            edit("file", b"missing"),
+            ApplicationContext::new(&authoring_content),
+        )
         .unwrap();
     let closure = repository.canonical_closure();
 
@@ -116,16 +138,33 @@ async fn stale_publication_keeps_the_winning_head_and_retains_prepared_objects()
     content.put(b"winner").unwrap();
     content.put(b"loser").unwrap();
     let mut base = Repository::new(Tree::new());
-    base.create_change([], edit("first", b"first")).unwrap();
+    base.create_change(
+        [],
+        edit("first", b"first"),
+        ApplicationContext::new(&content),
+    )
+    .unwrap();
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let initial = publisher.initialize(&base).await.unwrap();
 
     let mut winner = base.clone();
-    winner.create_change([], edit("winner", b"winner")).unwrap();
+    winner
+        .create_change(
+            [],
+            edit("winner", b"winner"),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
     let winning_head = publisher.publish(initial, &winner).await.unwrap();
 
     let mut loser = base;
-    loser.create_change([], edit("loser", b"loser")).unwrap();
+    loser
+        .create_change(
+            [],
+            edit("loser", b"loser"),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
     let losing_closure = loser.canonical_closure();
     assert!(matches!(
         publisher.publish(initial, &loser).await,
@@ -144,7 +183,11 @@ async fn repeated_preparation_and_initialization_are_idempotent_across_reopen() 
     content.put(b"value").unwrap();
     let mut repository = Repository::new(Tree::new());
     repository
-        .create_change([], edit("file", b"value"))
+        .create_change(
+            [],
+            edit("file", b"value"),
+            ApplicationContext::new(&content),
+        )
         .unwrap();
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
 
@@ -163,12 +206,18 @@ async fn repeated_preparation_and_initialization_are_idempotent_across_reopen() 
 async fn corrupt_required_content_prevents_publication() {
     let directory = tempfile::tempdir().unwrap();
     let (objects, content, heads) = stores(directory.path());
-    let id = content.put(b"value").unwrap();
-    fs::write(content.path(id), b"corrupt").unwrap();
+    let authoring_content = ContentStore::new(directory.path().join("authoring-content"));
+    authoring_content.put(b"value").unwrap();
     let mut repository = Repository::new(Tree::new());
     repository
-        .create_change([], edit("file", b"value"))
+        .create_change(
+            [],
+            edit("file", b"value"),
+            ApplicationContext::new(&authoring_content),
+        )
         .unwrap();
+    let id = content.put(b"value").unwrap();
+    fs::write(content.path(id), b"corrupt").unwrap();
 
     let error = RepositoryPublisher::new(&objects, &content, &heads)
         .initialize(&repository)

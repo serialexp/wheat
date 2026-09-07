@@ -32,6 +32,7 @@ pub enum ObjectKind {
     RetainedSetNode = 13,
     BranchManifest = 14,
     RepositoryEnvelope = 15,
+    Edit = 16,
 }
 
 impl From<CanonicalObjectKind> for ObjectKind {
@@ -52,6 +53,7 @@ impl From<CanonicalObjectKind> for ObjectKind {
             CanonicalObjectKind::RetainedSetNode => Self::RetainedSetNode,
             CanonicalObjectKind::BranchManifest => Self::BranchManifest,
             CanonicalObjectKind::RepositoryEnvelope => Self::RepositoryEnvelope,
+            CanonicalObjectKind::Edit => Self::Edit,
         }
     }
 }

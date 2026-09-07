@@ -16,6 +16,8 @@ pub enum RevisionMapError {
     InvalidRootDepth,
     #[error("revision-map child depth does not match its parent")]
     InvalidChildDepth,
+    #[error("revision-map node has an invalid terminal shape")]
+    InvalidTerminalNode,
 }
 
 impl From<radix::Error> for RevisionMapError {
@@ -25,6 +27,7 @@ impl From<radix::Error> for RevisionMapError {
             radix::Error::Decode(e) => Self::Decode(e),
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
+            radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
         }
     }
 }
@@ -50,7 +53,7 @@ impl radix::Collection for RevisionCollection {
     }
     fn unpack(node: Self::PublicNode) -> radix::Node<Self::Id, Self::Value> {
         radix::Node {
-            depth: node.depth,
+            prefix: node.prefix,
             value: node.value,
             children: node
                 .children
@@ -63,7 +66,7 @@ impl radix::Collection for RevisionCollection {
         node: radix::Node<Self::Id, Self::Value>,
     ) -> Result<Self::PublicNode, wheat_core::CanonicalObjectError> {
         RevisionMapNode::new(
-            node.depth,
+            node.prefix,
             node.value,
             node.children
                 .into_iter()

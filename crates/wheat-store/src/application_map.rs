@@ -16,6 +16,8 @@ pub enum ApplicationMapError {
     InvalidRootDepth,
     #[error("application-map child depth does not match its parent")]
     InvalidChildDepth,
+    #[error("application-map node has an invalid terminal shape")]
+    InvalidTerminalNode,
 }
 impl From<radix::Error> for ApplicationMapError {
     fn from(e: radix::Error) -> Self {
@@ -24,6 +26,7 @@ impl From<radix::Error> for ApplicationMapError {
             radix::Error::Decode(e) => Self::Decode(e),
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
+            radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
         }
     }
 }
@@ -40,7 +43,7 @@ impl radix::Collection for ApplicationCollection {
     }
     fn unpack(n: Self::PublicNode) -> radix::Node<Self::Id, Self::Value> {
         radix::Node {
-            depth: n.depth,
+            prefix: n.prefix,
             value: n.value,
             children: n.children.into_iter().map(|c| (c.edge, c.child)).collect(),
         }
@@ -49,7 +52,7 @@ impl radix::Collection for ApplicationCollection {
         n: radix::Node<Self::Id, Self::Value>,
     ) -> Result<Self::PublicNode, wheat_core::CanonicalObjectError> {
         ApplicationMapNode::new(
-            n.depth,
+            n.prefix,
             n.value,
             n.children
                 .into_iter()

@@ -61,7 +61,7 @@ async fn digest_set_batches_write_only_changed_prefixes() {
         .update_batch(empty, [(a, true), (b, true)])
         .await
         .unwrap();
-    assert_eq!(objects.reset(), 34, "two leaves and 32 shared prefixes");
+    assert_eq!(objects.reset(), 3, "two leaves and one compressed branch");
     assert_eq!(
         sets.update_batch(root, [(a, false), (a, true)])
             .await
@@ -75,7 +75,11 @@ async fn digest_set_batches_write_only_changed_prefixes() {
             .unwrap(),
         empty
     );
-    assert_eq!(objects.reset(), 1, "pruned children are not written");
+    assert_eq!(
+        objects.reset(),
+        2,
+        "sequential COW deletion writes the surviving compressed leaf, then the empty root"
+    );
 }
 
 #[tokio::test]
@@ -87,7 +91,7 @@ async fn failed_batch_keeps_old_root_readable_and_retry_is_deterministic() {
     let b = ContentId::from_digest([2; 32]);
     let old = sets.insert(empty, a).await.unwrap();
     objects.reset();
-    objects.fail_at.store(4, Ordering::SeqCst);
+    objects.fail_at.store(1, Ordering::SeqCst);
     assert!(sets.insert(old, b).await.is_err());
     assert!(sets.contains(old, a).await.unwrap());
     assert!(!sets.contains(old, b).await.unwrap());
@@ -105,7 +109,7 @@ async fn cursor_rejects_wrong_depth_and_missing_children_without_skipping_them()
     let objects = InstrumentedStore::new();
     let sets = ContentSetStore::new(&objects);
     for missing in [false, true] {
-        let child = ContentSetNode::new(2, false, vec![]).unwrap();
+        let child = ContentSetNode::new(vec![2], true, vec![]).unwrap();
         let child_id = if missing {
             ContentSetId::from_digest([99; 32])
         } else {
@@ -116,12 +120,18 @@ async fn cursor_rejects_wrong_depth_and_missing_children_without_skipping_them()
             child.id()
         };
         let root = ContentSetNode::new(
-            0,
+            vec![],
             false,
-            vec![ContentSetChild {
-                edge: 0,
-                child: child_id,
-            }],
+            vec![
+                ContentSetChild {
+                    edge: 0,
+                    child: child_id,
+                },
+                ContentSetChild {
+                    edge: 1,
+                    child: child_id,
+                },
+            ],
         )
         .unwrap();
         objects

@@ -24,6 +24,7 @@ pub enum WheatObject {
     RetainedSetNodeV1(RetainedSetNodeV1Output),
     BranchManifestV1(BranchManifestV1Output),
     RepositoryEnvelopeV1(RepositoryEnvelopeV1Output),
+    EditV1(EditV1Output),
 }
 
 impl WheatObject {
@@ -76,7 +77,11 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
                 v.authored_against.encode_into(encoder)?;
-                v.transformation.encode_into(encoder)?;
+                encoder.write_uint32(v.edits.len() as u32, Endianness::BigEndian);
+                for item in &v.edits {
+                    item.encode_into(encoder)?;
+                }
+                v.transition.encode_into(encoder)?;
                 v.resulting_tree.encode_into(encoder)?;
             }
             WheatObject::ApplicationV1(v) => {
@@ -87,6 +92,10 @@ impl WheatObject {
                 v.revision_id.encode_into(encoder)?;
                 v.target_view.encode_into(encoder)?;
                 v.result.encode_into(encoder)?;
+                encoder.write_uint32(v.applied.len() as u32, Endianness::BigEndian);
+                for item in &v.applied {
+                    item.encode_into(encoder)?;
+                }
             }
             WheatObject::ConflictV1(v) => {
                 // Build per-variant context for nested struct sub-fields
@@ -94,8 +103,8 @@ impl WheatObject {
                 let _variant_ctx = ctx.extend_with_parent(variant_fields);
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 v.target_view.encode_into(encoder)?;
-                encoder.write_uint32(v.paths.len() as u32, Endianness::BigEndian);
-                for item in &v.paths {
+                encoder.write_uint32(v.edits.len() as u32, Endianness::BigEndian);
+                for item in &v.edits {
                     item.encode_into(encoder)?;
                 }
             }
@@ -133,7 +142,10 @@ impl WheatObject {
             }
             WheatObject::RevisionMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint8(v.depth);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
                 encoder.write_uint32(v.value.len() as u32, Endianness::BigEndian);
                 for item in &v.value {
                     item.encode_into(encoder)?;
@@ -145,7 +157,10 @@ impl WheatObject {
             }
             WheatObject::ApplicationMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint8(v.depth);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
                 encoder.write_uint32(v.value.len() as u32, Endianness::BigEndian);
                 for item in &v.value {
                     item.encode_into(encoder)?;
@@ -157,7 +172,10 @@ impl WheatObject {
             }
             WheatObject::ConflictSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint8(v.depth);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
                 encoder.write_uint8(if v.present { 1 } else { 0 });
                 encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
                 for item in &v.children {
@@ -166,7 +184,10 @@ impl WheatObject {
             }
             WheatObject::ContentSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint8(v.depth);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
                 encoder.write_uint8(if v.present { 1 } else { 0 });
                 encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
                 for item in &v.children {
@@ -175,7 +196,10 @@ impl WheatObject {
             }
             WheatObject::RetainedSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint8(v.depth);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
                 encoder.write_uint8(if v.present { 1 } else { 0 });
                 encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
                 for item in &v.children {
@@ -196,6 +220,15 @@ impl WheatObject {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 v.state.encode_into(encoder)?;
                 v.branches.encode_into(encoder)?;
+            }
+            WheatObject::EditV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_uint32(v.path.len() as u32, Endianness::BigEndian);
+                let string_bytes: &[u8] = v.path.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                v.operation.encode_into(encoder)?;
             }
         }
         Ok(())
@@ -239,6 +272,8 @@ impl WheatObject {
             Ok(WheatObject::BranchManifestV1(BranchManifestV1Output::decode_with_decoder(decoder)?))
         } else if value == 0x0f01 {
             Ok(WheatObject::RepositoryEnvelopeV1(RepositoryEnvelopeV1Output::decode_with_decoder(decoder)?))
+        } else if value == 0x1001 {
+            Ok(WheatObject::EditV1(EditV1Output::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }
@@ -420,6 +455,52 @@ pub struct RevisionId {
 }
 
 impl RevisionId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct digest
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditId {
+    pub digest: Digest256,
+}
+
+impl EditId {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
@@ -1206,7 +1287,7 @@ impl DirectoryEntryValueV1 {
                 let variant_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
                 let _variant_ctx = ctx.extend_with_parent(variant_fields);
                 encoder.write_uint8(v.entry_kind);
-                v.content.encode_into(encoder)?;
+                v.value.encode_into(encoder)?;
             }
             DirectoryEntryValueV1::DirectoryEntryRefV1(v) => {
                 // Build per-variant context for nested struct sub-fields
@@ -1238,14 +1319,95 @@ impl DirectoryEntryValueV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FileEntryV1Input {
+pub struct FileKindV1 {
+    pub value: u8,
+}
+
+impl FileKindV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.value);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = decoder.read_byte()?;
+        Ok(Self {
+            value,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileValueV1 {
     pub content: ContentId,
+    pub kind: FileKindV1,
+}
+
+impl FileValueV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct content with context
+        self.content.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct kind
+        self.kind.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let content = ContentId::decode_with_decoder(decoder)?;
+        let kind = FileKindV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            content,
+            kind,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileEntryV1Input {
+    pub value: FileValueV1,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileEntryV1Output {
     pub entry_kind: u8,
-    pub content: ContentId,
+    pub value: FileValueV1,
 }
 
 pub type FileEntryV1 = FileEntryV1Output;
@@ -1274,8 +1436,8 @@ impl FileEntryV1Input {
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_byte(0);
-        // Encode nested struct content with context
-        self.content.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct value with context
+        self.value.encode_into_with_context(encoder, &child_ctx)?;
         Ok(())
     }
 
@@ -1292,10 +1454,10 @@ impl FileEntryV1Output {
         if entry_kind != 0u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 0, got {}", entry_kind)));
         }
-        let content = ContentId::decode_with_decoder(decoder)?;
+        let value = FileValueV1::decode_with_decoder(decoder)?;
         Ok(Self {
             entry_kind,
-            content,
+            value,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -1315,7 +1477,7 @@ impl FileEntryV1Output {
 impl From<FileEntryV1Output> for FileEntryV1Input {
     fn from(o: FileEntryV1Output) -> Self {
         Self {
-            content: o.content,
+            value: o.value,
         }
     }
 }
@@ -1324,7 +1486,7 @@ impl From<FileEntryV1Input> for FileEntryV1Output {
     fn from(i: FileEntryV1Input) -> Self {
         Self {
             entry_kind: 0u8,
-            content: i.content,
+            value: i.value,
         }
     }
 }
@@ -1879,7 +2041,8 @@ pub struct RevisionV1Input {
     pub predecessors: Vec<RevisionId>,
     pub dependencies: Vec<ChangeId>,
     pub authored_against: ViewId,
-    pub transformation: TransformationV1,
+    pub edits: Vec<EditId>,
+    pub transition: EditTransitionV1,
     pub resulting_tree: TreeId,
 }
 
@@ -1891,7 +2054,8 @@ pub struct RevisionV1Output {
     pub predecessors: Vec<RevisionId>,
     pub dependencies: Vec<ChangeId>,
     pub authored_against: ViewId,
-    pub transformation: TransformationV1,
+    pub edits: Vec<EditId>,
+    pub transition: EditTransitionV1,
     pub resulting_tree: TreeId,
 }
 
@@ -1940,6 +2104,17 @@ impl RevisionV1Input {
             }
             parent_fields.insert("dependencies".to_string(), FieldValue::Items(items_data));
         }
+        // Collect items with sub-field values for typed array 'edits'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.edits {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("edits".to_string(), FieldValue::Items(items_data));
+        }
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(769);
@@ -1957,8 +2132,12 @@ impl RevisionV1Input {
         }
         // Encode nested struct authored_against with context
         self.authored_against.encode_into_with_context(encoder, &child_ctx)?;
-        // Encode nested struct transformation
-        self.transformation.encode_into(encoder)?;
+        encoder.write_u32_be(self.edits.len() as u32);
+        for item in &self.edits {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        // Encode nested struct transition with context
+        self.transition.encode_into_with_context(encoder, &child_ctx)?;
         // Encode nested struct resulting_tree with context
         self.resulting_tree.encode_into_with_context(encoder, &child_ctx)?;
         Ok(())
@@ -1992,7 +2171,13 @@ impl RevisionV1Output {
             dependencies.push(item);
         }
         let authored_against = ViewId::decode_with_decoder(decoder)?;
-        let transformation = TransformationV1::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut edits = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditId::decode_with_decoder(decoder)?;
+            edits.push(item);
+        }
+        let transition = EditTransitionV1::decode_with_decoder(decoder)?;
         let resulting_tree = TreeId::decode_with_decoder(decoder)?;
         Ok(Self {
             wire_tag,
@@ -2001,7 +2186,8 @@ impl RevisionV1Output {
             predecessors,
             dependencies,
             authored_against,
-            transformation,
+            edits,
+            transition,
             resulting_tree,
         })
     }
@@ -2027,7 +2213,8 @@ impl From<RevisionV1Output> for RevisionV1Input {
             predecessors: o.predecessors,
             dependencies: o.dependencies,
             authored_against: o.authored_against,
-            transformation: o.transformation,
+            edits: o.edits,
+            transition: o.transition,
             resulting_tree: o.resulting_tree,
         }
     }
@@ -2042,28 +2229,119 @@ impl From<RevisionV1Input> for RevisionV1Output {
             predecessors: i.predecessors,
             dependencies: i.dependencies,
             authored_against: i.authored_against,
-            transformation: i.transformation,
+            edits: i.edits,
+            transition: i.transition,
             resulting_tree: i.resulting_tree,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TransformationV1 {
-    pub edits: Vec<FileEditV1>,
+pub struct EditTransitionV1 {
+    pub preserved: Vec<EditId>,
+    pub added: Vec<EditId>,
+    pub removed: Vec<EditId>,
+    pub subsumed: Vec<EditSubsumptionV1>,
+    pub resolutions: Vec<ConflictResolutionEvidenceV1>,
 }
 
-impl TransformationV1 {
+impl EditTransitionV1 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u32_be(self.edits.len() as u32);
-        for item in &self.edits {
-            item.encode_into(encoder)?;
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'preserved'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.preserved {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("preserved".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'added'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.added {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("added".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'removed'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.removed {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("removed".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'subsumed'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.subsumed {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditSubsumptionV1".to_string(), item_fields));
+            }
+            parent_fields.insert("subsumed".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'resolutions'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.resolutions {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("ConflictResolutionEvidenceV1".to_string(), item_fields));
+            }
+            parent_fields.insert("resolutions".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(self.preserved.len() as u32);
+        for item in &self.preserved {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u32_be(self.added.len() as u32);
+        for item in &self.added {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u32_be(self.removed.len() as u32);
+        for item in &self.removed {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u32_be(self.subsumed.len() as u32);
+        for item in &self.subsumed {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u32_be(self.resolutions.len() as u32);
+        for item in &self.resolutions {
+            item.encode_into_with_context(encoder, &child_ctx)?;
         }
         Ok(())
     }
@@ -2075,48 +2353,90 @@ impl TransformationV1 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut edits = Vec::with_capacity(length);
+        let mut preserved = Vec::with_capacity(length);
         for _ in 0..length {
-            let item = FileEditV1::decode_with_decoder(decoder)?;
-            edits.push(item);
+            let item = EditId::decode_with_decoder(decoder)?;
+            preserved.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut added = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditId::decode_with_decoder(decoder)?;
+            added.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut removed = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditId::decode_with_decoder(decoder)?;
+            removed.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut subsumed = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditSubsumptionV1::decode_with_decoder(decoder)?;
+            subsumed.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut resolutions = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ConflictResolutionEvidenceV1::decode_with_decoder(decoder)?;
+            resolutions.push(item);
         }
         Ok(Self {
-            edits,
+            preserved,
+            added,
+            removed,
+            subsumed,
+            resolutions,
         })
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FileEditV1 {
-    pub path: std::string::String,
-    pub expected: Option<ContentId>,
-    pub replacement: Option<ContentId>,
+pub struct EditSubsumptionV1 {
+    pub source: EditId,
+    pub replacements: Vec<EditId>,
 }
 
-impl FileEditV1 {
+impl EditSubsumptionV1 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
         Ok(encoder.finish())
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u32_be(self.path.len() as u32);
-        let string_bytes: &[u8] = self.path.as_bytes();
-        for &b in string_bytes.iter() {
-            encoder.write_byte(b);
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'replacements'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.replacements {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("replacements".to_string(), FieldValue::Items(items_data));
         }
-        if let Some(ref v) = self.expected {
-            encoder.write_uint8(1);
-            v.encode_into(encoder)?;
-        } else {
-            encoder.write_uint8(0);
-        }
-        if let Some(ref v) = self.replacement {
-            encoder.write_uint8(1);
-            v.encode_into(encoder)?;
-        } else {
-            encoder.write_uint8(0);
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct source with context
+        self.source.encode_into_with_context(encoder, &child_ctx)?;
+        encoder.write_u32_be(self.replacements.len() as u32);
+        for item in &self.replacements {
+            item.encode_into_with_context(encoder, &child_ctx)?;
         }
         Ok(())
     }
@@ -2127,25 +2447,108 @@ impl FileEditV1 {
     }
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let source = EditId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let bytes = decoder.read_bytes_vec(length)?;
-        let path = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
-        let has_value = decoder.read_uint8()? != 0;
-        let expected = if has_value {
-            Some(ContentId::decode_with_decoder(decoder)?)
-        } else {
-            None
-        };
-        let has_value = decoder.read_uint8()? != 0;
-        let replacement = if has_value {
-            Some(ContentId::decode_with_decoder(decoder)?)
-        } else {
-            None
-        };
+        let mut replacements = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditId::decode_with_decoder(decoder)?;
+            replacements.push(item);
+        }
         Ok(Self {
-            path,
-            expected,
-            replacement,
+            source,
+            replacements,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictResolutionEvidenceV1 {
+    pub application: ApplicationId,
+    pub conflicted_edits: Vec<EditId>,
+    pub replacement_edits: Vec<EditId>,
+}
+
+impl ConflictResolutionEvidenceV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'conflicted_edits'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.conflicted_edits {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("conflicted_edits".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'replacement_edits'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.replacement_edits {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("replacement_edits".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct application with context
+        self.application.encode_into_with_context(encoder, &child_ctx)?;
+        encoder.write_u32_be(self.conflicted_edits.len() as u32);
+        for item in &self.conflicted_edits {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u32_be(self.replacement_edits.len() as u32);
+        for item in &self.replacement_edits {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let application = ApplicationId::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut conflicted_edits = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditId::decode_with_decoder(decoder)?;
+            conflicted_edits.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut replacement_edits = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditId::decode_with_decoder(decoder)?;
+            replacement_edits.push(item);
+        }
+        Ok(Self {
+            application,
+            conflicted_edits,
+            replacement_edits,
         })
     }
 }
@@ -2155,6 +2558,7 @@ pub struct ApplicationV1Input {
     pub revision_id: RevisionId,
     pub target_view: ViewId,
     pub result: ApplicationResultV1,
+    pub applied: Vec<AppliedEditEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2163,6 +2567,7 @@ pub struct ApplicationV1Output {
     pub revision_id: RevisionId,
     pub target_view: ViewId,
     pub result: ApplicationResultV1,
+    pub applied: Vec<AppliedEditEntryV1>,
 }
 
 pub type ApplicationV1 = ApplicationV1Output;
@@ -2187,7 +2592,18 @@ impl ApplicationV1Input {
     pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
 
         // Build parent context for nested struct encoding
-        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'applied'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.applied {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("AppliedEditEntryV1".to_string(), item_fields));
+            }
+            parent_fields.insert("applied".to_string(), FieldValue::Items(items_data));
+        }
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(1025);
@@ -2196,6 +2612,10 @@ impl ApplicationV1Input {
         // Encode nested struct target_view with context
         self.target_view.encode_into_with_context(encoder, &child_ctx)?;
         self.result.encode_into(encoder)?;
+        encoder.write_u32_be(self.applied.len() as u32);
+        for item in &self.applied {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
         Ok(())
     }
 
@@ -2215,11 +2635,18 @@ impl ApplicationV1Output {
         let revision_id = RevisionId::decode_with_decoder(decoder)?;
         let target_view = ViewId::decode_with_decoder(decoder)?;
         let result = ApplicationResultV1::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut applied = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = AppliedEditEntryV1::decode_with_decoder(decoder)?;
+            applied.push(item);
+        }
         Ok(Self {
             wire_tag,
             revision_id,
             target_view,
             result,
+            applied,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -2242,6 +2669,7 @@ impl From<ApplicationV1Output> for ApplicationV1Input {
             revision_id: o.revision_id,
             target_view: o.target_view,
             result: o.result,
+            applied: o.applied,
         }
     }
 }
@@ -2253,6 +2681,7 @@ impl From<ApplicationV1Input> for ApplicationV1Output {
             revision_id: i.revision_id,
             target_view: i.target_view,
             result: i.result,
+            applied: i.applied,
         }
     }
 }
@@ -2514,14 +2943,14 @@ impl From<ConflictedApplicationV1Input> for ConflictedApplicationV1Output {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConflictV1Input {
     pub target_view: ViewId,
-    pub paths: Vec<PathConflictV1>,
+    pub edits: Vec<FailedEditEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConflictV1Output {
     pub wire_tag: u16,
     pub target_view: ViewId,
-    pub paths: Vec<PathConflictV1>,
+    pub edits: Vec<FailedEditEntryV1>,
 }
 
 pub type ConflictV1 = ConflictV1Output;
@@ -2547,26 +2976,25 @@ impl ConflictV1Input {
 
         // Build parent context for nested struct encoding
         let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        // Collect items with sub-field values for typed array 'paths'
+        // Collect items with sub-field values for typed array 'edits'
         {
             let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
-            for item in &self.paths {
-                let item_bytes = item.encode()?;
+            for _ in &self.edits {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
                 let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
                 item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
-                item_fields.insert("path".to_string(), FieldValue::String(item.path.clone()));
-                items_data.push(("PathConflictV1".to_string(), item_fields));
+                items_data.push(("FailedEditEntryV1".to_string(), item_fields));
             }
-            parent_fields.insert("paths".to_string(), FieldValue::Items(items_data));
+            parent_fields.insert("edits".to_string(), FieldValue::Items(items_data));
         }
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(1281);
         // Encode nested struct target_view with context
         self.target_view.encode_into_with_context(encoder, &child_ctx)?;
-        encoder.write_u32_be(self.paths.len() as u32);
-        for item in &self.paths {
-            item.encode_into(encoder)?;
+        encoder.write_u32_be(self.edits.len() as u32);
+        for item in &self.edits {
+            item.encode_into_with_context(encoder, &child_ctx)?;
         }
         Ok(())
     }
@@ -2586,15 +3014,15 @@ impl ConflictV1Output {
         }
         let target_view = ViewId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut paths = Vec::with_capacity(length);
+        let mut edits = Vec::with_capacity(length);
         for _ in 0..length {
-            let item = PathConflictV1::decode_with_decoder(decoder)?;
-            paths.push(item);
+            let item = FailedEditEntryV1::decode_with_decoder(decoder)?;
+            edits.push(item);
         }
         Ok(Self {
             wire_tag,
             target_view,
-            paths,
+            edits,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -2615,7 +3043,7 @@ impl From<ConflictV1Output> for ConflictV1Input {
     fn from(o: ConflictV1Output) -> Self {
         Self {
             target_view: o.target_view,
-            paths: o.paths,
+            edits: o.edits,
         }
     }
 }
@@ -2625,20 +3053,18 @@ impl From<ConflictV1Input> for ConflictV1Output {
         Self {
             wire_tag: 1281u16,
             target_view: i.target_view,
-            paths: i.paths,
+            edits: i.edits,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PathConflictV1 {
-    pub path: std::string::String,
-    pub expected: Option<ContentId>,
-    pub actual: Option<ContentId>,
-    pub proposed: Option<ContentId>,
+pub struct ByteRangeV1 {
+    pub start: u64,
+    pub end: u64,
 }
 
-impl PathConflictV1 {
+impl ByteRangeV1 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2646,28 +3072,155 @@ impl PathConflictV1 {
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u32_be(self.path.len() as u32);
-        let string_bytes: &[u8] = self.path.as_bytes();
-        for &b in string_bytes.iter() {
-            encoder.write_byte(b);
+        encoder.write_u64_be(self.start);
+        encoder.write_u64_be(self.end);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let start = decoder.read_u64_be()?;
+        let end = decoder.read_u64_be()?;
+        Ok(Self {
+            start,
+            end,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedEditEntryV1 {
+    pub edit: EditId,
+    pub evidence: AppliedEditEvidenceV1,
+}
+
+impl AppliedEditEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct edit with context
+        self.edit.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct evidence with context
+        self.evidence.encode_into_with_context(encoder, &child_ctx)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edit = EditId::decode_with_decoder(decoder)?;
+        let evidence = AppliedEditEvidenceV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            edit,
+            evidence,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedEditEvidenceV1 {
+    pub target: Vec<FileValueV1>,
+    pub read: Vec<ByteRangeV1>,
+    pub write: Vec<ByteRangeV1>,
+}
+
+impl AppliedEditEvidenceV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'target'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.target {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("FileValueV1".to_string(), item_fields));
+            }
+            parent_fields.insert("target".to_string(), FieldValue::Items(items_data));
         }
-        if let Some(ref v) = self.expected {
-            encoder.write_uint8(1);
-            v.encode_into(encoder)?;
-        } else {
-            encoder.write_uint8(0);
+        // Collect items with sub-field values for typed array 'read'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.read {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("start".to_string(), FieldValue::U64(item.start));
+                item_fields.insert("end".to_string(), FieldValue::U64(item.end));
+                items_data.push(("ByteRangeV1".to_string(), item_fields));
+            }
+            parent_fields.insert("read".to_string(), FieldValue::Items(items_data));
         }
-        if let Some(ref v) = self.actual {
-            encoder.write_uint8(1);
-            v.encode_into(encoder)?;
-        } else {
-            encoder.write_uint8(0);
+        // Collect items with sub-field values for typed array 'write'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for item in &self.write {
+                let item_bytes = item.encode()?;
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                item_fields.insert("start".to_string(), FieldValue::U64(item.start));
+                item_fields.insert("end".to_string(), FieldValue::U64(item.end));
+                items_data.push(("ByteRangeV1".to_string(), item_fields));
+            }
+            parent_fields.insert("write".to_string(), FieldValue::Items(items_data));
         }
-        if let Some(ref v) = self.proposed {
-            encoder.write_uint8(1);
-            v.encode_into(encoder)?;
-        } else {
-            encoder.write_uint8(0);
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(self.target.len() as u32);
+        for item in &self.target {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u32_be(self.read.len() as u32);
+        for item in &self.read {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.write.len() as u32);
+        for item in &self.write {
+            item.encode_into(encoder)?;
         }
         Ok(())
     }
@@ -2679,32 +3232,574 @@ impl PathConflictV1 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let bytes = decoder.read_bytes_vec(length)?;
-        let path = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
-        let has_value = decoder.read_uint8()? != 0;
-        let expected = if has_value {
-            Some(ContentId::decode_with_decoder(decoder)?)
-        } else {
-            None
-        };
-        let has_value = decoder.read_uint8()? != 0;
-        let actual = if has_value {
-            Some(ContentId::decode_with_decoder(decoder)?)
-        } else {
-            None
-        };
-        let has_value = decoder.read_uint8()? != 0;
-        let proposed = if has_value {
-            Some(ContentId::decode_with_decoder(decoder)?)
-        } else {
-            None
-        };
+        let mut target = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = FileValueV1::decode_with_decoder(decoder)?;
+            target.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut read = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ByteRangeV1::decode_with_decoder(decoder)?;
+            read.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut write = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ByteRangeV1::decode_with_decoder(decoder)?;
+            write.push(item);
+        }
         Ok(Self {
-            path,
-            expected,
-            actual,
-            proposed,
+            target,
+            read,
+            write,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedEditEntryV1 {
+    pub edit: EditId,
+    pub evidence: FailedEditEvidenceV1,
+}
+
+impl FailedEditEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        // Encode nested struct edit with context
+        self.edit.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct evidence with context
+        self.evidence.encode_into_with_context(encoder, &child_ctx)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edit = EditId::decode_with_decoder(decoder)?;
+        let evidence = FailedEditEvidenceV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            edit,
+            evidence,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedEditEvidenceV1 {
+    pub target: Vec<FileValueV1>,
+    pub reason: EditFailureV1,
+}
+
+impl FailedEditEvidenceV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'target'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.target {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("FileValueV1".to_string(), item_fields));
+            }
+            parent_fields.insert("target".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_u32_be(self.target.len() as u32);
+        for item in &self.target {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        self.reason.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut target = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = FileValueV1::decode_with_decoder(decoder)?;
+            target.push(item);
+        }
+        let reason = EditFailureV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            target,
+            reason,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditFailureV1 {
+    NoMatchFailureV1(NoMatchFailureV1Output),
+    AmbiguousFailureV1(AmbiguousFailureV1Output),
+    InterferenceFailureV1(InterferenceFailureV1Output),
+    KindMismatchFailureV1(KindMismatchFailureV1Output),
+    ExpectedFileMismatchFailureV1(ExpectedFileMismatchFailureV1Output),
+}
+
+impl EditFailureV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        match self {
+            EditFailureV1::NoMatchFailureV1(v) => {
+                encoder.write_uint8(v.failure_kind);
+            }
+            EditFailureV1::AmbiguousFailureV1(v) => {
+                encoder.write_uint8(v.failure_kind);
+            }
+            EditFailureV1::InterferenceFailureV1(v) => {
+                encoder.write_uint8(v.failure_kind);
+                encoder.write_uint32(v.with.len() as u32, Endianness::BigEndian);
+                for item in &v.with {
+                    item.encode_into(encoder)?;
+                }
+            }
+            EditFailureV1::KindMismatchFailureV1(v) => {
+                encoder.write_uint8(v.failure_kind);
+            }
+            EditFailureV1::ExpectedFileMismatchFailureV1(v) => {
+                encoder.write_uint8(v.failure_kind);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = decoder.peek_uint8()?;
+        // Match on discriminator value
+        if value == 0 {
+            Ok(EditFailureV1::NoMatchFailureV1(NoMatchFailureV1Output::decode_with_decoder(decoder)?))
+        } else if value == 1 {
+            Ok(EditFailureV1::AmbiguousFailureV1(AmbiguousFailureV1Output::decode_with_decoder(decoder)?))
+        } else if value == 2 {
+            Ok(EditFailureV1::InterferenceFailureV1(InterferenceFailureV1Output::decode_with_decoder(decoder)?))
+        } else if value == 3 {
+            Ok(EditFailureV1::KindMismatchFailureV1(KindMismatchFailureV1Output::decode_with_decoder(decoder)?))
+        } else if value == 4 {
+            Ok(EditFailureV1::ExpectedFileMismatchFailureV1(ExpectedFileMismatchFailureV1Output::decode_with_decoder(decoder)?))
+        } else {
+            Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoMatchFailureV1Input {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoMatchFailureV1Output {
+    pub failure_kind: u8,
+}
+
+pub type NoMatchFailureV1 = NoMatchFailureV1Output;
+
+impl NoMatchFailureV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(0);
+        Ok(())
+    }
+
+}
+
+impl NoMatchFailureV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let failure_kind = decoder.read_byte()?;
+        if failure_kind != 0u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 0, got {}", failure_kind)));
+        }
+        Ok(Self {
+            failure_kind,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        NoMatchFailureV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        NoMatchFailureV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<NoMatchFailureV1Output> for NoMatchFailureV1Input {
+    fn from(_o: NoMatchFailureV1Output) -> Self {
+        Self {
+        }
+    }
+}
+
+impl From<NoMatchFailureV1Input> for NoMatchFailureV1Output {
+    fn from(_i: NoMatchFailureV1Input) -> Self {
+        Self {
+            failure_kind: 0u8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmbiguousFailureV1Input {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmbiguousFailureV1Output {
+    pub failure_kind: u8,
+}
+
+pub type AmbiguousFailureV1 = AmbiguousFailureV1Output;
+
+impl AmbiguousFailureV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(1);
+        Ok(())
+    }
+
+}
+
+impl AmbiguousFailureV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let failure_kind = decoder.read_byte()?;
+        if failure_kind != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", failure_kind)));
+        }
+        Ok(Self {
+            failure_kind,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AmbiguousFailureV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AmbiguousFailureV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AmbiguousFailureV1Output> for AmbiguousFailureV1Input {
+    fn from(_o: AmbiguousFailureV1Output) -> Self {
+        Self {
+        }
+    }
+}
+
+impl From<AmbiguousFailureV1Input> for AmbiguousFailureV1Output {
+    fn from(_i: AmbiguousFailureV1Input) -> Self {
+        Self {
+            failure_kind: 1u8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterferenceFailureV1Input {
+    pub with: Vec<EditId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterferenceFailureV1Output {
+    pub failure_kind: u8,
+    pub with: Vec<EditId>,
+}
+
+pub type InterferenceFailureV1 = InterferenceFailureV1Output;
+
+impl InterferenceFailureV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'with'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.with {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("EditId".to_string(), item_fields));
+            }
+            parent_fields.insert("with".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(2);
+        encoder.write_u32_be(self.with.len() as u32);
+        for item in &self.with {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl InterferenceFailureV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let failure_kind = decoder.read_byte()?;
+        if failure_kind != 2u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", failure_kind)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut with = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = EditId::decode_with_decoder(decoder)?;
+            with.push(item);
+        }
+        Ok(Self {
+            failure_kind,
+            with,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        InterferenceFailureV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        InterferenceFailureV1Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        InterferenceFailureV1Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        InterferenceFailureV1Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<InterferenceFailureV1Output> for InterferenceFailureV1Input {
+    fn from(o: InterferenceFailureV1Output) -> Self {
+        Self {
+            with: o.with,
+        }
+    }
+}
+
+impl From<InterferenceFailureV1Input> for InterferenceFailureV1Output {
+    fn from(i: InterferenceFailureV1Input) -> Self {
+        Self {
+            failure_kind: 2u8,
+            with: i.with,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KindMismatchFailureV1Input {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KindMismatchFailureV1Output {
+    pub failure_kind: u8,
+}
+
+pub type KindMismatchFailureV1 = KindMismatchFailureV1Output;
+
+impl KindMismatchFailureV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(3);
+        Ok(())
+    }
+
+}
+
+impl KindMismatchFailureV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let failure_kind = decoder.read_byte()?;
+        if failure_kind != 3u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3, got {}", failure_kind)));
+        }
+        Ok(Self {
+            failure_kind,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        KindMismatchFailureV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        KindMismatchFailureV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<KindMismatchFailureV1Output> for KindMismatchFailureV1Input {
+    fn from(_o: KindMismatchFailureV1Output) -> Self {
+        Self {
+        }
+    }
+}
+
+impl From<KindMismatchFailureV1Input> for KindMismatchFailureV1Output {
+    fn from(_i: KindMismatchFailureV1Input) -> Self {
+        Self {
+            failure_kind: 3u8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpectedFileMismatchFailureV1Input {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpectedFileMismatchFailureV1Output {
+    pub failure_kind: u8,
+}
+
+pub type ExpectedFileMismatchFailureV1 = ExpectedFileMismatchFailureV1Output;
+
+impl ExpectedFileMismatchFailureV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(4);
+        Ok(())
+    }
+
+}
+
+impl ExpectedFileMismatchFailureV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let failure_kind = decoder.read_byte()?;
+        if failure_kind != 4u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 4, got {}", failure_kind)));
+        }
+        Ok(Self {
+            failure_kind,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ExpectedFileMismatchFailureV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ExpectedFileMismatchFailureV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ExpectedFileMismatchFailureV1Output> for ExpectedFileMismatchFailureV1Input {
+    fn from(_o: ExpectedFileMismatchFailureV1Output) -> Self {
+        Self {
+        }
+    }
+}
+
+impl From<ExpectedFileMismatchFailureV1Input> for ExpectedFileMismatchFailureV1Output {
+    fn from(_i: ExpectedFileMismatchFailureV1Input) -> Self {
+        Self {
+            failure_kind: 4u8,
+        }
     }
 }
 
@@ -2926,7 +4021,7 @@ impl From<ContentManifestV1Input> for ContentManifestV1Output {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RevisionMapNodeV1Input {
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub value: Vec<RevisionId>,
     pub children: Vec<RevisionMapChildV1>,
 }
@@ -2934,7 +4029,7 @@ pub struct RevisionMapNodeV1Input {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RevisionMapNodeV1Output {
     pub wire_tag: u16,
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub value: Vec<RevisionId>,
     pub children: Vec<RevisionMapChildV1>,
 }
@@ -2962,7 +4057,7 @@ impl RevisionMapNodeV1Input {
 
         // Build parent context for nested struct encoding
         let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("depth".to_string(), FieldValue::U8(self.depth));
+        parent_fields.insert("prefix".to_string(), FieldValue::Bytes(self.prefix.clone()));
         // Collect items with sub-field values for typed array 'value'
         {
             let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
@@ -2988,7 +4083,10 @@ impl RevisionMapNodeV1Input {
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(2305);
-        encoder.write_byte(self.depth);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
         encoder.write_u32_be(self.value.len() as u32);
         for item in &self.value {
             item.encode_into_with_context(encoder, &child_ctx)?;
@@ -3013,7 +4111,12 @@ impl RevisionMapNodeV1Output {
         if wire_tag != 2305u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2305, got {}", wire_tag)));
         }
-        let depth = decoder.read_byte()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut prefix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            prefix.push(item);
+        }
         let length = decoder.read_u32_be()? as usize;
         let mut value = Vec::with_capacity(length);
         for _ in 0..length {
@@ -3028,7 +4131,7 @@ impl RevisionMapNodeV1Output {
         }
         Ok(Self {
             wire_tag,
-            depth,
+            prefix,
             value,
             children,
         })
@@ -3050,7 +4153,7 @@ impl RevisionMapNodeV1Output {
 impl From<RevisionMapNodeV1Output> for RevisionMapNodeV1Input {
     fn from(o: RevisionMapNodeV1Output) -> Self {
         Self {
-            depth: o.depth,
+            prefix: o.prefix,
             value: o.value,
             children: o.children,
         }
@@ -3061,7 +4164,7 @@ impl From<RevisionMapNodeV1Input> for RevisionMapNodeV1Output {
     fn from(i: RevisionMapNodeV1Input) -> Self {
         Self {
             wire_tag: 2305u16,
-            depth: i.depth,
+            prefix: i.prefix,
             value: i.value,
             children: i.children,
         }
@@ -3121,7 +4224,7 @@ impl RevisionMapChildV1 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplicationMapNodeV1Input {
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub value: Vec<ApplicationId>,
     pub children: Vec<ApplicationMapChildV1>,
 }
@@ -3129,7 +4232,7 @@ pub struct ApplicationMapNodeV1Input {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplicationMapNodeV1Output {
     pub wire_tag: u16,
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub value: Vec<ApplicationId>,
     pub children: Vec<ApplicationMapChildV1>,
 }
@@ -3157,7 +4260,7 @@ impl ApplicationMapNodeV1Input {
 
         // Build parent context for nested struct encoding
         let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("depth".to_string(), FieldValue::U8(self.depth));
+        parent_fields.insert("prefix".to_string(), FieldValue::Bytes(self.prefix.clone()));
         // Collect items with sub-field values for typed array 'value'
         {
             let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
@@ -3183,7 +4286,10 @@ impl ApplicationMapNodeV1Input {
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(2561);
-        encoder.write_byte(self.depth);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
         encoder.write_u32_be(self.value.len() as u32);
         for item in &self.value {
             item.encode_into_with_context(encoder, &child_ctx)?;
@@ -3208,7 +4314,12 @@ impl ApplicationMapNodeV1Output {
         if wire_tag != 2561u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2561, got {}", wire_tag)));
         }
-        let depth = decoder.read_byte()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut prefix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            prefix.push(item);
+        }
         let length = decoder.read_u32_be()? as usize;
         let mut value = Vec::with_capacity(length);
         for _ in 0..length {
@@ -3223,7 +4334,7 @@ impl ApplicationMapNodeV1Output {
         }
         Ok(Self {
             wire_tag,
-            depth,
+            prefix,
             value,
             children,
         })
@@ -3245,7 +4356,7 @@ impl ApplicationMapNodeV1Output {
 impl From<ApplicationMapNodeV1Output> for ApplicationMapNodeV1Input {
     fn from(o: ApplicationMapNodeV1Output) -> Self {
         Self {
-            depth: o.depth,
+            prefix: o.prefix,
             value: o.value,
             children: o.children,
         }
@@ -3256,7 +4367,7 @@ impl From<ApplicationMapNodeV1Input> for ApplicationMapNodeV1Output {
     fn from(i: ApplicationMapNodeV1Input) -> Self {
         Self {
             wire_tag: 2561u16,
-            depth: i.depth,
+            prefix: i.prefix,
             value: i.value,
             children: i.children,
         }
@@ -3316,7 +4427,7 @@ impl ApplicationMapChildV1 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConflictSetNodeV1Input {
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ConflictSetChildV1>,
 }
@@ -3324,7 +4435,7 @@ pub struct ConflictSetNodeV1Input {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConflictSetNodeV1Output {
     pub wire_tag: u16,
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ConflictSetChildV1>,
 }
@@ -3352,7 +4463,7 @@ impl ConflictSetNodeV1Input {
 
         // Build parent context for nested struct encoding
         let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("depth".to_string(), FieldValue::U8(self.depth));
+        parent_fields.insert("prefix".to_string(), FieldValue::Bytes(self.prefix.clone()));
         // Collect items with sub-field values for typed array 'children'
         {
             let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
@@ -3367,7 +4478,10 @@ impl ConflictSetNodeV1Input {
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(2817);
-        encoder.write_byte(self.depth);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
         encoder.write_byte(if self.present { 1 } else { 0 });
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
@@ -3389,7 +4503,12 @@ impl ConflictSetNodeV1Output {
         if wire_tag != 2817u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2817, got {}", wire_tag)));
         }
-        let depth = decoder.read_byte()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut prefix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            prefix.push(item);
+        }
         let present = decoder.read_byte()? != 0;
         let length = decoder.read_u32_be()? as usize;
         let mut children = Vec::with_capacity(length);
@@ -3399,7 +4518,7 @@ impl ConflictSetNodeV1Output {
         }
         Ok(Self {
             wire_tag,
-            depth,
+            prefix,
             present,
             children,
         })
@@ -3421,7 +4540,7 @@ impl ConflictSetNodeV1Output {
 impl From<ConflictSetNodeV1Output> for ConflictSetNodeV1Input {
     fn from(o: ConflictSetNodeV1Output) -> Self {
         Self {
-            depth: o.depth,
+            prefix: o.prefix,
             present: o.present,
             children: o.children,
         }
@@ -3432,7 +4551,7 @@ impl From<ConflictSetNodeV1Input> for ConflictSetNodeV1Output {
     fn from(i: ConflictSetNodeV1Input) -> Self {
         Self {
             wire_tag: 2817u16,
-            depth: i.depth,
+            prefix: i.prefix,
             present: i.present,
             children: i.children,
         }
@@ -3492,7 +4611,7 @@ impl ConflictSetChildV1 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentSetNodeV1Input {
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ContentSetChildV1>,
 }
@@ -3500,7 +4619,7 @@ pub struct ContentSetNodeV1Input {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentSetNodeV1Output {
     pub wire_tag: u16,
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ContentSetChildV1>,
 }
@@ -3528,7 +4647,7 @@ impl ContentSetNodeV1Input {
 
         // Build parent context for nested struct encoding
         let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("depth".to_string(), FieldValue::U8(self.depth));
+        parent_fields.insert("prefix".to_string(), FieldValue::Bytes(self.prefix.clone()));
         // Collect items with sub-field values for typed array 'children'
         {
             let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
@@ -3543,7 +4662,10 @@ impl ContentSetNodeV1Input {
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(3073);
-        encoder.write_byte(self.depth);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
         encoder.write_byte(if self.present { 1 } else { 0 });
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
@@ -3565,7 +4687,12 @@ impl ContentSetNodeV1Output {
         if wire_tag != 3073u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3073, got {}", wire_tag)));
         }
-        let depth = decoder.read_byte()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut prefix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            prefix.push(item);
+        }
         let present = decoder.read_byte()? != 0;
         let length = decoder.read_u32_be()? as usize;
         let mut children = Vec::with_capacity(length);
@@ -3575,7 +4702,7 @@ impl ContentSetNodeV1Output {
         }
         Ok(Self {
             wire_tag,
-            depth,
+            prefix,
             present,
             children,
         })
@@ -3597,7 +4724,7 @@ impl ContentSetNodeV1Output {
 impl From<ContentSetNodeV1Output> for ContentSetNodeV1Input {
     fn from(o: ContentSetNodeV1Output) -> Self {
         Self {
-            depth: o.depth,
+            prefix: o.prefix,
             present: o.present,
             children: o.children,
         }
@@ -3608,7 +4735,7 @@ impl From<ContentSetNodeV1Input> for ContentSetNodeV1Output {
     fn from(i: ContentSetNodeV1Input) -> Self {
         Self {
             wire_tag: 3073u16,
-            depth: i.depth,
+            prefix: i.prefix,
             present: i.present,
             children: i.children,
         }
@@ -3668,7 +4795,7 @@ impl ContentSetChildV1 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetainedSetNodeV1Input {
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<RetainedSetChildV1>,
 }
@@ -3676,7 +4803,7 @@ pub struct RetainedSetNodeV1Input {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetainedSetNodeV1Output {
     pub wire_tag: u16,
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<RetainedSetChildV1>,
 }
@@ -3704,7 +4831,7 @@ impl RetainedSetNodeV1Input {
 
         // Build parent context for nested struct encoding
         let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
-        parent_fields.insert("depth".to_string(), FieldValue::U8(self.depth));
+        parent_fields.insert("prefix".to_string(), FieldValue::Bytes(self.prefix.clone()));
         // Collect items with sub-field values for typed array 'children'
         {
             let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
@@ -3719,7 +4846,10 @@ impl RetainedSetNodeV1Input {
         let child_ctx = ctx.extend_with_parent(parent_fields);
         let _ = &child_ctx; // Used by nested struct encoding
         encoder.write_u16_be(3329);
-        encoder.write_byte(self.depth);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
         encoder.write_byte(if self.present { 1 } else { 0 });
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
@@ -3741,7 +4871,12 @@ impl RetainedSetNodeV1Output {
         if wire_tag != 3329u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3329, got {}", wire_tag)));
         }
-        let depth = decoder.read_byte()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut prefix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            prefix.push(item);
+        }
         let present = decoder.read_byte()? != 0;
         let length = decoder.read_u32_be()? as usize;
         let mut children = Vec::with_capacity(length);
@@ -3751,7 +4886,7 @@ impl RetainedSetNodeV1Output {
         }
         Ok(Self {
             wire_tag,
-            depth,
+            prefix,
             present,
             children,
         })
@@ -3773,7 +4908,7 @@ impl RetainedSetNodeV1Output {
 impl From<RetainedSetNodeV1Output> for RetainedSetNodeV1Input {
     fn from(o: RetainedSetNodeV1Output) -> Self {
         Self {
-            depth: o.depth,
+            prefix: o.prefix,
             present: o.present,
             children: o.children,
         }
@@ -3784,7 +4919,7 @@ impl From<RetainedSetNodeV1Input> for RetainedSetNodeV1Output {
     fn from(i: RetainedSetNodeV1Input) -> Self {
         Self {
             wire_tag: 3329u16,
-            depth: i.depth,
+            prefix: i.prefix,
             present: i.present,
             children: i.children,
         }
@@ -4253,6 +5388,434 @@ impl From<RepositoryEnvelopeV1Input> for RepositoryEnvelopeV1Output {
             wire_tag: 3841u16,
             state: i.state,
             branches: i.branches,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditV1Input {
+    pub path: std::string::String,
+    pub operation: EditOperationV1,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditV1Output {
+    pub wire_tag: u16,
+    pub path: std::string::String,
+    pub operation: EditOperationV1,
+}
+
+pub type EditV1 = EditV1Output;
+
+impl EditV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(4097);
+        encoder.write_u32_be(self.path.len() as u32);
+        let string_bytes: &[u8] = self.path.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        self.operation.encode_into(encoder)?;
+        Ok(())
+    }
+
+}
+
+impl EditV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 4097u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 4097, got {}", wire_tag)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let path = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let operation = EditOperationV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            wire_tag,
+            path,
+            operation,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        EditV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        EditV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<EditV1Output> for EditV1Input {
+    fn from(o: EditV1Output) -> Self {
+        Self {
+            path: o.path,
+            operation: o.operation,
+        }
+    }
+}
+
+impl From<EditV1Input> for EditV1Output {
+    fn from(i: EditV1Input) -> Self {
+        Self {
+            wire_tag: 4097u16,
+            path: i.path,
+            operation: i.operation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditOperationV1 {
+    GuardedTextEditV1(GuardedTextEditV1Output),
+    ExactFileEditV1(ExactFileEditV1Output),
+}
+
+impl EditOperationV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        match self {
+            EditOperationV1::GuardedTextEditV1(v) => {
+                // Build per-variant context for nested struct sub-fields
+                let variant_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                let _variant_ctx = ctx.extend_with_parent(variant_fields);
+                encoder.write_uint8(v.operation_kind);
+                v.kind.encode_into(encoder)?;
+                v.before.encode_into(encoder)?;
+                v.expected.encode_into(encoder)?;
+                v.replacement.encode_into(encoder)?;
+                v.after.encode_into(encoder)?;
+                encoder.write_uint8(if v.start_anchor { 1 } else { 0 });
+                encoder.write_uint8(if v.end_anchor { 1 } else { 0 });
+            }
+            EditOperationV1::ExactFileEditV1(v) => {
+                encoder.write_uint8(v.operation_kind);
+                encoder.write_uint32(v.expected.len() as u32, Endianness::BigEndian);
+                for item in &v.expected {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.replacement.len() as u32, Endianness::BigEndian);
+                for item in &v.replacement {
+                    item.encode_into(encoder)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = decoder.peek_uint8()?;
+        // Match on discriminator value
+        if value == 0 {
+            Ok(EditOperationV1::GuardedTextEditV1(GuardedTextEditV1Output::decode_with_decoder(decoder)?))
+        } else if value == 1 {
+            Ok(EditOperationV1::ExactFileEditV1(ExactFileEditV1Output::decode_with_decoder(decoder)?))
+        } else {
+            Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuardedTextEditV1Input {
+    pub kind: FileKindV1,
+    pub before: ContentId,
+    pub expected: ContentId,
+    pub replacement: ContentId,
+    pub after: ContentId,
+    pub start_anchor: bool,
+    pub end_anchor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuardedTextEditV1Output {
+    pub operation_kind: u8,
+    pub kind: FileKindV1,
+    pub before: ContentId,
+    pub expected: ContentId,
+    pub replacement: ContentId,
+    pub after: ContentId,
+    pub start_anchor: bool,
+    pub end_anchor: bool,
+}
+
+pub type GuardedTextEditV1 = GuardedTextEditV1Output;
+
+impl GuardedTextEditV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(0);
+        // Encode nested struct kind
+        self.kind.encode_into(encoder)?;
+        // Encode nested struct before with context
+        self.before.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct expected with context
+        self.expected.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct replacement with context
+        self.replacement.encode_into_with_context(encoder, &child_ctx)?;
+        // Encode nested struct after with context
+        self.after.encode_into_with_context(encoder, &child_ctx)?;
+        encoder.write_byte(if self.start_anchor { 1 } else { 0 });
+        encoder.write_byte(if self.end_anchor { 1 } else { 0 });
+        Ok(())
+    }
+
+}
+
+impl GuardedTextEditV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let operation_kind = decoder.read_byte()?;
+        if operation_kind != 0u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 0, got {}", operation_kind)));
+        }
+        let kind = FileKindV1::decode_with_decoder(decoder)?;
+        let before = ContentId::decode_with_decoder(decoder)?;
+        let expected = ContentId::decode_with_decoder(decoder)?;
+        let replacement = ContentId::decode_with_decoder(decoder)?;
+        let after = ContentId::decode_with_decoder(decoder)?;
+        let start_anchor = decoder.read_byte()? != 0;
+        let end_anchor = decoder.read_byte()? != 0;
+        Ok(Self {
+            operation_kind,
+            kind,
+            before,
+            expected,
+            replacement,
+            after,
+            start_anchor,
+            end_anchor,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        GuardedTextEditV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        GuardedTextEditV1Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        GuardedTextEditV1Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        GuardedTextEditV1Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<GuardedTextEditV1Output> for GuardedTextEditV1Input {
+    fn from(o: GuardedTextEditV1Output) -> Self {
+        Self {
+            kind: o.kind,
+            before: o.before,
+            expected: o.expected,
+            replacement: o.replacement,
+            after: o.after,
+            start_anchor: o.start_anchor,
+            end_anchor: o.end_anchor,
+        }
+    }
+}
+
+impl From<GuardedTextEditV1Input> for GuardedTextEditV1Output {
+    fn from(i: GuardedTextEditV1Input) -> Self {
+        Self {
+            operation_kind: 0u8,
+            kind: i.kind,
+            before: i.before,
+            expected: i.expected,
+            replacement: i.replacement,
+            after: i.after,
+            start_anchor: i.start_anchor,
+            end_anchor: i.end_anchor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactFileEditV1Input {
+    pub expected: Vec<FileValueV1>,
+    pub replacement: Vec<FileValueV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactFileEditV1Output {
+    pub operation_kind: u8,
+    pub expected: Vec<FileValueV1>,
+    pub replacement: Vec<FileValueV1>,
+}
+
+pub type ExactFileEditV1 = ExactFileEditV1Output;
+
+impl ExactFileEditV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, &EncodeContext::new())?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.encode_into_with_context(encoder, &EncodeContext::new())
+    }
+
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into_with_context(&mut encoder, ctx)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+
+        // Build parent context for nested struct encoding
+        let mut parent_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+        // Collect items with sub-field values for typed array 'expected'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.expected {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("FileValueV1".to_string(), item_fields));
+            }
+            parent_fields.insert("expected".to_string(), FieldValue::Items(items_data));
+        }
+        // Collect items with sub-field values for typed array 'replacement'
+        {
+            let mut items_data: Vec<(std::string::String, HashMap<std::string::String, FieldValue>)> = Vec::new();
+            for _ in &self.replacement {
+                let item_bytes = Vec::<u8>::new(); // Items need context, skip encoding for now
+                let mut item_fields: HashMap<std::string::String, FieldValue> = HashMap::new();
+                item_fields.insert("_encoded_size".to_string(), FieldValue::U64(item_bytes.len() as u64));
+                items_data.push(("FileValueV1".to_string(), item_fields));
+            }
+            parent_fields.insert("replacement".to_string(), FieldValue::Items(items_data));
+        }
+        let child_ctx = ctx.extend_with_parent(parent_fields);
+        let _ = &child_ctx; // Used by nested struct encoding
+        encoder.write_byte(1);
+        encoder.write_u32_be(self.expected.len() as u32);
+        for item in &self.expected {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        encoder.write_u32_be(self.replacement.len() as u32);
+        for item in &self.replacement {
+            item.encode_into_with_context(encoder, &child_ctx)?;
+        }
+        Ok(())
+    }
+
+}
+
+impl ExactFileEditV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let operation_kind = decoder.read_byte()?;
+        if operation_kind != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", operation_kind)));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut expected = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = FileValueV1::decode_with_decoder(decoder)?;
+            expected.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut replacement = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = FileValueV1::decode_with_decoder(decoder)?;
+            replacement.push(item);
+        }
+        Ok(Self {
+            operation_kind,
+            expected,
+            replacement,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ExactFileEditV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ExactFileEditV1Input::from(self.clone()).encode_into(encoder)
+    }
+    pub fn encode_with_context(&self, ctx: &EncodeContext) -> Result<Vec<u8>> {
+        ExactFileEditV1Input::from(self.clone()).encode_with_context(ctx)
+    }
+    pub fn encode_into_with_context(&self, encoder: &mut BitStreamEncoder, ctx: &EncodeContext) -> Result<()> {
+        ExactFileEditV1Input::from(self.clone()).encode_into_with_context(encoder, ctx)
+    }
+}
+
+impl From<ExactFileEditV1Output> for ExactFileEditV1Input {
+    fn from(o: ExactFileEditV1Output) -> Self {
+        Self {
+            expected: o.expected,
+            replacement: o.replacement,
+        }
+    }
+}
+
+impl From<ExactFileEditV1Input> for ExactFileEditV1Output {
+    fn from(i: ExactFileEditV1Input) -> Self {
+        Self {
+            operation_kind: 1u8,
+            expected: i.expected,
+            replacement: i.replacement,
         }
     }
 }

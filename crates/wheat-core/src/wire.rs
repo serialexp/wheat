@@ -7,9 +7,9 @@ use crate::{
     Actor, Application, ApplicationMapChild, ApplicationMapNode, ApplicationResult, Change,
     ChangeId, ChangeMetadata, ChangeRevision, Conflict, ConflictSetChild, ConflictSetNode,
     ContentId, ContentManifestId, ContentSetChild, ContentSetNode, DirectoryEntry, DirectoryNode,
-    FileEdit, PathConflict, RepositoryState, RepositoryView, RetainedSetChild, RetainedSetNode,
-    RevisionId, RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance, Timestamp,
-    Transformation, Tree, TreeId,
+    EditOperation, EditRecord, FileKind, FileValue, RepositoryState, RepositoryView,
+    RetainedSetChild, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapNode,
+    RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId,
 };
 
 const BLAKE3_256: u8 = 1;
@@ -38,6 +38,7 @@ pub enum CanonicalObjectError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalObjectKind {
     Tree,
+    Edit,
     Change,
     Revision,
     Application,
@@ -62,16 +63,48 @@ pub fn validate_canonical_object(
 }
 
 fn decode_validated(bytes: &[u8]) -> Result<wire::WheatObject, CanonicalObjectError> {
-    let object = wire::WheatObject::decode(bytes)
+    let mut decoder =
+        wheat_binschema::BitStreamDecoder::new(bytes, wheat_binschema::BitOrder::MsbFirst);
+    let object = wire::WheatObject::decode_with_decoder(&mut decoder)
         .map_err(|error| CanonicalObjectError::Decode(format!("{error:?}")))?;
-    validate_object(&object)?;
-    let encoded = object
-        .encode()
-        .map_err(|error| CanonicalObjectError::Decode(format!("{error:?}")))?;
-    if encoded != bytes {
+    if decoder.position() != decoder.bytes_len() {
         return Err(CanonicalObjectError::NonCanonicalEncoding);
     }
+    validate_object(&object)?;
     Ok(object)
+}
+
+pub fn decode_edit_record(bytes: &[u8]) -> Result<EditRecord, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::EditV1(edit) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::Edit,
+            actual: object_kind(&object),
+        });
+    };
+    let operation = match edit.operation {
+        wire::EditOperationV1::GuardedTextEditV1(value) => EditOperation::GuardedText {
+            kind: guarded_file_kind(value.kind.value)?,
+            before: content_id_domain(&value.before)?,
+            expected: content_id_domain(&value.expected)?,
+            replacement: content_id_domain(&value.replacement)?,
+            after: content_id_domain(&value.after)?,
+            start_anchor: value.start_anchor,
+            end_anchor: value.end_anchor,
+        },
+        wire::EditOperationV1::ExactFileEditV1(value) => EditOperation::ExactFile {
+            expected: value.expected.first().map(file_value_domain).transpose()?,
+            replacement: value
+                .replacement
+                .first()
+                .map(file_value_domain)
+                .transpose()?,
+        },
+    };
+    Ok(EditRecord {
+        path: edit.path,
+        operation,
+    })
 }
 
 pub fn decode_view_record(bytes: &[u8]) -> Result<crate::ViewRecord, CanonicalObjectError> {
@@ -195,7 +228,7 @@ pub fn decode_directory_node(bytes: &[u8]) -> Result<DirectoryNode, CanonicalObj
         .map(|entry| {
             let value = match entry.value {
                 wire::DirectoryEntryValueV1::FileEntryV1(file) => {
-                    DirectoryEntry::File(content_id_domain(&file.content)?)
+                    DirectoryEntry::File(file_value_domain(&file.value)?)
                 }
                 wire::DirectoryEntryValueV1::DirectoryEntryRefV1(directory) => {
                     DirectoryEntry::Directory(TreeId::from_digest(digest_domain(
@@ -218,7 +251,7 @@ pub fn decode_revision_map_node(bytes: &[u8]) -> Result<RevisionMapNode, Canonic
         });
     };
     Ok(RevisionMapNode {
-        depth: node.depth,
+        prefix: node.prefix,
         value: node.value.first().map(|value| {
             RevisionId::from_digest(digest_domain(&value.digest).expect("validated digest"))
         }),
@@ -238,29 +271,24 @@ pub fn decode_revision_map_node(bytes: &[u8]) -> Result<RevisionMapNode, Canonic
 pub(crate) fn validate_revision_map_node(
     node: &RevisionMapNode,
 ) -> Result<(), CanonicalObjectError> {
-    if node.depth > 16 {
-        return Err(CanonicalObjectError::InvalidCollection(
-            "revision map depth exceeds key length",
-        ));
-    }
-    if node.value.is_some() && node.depth != 16 {
-        return Err(CanonicalObjectError::InvalidCollection(
-            "revision map value requires terminal depth",
-        ));
-    }
-    if node.depth == 16 && !node.children.is_empty() {
-        return Err(CanonicalObjectError::InvalidCollection(
-            "terminal revision map node cannot have children",
-        ));
-    }
-    validate_sorted_unique_by(&node.children, |child| &child.edge, "revision map children")
+    validate_radix_node(
+        &node.prefix,
+        node.value.is_some(),
+        &node
+            .children
+            .iter()
+            .map(|child| child.edge)
+            .collect::<Vec<_>>(),
+        16,
+        "revision map node",
+    )
 }
 
 pub(crate) fn revision_map_node_bytes(node: &RevisionMapNode) -> Vec<u8> {
     validate_revision_map_node(node).expect("revision map node violates canonical invariants");
     encode(wire::WheatObject::RevisionMapNodeV1(
         wire::RevisionMapNodeV1Input {
-            depth: node.depth,
+            prefix: node.prefix.clone(),
             value: node.value.into_iter().map(revision_id).collect(),
             children: node
                 .children
@@ -286,7 +314,7 @@ macro_rules! decode_set_node {
                 });
             };
             Ok($node {
-                depth: node.depth,
+                prefix: node.prefix,
                 present: node.present,
                 children: node
                     .children
@@ -339,7 +367,7 @@ pub fn decode_application_map_node(
         });
     };
     Ok(ApplicationMapNode {
-        depth: node.depth,
+        prefix: node.prefix,
         value: node.value.first().map(|value| {
             crate::ApplicationId::from_digest(
                 digest_domain(&value.digest).expect("validated digest"),
@@ -358,20 +386,18 @@ pub fn decode_application_map_node(
     })
 }
 
-fn validate_trie(
-    depth: u8,
+fn validate_radix_node(
+    prefix: &[u8],
     terminal: bool,
     children: &[u8],
-    key_len: u8,
+    key_len: usize,
     name: &'static str,
 ) -> Result<(), CanonicalObjectError> {
-    if depth > key_len {
-        return Err(CanonicalObjectError::InvalidCollection(name));
-    }
-    if terminal && depth != key_len {
-        return Err(CanonicalObjectError::InvalidCollection(name));
-    }
-    if depth == key_len && !children.is_empty() {
+    if prefix.len() > key_len
+        || (terminal && !children.is_empty())
+        || (!terminal && children.len() == 1)
+        || (!terminal && children.is_empty() && !prefix.is_empty())
+    {
         return Err(CanonicalObjectError::InvalidCollection(name));
     }
     validate_sorted_unique_by(children, |edge| edge, name)
@@ -380,8 +406,8 @@ fn validate_trie(
 pub(crate) fn validate_application_map_node(
     node: &ApplicationMapNode,
 ) -> Result<(), CanonicalObjectError> {
-    validate_trie(
-        node.depth,
+    validate_radix_node(
+        &node.prefix,
         node.value.is_some(),
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
         16,
@@ -391,8 +417,8 @@ pub(crate) fn validate_application_map_node(
 pub(crate) fn validate_conflict_set_node(
     node: &ConflictSetNode,
 ) -> Result<(), CanonicalObjectError> {
-    validate_trie(
-        node.depth,
+    validate_radix_node(
+        &node.prefix,
         node.present,
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
         32,
@@ -400,8 +426,8 @@ pub(crate) fn validate_conflict_set_node(
     )
 }
 pub(crate) fn validate_content_set_node(node: &ContentSetNode) -> Result<(), CanonicalObjectError> {
-    validate_trie(
-        node.depth,
+    validate_radix_node(
+        &node.prefix,
         node.present,
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
         32,
@@ -411,8 +437,8 @@ pub(crate) fn validate_content_set_node(node: &ContentSetNode) -> Result<(), Can
 pub(crate) fn validate_retained_set_node(
     node: &RetainedSetNode,
 ) -> Result<(), CanonicalObjectError> {
-    validate_trie(
-        node.depth,
+    validate_radix_node(
+        &node.prefix,
         node.present,
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
         32,
@@ -425,7 +451,7 @@ pub(crate) fn application_map_node_bytes(node: &ApplicationMapNode) -> Vec<u8> {
         .expect("application map node violates canonical invariants");
     encode(wire::WheatObject::ApplicationMapNodeV1(
         wire::ApplicationMapNodeV1Input {
-            depth: node.depth,
+            prefix: node.prefix.clone(),
             value: node.value.into_iter().map(application_id).collect(),
             children: node
                 .children
@@ -446,7 +472,7 @@ macro_rules! set_node_bytes {
             $validate(node).expect("set node violates canonical invariants");
             encode(wire::WheatObject::$variant(
                 wire::$input {
-                    depth: node.depth,
+                    prefix: node.prefix.clone(),
                     present: node.present,
                     children: node
                         .children
@@ -502,9 +528,9 @@ pub(crate) fn directory_node_bytes(node: &DirectoryNode) -> Vec<u8> {
                 .map(|(name, entry)| wire::DirectoryEntryV1 {
                     name: name.clone(),
                     value: match entry {
-                        DirectoryEntry::File(content) => wire::DirectoryEntryValueV1::FileEntryV1(
+                        DirectoryEntry::File(value) => wire::DirectoryEntryValueV1::FileEntryV1(
                             wire::FileEntryV1Input {
-                                content: content_id(*content),
+                                value: file_value(*value),
                             }
                             .into(),
                         ),
@@ -534,7 +560,7 @@ pub(crate) fn tree_id(tree: &Tree) -> TreeId {
 pub(crate) fn tree_objects(tree: &Tree) -> Vec<(TreeId, Vec<u8>)> {
     #[derive(Default)]
     struct PendingDirectory {
-        files: BTreeMap<String, ContentId>,
+        files: BTreeMap<String, FileValue>,
         directories: BTreeMap<String, PendingDirectory>,
     }
 
@@ -625,18 +651,96 @@ pub(crate) fn revision_bytes(revision: &ChangeRevision) -> Vec<u8> {
                 .map(change_id)
                 .collect(),
             authored_against: view_id(revision.authored_against),
-            transformation: transformation(&revision.transformation),
+            edits: revision.edits.edits.keys().copied().map(edit_id).collect(),
+            transition: edit_transition(&revision.edits.transition),
             resulting_tree: tree_id_wire(tree_id(&revision.resulting_tree)),
         }
         .into(),
     ))
 }
 
+fn edit_transition(value: &crate::EditTransition) -> wire::EditTransitionV1 {
+    let mut subsumed = value
+        .subsumed
+        .iter()
+        .map(|s| wire::EditSubsumptionV1 {
+            source: edit_id(s.source),
+            replacements: s.replacements.iter().copied().map(edit_id).collect(),
+        })
+        .collect::<Vec<_>>();
+    subsumed.sort_by(|a, b| a.source.digest.bytes.cmp(&b.source.digest.bytes));
+    let mut resolutions = value
+        .resolutions
+        .iter()
+        .map(|r| wire::ConflictResolutionEvidenceV1 {
+            application: application_id(r.application),
+            conflicted_edits: r.conflicted_edits.iter().copied().map(edit_id).collect(),
+            replacement_edits: r.replacement_edits.iter().copied().map(edit_id).collect(),
+        })
+        .collect::<Vec<_>>();
+    resolutions.sort_by(|a, b| a.application.digest.bytes.cmp(&b.application.digest.bytes));
+    wire::EditTransitionV1 {
+        preserved: value.preserved.iter().copied().map(edit_id).collect(),
+        added: value.added.iter().copied().map(edit_id).collect(),
+        removed: value.removed.iter().copied().map(edit_id).collect(),
+        subsumed,
+        resolutions,
+    }
+}
+
+fn applied_evidence(value: &crate::AppliedEditEvidence) -> wire::AppliedEditEvidenceV1 {
+    let range = |r: crate::ByteRange| wire::ByteRangeV1 {
+        start: r.start,
+        end: r.end,
+    };
+    wire::AppliedEditEvidenceV1 {
+        target: value.target.map(file_value).into_iter().collect(),
+        read: value.read.map(range).into_iter().collect(),
+        write: value.write.map(range).into_iter().collect(),
+    }
+}
+
+fn failed_evidence(value: &crate::FailedEditEvidence) -> wire::FailedEditEvidenceV1 {
+    let reason = match &value.reason {
+        crate::EditFailure::NoMatch => {
+            wire::EditFailureV1::NoMatchFailureV1(wire::NoMatchFailureV1Input {}.into())
+        }
+        crate::EditFailure::Ambiguous => {
+            wire::EditFailureV1::AmbiguousFailureV1(wire::AmbiguousFailureV1Input {}.into())
+        }
+        crate::EditFailure::Interference { with } => wire::EditFailureV1::InterferenceFailureV1(
+            wire::InterferenceFailureV1Input {
+                with: with.iter().copied().map(edit_id).collect(),
+            }
+            .into(),
+        ),
+        crate::EditFailure::KindMismatch => {
+            wire::EditFailureV1::KindMismatchFailureV1(wire::KindMismatchFailureV1Input {}.into())
+        }
+        crate::EditFailure::ExpectedFileMismatch => {
+            wire::EditFailureV1::ExpectedFileMismatchFailureV1(
+                wire::ExpectedFileMismatchFailureV1Input {}.into(),
+            )
+        }
+    };
+    wire::FailedEditEvidenceV1 {
+        target: value.target.map(file_value).into_iter().collect(),
+        reason,
+    }
+}
+
 pub(crate) fn conflict_bytes(conflict: &Conflict) -> Vec<u8> {
     encode(wire::WheatObject::ConflictV1(
         wire::ConflictV1Input {
             target_view: view_id(conflict.base_view),
-            paths: conflict.paths.iter().map(path_conflict).collect(),
+            edits: conflict
+                .edits
+                .iter()
+                .map(|(edit, evidence)| wire::FailedEditEntryV1 {
+                    edit: edit_id(*edit),
+                    evidence: failed_evidence(evidence),
+                })
+                .collect(),
         }
         .into(),
     ))
@@ -673,6 +777,14 @@ pub(crate) fn application_bytes(application: &Application) -> Vec<u8> {
             revision_id: revision_id(application.revision_id),
             target_view: view_id(application.target_view),
             result,
+            applied: application
+                .applied
+                .iter()
+                .map(|(edit, evidence)| wire::AppliedEditEntryV1 {
+                    edit: edit_id(*edit),
+                    evidence: applied_evidence(evidence),
+                })
+                .collect(),
         }
         .into(),
     ))
@@ -743,8 +855,130 @@ pub(crate) fn view_bytes(view: &RepositoryView) -> Vec<u8> {
     crate::build_view_record(view, &mut |_| {}).canonical_bytes()
 }
 
+pub(crate) fn validate_edit_record(edit: &EditRecord) -> Result<(), CanonicalObjectError> {
+    validate_path(&edit.path)?;
+    match &edit.operation {
+        EditOperation::GuardedText { kind, .. } if *kind == FileKind::Symlink => Err(
+            CanonicalObjectError::Decode("guarded text requires regular or executable file".into()),
+        ),
+        EditOperation::ExactFile {
+            expected,
+            replacement,
+        } if expected == replacement => Err(CanonicalObjectError::InvalidCollection(
+            "exact file edit must change value",
+        )),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn edit_record_bytes(edit: &EditRecord) -> Vec<u8> {
+    validate_edit_record(edit).expect("invalid edit record");
+    let operation = match &edit.operation {
+        EditOperation::GuardedText {
+            kind,
+            before,
+            expected,
+            replacement,
+            after,
+            start_anchor,
+            end_anchor,
+        } => wire::EditOperationV1::GuardedTextEditV1(
+            wire::GuardedTextEditV1Input {
+                kind: wire::FileKindV1 {
+                    value: match kind {
+                        FileKind::Regular => 0,
+                        FileKind::Executable => 1,
+                        FileKind::Symlink => unreachable!(),
+                    },
+                },
+                before: content_id(*before),
+                expected: content_id(*expected),
+                replacement: content_id(*replacement),
+                after: content_id(*after),
+                start_anchor: *start_anchor,
+                end_anchor: *end_anchor,
+            }
+            .into(),
+        ),
+        EditOperation::ExactFile {
+            expected,
+            replacement,
+        } => wire::EditOperationV1::ExactFileEditV1(
+            wire::ExactFileEditV1Input {
+                expected: expected.iter().copied().map(file_value).collect(),
+                replacement: replacement.iter().copied().map(file_value).collect(),
+            }
+            .into(),
+        ),
+    };
+    encode(wire::WheatObject::EditV1(
+        wire::EditV1Input {
+            path: edit.path.clone(),
+            operation,
+        }
+        .into(),
+    ))
+}
+
+fn validate_path(path: &str) -> Result<(), CanonicalObjectError> {
+    if path.is_empty()
+        || path
+            .split('/')
+            .any(|part| validate_directory_component(part).is_err())
+    {
+        return Err(CanonicalObjectError::InvalidDirectoryComponent(
+            path.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn guarded_file_kind(value: u8) -> Result<FileKind, CanonicalObjectError> {
+    match value {
+        0 => Ok(FileKind::Regular),
+        1 => Ok(FileKind::Executable),
+        _ => Err(CanonicalObjectError::Decode(
+            "invalid guarded text file kind".into(),
+        )),
+    }
+}
+
 fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectError> {
     match object {
+        wire::WheatObject::EditV1(edit) => {
+            validate_path(&edit.path)?;
+            match &edit.operation {
+                wire::EditOperationV1::GuardedTextEditV1(value) => {
+                    guarded_file_kind(value.kind.value)?;
+                    validate_content_id(&value.before)?;
+                    validate_content_id(&value.expected)?;
+                    validate_content_id(&value.replacement)?;
+                    validate_content_id(&value.after)?;
+                    if value.expected == value.replacement {
+                        return Err(CanonicalObjectError::InvalidCollection(
+                            "guarded text edit must not be a no-op",
+                        ));
+                    }
+                }
+                wire::EditOperationV1::ExactFileEditV1(value) => {
+                    if value.expected.len() > 1 || value.replacement.len() > 1 {
+                        return Err(CanonicalObjectError::InvalidCollection(
+                            "exact file option cardinality",
+                        ));
+                    }
+                    value.expected.first().map_or(Ok(()), validate_file_value)?;
+                    value
+                        .replacement
+                        .first()
+                        .map_or(Ok(()), validate_file_value)?;
+                    if value.expected == value.replacement {
+                        return Err(CanonicalObjectError::InvalidCollection(
+                            "exact file edit must change value",
+                        ));
+                    }
+                }
+            }
+        }
         wire::WheatObject::TreeV1(tree) => {
             validate_sorted_unique_by(
                 &tree.entries,
@@ -754,7 +988,7 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             for entry in &tree.entries {
                 validate_directory_component(&entry.name)?;
                 if let wire::DirectoryEntryValueV1::FileEntryV1(file) = &entry.value {
-                    validate_content_id(&file.content)?;
+                    validate_file_value(&file.value)?;
                 }
             }
         }
@@ -770,56 +1004,43 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 |dependency| dependency.uuid.bytes.as_slice(),
                 "revision dependencies",
             )?;
+            validate_edit_ids(&revision.edits, "revision edits")?;
+            validate_transition(&revision.transition, &revision.edits)?;
+        }
+        wire::WheatObject::ApplicationV1(application) => {
             validate_sorted_unique_by(
-                &revision.transformation.edits,
-                |edit| edit.path.as_str(),
-                "transformation paths",
+                &application.applied,
+                |e| e.edit.digest.bytes.as_slice(),
+                "application applied edits",
             )?;
-            for edit in &revision.transformation.edits {
-                validate_optional_content_id(edit.expected.as_ref())?;
-                validate_optional_content_id(edit.replacement.as_ref())?;
+            for entry in &application.applied {
+                validate_applied_evidence(&entry.evidence)?;
             }
         }
-        wire::WheatObject::ApplicationV1(_) => {}
         wire::WheatObject::ConflictV1(conflict) => {
             validate_sorted_unique_by(
-                &conflict.paths,
-                |path| path.path.as_str(),
-                "conflict paths",
+                &conflict.edits,
+                |e| e.edit.digest.bytes.as_slice(),
+                "conflict edits",
             )?;
-            for path in &conflict.paths {
-                validate_optional_content_id(path.expected.as_ref())?;
-                validate_optional_content_id(path.actual.as_ref())?;
-                validate_optional_content_id(path.proposed.as_ref())?;
+            for entry in &conflict.edits {
+                validate_failed_evidence(&entry.evidence)?;
             }
         }
         wire::WheatObject::ViewV1(_) => {}
         wire::WheatObject::ContentManifestV1(_) => {}
         wire::WheatObject::RevisionMapNodeV1(node) => {
-            if node.depth > 16 {
-                return Err(CanonicalObjectError::InvalidCollection(
-                    "revision map depth exceeds key length",
-                ));
-            }
             if node.value.len() > 1 {
                 return Err(CanonicalObjectError::InvalidCollection(
                     "revision map must have at most one value",
                 ));
             }
-            if !node.value.is_empty() && node.depth != 16 {
-                return Err(CanonicalObjectError::InvalidCollection(
-                    "revision map value requires terminal depth",
-                ));
-            }
-            if node.depth == 16 && !node.children.is_empty() {
-                return Err(CanonicalObjectError::InvalidCollection(
-                    "terminal revision map node cannot have children",
-                ));
-            }
-            validate_sorted_unique_by(
-                &node.children,
-                |child| &child.edge,
-                "revision map children",
+            validate_radix_node(
+                &node.prefix,
+                !node.value.is_empty(),
+                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                16,
+                "revision map node",
             )?;
         }
         wire::WheatObject::ApplicationMapNodeV1(node) => {
@@ -828,8 +1049,8 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                     "application map value",
                 ));
             }
-            validate_trie(
-                node.depth,
+            validate_radix_node(
+                &node.prefix,
                 !node.value.is_empty(),
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
                 16,
@@ -837,8 +1058,8 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             )?;
         }
         wire::WheatObject::ConflictSetNodeV1(node) => {
-            validate_trie(
-                node.depth,
+            validate_radix_node(
+                &node.prefix,
                 node.present,
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
                 32,
@@ -846,8 +1067,8 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             )?;
         }
         wire::WheatObject::ContentSetNodeV1(node) => {
-            validate_trie(
-                node.depth,
+            validate_radix_node(
+                &node.prefix,
                 node.present,
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
                 32,
@@ -855,8 +1076,8 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             )?;
         }
         wire::WheatObject::RetainedSetNodeV1(node) => {
-            validate_trie(
-                node.depth,
+            validate_radix_node(
+                &node.prefix,
                 node.present,
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
                 32,
@@ -881,6 +1102,7 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
 fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
     match object {
         wire::WheatObject::TreeV1(_) => CanonicalObjectKind::Tree,
+        wire::WheatObject::EditV1(_) => CanonicalObjectKind::Edit,
         wire::WheatObject::ChangeV1(_) => CanonicalObjectKind::Change,
         wire::WheatObject::RevisionV1(_) => CanonicalObjectKind::Revision,
         wire::WheatObject::ApplicationV1(_) => CanonicalObjectKind::Application,
@@ -898,6 +1120,142 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
     }
 }
 
+fn validate_edit_ids(
+    values: &[wire::EditId],
+    name: &'static str,
+) -> Result<(), CanonicalObjectError> {
+    validate_sorted_unique_by(values, |id| id.digest.bytes.as_slice(), name)
+}
+
+fn validate_transition(
+    value: &wire::EditTransitionV1,
+    selected: &[wire::EditId],
+) -> Result<(), CanonicalObjectError> {
+    validate_edit_ids(&value.preserved, "preserved edits")?;
+    validate_edit_ids(&value.added, "added edits")?;
+    validate_edit_ids(&value.removed, "removed edits")?;
+    let selected_set: BTreeSet<_> = selected
+        .iter()
+        .map(|id| id.digest.bytes.as_slice())
+        .collect();
+    let preserved: BTreeSet<_> = value
+        .preserved
+        .iter()
+        .map(|id| id.digest.bytes.as_slice())
+        .collect();
+    let added: BTreeSet<_> = value
+        .added
+        .iter()
+        .map(|id| id.digest.bytes.as_slice())
+        .collect();
+    let removed: BTreeSet<_> = value
+        .removed
+        .iter()
+        .map(|id| id.digest.bytes.as_slice())
+        .collect();
+    if !preserved.is_disjoint(&added)
+        || !preserved.is_disjoint(&removed)
+        || !added.is_disjoint(&removed)
+        || selected_set != preserved.union(&added).copied().collect()
+    {
+        return Err(CanonicalObjectError::InvalidCollection(
+            "invalid edit transition partition",
+        ));
+    }
+    validate_sorted_unique_by(
+        &value.subsumed,
+        |s| s.source.digest.bytes.as_slice(),
+        "edit subsumptions",
+    )?;
+    for s in &value.subsumed {
+        validate_edit_ids(&s.replacements, "subsumption replacements")?;
+        if s.replacements.is_empty()
+            || !removed.contains(s.source.digest.bytes.as_slice())
+            || !s
+                .replacements
+                .iter()
+                .all(|id| added.contains(id.digest.bytes.as_slice()))
+        {
+            return Err(CanonicalObjectError::InvalidCollection(
+                "invalid edit subsumption",
+            ));
+        }
+    }
+    validate_sorted_unique_by(
+        &value.resolutions,
+        |r| r.application.digest.bytes.as_slice(),
+        "conflict resolutions",
+    )?;
+    for r in &value.resolutions {
+        validate_edit_ids(&r.conflicted_edits, "resolution conflicted edits")?;
+        validate_edit_ids(&r.replacement_edits, "resolution replacement edits")?;
+        if r.conflicted_edits.is_empty()
+            || !r
+                .replacement_edits
+                .iter()
+                .all(|id| selected_set.contains(id.digest.bytes.as_slice()))
+        {
+            return Err(CanonicalObjectError::InvalidCollection(
+                "invalid conflict resolution evidence",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_range(range: &wire::ByteRangeV1) -> Result<(), CanonicalObjectError> {
+    if range.start > range.end {
+        Err(CanonicalObjectError::InvalidCollection(
+            "invalid byte range",
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn validate_applied_evidence(
+    value: &wire::AppliedEditEvidenceV1,
+) -> Result<(), CanonicalObjectError> {
+    if value.target.len() > 1 || value.read.len() > 1 || value.write.len() > 1 {
+        return Err(CanonicalObjectError::InvalidCollection(
+            "edit evidence option cardinality",
+        ));
+    }
+    value.target.first().map_or(Ok(()), validate_file_value)?;
+    if let Some(read) = value.read.first() {
+        validate_range(read)?;
+    }
+    if let Some(write) = value.write.first() {
+        validate_range(write)?;
+    }
+    if let Some(write) = value.write.first() {
+        let Some(read) = value.read.first() else {
+            return Err(CanonicalObjectError::InvalidCollection(
+                "write range requires read range",
+            ));
+        };
+        if write.start < read.start || write.end > read.end {
+            return Err(CanonicalObjectError::InvalidCollection(
+                "write range must be contained in read range",
+            ));
+        }
+    }
+    Ok(())
+}
+fn validate_failed_evidence(
+    value: &wire::FailedEditEvidenceV1,
+) -> Result<(), CanonicalObjectError> {
+    if value.target.len() > 1 {
+        return Err(CanonicalObjectError::InvalidCollection(
+            "failed edit target option cardinality",
+        ));
+    }
+    value.target.first().map_or(Ok(()), validate_file_value)?;
+    if let wire::EditFailureV1::InterferenceFailureV1(v) = &value.reason {
+        validate_edit_ids(&v.with, "interfering edits")?;
+    }
+    Ok(())
+}
+
 fn validate_sorted_unique_by<T, K: Ord + ?Sized>(
     values: &[T],
     key: impl Fn(&T) -> &K,
@@ -913,10 +1271,12 @@ fn validate_sorted_unique_by<T, K: Ord + ?Sized>(
     }
 }
 
-fn validate_optional_content_id(
-    content: Option<&wire::ContentId>,
-) -> Result<(), CanonicalObjectError> {
-    content.map_or(Ok(()), validate_content_id)
+fn validate_file_value(value: &wire::FileValueV1) -> Result<(), CanonicalObjectError> {
+    validate_content_id(&value.content)?;
+    if value.kind.value > 2 {
+        return Err(CanonicalObjectError::Decode("invalid file kind".into()));
+    }
+    Ok(())
 }
 
 fn validate_content_id(content: &wire::ContentId) -> Result<(), CanonicalObjectError> {
@@ -990,37 +1350,36 @@ fn revision_metadata(value: &RevisionMetadata) -> wire::RevisionMetadataV1 {
     }
 }
 
-fn transformation(value: &Transformation) -> wire::TransformationV1 {
-    let mut edits = value.edits.iter().map(file_edit).collect::<Vec<_>>();
-    edits.sort_by(|left, right| left.path.cmp(&right.path));
-    assert!(
-        edits.windows(2).all(|edits| edits[0].path != edits[1].path),
-        "a transformation may contain only one edit per path"
-    );
-    wire::TransformationV1 { edits }
-}
-
-fn file_edit(value: &FileEdit) -> wire::FileEditV1 {
-    wire::FileEditV1 {
-        path: value.path.clone(),
-        expected: value.expected.map(content_id),
-        replacement: value.replacement.map(content_id),
-    }
-}
-
-fn path_conflict(value: &PathConflict) -> wire::PathConflictV1 {
-    wire::PathConflictV1 {
-        path: value.path.clone(),
-        expected: value.expected.map(content_id),
-        actual: value.actual.map(content_id),
-        proposed: value.proposed.map(content_id),
-    }
-}
-
 fn change_id(value: ChangeId) -> wire::ChangeId {
     wire::ChangeId {
         uuid: wire::Uuid128 {
             bytes: value.as_bytes().to_vec(),
+        },
+    }
+}
+
+fn file_value_domain(value: &wire::FileValueV1) -> Result<FileValue, CanonicalObjectError> {
+    let kind = match value.kind.value {
+        0 => FileKind::Regular,
+        1 => FileKind::Executable,
+        2 => FileKind::Symlink,
+        _ => return Err(CanonicalObjectError::Decode("invalid file kind".into())),
+    };
+    Ok(FileValue {
+        content: content_id_domain(&value.content)?,
+        kind,
+    })
+}
+
+fn file_value(value: FileValue) -> wire::FileValueV1 {
+    wire::FileValueV1 {
+        content: content_id(value.content),
+        kind: wire::FileKindV1 {
+            value: match value.kind {
+                FileKind::Regular => 0,
+                FileKind::Executable => 1,
+                FileKind::Symlink => 2,
+            },
         },
     }
 }
@@ -1043,6 +1402,7 @@ macro_rules! wire_digest_id {
 }
 
 wire_digest_id!(revision_id, RevisionId, RevisionId);
+wire_digest_id!(edit_id, crate::EditId, EditId);
 wire_digest_id!(revision_map_id, crate::RevisionMapId, RevisionMapId);
 wire_digest_id!(
     application_map_id,

@@ -3,14 +3,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplicationId, ChangeId, ConflictId, ContentId, ContentManifestId, RevisionId, ViewId,
+    ApplicationId, ChangeId, ConflictId, ContentId, ContentManifestId, EditId, EditRecord,
+    RevisionId, ViewId,
 };
 
-pub type Tree = BTreeMap<String, ContentId>;
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum FileKind {
+    #[default]
+    Regular,
+    Executable,
+    Symlink,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct FileValue {
+    pub content: ContentId,
+    pub kind: FileKind,
+}
+
+pub type Tree = BTreeMap<String, FileValue>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectoryEntry {
-    File(ContentId),
+    File(FileValue),
     Directory(crate::TreeId),
 }
 
@@ -97,16 +112,77 @@ impl Change {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EditTransition {
+    pub preserved: BTreeSet<EditId>,
+    pub added: BTreeSet<EditId>,
+    pub removed: BTreeSet<EditId>,
+    pub subsumed: Vec<EditSubsumption>,
+    pub resolutions: Vec<ConflictResolutionEvidence>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FileEdit {
-    pub path: String,
-    pub expected: Option<ContentId>,
-    pub replacement: Option<ContentId>,
+pub struct EditSubsumption {
+    pub source: EditId,
+    pub replacements: BTreeSet<EditId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConflictResolutionEvidence {
+    pub application: ApplicationId,
+    pub conflicted_edits: BTreeSet<EditId>,
+    pub replacement_edits: BTreeSet<EditId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Transformation {
-    pub edits: Vec<FileEdit>,
+pub struct RevisionEdits {
+    pub edits: BTreeMap<EditId, EditRecord>,
+    pub transition: EditTransition,
+}
+
+impl RevisionEdits {
+    pub fn validate(&self) -> Result<(), crate::CanonicalObjectError> {
+        let selected = self.edits.keys().copied().collect::<BTreeSet<_>>();
+        self.transition.validate(&selected)?;
+        if self.edits.iter().any(|(id, edit)| *id != edit.id()) {
+            return Err(crate::CanonicalObjectError::InvalidCollection(
+                "revision edit key does not match edit identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl EditTransition {
+    pub fn validate(&self, selected: &BTreeSet<EditId>) -> Result<(), crate::CanonicalObjectError> {
+        if !self.preserved.is_disjoint(&self.added)
+            || !self.preserved.is_disjoint(&self.removed)
+            || !self.added.is_disjoint(&self.removed)
+            || selected != &self.preserved.union(&self.added).copied().collect()
+        {
+            return Err(crate::CanonicalObjectError::InvalidCollection(
+                "invalid edit transition partition",
+            ));
+        }
+        for item in &self.subsumed {
+            if item.replacements.is_empty()
+                || !self.removed.contains(&item.source)
+                || !item.replacements.is_subset(&self.added)
+            {
+                return Err(crate::CanonicalObjectError::InvalidCollection(
+                    "invalid edit subsumption",
+                ));
+            }
+        }
+        for item in &self.resolutions {
+            if item.conflicted_edits.is_empty() || !item.replacement_edits.is_subset(selected) {
+                return Err(crate::CanonicalObjectError::InvalidCollection(
+                    "invalid conflict resolution evidence",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -117,7 +193,7 @@ pub struct ChangeRevision {
     pub(crate) predecessor: Option<RevisionId>,
     pub(crate) dependencies: BTreeSet<ChangeId>,
     pub(crate) authored_against: ViewId,
-    pub(crate) transformation: Transformation,
+    pub(crate) edits: RevisionEdits,
     pub(crate) resulting_tree: Tree,
 }
 
@@ -153,8 +229,13 @@ impl ChangeRevision {
     }
 
     #[must_use]
-    pub fn transformation(&self) -> &Transformation {
-        &self.transformation
+    pub fn edits(&self) -> &BTreeMap<EditId, EditRecord> {
+        &self.edits.edits
+    }
+
+    #[must_use]
+    pub fn edit_transition(&self) -> &EditTransition {
+        &self.edits.transition
     }
 
     #[must_use]
@@ -176,20 +257,20 @@ pub struct RevisionMapChild {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RevisionMapNode {
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub value: Option<RevisionId>,
     pub children: Vec<RevisionMapChild>,
 }
 
 impl RevisionMapNode {
     pub fn new(
-        depth: u8,
+        prefix: Vec<u8>,
         value: Option<RevisionId>,
         mut children: Vec<RevisionMapChild>,
     ) -> Result<Self, crate::CanonicalObjectError> {
         children.sort_by_key(|child| child.edge);
         let node = Self {
-            depth,
+            prefix,
             value,
             children,
         };
@@ -208,33 +289,72 @@ impl RevisionMapNode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PathConflict {
-    pub path: String,
-    pub expected: Option<ContentId>,
-    pub actual: Option<ContentId>,
-    pub proposed: Option<ContentId>,
+pub struct AppliedEditEvidence {
+    pub target: Option<FileValue>,
+    pub read: Option<ByteRange>,
+    pub write: Option<ByteRange>,
+}
+
+impl AppliedEditEvidence {
+    pub fn validate(&self) -> Result<(), crate::CanonicalObjectError> {
+        if self.read.is_some_and(|r| r.start > r.end) || self.write.is_some_and(|r| r.start > r.end)
+        {
+            return Err(crate::CanonicalObjectError::InvalidCollection(
+                "invalid byte range",
+            ));
+        }
+        if let Some(write) = self.write {
+            let Some(read) = self.read else {
+                return Err(crate::CanonicalObjectError::InvalidCollection(
+                    "write range requires read range",
+                ));
+            };
+            if write.start < read.start || write.end > read.end {
+                return Err(crate::CanonicalObjectError::InvalidCollection(
+                    "write range must be contained in read range",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EditFailure {
+    NoMatch,
+    Ambiguous,
+    Interference { with: BTreeSet<EditId> },
+    KindMismatch,
+    ExpectedFileMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FailedEditEvidence {
+    pub target: Option<FileValue>,
+    pub reason: EditFailure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Conflict {
     pub id: ConflictId,
     pub base_view: ViewId,
-    pub paths: Vec<PathConflict>,
+    pub edits: BTreeMap<EditId, FailedEditEvidence>,
 }
 
 impl Conflict {
     #[must_use]
-    pub fn new(base_view: ViewId, mut paths: Vec<PathConflict>) -> Self {
-        paths.sort_by(|left, right| left.path.cmp(&right.path));
-        assert!(
-            paths.windows(2).all(|paths| paths[0].path != paths[1].path),
-            "a conflict may contain only one entry per path"
-        );
+    pub fn new(base_view: ViewId, edits: BTreeMap<EditId, FailedEditEvidence>) -> Self {
         let mut conflict = Self {
             id: ConflictId::from_digest([0; 32]),
             base_view,
-            paths,
+            edits,
         };
         conflict.id = ConflictId::of_canonical_bytes(&crate::wire::conflict_bytes(&conflict));
         conflict
@@ -273,16 +393,27 @@ pub struct Application {
     pub revision_id: RevisionId,
     pub target_view: ViewId,
     pub result: ApplicationResult,
+    pub applied: BTreeMap<EditId, AppliedEditEvidence>,
 }
 
 impl Application {
     #[must_use]
-    pub fn new(revision_id: RevisionId, target_view: ViewId, result: ApplicationResult) -> Self {
+    pub fn new(
+        revision_id: RevisionId,
+        target_view: ViewId,
+        result: ApplicationResult,
+        applied: BTreeMap<EditId, AppliedEditEvidence>,
+    ) -> Self {
+        assert!(
+            applied.values().all(|evidence| evidence.validate().is_ok()),
+            "application contains invalid edit evidence"
+        );
         let mut application = Self {
             id: ApplicationId::from_digest([0; 32]),
             revision_id,
             target_view,
             result,
+            applied,
         };
         application.id =
             ApplicationId::of_canonical_bytes(&crate::wire::application_bytes(&application));
@@ -340,7 +471,10 @@ impl RepositoryView {
         applications: BTreeMap<ChangeId, ApplicationId>,
         unresolved_conflicts: BTreeSet<ConflictId>,
     ) -> Self {
-        let required_content = tree.values().copied().collect::<BTreeSet<_>>();
+        let required_content = tree
+            .values()
+            .map(|value| value.content)
+            .collect::<BTreeSet<_>>();
         let mut view = Self {
             id: ViewId::from_digest([0; 32]),
             tree,

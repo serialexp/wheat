@@ -37,19 +37,7 @@ async fn conformance<S: ImmutableObjectStore>(objects: &S) {
 
     let one = maps.insert(empty, first, revision_a).await.unwrap();
     let two = maps.insert(one, sibling, revision_b).await.unwrap();
-    let shared_branch = maps.read_node(two).await.unwrap().children[0].child;
     let three = maps.insert(two, distant, revision_c).await.unwrap();
-    assert_eq!(
-        maps.read_node(three)
-            .await
-            .unwrap()
-            .children
-            .iter()
-            .find(|child| child.edge == first.as_bytes()[0])
-            .unwrap()
-            .child,
-        shared_branch
-    );
     assert_eq!(maps.get(three, first).await.unwrap(), Some(revision_a));
     assert_eq!(maps.get(three, sibling).await.unwrap(), Some(revision_b));
     assert_eq!(maps.get(three, distant).await.unwrap(), Some(revision_c));
@@ -150,7 +138,11 @@ async fn batch_groups_shared_paths_and_prunes_deletions() {
         .update_batch(empty, [(first, Some(revision_a))])
         .await
         .unwrap();
-    assert_eq!(objects.take_writes(), 17, "one key writes its 17-node path");
+    assert_eq!(
+        objects.take_writes(),
+        1,
+        "one key writes one compressed leaf"
+    );
 
     let no_op = maps
         .update_batch(
@@ -179,8 +171,8 @@ async fn batch_groups_shared_paths_and_prunes_deletions() {
         .unwrap();
     assert_eq!(
         objects.take_writes(),
-        18,
-        "shared prefixes are rewritten once per batch"
+        3,
+        "two leaves and their compressed branch are written once"
     );
     assert_eq!(maps.get(two, first).await.unwrap(), Some(revision_a));
     assert_eq!(maps.get(two, second).await.unwrap(), Some(revision_b));
@@ -307,36 +299,22 @@ async fn deterministic_batches_match_btree_map_and_cursor_order() {
 }
 
 #[tokio::test]
-async fn cursor_rejects_a_root_at_the_wrong_depth() {
-    let objects = memory_store("wrong-root-depth");
-    let node = RevisionMapNode::new(1, None, vec![]).unwrap();
-    objects
-        .put_if_absent(node.id().into(), &node.canonical_bytes())
-        .await
-        .unwrap();
-
-    let maps = RevisionMapStore::new(&objects);
-    assert!(matches!(
-        maps.cursor(node.id()).await,
-        Err(RevisionMapError::InvalidRootDepth)
-    ));
-    assert!(matches!(
-        maps.update_batch(node.id(), std::iter::empty()).await,
-        Err(RevisionMapError::InvalidRootDepth)
-    ));
-}
-
-#[tokio::test]
 async fn cursor_reports_a_missing_child_during_iteration() {
     let objects = memory_store("cursor-missing-child");
     let missing = RevisionMapId::from_digest([0xee; 32]);
     let root = RevisionMapNode::new(
-        0,
+        vec![],
         None,
-        vec![RevisionMapChild {
-            edge: 42,
-            child: missing,
-        }],
+        vec![
+            RevisionMapChild {
+                edge: 42,
+                child: missing,
+            },
+            RevisionMapChild {
+                edge: 43,
+                child: missing,
+            },
+        ],
     )
     .unwrap();
     objects

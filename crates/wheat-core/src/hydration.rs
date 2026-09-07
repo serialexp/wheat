@@ -1,8 +1,10 @@
 //! Validated reconstruction of executable model objects from persisted records.
 
+use std::collections::BTreeMap;
+
 use crate::{
     Application, ApplicationRecord, ApplicationResult, ApplicationResultRecord, ChangeRevision,
-    Conflict, RepositoryError, RevisionRecord, Tree,
+    Conflict, EditId, EditRecord, RepositoryError, RevisionEdits, RevisionRecord, Tree,
 };
 
 /// Materialize a revision record with the tree object it references.
@@ -12,6 +14,7 @@ use crate::{
 pub fn hydrate_revision(
     record: RevisionRecord,
     resulting_tree: Tree,
+    edit_definitions: BTreeMap<EditId, EditRecord>,
 ) -> Result<ChangeRevision, RepositoryError> {
     if crate::wire::tree_id(&resulting_tree) != record.resulting_tree {
         return Err(RepositoryError::InvalidRepositoryState(
@@ -19,6 +22,17 @@ pub fn hydrate_revision(
         ));
     }
 
+    if edit_definitions
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        != record.edits
+        || edit_definitions.iter().any(|(id, edit)| edit.id() != *id)
+    {
+        return Err(RepositoryError::InvalidRepositoryState(
+            "revision edit definitions",
+        ));
+    }
     Ok(ChangeRevision {
         id: record.id(),
         change_id: record.change_id,
@@ -26,7 +40,10 @@ pub fn hydrate_revision(
         predecessor: record.predecessor,
         dependencies: record.dependencies,
         authored_against: record.authored_against,
-        transformation: record.transformation,
+        edits: RevisionEdits {
+            edits: edit_definitions,
+            transition: record.transition,
+        },
         resulting_tree,
     })
 }
@@ -93,6 +110,7 @@ pub fn hydrate_application(
         revision_id: record.revision_id,
         target_view: record.target_view,
         result,
+        applied: record.applied,
     };
     if application.id != crate::ApplicationId::of_canonical_bytes(&application.canonical_bytes()) {
         return Err(RepositoryError::InvalidRepositoryState(

@@ -83,6 +83,53 @@ impl SegmentFooter {
     }
 }
 
+impl SegmentIndexEntry {
+    /// Returns the stable segment kind code for a canonical metadata object.
+    pub fn canonical_kind_code(kind: crate::CanonicalObjectKind) -> u16 {
+        match kind {
+            crate::CanonicalObjectKind::Tree => 1,
+            crate::CanonicalObjectKind::Change => 2,
+            crate::CanonicalObjectKind::Revision => 3,
+            crate::CanonicalObjectKind::Application => 4,
+            crate::CanonicalObjectKind::Conflict => 5,
+            crate::CanonicalObjectKind::View => 6,
+            crate::CanonicalObjectKind::ContentManifest => 7,
+            crate::CanonicalObjectKind::RepositoryState => 8,
+            crate::CanonicalObjectKind::RevisionMapNode => 9,
+            crate::CanonicalObjectKind::ApplicationMapNode => 10,
+            crate::CanonicalObjectKind::ConflictSetNode => 11,
+            crate::CanonicalObjectKind::ContentSetNode => 12,
+            crate::CanonicalObjectKind::RetainedSetNode => 13,
+            crate::CanonicalObjectKind::BranchManifest => 14,
+            crate::CanonicalObjectKind::RepositoryEnvelope => 15,
+            crate::CanonicalObjectKind::Edit => 16,
+        }
+    }
+
+    /// Resolves a segment metadata kind code, rejecting unassigned values.
+    pub fn canonical_kind(code: u16) -> Option<crate::CanonicalObjectKind> {
+        Some(match code {
+            1 => crate::CanonicalObjectKind::Tree,
+            2 => crate::CanonicalObjectKind::Change,
+            3 => crate::CanonicalObjectKind::Revision,
+            4 => crate::CanonicalObjectKind::Application,
+            5 => crate::CanonicalObjectKind::Conflict,
+            6 => crate::CanonicalObjectKind::View,
+            7 => crate::CanonicalObjectKind::ContentManifest,
+            8 => crate::CanonicalObjectKind::RepositoryState,
+            9 => crate::CanonicalObjectKind::RevisionMapNode,
+            10 => crate::CanonicalObjectKind::ApplicationMapNode,
+            11 => crate::CanonicalObjectKind::ConflictSetNode,
+            12 => crate::CanonicalObjectKind::ContentSetNode,
+            13 => crate::CanonicalObjectKind::RetainedSetNode,
+            14 => crate::CanonicalObjectKind::BranchManifest,
+            15 => crate::CanonicalObjectKind::RepositoryEnvelope,
+            16 => crate::CanonicalObjectKind::Edit,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SegmentRecordError {
     #[error("segment record does not decode: {0}")]
@@ -119,7 +166,8 @@ fn checked<T, E: std::fmt::Debug>(
 }
 fn valid_entry(e: &SegmentIndexEntry) -> Result<(), SegmentRecordError> {
     if !((e.namespace == SEGMENT_NAMESPACE_CONTENT && e.kind == 0)
-        || (e.namespace == SEGMENT_NAMESPACE_METADATA && (1..=15).contains(&e.kind)))
+        || (e.namespace == SEGMENT_NAMESPACE_METADATA
+            && SegmentIndexEntry::canonical_kind(e.kind).is_some()))
     {
         return Err(SegmentRecordError::InvalidNamespaceKind {
             namespace: e.namespace,

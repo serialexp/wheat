@@ -9,7 +9,7 @@ use wheat_core::*;
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
 
 impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
-    async fn hydrate_tree(&self, root: TreeId) -> Result<Tree> {
+    pub(crate) async fn hydrate_tree(&self, root: TreeId) -> Result<Tree> {
         let trees = MerkleTreeStore::new(self.objects);
         let mut result = Tree::new();
         let mut stack = vec![(
@@ -109,7 +109,11 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                 .revision(RevisionId::from_digest(*id.as_bytes()))
                 .await?;
             let tree = self.hydrate_tree(record.resulting_tree).await?;
-            revisions.push((record, tree));
+            let mut edits = BTreeMap::new();
+            for edit_id in &record.edits {
+                edits.insert(*edit_id, self.edit(*edit_id).await?);
+            }
+            revisions.push((record, tree, edits));
         }
         let mut applications = Vec::new();
         let mut cursor = retained.cursor(state.retained_applications).await?;

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 use wheat_core::{
-    ContentId, DirectoryEntry, DirectoryNode, ObjectId, TreeId, decode_directory_node,
+    DirectoryEntry, DirectoryNode, FileValue, ObjectId, TreeId, decode_directory_node,
     validate_directory_component,
 };
 
@@ -23,7 +23,7 @@ pub enum MerkleTreeError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeEdit {
     pub path: Vec<String>,
-    pub content: Option<ContentId>,
+    pub value: Option<FileValue>,
 }
 
 pub struct MerkleTreeStore<'a, S> {
@@ -67,7 +67,7 @@ where
         &self,
         root: TreeId,
         path: &[String],
-    ) -> Result<Option<ContentId>, MerkleTreeError> {
+    ) -> Result<Option<FileValue>, MerkleTreeError> {
         if path.is_empty() {
             return Err(MerkleTreeError::EmptyPath);
         }
@@ -104,7 +104,7 @@ where
             validate_directory_component(first)?;
             grouped.entry(first.clone()).or_default().push(TreeEdit {
                 path: rest.to_vec(),
-                content: edit.content,
+                value: edit.value,
             });
         }
         for (name, child_edits) in grouped {
@@ -113,11 +113,9 @@ where
                 if child_edits.len() != 1 {
                     return Err(MerkleTreeError::FileInPath(name));
                 }
-                match edit.content {
-                    Some(content) => {
-                        root_node
-                            .entries
-                            .insert(name, DirectoryEntry::File(content));
+                match edit.value {
+                    Some(value) => {
+                        root_node.entries.insert(name, DirectoryEntry::File(value));
                     }
                     None => {
                         root_node.entries.remove(&name);

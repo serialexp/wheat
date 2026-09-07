@@ -1,19 +1,62 @@
-use std::collections::BTreeMap;
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+};
 use wheat_core::*;
+
+#[derive(Default)]
+struct TestContent(RefCell<BTreeMap<ContentId, Vec<u8>>>);
+
+impl ContentIo for TestContent {
+    type Error = &'static str;
+
+    fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
+        self.0.borrow().get(&id).cloned().ok_or("missing content")
+    }
+
+    fn store_generated(&self, id: ContentId, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().insert(id, bytes.to_vec());
+        Ok(())
+    }
+}
+
+fn content(value: &[u8]) -> FileValue {
+    FileValue {
+        content: ContentId::of(value),
+        kind: FileKind::Regular,
+    }
+}
+
+fn edit(io: &TestContent, path: &str, bytes: &[u8]) -> RevisionEdits {
+    let value = content(bytes);
+    io.0.borrow_mut().insert(value.content, bytes.to_vec());
+    let record = EditRecord::new(
+        path,
+        EditOperation::ExactFile {
+            expected: None,
+            replacement: Some(value),
+        },
+    )
+    .unwrap();
+    let id = record.id();
+    RevisionEdits {
+        edits: BTreeMap::from([(id, record)]),
+        transition: EditTransition {
+            added: BTreeSet::from([id]),
+            ..Default::default()
+        },
+    }
+}
 
 #[test]
 fn identity_and_emitted_view_roots_use_the_same_builder() {
+    let io = TestContent::default();
     let mut repository = Repository::new(Tree::new());
     repository
         .create_change(
             [],
-            Transformation {
-                edits: vec![FileEdit {
-                    path: "dir/file".into(),
-                    expected: None,
-                    replacement: Some(ContentId::of(b"value")),
-                }],
-            },
+            edit(&io, "dir/file", b"value"),
+            ApplicationContext::new(&io),
         )
         .unwrap();
     let view = repository.working_view();
@@ -56,7 +99,7 @@ fn root_only_view_encoding_stays_constant_size() {
     let mut frontier = BTreeMap::new();
     let empty = RepositoryView::new(tree.clone(), frontier.clone());
     for n in 0..32u8 {
-        tree.insert(format!("file{n}"), ContentId::of(&[n]));
+        tree.insert(format!("file{n}"), content(&[n]));
         frontier.insert(
             ChangeId::from_bytes([n; 16]),
             RevisionId::from_digest([n; 32]),
@@ -72,17 +115,13 @@ fn root_only_view_encoding_stays_constant_size() {
 
 #[test]
 fn every_semantic_record_roundtrips_canonical_bytes() {
+    let io = TestContent::default();
     let mut repository = Repository::new(Tree::new());
     repository
         .create_change(
             [],
-            Transformation {
-                edits: vec![FileEdit {
-                    path: "file".into(),
-                    expected: None,
-                    replacement: Some(ContentId::of(b"value")),
-                }],
-            },
+            edit(&io, "file", b"value"),
+            ApplicationContext::new(&io),
         )
         .unwrap();
     for object in repository.canonical_closure().objects {

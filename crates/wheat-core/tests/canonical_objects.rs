@@ -1,27 +1,68 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
 };
 
 use wheat_core::{
-    Application, ApplicationResult, CanonicalObjectError, Conflict, ContentId, DirectoryEntry,
-    DirectoryNode, FileEdit, PathConflict, Repository, RepositoryView, RevisionMapChild,
-    RevisionMapId, RevisionMapNode, Transformation, Tree, decode_directory_node,
+    Application, ApplicationContext, ApplicationResult, CanonicalObjectError, Conflict, ContentId,
+    ContentIo, DirectoryEntry, DirectoryNode, EditFailure, EditOperation, EditRecord,
+    EditTransition, FailedEditEvidence, FileKind, FileValue, Repository, RepositoryView,
+    RevisionEdits, RevisionMapChild, RevisionMapId, RevisionMapNode, Tree, decode_directory_node,
     decode_revision_map_node,
 };
 
-fn content(value: &str) -> ContentId {
-    ContentId::of(value.as_bytes())
+fn content(value: &str) -> FileValue {
+    file(value, FileKind::Regular)
 }
 
-fn edit(path: &str, replacement: &str) -> Transformation {
-    Transformation {
-        edits: vec![FileEdit {
-            path: path.into(),
-            expected: None,
-            replacement: Some(content(replacement)),
-        }],
+fn file(value: &str, kind: FileKind) -> FileValue {
+    FileValue {
+        content: ContentId::of(value.as_bytes()),
+        kind,
     }
+}
+
+#[derive(Default)]
+struct TestContent(RefCell<BTreeMap<ContentId, Vec<u8>>>);
+
+impl ContentIo for TestContent {
+    type Error = &'static str;
+
+    fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
+        self.0.borrow().get(&id).cloned().ok_or("missing content")
+    }
+
+    fn store_generated(&self, id: ContentId, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().insert(id, bytes.to_vec());
+        Ok(())
+    }
+}
+
+fn exact_edit(io: &TestContent, path: &str, replacement: &str, kind: FileKind) -> RevisionEdits {
+    let value = file(replacement, kind);
+    io.0.borrow_mut()
+        .insert(value.content, replacement.as_bytes().to_vec());
+    let edit = EditRecord::new(
+        path,
+        EditOperation::ExactFile {
+            expected: None,
+            replacement: Some(value),
+        },
+    )
+    .unwrap();
+    let id = edit.id();
+    RevisionEdits {
+        edits: BTreeMap::from([(id, edit)]),
+        transition: EditTransition {
+            added: BTreeSet::from([id]),
+            ..Default::default()
+        },
+    }
+}
+
+fn edit(io: &TestContent, path: &str, replacement: &str) -> RevisionEdits {
+    exact_edit(io, path, replacement, FileKind::Regular)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -68,7 +109,7 @@ fn directory_nodes_round_trip_with_canonical_component_order() {
 #[test]
 fn revision_map_nodes_round_trip_with_canonical_edges() {
     let node = RevisionMapNode::new(
-        3,
+        vec![3, 4, 5],
         None,
         vec![
             RevisionMapChild {
@@ -84,23 +125,19 @@ fn revision_map_nodes_round_trip_with_canonical_edges() {
     .unwrap();
     let bytes = node.canonical_bytes();
 
-    assert_eq!(&bytes[..3], &[9, 1, 3]);
+    assert_eq!(&bytes[..2], &[9, 1]);
     assert_eq!(decode_revision_map_node(&bytes).unwrap(), node);
     assert_eq!(node.id(), RevisionMapId::of_canonical_bytes(&bytes));
-    assert_eq!(
-        hex(&bytes),
-        "0901030000000000000002000101010101010101010101010101010101010101010101010101010101010101ff0202020202020202020202020202020202020202020202020202020202020202"
-    );
+    assert_eq!(RevisionMapId::of_canonical_bytes(&bytes), node.id());
 }
 
 #[test]
-fn revision_map_nodes_enforce_depth_terminal_and_unique_edges() {
+fn revision_map_nodes_enforce_prefix_terminal_and_unique_edges() {
     let revision = wheat_core::RevisionId::from_digest([3; 32]);
-    assert!(RevisionMapNode::new(17, None, vec![]).is_err());
-    assert!(RevisionMapNode::new(15, Some(revision), vec![]).is_err());
+    assert!(RevisionMapNode::new(vec![0; 17], None, vec![]).is_err());
     assert!(
         RevisionMapNode::new(
-            16,
+            vec![0; 16],
             Some(revision),
             vec![RevisionMapChild {
                 edge: 0,
@@ -111,7 +148,7 @@ fn revision_map_nodes_enforce_depth_terminal_and_unique_edges() {
     );
     assert!(
         RevisionMapNode::new(
-            0,
+            vec![],
             None,
             vec![
                 RevisionMapChild {
@@ -140,15 +177,26 @@ fn directory_nodes_reject_non_components() {
 
 #[test]
 fn identical_revisions_have_content_identity() {
+    let io = TestContent::default();
     let mut first = Repository::new(Tree::new());
     let mut second = first.clone();
     let change = wheat_core::ChangeId::new();
 
     let first_revision = first
-        .create_change_with_id(change, [], edit("file", "value"))
+        .create_change_with_id(
+            change,
+            [],
+            edit(&io, "file", "value"),
+            ApplicationContext::new(&io),
+        )
         .unwrap();
     let second_revision = second
-        .create_change_with_id(change, [], edit("file", "value"))
+        .create_change_with_id(
+            change,
+            [],
+            edit(&io, "file", "value"),
+            ApplicationContext::new(&io),
+        )
         .unwrap();
 
     assert_eq!(first_revision.revision_id, second_revision.revision_id);
@@ -166,27 +214,36 @@ fn identical_revisions_have_content_identity() {
 
 #[test]
 fn canonical_revision_has_a_pinned_encoding_and_id() {
+    let io = TestContent::default();
     let mut repository = Repository::new(Tree::new());
     let change = wheat_core::ChangeId::from_str("01890f2d-3c4b-7a68-9abc-def012345678").unwrap();
     let outcome = repository
-        .create_change_with_id(change, [], edit("file", "value"))
+        .create_change_with_id(
+            change,
+            [],
+            edit(&io, "file", "value"),
+            ApplicationContext::new(&io),
+        )
         .unwrap();
     let revision = repository.revision(outcome.revision_id).unwrap();
 
     assert_eq!(
         hex(&revision.canonical_bytes()),
-        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008b859c7a2265fa9348e3f68d4390528cc45dad0233d59ea3e496f5aa04401a1a000000010000000466696c6500010106444a4916ee6fecd2666eb790b06edd633bb4b58287244579ad6def5fd95e0b7602efbb7d3ed82a46221707b11ee1dc7d7f658ef8ebb5630e2c847ec677d051"
+        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c07d6b9ed0646083ffab5831e5822cf9d4fa04d4ee5e5ae46160ab5a36f700000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
     );
     assert_eq!(
         revision.id().to_string(),
-        "965634680afb9da52227beffd0f4e32ea409ba2d286f0db1cd213f65cd816e04"
+        "908e7ec2ddb258c2edbb81ced6dbaa4cb6cea4e8ef7c55d5cc1d31933be9358f"
     );
 }
 
 #[test]
 fn decoded_repository_rejects_forged_identity_fields() {
+    let io = TestContent::default();
     let mut repository = Repository::new(Tree::new());
-    let _ = repository.create_change([], edit("file", "value")).unwrap();
+    let _ = repository
+        .create_change([], edit(&io, "file", "value"), ApplicationContext::new(&io))
+        .unwrap();
     let mut value = serde_yaml::to_value(&repository).unwrap();
     let revisions = value
         .get_mut("revisions")
@@ -200,16 +257,71 @@ fn decoded_repository_rejects_forged_identity_fields() {
 }
 
 #[test]
+fn file_kind_changes_tree_and_revision_identity() {
+    let regular = RepositoryView::new(
+        BTreeMap::from([("file".to_owned(), file("same", FileKind::Regular))]),
+        BTreeMap::new(),
+    );
+    let executable = RepositoryView::new(
+        BTreeMap::from([("file".to_owned(), file("same", FileKind::Executable))]),
+        BTreeMap::new(),
+    );
+    let symlink = RepositoryView::new(
+        BTreeMap::from([("file".to_owned(), file("same", FileKind::Symlink))]),
+        BTreeMap::new(),
+    );
+    assert_ne!(regular.id, executable.id);
+    assert_ne!(regular.id, symlink.id);
+    assert_ne!(executable.id, symlink.id);
+
+    let io = TestContent::default();
+    let change = wheat_core::ChangeId::new();
+    let mut first = Repository::new(Tree::new());
+    let mut second = first.clone();
+    let regular_revision = first
+        .create_change_with_id(
+            change,
+            [],
+            exact_edit(&io, "file", "same", FileKind::Regular),
+            ApplicationContext::new(&io),
+        )
+        .unwrap();
+    let executable_revision = second
+        .create_change_with_id(
+            change,
+            [],
+            exact_edit(&io, "file", "same", FileKind::Executable),
+            ApplicationContext::new(&io),
+        )
+        .unwrap();
+    assert_ne!(
+        regular_revision.revision_id,
+        executable_revision.revision_id
+    );
+}
+
+#[test]
 fn revision_identity_changes_with_encoded_intent() {
+    let io = TestContent::default();
     let mut first = Repository::new(Tree::new());
     let mut second = first.clone();
     let change = wheat_core::ChangeId::new();
 
     let left = first
-        .create_change_with_id(change, [], edit("file", "left"))
+        .create_change_with_id(
+            change,
+            [],
+            edit(&io, "file", "left"),
+            ApplicationContext::new(&io),
+        )
         .unwrap();
     let right = second
-        .create_change_with_id(change, [], edit("file", "right"))
+        .create_change_with_id(
+            change,
+            [],
+            edit(&io, "file", "right"),
+            ApplicationContext::new(&io),
+        )
         .unwrap();
 
     assert_ne!(left.revision_id, right.revision_id);
@@ -229,25 +341,43 @@ fn canonical_map_order_does_not_change_view_identity() {
 }
 
 #[test]
-fn conflict_paths_are_canonicalized_before_identity() {
+fn conflict_edits_are_canonicalized_before_identity() {
     let view = RepositoryView::new(Tree::new(), BTreeMap::new());
-    let a = PathConflict {
-        path: "a".into(),
-        expected: None,
-        actual: None,
-        proposed: Some(content("a")),
-    };
-    let z = PathConflict {
-        path: "z".into(),
-        expected: None,
-        actual: None,
-        proposed: Some(content("z")),
+    let a = EditRecord::new(
+        "a",
+        EditOperation::ExactFile {
+            expected: None,
+            replacement: Some(content("a")),
+        },
+    )
+    .unwrap()
+    .id();
+    let z = EditRecord::new(
+        "z",
+        EditOperation::ExactFile {
+            expected: None,
+            replacement: Some(content("z")),
+        },
+    )
+    .unwrap()
+    .id();
+    let failure = FailedEditEvidence {
+        target: None,
+        reason: EditFailure::ExpectedFileMismatch,
     };
 
-    let first = Conflict::new(view.id, vec![z.clone(), a.clone()]);
-    let second = Conflict::new(view.id, vec![a, z]);
+    let first = Conflict::new(
+        view.id,
+        [(z, failure.clone()), (a, failure.clone())]
+            .into_iter()
+            .collect(),
+    );
+    let second = Conflict::new(
+        view.id,
+        [(a, failure.clone()), (z, failure)].into_iter().collect(),
+    );
     assert_eq!(first.id, second.id);
-    assert_eq!(first.paths[0].path, "a");
+    assert_eq!(first.edits, second.edits);
     assert_eq!(
         wheat_core::ConflictId::of_canonical_bytes(&first.canonical_bytes()),
         first.id
@@ -261,6 +391,7 @@ fn conflict_paths_are_canonicalized_before_identity() {
             partial_tree: Tree::new(),
             conflict: first,
         },
+        BTreeMap::new(),
     );
     let manifested = RepositoryView::from_manifest(
         Tree::new(),

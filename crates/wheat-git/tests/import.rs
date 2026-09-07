@@ -1,6 +1,9 @@
 use std::{path::Path, process::Command};
 
-use wheat_git::import_repository;
+use wheat_core::{EditOperation, FileKind};
+use wheat_git::{
+    ImportError, ImportLimit, ImportLimits, import_repository, import_repository_with_limits,
+};
 use wheat_store::ContentStore;
 
 fn git(repo: &Path, arguments: &[&str]) -> String {
@@ -128,8 +131,171 @@ fn preserves_change_and_revision_metadata_and_content() {
         "git-sha1"
     );
     let tree = imported.repository.view(root.resulting_view).unwrap();
-    let bytes = content.get(*tree.tree.get("base.txt").unwrap()).unwrap();
+    let bytes = content
+        .get(tree.tree.get("base.txt").unwrap().content)
+        .unwrap();
     assert_eq!(bytes, b"base");
+}
+
+#[test]
+fn imports_file_kinds_and_canonicalizes_only_text_blobs() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "-b", "main"]);
+    std::fs::write(directory.path().join("text"), b"one\r\ntwo\rthree\n").unwrap();
+    std::fs::write(directory.path().join("script"), b"#!/bin/sh\r\necho ok\r").unwrap();
+    std::fs::write(directory.path().join("binary"), b"nul\0raw\r\n\xff").unwrap();
+    git(directory.path(), &["add", "."]);
+    git(directory.path(), &["update-index", "--chmod=+x", "script"]);
+    let shared_oid = git(directory.path(), &["hash-object", "text"]);
+    git(
+        directory.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{shared_oid},link"),
+        ],
+    );
+    git(directory.path(), &["commit", "-m", "mixed files"]);
+    let first = git(directory.path(), &["rev-parse", "HEAD"]);
+    git(directory.path(), &["update-index", "--chmod=+x", "text"]);
+    git(directory.path(), &["commit", "-m", "chmod only"]);
+    let second = git(directory.path(), &["rev-parse", "HEAD"]);
+
+    let content_dir = tempfile::tempdir().unwrap();
+    let content = ContentStore::new(content_dir.path());
+    let imported = import_repository(directory.path(), &content).unwrap();
+    let first_commit = &imported.commits[&hex(&first)];
+    let second_commit = &imported.commits[&hex(&second)];
+    let first_tree = &imported
+        .repository
+        .view(first_commit.resulting_view)
+        .unwrap()
+        .tree;
+    let second_tree = &imported
+        .repository
+        .view(second_commit.resulting_view)
+        .unwrap()
+        .tree;
+
+    assert_eq!(first_tree["text"].kind, FileKind::Regular);
+    assert_eq!(first_tree["script"].kind, FileKind::Executable);
+    assert_eq!(first_tree["link"].kind, FileKind::Symlink);
+    assert_eq!(second_tree["text"].kind, FileKind::Executable);
+    assert_eq!(first_tree["text"].content, second_tree["text"].content);
+    assert_eq!(
+        content.get(first_tree["text"].content).unwrap(),
+        b"one\ntwo\nthree\n"
+    );
+    assert_eq!(
+        content.get(first_tree["script"].content).unwrap(),
+        b"#!/bin/sh\necho ok\n"
+    );
+    assert_eq!(
+        content.get(first_tree["link"].content).unwrap(),
+        b"one\r\ntwo\rthree\n"
+    );
+    assert_eq!(
+        content.get(first_tree["binary"].content).unwrap(),
+        b"nul\0raw\r\n\xff"
+    );
+    assert_ne!(first_tree["text"].content, first_tree["link"].content);
+
+    let revision = imported
+        .repository
+        .revision(second_commit.revision_id)
+        .unwrap();
+    assert!(!revision.edits().is_empty());
+    assert!(revision.edits().values().all(|edit| edit.path == "text"));
+    assert!(revision.edits().values().any(|edit| matches!(
+        edit.operation,
+        EditOperation::ExactFile {
+            expected: Some(_),
+            replacement: Some(_)
+        }
+    )));
+    assert_eq!(
+        revision.edit_transition().added,
+        revision.edits().keys().copied().collect()
+    );
+}
+
+#[test]
+fn direct_import_rejects_commit_limit_before_graph_accumulates() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "-b", "main"]);
+    for number in 0..3 {
+        std::fs::write(directory.path().join("file"), number.to_string()).unwrap();
+        git(directory.path(), &["add", "file"]);
+        git(directory.path(), &["commit", "-m", "next"]);
+    }
+    let content_dir = tempfile::tempdir().unwrap();
+    let limits = ImportLimits {
+        max_reachable_commits: 2,
+        ..ImportLimits::default()
+    };
+    assert!(matches!(
+        import_repository_with_limits(
+            directory.path(),
+            &ContentStore::new(content_dir.path()),
+            limits
+        ),
+        Err(ImportError::LimitExceeded {
+            limit: ImportLimit::ReachableCommits,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn direct_import_rejects_flat_tree_budget_before_materializing_more_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "-b", "main"]);
+    std::fs::write(directory.path().join("one"), b"one").unwrap();
+    std::fs::write(directory.path().join("two"), b"two").unwrap();
+    git(directory.path(), &["add", "."]);
+    git(directory.path(), &["commit", "-m", "tree"]);
+    let content_dir = tempfile::tempdir().unwrap();
+    let limits = ImportLimits {
+        max_flat_tree_entries: 1,
+        ..ImportLimits::default()
+    };
+    assert!(matches!(
+        import_repository_with_limits(
+            directory.path(),
+            &ContentStore::new(content_dir.path()),
+            limits
+        ),
+        Err(ImportError::LimitExceeded {
+            limit: ImportLimit::FlatTreeEntries,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn direct_import_rejects_pending_content_budget_before_copying_more_content() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "-b", "main"]);
+    std::fs::write(directory.path().join("file"), b"too much content").unwrap();
+    git(directory.path(), &["add", "file"]);
+    git(directory.path(), &["commit", "-m", "content"]);
+    let content_dir = tempfile::tempdir().unwrap();
+    let limits = ImportLimits {
+        max_pending_content_bytes: 4,
+        ..ImportLimits::default()
+    };
+    assert!(matches!(
+        import_repository_with_limits(
+            directory.path(),
+            &ContentStore::new(content_dir.path()),
+            limits
+        ),
+        Err(ImportError::LimitExceeded {
+            limit: ImportLimit::PendingContentBytes,
+            ..
+        })
+    ));
 }
 
 #[test]

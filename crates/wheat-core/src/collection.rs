@@ -22,20 +22,20 @@ child!(RetainedSetChild, RetainedSetId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationMapNode {
-    pub depth: u8,
+    pub prefix: Vec<u8>,
     pub value: Option<ApplicationId>,
     pub children: Vec<ApplicationMapChild>,
 }
 
 impl ApplicationMapNode {
     pub fn new(
-        depth: u8,
+        prefix: Vec<u8>,
         value: Option<ApplicationId>,
         mut children: Vec<ApplicationMapChild>,
     ) -> Result<Self, CanonicalObjectError> {
         children.sort_by_key(|child| child.edge);
         let node = Self {
-            depth,
+            prefix,
             value,
             children,
         };
@@ -58,20 +58,20 @@ macro_rules! set_node {
     ($node:ident, $child:ident, $id:ty, $validate:ident, $bytes:ident) => {
         #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
         pub struct $node {
-            pub depth: u8,
+            pub prefix: Vec<u8>,
             pub present: bool,
             pub children: Vec<$child>,
         }
 
         impl $node {
             pub fn new(
-                depth: u8,
+                prefix: Vec<u8>,
                 present: bool,
                 mut children: Vec<$child>,
             ) -> Result<Self, CanonicalObjectError> {
                 children.sort_by_key(|child| child.edge);
                 let node = Self {
-                    depth,
+                    prefix,
                     present,
                     children,
                 };

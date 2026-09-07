@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use object_store::memory::InMemory;
-use wheat_core::{ContentId, DirectoryEntry, ObjectId};
+use wheat_core::{ContentId, DirectoryEntry, FileKind, FileValue, ObjectId};
 use wheat_store::{
     ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectStoreAdapter,
     TreeEdit,
@@ -11,13 +11,20 @@ fn content(value: &str) -> ContentId {
     ContentId::of(value.as_bytes())
 }
 
+fn file(value: &str) -> FileValue {
+    FileValue {
+        content: content(value),
+        kind: FileKind::Regular,
+    }
+}
+
 fn edit(path: &[&str], value: Option<&str>) -> TreeEdit {
     TreeEdit {
         path: path
             .iter()
             .map(|component| (*component).to_owned())
             .collect(),
-        content: value.map(content),
+        value: value.map(file),
     }
 }
 
@@ -67,14 +74,14 @@ async fn conformance<S: ImmutableObjectStore>(objects: &S) {
             .lookup(updated, &["src".into(), "auth.rs".into()])
             .await
             .unwrap(),
-        Some(content("auth-v2"))
+        Some(file("auth-v2"))
     );
     assert_eq!(
         trees
             .lookup(initial, &["src".into(), "auth.rs".into()])
             .await
             .unwrap(),
-        Some(content("auth-v1"))
+        Some(file("auth-v1"))
     );
 
     let pruned = trees
@@ -94,7 +101,7 @@ async fn conformance<S: ImmutableObjectStore>(objects: &S) {
             .lookup(pruned, &["src".into(), "lib.rs".into()])
             .await
             .unwrap(),
-        Some(content("lib"))
+        Some(file("lib"))
     );
 }
 
@@ -118,7 +125,7 @@ async fn loose_store_reopens_and_structurally_shares_merkle_trees() {
             .lookup(root, &["nested".into(), "file".into()])
             .await
             .unwrap(),
-        Some(content("value"))
+        Some(file("value"))
     );
 }
 
@@ -127,6 +134,85 @@ async fn apache_memory_store_passes_merkle_tree_conformance() {
     let backend = Arc::new(InMemory::new());
     let objects = ObjectStoreAdapter::new(backend, "merkle-conformance");
     conformance(&objects).await;
+}
+
+#[tokio::test]
+async fn file_kind_changes_tree_identity_and_all_kinds_survive_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let empty = trees.empty_root().await.unwrap();
+    let id = content("same");
+    let regular = trees
+        .apply_edits(
+            empty,
+            &[TreeEdit {
+                path: vec!["file".into()],
+                value: Some(FileValue {
+                    content: id,
+                    kind: FileKind::Regular,
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+    let executable = trees
+        .apply_edits(
+            empty,
+            &[TreeEdit {
+                path: vec!["file".into()],
+                value: Some(FileValue {
+                    content: id,
+                    kind: FileKind::Executable,
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_ne!(regular, executable);
+
+    let all = trees
+        .apply_edits(
+            empty,
+            &[
+                TreeEdit {
+                    path: vec!["regular".into()],
+                    value: Some(FileValue {
+                        content: id,
+                        kind: FileKind::Regular,
+                    }),
+                },
+                TreeEdit {
+                    path: vec!["executable".into()],
+                    value: Some(FileValue {
+                        content: id,
+                        kind: FileKind::Executable,
+                    }),
+                },
+                TreeEdit {
+                    path: vec!["symlink".into()],
+                    value: Some(FileValue {
+                        content: id,
+                        kind: FileKind::Symlink,
+                    }),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    drop(objects);
+    let reopened = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&reopened);
+    for (path, kind) in [
+        ("regular", FileKind::Regular),
+        ("executable", FileKind::Executable),
+        ("symlink", FileKind::Symlink),
+    ] {
+        assert_eq!(
+            trees.lookup(all, &[path.into()]).await.unwrap(),
+            Some(FileValue { content: id, kind })
+        );
+    }
 }
 
 #[tokio::test]

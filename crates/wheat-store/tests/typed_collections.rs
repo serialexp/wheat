@@ -91,6 +91,49 @@ macro_rules! set_conformance {
             assert!(sets.contains(union, marker).await.unwrap());
             assert_eq!(sets.difference(union, singleton).await.unwrap(), root);
             assert_eq!(sets.union(root, root).await.unwrap(), root);
+            assert_eq!(sets.union(root, singleton).await.unwrap(), union);
+            assert_eq!(sets.union(singleton, root).await.unwrap(), union);
+
+            // Differential structural-union test: compare every member with an ordinary COW
+            // update and verify commutativity/idempotence at the canonical root level.
+            let left_keys: Vec<_> = (0..40)
+                .map(|slot| {
+                    let mut bytes = [0_u8; 32];
+                    bytes[0] = slot % 2;
+                    bytes[1] = slot;
+                    $key::from_digest(bytes)
+                })
+                .collect();
+            let right_keys: Vec<_> = (20..60)
+                .map(|slot| {
+                    let mut bytes = [0_u8; 32];
+                    bytes[0] = slot % 2;
+                    bytes[1] = slot;
+                    $key::from_digest(bytes)
+                })
+                .collect();
+            let left = sets
+                .update_batch(empty, left_keys.iter().copied().map(|key| (key, true)))
+                .await
+                .unwrap();
+            let right = sets
+                .update_batch(empty, right_keys.iter().copied().map(|key| (key, true)))
+                .await
+                .unwrap();
+            let structural = sets.union(left, right).await.unwrap();
+            let expected = sets
+                .update_batch(left, right_keys.iter().copied().map(|key| (key, true)))
+                .await
+                .unwrap();
+            assert_eq!(structural, expected);
+            assert_eq!(sets.union(right, left).await.unwrap(), structural);
+            assert_eq!(
+                sets.union(structural, structural).await.unwrap(),
+                structural
+            );
+            for key in left_keys.iter().chain(&right_keys) {
+                assert!(sets.contains(structural, *key).await.unwrap());
+            }
             assert_eq!(sets.difference(root, root).await.unwrap(), empty);
             assert_eq!(sets.remove(singleton, marker).await.unwrap(), empty);
         }

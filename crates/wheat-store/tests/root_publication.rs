@@ -1,16 +1,45 @@
 use async_trait::async_trait;
 use std::fs;
-use wheat_core::{ContentId, FileEdit, ObjectId, Repository, Transformation, Tree};
+use wheat_core::*;
 use wheat_store::*;
 
-fn edit(value: &[u8]) -> Transformation {
-    Transformation {
-        edits: vec![FileEdit {
-            path: "file".into(),
-            expected: None,
-            replacement: Some(ContentId::of(value)),
-        }],
+fn edit(
+    expected: Option<&[u8]>,
+    value: &[u8],
+    removed: impl IntoIterator<Item = EditId>,
+) -> RevisionEdits {
+    let record = EditRecord::new(
+        "file",
+        EditOperation::ExactFile {
+            expected: expected.map(|bytes| FileValue {
+                content: ContentId::of(bytes),
+                kind: FileKind::Regular,
+            }),
+            replacement: Some(FileValue {
+                content: ContentId::of(value),
+                kind: FileKind::Regular,
+            }),
+        },
+    )
+    .unwrap();
+    let id = record.id();
+    RevisionEdits {
+        edits: [(id, record)].into(),
+        transition: EditTransition {
+            added: [id].into(),
+            removed: removed.into_iter().collect(),
+            ..EditTransition::default()
+        },
     }
+}
+
+fn predecessor_edits(repo: &Repository, revision: RevisionId) -> Vec<EditId> {
+    repo.revision(revision)
+        .unwrap()
+        .edits()
+        .keys()
+        .copied()
+        .collect()
 }
 
 struct ClaimsPresent(LooseObjectStore);
@@ -35,7 +64,12 @@ async fn root_publication_rejects_missing_descendant_even_when_head_requests_cla
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     content.put(b"hello").unwrap();
     let mut repo = Repository::new(Tree::new());
-    repo.create_change([], edit(b"hello")).unwrap();
+    repo.create_change(
+        [],
+        edit(None, b"hello", []),
+        ApplicationContext::new(&content),
+    )
+    .unwrap();
     let closure = repo.canonical_closure();
     for object in &closure.objects {
         objects
@@ -72,11 +106,23 @@ async fn reopen_and_publish_only_persisted_roots_without_repository() {
     content.put(b"second").unwrap();
     let (first, second) = {
         let mut repo = Repository::new(Tree::new());
-        let (change, outcome) = repo.create_change([], edit(b"first")).unwrap();
+        let (change, outcome) = repo
+            .create_change(
+                [],
+                edit(None, b"first", []),
+                ApplicationContext::new(&content),
+            )
+            .unwrap();
         let publisher = RepositoryPublisher::new(&objects, &content, &heads);
         let first = publisher.prepare(&repo).await.unwrap().state.id;
-        repo.revise_change(change, outcome.revision_id, edit(b"second"))
-            .unwrap();
+        let removed = predecessor_edits(&repo, outcome.revision_id);
+        repo.revise_change(
+            change,
+            outcome.revision_id,
+            edit(None, b"second", removed),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
         let second = publisher.prepare(&repo).await.unwrap().state.id;
         (first, second)
     };
@@ -108,18 +154,34 @@ async fn conflicted_history_retains_conflict_terms_and_rejects_incomplete_aggreg
     for bytes in [b"base".as_slice(), b"a1", b"b1", b"a2"] {
         content.put(bytes).unwrap();
     }
-    let transform = |expected: &[u8], replacement: &[u8]| Transformation {
-        edits: vec![FileEdit {
-            path: "file".into(),
-            expected: Some(ContentId::of(expected)),
-            replacement: Some(ContentId::of(replacement)),
-        }],
-    };
-    let mut repo = Repository::new(Tree::from([("file".into(), ContentId::of(b"base"))]));
-    let (a, first) = repo.create_change([], transform(b"base", b"a1")).unwrap();
-    repo.create_change([a], transform(b"a1", b"b1")).unwrap();
-    repo.revise_change(a, first.revision_id, transform(b"base", b"a2"))
+    let mut repo = Repository::new(Tree::from([(
+        "file".into(),
+        wheat_core::FileValue {
+            content: ContentId::of(b"base"),
+            kind: wheat_core::FileKind::Regular,
+        },
+    )]));
+    let (a, first) = repo
+        .create_change(
+            [],
+            edit(Some(b"base"), b"a1", []),
+            ApplicationContext::new(&content),
+        )
         .unwrap();
+    repo.create_change(
+        [a],
+        edit(Some(b"a1"), b"b1", []),
+        ApplicationContext::new(&content),
+    )
+    .unwrap();
+    let removed = predecessor_edits(&repo, first.revision_id);
+    repo.revise_change(
+        a,
+        first.revision_id,
+        edit(Some(b"base"), b"a2", removed),
+        ApplicationContext::new(&content),
+    )
+    .unwrap();
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let closure = publisher.prepare(&repo).await.unwrap();
     drop(repo);
@@ -161,7 +223,12 @@ async fn ordinary_publication_cannot_discard_history() {
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     content.put(b"retained").unwrap();
     let mut repo = Repository::new(Tree::new());
-    repo.create_change([], edit(b"retained")).unwrap();
+    repo.create_change(
+        [],
+        edit(None, b"retained", []),
+        ApplicationContext::new(&content),
+    )
+    .unwrap();
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let initial = publisher.initialize(&repo).await.unwrap();
     let unrelated = Repository::new(Tree::new());

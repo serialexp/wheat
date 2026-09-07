@@ -17,6 +17,8 @@ pub enum CollectionError {
     InvalidRootDepth,
     #[error("collection child depth does not match its parent")]
     InvalidChildDepth,
+    #[error("collection values are permitted only at terminal depth")]
+    InvalidTerminalNode,
 }
 impl From<radix::Error> for CollectionError {
     fn from(e: radix::Error) -> Self {
@@ -25,6 +27,7 @@ impl From<radix::Error> for CollectionError {
             radix::Error::Decode(e) => Self::Decode(e),
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
+            radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
         }
     }
 }
@@ -60,7 +63,7 @@ macro_rules! set_collection {
             }
             fn unpack(n: Self::PublicNode) -> radix::Node<Self::Id, Self::Value> {
                 radix::Node {
-                    depth: n.depth,
+                    prefix: n.prefix,
                     value: n.present.then_some(()),
                     children: n.children.into_iter().map(|c| (c.edge, c.child)).collect(),
                 }
@@ -69,7 +72,7 @@ macro_rules! set_collection {
                 n: radix::Node<Self::Id, Self::Value>,
             ) -> Result<Self::PublicNode, wheat_core::CanonicalObjectError> {
                 <$node>::new(
-                    n.depth,
+                    n.prefix,
                     n.value.is_some(),
                     n.children
                         .into_iter()
@@ -140,6 +143,12 @@ macro_rules! set_api {
             pub async fn read_node(&self, id: $id) -> Result<$node, CollectionError> {
                 Ok(self.inner.read_public(id).await?)
             }
+            /// Persist one already-canonical node produced by a sorted collection builder.
+            pub async fn write_node(&self, node: $node) -> Result<$id, CollectionError> {
+                let id = node.id();
+                self.inner.write_public(id, node.canonical_bytes()).await?;
+                Ok(id)
+            }
             pub async fn contains_node(&self, id: $id) -> Result<bool, CollectionError> {
                 Ok(self.inner.contains_node(id).await?)
             }
@@ -167,23 +176,12 @@ macro_rules! set_api {
                     inner: self.inner.cursor(root).await?,
                 })
             }
-            /// Returns the union while retaining only a bounded edit chunk in memory.
-            pub async fn union(&self, mut root: $id, other: $id) -> Result<$id, CollectionError> {
-                root = self.update_batch(root, []).await?;
-                let mut cursor = self.cursor(other).await?;
-                let mut chunk = Vec::with_capacity(1024);
-                loop {
-                    while chunk.len() < 1024 {
-                        match cursor.next().await? {
-                            Some(k) => chunk.push((k, true)),
-                            None => break,
-                        }
-                    }
-                    if chunk.is_empty() {
-                        return Ok(root);
-                    }
-                    root = self.update_batch(root, chunk.drain(..)).await?;
-                }
+            /// Returns the authenticated structural union of two roots.
+            ///
+            /// Equal and disjoint subtrees are reused directly; only divergent ancestors are
+            /// emitted, so memory is bounded by the radix depth and fanout.
+            pub async fn union(&self, root: $id, other: $id) -> Result<$id, CollectionError> {
+                Ok(self.inner.union(root, other).await?)
             }
             /// Removes all keys in `other`, retaining only a bounded edit chunk in memory.
             pub async fn difference(

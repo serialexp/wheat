@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+libc = { workspace = true }
 tokio = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-store = { path = "../wheat-store" }

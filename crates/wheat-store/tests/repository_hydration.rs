@@ -1,13 +1,33 @@
 use wheat_core::*;
 use wheat_store::*;
 
-fn edit(expected: Option<&[u8]>, replacement: &[u8]) -> Transformation {
-    Transformation {
-        edits: vec![FileEdit {
-            path: "file".into(),
-            expected: expected.map(ContentId::of),
-            replacement: Some(ContentId::of(replacement)),
-        }],
+fn edit(
+    expected: Option<&[u8]>,
+    replacement: &[u8],
+    removed: impl IntoIterator<Item = EditId>,
+) -> RevisionEdits {
+    let definition = EditRecord::new(
+        "file",
+        EditOperation::ExactFile {
+            expected: expected.map(|bytes| FileValue {
+                content: ContentId::of(bytes),
+                kind: FileKind::Regular,
+            }),
+            replacement: Some(FileValue {
+                content: ContentId::of(replacement),
+                kind: FileKind::Regular,
+            }),
+        },
+    )
+    .unwrap();
+    let id = definition.id();
+    RevisionEdits {
+        edits: [(id, definition)].into(),
+        transition: EditTransition {
+            added: [id].into(),
+            removed: removed.into_iter().collect(),
+            ..EditTransition::default()
+        },
     }
 }
 
@@ -22,9 +42,24 @@ async fn canonical_reopen_preserves_history_and_allows_revision_and_publication(
     let (head, change, revision, closure) = {
         let objects = LooseObjectStore::new(dir.path().join("objects"));
         let mut repo = Repository::new(Tree::new());
-        let (change, first) = repo.create_change([], edit(None, b"one")).unwrap();
+        let context = ApplicationContext::new(&content);
+        let (change, first) = repo
+            .create_change([], edit(None, b"one", []), context)
+            .unwrap();
+        let removed = repo
+            .revision(first.revision_id)
+            .unwrap()
+            .edits()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
         let second = repo
-            .revise_change(change, first.revision_id, edit(None, b"two"))
+            .revise_change(
+                change,
+                first.revision_id,
+                edit(None, b"two", removed),
+                context,
+            )
             .unwrap();
         let head = RepositoryPublisher::new(&objects, &content, &heads)
             .initialize(&repo)
@@ -37,8 +72,20 @@ async fn canonical_reopen_preserves_history_and_allows_revision_and_publication(
     let initial_envelope = reader.envelope(head.envelope).await.unwrap();
     let mut reopened = reader.hydrate(initial_envelope.state).await.unwrap();
     assert_eq!(reopened.canonical_closure(), closure);
+    let removed = reopened
+        .revision(revision)
+        .unwrap()
+        .edits()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
     reopened
-        .revise_change(change, revision, edit(None, b"three"))
+        .revise_change(
+            change,
+            revision,
+            edit(None, b"three", removed),
+            ApplicationContext::new(&content),
+        )
         .unwrap();
     let next = RepositoryPublisher::new(&objects, &content, &heads)
         .publish(head, &reopened)
@@ -47,7 +94,10 @@ async fn canonical_reopen_preserves_history_and_allows_revision_and_publication(
     let reader = RepositoryReader::new(&objects, &content);
     let root = reader.envelope(next.envelope).await.unwrap().state;
     let again = reader.hydrate(root).await.unwrap();
-    assert_eq!(again.working_view().tree["file"], ContentId::of(b"three"));
+    assert_eq!(
+        again.working_view().tree["file"].content,
+        ContentId::of(b"three")
+    );
     assert_eq!(again.canonical_closure(), reopened.canonical_closure());
 }
 
@@ -61,11 +111,33 @@ async fn conflicted_stack_reopens_with_dependency_reapplication_intact() {
         content.put(bytes).unwrap();
     }
     let (head, a, a2, expected) = {
-        let mut repo = Repository::new(Tree::from([("file".into(), ContentId::of(b"base"))]));
-        let (a, a1) = repo.create_change([], edit(Some(b"base"), b"a1")).unwrap();
-        repo.create_change([a], edit(Some(b"a1"), b"b1")).unwrap();
+        let mut repo = Repository::new(Tree::from([(
+            "file".into(),
+            wheat_core::FileValue {
+                content: ContentId::of(b"base"),
+                kind: wheat_core::FileKind::Regular,
+            },
+        )]));
+        let context = ApplicationContext::new(&content);
+        let (a, a1) = repo
+            .create_change([], edit(Some(b"base"), b"a1", []), context)
+            .unwrap();
+        repo.create_change([a], edit(Some(b"a1"), b"b1", []), context)
+            .unwrap();
+        let removed = repo
+            .revision(a1.revision_id)
+            .unwrap()
+            .edits()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
         let a2 = repo
-            .revise_change(a, a1.revision_id, edit(Some(b"base"), b"a2"))
+            .revise_change(
+                a,
+                a1.revision_id,
+                edit(Some(b"base"), b"a2", removed),
+                context,
+            )
             .unwrap();
         let head = RepositoryPublisher::new(&objects, &content, &heads)
             .initialize(&repo)
@@ -79,10 +151,25 @@ async fn conflicted_stack_reopens_with_dependency_reapplication_intact() {
     assert_eq!(repo.canonical_closure(), expected);
     assert!(!repo.working_view().unresolved_conflicts.is_empty());
     // Restore the parent's old contents; the reconstructed dependency graph must reapply B.
-    repo.revise_change(a, a2, edit(Some(b"base"), b"a1"))
-        .unwrap();
+    let removed = repo
+        .revision(a2)
+        .unwrap()
+        .edits()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    repo.revise_change(
+        a,
+        a2,
+        edit(Some(b"base"), b"a1", removed),
+        ApplicationContext::new(&content),
+    )
+    .unwrap();
     assert!(repo.working_view().unresolved_conflicts.is_empty());
-    assert_eq!(repo.working_view().tree["file"], ContentId::of(b"b1"));
+    assert_eq!(
+        repo.working_view().tree["file"].content,
+        ContentId::of(b"b1")
+    );
     RepositoryPublisher::new(&objects, &content, &heads)
         .publish(head, &repo)
         .await
@@ -98,9 +185,24 @@ async fn reopen_rejects_missing_historical_content_before_returning_editable_sta
     let historical = content.put(b"old").unwrap();
     content.put(b"new").unwrap();
     let mut repo = Repository::new(Tree::new());
-    let (change, first) = repo.create_change([], edit(None, b"old")).unwrap();
-    repo.revise_change(change, first.revision_id, edit(None, b"new"))
+    let context = ApplicationContext::new(&content);
+    let (change, first) = repo
+        .create_change([], edit(None, b"old", []), context)
         .unwrap();
+    let removed = repo
+        .revision(first.revision_id)
+        .unwrap()
+        .edits()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    repo.revise_change(
+        change,
+        first.revision_id,
+        edit(None, b"new", removed),
+        context,
+    )
+    .unwrap();
     let head = RepositoryPublisher::new(&objects, &content, &heads)
         .initialize(&repo)
         .await

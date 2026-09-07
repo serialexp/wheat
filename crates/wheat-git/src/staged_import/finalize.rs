@@ -8,8 +8,8 @@ use content_accumulator::{ContentAccumulator, ContentAccumulatorError, RetainedT
 
 use thiserror::Error;
 use wheat_core::{
-    BranchManifestRecord, Change, ChangeObjectId, ContentManifestRecord, ObjectId,
-    RepositoryStateRecord,
+    ApplicationRecord, BranchManifestRecord, Change, ChangeObjectId, ContentId,
+    ContentManifestRecord, EditOperation, EditRecord, ObjectId, RepositoryStateRecord,
 };
 use wheat_store::{
     CollectionError, CommitWriterError, ContentSetStore, ContentStore, ImmutableObjectStore,
@@ -55,6 +55,34 @@ pub enum FinalizeImportError {
     Git(String),
 }
 
+/// A boundary entered while finalizing a staged import.
+///
+/// This is experimental instrumentation for observing finalization without coupling callers to
+/// its implementation. The observer is called synchronously before work in each phase begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalizePhase {
+    Preflight,
+    JournalAuthenticationAccumulation,
+    AggregateSetConstruction,
+    BatchFlush,
+    PrepareEnvelopeValidation,
+    HeadInitialize,
+}
+
+impl FinalizePhase {
+    /// Stable, machine-readable label for profiling output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::JournalAuthenticationAccumulation => "journal_auth_accumulation",
+            Self::AggregateSetConstruction => "aggregate_set_construction",
+            Self::BatchFlush => "batch_flush",
+            Self::PrepareEnvelopeValidation => "prepare_envelope_validation",
+            Self::HeadInitialize => "head_initialize",
+        }
+    }
+}
+
 /// Finalize a complete staged import and initialize its repository head.
 ///
 /// No commits are materialized here. `stage_import(..., Some(0))` only discovers work and
@@ -71,8 +99,38 @@ where
     O: ImmutableObjectStore,
     P: PublicationStore,
 {
+    finalize_import_with_observer(
+        git_path,
+        journal_path,
+        objects,
+        content,
+        publications,
+        working_branch,
+        |_| {},
+    )
+    .await
+}
+
+/// Finalize an import while synchronously observing phase boundaries.
+///
+/// The observer is never held across an await point.
+pub async fn finalize_import_with_observer<O, P, F>(
+    git_path: impl AsRef<Path>,
+    journal_path: impl AsRef<Path>,
+    objects: &O,
+    content: &ContentStore,
+    publications: &P,
+    working_branch: &str,
+    mut observer: F,
+) -> Result<RepositoryHead, FinalizeImportError>
+where
+    O: ImmutableObjectStore,
+    P: PublicationStore,
+    F: FnMut(FinalizePhase),
+{
     let git_path = git_path.as_ref();
     let journal_path = journal_path.as_ref();
+    observer(FinalizePhase::Preflight);
     let staged = stage_import(git_path, journal_path, objects, content, Some(0)).await?;
     if !staged.complete {
         return Err(FinalizeImportError::Incomplete {
@@ -109,6 +167,7 @@ where
             .map_err(ContentAccumulatorError::from)?;
     }
 
+    observer(FinalizePhase::JournalAuthenticationAccumulation);
     let mut after = None::<Vec<u8>>;
     loop {
         let page = journal.completed(after.as_deref(), PAGE)?;
@@ -166,7 +225,11 @@ where
                 .manifest(view.required_content)
                 .await
                 .map_err(|e| bad(e.to_string()))?;
-            ContentAccumulator::insert_manifest(&transaction, &content_sets, manifest.content)
+            // Per-view manifests are already authenticated radix roots. Retain the root and
+            // merge it structurally during finalization instead of enumerating every blob.
+            ContentAccumulator::insert_manifest(&transaction, manifest.content)
+                .map_err(|e| bad(e.to_string()))?;
+            collect_historical_content(&transaction, &reader, &revision.edits, &application)
                 .await
                 .map_err(|e| bad(e.to_string()))?;
             ContentAccumulator::insert_retained(
@@ -196,6 +259,7 @@ where
             .map_err(ContentAccumulatorError::from)?;
     }
 
+    observer(FinalizePhase::AggregateSetConstruction);
     let all_content = accumulator.build_content(&content_sets).await?;
     let retained_changes = accumulator
         .build_retained(&retained, RetainedTable::Changes)
@@ -243,10 +307,60 @@ where
     .map_err(|e| FinalizeImportError::InvalidBranchManifest(e.to_string()))?;
     // Final validation/publication must read durable backing objects, not the
     // read-your-writes buffer used while constructing retained inventories.
+    observer(FinalizePhase::BatchFlush);
     batch.flush().await?;
     let publisher = RepositoryPublisher::new(backing, content, publications);
+    observer(FinalizePhase::PrepareEnvelopeValidation);
     let envelope = publisher.prepare_envelope(state.id(), &branches).await?;
+    observer(FinalizePhase::HeadInitialize);
     Ok(publisher.initialize_prepared_envelope(envelope).await?)
+}
+
+/// Adds blobs referenced by historical revision records to the repository aggregate only.
+///
+/// Per-view manifests deliberately contain only their visible trees; definitions and applied
+/// evidence remain durable through the repository state's aggregate content root.
+async fn collect_historical_content<O: ImmutableObjectStore>(
+    transaction: &rusqlite::Transaction<'_>,
+    reader: &RepositoryReader<'_, O>,
+    edits: &std::collections::BTreeSet<wheat_core::EditId>,
+    application: &ApplicationRecord,
+) -> Result<(), FinalizeImportError> {
+    for edit_id in edits {
+        let edit = reader.edit(*edit_id).await?;
+        for id in edit_content(&edit) {
+            ContentAccumulator::insert_content(transaction, id)?;
+        }
+    }
+    for evidence in application.applied.values() {
+        if let Some(value) = evidence.target {
+            ContentAccumulator::insert_content(transaction, value.content)?;
+        }
+    }
+    Ok(())
+}
+
+fn edit_content(edit: &EditRecord) -> impl Iterator<Item = ContentId> + '_ {
+    let mut content = Vec::new();
+    match &edit.operation {
+        EditOperation::GuardedText {
+            before,
+            expected,
+            replacement,
+            after,
+            ..
+        } => content.extend([*before, *expected, *replacement, *after]),
+        EditOperation::ExactFile {
+            expected,
+            replacement,
+        } => content.extend(
+            expected
+                .iter()
+                .chain(replacement)
+                .map(|value| value.content),
+        ),
+    }
+    content.into_iter()
 }
 
 async fn authenticate_exact<O: ImmutableObjectStore>(

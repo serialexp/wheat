@@ -1,24 +1,43 @@
 use std::sync::Arc;
 
 use object_store::{ObjectStore as BackendObjectStore, memory::InMemory};
-use wheat_core::{ContentId, FileEdit, ObjectId, Repository, Transformation, Tree};
+use wheat_core::*;
 use wheat_store::{
     ContentStore, ImmutableObjectStore, LocalPublicationStore, ObjectStoreAdapter,
     ObjectStoreError, PublicationStore, RepositoryPublisher, RepositoryReader, S3ObjectStoreConfig,
 };
 
+fn revision_edits(path: &str, value: &[u8]) -> RevisionEdits {
+    let edit = EditRecord::new(
+        path,
+        EditOperation::ExactFile {
+            expected: None,
+            replacement: Some(FileValue {
+                content: ContentId::of(value),
+                kind: FileKind::Regular,
+            }),
+        },
+    )
+    .unwrap();
+    let id = edit.id();
+    RevisionEdits {
+        edits: [(id, edit)].into(),
+        transition: EditTransition {
+            added: [id].into(),
+            ..Default::default()
+        },
+    }
+}
+
 fn canonical_objects() -> (Vec<u8>, Vec<u8>) {
+    let content = wheat_store::ContentStore::new(tempfile::tempdir().unwrap().keep());
+    content.put(b"value").unwrap();
     let mut repository = Repository::new(Tree::new());
     let (_, outcome) = repository
         .create_change(
             [],
-            Transformation {
-                edits: vec![FileEdit {
-                    path: "file".into(),
-                    expected: None,
-                    replacement: Some(ContentId::of(b"value")),
-                }],
-            },
+            revision_edits("file", b"value"),
+            ApplicationContext::new(&content),
         )
         .unwrap();
     (
@@ -95,13 +114,8 @@ async fn repository_closure_publishes_through_configured_s3_backend() {
     repository
         .create_change(
             [],
-            Transformation {
-                edits: vec![FileEdit {
-                    path: "file".into(),
-                    expected: None,
-                    replacement: Some(ContentId::of(b"value")),
-                }],
-            },
+            revision_edits("file", b"value"),
+            ApplicationContext::new(&content),
         )
         .unwrap();
 

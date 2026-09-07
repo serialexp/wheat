@@ -93,6 +93,7 @@ macro_rules! digest_id {
 
 digest_id!(ObjectId);
 digest_id!(ChangeObjectId);
+digest_id!(EditId);
 digest_id!(RevisionId);
 digest_id!(TreeId);
 digest_id!(ApplicationId);
@@ -122,6 +123,7 @@ macro_rules! object_id_from {
 
 object_id_from!(
     ChangeObjectId,
+    EditId,
     RevisionId,
     TreeId,
     ApplicationId,

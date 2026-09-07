@@ -7,11 +7,12 @@
 pub mod journal;
 mod staged_import;
 pub use staged_import::{
-    FinalizeImportError, StagedBranch, StagedImportError, StagedImportResult, finalize_import,
-    stage_import,
+    DEFAULT_STAGE_COMMITS, FinalizeImportError, FinalizePhase, StagedBranch, StagedImportError,
+    StagedImportResult, finalize_import, finalize_import_with_observer, stage_import,
 };
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::Path,
     time::Instant,
@@ -21,12 +22,137 @@ use gix::bstr::ByteSlice;
 use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{
-    Actor, ChangeId, ChangeMetadata, ChangeProposal, ContentId, FileEdit, Repository,
-    RevisionMetadata, SourceProvenance, Timestamp, Transformation, Tree, ViewId,
+    Actor, ApplicationContext, ChangeId, ChangeMetadata, ChangeProposal, ContentId, EditTransition,
+    FileKind, FileValue, Repository, RevisionEdits, RevisionMetadata, SourceProvenance, Timestamp,
+    Tree, ViewId,
+    edit_capture::{FileSnapshot, capture_edit},
+    guarded,
 };
 use wheat_store::{ContentStore, ContentStoreError};
 
 const GIT_IMPORT_NAMESPACE: Uuid = Uuid::from_u128(0xc245_a89b_519f_5a4b_9b36_d62b_78f5_2901);
+
+/// Resource limits for the direct Git importer.
+///
+/// The direct importer intentionally materializes a complete [`Repository`], so it
+/// rejects source histories that exceed these limits instead of returning a partial
+/// repository. `Default` is conservative and is used by [`import_repository`] and
+/// [`import_open_repository`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImportLimits {
+    /// Maximum local branches examined at the Git boundary.
+    pub max_branches: usize,
+    /// Maximum distinct commits reachable from local branch tips.
+    pub max_reachable_commits: usize,
+    /// Maximum entries across all unique, materialized flat Git trees.
+    pub max_flat_tree_entries: usize,
+    /// Maximum UTF-8 path bytes across all unique, materialized flat Git trees.
+    pub max_flat_tree_bytes: usize,
+    /// Maximum number of unique content objects held before `put_many`.
+    pub max_pending_content_count: usize,
+    /// Maximum bytes of unique content held before `put_many`.
+    pub max_pending_content_bytes: usize,
+}
+
+impl Default for ImportLimits {
+    fn default() -> Self {
+        Self {
+            max_branches: 256,
+            max_reachable_commits: 10_000,
+            max_flat_tree_entries: 250_000,
+            max_flat_tree_bytes: 64 * 1024 * 1024,
+            max_pending_content_count: 100_000,
+            max_pending_content_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImportLimit {
+    Branches,
+    ReachableCommits,
+    FlatTreeEntries,
+    FlatTreeBytes,
+    PendingContentCount,
+    PendingContentBytes,
+}
+
+impl std::fmt::Display for ImportLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Branches => "branches",
+            Self::ReachableCommits => "reachable commits",
+            Self::FlatTreeEntries => "flat tree entries",
+            Self::FlatTreeBytes => "flat tree bytes",
+            Self::PendingContentCount => "pending content count",
+            Self::PendingContentBytes => "pending content bytes",
+        })
+    }
+}
+
+#[derive(Default)]
+struct ImportAccounting {
+    flat_tree_entries: usize,
+    flat_tree_bytes: usize,
+    pending_content_count: usize,
+    pending_content_bytes: usize,
+}
+
+impl ImportAccounting {
+    fn add(
+        current: &mut usize,
+        limit: ImportLimit,
+        amount: usize,
+        maximum: usize,
+    ) -> Result<(), ImportError> {
+        let actual = current
+            .checked_add(amount)
+            .ok_or(ImportError::LimitExceeded {
+                limit,
+                actual: usize::MAX,
+                maximum,
+            })?;
+        if actual > maximum {
+            return Err(ImportError::LimitExceeded {
+                limit,
+                actual,
+                maximum,
+            });
+        }
+        *current = actual;
+        Ok(())
+    }
+
+    fn tree_entry(&mut self, path_bytes: usize, limits: ImportLimits) -> Result<(), ImportError> {
+        Self::add(
+            &mut self.flat_tree_entries,
+            ImportLimit::FlatTreeEntries,
+            1,
+            limits.max_flat_tree_entries,
+        )?;
+        Self::add(
+            &mut self.flat_tree_bytes,
+            ImportLimit::FlatTreeBytes,
+            path_bytes,
+            limits.max_flat_tree_bytes,
+        )
+    }
+
+    fn content(&mut self, bytes: usize, limits: ImportLimits) -> Result<(), ImportError> {
+        Self::add(
+            &mut self.pending_content_count,
+            ImportLimit::PendingContentCount,
+            1,
+            limits.max_pending_content_count,
+        )?;
+        Self::add(
+            &mut self.pending_content_bytes,
+            ImportLimit::PendingContentBytes,
+            bytes,
+            limits.max_pending_content_bytes,
+        )
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportedCommit {
@@ -57,6 +183,8 @@ pub enum ImportError {
     Git(String),
     #[error("content retention failed")]
     Content(#[from] ContentStoreError),
+    #[error("edit capture failed: {0}")]
+    EditCapture(#[from] wheat_core::edit_capture::EditCaptureError),
     #[error("Wheat import failed: {0}")]
     Wheat(#[from] wheat_core::RepositoryError),
     #[error("Git metadata is not valid UTF-8: {0}")]
@@ -65,24 +193,50 @@ pub enum ImportError {
     UnsupportedSubmodule(String),
     #[error("Git commit graph contains a cycle")]
     CommitCycle,
+    #[error("Git import exceeded {limit}: {actual} > {maximum}")]
+    LimitExceeded {
+        limit: ImportLimit,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
+/// Imports using [`ImportLimits::default`]. Use [`import_repository_with_limits`]
+/// when the source is expected to exceed the documented conservative defaults.
 pub fn import_repository(
     path: impl AsRef<Path>,
     content: &ContentStore,
 ) -> Result<ImportResult, ImportError> {
-    let git = gix::open(path.as_ref()).map_err(git_error)?;
-    import_open_repository(&git, content)
+    import_repository_with_limits(path, content, ImportLimits::default())
 }
 
+pub fn import_repository_with_limits(
+    path: impl AsRef<Path>,
+    content: &ContentStore,
+    limits: ImportLimits,
+) -> Result<ImportResult, ImportError> {
+    let git = gix::open(path.as_ref()).map_err(git_error)?;
+    import_open_repository_with_limits(&git, content, limits)
+}
+
+/// Imports using [`ImportLimits::default`]. Use [`import_open_repository_with_limits`]
+/// when the source is expected to exceed the documented conservative defaults.
 pub fn import_open_repository(
     git: &gix::Repository,
     content: &ContentStore,
 ) -> Result<ImportResult, ImportError> {
+    import_open_repository_with_limits(git, content, ImportLimits::default())
+}
+
+pub fn import_open_repository_with_limits(
+    git: &gix::Repository,
+    content: &ContentStore,
+    limits: ImportLimits,
+) -> Result<ImportResult, ImportError> {
     let profile = std::env::var_os("WHEAT_IMPORT_PROFILE").is_some();
     let started = Instant::now();
-    let branches = branch_tips(git)?;
-    let order = commit_order(git, branches.values().copied())?;
+    let branches = branch_tips(git, limits)?;
+    let order = commit_order(git, branches.values().copied(), limits)?;
     if profile {
         eprintln!("graph_ms={:.3}", started.elapsed().as_secs_f64() * 1_000.0);
     }
@@ -94,15 +248,23 @@ pub fn import_open_repository(
     let mut tree_cache = BTreeMap::new();
     let mut blob_cache = BTreeMap::new();
     let mut pending_content = BTreeMap::new();
+    let mut accounting = ImportAccounting::default();
     let mut proposals = Vec::with_capacity(order.len());
     let mut commit_changes = BTreeMap::new();
 
     for oid in order {
         let commit = git.find_commit(oid).map_err(git_error)?;
-        let parents = commit
-            .parent_ids()
-            .map(|id| id.detach())
-            .collect::<Vec<_>>();
+        let mut parents = Vec::new();
+        for parent in commit.parent_ids() {
+            if parents.len() >= limits.max_reachable_commits {
+                return Err(ImportError::LimitExceeded {
+                    limit: ImportLimit::ReachableCommits,
+                    actual: parents.len().saturating_add(1),
+                    maximum: limits.max_reachable_commits,
+                });
+            }
+            parents.push(parent.detach());
+        }
         merge_count += usize::from(parents.len() > 1);
         let tree = materialize_commit_tree(
             git,
@@ -111,6 +273,8 @@ pub fn import_open_repository(
             &mut tree_cache,
             &mut blob_cache,
             &mut pending_content,
+            &mut accounting,
+            limits,
         )?;
         let parent_tree = parents
             .first()
@@ -122,11 +286,19 @@ pub fn import_open_repository(
                     &mut tree_cache,
                     &mut blob_cache,
                     &mut pending_content,
+                    &mut accounting,
+                    limits,
                 )
             })
             .transpose()?
             .unwrap_or_default();
-        let transformation = transformation_between(&parent_tree, &tree);
+        let edits = edits_between(
+            &parent_tree,
+            &tree,
+            &mut pending_content,
+            &mut accounting,
+            limits,
+        )?;
         let oid_bytes = oid.as_bytes().to_vec();
         let change_id = ChangeId::from_import_identity(GIT_IMPORT_NAMESPACE, &oid_bytes);
         let dependency = parents
@@ -143,7 +315,7 @@ pub fn import_open_repository(
             metadata: metadata.0,
             dependencies: dependency.collect(),
             revision_metadata: metadata.1,
-            transformation,
+            edits,
         });
         commit_changes.insert(oid_bytes, change_id);
     }
@@ -156,7 +328,7 @@ pub fn import_open_repository(
         );
     }
     let materialize_started = Instant::now();
-    let outcomes = repository.import_changes(proposals)?;
+    let outcomes = repository.import_changes(proposals, ApplicationContext::new(content))?;
     if profile {
         eprintln!(
             "materialize_ms={:.3}",
@@ -193,11 +365,29 @@ pub fn import_open_repository(
     })
 }
 
-fn branch_tips(git: &gix::Repository) -> Result<BTreeMap<String, gix::ObjectId>, ImportError> {
+fn branch_tips(
+    git: &gix::Repository,
+    limits: ImportLimits,
+) -> Result<BTreeMap<String, gix::ObjectId>, ImportError> {
     let platform = git.references().map_err(git_error)?;
     let iter = platform.local_branches().map_err(git_error)?;
     let mut branches = BTreeMap::new();
     for reference in iter {
+        let actual = branches
+            .len()
+            .checked_add(1)
+            .ok_or(ImportError::LimitExceeded {
+                limit: ImportLimit::Branches,
+                actual: usize::MAX,
+                maximum: limits.max_branches,
+            })?;
+        if actual > limits.max_branches {
+            return Err(ImportError::LimitExceeded {
+                limit: ImportLimit::Branches,
+                actual,
+                maximum: limits.max_branches,
+            });
+        }
         let mut reference = reference.map_err(git_error)?;
         let name = reference
             .name()
@@ -214,6 +404,7 @@ fn branch_tips(git: &gix::Repository) -> Result<BTreeMap<String, gix::ObjectId>,
 fn commit_order(
     git: &gix::Repository,
     tips: impl IntoIterator<Item = gix::ObjectId>,
+    limits: ImportLimits,
 ) -> Result<Vec<gix::ObjectId>, ImportError> {
     enum Visit {
         Enter(gix::ObjectId),
@@ -235,11 +426,50 @@ fn commit_order(
                     if !visiting.insert(key) {
                         return Err(ImportError::CommitCycle);
                     }
+                    let discovered = visiting.len().checked_add(visited.len()).ok_or(
+                        ImportError::LimitExceeded {
+                            limit: ImportLimit::ReachableCommits,
+                            actual: usize::MAX,
+                            maximum: limits.max_reachable_commits,
+                        },
+                    )?;
+                    if discovered > limits.max_reachable_commits {
+                        return Err(ImportError::LimitExceeded {
+                            limit: ImportLimit::ReachableCommits,
+                            actual: discovered,
+                            maximum: limits.max_reachable_commits,
+                        });
+                    }
                     let commit = git.find_commit(oid).map_err(git_error)?;
-                    let parents = commit
-                        .parent_ids()
-                        .map(|parent| parent.detach())
-                        .collect::<Vec<_>>();
+                    let mut parents = Vec::new();
+                    for parent in commit.parent_ids() {
+                        if parents.len() >= limits.max_reachable_commits {
+                            return Err(ImportError::LimitExceeded {
+                                limit: ImportLimit::ReachableCommits,
+                                actual: parents.len().saturating_add(1),
+                                maximum: limits.max_reachable_commits,
+                            });
+                        }
+                        parents.push(parent.detach());
+                    }
+                    // Bound the explicit DFS work stack too: a wide merge graph can
+                    // enqueue duplicate parents before they are marked visited.
+                    let queued = pending
+                        .len()
+                        .checked_add(parents.len())
+                        .and_then(|count| count.checked_add(1)) // Exit(oid)
+                        .ok_or(ImportError::LimitExceeded {
+                            limit: ImportLimit::ReachableCommits,
+                            actual: usize::MAX,
+                            maximum: limits.max_reachable_commits,
+                        })?;
+                    if queued > limits.max_reachable_commits {
+                        return Err(ImportError::LimitExceeded {
+                            limit: ImportLimit::ReachableCommits,
+                            actual: queued,
+                            maximum: limits.max_reachable_commits,
+                        });
+                    }
                     pending.push(Visit::Exit(oid));
                     pending.extend(parents.into_iter().rev().map(Visit::Enter));
                 }
@@ -261,8 +491,10 @@ fn materialize_commit_tree(
     commit: gix::ObjectId,
     unique_content: &mut BTreeSet<ContentId>,
     tree_cache: &mut BTreeMap<Vec<u8>, Tree>,
-    blob_cache: &mut BTreeMap<Vec<u8>, ContentId>,
+    blob_cache: &mut BTreeMap<(Vec<u8>, bool), ContentId>,
     pending_content: &mut BTreeMap<ContentId, Vec<u8>>,
+    accounting: &mut ImportAccounting,
+    limits: ImportLimits,
 ) -> Result<Tree, ImportError> {
     let tree = git
         .find_commit(commit)
@@ -279,6 +511,8 @@ fn materialize_commit_tree(
         tree_cache,
         blob_cache,
         pending_content,
+        accounting,
+        limits,
     )
 }
 
@@ -286,8 +520,10 @@ fn flatten_tree(
     tree: &gix::Tree<'_>,
     unique_content: &mut BTreeSet<ContentId>,
     tree_cache: &mut BTreeMap<Vec<u8>, Tree>,
-    blob_cache: &mut BTreeMap<Vec<u8>, ContentId>,
+    blob_cache: &mut BTreeMap<(Vec<u8>, bool), ContentId>,
     pending_content: &mut BTreeMap<ContentId, Vec<u8>>,
+    accounting: &mut ImportAccounting,
+    limits: ImportLimits,
 ) -> Result<Tree, ImportError> {
     let tree_oid = tree.id().as_bytes().to_vec();
     if let Some(cached) = tree_cache.get(&tree_oid) {
@@ -313,14 +549,30 @@ fn flatten_tree(
                 tree_cache,
                 blob_cache,
                 pending_content,
+                accounting,
+                limits,
             )? {
-                output.insert(format!("{name}/{path}"), id);
+                let path = format!("{name}/{path}");
+                accounting.tree_entry(path.len(), limits)?;
+                output.insert(path, id);
             }
         } else if entry.mode().is_commit() {
             return Err(ImportError::UnsupportedSubmodule(name.to_owned()));
         } else {
+            let mode = entry.mode();
+            let kind = if mode.is_link() {
+                FileKind::Symlink
+            } else if mode.is_executable() {
+                FileKind::Executable
+            } else {
+                FileKind::Regular
+            };
             let oid = entry.id().as_bytes().to_vec();
-            let id = if let Some(id) = blob_cache.get(&oid) {
+            // A Git blob can appear both as a symlink target (always raw) and as a
+            // regular/executable file (canonical text capture), so OID alone is
+            // not a sufficient cache key.
+            let cache_key = (oid, kind == FileKind::Symlink);
+            let id = if let Some(id) = blob_cache.get(&cache_key) {
                 *id
             } else {
                 let blob = entry
@@ -328,37 +580,98 @@ fn flatten_tree(
                     .map_err(git_error)?
                     .try_into_blob()
                     .map_err(git_error)?;
-                let id = ContentId::of(&blob.data);
-                pending_content
-                    .entry(id)
-                    .or_insert_with(|| blob.data.clone());
-                blob_cache.insert(oid, id);
+                let captured = capture_blob(&blob.data, kind);
+                let id = ContentId::of(&captured);
+                if let std::collections::btree_map::Entry::Vacant(entry) = pending_content.entry(id)
+                {
+                    accounting.content(captured.len(), limits)?;
+                    entry.insert(captured.into_owned());
+                }
+                blob_cache.insert(cache_key, id);
                 id
             };
             unique_content.insert(id);
-            output.insert(name.to_owned(), id);
+            accounting.tree_entry(name.len(), limits)?;
+            output.insert(name.to_owned(), FileValue { content: id, kind });
         }
     }
     tree_cache.insert(tree_oid, output.clone());
     Ok(output)
 }
 
-fn transformation_between(parent: &Tree, current: &Tree) -> Transformation {
-    let paths = parent.keys().chain(current.keys()).collect::<BTreeSet<_>>();
-    Transformation {
-        edits: paths
-            .into_iter()
-            .filter_map(|path| {
-                let expected = parent.get(path).copied();
-                let replacement = current.get(path).copied();
-                (expected != replacement).then(|| FileEdit {
-                    path: path.clone(),
-                    expected,
-                    replacement,
-                })
-            })
-            .collect(),
+fn capture_blob(bytes: &[u8], kind: FileKind) -> Cow<'_, [u8]> {
+    if kind == FileKind::Symlink {
+        return Cow::Borrowed(bytes);
     }
+    match wheat_core::text_capture::capture(bytes) {
+        wheat_core::text_capture::CapturedBytes::Text(Cow::Borrowed(text)) => {
+            Cow::Borrowed(text.as_bytes())
+        }
+        wheat_core::text_capture::CapturedBytes::Text(Cow::Owned(text)) => {
+            Cow::Owned(text.into_bytes())
+        }
+        wheat_core::text_capture::CapturedBytes::Binary(bytes) => bytes,
+    }
+}
+
+fn edits_between(
+    parent: &Tree,
+    current: &Tree,
+    content: &mut BTreeMap<ContentId, Vec<u8>>,
+    accounting: &mut ImportAccounting,
+    limits: ImportLimits,
+) -> Result<RevisionEdits, ImportError> {
+    let paths = parent.keys().chain(current.keys()).collect::<BTreeSet<_>>();
+    let mut edits = BTreeMap::new();
+    for path in paths {
+        let before = parent.get(path).copied();
+        let after = current.get(path).copied();
+        if before == after {
+            continue;
+        }
+        let before_bytes = before.map(|value| {
+            content
+                .get(&value.content)
+                .expect("materialized Git content is retained before edit capture")
+                .as_slice()
+        });
+        let after_bytes = after.map(|value| {
+            content
+                .get(&value.content)
+                .expect("materialized Git content is retained before edit capture")
+                .as_slice()
+        });
+        let captured = capture_edit(
+            path,
+            before.zip(before_bytes).map(|(value, bytes)| FileSnapshot {
+                kind: value.kind,
+                bytes,
+            }),
+            after.zip(after_bytes).map(|(value, bytes)| FileSnapshot {
+                kind: value.kind,
+                bytes,
+            }),
+            None,
+            guarded::Limits::default(),
+        )?;
+        edits.extend(captured.edits);
+        for (id, bytes) in captured.content {
+            if let std::collections::btree_map::Entry::Vacant(entry) = content.entry(id) {
+                // Guarded capture may retain replacement fragments in addition to
+                // tree blobs; charge them before copying into the pending map.
+                accounting.content(bytes.len(), limits)?;
+                entry.insert(bytes);
+            }
+        }
+    }
+    let added = edits.keys().copied().collect();
+    Ok(RevisionEdits {
+        edits,
+        transition: EditTransition {
+            added,
+            ..EditTransition::default()
+        },
+    })
 }
 
 fn metadata(

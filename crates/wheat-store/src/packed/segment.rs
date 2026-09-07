@@ -13,13 +13,13 @@ use std::{
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{
-    CanonicalObjectKind, ContentId, ObjectId, SEGMENT_FOOTER_ENCODED_SIZE,
-    SEGMENT_NAMESPACE_CONTENT, SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE,
-    SegmentDirectory, SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry,
-    SegmentIndexKey, SegmentIndexPage, SegmentRecordError, decode_segment_directory,
-    decode_segment_footer, decode_segment_index_page, decode_segment_prefix,
-    encode_segment_directory, encode_segment_footer, encode_segment_index_page,
-    encode_segment_prefix, validate_canonical_object,
+    ContentId, ObjectId, SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_NAMESPACE_CONTENT,
+    SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE, SegmentDirectory,
+    SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry, SegmentIndexKey,
+    SegmentIndexPage, SegmentRecordError, decode_segment_directory, decode_segment_footer,
+    decode_segment_index_page, decode_segment_prefix, encode_segment_directory,
+    encode_segment_footer, encode_segment_index_page, encode_segment_prefix,
+    validate_canonical_object,
 };
 
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 1024;
@@ -119,9 +119,12 @@ impl SegmentBuilder {
         if self.entries.len() == MAX_SEGMENT_ENTRIES {
             return Err(SegmentError::TooManyEntries);
         }
-        if !((record.namespace == CONTENT_NAMESPACE && record.kind == 0)
-            || (record.namespace == METADATA_NAMESPACE && (1..=15).contains(&record.kind)))
-        {
+        let valid_kind = match record.namespace {
+            CONTENT_NAMESPACE => record.kind == 0,
+            METADATA_NAMESPACE => SegmentIndexEntry::canonical_kind(record.kind).is_some(),
+            _ => false,
+        };
+        if !valid_kind {
             return Err(SegmentError::Format("namespace/kind"));
         }
         let length = u64::try_from(record.bytes.len()).map_err(|_| SegmentError::TooLarge)?;
@@ -395,33 +398,13 @@ fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), Segment
             }
             let kind = validate_canonical_object(bytes)
                 .map_err(|error| SegmentError::InvalidMetadata(error.to_string()))?;
-            if canonical_kind_code(kind) != entry.kind {
+            if SegmentIndexEntry::canonical_kind_code(kind) != entry.kind {
                 return Err(SegmentError::WrongKind);
             }
         }
         _ => return Err(SegmentError::Format("namespace")),
     }
     Ok(())
-}
-
-fn canonical_kind_code(kind: CanonicalObjectKind) -> u16 {
-    match kind {
-        CanonicalObjectKind::Tree => 1,
-        CanonicalObjectKind::Change => 2,
-        CanonicalObjectKind::Revision => 3,
-        CanonicalObjectKind::Application => 4,
-        CanonicalObjectKind::Conflict => 5,
-        CanonicalObjectKind::View => 6,
-        CanonicalObjectKind::ContentManifest => 7,
-        CanonicalObjectKind::RepositoryState => 8,
-        CanonicalObjectKind::RevisionMapNode => 9,
-        CanonicalObjectKind::ApplicationMapNode => 10,
-        CanonicalObjectKind::ConflictSetNode => 11,
-        CanonicalObjectKind::ContentSetNode => 12,
-        CanonicalObjectKind::RetainedSetNode => 13,
-        CanonicalObjectKind::BranchManifest => 14,
-        CanonicalObjectKind::RepositoryEnvelope => 15,
-    }
 }
 
 fn hash_range(file: &mut File, offset: u64, length: u64) -> Result<[u8; 32], SegmentError> {
@@ -546,18 +529,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_namespace_and_truncation() {
+    fn edit_metadata_packs_and_reads_back() {
+        let edit = wheat_core::EditRecord::new(
+            "edited.txt",
+            wheat_core::EditOperation::ExactFile {
+                expected: None,
+                replacement: Some(wheat_core::FileValue {
+                    content: ContentId::of(b"replacement"),
+                    kind: wheat_core::FileKind::Regular,
+                }),
+            },
+        )
+        .unwrap();
+        let canonical = edit.canonical_bytes();
+        let digest = *ObjectId::of_canonical_bytes(&canonical).as_bytes();
+        let kind = SegmentIndexEntry::canonical_kind_code(wheat_core::CanonicalObjectKind::Edit);
+        assert_eq!(kind, 16);
+
         let directory = tempfile::tempdir().unwrap();
         let mut builder = SegmentBuilder::new(directory.path()).unwrap();
-        assert!(matches!(
-            builder.push(SegmentRecord {
-                namespace: 0,
-                kind: 0,
-                digest: [0; 32],
-                bytes: b"x"
-            }),
-            Err(SegmentError::Format("namespace/kind"))
-        ));
+        builder
+            .push(SegmentRecord {
+                namespace: METADATA_NAMESPACE,
+                kind,
+                digest,
+                bytes: &canonical,
+            })
+            .unwrap();
+        let segment = builder.seal().unwrap();
+        let mut reader = SegmentReader::open(segment.file.reopen().unwrap()).unwrap();
+        assert_eq!(
+            reader.lookup(METADATA_NAMESPACE, digest).unwrap(),
+            Some((kind, canonical))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_namespace_kinds_and_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        for (namespace, kind) in [
+            (0, 0),
+            (CONTENT_NAMESPACE, 1),
+            (METADATA_NAMESPACE, 0),
+            (METADATA_NAMESPACE, 17),
+        ] {
+            let mut builder = SegmentBuilder::new(directory.path()).unwrap();
+            assert!(matches!(
+                builder.push(SegmentRecord {
+                    namespace,
+                    kind,
+                    digest: [0; 32],
+                    bytes: b"x"
+                }),
+                Err(SegmentError::Format("namespace/kind"))
+            ));
+        }
 
         let segment = build(&[b"payload"]);
         let mut raw = bytes(&segment);

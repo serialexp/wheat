@@ -6,36 +6,41 @@
 use std::collections::BTreeMap;
 
 use gix::bstr::ByteSlice;
-use wheat_core::{ContentId, FileEdit};
+use wheat_core::{
+    EditId, EditRecord, EditTransition, FileKind, RevisionEdits,
+    edit_capture::{FileSnapshot, capture_edit},
+    guarded,
+};
 use wheat_store::ContentStore;
 
 use super::{StagedImportError, git_error_local};
 
 const MAX_TREE_DEPTH: usize = 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum EntryKind {
     Tree,
-    Blob,
+    File(FileKind),
     Submodule,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct Entry {
     oid: gix::ObjectId,
     kind: EntryKind,
 }
 
-/// Produce the first-parent transformation recorded by `commit`.
+/// Produce the first-parent guarded edits recorded by `commit`.
 ///
-/// Blob contents are put in the content store as soon as they are read. Equal subtree IDs are
+/// Captured content is put in the content store as soon as it is derived. Equal subtree IDs are
 /// skipped without opening the subtree, and only the two directories at the current recursion
 /// depth are materialized at once.
 pub(super) fn tree_edits(
     git: &gix::Repository,
     commit: &gix::Commit<'_>,
+    commit_oid: &[u8],
     content: &ContentStore,
-) -> Result<Vec<FileEdit>, StagedImportError> {
+) -> Result<RevisionEdits, StagedImportError> {
     let new_tree = commit.tree_id().map_err(git_error_local)?.detach();
     let old_tree = commit
         .parent_ids()
@@ -51,11 +56,26 @@ pub(super) fn tree_edits(
 
     let mut edits = BTreeMap::new();
     let mut batch = wheat_store::ContentWriteBatch::new(content);
-    compare_directories(git, old_tree, Some(new_tree), "", 0, &mut batch, &mut edits)?;
-    // The commit writer reads these IDs from the durable backing store.
-    // Never return edits while their content is only in the pending tail.
+    compare_directories(
+        git,
+        old_tree,
+        Some(new_tree),
+        "",
+        0,
+        commit_oid,
+        &mut batch,
+        &mut edits,
+    )?;
+    // Never return edits while their snapshots and guard fragments are only pending.
     batch.commit()?;
-    Ok(edits.into_values().collect())
+    let added = edits.keys().copied().collect();
+    Ok(RevisionEdits {
+        edits,
+        transition: EditTransition {
+            added,
+            ..EditTransition::default()
+        },
+    })
 }
 
 fn compare_directories(
@@ -64,8 +84,9 @@ fn compare_directories(
     new: Option<gix::ObjectId>,
     prefix: &str,
     depth: usize,
+    commit_oid: &[u8],
     content: &mut wheat_store::ContentWriteBatch<'_>,
-    edits: &mut BTreeMap<String, FileEdit>,
+    edits: &mut BTreeMap<EditId, EditRecord>,
 ) -> Result<(), StagedImportError> {
     if old == new {
         return Ok(());
@@ -96,6 +117,7 @@ fn compare_directories(
             new_entries.get(&name).copied(),
             &path,
             depth,
+            commit_oid,
             content,
             edits,
         )?;
@@ -110,8 +132,9 @@ fn compare_entries(
     new: Option<Entry>,
     path: &str,
     directory_depth: usize,
+    commit_oid: &[u8],
     content: &mut wheat_store::ContentWriteBatch<'_>,
-    edits: &mut BTreeMap<String, FileEdit>,
+    edits: &mut BTreeMap<EditId, EditRecord>,
 ) -> Result<(), StagedImportError> {
     if matches!(
         old,
@@ -130,7 +153,7 @@ fn compare_entries(
     }
 
     match (old, new) {
-        (Some(old), Some(new)) if old.oid == new.oid => Ok(()),
+        (Some(old), Some(new)) if old == new => Ok(()),
         (
             Some(Entry {
                 oid: old,
@@ -146,6 +169,7 @@ fn compare_entries(
             Some(new),
             path,
             directory_depth + 1,
+            commit_oid,
             content,
             edits,
         ),
@@ -162,15 +186,24 @@ fn compare_entries(
                 None,
                 path,
                 directory_depth + 1,
+                commit_oid,
                 content,
                 edits,
             )?;
             if let Some(Entry {
                 oid,
-                kind: EntryKind::Blob,
+                kind: EntryKind::File(kind),
             }) = new
             {
-                record_blob_edit(git, None, Some(oid), path, content, edits)?;
+                record_blob_edit(
+                    git,
+                    None,
+                    Some((oid, kind)),
+                    path,
+                    commit_oid,
+                    content,
+                    edits,
+                )?;
             }
             Ok(())
         }
@@ -183,10 +216,18 @@ fn compare_entries(
         ) => {
             if let Some(Entry {
                 oid,
-                kind: EntryKind::Blob,
+                kind: EntryKind::File(kind),
             }) = old
             {
-                record_blob_edit(git, Some(oid), None, path, content, edits)?;
+                record_blob_edit(
+                    git,
+                    Some((oid, kind)),
+                    None,
+                    path,
+                    commit_oid,
+                    content,
+                    edits,
+                )?;
             }
             compare_directories(
                 git,
@@ -194,15 +235,23 @@ fn compare_entries(
                 Some(oid),
                 path,
                 directory_depth + 1,
+                commit_oid,
                 content,
                 edits,
             )
         }
         (old, new) => record_blob_edit(
             git,
-            old.map(|entry| entry.oid),
-            new.map(|entry| entry.oid),
+            old.and_then(|entry| match entry.kind {
+                EntryKind::File(kind) => Some((entry.oid, kind)),
+                _ => None,
+            }),
+            new.and_then(|entry| match entry.kind {
+                EntryKind::File(kind) => Some((entry.oid, kind)),
+                _ => None,
+            }),
             path,
+            commit_oid,
             content,
             edits,
         ),
@@ -230,8 +279,12 @@ fn directory_entries(
             EntryKind::Tree
         } else if mode.is_commit() {
             EntryKind::Submodule
+        } else if mode.is_link() {
+            EntryKind::File(FileKind::Symlink)
+        } else if mode.is_executable() {
+            EntryKind::File(FileKind::Executable)
         } else {
-            EntryKind::Blob
+            EntryKind::File(FileKind::Regular)
         };
         entries.insert(
             name,
@@ -246,42 +299,54 @@ fn directory_entries(
 
 fn record_blob_edit(
     git: &gix::Repository,
-    old: Option<gix::ObjectId>,
-    new: Option<gix::ObjectId>,
+    old: Option<(gix::ObjectId, FileKind)>,
+    new: Option<(gix::ObjectId, FileKind)>,
     path: &str,
+    commit_oid: &[u8],
     content: &mut wheat_store::ContentWriteBatch<'_>,
-    edits: &mut BTreeMap<String, FileEdit>,
+    edits: &mut BTreeMap<EditId, EditRecord>,
 ) -> Result<(), StagedImportError> {
     if old == new {
         return Ok(());
     }
-    let expected = old.map(|oid| store_blob(git, oid, content)).transpose()?;
-    let replacement = new.map(|oid| store_blob(git, oid, content)).transpose()?;
-    // Git modes are not represented in a FileEdit. This also protects against mode-only changes
-    // if distinct object references happen to resolve to identical bytes.
-    if expected != replacement {
-        let path = path.to_owned();
-        edits.insert(
-            path.clone(),
-            FileEdit {
-                path,
-                expected,
-                replacement,
-            },
-        );
+    let before = old
+        .map(|(oid, kind)| load_blob(git, oid).map(|bytes| (kind, bytes)))
+        .transpose()?;
+    let after = new
+        .map(|(oid, kind)| load_blob(git, oid).map(|bytes| (kind, bytes)))
+        .transpose()?;
+    let captured = capture_edit(
+        path,
+        before
+            .as_ref()
+            .map(|(kind, bytes)| FileSnapshot { kind: *kind, bytes }),
+        after
+            .as_ref()
+            .map(|(kind, bytes)| FileSnapshot { kind: *kind, bytes }),
+        None,
+        guarded::Limits::default(),
+    )
+    .map_err(|source| StagedImportError::EditCapture {
+        commit: commit_oid
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        path: path.to_owned(),
+        source,
+    })?;
+    for (id, bytes) in captured.content {
+        let stored = content.put(&bytes)?;
+        debug_assert_eq!(stored, id);
     }
+    edits.extend(captured.edits);
     Ok(())
 }
 
-fn store_blob(
-    git: &gix::Repository,
-    oid: gix::ObjectId,
-    content: &mut wheat_store::ContentWriteBatch<'_>,
-) -> Result<ContentId, StagedImportError> {
+fn load_blob(git: &gix::Repository, oid: gix::ObjectId) -> Result<Vec<u8>, StagedImportError> {
     let blob = git
         .find_object(oid)
         .map_err(git_error_local)?
         .try_into_blob()
         .map_err(git_error_local)?;
-    content.put(&blob.data).map_err(Into::into)
+    Ok(blob.data.clone())
 }

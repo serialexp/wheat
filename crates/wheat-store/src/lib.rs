@@ -9,6 +9,7 @@ mod commit_content;
 mod commit_writer;
 mod content_batch;
 pub use content_batch::ContentWriteBatch;
+mod content_io;
 mod loose;
 mod merkle_tree;
 mod object_store_adapter;
