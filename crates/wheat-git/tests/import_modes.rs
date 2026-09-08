@@ -38,6 +38,29 @@ fn fixture() -> tempfile::TempDir {
     root
 }
 
+fn large_binary_fixture() -> (tempfile::TempDir, Vec<u8>) {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-b", "main"]);
+    let mut content = vec![0_u8; 17 * 1024 * 1024];
+    for (index, byte) in content.iter_mut().enumerate() {
+        *byte = (index.wrapping_mul(31) >> 9) as u8;
+    }
+    std::fs::write(root.path().join("model.bin"), &content).unwrap();
+    git(root.path(), &["add", "model.bin"]);
+    git(root.path(), &["commit", "-m", "large binary"]);
+    (root, content)
+}
+
+fn oversized_binary_fixture() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-b", "main"]);
+    let file = std::fs::File::create(root.path().join("too-large.bin")).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+    git(root.path(), &["add", "too-large.bin"]);
+    git(root.path(), &["commit", "-m", "oversized binary"]);
+    root
+}
+
 #[tokio::test]
 async fn atomic_and_resumable_imports_publish_the_same_envelope() {
     let git = fixture();
@@ -93,6 +116,53 @@ async fn atomic_and_resumable_imports_publish_the_same_envelope() {
             .unwrap(),
         atomic_head
     );
+}
+
+#[tokio::test]
+async fn atomic_import_retains_binary_content_above_the_guarded_text_limit() {
+    let (git, expected) = large_binary_fixture();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("atomic");
+
+    let head = atomic_import(git.path(), &destination, "refs/heads/main")
+        .await
+        .unwrap();
+    let objects = PackedObjectStore::open(destination.join("storage")).unwrap();
+    let content = objects.content_store();
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    let repository = reader.hydrate(envelope.state).await.unwrap();
+    let value = repository
+        .working_view()
+        .tree
+        .get("model.bin")
+        .expect("large file is visible");
+
+    assert_eq!(content.get(value.content).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn atomic_import_rejects_a_file_above_the_in_memory_import_bound() {
+    let git = oversized_binary_fixture();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("atomic");
+
+    let error = atomic_import(git.path(), &destination, "refs/heads/main")
+        .await
+        .unwrap_err();
+    let AtomicImportError::Stage(wheat_git::StagedImportError::EditCapture { source, .. }) = error
+    else {
+        panic!("unexpected error: {error:?}")
+    };
+    assert!(matches!(
+        source,
+        wheat_core::edit_capture::EditCaptureError::InputTooLarge {
+            side: wheat_core::edit_capture::SnapshotSide::After,
+            actual: 67_108_865,
+            limit: 67_108_864
+        }
+    ));
+    assert!(!destination.exists());
 }
 
 #[tokio::test]

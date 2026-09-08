@@ -1,6 +1,9 @@
 use wheat_core::{
     ContentId, EditOperation, FileKind,
-    edit_capture::{EditCaptureError, FileSnapshot, SnapshotSide, capture_edit},
+    edit_capture::{
+        CaptureLimits, EditCaptureError, FileSnapshot, SnapshotSide, capture_edit,
+        capture_edit_with_limits,
+    },
     guarded::{Limits, authoring::AuthoringError},
 };
 
@@ -51,6 +54,90 @@ fn binary_and_symlink_snapshots_are_byte_exact() {
             EditOperation::ExactFile { .. }
         ));
     }
+}
+
+#[test]
+fn text_above_guarded_bound_is_an_exact_replacement_with_a_separate_file_bound() {
+    let before = b"alpha\nbeta\ngamma\n";
+    let after = b"alpha\nchanged\ngamma\n";
+    let captured = capture_edit_with_limits(
+        "large.txt",
+        Some(file(FileKind::Regular, before)),
+        Some(file(FileKind::Regular, after)),
+        None,
+        CaptureLimits {
+            max_file_bytes: after.len(),
+            max_guarded_lines: wheat_core::guarded::line_diff::DEFAULT_MAX_LINES,
+            guarded: Limits {
+                max_input_bytes: before.len() - 1,
+                ..Limits::default()
+            },
+        },
+    )
+    .unwrap();
+
+    let EditOperation::ExactFile {
+        expected,
+        replacement,
+    } = captured.edits.values().next().unwrap().operation
+    else {
+        panic!("oversized text transition must be exact")
+    };
+    assert_eq!(expected.unwrap().content, ContentId::of(before));
+    assert_eq!(replacement.unwrap().content, ContentId::of(after));
+}
+
+#[test]
+fn text_above_line_diff_bound_is_an_exact_replacement() {
+    let before = "a\n".repeat(wheat_core::guarded::line_diff::DEFAULT_MAX_LINES + 1);
+    let mut after = before.clone();
+    after.replace_range(..1, "b");
+    let captured = capture_edit_with_limits(
+        "many-lines.txt",
+        Some(file(FileKind::Regular, before.as_bytes())),
+        Some(file(FileKind::Regular, after.as_bytes())),
+        None,
+        CaptureLimits {
+            max_file_bytes: after.len(),
+            max_guarded_lines: wheat_core::guarded::line_diff::DEFAULT_MAX_LINES,
+            guarded: Limits {
+                max_input_bytes: after.len(),
+                max_work: usize::MAX,
+                ..Limits::default()
+            },
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        captured.edits.values().next().unwrap().operation,
+        EditOperation::ExactFile { .. }
+    ));
+}
+
+#[test]
+fn separate_file_bound_still_rejects_oversized_exact_content() {
+    let error = capture_edit_with_limits(
+        "large.bin",
+        None,
+        Some(file(FileKind::Regular, b"large\0binary")),
+        None,
+        CaptureLimits {
+            max_file_bytes: 4,
+            max_guarded_lines: wheat_core::guarded::line_diff::DEFAULT_MAX_LINES,
+            guarded: Limits::default(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        EditCaptureError::InputTooLarge {
+            side: SnapshotSide::After,
+            actual: 12,
+            limit: 4
+        }
+    ));
 }
 
 #[test]

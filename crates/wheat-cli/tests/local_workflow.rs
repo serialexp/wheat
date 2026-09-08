@@ -17,6 +17,24 @@ fn field(output: &Output, name: &str) -> String {
         .to_owned()
 }
 
+fn git(root: &std::path::Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .env("GIT_AUTHOR_NAME", "Tester")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Tester")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("git command runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn initializes_mutates_and_reopens_local_repository() {
     let directory = tempfile::tempdir().unwrap();
@@ -56,6 +74,79 @@ fn initializes_mutates_and_reopens_local_repository() {
     let duplicate = wheat(directory.path(), &["init"]);
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
+}
+
+#[test]
+fn inspects_and_mutates_an_atomic_packed_repository() {
+    let git_repository = tempfile::tempdir().unwrap();
+    git(git_repository.path(), &["init", "-b", "main"]);
+    std::fs::write(git_repository.path().join("file"), b"one\n").unwrap();
+    git(git_repository.path(), &["add", "file"]);
+    git(git_repository.path(), &["commit", "-m", "root"]);
+
+    let parent = tempfile::tempdir().unwrap();
+    let repository = parent.path().join("atomic");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(wheat_git::atomic_import(
+            git_repository.path(),
+            &repository,
+            "refs/heads/main",
+        ))
+        .unwrap();
+
+    let status = wheat(&repository, &["status"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("changes: 1"));
+
+    let created = wheat(
+        &repository,
+        &["change", "new", "--path", "added", "--value", "packed"],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let reopened = wheat(&repository, &["status"]);
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("changes: 2"));
+
+    let log = wheat(&repository, &["log"]);
+    assert!(
+        log.status.success(),
+        "{}",
+        String::from_utf8_lossy(&log.stderr)
+    );
+    assert!(String::from_utf8_lossy(&log.stdout).contains(&field(&created, "revision")));
+    let edits = wheat(
+        &repository,
+        &["edits", "--revision", &field(&created, "revision")],
+    );
+    assert!(
+        edits.status.success(),
+        "{}",
+        String::from_utf8_lossy(&edits.stderr)
+    );
+    assert!(String::from_utf8_lossy(&edits.stdout).contains("added exact-file"));
+    let conflicts = wheat(&repository, &["conflicts"]);
+    assert!(conflicts.status.success());
+    assert!(conflicts.stdout.is_empty());
+
+    let content_id = wheat_core::ContentId::of(b"packed").to_string();
+    let retained = wheat(&repository, &["cat", &content_id]);
+    assert!(
+        retained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retained.stderr)
+    );
+    assert_eq!(retained.stdout, b"packed");
 }
 
 #[test]

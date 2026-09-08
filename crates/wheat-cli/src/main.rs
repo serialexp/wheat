@@ -10,7 +10,10 @@ mod inspection;
 mod local;
 mod workspace;
 mod workspace_files;
-use local::{content_store, initialize, with_repository};
+use local::{
+    content_store, current_conflicts, current_revisions, initialize, repository_summary,
+    revision_with_edits, with_repository,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "wheat", about = "Wheat source control prototype")]
@@ -166,32 +169,35 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => initialize(&cli.repository),
-        Command::Status => with_repository(&cli.repository, false, |repository, _, output| {
-            let working = repository.working_view();
-            writeln!(output, "working view: {}", working.id)?;
-            writeln!(output, "published view: {}", repository.published_view().id)?;
-            writeln!(
-                output,
-                "changes: {}",
-                repository.current_revisions().count()
-            )?;
-            writeln!(output, "conflicts: {}", working.unresolved_conflicts.len())?;
+        Command::Status => {
+            let summary = repository_summary(&cli.repository)?;
+            println!("working view: {}", summary.working_view);
+            println!("published view: {}", summary.published_view);
+            println!("changes: {}", summary.changes);
+            println!("conflicts: {}", summary.conflicts);
             Ok(())
-        }),
-        Command::Log => with_repository(&cli.repository, false, |repository, _, output| {
-            for (change, revision) in repository.current_revisions() {
+        }
+        Command::Log => {
+            let mut output = String::new();
+            for (change, revision) in current_revisions(&cli.repository)? {
                 writeln!(output, "{change} {revision}")?;
             }
+            print!("{output}");
             Ok(())
-        }),
-        Command::Conflicts => with_repository(&cli.repository, false, |repository, _, output| {
-            inspection::conflicts(repository, output)
-        }),
+        }
+        Command::Conflicts => {
+            let mut output = String::new();
+            inspection::conflicts(&current_conflicts(&cli.repository)?, &mut output)?;
+            print!("{output}");
+            Ok(())
+        }
         Command::Edits { revision } => {
-            with_repository(&cli.repository, false, |repository, _, output| {
-                let revision = RevisionId::from_str(&revision).context("invalid revision ID")?;
-                inspection::edits(repository, revision, output)
-            })
+            let revision = RevisionId::from_str(&revision).context("invalid revision ID")?;
+            let (revision, edits) = revision_with_edits(&cli.repository, revision)?;
+            let mut output = String::new();
+            inspection::edits(&revision, &edits, &mut output)?;
+            print!("{output}");
+            Ok(())
         }
         Command::Add(arguments) => {
             with_repository(&cli.repository, true, |repository, store, output| {
@@ -226,7 +232,7 @@ fn main() -> Result<()> {
         }
         Command::Cat { content } => {
             let id = ContentId::from_str(&content).context("invalid content ID")?;
-            let bytes = content_store(&cli.repository).get(id)?;
+            let bytes = content_store(&cli.repository)?.get(id)?;
             use std::io::Write as _;
             std::io::stdout().write_all(&bytes)?;
             Ok(())
@@ -271,7 +277,7 @@ fn main() -> Result<()> {
                             .or_else(|| tree.get(&arguments.path).map(|value| value.kind))
                             .unwrap_or(FileKind::Regular);
                         let content =
-                            put_captured_value(&content_store(&cli.repository), &value, kind)?;
+                            put_captured_value(&content_store(&cli.repository)?, &value, kind)?;
                         tree.insert(arguments.path, FileValue { content, kind });
                     }
                     None if arguments.delete => {

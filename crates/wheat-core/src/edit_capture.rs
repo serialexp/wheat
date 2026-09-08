@@ -60,6 +60,28 @@ pub enum EditCaptureError {
     InvalidRecord(#[source] CanonicalObjectError),
 }
 
+/// Limits for capturing a file transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureLimits {
+    /// Maximum bytes accepted for either complete file snapshot.
+    pub max_file_bytes: usize,
+    /// Maximum lines on either side of a guarded text transition. Text above
+    /// this bound remains importable as an exact whole-file replacement.
+    pub max_guarded_lines: usize,
+    /// Tighter work and size limits for deriving guarded text edits.
+    pub guarded: Limits,
+}
+
+impl From<Limits> for CaptureLimits {
+    fn from(guarded: Limits) -> Self {
+        Self {
+            max_file_bytes: guarded.max_input_bytes,
+            max_guarded_lines: crate::guarded::line_diff::DEFAULT_MAX_LINES,
+            guarded,
+        }
+    }
+}
+
 /// Convert borrowed, authenticated snapshots into canonical edit definitions.
 ///
 /// Regular and executable UTF-8 files without NUL bytes are canonicalized to LF
@@ -67,9 +89,9 @@ pub enum EditCaptureError {
 /// Explicit guard ranges use byte offsets into the canonical LF `after` workspace,
 /// not the caller's original line-ending representation. Nonempty ranges are only
 /// supported for changed text-to-text transitions of the same file kind.
-/// Existing text-to-text transitions of the same kind are always sent through
-/// guarded authoring; an authoring failure is returned and never converted into
-/// an `ExactFile` edit.
+/// Existing text-to-text transitions within `limits.max_input_bytes` are always sent
+/// through guarded authoring; an authoring failure is returned and never converted
+/// into an `ExactFile` edit.
 pub fn capture_edit(
     path: &str,
     before: Option<FileSnapshot<'_>>,
@@ -77,10 +99,25 @@ pub fn capture_edit(
     explicit_guard_ranges: Option<&[Range<usize>]>,
     limits: Limits,
 ) -> Result<CapturedEdit, EditCaptureError> {
+    capture_edit_with_limits(path, before, after, explicit_guard_ranges, limits.into())
+}
+
+/// Capture with a whole-file bound independent from the guarded-text bound.
+///
+/// A text transition with either side above the guarded bound is represented as one
+/// exact whole-file replacement. This keeps matching and diff work bounded while
+/// allowing repositories to retain large files as ordinary content-addressed values.
+pub fn capture_edit_with_limits(
+    path: &str,
+    before: Option<FileSnapshot<'_>>,
+    after: Option<FileSnapshot<'_>>,
+    explicit_guard_ranges: Option<&[Range<usize>]>,
+    limits: CaptureLimits,
+) -> Result<CapturedEdit, EditCaptureError> {
     // Validate cheap borrowed metadata before line-ending normalization or copies.
     validate_path(path).map_err(EditCaptureError::InvalidPath)?;
-    check_bound(before, SnapshotSide::Before, limits.max_input_bytes)?;
-    check_bound(after, SnapshotSide::After, limits.max_input_bytes)?;
+    check_bound(before, SnapshotSide::Before, limits.max_file_bytes)?;
+    check_bound(after, SnapshotSide::After, limits.max_file_bytes)?;
 
     let before = before.map(canonicalize);
     let after = after.map(canonicalize);
@@ -90,7 +127,10 @@ pub fn capture_edit(
     let changed = before_value != after_value;
     let guarded_text = changed
         && matches!((&before, &after), (Some(a), Some(b))
-            if a.kind == b.kind && a.kind != FileKind::Symlink && a.is_text && b.is_text);
+            if a.kind == b.kind
+                && a.kind != FileKind::Symlink
+                && guarded_text_eligible(a, limits.guarded, limits.max_guarded_lines)
+                && guarded_text_eligible(b, limits.guarded, limits.max_guarded_lines));
     if explicit_guard_ranges.is_some_and(|ranges| !ranges.is_empty()) && !guarded_text {
         return Err(EditCaptureError::UnsupportedExplicitGuards);
     }
@@ -130,7 +170,7 @@ pub fn capture_edit(
             &before.bytes,
             &after.bytes,
             explicit_guard_ranges,
-            limits,
+            limits.guarded,
         )
         .map_err(EditCaptureError::Authoring)?;
         for definition in definitions {
@@ -154,10 +194,10 @@ pub fn capture_edit(
             result.edits.insert(record.id(), record);
         }
     } else {
-        if limits.max_edits == 0 {
+        if limits.guarded.max_edits == 0 {
             return Err(EditCaptureError::TooManyEdits {
                 actual: 1,
-                limit: limits.max_edits,
+                limit: limits.guarded.max_edits,
             });
         }
         let record = EditRecord::new(
@@ -215,6 +255,21 @@ fn canonicalize(snapshot: FileSnapshot<'_>) -> CanonicalSnapshot<'_> {
             is_text: false,
         },
     }
+}
+
+fn guarded_text_eligible(
+    snapshot: &CanonicalSnapshot<'_>,
+    limits: Limits,
+    max_lines: usize,
+) -> bool {
+    snapshot.is_text
+        && snapshot.bytes.len() <= limits.max_input_bytes
+        && line_count(&snapshot.bytes) <= max_lines
+}
+
+fn line_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&byte| byte == b'\n').count()
+        + usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'))
 }
 
 fn check_bound(

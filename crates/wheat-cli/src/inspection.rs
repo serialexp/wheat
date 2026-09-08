@@ -1,18 +1,15 @@
 //! Human-readable immutable edit and conflict evidence inspection.
 use std::fmt::Write as _;
 
-use anyhow::{Context, Result};
-use wheat_core::{EditOperation, Repository, RevisionId};
+use anyhow::Result;
+use wheat_core::{Conflict, EditOperation, EditRecord, RevisionRecord};
 
 pub(crate) fn edits(
-    repository: &Repository,
-    revision: RevisionId,
+    revision: &RevisionRecord,
+    edits: &[(wheat_core::EditId, EditRecord)],
     output: &mut String,
 ) -> Result<()> {
-    let revision = repository
-        .revision(revision)
-        .context("revision is not retained")?;
-    for (id, edit) in revision.edits() {
+    for (id, edit) in edits {
         write!(output, "{id} {} ", edit.path)?;
         match &edit.operation {
             EditOperation::GuardedText {
@@ -36,7 +33,7 @@ pub(crate) fn edits(
             )?,
         }
     }
-    let transition = revision.edit_transition();
+    let transition = &revision.transition;
     writeln!(
         output,
         "transition preserved={} added={} removed={} subsumed={}",
@@ -71,9 +68,8 @@ fn write_ids<T: std::fmt::Display>(
     Ok(())
 }
 
-pub(crate) fn conflicts(repository: &Repository, output: &mut String) -> Result<()> {
-    let working = repository.working_view().id;
-    for conflict in repository.conflicts_in_view(working)? {
+pub(crate) fn conflicts(conflicts: &[Conflict], output: &mut String) -> Result<()> {
+    for conflict in conflicts {
         writeln!(output, "conflict {} on {}", conflict.id, conflict.base_view)?;
         for (edit, evidence) in &conflict.edits {
             writeln!(

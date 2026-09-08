@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 use gix::bstr::ByteSlice;
 use wheat_core::{
     EditId, EditRecord, EditTransition, FileKind, RevisionEdits,
-    edit_capture::{FileSnapshot, capture_edit},
+    edit_capture::{CaptureLimits, FileSnapshot, capture_edit_with_limits},
     guarded,
 };
 use wheat_store::ContentStore;
 
-use super::{StagedImportError, git_error_local};
+use super::{MAX_IMPORT_FILE_BYTES, MAX_IMPORT_GUARDED_LINES, StagedImportError, git_error_local};
 
 const MAX_TREE_DEPTH: usize = 1024;
 
@@ -315,7 +315,7 @@ fn record_blob_edit(
     let after = new
         .map(|(oid, kind)| load_blob(git, oid).map(|bytes| (kind, bytes)))
         .transpose()?;
-    let captured = capture_edit(
+    let captured = capture_edit_with_limits(
         path,
         before
             .as_ref()
@@ -324,7 +324,11 @@ fn record_blob_edit(
             .as_ref()
             .map(|(kind, bytes)| FileSnapshot { kind: *kind, bytes }),
         None,
-        guarded::Limits::default(),
+        CaptureLimits {
+            max_file_bytes: MAX_IMPORT_FILE_BYTES,
+            max_guarded_lines: MAX_IMPORT_GUARDED_LINES,
+            guarded: guarded::Limits::default(),
+        },
     )
     .map_err(|source| StagedImportError::EditCapture {
         commit: commit_oid

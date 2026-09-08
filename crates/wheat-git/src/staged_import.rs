@@ -43,6 +43,25 @@ const NAMESPACE: Uuid = Uuid::from_u128(0xc245_a89b_519f_5a4b_9b36_d62b_78f5_290
 const SNAPSHOT_VERSION: &[u8] = b"wheat-git-staged-import-v1\0";
 const DISCOVERY_BATCH: usize = 256;
 const MAX_STAGE_BRANCHES: usize = 256;
+/// The current import path materializes a complete blob and exact replacement
+/// sides in memory, so keep its whole-file ceiling explicit and conservative.
+/// Native streaming/chunked content storage will allow a larger repository policy
+/// without turning that policy into a per-process allocation allowance.
+const MAX_IMPORT_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Above this line count, imports retain text as an exact file replacement
+/// rather than spending guarded-authoring work proportional to a generated or
+/// lock file's size. Ordinary source files remain guarded.
+const MAX_IMPORT_GUARDED_LINES: usize = 10_000;
+
+fn import_application_limits() -> ApplicationLimits {
+    ApplicationLimits {
+        // Exact replacement replay may authenticate the target plus both old and
+        // new identities in one path group. Duplicate IDs are resolved only once.
+        max_resolved_bytes: MAX_IMPORT_FILE_BYTES.saturating_mul(3),
+        ..ApplicationLimits::default()
+    }
+}
+
 /// Default number of commits staged by one [`stage_import`] invocation when
 /// `max_commits` is `None`. Callers resume with another invocation; discovery
 /// is durably journaled and is likewise bounded to one batch per invocation.
@@ -168,7 +187,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     // must never make a pending write appear durable. Reads after each flush use
     // one invocation-local cache shared by all verifiers and Merkle traversals.
     let batch = wheat_store::BatchObjectStore::new(objects, 1024, 8 * 1024 * 1024);
-    let writer = PersistedCommitWriter::new(&batch, content);
+    let writer = PersistedCommitWriter::with_limits(&batch, content, import_application_limits());
     let empty = writer.empty_view().await?;
     batch.flush().await.map_err(CommitWriterError::from)?;
     let cached = cache::CachedObjects::new(objects, CACHE_ENTRIES, CACHE_BYTES);
@@ -508,7 +527,7 @@ async fn verify_mapping<O: ImmutableObjectStore>(
         &target,
         definitions.iter().cloned(),
         |id| content.get(id),
-        ApplicationLimits::default(),
+        import_application_limits(),
     )
     .map_err(|_| bad("edit replay"))?;
     let mut evidence = BTreeMap::new();

@@ -1258,8 +1258,17 @@ ObjectLocation {
 
 `ObjectId` remains the hash of the canonical BinSchema bytes; compaction,
 replication, and movement between loose storage, local NVMe, S3, and R2 do not
-change it. Large content normally remains a standalone object, while small
-metadata and content below a measured threshold are segment candidates.
+change it. Small metadata and content below a measured threshold are segment
+candidates. Large files remain ordinary tree entries addressed by one whole-file
+`ContentId`; changes above guarded-authoring bounds are exact file replacements,
+not rejected or split into independently editable pieces. The content backend may
+physically retain that identity as a whole object or as a manifest of
+content-defined chunks. Chunking is storage and transfer metadata: reassembly must
+authenticate to the same whole-file `ContentId`, and changing physical layout must
+not change any tree, edit, revision, application, or view identity. Native
+streaming put/get and bounded FastCDC-style chunk storage remain to be designed;
+the current prototype's `Vec<u8>` content interface and loose large-object fallback
+are only the reference implementation.
 
 A sealed segment is footer-indexed. A tiny fixed prefix may identify the file as
 a Wheat segment, but contains no offsets and never needs backpatching. Object

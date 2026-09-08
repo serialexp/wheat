@@ -17,6 +17,7 @@ wheat-store = { path = "../wheat-store" }
 
 [dev-dependencies]
 tempfile = "3"
+wheat-git = { path = "../wheat-git" }
 
 [lints]
 workspace = true

@@ -7,6 +7,9 @@
 
 use std::{collections::HashMap, ops::Range};
 
+/// Default maximum lines accepted by guarded-edit authoring.
+pub const DEFAULT_MAX_LINES: usize = 20_000;
+
 /// Hard limits for [`line_diff`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LineDiffLimits {
@@ -25,7 +28,7 @@ impl Default for LineDiffLimits {
     fn default() -> Self {
         Self {
             max_input_bytes: 4 * 1024 * 1024,
-            max_lines: 20_000,
+            max_lines: DEFAULT_MAX_LINES,
             max_cells: 4_000_000,
             max_work: 8_100_000,
         }
