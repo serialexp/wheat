@@ -44,7 +44,7 @@ pub(crate) trait Collection: Send + Sync {
     type Id: Copy + Eq + Into<ObjectId> + Send + Sync;
     type Key: Key;
     type Value: Copy + Eq + Send + Sync;
-    type PublicNode: Send;
+    type PublicNode: Clone + Send;
 
     const KIND: ObjectKind;
     fn decode(bytes: &[u8]) -> Result<Self::PublicNode, CanonicalObjectError>;
@@ -117,6 +117,17 @@ where
             .into());
         }
         Ok(C::decode(&object.canonical_bytes)?)
+    }
+
+    pub(crate) async fn read_public_at(
+        &self,
+        id: C::Id,
+        position: usize,
+    ) -> Result<C::PublicNode, Error> {
+        let public = self.read_public(id).await?;
+        let node = C::unpack(public.clone());
+        self.validate_at(&node, position)?;
+        Ok(public)
     }
 
     async fn read_at(&self, id: C::Id, position: usize) -> Result<Node<C::Id, C::Value>, Error> {

@@ -37,6 +37,11 @@ impl ContentAccumulator {
             "PRAGMA temp_store = FILE;
              PRAGMA cache_size = -8192;
              CREATE TABLE content_manifest_roots (id BLOB PRIMARY KEY) WITHOUT ROWID;
+             CREATE TABLE content_nodes_seen (
+                 id BLOB NOT NULL,
+                 path BLOB NOT NULL,
+                 PRIMARY KEY (id, path)
+             ) WITHOUT ROWID;
              CREATE TABLE content_ids (id BLOB PRIMARY KEY) WITHOUT ROWID;
              CREATE TABLE retained_changes (id BLOB PRIMARY KEY) WITHOUT ROWID;
              CREATE TABLE retained_views (id BLOB PRIMARY KEY) WITHOUT ROWID;
@@ -99,27 +104,7 @@ impl ContentAccumulator {
             }
             after_manifest = manifests.last().map(|id| *id.as_bytes());
             for manifest in manifests {
-                let mut cursor = store.cursor(manifest).await?;
-                loop {
-                    while chunk.len() < CHUNK {
-                        let Some(id) = cursor.next().await? else {
-                            break;
-                        };
-                        chunk.push(id);
-                    }
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    let complete = chunk.len() < CHUNK;
-                    let transaction = self.connection.transaction()?;
-                    for id in chunk.drain(..) {
-                        Self::insert_content(&transaction, id)?;
-                    }
-                    transaction.commit()?;
-                    if complete {
-                        break;
-                    }
-                }
+                self.collect_manifest(store, manifest, &mut chunk).await?;
             }
         }
 
@@ -127,6 +112,62 @@ impl ContentAccumulator {
             return Ok(store.empty_root().await?);
         };
         self.build_content_range(store, first, last, 0).await
+    }
+
+    async fn collect_manifest<S: ImmutableObjectStore>(
+        &mut self,
+        store: &ContentSetStore<'_, S>,
+        root: ContentSetId,
+        chunk: &mut Vec<ContentId>,
+    ) -> Result<(), ContentAccumulatorError> {
+        let mut stack = vec![(root, Vec::<u8>::new())];
+        while let Some((id, path)) = stack.pop() {
+            let inserted = self.connection.execute(
+                "INSERT OR IGNORE INTO content_nodes_seen (id, path) VALUES (?1, ?2)",
+                params![id.as_bytes().as_slice(), path.as_slice()],
+            )? == 1;
+            if !inserted {
+                continue;
+            }
+            let node = store.read_node_at(id, path.len()).await?;
+            let mut node_path = path;
+            node_path.extend_from_slice(&node.prefix);
+            if node.present {
+                if node_path.len() != 32 || !node.children.is_empty() {
+                    return Err(ContentAccumulatorError::NonterminalValue);
+                }
+                chunk.push(ContentId::from_digest(
+                    node_path
+                        .try_into()
+                        .expect("terminal path has the digest length"),
+                ));
+                if chunk.len() == CHUNK {
+                    self.flush_content_chunk(chunk)?;
+                }
+                continue;
+            }
+            for child in node.children.iter().rev() {
+                let mut child_path = node_path.clone();
+                child_path.push(child.edge);
+                stack.push((child.child, child_path));
+            }
+        }
+        if !chunk.is_empty() {
+            self.flush_content_chunk(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn flush_content_chunk(
+        &mut self,
+        chunk: &mut Vec<ContentId>,
+    ) -> Result<(), ContentAccumulatorError> {
+        let transaction = self.connection.transaction()?;
+        for id in chunk.drain(..) {
+            Self::insert_content(&transaction, id)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn build_content_range<'a, S: ImmutableObjectStore>(
@@ -398,12 +439,40 @@ impl RetainedTable {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
+    use async_trait::async_trait;
     use object_store::memory::InMemory;
-    use wheat_store::ObjectStoreAdapter;
+    use wheat_store::{ObjectKind, ObjectStoreAdapter, ObjectStoreError, StoredObject};
 
     use super::*;
+
+    struct CountingStore {
+        inner: ObjectStoreAdapter,
+        content_reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ImmutableObjectStore for CountingStore {
+        async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+            let object = self.inner.get(id).await?;
+            if object.kind == ObjectKind::ContentSetNode {
+                self.content_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(object)
+        }
+
+        async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+            self.inner.put_if_absent(id, bytes).await
+        }
+
+        async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+            self.inner.exists_many(ids).await
+        }
+    }
 
     #[tokio::test]
     async fn content_build_merges_many_overlapping_roots_in_one_canonical_pass() {
@@ -439,5 +508,50 @@ mod tests {
         }
         let expected = sets.update_batch(empty, expected_entries).await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn shared_manifest_subtrees_are_authenticated_once_per_path() {
+        let objects = CountingStore {
+            inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), "shared-manifests"),
+            content_reads: AtomicUsize::new(0),
+        };
+        let sets = ContentSetStore::new(&objects);
+        let empty = sets.empty_root().await.unwrap();
+        let common = (0..512_u16)
+            .map(|index| {
+                let mut bytes = [0_u8; 32];
+                bytes[0] = 7;
+                bytes[30..].copy_from_slice(&index.to_be_bytes());
+                ContentId::from_digest(bytes)
+            })
+            .collect::<Vec<_>>();
+        let base = sets
+            .update_batch(empty, common.iter().copied().map(|id| (id, true)))
+            .await
+            .unwrap();
+        let mut accumulator = ContentAccumulator::new().unwrap();
+        for index in 0..40_u8 {
+            let mut bytes = [index; 32];
+            bytes[0] = index.wrapping_add(32);
+            let root = sets
+                .insert(base, ContentId::from_digest(bytes))
+                .await
+                .unwrap();
+            let transaction = accumulator.begin_page().unwrap();
+            ContentAccumulator::insert_manifest(&transaction, root).unwrap();
+            transaction.commit().unwrap();
+        }
+        objects.content_reads.store(0, Ordering::Relaxed);
+
+        let actual = accumulator.build_content(&sets).await.unwrap();
+        let reads = objects.content_reads.load(Ordering::Relaxed);
+        for id in common {
+            assert!(sets.contains(actual, id).await.unwrap());
+        }
+        assert!(
+            reads < 700,
+            "shared authenticated subtrees must not be reread once per manifest: {reads} reads"
+        );
     }
 }

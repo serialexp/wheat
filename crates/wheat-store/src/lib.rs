@@ -10,6 +10,7 @@ mod commit_writer;
 mod content_batch;
 pub use content_batch::ContentWriteBatch;
 mod content_io;
+mod durability;
 mod loose;
 mod merkle_tree;
 mod object_store_adapter;
@@ -31,6 +32,7 @@ mod sets;
 pub use application_map::{ApplicationMapCursor, ApplicationMapError, ApplicationMapStore};
 pub use batch::BatchObjectStore;
 pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
+pub use durability::{Durability, sync_directory, sync_filesystem};
 pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };

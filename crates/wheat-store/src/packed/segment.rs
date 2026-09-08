@@ -19,7 +19,6 @@ use wheat_core::{
     SegmentIndexPage, SegmentRecordError, decode_segment_directory, decode_segment_footer,
     decode_segment_index_page, decode_segment_prefix, encode_segment_directory,
     encode_segment_footer, encode_segment_index_page, encode_segment_prefix,
-    validate_canonical_object,
 };
 
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 1024;
@@ -79,8 +78,6 @@ pub(crate) enum SegmentError {
     ObjectDigest,
     #[error("metadata kind does not match the canonical object")]
     WrongKind,
-    #[error("stored metadata is not a canonical Wheat object: {0}")]
-    InvalidMetadata(String),
 }
 
 fn key(entry: &SegmentIndexEntry) -> (u8, [u8; 32]) {
@@ -396,9 +393,12 @@ fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), Segment
             if ObjectId::of_canonical_bytes(bytes).as_bytes() != &entry.digest {
                 return Err(SegmentError::ObjectDigest);
             }
-            let kind = validate_canonical_object(bytes)
-                .map_err(|error| SegmentError::InvalidMetadata(error.to_string()))?;
-            if SegmentIndexEntry::canonical_kind_code(kind) != entry.kind {
+            // Segment construction validated the canonical object and recorded
+            // its kind before hashing the complete immutable segment body. On
+            // read, the authenticated index kind plus object digest are enough;
+            // typed readers perform the one required canonical decode instead
+            // of making the physical store decode every object twice.
+            if SegmentIndexEntry::canonical_kind(entry.kind).is_none() {
                 return Err(SegmentError::WrongKind);
             }
         }

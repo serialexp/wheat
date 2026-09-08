@@ -129,24 +129,25 @@ pub(crate) fn match_parts_budget(
     // Boyer-Moore-Horspool skips alignments which cannot match based on their
     // final byte. The 256-entry table stays on the stack, and the fragmented
     // guard is compared in place instead of allocating a combined pattern.
-    // Adversarial repetitive inputs remain bounded by the precise comparison
-    // budget even when every shift is only one byte.
+    // Build and compare one fragment at a time: selecting a fragment for every
+    // byte comparison was measurable in this hot loop.
     let mut shift = [plen; 256];
-    for offset in 0..plen - 1 {
-        shift[pattern_byte(before, expected, after, offset) as usize] = plen - 1 - offset;
+    let mut offset = 0;
+    for part in [before, expected, after] {
+        for &byte in part {
+            if offset + 1 < plen {
+                shift[byte as usize] = plen - 1 - offset;
+            }
+            offset += 1;
+        }
     }
     let mut start = first;
     while start < past_last {
-        let mut remaining = plen;
-        while remaining != 0 {
-            let offset = remaining - 1;
-            work.charge(1)?;
-            if target[start + offset] != pattern_byte(before, expected, after, offset) {
-                break;
-            }
-            remaining = offset;
-        }
-        if remaining == 0 {
+        let matches =
+            reverse_part_matches(target, start + before.len() + expected.len(), after, work)?
+                && reverse_part_matches(target, start + before.len(), expected, work)?
+                && reverse_part_matches(target, start, before, work)?;
+        if matches {
             let found = matched_guard(start, plen, before.len(), expected.len());
             if one.is_some() {
                 return Ok(MatchStatus::Ambiguous);
@@ -158,15 +159,54 @@ pub(crate) fn match_parts_budget(
     Ok(one.map(MatchStatus::Unique).unwrap_or(MatchStatus::NoMatch))
 }
 
+/// Compare one fragment from its end so the BMH rejection byte is examined first.
 #[inline]
-fn pattern_byte(before: &[u8], expected: &[u8], after: &[u8], offset: usize) -> u8 {
-    if offset < before.len() {
-        before[offset]
-    } else if offset < before.len() + expected.len() {
-        expected[offset - before.len()]
-    } else {
-        after[offset - before.len() - expected.len()]
+fn reverse_part_matches(
+    target: &[u8],
+    start: usize,
+    part: &[u8],
+    work: &mut WorkBudget,
+) -> Result<bool, Error> {
+    const WORD: usize = size_of::<u64>();
+    let target = &target[start..start + part.len()];
+    let mut offset = part.len();
+    let mut compared = 0;
+
+    // Compare full words from the end. When a word differs, leading zero bytes
+    // in the little-endian XOR are precisely the bytes the scalar reverse scan
+    // would have accepted before its first mismatch, preserving exact budget
+    // accounting while avoiding one branch and charge call per equal byte.
+    while offset >= WORD {
+        let chunk_start = offset - WORD;
+        let actual = u64::from_le_bytes(
+            target[chunk_start..offset]
+                .try_into()
+                .expect("word-sized target chunk"),
+        );
+        let expected = u64::from_le_bytes(
+            part[chunk_start..offset]
+                .try_into()
+                .expect("word-sized pattern chunk"),
+        );
+        let difference = actual ^ expected;
+        if difference != 0 {
+            compared += (difference.leading_zeros() as usize / 8) + 1;
+            work.charge(compared)?;
+            return Ok(false);
+        }
+        compared += WORD;
+        offset = chunk_start;
     }
+    while offset != 0 {
+        offset -= 1;
+        compared += 1;
+        if target[offset] != part[offset] {
+            work.charge(compared)?;
+            return Ok(false);
+        }
+    }
+    work.charge(compared)?;
+    Ok(true)
 }
 
 fn matched_guard(

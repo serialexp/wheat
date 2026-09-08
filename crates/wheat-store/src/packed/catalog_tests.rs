@@ -7,9 +7,9 @@ fn catalog_reopens_without_derived_index_and_rejects_concurrent_open() {
     let bytes = b"packed payload";
     let digest = *wheat_core::ContentId::of(bytes).as_bytes();
     {
-        let mut store = PackedCatalog::open(root.path()).unwrap();
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
         assert!(matches!(
-            PackedCatalog::open(root.path()),
+            PackedCatalog::open(root.path(), crate::Durability::Durable),
             Err(CatalogError::Busy)
         ));
         store
@@ -25,7 +25,7 @@ fn catalog_reopens_without_derived_index_and_rejects_concurrent_open() {
             bytes
         );
     }
-    let mut reopened = PackedCatalog::open(root.path()).unwrap();
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
     assert_eq!(
         reopened.get(CONTENT_NAMESPACE, digest).unwrap().unwrap().1,
         bytes
@@ -44,7 +44,7 @@ fn retry_after_segment_install_before_catalog_publication_is_idempotent() {
         bytes,
     };
     {
-        let mut store = PackedCatalog::open(root.path()).unwrap();
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
         store.put_records(&[record]).unwrap();
         let catalogs = root.path().join("catalog");
         let published = std::fs::read_dir(&catalogs)
@@ -57,7 +57,7 @@ fn retry_after_segment_install_before_catalog_publication_is_idempotent() {
         // Simulate a crash after the immutable segment rename but before catalog publication.
         drop(store);
     }
-    let mut reopened = PackedCatalog::open(root.path()).unwrap();
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
     assert!(reopened.get(CONTENT_NAMESPACE, digest).unwrap().is_none());
     reopened.put_records(&[record]).unwrap();
     assert_eq!(
@@ -84,7 +84,7 @@ fn catalog_rejects_corruption_and_ignores_unpublished_files() {
     let bytes = b"payload";
     let digest = *wheat_core::ContentId::of(bytes).as_bytes();
     {
-        let mut store = PackedCatalog::open(root.path()).unwrap();
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
         store
             .put_records(&[SegmentRecord {
                 namespace: CONTENT_NAMESPACE,
@@ -95,7 +95,7 @@ fn catalog_rejects_corruption_and_ignores_unpublished_files() {
             .unwrap();
     }
     std::fs::write(root.path().join("segments/orphan.segment"), b"incomplete").unwrap();
-    assert!(PackedCatalog::open(root.path()).is_ok());
+    assert!(PackedCatalog::open(root.path(), crate::Durability::Durable).is_ok());
     let catalog = std::fs::read_dir(root.path().join("catalog"))
         .unwrap()
         .next()
@@ -103,5 +103,5 @@ fn catalog_rejects_corruption_and_ignores_unpublished_files() {
         .unwrap()
         .path();
     std::fs::write(catalog, b"corrupt").unwrap();
-    assert!(PackedCatalog::open(root.path()).is_err());
+    assert!(PackedCatalog::open(root.path(), crate::Durability::Durable).is_err());
 }

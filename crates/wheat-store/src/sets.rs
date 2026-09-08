@@ -143,6 +143,14 @@ macro_rules! set_api {
             pub async fn read_node(&self, id: $id) -> Result<$node, CollectionError> {
                 Ok(self.inner.read_public(id).await?)
             }
+            /// Read and contextually validate a node reached at the given key position.
+            pub async fn read_node_at(
+                &self,
+                id: $id,
+                position: usize,
+            ) -> Result<$node, CollectionError> {
+                Ok(self.inner.read_public_at(id, position).await?)
+            }
             /// Persist one already-canonical node produced by a sorted collection builder.
             pub async fn write_node(&self, node: $node) -> Result<$id, CollectionError> {
                 let id = node.id();

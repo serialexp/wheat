@@ -116,7 +116,7 @@ impl ObjectStoreAdapter {
         Ok(StoredObject {
             id,
             kind,
-            canonical_bytes: bytes,
+            canonical_bytes: bytes.into(),
         })
     }
 }

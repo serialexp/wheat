@@ -21,6 +21,7 @@ use wheat_core::{
 };
 
 use super::segment::{SegmentBuilder, SegmentError, SegmentReader, SegmentRecord};
+use crate::Durability;
 
 const SCHEMA: &str = include_str!("catalog_sql/schema.sql");
 const LOOKUP: &str = include_str!("catalog_sql/lookup.sql");
@@ -58,6 +59,7 @@ pub(crate) struct PackedCatalog {
     _index_file: NamedTempFile,
     generation: Option<u64>,
     head: Option<[u8; 32]>,
+    durability: Durability,
     // Segments are immutable and bounded to 1,024 index entries. Retain their
     // authenticated indexes for the catalog lifetime; evicting them caused
     // random-ID verification to repeatedly hash and decode entire segments.
@@ -65,7 +67,10 @@ pub(crate) struct PackedCatalog {
 }
 
 impl PackedCatalog {
-    pub(crate) fn open(root: impl AsRef<Path>) -> Result<Self, CatalogError> {
+    pub(crate) fn open(
+        root: impl AsRef<Path>,
+        durability: Durability,
+    ) -> Result<Self, CatalogError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let segments = root.join("segments");
@@ -79,7 +84,7 @@ impl PackedCatalog {
             } else {
                 path
             };
-            sync_directory(path)?;
+            durability.sync_directory(path)?;
             ancestor = if path == Path::new(".") {
                 None
             } else {
@@ -107,6 +112,7 @@ impl PackedCatalog {
             _index_file: index_file,
             generation: None,
             head: None,
+            durability,
             readers: HashMap::new(),
         };
         catalog.rebuild_index()?;
@@ -144,7 +150,7 @@ impl PackedCatalog {
             return Ok(());
         }
         let mut sealed = builder.seal()?;
-        sealed.file.as_file_mut().sync_all()?;
+        self.durability.sync_file(sealed.file.as_file_mut())?;
         let segment_name = format!("{}-{}{}", generation, hex(&sealed.id.0), SEGMENT_SUFFIX);
         let segment_path = self.segments.join(&segment_name);
         if let Err(error) = sealed.file.persist_noclobber(&segment_path) {
@@ -158,7 +164,7 @@ impl PackedCatalog {
                 return Err(CatalogError::Corrupt("conflicting orphan segment"));
             }
         }
-        sync_directory(&self.segments)?;
+        self.durability.sync_directory(&self.segments)?;
 
         let record = SegmentCatalogRecord {
             generation,
@@ -171,7 +177,7 @@ impl PackedCatalog {
         let catalog_name = format!("{}-{}.catalog", generation, hex(&catalog_digest));
         let mut temporary = NamedTempFile::new_in(&self.root)?;
         temporary.write_all(&encoded)?;
-        temporary.as_file_mut().sync_all()?;
+        self.durability.sync_file(temporary.as_file_mut())?;
         let catalog_path = self.catalogs.join(catalog_name);
         if let Err(error) = temporary.persist_noclobber(&catalog_path) {
             if error.error.kind() != io::ErrorKind::AlreadyExists {
@@ -181,7 +187,7 @@ impl PackedCatalog {
                 return Err(CatalogError::Corrupt("conflicting catalog retry"));
             }
         }
-        sync_directory(&self.catalogs)?;
+        self.durability.sync_directory(&self.catalogs)?;
 
         // Publication is complete at this point. If incremental indexing fails,
         // discard all derived state and reconstruct it from the durable chain.
@@ -199,12 +205,12 @@ impl PackedCatalog {
         namespace: u8,
         digest: [u8; 32],
     ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
-        let filename: Option<String> = self
-            .index
-            .query_row(LOOKUP, params![namespace, digest.as_slice()], |row| {
-                row.get(0)
-            })
-            .optional()?;
+        let filename: Option<String> = {
+            let mut lookup = self.index.prepare_cached(LOOKUP)?;
+            lookup
+                .query_row(params![namespace, digest.as_slice()], |row| row.get(0))
+                .optional()?
+        };
         let Some(filename) = filename else {
             return Ok(None);
         };
@@ -257,14 +263,17 @@ impl PackedCatalog {
         }
         let entries = reader.entries()?;
         let transaction = self.index.transaction()?;
-        for entry in entries {
-            transaction.execute(
+        {
+            let mut insert = transaction.prepare_cached(
                 "INSERT INTO locator(namespace,digest,segment_file) VALUES(?1,?2,?3) \
                  ON CONFLICT(namespace,digest) DO UPDATE SET segment_file=excluded.segment_file",
-                params![entry.namespace, entry.digest.as_slice(), filename],
             )?;
+            for entry in entries {
+                insert.execute(params![entry.namespace, entry.digest.as_slice(), filename])?;
+            }
         }
         transaction.commit()?;
+        self.readers.insert(filename.to_owned(), reader);
         Ok(())
     }
 
@@ -327,10 +336,6 @@ fn try_lock_exclusive(file: &File) -> Result<(), CatalogError> {
     } else {
         Err(CatalogError::Io(error))
     }
-}
-
-fn sync_directory(path: &Path) -> Result<(), io::Error> {
-    File::open(path)?.sync_all()
 }
 
 fn hex(bytes: &[u8; 32]) -> String {

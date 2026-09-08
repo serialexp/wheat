@@ -52,32 +52,35 @@ impl VerificationScratch {
         logical: ChangeId,
         object: ChangeObjectId,
     ) -> Result<bool, VerificationScratchError> {
-        Ok(self.connection.execute(
-            INSERT_CHANGE,
-            params![logical.as_bytes().as_slice(), object.as_bytes().as_slice()],
-        )? == 1)
+        Ok(self
+            .connection
+            .prepare_cached(INSERT_CHANGE)?
+            .execute(params![
+                logical.as_bytes().as_slice(),
+                object.as_bytes().as_slice()
+            ])?
+            == 1)
     }
 
     pub(crate) fn contains_change(&self, id: ChangeId) -> Result<bool, VerificationScratchError> {
         Ok(self
             .connection
-            .query_row(CONTAINS_CHANGE, [id.as_bytes().as_slice()], |row| {
-                row.get(0)
-            })?)
+            .prepare_cached(CONTAINS_CHANGE)?
+            .query_row([id.as_bytes().as_slice()], |row| row.get(0))?)
     }
 
     pub(crate) fn insert_content(&self, id: ContentId) -> Result<(), VerificationScratchError> {
         self.connection
-            .execute(INSERT_CONTENT, [id.as_bytes().as_slice()])?;
+            .prepare_cached(INSERT_CONTENT)?
+            .execute([id.as_bytes().as_slice()])?;
         Ok(())
     }
 
     pub(crate) fn contains_content(&self, id: ContentId) -> Result<bool, VerificationScratchError> {
         Ok(self
             .connection
-            .query_row(CONTAINS_CONTENT, [id.as_bytes().as_slice()], |row| {
-                row.get(0)
-            })?)
+            .prepare_cached(CONTAINS_CONTENT)?
+            .query_row([id.as_bytes().as_slice()], |row| row.get(0))?)
     }
 
     pub(crate) fn insert_retained(
@@ -86,7 +89,8 @@ impl VerificationScratch {
         id: ObjectId,
     ) -> Result<(), VerificationScratchError> {
         self.connection
-            .execute(INSERT_RETAINED, params![family, id.as_bytes().as_slice()])?;
+            .prepare_cached(INSERT_RETAINED)?
+            .execute(params![family, id.as_bytes().as_slice()])?;
         Ok(())
     }
 
@@ -95,11 +99,10 @@ impl VerificationScratch {
         family: u8,
         id: ObjectId,
     ) -> Result<bool, VerificationScratchError> {
-        Ok(self.connection.query_row(
-            CONTAINS_RETAINED,
-            params![family, id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .connection
+            .prepare_cached(CONTAINS_RETAINED)?
+            .query_row(params![family, id.as_bytes().as_slice()], |row| row.get(0))?)
     }
 
     fn visible_bytes(visible: Option<ContentSetId>) -> Vec<u8> {
@@ -112,8 +115,7 @@ impl VerificationScratch {
         aggregate: ContentSetId,
         visible: Option<ContentSetId>,
     ) -> Result<bool, VerificationScratchError> {
-        Ok(self.connection.query_row(
-            CONTAINS_TREE,
+        Ok(self.connection.prepare_cached(CONTAINS_TREE)?.query_row(
             params![
                 tree.as_bytes().as_slice(),
                 aggregate.as_bytes().as_slice(),
@@ -129,14 +131,13 @@ impl VerificationScratch {
         aggregate: ContentSetId,
         visible: Option<ContentSetId>,
     ) -> Result<(), VerificationScratchError> {
-        self.connection.execute(
-            INSERT_TREE,
-            params![
+        self.connection
+            .prepare_cached(INSERT_TREE)?
+            .execute(params![
                 tree.as_bytes().as_slice(),
                 aggregate.as_bytes().as_slice(),
                 Self::visible_bytes(visible)
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -145,11 +146,13 @@ impl VerificationScratch {
         node: ContentSetId,
         aggregate: ContentSetId,
     ) -> Result<bool, VerificationScratchError> {
-        Ok(self.connection.query_row(
-            CONTAINS_VISIBLE_SET,
-            params![node.as_bytes().as_slice(), aggregate.as_bytes().as_slice()],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .connection
+            .prepare_cached(CONTAINS_VISIBLE_SET)?
+            .query_row(
+                params![node.as_bytes().as_slice(), aggregate.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?)
     }
 
     pub(crate) fn record_visible_set(
@@ -157,10 +160,12 @@ impl VerificationScratch {
         node: ContentSetId,
         aggregate: ContentSetId,
     ) -> Result<(), VerificationScratchError> {
-        self.connection.execute(
-            INSERT_VISIBLE_SET,
-            params![node.as_bytes().as_slice(), aggregate.as_bytes().as_slice()],
-        )?;
+        self.connection
+            .prepare_cached(INSERT_VISIBLE_SET)?
+            .execute(params![
+                node.as_bytes().as_slice(),
+                aggregate.as_bytes().as_slice()
+            ])?;
         Ok(())
     }
 
@@ -169,11 +174,13 @@ impl VerificationScratch {
         node: RevisionMapId,
         retained: RetainedSetId,
     ) -> Result<bool, VerificationScratchError> {
-        Ok(self.connection.query_row(
-            CONTAINS_REVISION_MAP,
-            params![node.as_bytes().as_slice(), retained.as_bytes().as_slice()],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .connection
+            .prepare_cached(CONTAINS_REVISION_MAP)?
+            .query_row(
+                params![node.as_bytes().as_slice(), retained.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?)
     }
 
     pub(crate) fn record_revision_map(
@@ -181,10 +188,12 @@ impl VerificationScratch {
         node: RevisionMapId,
         retained: RetainedSetId,
     ) -> Result<(), VerificationScratchError> {
-        self.connection.execute(
-            INSERT_REVISION_MAP,
-            params![node.as_bytes().as_slice(), retained.as_bytes().as_slice()],
-        )?;
+        self.connection
+            .prepare_cached(INSERT_REVISION_MAP)?
+            .execute(params![
+                node.as_bytes().as_slice(),
+                retained.as_bytes().as_slice()
+            ])?;
         Ok(())
     }
 
@@ -195,16 +204,18 @@ impl VerificationScratch {
         retained: RetainedSetId,
         conflicts: ConflictSetId,
     ) -> Result<bool, VerificationScratchError> {
-        Ok(self.connection.query_row(
-            CONTAINS_MAP_PAIR,
-            params![
-                application.as_bytes().as_slice(),
-                revision.as_bytes().as_slice(),
-                retained.as_bytes().as_slice(),
-                conflicts.as_bytes().as_slice()
-            ],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .connection
+            .prepare_cached(CONTAINS_MAP_PAIR)?
+            .query_row(
+                params![
+                    application.as_bytes().as_slice(),
+                    revision.as_bytes().as_slice(),
+                    retained.as_bytes().as_slice(),
+                    conflicts.as_bytes().as_slice()
+                ],
+                |row| row.get(0),
+            )?)
     }
 
     pub(crate) fn record_map_pair(
@@ -214,15 +225,14 @@ impl VerificationScratch {
         retained: RetainedSetId,
         conflicts: ConflictSetId,
     ) -> Result<(), VerificationScratchError> {
-        self.connection.execute(
-            INSERT_MAP_PAIR,
-            params![
+        self.connection
+            .prepare_cached(INSERT_MAP_PAIR)?
+            .execute(params![
                 application.as_bytes().as_slice(),
                 revision.as_bytes().as_slice(),
                 retained.as_bytes().as_slice(),
                 conflicts.as_bytes().as_slice()
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 }

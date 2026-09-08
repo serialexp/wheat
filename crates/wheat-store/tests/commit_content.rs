@@ -54,10 +54,18 @@ fn proposal(n: u8, parent: Option<ChangeId>, records: Vec<EditRecord>) -> Change
     }
 }
 fn exact(path: String, replacement: Option<FileValue>) -> EditRecord {
+    exact_change(path, None, replacement)
+}
+
+fn exact_change(
+    path: String,
+    expected: Option<FileValue>,
+    replacement: Option<FileValue>,
+) -> EditRecord {
     EditRecord::new(
         path,
         EditOperation::ExactFile {
-            expected: None,
+            expected,
             replacement,
         },
     )
@@ -116,6 +124,51 @@ async fn noop_and_addition_do_not_walk_unchanged_subtrees_or_rebuild_content_set
     assert!(
         objects.sets.load(Ordering::SeqCst) < 40,
         "content-set rebuilding must remain bounded independently of key width"
+    );
+}
+
+#[tokio::test]
+async fn many_deletions_scan_the_resulting_tree_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = ContentStore::new(dir.path());
+    let objects = Counting {
+        inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), "content-removals"),
+        trees: AtomicUsize::new(0),
+        sets: AtomicUsize::new(0),
+    };
+    let writer = PersistedCommitWriter::new(&objects, &content);
+    let empty = writer.empty_view().await.unwrap();
+    let mut values = Vec::new();
+    let seed_edits = (0..64)
+        .map(|n| {
+            let value = FileValue {
+                content: content.put(format!("value{n}").as_bytes()).unwrap(),
+                kind: FileKind::Regular,
+            };
+            values.push(value);
+            exact(format!("dir{n}/file"), Some(value))
+        })
+        .collect();
+    let seed = writer
+        .write(empty, proposal(1, None, seed_edits))
+        .await
+        .unwrap();
+    objects.trees.store(0, Ordering::SeqCst);
+    let deletions = values
+        .into_iter()
+        .enumerate()
+        .map(|(n, value)| exact_change(format!("dir{n}/file"), Some(value), None))
+        .collect();
+    writer
+        .write(
+            seed.resulting_view,
+            proposal(2, Some(seed.change_id), deletions),
+        )
+        .await
+        .unwrap();
+    assert!(
+        objects.trees.load(Ordering::SeqCst) < 512,
+        "removed content candidates must share one resulting-tree traversal"
     );
 }
 

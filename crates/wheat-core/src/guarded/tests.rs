@@ -322,6 +322,33 @@ fn matcher_finds_fragmented_patterns_after_skipped_alignments() {
 }
 
 #[test]
+fn matcher_batches_budget_accounting_without_changing_exact_comparison_count() {
+    let edit = g("abc", "def", "replacement", "ghi");
+    let target = b"abcdefghi";
+    let exact = Limits {
+        max_input_bytes: 32,
+        max_edits: 1,
+        max_work: 9,
+    };
+    assert!(matches!(
+        match_guard(target, &edit, exact).unwrap(),
+        MatchStatus::Unique(_)
+    ));
+    assert_eq!(
+        match_guard(
+            target,
+            &edit,
+            Limits {
+                max_work: 8,
+                ..exact
+            }
+        )
+        .unwrap_err(),
+        Error::WorkBudgetExceeded { limit: 8 }
+    );
+}
+
+#[test]
 fn capture_large_mostly_unique_text_uses_actual_comparison_work() {
     let mut source = String::new();
     for line in 0..2_000 {

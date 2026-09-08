@@ -1,14 +1,17 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::{StreamExt, stream};
 use thiserror::Error;
 use wheat_core::{CanonicalObjectError, CanonicalObjectKind, ObjectId, validate_canonical_object};
+
+use crate::Durability;
 
 const MAX_BATCH_WORKERS: usize = 16;
 
@@ -33,6 +36,30 @@ pub enum ObjectKind {
     BranchManifest = 14,
     RepositoryEnvelope = 15,
     Edit = 16,
+}
+
+impl ObjectKind {
+    pub(crate) fn from_code(code: u16) -> Option<Self> {
+        Some(match code {
+            1 => Self::Tree,
+            2 => Self::Change,
+            3 => Self::Revision,
+            4 => Self::Application,
+            5 => Self::Conflict,
+            6 => Self::View,
+            7 => Self::ContentManifest,
+            8 => Self::RepositoryState,
+            9 => Self::RevisionMapNode,
+            10 => Self::ApplicationMapNode,
+            11 => Self::ConflictSetNode,
+            12 => Self::ContentSetNode,
+            13 => Self::RetainedSetNode,
+            14 => Self::BranchManifest,
+            15 => Self::RepositoryEnvelope,
+            16 => Self::Edit,
+            _ => return None,
+        })
+    }
 }
 
 impl From<CanonicalObjectKind> for ObjectKind {
@@ -62,7 +89,8 @@ impl From<CanonicalObjectKind> for ObjectKind {
 pub struct StoredObject {
     pub id: ObjectId,
     pub kind: ObjectKind,
-    pub canonical_bytes: Vec<u8>,
+    /// Shared immutable storage keeps cache hits allocation-free.
+    pub canonical_bytes: Bytes,
 }
 
 #[derive(Debug, Error)]
@@ -125,12 +153,21 @@ pub trait ImmutableObjectStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct LooseObjectStore {
     root: PathBuf,
+    durability: Durability,
 }
 
 impl LooseObjectStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::with_durability(root, Durability::Durable)
+    }
+
+    #[must_use]
+    pub fn with_durability(root: impl Into<PathBuf>, durability: Durability) -> Self {
+        Self {
+            root: root.into(),
+            durability,
+        }
     }
 
     pub async fn put(&self, canonical_bytes: &[u8]) -> Result<ObjectId, ObjectStoreError> {
@@ -177,7 +214,7 @@ impl LooseObjectStore {
         Ok(StoredObject {
             id,
             kind,
-            canonical_bytes,
+            canonical_bytes: canonical_bytes.into(),
         })
     }
 
@@ -222,10 +259,10 @@ impl ImmutableObjectStore for LooseObjectStore {
         let parent_was_missing = !parent.exists();
         fs::create_dir_all(parent)?;
         if root_was_missing && let Some(root_parent) = self.root.parent() {
-            sync_directory(root_parent)?;
+            self.durability.sync_directory(root_parent)?;
         }
         if parent_was_missing {
-            sync_directory(&self.root)?;
+            self.durability.sync_directory(&self.root)?;
         }
         let temporary = temporary_path(parent, id);
         let result = (|| {
@@ -234,12 +271,12 @@ impl ImmutableObjectStore for LooseObjectStore {
                 .create_new(true)
                 .open(&temporary)?;
             file.write_all(canonical_bytes)?;
-            file.sync_all()?;
+            self.durability.sync_file(&file)?;
 
             match fs::hard_link(&temporary, &path) {
                 Ok(()) => {
                     fs::remove_file(&temporary)?;
-                    sync_directory(parent)?;
+                    self.durability.sync_directory(parent)?;
                     Ok(())
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -251,7 +288,7 @@ impl ImmutableObjectStore for LooseObjectStore {
                         Err(ObjectStoreError::Missing(_)) => {
                             fs::hard_link(&temporary, &path)?;
                             fs::remove_file(&temporary)?;
-                            sync_directory(parent)?;
+                            self.durability.sync_directory(parent)?;
                             Ok(())
                         }
                         Err(error) => Err(error),
@@ -331,8 +368,4 @@ impl ImmutableObjectStore for LooseObjectStore {
 fn temporary_path(parent: &Path, id: ObjectId) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     parent.join(format!(".{id}.{}.{}.tmp", std::process::id(), sequence))
-}
-
-fn sync_directory(path: &Path) -> Result<(), io::Error> {
-    File::open(path)?.sync_all()
 }

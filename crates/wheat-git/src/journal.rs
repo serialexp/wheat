@@ -60,6 +60,24 @@ pub struct ImportJournal {
 impl ImportJournal {
     /// Opens or creates a journal bound to exactly the caller's canonical snapshot bytes.
     pub fn open(path: impl AsRef<Path>, source_snapshot: &[u8]) -> Result<Self, JournalError> {
+        Self::open_with_durability(path, source_snapshot, true)
+    }
+
+    /// Opens disposable journal state for an isolated atomic import.
+    ///
+    /// A crash may lose any or all progress; callers must restart the import.
+    pub fn open_deferred(
+        path: impl AsRef<Path>,
+        source_snapshot: &[u8],
+    ) -> Result<Self, JournalError> {
+        Self::open_with_durability(path, source_snapshot, false)
+    }
+
+    fn open_with_durability(
+        path: impl AsRef<Path>,
+        source_snapshot: &[u8],
+        durable: bool,
+    ) -> Result<Self, JournalError> {
         let path = path.as_ref();
         if let Some(parent) = path
             .parent()
@@ -87,8 +105,8 @@ impl ImportJournal {
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "synchronous", if durable { "FULL" } else { "OFF" })?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
         connection.execute_batch(include_str!("journal/schema.sql"))?;
 
         let identity = connection

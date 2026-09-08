@@ -1,15 +1,18 @@
 //! Inventory-driven verification with a per-run disk-backed membership and memo index.
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet},
+    num::NonZeroUsize,
     sync::Mutex,
 };
 
 use async_trait::async_trait;
+use lru::LruCache;
 
 use crate::{
-    ApplicationMapStore, ConflictSetStore, ContentSetStore, ImmutableObjectStore, MerkleTreeStore,
-    ObjectStoreError, RepositoryPublicationError, RepositoryReader, RetainedSetStore,
-    RevisionMapStore, StoredObject, verification_scratch::VerificationScratch,
+    ApplicationMapStore, ConflictSetStore, ContentSetStore, ContentStoreError,
+    ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryPublicationError,
+    RepositoryReader, RetainedSetStore, RevisionMapStore, StoredObject,
+    verification_scratch::VerificationScratch,
 };
 use wheat_core::*;
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
@@ -36,7 +39,7 @@ struct CachedObjects<'a, O> {
     inner: &'a O,
     max_entries: usize,
     max_bytes: usize,
-    cache: Mutex<(HashMap<ObjectId, StoredObject>, VecDeque<ObjectId>, usize)>,
+    cache: Mutex<(LruCache<ObjectId, StoredObject>, usize)>,
 }
 
 impl<'a, O> CachedObjects<'a, O> {
@@ -45,7 +48,12 @@ impl<'a, O> CachedObjects<'a, O> {
             inner,
             max_entries,
             max_bytes,
-            cache: Mutex::new((HashMap::new(), VecDeque::new(), 0)),
+            cache: Mutex::new((
+                LruCache::new(
+                    NonZeroUsize::new(max_entries.max(1)).expect("positive cache capacity"),
+                ),
+                0,
+            )),
         }
     }
 }
@@ -74,17 +82,16 @@ impl<O: ImmutableObjectStore> ImmutableObjectStore for CachedObjects<'_, O> {
         let object = self.inner.get(id).await?;
         let object_bytes = object.canonical_bytes.len();
         let mut cache = self.cache.lock().expect("verification cache poisoned");
-        while (cache.0.len() == self.max_entries || cache.2 + object_bytes > self.max_bytes)
-            && let Some(oldest) = cache.1.pop_front()
+        while (cache.0.len() >= self.max_entries || cache.1 + object_bytes > self.max_bytes)
+            && let Some((_id, evicted)) = cache.0.pop_lru()
         {
-            if let Some(evicted) = cache.0.remove(&oldest) {
-                cache.2 -= evicted.canonical_bytes.len();
-            }
+            cache.1 -= evicted.canonical_bytes.len();
         }
-        if object_bytes <= self.max_bytes {
-            cache.1.push_back(id);
-            cache.2 += object_bytes;
-            cache.0.insert(id, object.clone());
+        if self.max_entries != 0 && object_bytes <= self.max_bytes {
+            cache.1 += object_bytes;
+            if let Some(previous) = cache.0.put(id, object.clone()) {
+                cache.1 -= previous.canonical_bytes.len();
+            }
         }
         Ok(object)
     }
@@ -490,10 +497,13 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
             .await?;
         while let Some(id) = contents.next().await? {
             self.scratch.insert_content(id)?;
-            if !self.reader.content.contains(id) {
-                return Err(RepositoryPublicationError::MissingContent(id));
+            match self.reader.content.get(id) {
+                Ok(_) => {}
+                Err(ContentStoreError::Missing(_)) => {
+                    return Err(RepositoryPublicationError::MissingContent(id));
+                }
+                Err(error) => return Err(error.into()),
             }
-            self.reader.content.get(id)?;
         }
 
         // Change objects are addressed by content. Build the logical index exactly once,

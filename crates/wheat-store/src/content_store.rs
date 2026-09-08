@@ -1,6 +1,6 @@
 //! Content retention facade and loose reference backend.
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -9,6 +9,8 @@ use std::{
 
 use thiserror::Error;
 use wheat_core::ContentId;
+
+use crate::Durability;
 
 #[derive(Debug, Error)]
 pub enum ContentStoreError {
@@ -32,21 +34,33 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
 pub struct ContentStore {
     root: PathBuf,
     backend: Option<Arc<dyn ContentBackend>>,
+    durability: Durability,
 }
 
 impl ContentStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_durability(root, Durability::Durable)
+    }
+
+    #[must_use]
+    pub fn with_durability(root: impl Into<PathBuf>, durability: Durability) -> Self {
         Self {
             root: root.into(),
             backend: None,
+            durability,
         }
     }
 
-    pub(crate) fn with_backend(root: PathBuf, backend: Arc<dyn ContentBackend>) -> Self {
+    pub(crate) fn with_backend(
+        root: PathBuf,
+        backend: Arc<dyn ContentBackend>,
+        durability: Durability,
+    ) -> Self {
         Self {
             root,
             backend: Some(backend),
+            durability,
         }
     }
 
@@ -72,13 +86,15 @@ impl ContentStore {
                     actual,
                 });
             }
-            if let Some(previous) = deduplicated.insert(id, bytes.clone())
-                && previous != bytes
-            {
-                return Err(ContentStoreError::Corrupt {
-                    expected: id,
-                    actual: ContentId::of(&bytes),
-                });
+            if let Some(previous) = deduplicated.get(&id) {
+                if previous != &bytes {
+                    return Err(ContentStoreError::Corrupt {
+                        expected: id,
+                        actual,
+                    });
+                }
+            } else {
+                deduplicated.insert(id, bytes);
             }
         }
         if deduplicated.is_empty() {
@@ -136,7 +152,7 @@ impl ContentStore {
         // implicitly acknowledged success on retry.
         let mut directory = Some(nonempty_path(&self.root));
         while let Some(path) = directory {
-            sync_directory(path)?;
+            self.durability.sync_directory(path)?;
             directory = nonempty_parent(path);
         }
 
@@ -144,7 +160,7 @@ impl ContentStore {
             self.verify_existing(id, bytes)?;
             // The file may have been renamed by an attempt that subsequently
             // failed its parent-directory sync.
-            sync_directory(parent)?;
+            self.durability.sync_directory(parent)?;
             return Ok(());
         }
 
@@ -155,15 +171,15 @@ impl ContentStore {
                 .create_new(true)
                 .open(&temporary)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            self.durability.sync_file(&file)?;
             match fs::rename(&temporary, &path) {
                 Ok(()) => {
-                    sync_directory(parent)?;
+                    self.durability.sync_directory(parent)?;
                     Ok(())
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     self.verify_existing(id, bytes)?;
-                    sync_directory(parent)?;
+                    self.durability.sync_directory(parent)?;
                     Ok(())
                 }
                 Err(error) => Err(ContentStoreError::Io(error)),
@@ -242,8 +258,4 @@ fn nonempty_path(path: &Path) -> &Path {
     } else {
         path
     }
-}
-
-fn sync_directory(path: &Path) -> Result<(), io::Error> {
-    File::open(path)?.sync_all()
 }

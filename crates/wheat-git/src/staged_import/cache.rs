@@ -4,12 +4,10 @@
 //! an object, so this is merely an invocation-local performance cache, never a
 //! source of object authenticity or durability.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Mutex,
-};
+use std::{num::NonZeroUsize, sync::Mutex};
 
 use async_trait::async_trait;
+use lru::LruCache;
 use wheat_core::ObjectId;
 use wheat_store::{ImmutableObjectStore, ObjectStoreError, StoredObject};
 
@@ -22,9 +20,7 @@ pub(super) struct CachedObjects<'a, O> {
 }
 
 struct State {
-    objects: HashMap<ObjectId, StoredObject>,
-    /// Least recently used at the front.
-    order: VecDeque<ObjectId>,
+    objects: LruCache<ObjectId, StoredObject>,
     bytes: usize,
 }
 
@@ -35,27 +31,18 @@ impl<'a, O> CachedObjects<'a, O> {
             max_entries,
             max_bytes,
             state: Mutex::new(State {
-                objects: HashMap::new(),
-                order: VecDeque::new(),
+                objects: LruCache::new(
+                    NonZeroUsize::new(max_entries.max(1)).expect("positive cache capacity"),
+                ),
                 bytes: 0,
             }),
         }
     }
 
     fn remove(state: &mut State, id: ObjectId) {
-        if let Some(object) = state.objects.remove(&id) {
+        if let Some(object) = state.objects.pop(&id) {
             state.bytes -= object.canonical_bytes.len();
         }
-        if let Some(position) = state.order.iter().position(|candidate| *candidate == id) {
-            state.order.remove(position);
-        }
-    }
-
-    fn touch(state: &mut State, id: ObjectId) {
-        if let Some(position) = state.order.iter().position(|candidate| *candidate == id) {
-            state.order.remove(position);
-        }
-        state.order.push_back(id);
     }
 }
 
@@ -77,14 +64,14 @@ impl<O: ImmutableObjectStore> ImmutableObjectStore for CachedObjects<'_, O> {
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
-        if let Some(object) = {
-            let mut state = self.state.lock().expect("staged import cache poisoned");
-            let object = state.objects.get(&id).cloned();
-            if object.is_some() {
-                Self::touch(&mut state, id);
-            }
-            object
-        } {
+        if let Some(object) = self
+            .state
+            .lock()
+            .expect("staged import cache poisoned")
+            .objects
+            .get(&id)
+            .cloned()
+        {
             return Ok(object);
         }
 
@@ -101,15 +88,14 @@ impl<O: ImmutableObjectStore> ImmutableObjectStore for CachedObjects<'_, O> {
         Self::remove(&mut state, id);
         while (state.objects.len() >= self.max_entries
             || state.bytes + object_bytes > self.max_bytes)
-            && let Some(oldest) = state.order.pop_front()
+            && let Some((_id, evicted)) = state.objects.pop_lru()
         {
-            if let Some(evicted) = state.objects.remove(&oldest) {
-                state.bytes -= evicted.canonical_bytes.len();
-            }
+            state.bytes -= evicted.canonical_bytes.len();
         }
         state.bytes += object_bytes;
-        state.objects.insert(id, object.clone());
-        state.order.push_back(id);
+        if let Some(previous) = state.objects.put(id, object.clone()) {
+            state.bytes -= previous.canonical_bytes.len();
+        }
         Ok(object)
     }
 
@@ -166,7 +152,7 @@ mod tests {
                     StoredObject {
                         id,
                         kind: ObjectKind::Tree,
-                        canonical_bytes: vec![value; 4],
+                        canonical_bytes: vec![value; 4].into(),
                     },
                 )
             })
@@ -193,6 +179,21 @@ mod tests {
         let state = cache.state.lock().unwrap();
         assert!(state.objects.len() <= 2);
         assert!(state.bytes <= 8);
+    }
+
+    #[tokio::test]
+    async fn cache_hits_share_immutable_bytes() {
+        let store = store();
+        let cache = CachedObjects::new(&store, 2, 8);
+
+        let first = cache.get(id(1)).await.unwrap();
+        let second = cache.get(id(1)).await.unwrap();
+
+        assert!(std::ptr::eq(
+            first.canonical_bytes.as_ptr(),
+            second.canonical_bytes.as_ptr()
+        ));
+        assert_eq!(store.gets.lock().unwrap()[&id(1)], 1);
     }
 
     #[tokio::test]

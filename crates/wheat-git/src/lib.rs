@@ -7,8 +7,9 @@
 pub mod journal;
 mod staged_import;
 pub use staged_import::{
-    DEFAULT_STAGE_COMMITS, FinalizeImportError, FinalizePhase, StagedBranch, StagedImportError,
-    StagedImportResult, finalize_import, finalize_import_with_observer, stage_import,
+    AtomicImportError, DEFAULT_STAGE_COMMITS, FinalizeImportError, FinalizePhase, StagedBranch,
+    StagedImportError, StagedImportResult, atomic_import, finalize_import,
+    finalize_import_with_observer, stage_import,
 };
 
 use std::{

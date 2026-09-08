@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 blake3 = { workspace = true }
+bytes = { workspace = true }
 futures = "0.3"
 libc = { workspace = true }
+lru = "0.12"
 object_store = { version = "0.14.1", features = ["aws"] }
 rusqlite = "0.32"
 tempfile = "3"

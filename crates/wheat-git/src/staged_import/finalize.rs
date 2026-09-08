@@ -121,17 +121,72 @@ pub async fn finalize_import_with_observer<O, P, F>(
     content: &ContentStore,
     publications: &P,
     working_branch: &str,
-    mut observer: F,
+    observer: F,
 ) -> Result<RepositoryHead, FinalizeImportError>
 where
     O: ImmutableObjectStore,
     P: PublicationStore,
     F: FnMut(FinalizePhase),
 {
-    let git_path = git_path.as_ref();
-    let journal_path = journal_path.as_ref();
+    finalize_import_inner(
+        git_path.as_ref(),
+        journal_path.as_ref(),
+        objects,
+        content,
+        publications,
+        working_branch,
+        observer,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn finalize_import_deferred<O, P>(
+    git_path: &Path,
+    journal_path: &Path,
+    objects: &O,
+    content: &ContentStore,
+    publications: &P,
+    working_branch: &str,
+) -> Result<RepositoryHead, FinalizeImportError>
+where
+    O: ImmutableObjectStore,
+    P: PublicationStore,
+{
+    finalize_import_inner(
+        git_path,
+        journal_path,
+        objects,
+        content,
+        publications,
+        working_branch,
+        |_| {},
+        false,
+    )
+    .await
+}
+
+async fn finalize_import_inner<O, P, F>(
+    git_path: &Path,
+    journal_path: &Path,
+    objects: &O,
+    content: &ContentStore,
+    publications: &P,
+    working_branch: &str,
+    mut observer: F,
+    durable_journal: bool,
+) -> Result<RepositoryHead, FinalizeImportError>
+where
+    O: ImmutableObjectStore,
+    P: PublicationStore,
+    F: FnMut(FinalizePhase),
+{
     observer(FinalizePhase::Preflight);
-    let staged = stage_import(git_path, journal_path, objects, content, Some(0)).await?;
+    let staged = if durable_journal {
+        stage_import(git_path, journal_path, objects, content, Some(0)).await?
+    } else {
+        super::stage_import_deferred(git_path, journal_path, objects, content, Some(0)).await?
+    };
     if !staged.complete {
         return Err(FinalizeImportError::Incomplete {
             pending_commits: staged.pending_commits,
@@ -148,7 +203,11 @@ where
     let git = gix::open(git_path).map_err(|e| FinalizeImportError::Git(e.to_string()))?;
     let pinned = pinned_branches(&git)?;
     let snapshot = snapshot_bytes(&git, git_path, &pinned)?;
-    let journal = ImportJournal::open(journal_path, &snapshot)?;
+    let journal = if durable_journal {
+        ImportJournal::open(journal_path, &snapshot)?
+    } else {
+        ImportJournal::open_deferred(journal_path, &snapshot)?
+    };
 
     let backing = objects;
     let batch = wheat_store::BatchObjectStore::new(backing, 1024, 8 * 1024 * 1024);

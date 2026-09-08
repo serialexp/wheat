@@ -24,8 +24,10 @@ use crate::{
     metadata,
 };
 
+mod atomic;
 mod cache;
 mod finalize;
+pub use atomic::{AtomicImportError, atomic_import};
 pub use finalize::{
     FinalizeImportError, FinalizePhase, finalize_import, finalize_import_with_observer,
 };
@@ -103,10 +105,43 @@ pub async fn stage_import<O: ImmutableObjectStore>(
     content: &ContentStore,
     max_commits: Option<usize>,
 ) -> Result<StagedImportResult, StagedImportError> {
-    let git = gix::open(git_path.as_ref()).map_err(git_error_local)?;
+    stage_import_inner(
+        git_path.as_ref(),
+        journal_path.as_ref(),
+        objects,
+        content,
+        max_commits,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn stage_import_deferred<O: ImmutableObjectStore>(
+    git_path: &Path,
+    journal_path: &Path,
+    objects: &O,
+    content: &ContentStore,
+    max_commits: Option<usize>,
+) -> Result<StagedImportResult, StagedImportError> {
+    stage_import_inner(git_path, journal_path, objects, content, max_commits, false).await
+}
+
+async fn stage_import_inner<O: ImmutableObjectStore>(
+    git_path: &Path,
+    journal_path: &Path,
+    objects: &O,
+    content: &ContentStore,
+    max_commits: Option<usize>,
+    durable_journal: bool,
+) -> Result<StagedImportResult, StagedImportError> {
+    let git = gix::open(git_path).map_err(git_error_local)?;
     let branches = pinned_branches(&git)?;
-    let snapshot = snapshot_bytes(&git, git_path.as_ref(), &branches)?;
-    let mut journal = ImportJournal::open(journal_path, &snapshot)?;
+    let snapshot = snapshot_bytes(&git, git_path, &branches)?;
+    let mut journal = if durable_journal {
+        ImportJournal::open(journal_path, &snapshot)?
+    } else {
+        ImportJournal::open_deferred(journal_path, &snapshot)?
+    };
 
     for oid in branches.values() {
         add_commit(&git, &mut journal, *oid)?;

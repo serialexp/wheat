@@ -101,7 +101,7 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
         Ok(StoredObject {
             id,
             kind,
-            canonical_bytes,
+            canonical_bytes: canonical_bytes.into(),
         })
     }
 }

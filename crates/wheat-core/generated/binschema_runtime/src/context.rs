@@ -9,9 +9,9 @@
 // ABOUTME: Enables nested structs to access parent fields via ../field syntax
 // ABOUTME: Supports compression dictionary for back_reference encoding (DNS-style)
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 /// Dynamic field value for parent context.
 /// Used to pass parent field values down to nested struct encoders.
@@ -36,7 +36,12 @@ pub enum FieldValue {
     /// Array of items with their type names and sub-field values.
     /// Used by corresponding<Type> selectors to access sub-fields of correlated items.
     /// Each item is (type_name, field_name_to_value_map).
-    Items(Vec<(std::string::String, HashMap<std::string::String, FieldValue>)>),
+    Items(
+        Vec<(
+            std::string::String,
+            HashMap<std::string::String, FieldValue>,
+        )>,
+    ),
 }
 
 impl FieldValue {
@@ -71,18 +76,19 @@ impl FieldValue {
     /// Valid for TypeSizes and Items variants. Returns 0 for other variants.
     pub fn sum_type_sizes(&self, element_type: &str) -> usize {
         match self {
-            FieldValue::TypeSizes(entries) => {
-                entries.iter()
-                    .filter(|(type_name, _)| type_name == element_type)
-                    .map(|(_, size)| size)
-                    .sum()
-            }
+            FieldValue::TypeSizes(entries) => entries
+                .iter()
+                .filter(|(type_name, _)| type_name == element_type)
+                .map(|(_, size)| size)
+                .sum(),
             FieldValue::Items(items) => {
                 // Sum encoded sizes from Items — look for "_encoded_size" field
-                items.iter()
+                items
+                    .iter()
                     .filter(|(type_name, _)| type_name == element_type)
                     .map(|(_, fields)| {
-                        fields.get("_encoded_size")
+                        fields
+                            .get("_encoded_size")
                             .map(|v| v.length_of_value())
                             .unwrap_or(0)
                     })
@@ -97,22 +103,26 @@ impl FieldValue {
     pub fn sum_all_sizes(&self) -> usize {
         match self {
             FieldValue::TypeSizes(entries) => entries.iter().map(|(_, size)| size).sum(),
-            FieldValue::Items(items) => {
-                items.iter()
-                    .map(|(_, fields)| {
-                        fields.get("_encoded_size")
-                            .map(|v| v.length_of_value())
-                            .unwrap_or(0)
-                    })
-                    .sum()
-            }
+            FieldValue::Items(items) => items
+                .iter()
+                .map(|(_, fields)| {
+                    fields
+                        .get("_encoded_size")
+                        .map(|v| v.length_of_value())
+                        .unwrap_or(0)
+                })
+                .sum(),
             _ => 0,
         }
     }
 
     /// Find the Nth occurrence of a type in an Items list and return a reference to its fields.
     /// Used by corresponding<Type> selectors to access sub-fields of correlated items.
-    pub fn get_nth_item_of_type(&self, type_name: &str, n: usize) -> Option<&HashMap<std::string::String, FieldValue>> {
+    pub fn get_nth_item_of_type(
+        &self,
+        type_name: &str,
+        n: usize,
+    ) -> Option<&HashMap<std::string::String, FieldValue>> {
         match self {
             FieldValue::Items(items) => {
                 let mut count = 0;
@@ -140,14 +150,24 @@ impl FieldValue {
     }
 
     /// Convenience accessor for `first<Type>` selectors.
-    pub fn first_item_of_type(&self, type_name: &str) -> Option<&HashMap<std::string::String, FieldValue>> {
+    pub fn first_item_of_type(
+        &self,
+        type_name: &str,
+    ) -> Option<&HashMap<std::string::String, FieldValue>> {
         self.get_nth_item_of_type(type_name, 0)
     }
 
     /// Convenience accessor for `last<Type>` selectors.
-    pub fn last_item_of_type(&self, type_name: &str) -> Option<&HashMap<std::string::String, FieldValue>> {
+    pub fn last_item_of_type(
+        &self,
+        type_name: &str,
+    ) -> Option<&HashMap<std::string::String, FieldValue>> {
         let count = self.count_items_of_type(type_name);
-        if count == 0 { None } else { self.get_nth_item_of_type(type_name, count - 1) }
+        if count == 0 {
+            None
+        } else {
+            self.get_nth_item_of_type(type_name, count - 1)
+        }
     }
 
     /// Get the "length_of" value for this field.
@@ -166,7 +186,13 @@ impl FieldValue {
             FieldValue::I64(v) => *v as usize,
             FieldValue::F32(v) => *v as usize,
             FieldValue::F64(v) => *v as usize,
-            FieldValue::Bool(v) => if *v { 1 } else { 0 },
+            FieldValue::Bool(v) => {
+                if *v {
+                    1
+                } else {
+                    0
+                }
+            }
             FieldValue::Bytes(b) => b.len(),
             FieldValue::String(s) => s.len(), // UTF-8 byte length
             FieldValue::TypeSizes(entries) => entries.len(),
@@ -196,7 +222,7 @@ impl FieldValue {
             FieldValue::String(s) => s.as_bytes().to_vec(),
             FieldValue::Bytes(b) => b.clone(),
             FieldValue::TypeSizes(_) => Vec::new(), // Not applicable
-            FieldValue::Items(_) => Vec::new(), // Not applicable
+            FieldValue::Items(_) => Vec::new(),     // Not applicable
         }
     }
 }
@@ -207,49 +233,79 @@ pub trait IntoFieldValue {
 }
 
 impl IntoFieldValue for u8 {
-    fn into_field_value(self) -> FieldValue { FieldValue::U8(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::U8(self)
+    }
 }
 impl IntoFieldValue for u16 {
-    fn into_field_value(self) -> FieldValue { FieldValue::U16(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::U16(self)
+    }
 }
 impl IntoFieldValue for u32 {
-    fn into_field_value(self) -> FieldValue { FieldValue::U32(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::U32(self)
+    }
 }
 impl IntoFieldValue for u64 {
-    fn into_field_value(self) -> FieldValue { FieldValue::U64(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::U64(self)
+    }
 }
 impl IntoFieldValue for i8 {
-    fn into_field_value(self) -> FieldValue { FieldValue::I8(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::I8(self)
+    }
 }
 impl IntoFieldValue for i16 {
-    fn into_field_value(self) -> FieldValue { FieldValue::I16(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::I16(self)
+    }
 }
 impl IntoFieldValue for i32 {
-    fn into_field_value(self) -> FieldValue { FieldValue::I32(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::I32(self)
+    }
 }
 impl IntoFieldValue for i64 {
-    fn into_field_value(self) -> FieldValue { FieldValue::I64(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::I64(self)
+    }
 }
 impl IntoFieldValue for f32 {
-    fn into_field_value(self) -> FieldValue { FieldValue::F32(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::F32(self)
+    }
 }
 impl IntoFieldValue for f64 {
-    fn into_field_value(self) -> FieldValue { FieldValue::F64(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::F64(self)
+    }
 }
 impl IntoFieldValue for bool {
-    fn into_field_value(self) -> FieldValue { FieldValue::Bool(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::Bool(self)
+    }
 }
 impl IntoFieldValue for String {
-    fn into_field_value(self) -> FieldValue { FieldValue::String(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::String(self)
+    }
 }
 impl IntoFieldValue for &str {
-    fn into_field_value(self) -> FieldValue { FieldValue::String(self.to_string()) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::String(self.to_string())
+    }
 }
 impl IntoFieldValue for Vec<u8> {
-    fn into_field_value(self) -> FieldValue { FieldValue::Bytes(self) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::Bytes(self)
+    }
 }
 impl IntoFieldValue for &[u8] {
-    fn into_field_value(self) -> FieldValue { FieldValue::Bytes(self.to_vec()) }
+    fn into_field_value(self) -> FieldValue {
+        FieldValue::Bytes(self.to_vec())
+    }
 }
 
 /// Shared compression dictionary for back_reference encoding: encoded target
@@ -367,7 +423,10 @@ impl EncodeContext {
 
     /// Record a position for a given key (format: "{array_name}_{type_name}")
     pub fn track_position(&mut self, key: &str, position: usize) {
-        self.positions.entry(key.to_string()).or_default().push(position);
+        self.positions
+            .entry(key.to_string())
+            .or_default()
+            .push(position);
     }
 
     /// Get the first tracked position for a key
@@ -415,7 +474,10 @@ impl EncodeContext {
             }
         }
         // Fallback to any entry
-        self.array_iterations.iter().next().map(|(k, v)| (k.as_str(), *v))
+        self.array_iterations
+            .iter()
+            .next()
+            .map(|(k, v)| (k.as_str(), *v))
     }
 
     /// Increment the type occurrence counter and return the new count
@@ -511,7 +573,10 @@ mod tests {
 
         // Grandparent (root) context
         let mut grandparent_fields = HashMap::new();
-        grandparent_fields.insert("payload".to_string(), FieldValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        grandparent_fields.insert(
+            "payload".to_string(),
+            FieldValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        );
         let parent_ctx = ctx.extend_with_parent(grandparent_fields);
 
         // Parent context
@@ -546,6 +611,9 @@ mod tests {
         assert_eq!(FieldValue::U8(0x42).to_bytes(), vec![0x42]);
         assert_eq!(FieldValue::U16(0x1234).to_bytes(), vec![0x34, 0x12]); // Little-endian
         assert_eq!(FieldValue::Bytes(vec![1, 2, 3]).to_bytes(), vec![1, 2, 3]);
-        assert_eq!(FieldValue::String("AB".to_string()).to_bytes(), vec![0x41, 0x42]);
+        assert_eq!(
+            FieldValue::String("AB".to_string()).to_bytes(),
+            vec![0x41, 0x42]
+        );
     }
 }

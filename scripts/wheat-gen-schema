@@ -47,6 +47,13 @@ regenerate() {
     # Canonical validation needs the decoder's final position without coupling
     # wheat-core directly to the vendored runtime crate.
     printf '\npub use binschema_runtime::{BitOrder, BitStreamDecoder};\n' >> "${output}/src/lib.rs"
+    # Keep committed output reproducible after workspace formatting. The CLI's
+    # vendored runtime snapshot is not necessarily rustfmt-normalized.
+    mapfile -d '' runtime_modules < <(fd --print0 --extension rs --exclude lib.rs . "${output}/binschema_runtime/src" | sort -z)
+    rustfmt --edition 2021 "${runtime_modules[@]}"
+    rustfmt --edition 2021 "${output}/binschema_runtime/src/lib.rs"
+    rustfmt --edition 2021 "${output}/src/generated.rs"
+    rustfmt --edition 2021 "${output}/src/lib.rs"
 }
 
 if [[ "${CHECK}" -eq 1 ]]; then

@@ -18,8 +18,8 @@ use super::{
 };
 use crate::content_store::ContentBackend;
 use crate::{
-    ContentStore, ContentStoreError, ImmutableObjectStore, LooseObjectStore, ObjectKind,
-    ObjectStoreError, StoredObject,
+    ContentStore, ContentStoreError, Durability, ImmutableObjectStore, LooseObjectStore,
+    ObjectKind, ObjectStoreError, StoredObject,
 };
 
 const DEFAULT_LOOSE_THRESHOLD: usize = 128 * 1024;
@@ -35,6 +35,7 @@ struct PackedEngine {
     content: ContentStore,
     content_root: PathBuf,
     loose_threshold: usize,
+    durability: Durability,
 }
 
 impl fmt::Debug for PackedObjectStore {
@@ -55,29 +56,49 @@ impl fmt::Debug for PackedEngine {
 
 impl PackedObjectStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ObjectStoreError> {
-        Self::open_with_loose_threshold(root, DEFAULT_LOOSE_THRESHOLD)
+        Self::open_with_options(root, DEFAULT_LOOSE_THRESHOLD, Durability::Durable)
+    }
+
+    /// Opens storage for an isolated transaction whose entire directory remains
+    /// invisible until [`crate::sync_filesystem`] and atomic installation.
+    pub fn open_deferred(root: impl AsRef<Path>) -> Result<Self, ObjectStoreError> {
+        Self::open_with_options(root, DEFAULT_LOOSE_THRESHOLD, Durability::Deferred)
     }
 
     pub fn open_with_loose_threshold(
         root: impl AsRef<Path>,
         loose_threshold: usize,
     ) -> Result<Self, ObjectStoreError> {
+        Self::open_with_options(root, loose_threshold, Durability::Durable)
+    }
+
+    fn open_with_options(
+        root: impl AsRef<Path>,
+        loose_threshold: usize,
+        durability: Durability,
+    ) -> Result<Self, ObjectStoreError> {
         let root = root.as_ref();
-        let catalog = PackedCatalog::open(root.join("packed")).map_err(object_catalog_error)?;
+        let catalog =
+            PackedCatalog::open(root.join("packed"), durability).map_err(object_catalog_error)?;
         Ok(Self {
             engine: Arc::new(PackedEngine {
                 catalog: Arc::new(Mutex::new(catalog)),
-                objects: LooseObjectStore::new(root.join("loose-objects")),
-                content: ContentStore::new(root.join("loose-content")),
+                objects: LooseObjectStore::with_durability(root.join("loose-objects"), durability),
+                content: ContentStore::with_durability(root.join("loose-content"), durability),
                 content_root: root.join("loose-content"),
                 loose_threshold,
+                durability,
             }),
         })
     }
 
     #[must_use]
     pub fn content_store(&self) -> ContentStore {
-        ContentStore::with_backend(self.engine.content_root.clone(), self.engine.clone())
+        ContentStore::with_backend(
+            self.engine.content_root.clone(),
+            self.engine.clone(),
+            self.engine.durability,
+        )
     }
 
     fn catalog(&self) -> Result<MutexGuard<'_, PackedCatalog>, ObjectStoreError> {
@@ -173,35 +194,26 @@ impl ImmutableObjectStore for PackedObjectStore {
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
-        match self.engine.objects.get(id).await {
-            Ok(value) => return Ok(value),
-            Err(ObjectStoreError::Missing(_)) => {}
-            Err(error) => return Err(error),
-        }
         let Some((stored_kind, bytes)) = self
             .catalog()?
             .get(METADATA_NAMESPACE, *id.as_bytes())
             .map_err(object_catalog_error)?
         else {
-            return Err(ObjectStoreError::Missing(id));
+            // Oversized metadata bypasses packed segments. Probe the loose
+            // fallback only after the in-memory locator says the ID is not packed;
+            // the common packed path must not issue one failed filesystem lookup
+            // per logical object read.
+            return self.engine.objects.get(id).await;
         };
-        let actual = ObjectId::of_canonical_bytes(&bytes);
-        if actual != id {
-            return Err(ObjectStoreError::Corrupt {
-                expected: id,
-                actual,
-            });
-        }
-        let kind: ObjectKind = validate_canonical_object(&bytes)?.into();
-        if stored_kind != kind as u16 {
-            return Err(ObjectStoreError::Backend(
-                "packed metadata kind does not match canonical bytes".into(),
-            ));
-        }
+        // SegmentReader authenticated the immutable segment and verified this
+        // payload against the requested object digest before returning it.
+        let kind = ObjectKind::from_code(stored_kind).ok_or_else(|| {
+            ObjectStoreError::Backend("packed metadata has an unknown object kind".into())
+        })?;
         Ok(StoredObject {
             id,
             kind,
-            canonical_bytes: bytes,
+            canonical_bytes: bytes.into(),
         })
     }
 
@@ -269,11 +281,6 @@ impl ContentBackend for PackedEngine {
     }
 
     fn get(&self, id: ContentId) -> Result<Vec<u8>, ContentStoreError> {
-        match self.content.get(id) {
-            Ok(bytes) => return Ok(bytes),
-            Err(ContentStoreError::Missing(_)) => {}
-            Err(error) => return Err(error),
-        }
         let value = self
             .catalog
             .lock()
@@ -281,15 +288,12 @@ impl ContentBackend for PackedEngine {
             .get(CONTENT_NAMESPACE, *id.as_bytes())
             .map_err(content_catalog_error)?;
         let Some((_kind, bytes)) = value else {
-            return Err(ContentStoreError::Missing(id));
+            // Oversized content bypasses packed segments. As with metadata,
+            // avoid a failed loose-file probe for every ordinary packed read.
+            return self.content.get(id);
         };
-        let actual = ContentId::of(&bytes);
-        if actual != id {
-            return Err(ContentStoreError::Corrupt {
-                expected: id,
-                actual,
-            });
-        }
+        // SegmentReader authenticated the immutable segment and verified this
+        // payload against the requested content digest before returning it.
         Ok(bytes)
     }
 }

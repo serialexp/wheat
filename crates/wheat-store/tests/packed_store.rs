@@ -36,3 +36,15 @@ fn large_content_uses_standalone_fallback() {
     assert!(content.path(id).is_file());
     assert_eq!(content.get(id).unwrap(), [9; 17]);
 }
+
+#[tokio::test]
+async fn large_metadata_uses_standalone_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let objects = PackedObjectStore::open_with_loose_threshold(root.path(), 1).unwrap();
+    let bytes = DirectoryNode::default().canonical_bytes();
+    let id = ObjectId::of_canonical_bytes(&bytes);
+
+    objects.put_if_absent(id, &bytes).await.unwrap();
+
+    assert_eq!(objects.get(id).await.unwrap().canonical_bytes, bytes);
+}

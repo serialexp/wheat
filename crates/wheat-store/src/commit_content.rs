@@ -52,15 +52,21 @@ pub(crate) async fn update_content<O: ImmutableObjectStore>(
     }
 
     // A candidate can have been inserted at another touched path, or can remain in an untouched
-    // subtree.  Do not remove it until the latter has been ruled out by authenticated traversal.
-    let trees = MerkleTreeStore::new(objects);
-    let mut removals = BTreeSet::new();
-    for content in possibly_removed {
-        if !additions.contains(&content)
-            && !tree_contains_content(&trees, resulting_tree, content).await?
-        {
-            removals.insert(content);
-        }
+    // subtree. Authenticate the resulting tree once for every candidate rather than walking the
+    // same directory DAG independently for each removed blob.
+    let wanted = possibly_removed
+        .difference(&additions)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut removals = wanted.clone();
+    if !wanted.is_empty() {
+        retain_visible_content(
+            &MerkleTreeStore::new(objects),
+            resulting_tree,
+            &wanted,
+            &mut removals,
+        )
+        .await?;
     }
     Ok(ContentSetStore::new(objects)
         .update_batch(
@@ -73,21 +79,26 @@ pub(crate) async fn update_content<O: ImmutableObjectStore>(
         .await?)
 }
 
-async fn tree_contains_content<O: ImmutableObjectStore>(
+async fn retain_visible_content<O: ImmutableObjectStore>(
     trees: &MerkleTreeStore<'_, O>,
     root: TreeId,
-    wanted: ContentId,
-) -> Result<bool, CommitWriterError> {
-    for entry in trees.read_node(root).await?.entries.values() {
-        match entry {
-            DirectoryEntry::File(value) if value.content == wanted => return Ok(true),
-            DirectoryEntry::Directory(child) => {
-                if Box::pin(tree_contains_content(trees, *child, wanted)).await? {
-                    return Ok(true);
+    wanted: &BTreeSet<ContentId>,
+    removals: &mut BTreeSet<ContentId>,
+) -> Result<(), CommitWriterError> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for entry in trees.read_node(node).await?.entries.values() {
+            match entry {
+                DirectoryEntry::File(value) if wanted.contains(&value.content) => {
+                    removals.remove(&value.content);
                 }
+                DirectoryEntry::Directory(child) => stack.push(*child),
+                DirectoryEntry::File(_) => {}
             }
-            DirectoryEntry::File(_) => {}
+        }
+        if removals.is_empty() {
+            break;
         }
     }
-    Ok(false)
+    Ok(())
 }

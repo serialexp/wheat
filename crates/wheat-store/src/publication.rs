@@ -2,11 +2,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::fd::AsRawFd,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use thiserror::Error;
 use wheat_core::RepositoryEnvelopeId;
+
+use crate::Durability;
 
 const HEAD_MAGIC: &[u8; 9] = b"WHEATHEAD";
 const HEAD_VERSION: u8 = 2;
@@ -104,16 +106,23 @@ pub trait PublicationStore {
 pub struct LocalPublicationStore {
     head_path: PathBuf,
     lock_path: PathBuf,
+    durability: Durability,
 }
 
 impl LocalPublicationStore {
     #[must_use]
     pub fn new(head_path: impl Into<PathBuf>) -> Self {
+        Self::with_durability(head_path, Durability::Durable)
+    }
+
+    #[must_use]
+    pub fn with_durability(head_path: impl Into<PathBuf>, durability: Durability) -> Self {
         let head_path = head_path.into();
         let lock_path = head_path.with_extension("lock");
         Self {
             head_path,
             lock_path,
+            durability,
         }
     }
 
@@ -168,9 +177,9 @@ impl LocalPublicationStore {
                 .create_new(true)
                 .open(&temporary)?;
             file.write_all(&head.encode())?;
-            file.sync_all()?;
+            self.durability.sync_file(&file)?;
             fs::rename(&temporary, &self.head_path)?;
-            sync_directory(parent)?;
+            self.durability.sync_directory(parent)?;
             Ok(())
         })();
         if result.is_err() {
@@ -234,8 +243,4 @@ fn unlock(file: &File) -> Result<(), io::Error> {
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-fn sync_directory(path: &Path) -> Result<(), io::Error> {
-    File::open(path)?.sync_all()
 }
