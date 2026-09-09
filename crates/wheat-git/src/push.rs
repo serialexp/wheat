@@ -7,6 +7,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
 };
 
@@ -14,6 +15,7 @@ use thiserror::Error;
 
 /// Maximum stdout or stderr retained from any Git subprocess.
 pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 1024 * 1024;
+static CANDIDATE_REF_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteOid(String);
@@ -197,22 +199,7 @@ pub fn cache_observed_ref(
     };
     let private_ref = private_ref(destination);
 
-    let exists = Command::new("git")
-        .arg("-C")
-        .arg(projection)
-        .arg("cat-file")
-        .arg("-e")
-        .arg(oid.as_str())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|source| PushError::Spawn {
-            operation: "cat-file",
-            source,
-        })?
-        .success();
+    let exists = object_is_complete(projection, oid)?;
 
     let output = if exists {
         run_git(
@@ -232,24 +219,52 @@ pub fn cache_observed_ref(
                 .arg(projection)
                 .arg("fetch")
                 .arg("--no-tags")
+                .arg("--no-write-fetch-head")
                 .arg("--")
                 .arg(remote_url)
                 .arg(exact),
             "fetch",
         )?;
         if !output.status.success() {
-            let advertised = format!("+{destination}:{private_ref}");
+            let candidate_ref = format!(
+                "{private_ref}-candidate-{}-{}",
+                std::process::id(),
+                CANDIDATE_REF_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            let advertised = format!("+{destination}:{candidate_ref}");
             output = run_git(
                 Command::new("git")
                     .arg("-C")
                     .arg(projection)
                     .arg("fetch")
                     .arg("--no-tags")
+                    .arg("--no-write-fetch-head")
                     .arg("--")
                     .arg(remote_url)
                     .arg(advertised),
                 "fetch",
             )?;
+            require_success("fetch", &output)?;
+            let candidate = resolve_ref(projection, &candidate_ref)?;
+            let cleanup = delete_ref(projection, &candidate_ref);
+            if candidate != oid.as_str() {
+                cleanup?;
+                return Err(PushError::InvalidRemoteOutput(
+                    "remote ref changed while its observed object was being cached".into(),
+                ));
+            }
+            let promote = run_git(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(projection)
+                    .arg("update-ref")
+                    .arg(&private_ref)
+                    .arg(oid.as_str()),
+                "update-ref",
+            )?;
+            let promote_result = require_success("update-ref", &promote);
+            cleanup?;
+            promote_result?;
         }
         output
     };
@@ -270,6 +285,54 @@ pub fn cache_observed_ref(
         ));
     }
     Ok(Some(private_ref))
+}
+
+fn resolve_ref(projection: &Path, reference: &str) -> Result<String, PushError> {
+    let output = run_git(
+        Command::new("git")
+            .arg("-C")
+            .arg(projection)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg(reference),
+        "rev-parse",
+    )?;
+    require_success("rev-parse", &output)?;
+    Ok(output.stdout.to_string_lossy().trim().into())
+}
+
+fn delete_ref(projection: &Path, reference: &str) -> Result<(), PushError> {
+    let output = run_git(
+        Command::new("git")
+            .arg("-C")
+            .arg(projection)
+            .arg("update-ref")
+            .arg("-d")
+            .arg(reference),
+        "update-ref",
+    )?;
+    require_success("update-ref", &output)
+}
+
+fn object_is_complete(projection: &Path, oid: &RemoteOid) -> Result<bool, PushError> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(projection)
+        .arg("rev-list")
+        .arg("--objects")
+        .arg("--missing=error")
+        .arg("--quiet")
+        .arg(oid.as_str())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| PushError::Spawn {
+            operation: "rev-list",
+            source,
+        })?;
+    Ok(status.success())
 }
 
 /// Return whether `ancestor` is reachable from `descendant` in the projection repository.
@@ -350,7 +413,12 @@ pub fn push_ref(
             "git push output exceeded {MAX_CAPTURED_OUTPUT_BYTES} bytes per stream"
         )));
     }
-    let refs = parse_porcelain(&output.stdout.bytes);
+    let refs = parse_porcelain(&output.stdout.bytes)?;
+    if refs.len() != 1 || refs[0].source != source || refs[0].destination != destination {
+        return Err(PushError::InvalidRemoteOutput(format!(
+            "git push did not report exactly the requested ref update {source}:{destination}"
+        )));
+    }
     Ok(PushReport {
         exit_status: output.status,
         refs,
@@ -413,33 +481,46 @@ fn private_ref(destination: &str) -> String {
     )
 }
 
-fn parse_porcelain(stdout: &[u8]) -> Vec<RefOutcome> {
+fn parse_porcelain(stdout: &[u8]) -> Result<Vec<RefOutcome>, PushError> {
     let text = String::from_utf8_lossy(stdout);
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.splitn(3, '\t');
-            let flag = fields.next()?;
-            let refspec = fields.next()?;
-            let summary = fields.next().unwrap_or_default();
-            let (source, destination) = refspec.split_once(':')?;
-            let marker = flag.chars().next()?;
-            let status = match marker {
-                ' ' => RefStatus::Updated,
-                '+' => RefStatus::Forced,
-                '*' => RefStatus::Created,
-                '-' => RefStatus::Deleted,
-                '=' => RefStatus::UpToDate,
-                '!' => RefStatus::Rejected,
-                other => RefStatus::Unknown(other),
-            };
-            Some(RefOutcome {
-                source: source.into(),
-                destination: destination.into(),
-                status,
-                summary: summary.into(),
-            })
-        })
-        .collect()
+    let mut outcomes = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with("To ") || line == "Done" {
+            continue;
+        }
+        let mut fields = line.splitn(3, '\t');
+        let flag = fields.next().unwrap_or_default();
+        let refspec = fields.next().ok_or_else(|| {
+            PushError::InvalidRemoteOutput("git push returned a malformed status line".into())
+        })?;
+        let summary = fields.next().unwrap_or_default();
+        let (source, destination) = refspec.split_once(':').ok_or_else(|| {
+            PushError::InvalidRemoteOutput("git push returned a malformed refspec".into())
+        })?;
+        let marker = flag.chars().next().ok_or_else(|| {
+            PushError::InvalidRemoteOutput("git push returned an empty status marker".into())
+        })?;
+        let status = match marker {
+            ' ' => RefStatus::Updated,
+            '+' => RefStatus::Forced,
+            '*' => RefStatus::Created,
+            '-' => RefStatus::Deleted,
+            '=' => RefStatus::UpToDate,
+            '!' => RefStatus::Rejected,
+            other => {
+                return Err(PushError::InvalidRemoteOutput(format!(
+                    "git push returned unknown status marker {other:?}"
+                )));
+            }
+        };
+        outcomes.push(RefOutcome {
+            source: source.into(),
+            destination: destination.into(),
+            status,
+            summary: summary.into(),
+        });
+    }
+    Ok(outcomes)
 }
 
 struct CommandOutput {

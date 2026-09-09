@@ -116,6 +116,48 @@ fn absent_destination_push_succeeds() {
 }
 
 #[test]
+fn absent_exact_lease_rejects_a_concurrent_branch_creation() {
+    let fixture = Fixture::new();
+    commit(&fixture.work, "local", "local\n");
+    fixture.snapshot_projection();
+    let observed = observe_remote_ref(fixture.remote_url(), "refs/heads/main").unwrap();
+    assert_eq!(observed, RemoteState::Absent);
+
+    let competitor = fixture.root_oid.clone();
+    fixture.seed_remote(&competitor);
+    let report = push_ref(
+        &fixture.projection,
+        fixture.remote_url(),
+        "refs/heads/main",
+        "refs/heads/main",
+        PushMode::ForceWithLeaseAbsent,
+    )
+    .unwrap();
+    assert!(!report.accepted());
+    assert_eq!(report.refs[0].status, RefStatus::Rejected);
+    assert_eq!(
+        git(Some(&fixture.remote), &["rev-parse", "refs/heads/main"]),
+        competitor
+    );
+}
+
+#[test]
+fn absent_exact_lease_succeeds_while_the_destination_remains_absent() {
+    let fixture = Fixture::new();
+    fixture.snapshot_projection();
+    let report = push_ref(
+        &fixture.projection,
+        fixture.remote_url(),
+        "refs/heads/main",
+        "refs/heads/main",
+        PushMode::ForceWithLeaseAbsent,
+    )
+    .unwrap();
+    assert!(report.accepted(), "{}", report.stderr.to_string_lossy());
+    assert_eq!(report.refs[0].status, RefStatus::Created);
+}
+
+#[test]
 fn fast_forward_push_succeeds() {
     let fixture = Fixture::new();
     let root_oid = fixture.root_oid.clone();
@@ -273,4 +315,6 @@ fn observing_and_caching_do_not_persist_remote_url() {
     assert!(output.stdout.is_empty());
     let config = fs::read_to_string(fixture.projection.join("config")).unwrap();
     assert!(!config.contains(fixture.remote_url()));
+    let fetch_head = fs::read_to_string(fixture.projection.join("FETCH_HEAD")).unwrap_or_default();
+    assert!(!fetch_head.contains(fixture.remote_url()));
 }

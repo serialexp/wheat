@@ -203,7 +203,13 @@ struct ProjectionLock {
 
 impl ProjectionLock {
     fn acquire(projection: &Path) -> Result<Self, BridgeError> {
-        let lock_path = projection.with_extension("lock");
+        let file_name = projection.file_name().ok_or_else(|| BridgeError::Lock {
+            path: projection.into(),
+            message: "projection path has no file name".into(),
+        })?;
+        let mut lock_name = file_name.to_os_string();
+        lock_name.push(".lock");
+        let lock_path = projection.with_file_name(lock_name);
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| BridgeError::Lock {
                 path: lock_path.clone(),
@@ -259,4 +265,30 @@ fn open_or_initialize_bare(path: &Path) -> Result<gix::Repository, BridgeError> 
         path: path.into(),
         message: error.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProjectionLock;
+
+    #[test]
+    fn lock_names_preserve_the_complete_projection_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let plain = directory.path().join("projection");
+        let dotted = directory.path().join("projection.git");
+        let _plain_lock = ProjectionLock::acquire(&plain).unwrap();
+        let _dotted_lock = ProjectionLock::acquire(&dotted).unwrap();
+        assert!(directory.path().join("projection.lock").is_file());
+        assert!(directory.path().join("projection.git.lock").is_file());
+    }
+
+    #[test]
+    fn lock_is_exclusive_until_the_holder_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let projection = directory.path().join("projection.git");
+        let first = ProjectionLock::acquire(&projection).unwrap();
+        assert!(ProjectionLock::acquire(&projection).is_err());
+        drop(first);
+        ProjectionLock::acquire(&projection).unwrap();
+    }
 }

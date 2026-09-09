@@ -132,6 +132,15 @@ pub enum ExportError {
     MissingAnchor(gix::ObjectId),
     #[error("Git anchor {0} does not match provenance in the selected chain")]
     UnmatchedAnchor(gix::ObjectId),
+    #[error(
+        "projected Git anchor {anchor} has tree {actual_tree}, expected {expected_tree} for application {application}"
+    )]
+    MismatchedProjectedAnchor {
+        application: ApplicationId,
+        anchor: gix::ObjectId,
+        actual_tree: gix::ObjectId,
+        expected_tree: gix::ObjectId,
+    },
     #[error("Git export failed: {0}")]
     Git(String),
 }
@@ -169,17 +178,40 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
     let chain = reconstruct_chain(&reader, objects, selected, base, options.limits).await?;
 
     let anchor_index = if let Some(anchor) = options.anchor {
-        git.find_commit(anchor)
+        let anchor_commit = git
+            .find_commit(anchor)
             .map_err(|_| ExportError::MissingAnchor(anchor))?;
-        Some(
-            chain
-                .iter()
-                .position(|entry| {
-                    provenance_matches(&entry.revision, anchor)
-                        || options.projected_anchors.get(&entry.application) == Some(&anchor)
-                })
-                .ok_or(ExportError::UnmatchedAnchor(anchor))?,
-        )
+        let index = chain
+            .iter()
+            .position(|entry| {
+                provenance_matches(&entry.revision, anchor)
+                    || options.projected_anchors.get(&entry.application) == Some(&anchor)
+            })
+            .ok_or(ExportError::UnmatchedAnchor(anchor))?;
+        if options.projected_anchors.get(&chain[index].application) == Some(&anchor) {
+            let view = reader.view(chain[index].result).await?;
+            let mut verification_cache = ObjectCache::default();
+            let expected_tree = write_tree(
+                objects,
+                content,
+                git,
+                view.tree,
+                options.limits,
+                &mut verification_cache,
+                0,
+            )
+            .await?;
+            let actual_tree = anchor_commit.tree_id().map_err(git_error)?.detach();
+            if actual_tree != expected_tree {
+                return Err(ExportError::MismatchedProjectedAnchor {
+                    application: chain[index].application,
+                    anchor,
+                    actual_tree,
+                    expected_tree,
+                });
+            }
+        }
+        Some(index)
     } else {
         None
     };

@@ -50,7 +50,7 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
     let wheat_repository = root.path().join("wheat");
     let clone = root.path().join("clone");
     git(None, &["init", "-b", "main", source.to_str().unwrap()]);
-    std::fs::write(source.join("base"), b"base\n").unwrap();
+    std::fs::write(source.join("base"), b"base\r\n").unwrap();
     git(Some(&source), &["add", "base"]);
     git(Some(&source), &["commit", "-m", "base"]);
     let original = git(Some(&source), &["rev-parse", "HEAD"]);
@@ -108,6 +108,7 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
             clone.to_str().unwrap(),
         ],
     );
+    assert_eq!(std::fs::read(clone.join("base")).unwrap(), b"base\n");
     assert_eq!(std::fs::read(clone.join("native")).unwrap(), b"from wheat");
     assert_eq!(git(Some(&clone), &["fsck", "--strict"]), "");
 

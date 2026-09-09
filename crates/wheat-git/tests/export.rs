@@ -348,6 +348,77 @@ async fn reuses_imported_anchor_and_projects_only_its_suffix() {
 }
 
 #[tokio::test]
+async fn rejects_a_projected_anchor_whose_tree_does_not_match_its_application() {
+    let fixture = Fixture::new();
+    let (base, first, second) = two_revisions(&fixture).await;
+    let (_git_dir, git_repo) = bare();
+    let initial = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        second.resulting_view,
+        base,
+        &git_repo,
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(initial.applications.contains_key(&first.application_id));
+    let wrong_tree = git_repo
+        .write_object(&gix::objs::Tree {
+            entries: Vec::new(),
+        })
+        .unwrap()
+        .detach();
+    let signature = gix::actor::Signature {
+        name: "Forged".into(),
+        email: "forged@example.invalid".into(),
+        time: gix::date::Time {
+            seconds: 1_700_000_000,
+            offset: 0,
+        },
+    };
+    let forged = git_repo
+        .write_object(&gix::objs::Commit {
+            tree: wrong_tree,
+            parents: Default::default(),
+            author: signature.clone(),
+            committer: signature,
+            encoding: None,
+            message: "forged mapping\n".into(),
+            extra_headers: Vec::new(),
+        })
+        .unwrap()
+        .detach();
+
+    let error = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        second.resulting_view,
+        base,
+        &git_repo,
+        &ExportOptions {
+            anchor: Some(forged),
+            projected_anchors: BTreeMap::from([(first.application_id, forged)]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ExportError::MismatchedProjectedAnchor {
+            application,
+            anchor,
+            actual_tree,
+            expected_tree,
+        } if application == first.application_id
+            && anchor == forged
+            && actual_tree == wrong_tree
+            && expected_tree != wrong_tree
+    ));
+}
+
+#[tokio::test]
 async fn emits_regular_executable_symlink_and_binary_blobs() {
     let fixture = Fixture::new();
     let writer = PersistedCommitWriter::new(&fixture.objects, &fixture.content);
