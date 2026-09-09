@@ -1,6 +1,6 @@
 # Wheat — Server-Native Source Control
 
-Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, CLI workflow, and Git import paths are implemented and qualified in the Wheat prototype; forge review policy, optional LSP/structural warnings, broader store/protocol qualification, and product commitment remain open
+Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, CLI workflow, and Git import paths are implemented and qualified in the Wheat prototype; active-pack growth/sealing, forge review policy, optional LSP/structural warnings, broader store/protocol qualification, and product commitment remain open
 Owner: bart
 Last updated: 2026-09-09
 
@@ -164,10 +164,15 @@ described here.
   unreachable loose object less than 24 hours after its backend modification
   time; verify the proposed closure immediately before publication and initially
   leave sealed-segment deletion disabled.
+- [ ] **Phase 2 — active pack growth and sealing.** Replace one immutable segment per
+  metadata flush with a process-exclusive active local pack: preserve payload offsets, remove and
+  regenerate its cumulative index/directory/footer tail when appending, journal in-place recovery,
+  and seal/start a new pack only at a measured rehash-size threshold. Import durability batches
+  must not make commit boundaries into physical-file boundaries.
 - [ ] **Phase 2 — physical store qualification.** Benchmark and refine object
-  encoding, index fan-out, segment sizing, deltas, sharding, replication,
-  compaction, caching, and garbage collection against deep stacks and wide agent
-  fan-out on local files and real object-storage range requests.
+  encoding, index fan-out, active-pack sealing thresholds, deltas, sharding, replication,
+  caching, and garbage collection against deep stacks and wide agent fan-out on local files and
+  real object-storage range requests.
 - [ ] **Phase 2 — native protocol and remote CLI.** Specify a resumable,
   versioned client/server protocol and run the same workflow corpus through the
   reference CLI against an ephemeral repository daemon.
@@ -1299,9 +1304,48 @@ directory/fan-out structure, and a fixed-size authoritative footer:
 This permits natural one-pass construction: stream payloads while recording
 locations, emit the index and directory, then append the footer. A valid footer is
 the segment's completion marker; a truncated upload is not a sealed segment. The
-first implementation may still stage to a local file before one immutable upload,
-but its format does not require backpatching and can later map to multipart object
-storage without changing logical objects.
+same layout also supports bounded **active-pack growth on local disk** before the
+file is sealed: retain the existing payload prefix, truncate at the footer's
+`index_start`, append new payloads, regenerate one cumulative sorted index and
+page directory for all retained and new payloads, hash the resulting body again,
+and write one replacement footer. This is not a chain of per-append footers or
+embedded mini-segments; the latest footer describes the complete current file, so
+lookup remains one index traversal rather than searching historical tails.
+
+The active pack is process-exclusive mutable physical state, not a logical Wheat
+object. Each completed footer publishes a durable generation that readers may use,
+but the container does not become a final immutable segment until it reaches the
+sealing threshold. Existing payload offsets stay stable while it grows, allowing
+the derived SQLite locator to retain old rows and add only new locations after a
+successful append. The segment body digest and published physical generation
+change whenever the cumulative tail is rewritten; no repository tree, edit,
+revision, application, view, `ObjectId`, or `ContentId` changes with it.
+
+An in-place append must be recoverable without relying on a partially rewritten
+footer. Before truncating the old metadata tail, durably journal the active-pack
+identity, old total length and `index_start`, the old index/directory/footer bytes,
+and the intended new generation. Then append payloads and the rebuilt tail, sync
+the pack, atomically advance its small physical head/checkpoint, and update locator
+rows plus that same checkpoint in one transaction. Only after all objects for a
+bounded import batch are covered by a durable active-pack generation may the
+corresponding import journal entries be acknowledged together; per-commit
+acknowledgement must not force a pack rewrite. Recovery either validates the
+completed new footer or restores the saved old tail at its original `index_start`;
+bytes after the last published length are ignored. The isolated atomic-import path
+may use deferred syncs inside its hidden staging directory, but it must close the
+pack and locator before the terminal filesystem sync and destination rename.
+
+Active packs are size-bounded by measured rewrite cost rather than the current
+8 MiB ingestion constant. Rebuilding and hashing the cumulative tail is expected
+for each append; once that cost is no longer appropriate—an initial qualification
+target is in the 100–200 MiB range—the writer seals the file as an immutable
+segment and starts another active pack. The threshold is a physical policy and is
+not part of logical identity. A remote object store that cannot append receives
+only sealed packs; local active packs may later be uploaded when sealed.
+
+The first implementation may still stage a sealed pack to a local file before one
+immutable upload, but its format does not require payload backpatching and can map
+to multipart object storage without changing logical objects.
 
 The physical segment descriptor records its stored length, so a reader can issue
 one suffix range request without a preliminary HEAD. The normal tail fetch
@@ -1315,25 +1359,38 @@ never required in full.
 local `pread`, in-memory slices, S3/R2 range requests, or Gothab's existing
 `ObjectStore::get_range_stream`. BinSchema defines segment headers, index pages,
 records, and footers, but generated domain objects do not know their physical
-location. Segment sealing is:
+location. Local active-pack publication is:
 
-1. encode canonical objects and determine IDs;
-2. lay out payloads and index pages, then calculate the segment digest;
-3. upload and verify the complete immutable segment;
-4. publish an immutable segment catalog referencing it;
-5. advance the repository state/head with CAS;
-6. reclaim superseded loose objects or segments only after retention permits it.
+1. encode canonical objects, determine IDs, and discard keys already present;
+2. durably journal the old tail and proposed append generation;
+3. truncate the old index/directory/footer tail, append payloads, and emit a
+   cumulative index, directory, body digest, and replacement footer;
+4. sync and atomically publish the new active-pack generation;
+5. transactionally add locator rows/checkpoint;
+6. acknowledge the bounded batch of import receipts covered by that durable generation; and
+7. at the configured rewrite bound, seal the active pack and create a fresh one.
+
+Sealed-segment publication or remote upload is:
+
+1. verify the complete sealed pack and its final identity;
+2. upload/install it as one immutable object;
+3. publish an immutable segment catalog referencing it;
+4. advance the repository state/head with CAS; and
+5. reclaim superseded loose objects or segments only after retention permits it.
 
 The segment catalog itself is immutable and can use fan-out metadata and Bloom
-filters to skip irrelevant segments. Plain minimum/maximum ranges do not prune
-publication-grouped segments of uniformly distributed cryptographic IDs; range
-partitioning is useful only if a later compaction level intentionally creates
-non-overlapping key ranges. Lookup checks recent loose objects and active segments
-through the catalog. Compaction publishes a new physical catalog without changing
-logical object or view identity; catalog roots remain directly addressable so
-locating them never requires the catalog being located. Sealed-segment deletion
-remains disabled until old-catalog retention, reader retry, snapshot, replication,
-and lease semantics are implemented.
+filters to skip irrelevant sealed packs. Plain minimum/maximum ranges do not prune
+publication-grouped packs of uniformly distributed cryptographic IDs; range
+partitioning is useful only if a later rewrite intentionally creates non-overlapping
+key ranges. The local SQLite locator is persistent derived acceleration tied to the
+physical catalog/active-pack checkpoint: it routes an object ID directly to a pack
+and stable payload range, but immutable pack indexes and catalog records remain the
+rebuild authority. Ordinary active-pack growth is not compaction and must not create
+one catalog record or physical file per commit. A later sealed-pack rewrite may
+combine old packs or repartition ranges without changing logical object or view
+identity; catalog roots remain directly addressable so locating them never requires
+the catalog being located. Sealed-pack deletion remains disabled until old-catalog
+retention, reader retry, snapshot, replication, and lease semantics are implemented.
 
 Loose unpublished objects use a simpler initial safety rule: an unreachable
 object is ineligible for collection until at least 24 hours after the storage
