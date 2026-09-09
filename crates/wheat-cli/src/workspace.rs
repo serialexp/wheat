@@ -7,19 +7,23 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use wheat_core::{
-    ApplicationResult, ContentIo, EditOperation, EditRecord, EditSubsumption, EditTransition,
-    Repository, RevisionEdits, RevisionId,
+    ApplicationResultRecord, ContentIo, EditOperation, EditRecord, EditSubsumption, EditTransition,
+    RevisionEdits, RevisionId,
     edit_capture::{FileSnapshot, capture_edit},
     guarded::{GuardedEdit, Limits, authoring},
 };
-use wheat_store::ContentStore;
+use wheat_store::{
+    ApplicationMapStore, ContentStore, ImmutableObjectStore, MerkleTreeStore, RepositoryHead,
+    RepositoryReader, RevisionMapStore,
+};
 
 use crate::workspace_files::read_workspace_file;
 
-pub(crate) fn author_from_workspace(
+pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     root: &Path,
-    repository: &Repository,
+    objects: &O,
     store: &ContentStore,
+    head: RepositoryHead,
     change: wheat_core::ChangeId,
     predecessor: RevisionId,
     paths: &[String],
@@ -28,31 +32,44 @@ pub(crate) fn author_from_workspace(
     if paths.is_empty() {
         bail!("at least one explicit workspace path is required");
     }
-    if repository.current_revision(change) != Some(predecessor) {
+    let reader = RepositoryReader::new(objects, store);
+    let envelope = reader.envelope(head.envelope).await?;
+    let state = reader.state(envelope.state).await?;
+    let working = reader.view(state.working_view).await?;
+    let current = RevisionMapStore::new(objects)
+        .get(working.revisions, change)
+        .await?;
+    if current != Some(predecessor) {
         bail!("predecessor is not the exact current revision of the change");
     }
-    let revision = repository
-        .revision(predecessor)
-        .context("predecessor revision is not retained")?;
-    let application = repository
-        .current_application(change)
+    let revision = reader.revision(predecessor).await?;
+    let application_id = ApplicationMapStore::new(objects)
+        .get(working.applications, change)
+        .await?
         .context("change has no current application")?;
+    let application = reader.application(application_id).await?;
     if application.revision_id != predecessor {
         bail!("current application does not correspond to predecessor");
     }
-    if revision.authored_against() != application.target_view {
+    if revision.authored_against != application.target_view {
         bail!("predecessor authored base does not match its current application target");
     }
-    let published_application = repository.published_view().applications.get(&change);
-    if published_application != Some(&application.id) {
+    let published = reader.view(state.published_view).await?;
+    let published_application = ApplicationMapStore::new(objects)
+        .get(published.applications, change)
+        .await?;
+    if published_application != Some(application_id) {
         bail!("current application is not recorded by the published head");
     }
-    let ApplicationResult::Clean { tree: baseline } = &application.result else {
+    let ApplicationResultRecord::Clean { tree: baseline } = application.result else {
         bail!("current application is conflicted; resolve it before adding");
     };
-    let authored = repository
-        .view(application.target_view)
-        .context("current application's authored base is not retained")?;
+    let authored = reader.view(application.target_view).await?;
+    let trees = MerkleTreeStore::new(objects);
+    let mut old_definitions = BTreeMap::new();
+    for id in &revision.edits {
+        old_definitions.insert(*id, reader.edit(*id).await?);
+    }
 
     let selected = paths.iter().cloned().collect::<BTreeSet<_>>();
     if selected.len() != paths.len() {
@@ -63,13 +80,12 @@ pub(crate) fn author_from_workspace(
     }
 
     let limits = Limits::default();
-    let mut edits = revision
-        .edits()
+    let mut edits = old_definitions
         .iter()
         .filter(|(_, edit)| !selected.contains(&edit.path))
         .map(|(id, edit)| (*id, edit.clone()))
         .collect::<BTreeMap<_, _>>();
-    let old_ids = revision.edits().keys().copied().collect::<BTreeSet<_>>();
+    let old_ids = old_definitions.keys().copied().collect::<BTreeSet<_>>();
     // Candidate lineage is emitted only from the normalizer's final fixed-point
     // components. Path equality alone is not evidence that two edits interacted.
     let mut component_lineage = Vec::new();
@@ -77,11 +93,11 @@ pub(crate) fn author_from_workspace(
     for path in paths {
         let workspace = read_workspace_file(root, Path::new(path), limits.max_input_bytes)
             .with_context(|| format!("cannot read workspace path {path:?}"))?;
-        let a = authored.tree.get(path).copied();
-        let b = baseline.get(path).copied();
+        let components = path.split('/').map(str::to_owned).collect::<Vec<_>>();
+        let a = trees.lookup(authored.tree, &components).await?;
+        let b = trees.lookup(baseline, &components).await?;
         let ranges = guards.get(path).map(Vec::as_slice);
-        let old_on_path = revision
-            .edits()
+        let old_on_path = old_definitions
             .iter()
             .filter(|(_, e)| e.path == *path)
             .map(|(id, e)| (*id, e))

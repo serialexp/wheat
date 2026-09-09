@@ -3,16 +3,21 @@ use std::{fmt::Write as _, path::PathBuf, str::FromStr};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use wheat_core::{
-    ApplicationContext, ChangeId, ConflictResolution, ContentId, EditTransition, FileKind,
-    FileValue, RevisionEdits, RevisionId, guarded::Limits,
+    ApplicationResultRecord, ChangeId, ChangeMetadata, ChangeProposal, ContentId, EditTransition,
+    FileKind, FileValue, RevisionEdits, RevisionId, RevisionMetadata, guarded::Limits,
+};
+use wheat_store::{
+    ApplicationMapStore, BatchObjectStore, MerkleTreeStore, MutationTarget,
+    PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
+    RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
 mod inspection;
 mod local;
 mod workspace;
 mod workspace_files;
 use local::{
-    content_store, current_conflicts, current_revisions, initialize, repository_summary,
-    revision_with_edits, with_repository,
+    content_store, current_conflicts, current_revisions, initialize, open, repository_summary,
+    revision_with_edits, runtime,
 };
 
 #[derive(Debug, Parser)]
@@ -31,6 +36,8 @@ enum Command {
     Init,
     /// Show the current native repository state.
     Status,
+    /// Verify the complete retained repository state.
+    Validate,
     /// Inspect logical changes and immutable revisions.
     Log,
     /// Inspect durable conflicts and per-edit failure evidence.
@@ -59,9 +66,12 @@ enum ChangeCommand {
 
 #[derive(Debug, Args)]
 struct NewArgs {
-    /// Logical changes this change depends on.
-    #[arg(long = "depends-on")]
+    /// Logical changes this change depends on. Omit to build on the current working frontier.
+    #[arg(long = "depends-on", conflicts_with = "independent")]
     dependencies: Vec<String>,
+    /// Create a root change against the repository base instead of the current working frontier.
+    #[arg(long)]
+    independent: bool,
     #[command(flatten)]
     edit: EditArgs,
 }
@@ -177,6 +187,19 @@ fn main() -> Result<()> {
             println!("conflicts: {}", summary.conflicts);
             Ok(())
         }
+        Command::Validate => {
+            let local = open(&cli.repository)?;
+            let head = local.heads.read()?;
+            let runtime = runtime()?;
+            let state = runtime.block_on(async {
+                let reader = RepositoryReader::new(&local.objects, &local.content);
+                let envelope = reader.envelope(head.envelope).await?;
+                reader.validate_complete(envelope.state).await?;
+                Ok::<_, wheat_store::RepositoryPublicationError>(envelope.state)
+            })?;
+            println!("valid state: {state}");
+            Ok(())
+        }
         Command::Log => {
             let mut output = String::new();
             for (change, revision) in current_revisions(&cli.repository)? {
@@ -200,35 +223,56 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Add(arguments) => {
-            with_repository(&cli.repository, true, |repository, store, output| {
-                let change = ChangeId::from_str(&arguments.change).context("invalid change ID")?;
-                let predecessor = RevisionId::from_str(&arguments.predecessor)
-                    .context("invalid predecessor revision ID")?;
-                let mut guards = std::collections::BTreeMap::new();
-                for guard in arguments.guards {
-                    guards
-                        .entry(guard.path)
-                        .or_insert_with(Vec::new)
-                        .push(guard.range);
-                }
-                let edits = workspace::author_from_workspace(
-                    &cli.repository,
-                    repository,
-                    store,
-                    change,
-                    predecessor,
-                    &arguments.paths,
-                    &guards,
-                )?;
-                let outcome = repository.revise_change(
-                    change,
-                    predecessor,
-                    edits,
-                    ApplicationContext::new(store),
-                )?;
-                writeln!(output, "revision {}", outcome.revision_id)?;
-                print_reapplied(output, &outcome.reapplied)
-            })
+            let local = open(&cli.repository)?;
+            let expected = local.heads.read()?;
+            let change = ChangeId::from_str(&arguments.change).context("invalid change ID")?;
+            let predecessor = RevisionId::from_str(&arguments.predecessor)
+                .context("invalid predecessor revision ID")?;
+            let mut guards = std::collections::BTreeMap::new();
+            for guard in arguments.guards {
+                guards
+                    .entry(guard.path)
+                    .or_insert_with(Vec::new)
+                    .push(guard.range);
+            }
+            let runtime = runtime()?;
+            let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
+            let edits = runtime.block_on(workspace::author_from_workspace(
+                &cli.repository,
+                &objects,
+                &local.content,
+                expected,
+                change,
+                predecessor,
+                &arguments.paths,
+                &guards,
+            ))?;
+            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
+                .with_target(MutationTarget::PublishWorking);
+            let (prepared, outcome) = runtime.block_on(mutator.revise(
+                expected,
+                change,
+                predecessor,
+                RevisionMetadata::default(),
+                edits,
+            ))?;
+            runtime.block_on(async {
+                let publication = prepare_mutation_publication(
+                    &objects,
+                    &local.content,
+                    &local.heads,
+                    expected,
+                    prepared,
+                )
+                .await?;
+                objects.flush().await?;
+                finalize_mutation_publication(&local.heads, publication)
+            })?;
+            let mut output = String::new();
+            writeln!(output, "revision {}", outcome.revision_id)?;
+            print_reapplied(&mut output, &outcome.reapplied)?;
+            print!("{output}");
+            Ok(())
         }
         Command::Cat { content } => {
             let id = ContentId::from_str(&content).context("invalid content ID")?;
@@ -238,66 +282,136 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Change(ChangeCommand::New(arguments)) => {
-            with_repository(&cli.repository, true, |repository, store, output| {
-                let dependencies = arguments
-                    .dependencies
-                    .iter()
-                    .map(|value| ChangeId::from_str(value).context("invalid dependency change ID"))
-                    .collect::<Result<Vec<_>>>()?;
-                let edits = capture_initial_edit(store, arguments.edit)?;
-                let (change, outcome) = repository.create_change(
-                    dependencies,
-                    edits,
-                    ApplicationContext::new(store),
-                )?;
-                writeln!(output, "change {change}")?;
-                writeln!(output, "revision {}", outcome.revision_id)?;
-                print_reapplied(output, &outcome.reapplied)?;
-                Ok(())
-            })
+            let local = open(&cli.repository)?;
+            let expected = local.heads.read()?;
+            let dependencies = arguments
+                .dependencies
+                .iter()
+                .map(|value| ChangeId::from_str(value).context("invalid dependency change ID"))
+                .collect::<Result<std::collections::BTreeSet<_>>>()?;
+            let use_frontier = dependencies.is_empty() && !arguments.independent;
+            let edits = capture_initial_edit(&local.content, arguments.edit)?;
+            let change = ChangeId::new();
+            let proposal = ChangeProposal {
+                id: change,
+                metadata: ChangeMetadata::default(),
+                dependencies,
+                revision_metadata: RevisionMetadata::default(),
+                edits,
+            };
+            let runtime = runtime()?;
+            let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
+            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
+                .with_target(MutationTarget::PublishWorking);
+            let (prepared, outcome) = if use_frontier {
+                runtime.block_on(mutator.create_on_frontier(expected, proposal))?
+            } else {
+                runtime.block_on(mutator.create(expected, proposal))?
+            };
+            runtime.block_on(async {
+                let publication = prepare_mutation_publication(
+                    &objects,
+                    &local.content,
+                    &local.heads,
+                    expected,
+                    prepared,
+                )
+                .await?;
+                objects.flush().await?;
+                finalize_mutation_publication(&local.heads, publication)
+            })?;
+            let mut output = String::new();
+            writeln!(output, "change {change}")?;
+            writeln!(output, "revision {}", outcome.revision_id)?;
+            print_reapplied(&mut output, &outcome.reapplied)?;
+            print!("{output}");
+            Ok(())
         }
-        Command::Resolve(arguments) => {
-            with_repository(&cli.repository, true, |repository, store, output| {
-                let revision =
-                    RevisionId::from_str(&arguments.revision).context("invalid revision ID")?;
-                let target = repository
-                    .conflicted_application(revision)
-                    .context("revision is not the current conflicted application")?
-                    .target_view;
-                let mut tree = repository
-                    .view(target)
-                    .expect("application target view exists")
-                    .tree
-                    .clone();
-                match arguments.value {
-                    Some(value) => {
-                        let kind = arguments
-                            .kind
-                            .map(Into::into)
-                            .or_else(|| tree.get(&arguments.path).map(|value| value.kind))
-                            .unwrap_or(FileKind::Regular);
-                        let content =
-                            put_captured_value(&content_store(&cli.repository)?, &value, kind)?;
-                        tree.insert(arguments.path, FileValue { content, kind });
-                    }
-                    None if arguments.delete => {
-                        tree.remove(&arguments.path);
-                    }
-                    None => bail!("a value or --delete is required"),
-                }
-                let outcome = repository.resolve_conflict(
-                    ConflictResolution {
-                        conflict_revision: revision,
-                        resolved_tree: tree,
-                    },
-                    ApplicationContext::new(store),
-                )?;
-                writeln!(output, "revision {}", outcome.revision_id)?;
-                print_reapplied(output, &outcome.reapplied)?;
-                Ok(())
-            })
-        }
+        Command::Resolve(arguments) => resolve(&cli.repository, arguments),
     }
+}
+
+fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<()> {
+    let local = open(root)?;
+    let expected = local.heads.read()?;
+    let revision = RevisionId::from_str(&arguments.revision).context("invalid revision ID")?;
+    let runtime = runtime()?;
+    let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
+    let reader = RepositoryReader::new(&objects, &local.content);
+    let (application_id, existing) = runtime.block_on(async {
+        let envelope = reader.envelope(expected.envelope).await?;
+        let state = reader.state(envelope.state).await?;
+        let working = reader.view(state.working_view).await?;
+        let record = reader.revision(revision).await?;
+        let current = RevisionMapStore::new(&objects)
+            .get(working.revisions, record.change_id)
+            .await?;
+        if current != Some(revision) {
+            bail!("revision is not the current conflicted application");
+        }
+        let application_id = ApplicationMapStore::new(&objects)
+            .get(working.applications, record.change_id)
+            .await?
+            .context("revision is not the current conflicted application")?;
+        let application = reader.application(application_id).await?;
+        if application.revision_id != revision
+            || !matches!(
+                application.result,
+                ApplicationResultRecord::Conflicted { .. }
+            )
+        {
+            bail!("revision is not the current conflicted application");
+        }
+        let target = reader.view(application.target_view).await?;
+        let components = arguments
+            .path
+            .split('/')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let existing = MerkleTreeStore::new(&objects)
+            .lookup(target.tree, &components)
+            .await?;
+        Ok::<_, anyhow::Error>((application_id, existing))
+    })?;
+    // Store/authenticate content before metadata referring to it is prepared.
+    let value = match arguments.value {
+        Some(value) => {
+            let kind = arguments
+                .kind
+                .map(Into::into)
+                .or_else(|| existing.map(|value| value.kind))
+                .unwrap_or(FileKind::Regular);
+            let content = put_captured_value(&local.content, &value, kind)?;
+            Some(FileValue { content, kind })
+        }
+        None if arguments.delete => None,
+        None => bail!("a value or --delete is required"),
+    };
+    let resolution = PersistedConflictResolution {
+        conflict_revision: revision,
+        application: application_id,
+        resolved: std::collections::BTreeMap::from([(arguments.path, value)]),
+    };
+    let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
+        .with_target(MutationTarget::PublishWorking);
+    let (prepared, outcome) = runtime.block_on(mutator.resolve_conflict(expected, resolution))?;
+    runtime.block_on(async {
+        let publication = prepare_mutation_publication(
+            &objects,
+            &local.content,
+            &local.heads,
+            expected,
+            prepared,
+        )
+        .await?;
+        objects.flush().await?;
+        finalize_mutation_publication(&local.heads, publication)
+    })?;
+    let mut output = String::new();
+    writeln!(output, "revision {}", outcome.revision_id)?;
+    print_reapplied(&mut output, &outcome.reapplied)?;
+    print!("{output}");
+    Ok(())
 }
 
 /// Captures the initial whole-file edit for `change new`.

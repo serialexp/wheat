@@ -1,11 +1,61 @@
 //! Canonical local repository authority; YAML snapshots are never read or written.
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use std::path::Path;
-use wheat_core::{ChangeId, Conflict, Repository, RevisionId, RevisionRecord, Tree, ViewId};
+use wheat_core::{
+    ChangeId, Conflict, ObjectId, Repository, RevisionId, RevisionRecord, Tree, ViewId,
+};
 use wheat_store::{
     ConflictSetStore, ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
-    PackedObjectStore, PublicationStore, RepositoryPublisher, RepositoryReader, RevisionMapStore,
+    ObjectStoreError, PackedObjectStore, PublicationStore, RepositoryPublisher, RepositoryReader,
+    RevisionMapStore, StoredObject,
 };
+
+pub(crate) enum LocalObjects {
+    Loose(LooseObjectStore),
+    Packed(PackedObjectStore),
+}
+
+#[async_trait]
+impl ImmutableObjectStore for LocalObjects {
+    async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+        match self {
+            Self::Loose(store) => store.put_if_absent(id, bytes).await,
+            Self::Packed(store) => store.put_if_absent(id, bytes).await,
+        }
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        match self {
+            Self::Loose(store) => store.put_batch(objects, concurrency).await,
+            Self::Packed(store) => store.put_batch(objects, concurrency).await,
+        }
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        match self {
+            Self::Loose(store) => store.get(id).await,
+            Self::Packed(store) => store.get(id).await,
+        }
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        match self {
+            Self::Loose(store) => store.exists_many(ids).await,
+            Self::Packed(store) => store.exists_many(ids).await,
+        }
+    }
+}
+
+pub(crate) struct LocalRepository {
+    pub objects: LocalObjects,
+    pub content: ContentStore,
+    pub heads: LocalPublicationStore,
+}
 
 pub struct RepositorySummary {
     pub working_view: ViewId,
@@ -50,6 +100,26 @@ fn reject_legacy(root: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn open(root: &Path) -> Result<LocalRepository> {
+    reject_legacy(root)?;
+    match repository_layout(root)? {
+        RepositoryLayout::Loose => Ok(LocalRepository {
+            objects: LocalObjects::Loose(LooseObjectStore::new(root.join(".wheat/objects"))),
+            content: ContentStore::new(root.join(".wheat/content")),
+            heads: LocalPublicationStore::new(root.join(".wheat/repository.head")),
+        }),
+        RepositoryLayout::Packed => {
+            let objects = PackedObjectStore::open(root.join("storage"))?;
+            let content = objects.content_store();
+            Ok(LocalRepository {
+                objects: LocalObjects::Packed(objects),
+                content,
+                heads: LocalPublicationStore::new(root.join("repository.head")),
+            })
+        }
+    }
 }
 
 pub fn initialize(root: &Path) -> Result<()> {
@@ -254,94 +324,8 @@ fn read_current_revisions<O: ImmutableObjectStore>(
     })?)
 }
 
-pub fn with_repository(
-    root: &Path,
-    persist: bool,
-    operation: impl FnOnce(&mut Repository, &ContentStore, &mut String) -> Result<()>,
-) -> Result<()> {
-    reject_legacy(root)?;
-    match repository_layout(root)? {
-        RepositoryLayout::Loose => {
-            let objects = LooseObjectStore::new(root.join(".wheat/objects"));
-            let content = ContentStore::new(root.join(".wheat/content"));
-            let heads = LocalPublicationStore::new(root.join(".wheat/repository.head"));
-            operate(root, persist, operation, &objects, &content, &heads)
-        }
-        RepositoryLayout::Packed => {
-            let objects = PackedObjectStore::open(root.join("storage"))?;
-            let content = objects.content_store();
-            let heads = LocalPublicationStore::new(root.join("repository.head"));
-            operate(root, persist, operation, &objects, &content, &heads)
-        }
-    }
-}
-
-fn operate<O: ImmutableObjectStore>(
-    root: &Path,
-    persist: bool,
-    operation: impl FnOnce(&mut Repository, &ContentStore, &mut String) -> Result<()>,
-    objects: &O,
-    content: &ContentStore,
-    heads: &LocalPublicationStore,
-) -> Result<()> {
-    let expected = heads
-        .read()
-        .with_context(|| format!("cannot open Wheat repository: {}", root.display()))?;
-    let runtime = runtime()?;
-    let reader = RepositoryReader::new(objects, content);
-    let envelope = runtime.block_on(reader.validate_envelope(expected.envelope))?;
-    let mut repository = runtime.block_on(reader.hydrate(envelope.state))?;
-    let mut output = String::new();
-    operation(&mut repository, content, &mut output)?;
-    if persist {
-        let published = repository.published_view().id;
-        repository.publish(published)?;
-        runtime.block_on(
-            RepositoryPublisher::new(objects, content, heads).publish(expected, &repository),
-        )?;
-    }
-    print!("{output}");
-    Ok(())
-}
-
-fn runtime() -> Result<tokio::runtime::Runtime> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wheat_core::{ApplicationContext, RevisionEdits};
-
-    #[test]
-    fn concurrent_writer_cannot_overwrite_winning_head() {
-        let dir = tempfile::tempdir().unwrap();
-        initialize(dir.path()).unwrap();
-        let result = with_repository(dir.path(), true, |stale, content, output| {
-            stale.create_change(
-                [],
-                RevisionEdits::default(),
-                ApplicationContext::new(content),
-            )?;
-            output.push_str("must not be printed\n");
-            with_repository(dir.path(), true, |winner, content, _| {
-                winner.create_change(
-                    [],
-                    RevisionEdits::default(),
-                    ApplicationContext::new(content),
-                )?;
-                Ok(())
-            })?;
-            Ok(())
-        });
-        assert!(result.is_err());
-        assert!(format!("{:#}", result.unwrap_err()).contains("publication expected"));
-        with_repository(dir.path(), false, |repository, _, _| {
-            assert_eq!(repository.current_revisions().count(), 1);
-            Ok(())
-        })
-        .unwrap();
-    }
 }

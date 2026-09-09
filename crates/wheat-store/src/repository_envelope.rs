@@ -40,15 +40,23 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
         self.objects
             .put_if_absent(branches.id().into(), &branches.canonical_bytes())
             .await?;
-        let envelope = RepositoryEnvelopeRecord {
-            state,
-            branches: branches.id(),
-        };
-        self.objects
-            .put_if_absent(envelope.id().into(), &envelope.canonical_bytes())
+        let id = self
+            .prepare_envelope_unchecked(state, branches.id())
             .await?;
         RepositoryReader::new(self.objects, self.content)
-            .validate_envelope(envelope.id())
+            .validate_envelope(id)
+            .await?;
+        Ok(id)
+    }
+
+    pub(crate) async fn prepare_envelope_unchecked(
+        &self,
+        state: RepositoryStateId,
+        branches: wheat_core::BranchManifestId,
+    ) -> Result<RepositoryEnvelopeId> {
+        let envelope = RepositoryEnvelopeRecord { state, branches };
+        self.objects
+            .put_if_absent(envelope.id().into(), &envelope.canonical_bytes())
             .await?;
         Ok(envelope.id())
     }

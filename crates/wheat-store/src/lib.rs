@@ -13,6 +13,7 @@ mod content_io;
 mod durability;
 mod loose;
 mod merkle_tree;
+mod mutation_publication;
 mod object_store_adapter;
 mod packed;
 pub use packed::PackedObjectStore;
@@ -20,6 +21,7 @@ mod publication;
 mod radix;
 mod repository_envelope;
 mod repository_hydration;
+mod repository_mutation;
 mod repository_publication;
 mod repository_reader;
 mod repository_transition;
@@ -37,10 +39,17 @@ pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };
 pub use merkle_tree::{MerkleTreeError, MerkleTreeStore, TreeEdit};
+pub use mutation_publication::{
+    PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,
+};
 pub use object_store_adapter::{
     ObjectStoreAdapter, ObjectStoreAdapterBuildError, S3ObjectStoreConfig,
 };
 pub use publication::{LocalPublicationStore, PublicationError, PublicationStore, RepositoryHead};
+pub use repository_mutation::{
+    MutationTarget, PersistedConflictResolution, PersistedRepositoryMutator,
+    PreparedRepositoryMutation, RepositoryMutationError,
+};
 pub use repository_publication::{RepositoryPublicationError, RepositoryPublisher};
 pub use revision_map::{RevisionMapCursor, RevisionMapError, RevisionMapStore};
 pub use sets::{

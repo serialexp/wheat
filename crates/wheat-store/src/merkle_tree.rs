@@ -95,6 +95,9 @@ where
         root: TreeId,
         edits: &[TreeEdit],
     ) -> Result<TreeId, MerkleTreeError> {
+        if edits.is_empty() {
+            return Ok(root);
+        }
         let mut root_node = self.read_node(root).await?;
         let mut grouped = BTreeMap::<String, Vec<TreeEdit>>::new();
         for edit in edits {

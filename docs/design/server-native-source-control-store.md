@@ -1,8 +1,8 @@
 # Wheat — Server-Native Source Control
 
-Status: partial — the native guarded-edit model, application, incremental authoring, retention/reopen, CLI workflow, and Git import paths are implemented and qualified in the Wheat prototype; forge review policy, optional LSP/structural warnings, broader store/protocol qualification, and product commitment remain open
+Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, CLI workflow, and Git import paths are implemented and qualified in the Wheat prototype; forge review policy, optional LSP/structural warnings, broader store/protocol qualification, and product commitment remain open
 Owner: bart
-Last updated: 2026-09-07
+Last updated: 2026-09-09
 
 ## Implementation status
 
@@ -63,6 +63,13 @@ described here.
 - [x] **Guarded edits — application and conflict corpus.** Exact simultaneous guard
   matching, typed per-edit outcomes, durable ambiguity/interference conflicts,
   bounded work/output, and rollback are covered by the core/store/CLI corpus.
+- [x] **Persisted daily mutation path.** Local loose and atomic packed repositories support
+  root-backed `change new`, `add`, and conflict resolution without hydrating retained history.
+  Composition preserves the longest unchanged authenticated prefix, loads edit bodies only for
+  the affected suffix, batches metadata before head CAS, and preserves branch manifests. A fresh
+  1,607-change Gothab import qualified frontier creation in 12.91 seconds, revision in 3.75
+  seconds, reopen/status in 3.19 seconds, and explicit complete validation in 757.35 seconds;
+  the retained-history audit remains deliberately distinct from interactive mutation latency.
 - [~] **Guarded edits — interdiff and review continuity.** Revision transitions expose
   preserved, added, removed, subsumed, and resolution relationships, and applications
   bind outcomes to exact edit definitions and targets. Forge reviewer evidence and
@@ -109,10 +116,11 @@ described here.
   metadata/content publication, dependency validation, and property tests. The
   prototype now retains verified content bytes, but does not yet prove ownership,
   recovery, or safe reclamation; Git and gix remain outside the core.
-- [ ] **Phase 1 — complete the reference CLI and local workflow.** Extend the
-  current local CLI with workspace capture, composition, explicit publication,
-  richer conflict resolution, and black-box ergonomics tests; the current
-  exact-edit commands exercise the model but are not a daily-use client.
+- [~] **Phase 1 — complete the reference CLI and local workflow.** The local CLI now
+  has explicit-path workspace capture, persisted composition and mutation, working-view
+  publication, durable conflict inspection/resolution, complete validation, loose/packed reopen,
+  and black-box lifecycle/scaling coverage. Workspace-wide capture, ergonomic change selection,
+  explicit multi-target publication, and the remote mode remain.
 - [ ] **Phase 1 — complete the conflict and concurrency corpus.** Extend the
   current chain/branch/join/conflict/CAS tests to concurrent human/agent
   mutations, independent simultaneous conflicts, retries, dependency movement,
@@ -140,7 +148,8 @@ described here.
   shared identity/closure builders, and verified root-only publication/readback
   are implemented. A resumable disk-journaled Git importer now stages canonical
   commits without executable hydration and publishes retained named branches.
-  Interactive executable models remain hydrated; change-ID indexing, compressed
+  Interactive executable models remain hydrated, while CLI reads and daily mutations operate
+  directly over persisted roots with copy-on-write prefix reuse. Change-ID indexing, compressed
   radix qualification and wide-directory sharding remain.
 - [~] **Phase 2 — indexed sealed segments and ranged reads.** The local backend now
   packs canonical metadata and small content into immutable BinSchema-defined,

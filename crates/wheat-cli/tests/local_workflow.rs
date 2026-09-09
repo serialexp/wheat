@@ -1,5 +1,7 @@
 use std::process::{Command, Output};
 
+use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
+
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .arg("--repository")
@@ -15,6 +17,12 @@ fn field(output: &Output, name: &str) -> String {
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
         .expect("output field exists")
         .to_owned()
+}
+
+fn packed_catalog_count(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root.join("storage/packed/catalog"))
+        .unwrap()
+        .count()
 }
 
 fn git(root: &std::path::Path, arguments: &[&str]) {
@@ -70,6 +78,13 @@ fn initializes_mutates_and_reopens_local_repository() {
     let status = String::from_utf8_lossy(&reopened.stdout);
     assert!(status.contains("changes: 1"));
     assert!(status.contains("conflicts: 0"));
+    let validated = wheat(directory.path(), &["validate"]);
+    assert!(
+        validated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+    assert!(String::from_utf8_lossy(&validated.stdout).contains("valid state: "));
 
     let duplicate = wheat(directory.path(), &["init"]);
     assert!(!duplicate.status.success());
@@ -98,6 +113,21 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
         ))
         .unwrap();
 
+    let branches_before = {
+        let objects = PackedObjectStore::open(repository.join("storage")).unwrap();
+        let content = objects.content_store();
+        let heads = LocalPublicationStore::new(repository.join("repository.head"));
+        let reader = RepositoryReader::new(&objects, &content);
+        runtime.block_on(async {
+            let envelope = reader
+                .envelope(heads.read().unwrap().envelope)
+                .await
+                .unwrap();
+            reader.branch_manifest(envelope.branches).await.unwrap()
+        })
+    };
+    assert!(branches_before.branches.contains_key("refs/heads/main"));
+
     let status = wheat(&repository, &["status"]);
     assert!(
         status.status.success(),
@@ -106,6 +136,7 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
     );
     assert!(String::from_utf8_lossy(&status.stdout).contains("changes: 1"));
 
+    let catalogs_before = packed_catalog_count(&repository);
     let created = wheat(
         &repository,
         &["change", "new", "--path", "added", "--value", "packed"],
@@ -115,6 +146,10 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
+    // Content capture publishes one packed generation and the metadata graph, including its final
+    // envelope, is flushed through one put_batch call. Thus the mutation adds two generations
+    // rather than one generation per immutable metadata object.
+    assert_eq!(packed_catalog_count(&repository), catalogs_before + 2);
     let reopened = wheat(&repository, &["status"]);
     assert!(String::from_utf8_lossy(&reopened.stdout).contains("changes: 2"));
 
@@ -138,6 +173,85 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
     let conflicts = wheat(&repository, &["conflicts"]);
     assert!(conflicts.status.success());
     assert!(conflicts.stdout.is_empty());
+
+    let dependent = wheat(
+        &repository,
+        &[
+            "change",
+            "new",
+            "--depends-on",
+            &field(&created, "change"),
+            "--path",
+            "added",
+            "--expected",
+            "packed",
+            "--value",
+            "dependent",
+        ],
+    );
+    assert!(
+        dependent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dependent.stderr)
+    );
+    std::fs::write(repository.join("added"), "revised").unwrap();
+    let revised = wheat(
+        &repository,
+        &[
+            "add",
+            "--change",
+            &field(&created, "change"),
+            "--predecessor",
+            &field(&created, "revision"),
+            "added",
+        ],
+    );
+    assert!(
+        revised.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+    let conflicted = wheat(&repository, &["status"]);
+    assert!(String::from_utf8_lossy(&conflicted.stdout).contains("conflicts: 1"));
+    let resolved = wheat(
+        &repository,
+        &[
+            "resolve",
+            &field(&dependent, "revision"),
+            "--path",
+            "added",
+            "--value",
+            "resolved",
+        ],
+    );
+    assert!(
+        resolved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let reopened = wheat(&repository, &["status"]);
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("conflicts: 0"));
+    let validated = wheat(&repository, &["validate"]);
+    assert!(
+        validated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+
+    let branches_after = {
+        let objects = PackedObjectStore::open(repository.join("storage")).unwrap();
+        let content = objects.content_store();
+        let heads = LocalPublicationStore::new(repository.join("repository.head"));
+        let reader = RepositoryReader::new(&objects, &content);
+        runtime.block_on(async {
+            let envelope = reader
+                .envelope(heads.read().unwrap().envelope)
+                .await
+                .unwrap();
+            reader.branch_manifest(envelope.branches).await.unwrap()
+        })
+    };
+    assert_eq!(branches_after, branches_before);
 
     let content_id = wheat_core::ContentId::of(b"packed").to_string();
     let retained = wheat(&repository, &["cat", &content_id]);
