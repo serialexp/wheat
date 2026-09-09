@@ -1,8 +1,8 @@
 //! Durable publication catalog for immutable packed segments.
 //!
-//! The SQLite database is deliberately disposable: every open authenticates the
-//! immutable catalog chain and all referenced segments, then builds a fresh
-//! locator.  It is never a source of truth.
+//! SQLite is persistent but remains disposable derived state. A checkpoint ties
+//! it to the immutable catalog head; a missing, corrupt, or stale locator is
+//! reconstructed from the authoritative catalog chain and segments.
 
 use std::{
     collections::HashMap,
@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{
@@ -27,6 +27,10 @@ const SCHEMA: &str = include_str!("catalog_sql/schema.sql");
 const LOOKUP: &str = include_str!("catalog_sql/lookup.sql");
 const SEGMENT_SUFFIX: &str = ".segment";
 const CATALOG_SUFFIX: &str = ".catalog";
+const HEAD_FILE: &str = "catalog.head";
+const HEAD_MAGIC: &[u8; 9] = b"WHEATPACK";
+const HEAD_VERSION: u8 = 1;
+const HEAD_LEN: usize = HEAD_MAGIC.len() + 1 + 8 + 32;
 
 #[derive(Debug, Error)]
 pub(crate) enum CatalogError {
@@ -56,7 +60,6 @@ pub(crate) struct PackedCatalog {
     catalogs: PathBuf,
     _lock: File,
     index: Connection,
-    _index_file: NamedTempFile,
     generation: Option<u64>,
     head: Option<[u8; 32]>,
     durability: Durability,
@@ -100,22 +103,49 @@ impl PackedCatalog {
             .open(root.join("catalog.lock"))?;
         try_lock_exclusive(&lock)?;
 
-        let index_file = NamedTempFile::new_in(&root)?;
-        let index = Connection::open(index_file.path())?;
-        index.execute_batch(SCHEMA)?;
+        let index_path = root.join("catalog-locator.sqlite3");
+        let index_was_missing = !index_path.exists();
+        let mut index_recreated = false;
+        let index = open_index(&index_path, durability).or_else(|_| {
+            remove_index_files(&index_path)?;
+            index_recreated = true;
+            open_index(&index_path, durability)
+        })?;
+        if index_was_missing || index_recreated {
+            durability.sync_directory(&root)?;
+        }
         let mut catalog = Self {
             root,
             segments,
             catalogs,
             _lock: lock,
             index,
-            _index_file: index_file,
             generation: None,
             head: None,
             durability,
             readers: HashMap::new(),
         };
-        catalog.rebuild_index()?;
+
+        let head_path = catalog.root.join(HEAD_FILE);
+        let durable_head = match read_catalog_head(&head_path) {
+            Ok(head) => head,
+            Err(CatalogError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                // One-time migration from the original directory-as-authority format. Once the
+                // head exists, ordinary opens never enumerate the catalog directory.
+                let head = latest_catalog_head(&catalog.catalogs)?;
+                write_catalog_head(&catalog.root, &head_path, head, durability)?;
+                head
+            }
+            Err(error) => return Err(error),
+        };
+        validate_catalog_head(&catalog.catalogs, durable_head)?;
+        match catalog.read_checkpoint() {
+            Ok(checkpoint) if checkpoint == durable_head => {
+                catalog.generation = checkpoint.map(|(generation, _)| generation);
+                catalog.head = checkpoint.map(|(_, head)| head);
+            }
+            _ => catalog.rebuild_index()?,
+        }
         Ok(catalog)
     }
 
@@ -188,10 +218,24 @@ impl PackedCatalog {
             }
         }
         self.durability.sync_directory(&self.catalogs)?;
+        write_catalog_head(
+            &self.root,
+            &self.root.join(HEAD_FILE),
+            Some((generation, catalog_digest)),
+            self.durability,
+        )?;
 
-        // Publication is complete at this point. If incremental indexing fails,
-        // discard all derived state and reconstruct it from the durable chain.
-        if self.index_segment(&segment_name, &segment_path).is_err() {
+        // Head publication is complete at this point. Locator rows and their
+        // checkpoint become visible in one SQLite transaction. A crash before
+        // that commit leaves a stale checkpoint which the next open rebuilds.
+        if self
+            .index_segment_and_checkpoint(
+                &segment_name,
+                &segment_path,
+                Some((generation, catalog_digest)),
+            )
+            .is_err()
+        {
             self.rebuild_index()?;
             return Ok(());
         }
@@ -227,9 +271,13 @@ impl PackedCatalog {
     }
 
     fn rebuild_index(&mut self) -> Result<(), CatalogError> {
-        self.index.execute("DELETE FROM locator", [])?;
         self.readers.clear();
         let items = read_chain(&self.catalogs)?;
+        let checkpoint = items
+            .last()
+            .map(|item| (item.record.generation, item.digest));
+        let transaction = self.index.transaction()?;
+        transaction.execute("DELETE FROM locator", [])?;
         for item in &items {
             let filename = format!(
                 "{}-{}.segment",
@@ -247,34 +295,50 @@ impl PackedCatalog {
             if metadata.len() != item.record.stored_length {
                 return Err(CatalogError::Corrupt("stored segment length"));
             }
-            self.index_segment(&filename, &path)?;
+            let (_, _, entries) = open_segment_for_index(&filename, &path)?;
+            insert_entries(&transaction, &filename, &entries)?;
         }
-        self.generation = items.last().map(|item| item.record.generation);
-        self.head = items.last().map(|item| item.digest);
+        write_checkpoint(&transaction, checkpoint)?;
+        transaction.commit()?;
+
+        self.generation = checkpoint.map(|(generation, _)| generation);
+        self.head = checkpoint.map(|(_, head)| head);
         Ok(())
     }
 
-    fn index_segment(&mut self, filename: &str, path: &Path) -> Result<(), CatalogError> {
-        let mut reader = SegmentReader::open(File::open(path)?)?;
-        if !filename.ends_with(&format!("-{}.segment", hex(&reader.id().0))) {
-            return Err(CatalogError::Corrupt(
-                "segment identity disagrees with catalog",
-            ));
-        }
-        let entries = reader.entries()?;
+    fn index_segment_and_checkpoint(
+        &mut self,
+        filename: &str,
+        path: &Path,
+        checkpoint: Option<(u64, [u8; 32])>,
+    ) -> Result<(), CatalogError> {
+        let (filename, reader, entries) = open_segment_for_index(filename, path)?;
         let transaction = self.index.transaction()?;
-        {
-            let mut insert = transaction.prepare_cached(
-                "INSERT INTO locator(namespace,digest,segment_file) VALUES(?1,?2,?3) \
-                 ON CONFLICT(namespace,digest) DO UPDATE SET segment_file=excluded.segment_file",
-            )?;
-            for entry in entries {
-                insert.execute(params![entry.namespace, entry.digest.as_slice(), filename])?;
-            }
-        }
+        insert_entries(&transaction, &filename, &entries)?;
+        write_checkpoint(&transaction, checkpoint)?;
         transaction.commit()?;
-        self.readers.insert(filename.to_owned(), reader);
+        self.readers.insert(filename, reader);
         Ok(())
+    }
+
+    fn read_checkpoint(&self) -> Result<Option<(u64, [u8; 32])>, CatalogError> {
+        let row: (Option<i64>, Option<Vec<u8>>) = self.index.query_row(
+            "SELECT generation, head_digest FROM checkpoint WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        match row {
+            (None, None) => Ok(None),
+            (Some(generation), Some(head)) => {
+                let generation = u64::try_from(generation)
+                    .map_err(|_| CatalogError::Corrupt("locator checkpoint generation"))?;
+                let head = head
+                    .try_into()
+                    .map_err(|_| CatalogError::Corrupt("locator checkpoint digest"))?;
+                Ok(Some((generation, head)))
+            }
+            _ => Err(CatalogError::Corrupt("locator checkpoint shape")),
+        }
     }
 
     fn ensure_reader(&mut self, filename: &str) -> Result<(), CatalogError> {
@@ -284,6 +348,208 @@ impl PackedCatalog {
         }
         Ok(())
     }
+}
+
+fn open_index(path: &Path, durability: Durability) -> Result<Connection, CatalogError> {
+    let connection = Connection::open(path)?;
+    connection.pragma_update(None, "journal_mode", "DELETE")?;
+    connection.pragma_update(
+        None,
+        "synchronous",
+        match durability {
+            Durability::Durable => "FULL",
+            Durability::Deferred => "OFF",
+        },
+    )?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    connection.pragma_update(None, "cache_size", -8192)?;
+    connection.execute_batch(SCHEMA)?;
+    // Detect malformed database pages before trusting the checkpoint. This reads
+    // the small derived index, never the immutable segment payloads.
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(CatalogError::Corrupt("locator database integrity"));
+    }
+    Ok(connection)
+}
+
+fn remove_index_files(path: &Path) -> Result<(), CatalogError> {
+    let sidecar = |suffix: &str| {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    for candidate in [
+        path.to_path_buf(),
+        sidecar("-journal"),
+        sidecar("-wal"),
+        sidecar("-shm"),
+    ] {
+        match fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_catalog_head(path: &Path) -> Result<Option<(u64, [u8; 32])>, CatalogError> {
+    let encoded = fs::read(path)?;
+    if encoded.len() == HEAD_MAGIC.len() + 1 && encoded.starts_with(HEAD_MAGIC) {
+        return (encoded[HEAD_MAGIC.len()] == HEAD_VERSION)
+            .then_some(None)
+            .ok_or(CatalogError::Corrupt("catalog head version"));
+    }
+    if encoded.len() != HEAD_LEN
+        || !encoded.starts_with(HEAD_MAGIC)
+        || encoded[HEAD_MAGIC.len()] != HEAD_VERSION
+    {
+        return Err(CatalogError::Corrupt("catalog head format"));
+    }
+    let generation = u64::from_be_bytes(
+        encoded[HEAD_MAGIC.len() + 1..HEAD_MAGIC.len() + 9]
+            .try_into()
+            .expect("fixed catalog head generation"),
+    );
+    let digest = encoded[HEAD_MAGIC.len() + 9..]
+        .try_into()
+        .expect("fixed catalog head digest");
+    Ok(Some((generation, digest)))
+}
+
+fn write_catalog_head(
+    root: &Path,
+    path: &Path,
+    head: Option<(u64, [u8; 32])>,
+    durability: Durability,
+) -> Result<(), CatalogError> {
+    let mut encoded = Vec::with_capacity(HEAD_LEN);
+    encoded.extend_from_slice(HEAD_MAGIC);
+    encoded.push(HEAD_VERSION);
+    if let Some((generation, digest)) = head {
+        encoded.extend_from_slice(&generation.to_be_bytes());
+        encoded.extend_from_slice(&digest);
+    }
+    let mut temporary = NamedTempFile::new_in(root)?;
+    temporary.write_all(&encoded)?;
+    durability.sync_file(temporary.as_file())?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    durability.sync_directory(root)?;
+    Ok(())
+}
+
+fn validate_catalog_head(
+    directory: &Path,
+    head: Option<(u64, [u8; 32])>,
+) -> Result<(), CatalogError> {
+    let Some((generation, digest)) = head else {
+        return Ok(());
+    };
+    let path = directory.join(format!("{}-{}{}", generation, hex(&digest), CATALOG_SUFFIX));
+    let encoded = fs::read(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            CatalogError::Corrupt("catalog head references missing record")
+        } else {
+            CatalogError::Io(error)
+        }
+    })?;
+    let record = decode_segment_catalog_record(&encoded)?;
+    if record.generation != generation || blake3::hash(&encoded).as_bytes() != &digest {
+        return Err(CatalogError::Corrupt("catalog head disagrees with record"));
+    }
+    Ok(())
+}
+
+fn latest_catalog_head(directory: &Path) -> Result<Option<(u64, [u8; 32])>, CatalogError> {
+    let mut latest: Option<(u64, PathBuf)> = None;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(CatalogError::Corrupt("catalog filename"));
+        };
+        let Some((generation, _)) = name.split_once('-') else {
+            continue;
+        };
+        if !name.ends_with(CATALOG_SUFFIX) {
+            continue;
+        }
+        let generation = generation
+            .parse::<u64>()
+            .map_err(|_| CatalogError::Corrupt("catalog filename generation"))?;
+        if latest.as_ref().is_none_or(|(old, _)| generation > *old) {
+            latest = Some((generation, entry.path()));
+        }
+    }
+    let Some((generation, path)) = latest else {
+        return Ok(None);
+    };
+    let encoded = fs::read(&path)?;
+    let record = decode_segment_catalog_record(&encoded)?;
+    let digest = *blake3::hash(&encoded).as_bytes();
+    let expected = format!("{}-{}{}", record.generation, hex(&digest), CATALOG_SUFFIX);
+    if generation != record.generation
+        || path.file_name().and_then(|name| name.to_str()) != Some(&expected)
+    {
+        return Err(CatalogError::Corrupt(
+            "catalog filename does not match record",
+        ));
+    }
+    Ok(Some((generation, digest)))
+}
+
+fn open_segment_for_index(
+    filename: &str,
+    path: &Path,
+) -> Result<(String, SegmentReader, Vec<wheat_core::SegmentIndexEntry>), CatalogError> {
+    let mut reader = SegmentReader::open(File::open(path)?)?;
+    if !filename.ends_with(&format!("-{}.segment", hex(&reader.id().0))) {
+        return Err(CatalogError::Corrupt(
+            "segment identity disagrees with catalog",
+        ));
+    }
+    let entries = reader.entries()?;
+    Ok((filename.to_owned(), reader, entries))
+}
+
+fn insert_entries(
+    transaction: &Transaction<'_>,
+    filename: &str,
+    entries: &[wheat_core::SegmentIndexEntry],
+) -> Result<(), CatalogError> {
+    let mut insert = transaction.prepare_cached(
+        "INSERT INTO locator(namespace,digest,segment_file) VALUES(?1,?2,?3) \
+         ON CONFLICT(namespace,digest) DO UPDATE SET segment_file=excluded.segment_file",
+    )?;
+    for entry in entries {
+        insert.execute(params![entry.namespace, entry.digest.as_slice(), filename])?;
+    }
+    Ok(())
+}
+
+fn write_checkpoint(
+    transaction: &Transaction<'_>,
+    checkpoint: Option<(u64, [u8; 32])>,
+) -> Result<(), CatalogError> {
+    let (generation, head) = match checkpoint {
+        Some((generation, head)) => (
+            Some(
+                i64::try_from(generation)
+                    .map_err(|_| CatalogError::Corrupt("generation overflow"))?,
+            ),
+            Some(head),
+        ),
+        None => (None, None),
+    };
+    transaction.execute(
+        "UPDATE checkpoint SET generation = ?1, head_digest = ?2 WHERE singleton = 1",
+        params![generation, head.as_ref().map(|digest| digest.as_slice())],
+    )?;
+    Ok(())
 }
 
 fn read_chain(directory: &Path) -> Result<Vec<CatalogItem>, CatalogError> {

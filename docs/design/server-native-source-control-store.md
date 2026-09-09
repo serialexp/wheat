@@ -154,10 +154,12 @@ described here.
 - [~] **Phase 2 — indexed sealed segments and ranged reads.** The local backend now
   packs canonical metadata and small content into immutable BinSchema-defined,
   footer-indexed segments with paged sorted indexes, authenticated directories,
-  an additive crash-safe catalog, and a rebuildable SQLite locator. Large content
-  remains standalone. Local reopen/corruption/interrupted-install tests exist;
-  remote range reads, coalescing, compaction, GC, and broader failure injection
-  remain unqualified.
+  an additive crash-safe catalog, and a persistent derived SQLite locator tied to an atomically
+  published catalog head. Ordinary reopen reuses that locator without enumerating or
+  authenticating all historical segments; legacy, missing, stale, or corrupt locator state is
+  rebuilt from the immutable chain. Large content remains standalone. Local
+  reopen/corruption/interrupted-install tests exist; remote range reads, coalescing, compaction,
+  GC, and broader failure injection remain unqualified.
 - [ ] **Phase 2 — conservative loose-object collection.** Never collect an
   unreachable loose object less than 24 hours after its backend modification
   time; verify the proposed closure immediately before publication and initially
