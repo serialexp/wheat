@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    os::unix::fs::symlink,
+    path::{Path, PathBuf},
+};
 
 use wheat_git::{AtomicImportError, atomic_import, finalize_import, stage_import};
 use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
@@ -61,6 +64,21 @@ fn oversized_binary_fixture() -> tempfile::TempDir {
     root
 }
 
+fn private_stage(root: &Path, destination: &str, id: &str) -> PathBuf {
+    root.join(format!(".{destination}.wheat-import-{id}.tmp"))
+}
+
+fn stage_names(root: &Path, destination: &str) -> Vec<String> {
+    let prefix = format!(".{destination}.wheat-import-");
+    let mut names = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix) && name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 #[tokio::test]
 async fn atomic_and_resumable_imports_publish_the_same_envelope() {
     let git = fixture();
@@ -119,6 +137,75 @@ async fn atomic_and_resumable_imports_publish_the_same_envelope() {
 }
 
 #[tokio::test]
+async fn resumable_packed_import_reopens_before_authenticated_publication() {
+    let git = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let repository = root.path().join("resumable");
+    std::fs::create_dir(&repository).unwrap();
+    let storage = repository.join("storage");
+    let journal = repository.join("import.sqlite");
+    let publication_path = repository.join("repository.head");
+
+    {
+        let objects = PackedObjectStore::open(&storage).unwrap();
+        let content = objects.content_store();
+        let progress = stage_import(git.path(), &journal, &objects, &content, Some(1))
+            .await
+            .unwrap();
+        assert!(!progress.complete);
+        drop(content);
+        objects.close().unwrap();
+    }
+
+    {
+        let objects = PackedObjectStore::open(&storage).unwrap();
+        let content = objects.content_store();
+        loop {
+            let progress = stage_import(git.path(), &journal, &objects, &content, None)
+                .await
+                .unwrap();
+            if progress.complete {
+                break;
+            }
+        }
+        drop(content);
+        objects.close().unwrap();
+    }
+
+    let head = {
+        let objects = PackedObjectStore::open(&storage).unwrap();
+        let content = objects.content_store();
+        let publications = LocalPublicationStore::new(&publication_path);
+        let head = finalize_import(
+            git.path(),
+            &journal,
+            &objects,
+            &content,
+            &publications,
+            "refs/heads/main",
+        )
+        .await
+        .unwrap();
+        assert_eq!(publications.read().unwrap(), head);
+        drop(content);
+        objects.close().unwrap();
+        head
+    };
+
+    // Publication is trusted only after a fresh packed-store open authenticates
+    // the active segment and every object reachable from the published envelope.
+    let objects = PackedObjectStore::open(&storage).unwrap();
+    let content = objects.content_store();
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    reader.validate_complete(envelope.state).await.unwrap();
+    assert_eq!(
+        LocalPublicationStore::new(publication_path).read().unwrap(),
+        head
+    );
+}
+
+#[tokio::test]
 async fn atomic_import_retains_binary_content_above_the_guarded_text_limit() {
     let (git, expected) = large_binary_fixture();
     let root = tempfile::tempdir().unwrap();
@@ -166,12 +253,80 @@ async fn atomic_import_rejects_a_file_above_the_in_memory_import_bound() {
 }
 
 #[tokio::test]
-async fn atomic_import_never_replaces_an_existing_destination() {
+async fn atomic_import_removes_only_marker_authenticated_stale_stages_for_its_destination() {
     let git = fixture();
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("repository");
+    let stale = private_stage(root.path(), "repository", "stale");
+    let other_destination = private_stage(root.path(), "elsewhere", "stale");
+    let similarly_named_destination = private_stage(root.path(), "repository-copy", "stale");
+    let malformed = private_stage(root.path(), "repository", "malformed");
+    let missing_marker = private_stage(root.path(), "repository", "missing-marker");
+    let marker_directory = private_stage(root.path(), "repository", "marker-directory");
+    let marker_symlink = private_stage(root.path(), "repository", "marker-symlink");
+    let stage_symlink = private_stage(root.path(), "repository", "stage-symlink");
+    let symlink_target = root.path().join("symlink-target");
+
+    for path in [
+        &stale,
+        &other_destination,
+        &similarly_named_destination,
+        &malformed,
+        &missing_marker,
+        &marker_directory,
+        &marker_symlink,
+        &symlink_target,
+    ] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::write(path.join("sentinel"), b"keep").unwrap();
+    }
+    std::fs::write(stale.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+    for path in [&other_destination, &similarly_named_destination] {
+        std::fs::write(path.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+    }
+    std::fs::write(malformed.join("import.marker"), b"wrong\n").unwrap();
+    std::fs::create_dir(marker_directory.join("import.marker")).unwrap();
+    let external_marker = root.path().join("external-marker");
+    std::fs::write(&external_marker, b"wheat-atomic-import-v1\n").unwrap();
+    symlink(&external_marker, marker_symlink.join("import.marker")).unwrap();
+    symlink(&symlink_target, &stage_symlink).unwrap();
+
+    atomic_import(git.path(), &destination, "refs/heads/main")
+        .await
+        .unwrap();
+
+    assert!(!stale.exists());
+    for path in [
+        &other_destination,
+        &similarly_named_destination,
+        &malformed,
+        &missing_marker,
+        &marker_directory,
+        &marker_symlink,
+        &symlink_target,
+    ] {
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"keep");
+    }
+    assert!(
+        stage_symlink
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[tokio::test]
+async fn destination_exists_does_not_clean_authenticated_stale_stages() {
+    let git = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("repository");
+    let stale = private_stage(root.path(), "repository", "stale");
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("sentinel"), b"keep").unwrap();
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+    std::fs::write(stale.join("sentinel"), b"stale").unwrap();
 
     assert!(matches!(
         atomic_import(git.path(), &destination, "refs/heads/main").await,
@@ -181,19 +336,42 @@ async fn atomic_import_never_replaces_an_existing_destination() {
         std::fs::read(destination.join("sentinel")).unwrap(),
         b"keep"
     );
+    assert_eq!(std::fs::read(stale.join("sentinel")).unwrap(), b"stale");
 }
 
 #[tokio::test]
-async fn atomic_failure_removes_its_private_stage_and_leaves_no_destination() {
+async fn repeated_atomic_failures_do_not_accumulate_private_stages() {
+    let git = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("repository");
+    let stale = private_stage(root.path(), "repository", "stale");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+
+    for _ in 0..3 {
+        assert!(
+            atomic_import(git.path(), &destination, "refs/heads/missing")
+                .await
+                .is_err()
+        );
+        assert!(stage_names(root.path(), "repository").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn atomic_finalization_failure_removes_its_private_stage_and_leaves_no_destination() {
     let git = fixture();
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("repository");
 
-    assert!(
-        atomic_import(git.path(), &destination, "refs/heads/missing")
-            .await
-            .is_err()
-    );
+    let error = atomic_import(git.path(), &destination, "refs/heads/missing")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AtomicImportError::Finalize(wheat_git::FinalizeImportError::UnknownWorkingBranch(branch))
+            if branch == "refs/heads/missing"
+    ));
     assert!(!destination.exists());
     let leftovers = std::fs::read_dir(root.path())
         .unwrap()

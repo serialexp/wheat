@@ -16,8 +16,8 @@ mod local;
 mod workspace;
 mod workspace_files;
 use local::{
-    content_store, current_conflicts, current_revisions, initialize, open, repository_summary,
-    revision_with_edits, runtime,
+    content_store, current_conflicts, current_revisions, initialize, open, projection_path,
+    repository_summary, revision_with_edits, runtime,
 };
 
 #[derive(Debug, Parser)]
@@ -56,6 +56,8 @@ enum Command {
     Change(ChangeCommand),
     /// Resolve a durable conflict with an exact tree entry.
     Resolve(ResolveArgs),
+    /// Project Wheat revision history and push it to a Git branch.
+    Push(PushArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -155,6 +157,21 @@ impl From<CliFileKind> for FileKind {
             CliFileKind::Symlink => Self::Symlink,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct PushArgs {
+    /// Git remote URL. It is passed to Git and never persisted by Wheat.
+    remote: String,
+    /// Full destination branch ref, for example refs/heads/main.
+    #[arg(long)]
+    to: String,
+    /// Wheat source: published, working, or branch:<name>.
+    #[arg(long, default_value = "published")]
+    source: String,
+    /// Replace an unknown/diverged destination only if it still has the observed OID.
+    #[arg(long)]
+    force_with_lease: bool,
 }
 
 #[derive(Debug, Args)]
@@ -328,7 +345,71 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Resolve(arguments) => resolve(&cli.repository, arguments),
+        Command::Push(arguments) => push(&cli.repository, arguments),
     }
+}
+
+fn push(root: &std::path::Path, arguments: PushArgs) -> Result<()> {
+    let local = open(root)?;
+    let expected = local.heads.read()?;
+    let runtime = runtime()?;
+    let (base, selected) = runtime.block_on(async {
+        let reader = RepositoryReader::new(&local.objects, &local.content);
+        let envelope = reader.validate_envelope(expected.envelope).await?;
+        let state = reader.state(envelope.state).await?;
+        let selected = match arguments.source.as_str() {
+            "published" => state.published_view,
+            "working" => state.working_view,
+            source if source.starts_with("branch:") => {
+                let name = source.strip_prefix("branch:").expect("matched prefix");
+                let branches = reader.branch_manifest(envelope.branches).await?;
+                *branches
+                    .branches
+                    .get(name)
+                    .with_context(|| format!("unknown Wheat branch {name}"))?
+            }
+            _ => bail!("source must be published, working, or branch:<name>"),
+        };
+        Ok::<_, anyhow::Error>((state.base_view, selected))
+    })?;
+    let prepared = runtime.block_on(wheat_git::bridge::prepare_push(
+        &local.objects,
+        &local.content,
+        selected,
+        base,
+        &projection_path(root)?,
+        &arguments.remote,
+        &arguments.to,
+        arguments.force_with_lease,
+    ))?;
+    let actual = local.heads.read()?;
+    if actual != expected {
+        bail!("Wheat repository changed while preparing the Git projection; retry the push");
+    }
+    let projected = prepared
+        .export
+        .projected
+        .iter()
+        .filter(|application| !application.reused_anchor)
+        .count();
+    let tip = prepared
+        .export
+        .tip
+        .context("projection did not produce a Git commit")?;
+    let report = wheat_git::bridge::publish_prepared(prepared)?;
+    let outcome = report.refs.first().context("git returned no ref status")?;
+    match outcome.status {
+        wheat_git::push::RefStatus::UpToDate => {
+            println!("{} is already at {tip}", arguments.to);
+        }
+        _ => {
+            println!(
+                "pushed {projected} Wheat revisions to {} at {tip}",
+                arguments.to
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<()> {

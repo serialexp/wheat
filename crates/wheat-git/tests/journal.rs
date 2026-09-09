@@ -27,6 +27,27 @@ fn restart_preserves_pending_and_completed_work() {
 }
 
 #[test]
+fn journals_from_before_or_after_the_prepared_protocol_are_rejected() {
+    for version in [1, 3] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE journal_identity (singleton INTEGER PRIMARY KEY, format_version INTEGER NOT NULL, source_snapshot BLOB NOT NULL);\
+                 INSERT INTO journal_identity VALUES (1, {version}, X'736E617073686F74');"
+            ))
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            ImportJournal::open(&path, b"snapshot"),
+            Err(JournalError::SnapshotMismatch)
+        ));
+    }
+}
+
+#[test]
 fn source_snapshot_mismatch_fails() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("import.sqlite");
@@ -89,6 +110,128 @@ fn completion_cannot_skip_missing_or_incomplete_parent() {
     assert_eq!(journal.result(b"child").unwrap(), None);
     journal.complete(b"parent", native(1)).unwrap();
     journal.complete(b"child", native(2)).unwrap();
+}
+
+#[test]
+fn prepared_parents_schedule_dependents_without_becoming_completed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut journal =
+        ImportJournal::open(directory.path().join("import.sqlite"), b"snapshot").unwrap();
+    journal.add_pending(b"root", &[]).unwrap();
+    journal.add_pending(b"child", &[b"root".to_vec()]).unwrap();
+
+    journal.begin_preparing().unwrap();
+    journal.prepare(b"root", native(1)).unwrap();
+    assert_eq!(journal.result(b"root").unwrap(), None);
+    assert_eq!(journal.mapping(b"root").unwrap(), Some(native(1)));
+    assert_eq!(journal.ready(1).unwrap()[0].oid, b"child");
+    journal.prepare(b"child", native(2)).unwrap();
+    journal.commit_preparing().unwrap();
+
+    let prepared = journal.prepared(2).unwrap();
+    assert_eq!(
+        prepared
+            .iter()
+            .map(|(oid, _)| oid.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"root".as_slice(), b"child".as_slice()]
+    );
+    journal.complete_many(&prepared).unwrap();
+    assert_eq!(journal.result(b"root").unwrap(), Some(native(1)));
+    assert_eq!(journal.result(b"child").unwrap(), Some(native(2)));
+}
+
+#[test]
+fn complete_many_accepts_a_child_before_its_parent_in_the_same_set() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut journal =
+        ImportJournal::open(directory.path().join("import.sqlite"), b"snapshot").unwrap();
+    journal.add_pending(b"root", &[]).unwrap();
+    journal.add_pending(b"child", &[b"root".to_vec()]).unwrap();
+    journal.begin_preparing().unwrap();
+    journal.prepare(b"root", native(1)).unwrap();
+    journal.prepare(b"child", native(2)).unwrap();
+    journal.commit_preparing().unwrap();
+
+    journal
+        .complete_many(&[
+            (b"child".to_vec(), native(2)),
+            (b"root".to_vec(), native(1)),
+        ])
+        .unwrap();
+    assert_eq!(journal.result(b"root").unwrap(), Some(native(1)));
+    assert_eq!(journal.result(b"child").unwrap(), Some(native(2)));
+}
+
+#[test]
+fn complete_many_rejects_a_subset_without_its_prepared_parent_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut journal =
+        ImportJournal::open(directory.path().join("import.sqlite"), b"snapshot").unwrap();
+    journal.add_pending(b"root", &[]).unwrap();
+    journal.add_pending(b"child", &[b"root".to_vec()]).unwrap();
+    journal.begin_preparing().unwrap();
+    journal.prepare(b"root", native(1)).unwrap();
+    journal.prepare(b"child", native(2)).unwrap();
+    journal.commit_preparing().unwrap();
+
+    assert!(matches!(
+        journal.complete_many(&[(b"child".to_vec(), native(2))]),
+        Err(JournalError::IncompleteParents)
+    ));
+    assert_eq!(journal.result(b"root").unwrap(), None);
+    assert_eq!(journal.result(b"child").unwrap(), None);
+    assert_eq!(journal.prepared(2).unwrap().len(), 2);
+}
+
+#[test]
+fn complete_many_rejects_a_missing_parent_even_if_the_child_is_prepared() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("import.sqlite");
+    let mut journal = ImportJournal::open(&path, b"snapshot").unwrap();
+    journal
+        .add_pending(b"child", &[b"missing".to_vec()])
+        .unwrap();
+    drop(journal);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO prepared_work(oid, change_id, revision_id, view_id, application_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![b"child", native(2).change_id.as_bytes().as_slice(), native(2).revision_id.as_bytes().as_slice(), native(2).view_id.as_bytes().as_slice(), native(2).application_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+    drop(connection);
+    let mut journal = ImportJournal::open(&path, b"snapshot").unwrap();
+
+    assert!(matches!(
+        journal.complete_many(&[(b"child".to_vec(), native(2))]),
+        Err(JournalError::IncompleteParents)
+    ));
+    assert_eq!(journal.result(b"child").unwrap(), None);
+}
+
+#[test]
+fn complete_many_is_atomic_when_any_prepared_mapping_conflicts() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut journal =
+        ImportJournal::open(directory.path().join("import.sqlite"), b"snapshot").unwrap();
+    journal.add_pending(b"first", &[]).unwrap();
+    journal.add_pending(b"second", &[]).unwrap();
+    journal.begin_preparing().unwrap();
+    journal.prepare(b"first", native(1)).unwrap();
+    journal.prepare(b"second", native(2)).unwrap();
+    journal.commit_preparing().unwrap();
+
+    assert!(matches!(
+        journal.complete_many(&[
+            (b"first".to_vec(), native(1)),
+            (b"second".to_vec(), native(3)),
+        ]),
+        Err(JournalError::ConflictingCompletion)
+    ));
+    assert_eq!(journal.result(b"first").unwrap(), None);
+    assert_eq!(journal.result(b"second").unwrap(), None);
+    assert_eq!(journal.prepared(2).unwrap().len(), 2);
 }
 
 #[test]

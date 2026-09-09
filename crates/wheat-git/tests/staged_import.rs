@@ -1,7 +1,116 @@
-use std::{path::Path, process::Command};
-use wheat_core::EditOperation;
+use std::{
+    path::Path,
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use async_trait::async_trait;
+use wheat_core::{EditOperation, ObjectId, RevisionId, ViewId};
 use wheat_git::{DEFAULT_STAGE_COMMITS, import_repository, stage_import};
-use wheat_store::{ContentStore, LooseObjectStore, PackedObjectStore, RepositoryReader};
+use wheat_store::{
+    ContentStore, ImmutableObjectStore, LooseObjectStore, ObjectStoreError, PackedObjectStore,
+    RepositoryReader, StoredObject,
+};
+
+#[derive(Clone, Copy)]
+enum BatchFault {
+    None,
+    Error { batch: usize, after_writes: usize },
+    MissingSuccess { batch: usize },
+}
+
+struct ObservedStore {
+    inner: LooseObjectStore,
+    batches: AtomicUsize,
+    fault: BatchFault,
+}
+
+struct BlockedGetStore {
+    inner: LooseObjectStore,
+    blocked: ObjectId,
+}
+
+impl ObservedStore {
+    fn new(path: impl Into<std::path::PathBuf>, fault: BatchFault) -> Self {
+        Self {
+            inner: LooseObjectStore::new(path),
+            batches: AtomicUsize::new(0),
+            fault,
+        }
+    }
+}
+
+#[async_trait]
+impl ImmutableObjectStore for ObservedStore {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        let batch = self.batches.fetch_add(1, Ordering::SeqCst) + 1;
+        match self.fault {
+            BatchFault::Error {
+                batch: failed,
+                after_writes,
+            } if batch == failed => {
+                for (id, bytes) in objects.iter().take(after_writes) {
+                    self.inner.put_if_absent(*id, bytes).await?;
+                }
+                Err(ObjectStoreError::Backend("injected batch failure".into()))
+            }
+            // Simulate a backend that acknowledges the write without publishing
+            // any of the requested objects. Post-flush authentication must catch it.
+            BatchFault::MissingSuccess { batch: failed } if batch == failed => Ok(()),
+            _ => self.inner.put_batch(objects, concurrency).await,
+        }
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.inner.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.inner.exists_many(ids).await
+    }
+}
+
+#[async_trait]
+impl ImmutableObjectStore for BlockedGetStore {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        if id == self.blocked {
+            return Err(ObjectStoreError::Missing(id));
+        }
+        self.inner.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.inner.exists_many(ids).await
+    }
+}
 
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -21,6 +130,17 @@ fn git(root: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(out.stdout).unwrap().trim().into()
 }
+fn linear_fixture(commits: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-b", "main"]);
+    for number in 0..commits {
+        std::fs::write(dir.path().join("file"), number.to_string()).unwrap();
+        git(dir.path(), &["add", "file"]);
+        git(dir.path(), &["commit", "-m", "next"]);
+    }
+    dir
+}
+
 fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-b", "main"]);
@@ -101,6 +221,8 @@ async fn packed_restart_resume_matches_loose_reference_and_never_checkpoints_mis
         stage_import(git.path(), &journal, &objects, &content, Some(1))
             .await
             .unwrap();
+        drop(content);
+        objects.close().unwrap();
     }
     let objects = PackedObjectStore::open(directory.path().join("packed")).unwrap();
     let content = objects.content_store();
@@ -242,6 +364,249 @@ async fn repeated_line_deletion_uses_a_conservative_guarded_envelope() {
 }
 
 #[tokio::test]
+async fn dependent_linear_commits_share_one_bounded_acknowledgement_batch() {
+    let git = linear_fixture(8);
+    let dir = tempfile::tempdir().unwrap();
+    let objects = ObservedStore::new(dir.path().join("objects"), BatchFault::None);
+    let content = ContentStore::new(dir.path().join("content"));
+    let result = stage_import(
+        git.path(),
+        dir.path().join("import.sqlite"),
+        &objects,
+        &content,
+        Some(8),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.complete);
+    assert_eq!(result.completed_commits, 8);
+    assert_eq!(objects.batches.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_batch_flush_completes_nothing_and_resume_is_idempotent() {
+    let git = linear_fixture(4);
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("import.sqlite");
+    let objects = ObservedStore::new(
+        dir.path().join("objects"),
+        BatchFault::Error {
+            batch: 2,
+            after_writes: 1,
+        },
+    );
+    let content = ContentStore::new(dir.path().join("content"));
+
+    assert!(
+        stage_import(git.path(), &journal_path, &objects, &content, Some(4))
+            .await
+            .is_err()
+    );
+    let completed: i64 = rusqlite::Connection::open(&journal_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM work WHERE status = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(completed, 0);
+
+    let resumed = stage_import(git.path(), &journal_path, &objects, &content, Some(4))
+        .await
+        .unwrap();
+    assert!(resumed.complete);
+    assert_eq!(resumed.completed_commits, 4);
+    let repeated = stage_import(git.path(), &journal_path, &objects, &content, Some(4))
+        .await
+        .unwrap();
+    assert_eq!(repeated, resumed);
+}
+
+#[tokio::test]
+async fn invalid_completed_ancestry_prevents_prepared_descendant_promotion() {
+    let git = linear_fixture(2);
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("import.sqlite");
+    let object_path = dir.path().join("objects");
+    let objects = LooseObjectStore::new(&object_path);
+    let content = ContentStore::new(dir.path().join("content"));
+    stage_import(git.path(), &journal_path, &objects, &content, Some(2))
+        .await
+        .unwrap();
+
+    let mut connection = rusqlite::Connection::open(&journal_path).unwrap();
+    let blocked: Vec<u8> = connection
+        .query_row(
+            "SELECT revision_id FROM work ORDER BY sequence LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute_batch(
+            "INSERT INTO prepared_work(oid, change_id, revision_id, view_id, application_id) \
+             SELECT oid, change_id, revision_id, view_id, application_id FROM work ORDER BY sequence DESC LIMIT 1; \
+             UPDATE work SET status = 0, change_id = NULL, revision_id = NULL, view_id = NULL, application_id = NULL \
+             WHERE sequence = (SELECT MAX(sequence) FROM work);",
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let objects = BlockedGetStore {
+        inner: LooseObjectStore::new(object_path),
+        blocked: ObjectId::from_digest(blocked.try_into().unwrap()),
+    };
+    assert!(
+        stage_import(git.path(), &journal_path, &objects, &content, Some(0))
+            .await
+            .is_err()
+    );
+    let connection = rusqlite::Connection::open(&journal_path).unwrap();
+    let child_status: i64 = connection
+        .query_row(
+            "SELECT status FROM work ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let prepared: i64 = connection
+        .query_row("SELECT COUNT(*) FROM prepared_work", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(child_status, 0);
+    assert_eq!(prepared, 1);
+}
+
+#[tokio::test]
+async fn nominally_successful_flush_with_a_missing_object_completes_nothing() {
+    let git = linear_fixture(2);
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("import.sqlite");
+    let objects = ObservedStore::new(
+        dir.path().join("objects"),
+        BatchFault::MissingSuccess { batch: 2 },
+    );
+    let content = ContentStore::new(dir.path().join("content"));
+
+    assert!(
+        stage_import(git.path(), &journal_path, &objects, &content, Some(2))
+            .await
+            .is_err()
+    );
+    let connection = rusqlite::Connection::open(&journal_path).unwrap();
+    let completed: i64 = connection
+        .query_row("SELECT COUNT(*) FROM work WHERE status = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(completed, 0);
+}
+
+#[tokio::test]
+async fn packed_resume_authenticates_and_promotes_prepared_mappings_after_reopen() {
+    let git = linear_fixture(3);
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("import.sqlite");
+    let storage = dir.path().join("packed");
+
+    let staged = {
+        let objects = PackedObjectStore::open(&storage).unwrap();
+        let content = objects.content_store();
+        let staged = stage_import(git.path(), &journal_path, &objects, &content, Some(3))
+            .await
+            .unwrap();
+        assert!(staged.complete);
+        drop(content);
+        objects.close().unwrap();
+        staged
+    };
+
+    // Model the durable journal boundary left by a crash after preparation and
+    // object flush but before the mappings were promoted to completed work.
+    let mut connection = rusqlite::Connection::open(&journal_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute_batch(
+            "INSERT INTO prepared_work(oid, change_id, revision_id, view_id, application_id) \
+             SELECT oid, change_id, revision_id, view_id, application_id FROM work WHERE status = 1; \
+             UPDATE work SET status = 0, change_id = NULL, revision_id = NULL, view_id = NULL, application_id = NULL;",
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let objects = PackedObjectStore::open(&storage).unwrap();
+    let content = objects.content_store();
+    let resumed = stage_import(git.path(), &journal_path, &objects, &content, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(resumed, staged);
+    let repeated = stage_import(git.path(), &journal_path, &objects, &content, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(repeated, staged);
+
+    // Authentication and promotion must use reopened packed bytes, rather than
+    // invocation-local buffers or the prepared journal rows as authority.
+    let connection = rusqlite::Connection::open(&journal_path).unwrap();
+    let mappings = {
+        let mut statement = connection
+            .prepare("SELECT revision_id, view_id FROM work ORDER BY sequence")
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    drop(connection);
+    let reader = RepositoryReader::new(&objects, &content);
+    for (revision, view) in mappings {
+        let revision = RevisionId::from_digest(revision.try_into().unwrap());
+        let view = ViewId::from_digest(view.try_into().unwrap());
+        assert_eq!(reader.revision(revision).await.unwrap().id(), revision);
+        assert_eq!(reader.view(view).await.unwrap().id(), view);
+    }
+}
+
+#[tokio::test]
+async fn resume_promotes_fully_durable_prepared_mappings_idempotently() {
+    let git = linear_fixture(3);
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("import.sqlite");
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let staged = stage_import(git.path(), &journal_path, &objects, &content, Some(3))
+        .await
+        .unwrap();
+    assert!(staged.complete);
+
+    let mut connection = rusqlite::Connection::open(&journal_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute_batch(
+            "INSERT INTO prepared_work(oid, change_id, revision_id, view_id, application_id) \
+             SELECT oid, change_id, revision_id, view_id, application_id FROM work WHERE status = 1; \
+             UPDATE work SET status = 0, change_id = NULL, revision_id = NULL, view_id = NULL, application_id = NULL;",
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let resumed = stage_import(git.path(), &journal_path, &objects, &content, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(resumed, staged);
+    let repeated = stage_import(git.path(), &journal_path, &objects, &content, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(repeated, staged);
+}
+
+#[tokio::test]
 async fn default_stage_budget_leaves_large_history_incomplete_then_resumes() {
     let git = tempfile::tempdir().unwrap();
     self::git(git.path(), &["init", "-b", "main"]);
@@ -266,6 +631,39 @@ async fn default_stage_budget_leaves_large_history_incomplete_then_resumes() {
             .unwrap();
     }
     assert_eq!(result.completed_commits, DEFAULT_STAGE_COMMITS + 1);
+}
+
+#[tokio::test]
+async fn oversized_stage_budget_is_capped_and_resumable() {
+    let git = linear_fixture(DEFAULT_STAGE_COMMITS + 1);
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let journal = dir.path().join("import.sqlite");
+
+    let first = stage_import(
+        git.path(),
+        &journal,
+        &objects,
+        &content,
+        Some(DEFAULT_STAGE_COMMITS + 100),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.completed_commits, DEFAULT_STAGE_COMMITS);
+    assert!(!first.complete);
+
+    let resumed = stage_import(
+        git.path(),
+        &journal,
+        &objects,
+        &content,
+        Some(DEFAULT_STAGE_COMMITS + 100),
+    )
+    .await
+    .unwrap();
+    assert!(resumed.complete);
+    assert_eq!(resumed.completed_commits, DEFAULT_STAGE_COMMITS + 1);
 }
 
 #[tokio::test]

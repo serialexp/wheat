@@ -11,10 +11,7 @@ use wheat_core::{ContentId, ObjectId, validate_canonical_object};
 
 use super::{
     catalog::{CatalogError, PackedCatalog},
-    segment::{
-        CONTENT_NAMESPACE, MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE,
-        SegmentRecord,
-    },
+    segment::{CONTENT_NAMESPACE, METADATA_NAMESPACE, SegmentRecord},
 };
 use crate::content_store::ContentBackend;
 use crate::{
@@ -101,6 +98,35 @@ impl PackedObjectStore {
         )
     }
 
+    /// Explicitly closes every packed-store file handle and releases its process lock.
+    ///
+    /// Closing consumes this handle and fails while another object-store clone or a content
+    /// adapter still references the same engine. Callers performing a terminal filesystem sync
+    /// must drop those handles first so close-time SQLite errors are observable before the sync.
+    #[cfg(test)]
+    pub(crate) fn test_fail_close_before_finalize(&self) -> Result<(), ObjectStoreError> {
+        self.catalog()?
+            .test_set_close_failpoint(super::catalog::CloseFailpoint::BeforeFinalize);
+        Ok(())
+    }
+
+    pub fn close(self) -> Result<(), ObjectStoreError> {
+        let engine = Arc::try_unwrap(self.engine).map_err(|_| {
+            ObjectStoreError::Backend(
+                "StillReferenced: packed object/content store handles remain live".into(),
+            )
+        })?;
+        let catalog = Arc::try_unwrap(engine.catalog)
+            .map_err(|_| {
+                ObjectStoreError::Backend(
+                    "StillReferenced: packed catalog handle remains live".into(),
+                )
+            })?
+            .into_inner()
+            .map_err(|_| ObjectStoreError::Backend("packed catalog mutex poisoned".into()))?;
+        catalog.close().map_err(object_catalog_error)
+    }
+
     fn catalog(&self) -> Result<MutexGuard<'_, PackedCatalog>, ObjectStoreError> {
         self.engine
             .catalog
@@ -164,19 +190,8 @@ impl ImmutableObjectStore for PackedObjectStore {
         if !loose.is_empty() {
             self.engine.objects.put_batch(&loose, concurrency).await?;
         }
-        let mut start = 0;
-        while start < packed.len() {
-            let mut end = start;
-            let mut bytes = 0usize;
-            while end < packed.len() && end - start < MAX_SEGMENT_ENTRIES {
-                let next = packed[end].2.len();
-                if end > start && bytes.saturating_add(next) > MAX_SEGMENT_PAYLOAD_BYTES as usize {
-                    break;
-                }
-                bytes += next;
-                end += 1;
-            }
-            let records = packed[start..end]
+        if !packed.is_empty() {
+            let records = packed
                 .iter()
                 .map(|(id, kind, data)| SegmentRecord {
                     namespace: METADATA_NAMESPACE,
@@ -188,7 +203,6 @@ impl ImmutableObjectStore for PackedObjectStore {
             self.catalog()?
                 .put_records(&records)
                 .map_err(object_catalog_error)?;
-            start = end;
         }
         Ok(())
     }
@@ -230,6 +244,7 @@ impl ImmutableObjectStore for PackedObjectStore {
     }
 }
 
+#[async_trait]
 impl ContentBackend for PackedEngine {
     fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError> {
         let mut packed = Vec::new();
@@ -247,19 +262,8 @@ impl ContentBackend for PackedEngine {
                 packed.push((*id, bytes));
             }
         }
-        let mut start = 0;
-        while start < packed.len() {
-            let mut end = start;
-            let mut size = 0usize;
-            while end < packed.len() && end - start < MAX_SEGMENT_ENTRIES {
-                let next = packed[end].1.len();
-                if end > start && size.saturating_add(next) > MAX_SEGMENT_PAYLOAD_BYTES as usize {
-                    break;
-                }
-                size += next;
-                end += 1;
-            }
-            let records = packed[start..end]
+        if !packed.is_empty() {
+            let records = packed
                 .iter()
                 .map(|(id, bytes)| SegmentRecord {
                     namespace: CONTENT_NAMESPACE,
@@ -275,7 +279,6 @@ impl ContentBackend for PackedEngine {
                 })?
                 .put_records(&records)
                 .map_err(content_catalog_error)?;
-            start = end;
         }
         Ok(())
     }
@@ -295,5 +298,27 @@ impl ContentBackend for PackedEngine {
         // SegmentReader authenticated the immutable segment and verified this
         // payload against the requested content digest before returning it.
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_close_failure_is_returned_by_packed_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PackedObjectStore::open_deferred(root.path()).unwrap();
+        store.test_fail_close_before_finalize().unwrap();
+        let error = store.close().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("test failure before deferred bulk finalization")
+        );
+        PackedObjectStore::open_deferred(root.path())
+            .unwrap()
+            .close()
+            .unwrap();
     }
 }

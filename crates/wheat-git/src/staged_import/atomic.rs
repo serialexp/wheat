@@ -1,8 +1,11 @@
 use std::{
-    ffi::CString,
+    ffi::{CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io,
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    io::{self, Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -18,7 +21,9 @@ use super::{
     stage_import_deferred,
 };
 
-const MARKER: &str = "wheat-atomic-import-v1\n";
+const MARKER_NAME: &str = "import.marker";
+const MARKER: &[u8] = b"wheat-atomic-import-v1\n";
+const STAGE_SUFFIX: &[u8] = b".tmp";
 
 #[derive(Debug, Error)]
 pub enum AtomicImportError {
@@ -64,7 +69,8 @@ pub async fn atomic_import(
         );
     }
 
-    let lock_path = parent.join(format!(".{}.wheat-import.lock", name.to_string_lossy()));
+    let stage_prefix = private_stage_prefix(name);
+    let lock_path = parent.join(private_lock_name(name));
     let lock = DestinationLock::acquire(lock_path)?;
     if destination.exists() {
         return Err(AtomicImportError::DestinationExists(
@@ -72,14 +78,15 @@ pub async fn atomic_import(
         ));
     }
 
-    let staging = parent.join(format!(
-        ".{}.wheat-import-{}.tmp",
-        name.to_string_lossy(),
-        Uuid::new_v4()
-    ));
+    remove_stale_stages(parent, &stage_prefix)?;
+
+    let mut staging_name = stage_prefix.clone();
+    staging_name.push(Uuid::new_v4().to_string());
+    staging_name.push(OsStr::from_bytes(STAGE_SUFFIX));
+    let staging = parent.join(staging_name);
     fs::create_dir(&staging)?;
     let mut cleanup = StageCleanup::new(staging.clone());
-    fs::write(staging.join("import.marker"), MARKER)?;
+    write_stage_marker(&staging)?;
 
     let head = {
         let objects = PackedObjectStore::open_deferred(staging.join("storage"))?;
@@ -107,7 +114,11 @@ pub async fn atomic_import(
         )
         .await?;
         // Finalization has just validated this exact envelope against the isolated
-        // backing store. The terminal barrier makes those validated bytes durable.
+        // backing store. Close every content/SQLite/pack handle before the terminal
+        // barrier so buffered writes and close errors cannot cross the atomic rename.
+        drop(content);
+        drop(publications);
+        objects.close()?;
         sync_filesystem(&staging)?;
         head
     };
@@ -117,6 +128,76 @@ pub async fn atomic_import(
     sync_directory(parent)?;
     drop(lock);
     Ok(head)
+}
+
+fn private_stage_prefix(destination_name: &OsStr) -> OsString {
+    let mut prefix = OsString::from(".");
+    prefix.push(destination_name);
+    prefix.push(".wheat-import-");
+    prefix
+}
+
+fn private_lock_name(destination_name: &OsStr) -> OsString {
+    let mut name = OsString::from(".");
+    name.push(destination_name);
+    name.push(".wheat-import.lock");
+    name
+}
+
+fn write_stage_marker(staging: &Path) -> io::Result<()> {
+    let marker_path = staging.join(MARKER_NAME);
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(marker_path)?;
+    marker.write_all(MARKER)?;
+    marker.sync_all()?;
+    sync_directory(staging)
+}
+
+fn remove_stale_stages(parent: &Path, prefix: &OsStr) -> io::Result<()> {
+    let prefix = prefix.as_bytes();
+    let mut removed_any = false;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.as_bytes();
+        if !name.starts_with(prefix) || !name.ends_with(STAGE_SUFFIX) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() || !has_exact_stage_marker(&entry.path()) {
+            continue;
+        }
+        fs::remove_dir_all(entry.path())?;
+        removed_any = true;
+    }
+    if removed_any {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn has_exact_stage_marker(candidate: &Path) -> bool {
+    let marker = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(candidate.join(MARKER_NAME))
+    {
+        Ok(marker) => marker,
+        Err(_) => return false,
+    };
+    let metadata = match marker.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    if !metadata.file_type().is_file() || metadata.len() != MARKER.len() as u64 {
+        return false;
+    }
+    let mut contents = [0_u8; MARKER.len()];
+    let mut marker = marker;
+    marker.read_exact(&mut contents).is_ok() && contents == MARKER
 }
 
 struct DestinationLock {

@@ -4,25 +4,33 @@
 //! `wheat_core`: prefix, payload bytes, sorted index pages, page directory, and
 //! footer. The footer's body digest covers every byte before the footer.
 
+#[cfg(test)]
+use std::path::Path;
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
-    path::Path,
 };
 
+#[cfg(test)]
 use tempfile::NamedTempFile;
 use thiserror::Error;
+#[cfg(test)]
+use wheat_core::encode_segment_prefix;
 use wheat_core::{
-    ContentId, ObjectId, SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_NAMESPACE_CONTENT,
-    SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE, SegmentDirectory,
-    SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry, SegmentIndexKey,
-    SegmentIndexPage, SegmentRecordError, decode_segment_directory, decode_segment_footer,
-    decode_segment_index_page, decode_segment_prefix, encode_segment_directory,
-    encode_segment_footer, encode_segment_index_page, encode_segment_prefix,
+    CanonicalObjectError, ContentId, ObjectId, SEGMENT_FOOTER_ENCODED_SIZE,
+    SEGMENT_NAMESPACE_CONTENT, SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE,
+    SegmentDirectory, SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry,
+    SegmentIndexKey, SegmentIndexPage, SegmentRecordError, decode_segment_directory,
+    decode_segment_footer, decode_segment_index_page, decode_segment_prefix,
+    encode_segment_directory, encode_segment_footer, encode_segment_index_page,
+    validate_canonical_object,
 };
 
-pub(crate) const MAX_SEGMENT_ENTRIES: usize = 1024;
-pub(crate) const MAX_SEGMENT_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
+/// Hard decode/allocation ceiling for a V1 segment. Active packs seal in this
+/// same format, so readers must accept the active-pack policy bounds.
+pub(crate) const MAX_SEGMENT_ENTRIES: usize = 1_000_000;
+pub(crate) const MAX_SEGMENT_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_SEGMENT_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_INDEX_PAGE_ENTRIES: usize = 128;
 pub(crate) const METADATA_NAMESPACE: u8 = SEGMENT_NAMESPACE_METADATA;
 pub(crate) const CONTENT_NAMESPACE: u8 = SEGMENT_NAMESPACE_CONTENT;
@@ -49,6 +57,7 @@ pub(crate) struct SegmentMetadata {
     pub directory_length: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct SealedSegment {
     pub file: NamedTempFile,
@@ -78,9 +87,11 @@ pub(crate) enum SegmentError {
     ObjectDigest,
     #[error("metadata kind does not match the canonical object")]
     WrongKind,
+    #[error("canonical metadata object failed validation: {0}")]
+    Canonical(#[from] CanonicalObjectError),
 }
 
-fn key(entry: &SegmentIndexEntry) -> (u8, [u8; 32]) {
+pub(super) fn key(entry: &SegmentIndexEntry) -> (u8, [u8; 32]) {
     (entry.namespace, entry.digest)
 }
 
@@ -88,27 +99,80 @@ fn directory_key(entry: &SegmentDirectoryEntry) -> (u8, [u8; 32]) {
     (entry.first_key.namespace, entry.first_key.digest)
 }
 
-/// Streaming builder: caller buffers are borrowed only for the duration of `push`.
+pub(super) fn validate_record(record: SegmentRecord<'_>) -> Result<(), SegmentError> {
+    match record.namespace {
+        CONTENT_NAMESPACE if record.kind == 0 => {
+            if ContentId::of(record.bytes).as_bytes() != &record.digest {
+                return Err(SegmentError::ObjectDigest);
+            }
+        }
+        METADATA_NAMESPACE => {
+            let expected = SegmentIndexEntry::canonical_kind(record.kind)
+                .ok_or(SegmentError::Format("namespace/kind"))?;
+            let actual = validate_canonical_object(record.bytes)?;
+            if actual != expected {
+                return Err(SegmentError::WrongKind);
+            }
+            if ObjectId::of_canonical_bytes(record.bytes).as_bytes() != &record.digest {
+                return Err(SegmentError::ObjectDigest);
+            }
+        }
+        _ => return Err(SegmentError::Format("namespace/kind")),
+    }
+    Ok(())
+}
+
+/// Exact physical size of a V1 segment with the supplied payload and entry count.
+pub(crate) fn projected_total_length(
+    entry_count: usize,
+    payload_bytes: u64,
+) -> Result<u64, SegmentError> {
+    if entry_count > MAX_SEGMENT_ENTRIES {
+        return Err(SegmentError::TooManyEntries);
+    }
+    if payload_bytes > MAX_SEGMENT_PAYLOAD_BYTES {
+        return Err(SegmentError::TooLarge);
+    }
+    let count = u64::try_from(entry_count).map_err(|_| SegmentError::TooManyEntries)?;
+    let pages = u64::try_from(entry_count.div_ceil(MAX_INDEX_PAGE_ENTRIES))
+        .map_err(|_| SegmentError::TooManyEntries)?;
+    // Both page and directory records have a four-byte count prefix.
+    let page_bytes = count.checked_mul(51).and_then(|n| n.checked_add(pages * 4));
+    let directory_bytes = pages.checked_mul(81).and_then(|n| n.checked_add(4));
+    let tail_bytes = page_bytes
+        .and_then(|pages| directory_bytes.and_then(|directory| pages.checked_add(directory)))
+        .and_then(|n| n.checked_add(FOOTER_LEN))
+        .ok_or(SegmentError::TooLarge)?;
+    if tail_bytes > MAX_SEGMENT_TAIL_BYTES {
+        return Err(SegmentError::TooLarge);
+    }
+    PREFIX_LEN
+        .checked_add(payload_bytes)
+        .and_then(|n| n.checked_add(tail_bytes))
+        .ok_or(SegmentError::TooLarge)
+}
+
+/// Streaming builder used to produce immutable V1 fixtures and sealed packs.
+#[cfg(test)]
 pub(crate) struct SegmentBuilder {
     file: NamedTempFile,
     entries: Vec<SegmentIndexEntry>,
     payload_bytes: u64,
-    body_hasher: blake3::Hasher,
+    io_buffer: Vec<u8>,
 }
 
+#[cfg(test)]
 impl SegmentBuilder {
     pub(crate) fn new(directory: impl AsRef<Path>) -> Result<Self, SegmentError> {
         let mut file = NamedTempFile::new_in(directory)?;
         let prefix = encode_segment_prefix()?;
         debug_assert_eq!(prefix.len(), SEGMENT_PREFIX_ENCODED_SIZE);
         file.write_all(&prefix)?;
-        let mut body_hasher = blake3::Hasher::new();
-        body_hasher.update(&prefix);
         Ok(Self {
             file,
             entries: Vec::new(),
             payload_bytes: 0,
-            body_hasher,
+            io_buffer: vec![0; HASH_BUFFER_SIZE],
         })
     }
 
@@ -116,14 +180,7 @@ impl SegmentBuilder {
         if self.entries.len() == MAX_SEGMENT_ENTRIES {
             return Err(SegmentError::TooManyEntries);
         }
-        let valid_kind = match record.namespace {
-            CONTENT_NAMESPACE => record.kind == 0,
-            METADATA_NAMESPACE => SegmentIndexEntry::canonical_kind(record.kind).is_some(),
-            _ => false,
-        };
-        if !valid_kind {
-            return Err(SegmentError::Format("namespace/kind"));
-        }
+        validate_record(record)?;
         let length = u64::try_from(record.bytes.len()).map_err(|_| SegmentError::TooLarge)?;
         if self
             .payload_bytes
@@ -135,7 +192,6 @@ impl SegmentBuilder {
         }
         let offset = PREFIX_LEN + self.payload_bytes;
         self.file.write_all(record.bytes)?;
-        self.body_hasher.update(record.bytes);
         self.payload_bytes += length;
         self.entries.push(SegmentIndexEntry {
             namespace: record.namespace,
@@ -148,55 +204,15 @@ impl SegmentBuilder {
     }
 
     pub(crate) fn seal(mut self) -> Result<SealedSegment, SegmentError> {
-        self.entries.sort_unstable_by_key(key);
-        if self.entries.windows(2).any(|w| key(&w[0]) == key(&w[1])) {
-            return Err(SegmentError::DuplicateKey);
-        }
-
-        let index_start = PREFIX_LEN + self.payload_bytes;
-        let mut pages = Vec::new();
-        for chunk in self.entries.chunks(MAX_INDEX_PAGE_ENTRIES) {
-            let offset = self.file.stream_position()?;
-            let page = encode_segment_index_page(&SegmentIndexPage {
-                entries: chunk.to_vec(),
-            })?;
-            let page_digest = *blake3::hash(&page).as_bytes();
-            self.file.write_all(&page)?;
-            self.body_hasher.update(&page);
-            pages.push(SegmentDirectoryEntry {
-                first_key: SegmentIndexKey {
-                    namespace: chunk[0].namespace,
-                    digest: chunk[0].digest,
-                },
-                offset,
-                length: page.len() as u64,
-                page_digest,
-            });
-        }
-
-        let directory_offset = self.file.stream_position()?;
-        let directory = encode_segment_directory(&SegmentDirectory { pages })?;
-        self.file.write_all(&directory)?;
-        self.body_hasher.update(&directory);
-        let directory_length = directory.len() as u64;
-        let body_length = self.file.stream_position()?;
-        debug_assert_eq!(body_length, directory_offset + directory_length);
-
-        let body_digest = *self.body_hasher.finalize().as_bytes();
-        let total_length = body_length
-            .checked_add(FOOTER_LEN)
+        let index_start = PREFIX_LEN
+            .checked_add(self.payload_bytes)
             .ok_or(SegmentError::TooLarge)?;
-        let footer = SegmentFooter {
-            total_length,
-            object_count: self.entries.len() as u64,
+        let footer = emit_cumulative_tail(
+            self.file.as_file_mut(),
+            &mut self.entries,
             index_start,
-            directory_offset,
-            directory_length,
-            body_digest,
-        };
-        let footer_bytes = encode_segment_footer(&footer)?;
-        debug_assert_eq!(footer_bytes.len(), SEGMENT_FOOTER_ENCODED_SIZE);
-        self.file.write_all(&footer_bytes)?;
+            &mut self.io_buffer,
+        )?;
         self.file.flush()?;
 
         Ok(SealedSegment {
@@ -207,20 +223,123 @@ impl SegmentBuilder {
     }
 }
 
+/// Replaces the V1 cumulative index/directory/footer at `index_start`.
+///
+/// Payload bytes before `index_start` are never rewritten. `entries` is sorted
+/// in place and the supplied I/O buffer is reused while hashing the complete
+/// body. On success the file length is exactly the returned footer length.
+pub(crate) fn emit_cumulative_tail(
+    file: &mut File,
+    entries: &mut [SegmentIndexEntry],
+    index_start: u64,
+    io_buffer: &mut Vec<u8>,
+) -> Result<SegmentFooter, SegmentError> {
+    if entries.len() > MAX_SEGMENT_ENTRIES {
+        return Err(SegmentError::TooManyEntries);
+    }
+    let payload_bytes = index_start
+        .checked_sub(PREFIX_LEN)
+        .ok_or(SegmentError::Format("index start"))?;
+    if payload_bytes > MAX_SEGMENT_PAYLOAD_BYTES {
+        return Err(SegmentError::TooLarge);
+    }
+    entries.sort_unstable_by_key(key);
+    if entries.windows(2).any(|w| key(&w[0]) == key(&w[1])) {
+        return Err(SegmentError::DuplicateKey);
+    }
+
+    file.set_len(index_start)?;
+    file.seek(SeekFrom::Start(index_start))?;
+    let page_count = entries.len().div_ceil(MAX_INDEX_PAGE_ENTRIES);
+    let mut pages = Vec::with_capacity(page_count);
+    let mut page = SegmentIndexPage {
+        entries: Vec::with_capacity(MAX_INDEX_PAGE_ENTRIES),
+    };
+    for chunk in entries.chunks(MAX_INDEX_PAGE_ENTRIES) {
+        page.entries.clear();
+        page.entries.extend_from_slice(chunk);
+        let offset = file.stream_position()?;
+        let encoded = encode_segment_index_page(&page)?;
+        let length = u64::try_from(encoded.len()).map_err(|_| SegmentError::TooLarge)?;
+        file.write_all(&encoded)?;
+        pages.push(SegmentDirectoryEntry {
+            first_key: SegmentIndexKey {
+                namespace: chunk[0].namespace,
+                digest: chunk[0].digest,
+            },
+            offset,
+            length,
+            page_digest: *blake3::hash(&encoded).as_bytes(),
+        });
+    }
+
+    let directory_offset = file.stream_position()?;
+    let encoded = encode_segment_directory(&SegmentDirectory { pages })?;
+    let directory_length = u64::try_from(encoded.len()).map_err(|_| SegmentError::TooLarge)?;
+    file.write_all(&encoded)?;
+    let body_length = directory_offset
+        .checked_add(directory_length)
+        .ok_or(SegmentError::TooLarge)?;
+    let tail_length = body_length
+        .checked_sub(index_start)
+        .and_then(|length| length.checked_add(FOOTER_LEN))
+        .ok_or(SegmentError::TooLarge)?;
+    if tail_length > MAX_SEGMENT_TAIL_BYTES {
+        return Err(SegmentError::TooLarge);
+    }
+
+    if io_buffer.len() != HASH_BUFFER_SIZE {
+        io_buffer.resize(HASH_BUFFER_SIZE, 0);
+    }
+    let body_digest = hash_range_buffered(file, 0, body_length, io_buffer)?;
+    let total_length = body_length
+        .checked_add(FOOTER_LEN)
+        .ok_or(SegmentError::TooLarge)?;
+    let footer = SegmentFooter {
+        total_length,
+        object_count: entries.len() as u64,
+        index_start,
+        directory_offset,
+        directory_length,
+        body_digest,
+    };
+    let encoded = encode_segment_footer(&footer)?;
+    debug_assert_eq!(encoded.len(), SEGMENT_FOOTER_ENCODED_SIZE);
+    file.seek(SeekFrom::Start(body_length))?;
+    file.write_all(&encoded)?;
+    file.set_len(total_length)?;
+    Ok(footer)
+}
+
 pub(crate) struct SegmentReader {
     file: File,
     id: SegmentId,
     metadata: SegmentMetadata,
-    directory: Vec<SegmentDirectoryEntry>,
     entries_by_key: Vec<SegmentIndexEntry>,
 }
 
 impl SegmentReader {
     /// Opens and fully authenticates the body once. Payloads are not retained.
-    pub(crate) fn open(mut file: File) -> Result<Self, SegmentError> {
+    pub(crate) fn open(file: File) -> Result<Self, SegmentError> {
         let actual_len = file.metadata()?.len();
+        Self::open_at_length(file, actual_len)
+    }
+
+    /// Authenticates a published prefix while ignoring an uncommitted suffix.
+    pub(super) fn open_at_published_length(
+        file: File,
+        published_length: u64,
+    ) -> Result<Self, SegmentError> {
+        if file.metadata()?.len() < published_length {
+            return Err(SegmentError::Format("truncated published segment"));
+        }
+        Self::open_at_length(file, published_length)
+    }
+
+    fn open_at_length(mut file: File, actual_len: u64) -> Result<Self, SegmentError> {
         // Bound all subsequent allocations, including a forged directory length.
-        const MAX_PHYSICAL_BYTES: u64 = MAX_SEGMENT_PAYLOAD_BYTES + 128 * 1024;
+        const MAX_PHYSICAL_BYTES: u64 =
+            MAX_SEGMENT_PAYLOAD_BYTES + MAX_SEGMENT_TAIL_BYTES + FOOTER_LEN;
         if !(PREFIX_LEN + FOOTER_LEN..=MAX_PHYSICAL_BYTES).contains(&actual_len) {
             return Err(SegmentError::Format("truncated or oversized"));
         }
@@ -233,6 +352,10 @@ impl SegmentReader {
             || footer.index_start < PREFIX_LEN
             || footer.index_start - PREFIX_LEN > MAX_SEGMENT_PAYLOAD_BYTES
             || footer.directory_offset < footer.index_start
+            || footer
+                .index_start
+                .checked_add(MAX_SEGMENT_TAIL_BYTES)
+                .is_none_or(|tail_end| actual_len > tail_end)
             || footer.directory_offset.checked_add(footer.directory_length) != Some(footer_offset)
         {
             return Err(SegmentError::Format("footer offsets"));
@@ -294,7 +417,10 @@ impl SegmentReader {
         }
 
         // Payload ranges must cover precisely the payload body, regardless of key order.
-        all_entries.sort_unstable_by_key(|entry| entry.offset);
+        // Empty payloads can share an offset with the following non-empty payload;
+        // order zero-length entries first so key sorting cannot make valid coverage
+        // appear overlapping.
+        all_entries.sort_unstable_by_key(|entry| (entry.offset, entry.length));
         let mut next_payload_offset = PREFIX_LEN;
         for entry in &all_entries {
             if entry.offset != next_payload_offset
@@ -316,7 +442,6 @@ impl SegmentReader {
             file,
             id: footer.segment_id(),
             metadata: metadata(&footer),
-            directory,
             entries_by_key: all_entries,
         })
     }
@@ -329,37 +454,24 @@ impl SegmentReader {
         self.metadata
     }
 
-    /// Enumerates the authenticated index without reading object payloads.
-    ///
-    /// `open` has already authenticated the complete segment body. Pages are
-    /// nevertheless checked again here so a file modified after opening cannot
-    /// silently poison a rebuilt catalog index.
-    pub(crate) fn entries(&mut self) -> Result<Vec<SegmentIndexEntry>, SegmentError> {
-        let mut result = Vec::with_capacity(self.metadata.object_count as usize);
-        for descriptor in &self.directory {
-            let page = read_range(&mut self.file, descriptor.offset, descriptor.length)?;
-            if blake3::hash(&page).as_bytes() != &descriptor.page_digest {
-                return Err(SegmentError::PageDigest);
-            }
-            let entries = decode_segment_index_page(&page)?.entries;
-            if result.len().checked_add(entries.len()).is_none_or(|count| {
-                count > MAX_SEGMENT_ENTRIES || count as u64 > self.metadata.object_count
-            }) {
-                return Err(SegmentError::TooManyEntries);
-            }
-            result.extend(entries);
-        }
-        if result.len() as u64 != self.metadata.object_count {
-            return Err(SegmentError::Format("object count"));
-        }
-        Ok(result)
+    pub(crate) fn into_authenticated_parts(
+        self,
+    ) -> (File, SegmentId, SegmentMetadata, Vec<SegmentIndexEntry>) {
+        (self.file, self.id, self.metadata, self.entries_by_key)
     }
 
-    pub(crate) fn lookup(
+    /// Borrows the index decoded and authenticated by `open`.
+    pub(crate) fn authenticated_entries(&self) -> &[SegmentIndexEntry] {
+        &self.entries_by_key
+    }
+
+    /// Returns the authenticated index entry and its logically verified payload.
+    /// The index is neither read nor decoded again.
+    pub(crate) fn lookup_entry(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
-    ) -> Result<Option<(u16, Vec<u8>)>, SegmentError> {
+    ) -> Result<Option<(&SegmentIndexEntry, Vec<u8>)>, SegmentError> {
         let wanted = (namespace, digest);
         let Ok(index) = self.entries_by_key.binary_search_by_key(&wanted, key) else {
             return Ok(None);
@@ -367,11 +479,22 @@ impl SegmentReader {
         let entry = &self.entries_by_key[index];
         let bytes = read_range(&mut self.file, entry.offset, entry.length)?;
         verify_logical(entry, &bytes)?;
-        Ok(Some((entry.kind, bytes)))
+        Ok(Some((entry, bytes)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup(
+        &mut self,
+        namespace: u8,
+        digest: [u8; 32],
+    ) -> Result<Option<(u16, Vec<u8>)>, SegmentError> {
+        Ok(self
+            .lookup_entry(namespace, digest)?
+            .map(|(entry, bytes)| (entry.kind, bytes)))
     }
 }
 
-fn metadata(footer: &SegmentFooter) -> SegmentMetadata {
+pub(super) fn metadata(footer: &SegmentFooter) -> SegmentMetadata {
     SegmentMetadata {
         object_count: footer.object_count,
         payload_bytes: footer.index_start - PREFIX_LEN,
@@ -382,7 +505,7 @@ fn metadata(footer: &SegmentFooter) -> SegmentMetadata {
     }
 }
 
-fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), SegmentError> {
+pub(super) fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), SegmentError> {
     match entry.namespace {
         CONTENT_NAMESPACE => {
             if ContentId::of(bytes).as_bytes() != &entry.digest {
@@ -393,12 +516,9 @@ fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), Segment
             if ObjectId::of_canonical_bytes(bytes).as_bytes() != &entry.digest {
                 return Err(SegmentError::ObjectDigest);
             }
-            // Segment construction validated the canonical object and recorded
-            // its kind before hashing the complete immutable segment body. On
-            // read, the authenticated index kind plus object digest are enough;
-            // typed readers perform the one required canonical decode instead
-            // of making the physical store decode every object twice.
-            if SegmentIndexEntry::canonical_kind(entry.kind).is_none() {
+            let expected =
+                SegmentIndexEntry::canonical_kind(entry.kind).ok_or(SegmentError::WrongKind)?;
+            if validate_canonical_object(bytes)? != expected {
                 return Err(SegmentError::WrongKind);
             }
         }
@@ -408,12 +528,24 @@ fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), Segment
 }
 
 fn hash_range(file: &mut File, offset: u64, length: u64) -> Result<[u8; 32], SegmentError> {
+    let mut buffer = vec![0; HASH_BUFFER_SIZE];
+    hash_range_buffered(file, offset, length, &mut buffer)
+}
+
+fn hash_range_buffered(
+    file: &mut File,
+    offset: u64,
+    length: u64,
+    buffer: &mut [u8],
+) -> Result<[u8; 32], SegmentError> {
+    if buffer.is_empty() {
+        return Err(SegmentError::Format("empty I/O buffer"));
+    }
     file.seek(SeekFrom::Start(offset))?;
     let mut remaining = length;
-    let mut buffer = [0_u8; HASH_BUFFER_SIZE];
     let mut hasher = blake3::Hasher::new();
     while remaining != 0 {
-        let amount = usize::try_from(remaining.min(HASH_BUFFER_SIZE as u64)).unwrap();
+        let amount = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
         file.read_exact(&mut buffer[..amount])?;
         hasher.update(&buffer[..amount]);
         remaining -= amount as u64;
@@ -529,6 +661,26 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_payload_before_a_nonempty_payload_authenticates() {
+        let empty = b"".as_slice();
+        let nonempty = b"payload".as_slice();
+        let segment = build(&[empty, nonempty]);
+        let mut reader = SegmentReader::open(segment.file.reopen().unwrap()).unwrap();
+        assert_eq!(
+            reader
+                .lookup(CONTENT_NAMESPACE, *ContentId::of(empty).as_bytes())
+                .unwrap(),
+            Some((0, Vec::new()))
+        );
+        assert_eq!(
+            reader
+                .lookup(CONTENT_NAMESPACE, *ContentId::of(nonempty).as_bytes())
+                .unwrap(),
+            Some((0, nonempty.to_vec()))
+        );
+    }
+
+    #[test]
     fn edit_metadata_packs_and_reads_back() {
         let edit = wheat_core::EditRecord::new(
             "edited.txt",
@@ -560,8 +712,23 @@ mod tests {
         let mut reader = SegmentReader::open(segment.file.reopen().unwrap()).unwrap();
         assert_eq!(
             reader.lookup(METADATA_NAMESPACE, digest).unwrap(),
-            Some((kind, canonical))
+            Some((kind, canonical.clone()))
         );
+        let wrong_known_kind =
+            SegmentIndexEntry::canonical_kind_code(wheat_core::CanonicalObjectKind::Tree);
+        assert!(matches!(
+            verify_logical(
+                &SegmentIndexEntry {
+                    namespace: METADATA_NAMESPACE,
+                    kind: wrong_known_kind,
+                    digest,
+                    offset: 0,
+                    length: canonical.len() as u64,
+                },
+                &canonical,
+            ),
+            Err(SegmentError::WrongKind)
+        ));
     }
 
     #[test]

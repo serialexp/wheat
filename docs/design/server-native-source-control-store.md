@@ -1,6 +1,6 @@
 # Wheat — Server-Native Source Control
 
-Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, CLI workflow, and Git import paths are implemented and qualified in the Wheat prototype; active-pack growth/sealing, forge review policy, optional LSP/structural warnings, broader store/protocol qualification, and product commitment remain open
+Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, CLI workflow, Git import paths, and local active-pack growth/sealing are implemented and qualified in the Wheat prototype; forge review policy, optional LSP/structural warnings, broader remote-store/protocol qualification, and product commitment remain open
 Owner: bart
 Last updated: 2026-09-09
 
@@ -154,21 +154,34 @@ described here.
 - [~] **Phase 2 — indexed sealed segments and ranged reads.** The local backend now
   packs canonical metadata and small content into immutable BinSchema-defined,
   footer-indexed segments with paged sorted indexes, authenticated directories,
-  an additive crash-safe catalog, and a persistent derived SQLite locator tied to an atomically
-  published catalog head. Ordinary reopen reuses that locator without enumerating or
-  authenticating all historical segments; legacy, missing, stale, or corrupt locator state is
-  rebuilt from the immutable chain. Large content remains standalone. Local
+  an additive crash-safe catalog, and a persistent derived SQLite locator tied to atomically
+  published catalog and active-pack heads. Ordinary reopen reuses the checkpoint-matched locator;
+  sealed sources authenticate lazily once per process and retain their decoded indexes, while
+  active reads use the already-authenticated in-memory index. Legacy, missing, stale, or corrupt
+  locator state is rebuilt from immutable authority. Large content remains standalone. Local
   reopen/corruption/interrupted-install tests exist; remote range reads, coalescing, compaction,
-  GC, and broader failure injection remain unqualified.
+  GC, and broader remote-store failure injection remain unqualified.
 - [ ] **Phase 2 — conservative loose-object collection.** Never collect an
   unreachable loose object less than 24 hours after its backend modification
   time; verify the proposed closure immediately before publication and initially
   leave sealed-segment deletion disabled.
-- [ ] **Phase 2 — active pack growth and sealing.** Replace one immutable segment per
-  metadata flush with a process-exclusive active local pack: preserve payload offsets, remove and
-  regenerate its cumulative index/directory/footer tail when appending, journal in-place recovery,
-  and seal/start a new pack only at a measured rehash-size threshold. Import durability batches
-  must not make commit boundaries into physical-file boundaries.
+- [x] **Phase 2 — active pack growth and sealing.** Durable local mutations now use one
+  process-exclusive active pack, preserve payload offsets, replace its cumulative authenticated
+  tail, journal exact rollback state, publish a checksummed physical head, update locator rows
+  incrementally, and seal/start a new pack at a 128 MiB initial policy bound with independent
+  count/payload/tail limits. Resumable imports acknowledge bounded groups only after one durable
+  flush and authenticated readback. Isolated atomic imports use a one-pass deferred writer that
+  appends each payload once and emits a final V1 tail only on rollover or consuming close before
+  the terminal filesystem sync and no-replace rename. A fresh 1,624-change Gothab import produced
+  seven packs (six near 128 MiB) in 290.61 seconds with 317 MiB peak RSS; reopen status took 1.18
+  seconds, log 0.41 seconds, and explicit complete validation 178.18 seconds. Crash, tampering,
+  rollover, close-failure, restart, acknowledgement, cached-read, and orphan-publication cleanup
+  regressions are covered. Marker-authenticated stale atomic-import directories are reclaimed under
+  the per-destination lock; unrelated, malformed, and symlinked candidates are preserved. An ignored
+  release benchmark tracks the intentionally expensive one-object durable path: 128–2,048 small
+  appends sustained roughly 39–49 objects/second on the qualification host, reinforcing that bulk
+  ingestion must use bounded batches or the deferred writer rather than treating per-object fsync as
+  a throughput path.
 - [ ] **Phase 2 — physical store qualification.** Benchmark and refine object
   encoding, index fan-out, active-pack sealing thresholds, deltas, sharding, replication,
   caching, and garbage collection against deep stacks and wide agent fan-out on local files and

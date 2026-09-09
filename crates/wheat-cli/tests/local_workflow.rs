@@ -146,10 +146,11 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
-    // Content capture publishes one packed generation and the metadata graph, including its final
-    // envelope, is flushed through one put_batch call. Thus the mutation adds two generations
-    // rather than one generation per immutable metadata object.
-    assert_eq!(packed_catalog_count(&repository), catalogs_before + 2);
+    // Small content and metadata batches grow the active pack. They must not turn
+    // logical mutation or durability boundaries into immutable catalog generations.
+    assert_eq!(packed_catalog_count(&repository), catalogs_before);
+    assert!(repository.join("storage/packed/active.segment").is_file());
+    assert!(repository.join("storage/packed/active.head").is_file());
     let reopened = wheat(&repository, &["status"]);
     assert!(String::from_utf8_lossy(&reopened.stdout).contains("changes: 2"));
 

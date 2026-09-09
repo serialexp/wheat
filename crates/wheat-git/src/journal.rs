@@ -4,6 +4,7 @@
 //! Callers must durably write and verify those objects before calling [`ImportJournal::complete`].
 
 use std::{
+    collections::HashSet,
     fs::{File, OpenOptions},
     io,
     os::fd::AsRawFd,
@@ -14,7 +15,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 use wheat_core::{ApplicationId, ChangeId, RevisionId, ViewId};
 
-const FORMAT_VERSION: i64 = 1;
+// Version 2 introduces crash-durable prepared mappings. Prototype journals are
+// deliberately not migrated: callers must restart from the pinned source snapshot.
+const FORMAT_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -160,16 +163,21 @@ impl ImportJournal {
         Ok(())
     }
 
-    /// Returns at most `limit` pending commits whose every parent is complete.
+    /// Returns at most `limit` pending commits whose every parent has a completed
+    /// or prepared mapping. Prepared parents allow one bounded write batch to
+    /// advance through dependent commits without claiming they are durable yet.
     /// Ordering is stable insertion order, while parent order is retained separately.
     pub fn ready(&self, limit: usize) -> Result<Vec<PendingWork>, JournalError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let mut statement = self.connection.prepare(
-            "SELECT w.oid FROM work w WHERE w.status = 0 AND NOT EXISTS (\
+            "SELECT w.oid FROM work w WHERE w.status = 0 \
+             AND NOT EXISTS (SELECT 1 FROM prepared_work prepared WHERE prepared.oid = w.oid) \
+             AND NOT EXISTS (\
              SELECT 1 FROM work_parent p LEFT JOIN work pw ON pw.oid = p.parent_oid \
-             WHERE p.oid = w.oid AND (pw.oid IS NULL OR pw.status != 1)) \
+             LEFT JOIN prepared_work prepared ON prepared.oid = p.parent_oid \
+             WHERE p.oid = w.oid AND (pw.oid IS NULL OR (pw.status != 1 AND prepared.oid IS NULL))) \
              ORDER BY w.sequence LIMIT ?1",
         )?;
         let oids = statement
@@ -194,6 +202,38 @@ impl ImportJournal {
             )
             .optional()
             .map_err(JournalError::from)
+    }
+
+    /// Returns a mapping usable while staging, including an unpromoted prepared mapping.
+    pub fn mapping(&self, oid: &[u8]) -> Result<Option<NativeResult>, JournalError> {
+        if let Some(result) = self.result(oid)? {
+            return Ok(Some(result));
+        }
+        self.connection
+            .query_row(
+                "SELECT change_id, revision_id, view_id, application_id FROM prepared_work WHERE oid = ?1",
+                [oid],
+                |row| decode_result(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+            )
+            .optional()
+            .map_err(JournalError::from)
+    }
+
+    /// Bounded prepared mappings awaiting backing-store authentication.
+    pub fn prepared(&self, limit: usize) -> Result<Vec<(Vec<u8>, NativeResult)>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT prepared.oid, prepared.change_id, prepared.revision_id, prepared.view_id, prepared.application_id \
+             FROM prepared_work prepared JOIN work ON work.oid = prepared.oid \
+             ORDER BY work.sequence LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok((
+                    row.get(0)?,
+                    decode_result(row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?)
     }
 
     /// Returns the source parent OIDs in their original order.
@@ -257,6 +297,143 @@ impl ImportJournal {
                 },
             )?
             .collect::<Result<_, _>>()?)
+    }
+
+    /// Starts one SQLite transaction for a bounded group of prepared mappings.
+    pub fn begin_preparing(&self) -> Result<(), JournalError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    /// Records a mapping inside the active preparation transaction. It remains
+    /// invisible to completed-only APIs until [`Self::complete_many`] promotes it.
+    pub fn prepare(&self, oid: &[u8], result: NativeResult) -> Result<(), JournalError> {
+        let status: Option<i64> = self
+            .connection
+            .query_row("SELECT status FROM work WHERE oid = ?1", [oid], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match status {
+            None => return Err(JournalError::UnknownWork),
+            Some(1) => {
+                if self.result(oid)? != Some(result) {
+                    return Err(JournalError::ConflictingCompletion);
+                }
+                return Ok(());
+            }
+            Some(0) => {}
+            Some(_) => return Err(JournalError::Corrupt("work status")),
+        }
+        let incomplete: bool = self.connection.query_row(
+            include_str!("journal/incomplete_prepared_parents.sql"),
+            [oid],
+            |row| row.get(0),
+        )?;
+        if incomplete {
+            return Err(JournalError::IncompleteParents);
+        }
+        let existing = self.mapping(oid)?;
+        if existing.is_some_and(|actual| actual != result) {
+            return Err(JournalError::ConflictingCompletion);
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO prepared_work(oid, change_id, revision_id, view_id, application_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![oid, result.change_id.as_bytes().as_slice(), result.revision_id.as_bytes().as_slice(), result.view_id.as_bytes().as_slice(), result.application_id.as_bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Durably commits the bounded preparation transaction before object flushing.
+    pub fn commit_preparing(&self) -> Result<(), JournalError> {
+        self.connection.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Abandons an in-progress preparation transaction.
+    pub fn rollback_preparing(&self) -> Result<(), JournalError> {
+        self.connection.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    /// Resets every prepared mapping to ordinary pending work after failed authentication.
+    pub fn reset_prepared(&mut self) -> Result<(), JournalError> {
+        self.connection.execute("DELETE FROM prepared_work", [])?;
+        Ok(())
+    }
+
+    /// Atomically promotes the supplied bounded set of prepared mappings.
+    pub fn complete_many(
+        &mut self,
+        mappings: &[(Vec<u8>, NativeResult)],
+    ) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let promotion_oids = mappings
+            .iter()
+            .map(|(oid, _)| oid.as_slice())
+            .collect::<HashSet<_>>();
+        if promotion_oids.len() != mappings.len() {
+            return Err(JournalError::Corrupt("duplicate promotion mapping"));
+        }
+        for (oid, _) in mappings {
+            for parent in parents_for(&transaction, oid)? {
+                if promotion_oids.contains(parent.as_slice()) {
+                    continue;
+                }
+                let completed = transaction
+                    .query_row(
+                        "SELECT status = 1 FROM work WHERE oid = ?1",
+                        [&parent],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?;
+                if completed != Some(true) {
+                    return Err(JournalError::IncompleteParents);
+                }
+            }
+        }
+        for (oid, result) in mappings {
+            let status: Option<i64> = transaction
+                .query_row("SELECT status FROM work WHERE oid = ?1", [oid], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            match status {
+                None => return Err(JournalError::UnknownWork),
+                Some(1) => {
+                    let actual = transaction.query_row(
+                        "SELECT change_id, revision_id, view_id, application_id FROM work WHERE oid = ?1",
+                        [oid],
+                        |row| decode_result(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                    )?;
+                    if actual != *result {
+                        return Err(JournalError::ConflictingCompletion);
+                    }
+                }
+                Some(0) => {
+                    let prepared = transaction
+                        .query_row(
+                            "SELECT change_id, revision_id, view_id, application_id FROM prepared_work WHERE oid = ?1",
+                            [oid],
+                            |row| decode_result(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                        )
+                        .optional()?;
+                    if prepared != Some(*result) {
+                        return Err(JournalError::ConflictingCompletion);
+                    }
+                    transaction.execute(
+                        "UPDATE work SET status = 1, change_id = ?2, revision_id = ?3, view_id = ?4, application_id = ?5 WHERE oid = ?1",
+                        params![oid, result.change_id.as_bytes().as_slice(), result.revision_id.as_bytes().as_slice(), result.view_id.as_bytes().as_slice(), result.application_id.as_bytes().as_slice()],
+                    )?;
+                }
+                Some(_) => return Err(JournalError::Corrupt("work status")),
+            }
+            transaction.execute("DELETE FROM prepared_work WHERE oid = ?1", [oid])?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Atomically checkpoints completion after the caller has written immutable objects.

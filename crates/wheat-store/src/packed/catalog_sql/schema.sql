@@ -1,13 +1,37 @@
-CREATE TABLE IF NOT EXISTS locator (
+CREATE TABLE physical_source (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE
+);
+CREATE TABLE locator (
     namespace INTEGER NOT NULL,
     digest BLOB NOT NULL CHECK(length(digest) = 32),
-    segment_file TEXT NOT NULL,
+    kind INTEGER NOT NULL,
+    offset INTEGER NOT NULL CHECK(offset >= 0),
+    length INTEGER NOT NULL CHECK(length >= 0),
+    source_id INTEGER NOT NULL REFERENCES physical_source(id),
     PRIMARY KEY (namespace, digest)
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS checkpoint (
+CREATE TABLE checkpoint (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-    generation INTEGER,
-    head_digest BLOB CHECK(head_digest IS NULL OR length(head_digest) = 32),
-    CHECK((generation IS NULL) = (head_digest IS NULL))
+    catalog_generation INTEGER,
+    catalog_digest BLOB CHECK(catalog_digest IS NULL OR length(catalog_digest) = 32),
+    active_generation INTEGER,
+    active_id BLOB CHECK(active_id IS NULL OR length(active_id) = 32),
+    active_object_count INTEGER,
+    active_payload_bytes INTEGER,
+    active_total_length INTEGER,
+    active_index_start INTEGER,
+    active_directory_offset INTEGER,
+    active_directory_length INTEGER,
+    locator_count INTEGER NOT NULL DEFAULT 0 CHECK(locator_count >= 0),
+    CHECK((catalog_generation IS NULL) = (catalog_digest IS NULL)),
+    CHECK((active_generation IS NULL) = (active_id IS NULL)),
+    CHECK((active_id IS NULL) = (active_object_count IS NULL)),
+    CHECK((active_id IS NULL) = (active_payload_bytes IS NULL)),
+    CHECK((active_id IS NULL) = (active_total_length IS NULL)),
+    CHECK((active_id IS NULL) = (active_index_start IS NULL)),
+    CHECK((active_id IS NULL) = (active_directory_offset IS NULL)),
+    CHECK((active_id IS NULL) = (active_directory_length IS NULL))
 );
-INSERT OR IGNORE INTO checkpoint(singleton, generation, head_digest) VALUES(1, NULL, NULL);
+INSERT INTO checkpoint(singleton) VALUES(1);
+PRAGMA user_version = 2;

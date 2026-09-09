@@ -1,9 +1,9 @@
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{fs, io::Write, os::unix::fs::MetadataExt};
 
 use rusqlite::{Connection, params};
 
 use super::catalog::*;
-use super::segment::{CONTENT_NAMESPACE, SegmentRecord};
+use super::segment::{CONTENT_NAMESPACE, MAX_SEGMENT_TAIL_BYTES, SegmentError, SegmentRecord};
 
 const LOCATOR_FILE: &str = "catalog-locator.sqlite3";
 
@@ -16,269 +16,824 @@ fn record(bytes: &'static [u8]) -> SegmentRecord<'static> {
     }
 }
 
+fn assert_value(store: &mut PackedCatalog, value: SegmentRecord<'_>) {
+    assert_eq!(
+        store.get(CONTENT_NAMESPACE, value.digest).unwrap().unwrap(),
+        (value.kind, value.bytes.to_vec())
+    );
+}
+
+fn write_catalog_record(
+    directory: &std::path::Path,
+    record: &wheat_core::SegmentCatalogRecord,
+) -> [u8; 32] {
+    let encoded = wheat_core::encode_segment_catalog_record(record).unwrap();
+    let digest = *blake3::hash(&encoded).as_bytes();
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    fs::write(
+        directory.join(format!("{}-{digest_hex}.catalog", record.generation)),
+        encoded,
+    )
+    .unwrap();
+    digest
+}
+
+fn publication_names(root: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let names = |directory: &str| {
+        let mut names = fs::read_dir(root.join(directory))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    (names("segments"), names("catalog"))
+}
+
 #[test]
-fn catalog_reopens_without_derived_index_and_rejects_concurrent_open() {
+fn deferred_many_tiny_batches_read_through_and_finalize_one_tail_on_close() {
     let root = tempfile::tempdir().unwrap();
-    let bytes = b"packed payload";
-    let digest = *wheat_core::ContentId::of(bytes).as_bytes();
+    let values = [
+        record(b"deferred one"),
+        record(b"deferred two"),
+        record(b"deferred three"),
+    ];
+    let mut store = PackedCatalog::open_with_test_threshold(
+        root.path(),
+        crate::Durability::Deferred,
+        1024 * 1024,
+    )
+    .unwrap();
+    for value in values {
+        store.put_records(&[value]).unwrap();
+        assert_value(&mut store, value);
+    }
+    store.put_records(&values).unwrap();
+    assert_eq!(store.test_counts().unwrap(), (3, 2, 0));
+    assert_eq!(
+        fs::read_dir(root.path().join("catalog")).unwrap().count(),
+        0
+    );
+    store.close().unwrap();
+    assert_eq!(
+        fs::read_dir(root.path().join("segments")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("catalog")).unwrap().count(),
+        1
+    );
+
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
+    for value in values {
+        assert_value(&mut reopened, value);
+    }
+}
+
+#[test]
+fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
+    let root = tempfile::tempdir().unwrap();
+    let values = [
+        record(b"roll one"),
+        record(b"roll two"),
+        record(b"roll three"),
+    ];
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Deferred, 1)
+            .unwrap();
+    for value in values {
+        store.put_records(&[value]).unwrap();
+        assert_value(&mut store, value);
+    }
+    let first_pack = fs::read_dir(root.path().join("segments"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let first_pack_inode = fs::metadata(&first_pack).unwrap().ino();
+    let first_pack_bytes = fs::read(&first_pack).unwrap();
+    // Each following append rolls the preceding pack; the last remains mutable.
+    assert_eq!(
+        fs::read_dir(root.path().join("catalog")).unwrap().count(),
+        2
+    );
+    store.close().unwrap();
+    assert_eq!(
+        fs::read_dir(root.path().join("segments")).unwrap().count(),
+        3
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("catalog")).unwrap().count(),
+        3
+    );
+    assert_eq!(fs::metadata(&first_pack).unwrap().ino(), first_pack_inode);
+    assert_eq!(fs::read(&first_pack).unwrap(), first_pack_bytes);
+}
+
+#[test]
+fn deferred_duplicate_is_idempotent_and_conflict_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let original = record(b"same digest authority");
+    let mut conflicting = original;
+    conflicting.bytes = b"different bytes";
+    let mut store = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
+    store.put_records(&[original, original]).unwrap();
+    assert_eq!(store.test_counts().unwrap().0, 1);
+    assert!(matches!(
+        store.put_records(&[conflicting]),
+        Err(CatalogError::Corrupt(
+            "existing key differs from proposed bytes"
+        ))
+    ));
+}
+
+#[test]
+fn active_appends_reopen_without_immutable_catalog_generations_and_lock_excludes_writers() {
+    let root = tempfile::tempdir().unwrap();
+    let values = [record(b"first"), record(b"second"), record(b"third")];
     {
         let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
         assert!(matches!(
             PackedCatalog::open(root.path(), crate::Durability::Durable),
             Err(CatalogError::Busy)
         ));
-        store
-            .put_records(&[SegmentRecord {
-                namespace: CONTENT_NAMESPACE,
-                kind: 0,
-                digest,
-                bytes,
-            }])
-            .unwrap();
-        assert_eq!(
-            store.get(CONTENT_NAMESPACE, digest).unwrap().unwrap().1,
-            bytes
-        );
+        for value in values {
+            store.put_records(&[value]).unwrap();
+        }
+        assert_eq!(store.test_counts().unwrap(), (3, 1, 0));
     }
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    assert_eq!(
-        reopened.get(CONTENT_NAMESPACE, digest).unwrap().unwrap().1,
-        bytes
-    );
-}
-
-#[test]
-fn retry_after_segment_install_before_catalog_publication_is_idempotent() {
-    let root = tempfile::tempdir().unwrap();
-    let bytes = b"retry payload";
-    let digest = *wheat_core::ContentId::of(bytes).as_bytes();
-    let record = SegmentRecord {
-        namespace: CONTENT_NAMESPACE,
-        kind: 0,
-        digest,
-        bytes,
-    };
-    {
-        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-        store.put_records(&[record]).unwrap();
-        let catalogs = root.path().join("catalog");
-        let published = std::fs::read_dir(&catalogs)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        std::fs::remove_file(published).unwrap();
-        std::fs::remove_file(root.path().join("catalog.head")).unwrap();
-        // Simulate a crash after the immutable segment rename but before catalog/head publication.
-        drop(store);
+    for value in values {
+        assert_value(&mut reopened, value);
     }
-    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    assert!(reopened.get(CONTENT_NAMESPACE, digest).unwrap().is_none());
-    reopened.put_records(&[record]).unwrap();
-    assert_eq!(
-        reopened.get(CONTENT_NAMESPACE, digest).unwrap().unwrap().1,
-        bytes
-    );
-    assert_eq!(
-        std::fs::read_dir(root.path().join("segments"))
-            .unwrap()
-            .count(),
-        1
-    );
-    assert_eq!(
-        std::fs::read_dir(root.path().join("catalog"))
-            .unwrap()
-            .count(),
-        1
-    );
+    assert_eq!(reopened.test_counts().unwrap(), (3, 1, 0));
 }
 
 #[test]
-fn catalog_rejects_corruption_and_ignores_unpublished_files() {
+fn active_locator_append_does_not_rewrite_existing_rows() {
     let root = tempfile::tempdir().unwrap();
-    let bytes = b"payload";
-    let digest = *wheat_core::ContentId::of(bytes).as_bytes();
-    {
-        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-        store
-            .put_records(&[SegmentRecord {
-                namespace: CONTENT_NAMESPACE,
-                kind: 0,
-                digest,
-                bytes,
-            }])
-            .unwrap();
-    }
-    std::fs::write(root.path().join("segments/orphan.segment"), b"incomplete").unwrap();
-    assert!(PackedCatalog::open(root.path(), crate::Durability::Durable).is_ok());
-    let catalog = std::fs::read_dir(root.path().join("catalog"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    std::fs::write(catalog, b"corrupt").unwrap();
-    assert!(PackedCatalog::open(root.path(), crate::Durability::Durable).is_err());
+    let first = record(b"stable locator row");
+    let second = record(b"new locator row");
+    let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    store.put_records(&[first]).unwrap();
+    store.test_reject_locator_rewrite(first.digest).unwrap();
+    store.put_records(&[second]).unwrap();
+    assert_value(&mut store, first);
+    assert_value(&mut store, second);
 }
 
 #[test]
-fn matching_checkpoint_reopens_without_scanning_or_authenticating_old_storage() {
+fn legacy_immutable_only_store_is_preserved_and_gains_an_active_pack() {
     let root = tempfile::tempdir().unwrap();
-    let old = record(b"old payload");
-    let new = record(b"new payload");
+    let old = record(b"legacy immutable");
     {
-        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
         store.put_records(&[old]).unwrap();
-        store.put_records(&[new]).unwrap();
+        assert_eq!(store.test_counts().unwrap(), (1, 2, 1));
     }
-
-    let old_segment = std::fs::read_dir(root.path().join("segments"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("0-")
-        })
-        .unwrap();
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(old_segment)
-        .unwrap();
-    file.seek(SeekFrom::Start(8)).unwrap();
-    let mut byte = [0];
-    file.read_exact(&mut byte).unwrap();
-    byte[0] ^= 1;
-    file.seek(SeekFrom::Start(8)).unwrap();
-    file.write_all(&byte).unwrap();
-    file.sync_all().unwrap();
-    // A malformed orphan would make a directory scan fail. Once catalog.head exists, it is not
-    // authority and ordinary reopen must not enumerate catalog/ at all.
-    std::fs::write(
-        root.path().join("catalog/not-a-generation.catalog"),
-        b"orphan",
-    )
-    .unwrap();
+    fs::remove_file(root.path().join("active.head")).unwrap();
+    fs::remove_file(root.path().join("active.segment")).unwrap();
+    fs::remove_file(root.path().join(LOCATOR_FILE)).unwrap();
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    assert_eq!(
-        reopened
-            .get(CONTENT_NAMESPACE, new.digest)
-            .unwrap()
-            .unwrap()
-            .1,
-        new.bytes
-    );
-    assert!(reopened.get(CONTENT_NAMESPACE, old.digest).is_err());
+    assert_value(&mut reopened, old);
+    assert!(root.path().join("active.head").exists());
+    assert!(root.path().join("active.segment").exists());
 }
 
 #[test]
-fn missing_or_corrupt_locator_is_rebuilt() {
-    for corrupt in [false, true] {
+fn missing_corrupt_stale_or_old_schema_locator_rebuilds_with_active_state() {
+    for mode in 0..4 {
         let root = tempfile::tempdir().unwrap();
-        let value = record(if corrupt {
-            b"corrupt locator payload"
-        } else {
-            b"missing locator payload"
+        let value = record(match mode {
+            0 => b"missing",
+            1 => b"corrupt",
+            2 => b"stale",
+            _ => b"old schema",
         });
         {
             let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
             store.put_records(&[value]).unwrap();
         }
         let locator = root.path().join(LOCATOR_FILE);
-        if corrupt {
-            std::fs::write(&locator, b"not sqlite").unwrap();
-        } else {
-            std::fs::remove_file(&locator).unwrap();
+        match mode {
+            0 => fs::remove_file(&locator).unwrap(),
+            1 => fs::write(&locator, b"not sqlite").unwrap(),
+            2 => {
+                let connection = Connection::open(&locator).unwrap();
+                connection.execute("DELETE FROM locator", []).unwrap();
+                connection
+                    .execute("UPDATE checkpoint SET active_generation=99", [])
+                    .unwrap();
+            }
+            _ => {
+                let connection = Connection::open(&locator).unwrap();
+                connection.pragma_update(None, "user_version", 1).unwrap();
+            }
         }
-
         let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-        assert_eq!(
-            reopened
-                .get(CONTENT_NAMESPACE, value.digest)
-                .unwrap()
-                .unwrap()
-                .1,
-            value.bytes
-        );
+        assert_value(&mut reopened, value);
+        assert_eq!(reopened.test_counts().unwrap(), (1, 1, 0));
     }
 }
 
 #[test]
-fn stale_checkpoint_rebuilds_after_catalog_publication_index_gap() {
+fn same_checkpoint_missing_locator_row_is_rebuilt_on_reopen() {
     let root = tempfile::tempdir().unwrap();
-    let first = record(b"first generation");
-    let second = record(b"second generation");
+    let value = record(b"deleted locator row");
     {
-        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-        store.put_records(&[first]).unwrap();
-        store.put_records(&[second]).unwrap();
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&[value]).unwrap();
     }
-
-    let first_catalog = std::fs::read_dir(root.path().join("catalog"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("0-")
-        })
-        .unwrap();
-    let first_head = *blake3::hash(&std::fs::read(first_catalog).unwrap()).as_bytes();
-    let mut connection = Connection::open(root.path().join(LOCATOR_FILE)).unwrap();
-    let transaction = connection.transaction().unwrap();
-    transaction
+    let connection = Connection::open(root.path().join(LOCATOR_FILE)).unwrap();
+    connection
         .execute(
-            "DELETE FROM locator WHERE digest = ?1",
-            params![second.digest.as_slice()],
+            "DELETE FROM locator WHERE digest=?1",
+            [value.digest.as_slice()],
         )
         .unwrap();
-    transaction
-        .execute(
-            "UPDATE checkpoint SET generation = 0, head_digest = ?1 WHERE singleton = 1",
-            params![first_head.as_slice()],
-        )
-        .unwrap();
-    transaction.commit().unwrap();
     drop(connection);
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    assert_eq!(
+    assert_eq!(reopened.test_sealed_authentications(), 1);
+    assert_value(&mut reopened, value);
+    assert_value(&mut reopened, value);
+    assert!(
         reopened
-            .get(CONTENT_NAMESPACE, second.digest)
+            .get(CONTENT_NAMESPACE, [0x5a; 32])
             .unwrap()
+            .is_none()
+    );
+    assert_eq!(reopened.test_sealed_authentications(), 1);
+    assert_eq!(reopened.test_counts().unwrap().0, 1);
+}
+
+#[test]
+fn journal_with_old_head_restores_the_previous_active_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let old = record(b"published");
+    let attempted = record(b"uncommitted");
+    {
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        store.put_records(&[old]).unwrap();
+        store.test_interrupt_append(&[attempted], false).unwrap();
+    }
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_value(&mut reopened, old);
+    assert!(
+        reopened
+            .get(CONTENT_NAMESPACE, attempted.digest)
             .unwrap()
-            .1,
-        second.bytes
+            .is_none()
+    );
+    assert!(!root.path().join("active.append").exists());
+}
+
+#[test]
+fn journal_with_intended_head_validates_append_and_repairs_locator() {
+    let root = tempfile::tempdir().unwrap();
+    let old = record(b"published");
+    let appended = record(b"committed before sqlite");
+    {
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        store.put_records(&[old]).unwrap();
+        store.test_interrupt_append(&[appended], true).unwrap();
+    }
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_value(&mut reopened, old);
+    assert_value(&mut reopened, appended);
+    assert_eq!(reopened.test_counts().unwrap(), (2, 1, 0));
+    assert!(!root.path().join("active.append").exists());
+}
+
+#[test]
+fn corrupt_active_control_file_is_rejected_before_locator_is_trusted() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"authority");
+    {
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        store.put_records(&[value]).unwrap();
+    }
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.path().join("active.head"))
+        .unwrap()
+        .write_all(b"corruption")
+        .unwrap();
+    assert!(PackedCatalog::open(root.path(), crate::Durability::Durable).is_err());
+}
+
+#[test]
+fn durable_post_mutation_errors_poison_and_recover_without_retry_ambiguity() {
+    for failpoint in [
+        AppendFailpoint::MutationApplied,
+        AppendFailpoint::HeadPublished,
+        AppendFailpoint::JournalRemoved,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let attempted = record(b"durable attempted append");
+        let later = record(b"durable later append");
+        {
+            let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+            store.test_set_append_failpoint(failpoint);
+            assert!(store.put_records(&[attempted]).is_err());
+            assert!(matches!(
+                store.put_records(&[later]),
+                Err(CatalogError::Poisoned)
+            ));
+        }
+        let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        let present = reopened
+            .get(CONTENT_NAMESPACE, attempted.digest)
+            .unwrap()
+            .is_some();
+        assert_eq!(present, failpoint != AppendFailpoint::MutationApplied);
+        reopened.put_records(&[attempted]).unwrap();
+        assert_value(&mut reopened, attempted);
+    }
+}
+
+#[test]
+fn deferred_index_failure_cannot_publish_unindexed_object() {
+    let root = tempfile::tempdir().unwrap();
+    let attempted = record(b"deferred unindexed append");
+    let later = record(b"deferred later append");
+    {
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
+        store.test_set_deferred_failpoint(DeferredFailpoint::IndexCommit);
+        assert!(store.put_records(&[attempted]).is_err());
+        assert!(matches!(
+            store.put_records(&[later]),
+            Err(CatalogError::Poisoned)
+        ));
+        assert!(matches!(store.finalize_bulk(), Err(CatalogError::Poisoned)));
+    }
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
+    assert!(
+        reopened
+            .get(CONTENT_NAMESPACE, attempted.digest)
+            .unwrap()
+            .is_none()
+    );
+    reopened.put_records(&[attempted]).unwrap();
+    reopened.close().unwrap();
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_value(&mut reopened, attempted);
+}
+
+#[test]
+fn deferred_post_authority_error_poisoned_handle_recovers_published_object() {
+    let root = tempfile::tempdir().unwrap();
+    let attempted = record(b"deferred published append");
+    let later = record(b"deferred must reopen");
+    {
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
+        store.put_records(&[attempted]).unwrap();
+        store.test_set_deferred_failpoint(DeferredFailpoint::AfterCatalogHead);
+        assert!(store.finalize_bulk().is_err());
+        assert!(matches!(
+            store.put_records(&[later]),
+            Err(CatalogError::Poisoned)
+        ));
+    }
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_value(&mut reopened, attempted);
+    assert!(
+        reopened
+            .get(CONTENT_NAMESPACE, later.digest)
+            .unwrap()
+            .is_none()
     );
 }
 
 #[test]
-fn incremental_publication_persists_locator_for_next_reopen() {
-    let root = tempfile::tempdir().unwrap();
-    let first = record(b"incremental first");
-    let second = record(b"incremental second");
-    {
-        let mut store = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
-        store.put_records(&[first]).unwrap();
-    }
-    {
-        let mut store = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
-        store.put_records(&[second]).unwrap();
-    }
-    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
-    for value in [first, second] {
-        assert_eq!(
+fn seal_errors_after_authority_publication_poison_writer_and_recover_on_reopen() {
+    for failpoint in [
+        SealFailpoint::SqliteAfterHead,
+        SealFailpoint::DuringRetirement,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let sealed = record(b"published before returned seal error");
+        let later = record(b"must not mutate published inode");
+        {
+            let mut store =
+                PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                    .unwrap();
+            store.test_set_seal_failpoint(failpoint);
+            assert!(store.put_records(&[sealed]).is_err());
+            // Reads remain pinned to authenticated active/sealed readers even
+            // though this writer may no longer append until recovery.
+            assert_value(&mut store, sealed);
+            assert!(matches!(
+                store.put_records(&[later]),
+                Err(CatalogError::Poisoned)
+            ));
+        }
+        let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        assert_value(&mut reopened, sealed);
+        assert!(
             reopened
-                .get(CONTENT_NAMESPACE, value.digest)
+                .get(CONTENT_NAMESPACE, later.digest)
                 .unwrap()
-                .unwrap()
-                .1,
-            value.bytes
+                .is_none()
+        );
+        reopened.put_records(&[later]).unwrap();
+        assert_value(&mut reopened, later);
+    }
+}
+
+#[test]
+fn empty_active_without_head_recovers_but_nonempty_legacy_window_is_rejected() {
+    let fresh = tempfile::tempdir().unwrap();
+    {
+        let _store = PackedCatalog::open(fresh.path(), crate::Durability::Durable).unwrap();
+    }
+    fs::remove_file(fresh.path().join("active.head")).unwrap();
+    let _reopened = PackedCatalog::open(fresh.path(), crate::Durability::Durable).unwrap();
+
+    let legacy = tempfile::tempdir().unwrap();
+    let value = record(b"not published by a head");
+    {
+        let mut store = PackedCatalog::open(legacy.path(), crate::Durability::Durable).unwrap();
+        store.put_records(&[value]).unwrap();
+    }
+    fs::remove_file(legacy.path().join("active.head")).unwrap();
+    assert!(PackedCatalog::open(legacy.path(), crate::Durability::Durable).is_err());
+}
+
+#[test]
+fn valid_sqlite_semantic_corruption_is_rebuilt_before_read_allocation() {
+    for column in ["kind", "offset", "length", "path"] {
+        let root = tempfile::tempdir().unwrap();
+        let value = record(b"authoritative payload");
+        {
+            let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+            store.put_records(&[value]).unwrap();
+        }
+        let connection = Connection::open(root.path().join(LOCATOR_FILE)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        match column {
+            "kind" => connection
+                .execute("UPDATE locator SET kind=42", [])
+                .unwrap(),
+            "offset" => connection
+                .execute("UPDATE locator SET offset=999999", [])
+                .unwrap(),
+            "length" => connection
+                .execute("UPDATE locator SET length=9223372036854775807", [])
+                .unwrap(),
+            "path" => connection
+                .execute("UPDATE physical_source SET path='../arbitrary'", [])
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        drop(connection);
+        let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        // The checkpoint still matches exactly; get must distrust the remaining
+        // valid SQLite and rebuild from authenticated authority once.
+        assert_value(&mut reopened, value);
+    }
+}
+
+#[test]
+fn legacy_head_discovery_ignores_malformed_and_orphan_higher_generations() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"valid chain root");
+    {
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&[value]).unwrap();
+    }
+    fs::remove_file(root.path().join("catalog.head")).unwrap();
+    let catalogs = root.path().join("catalog");
+    fs::write(catalogs.join("garbage.catalog"), b"garbage").unwrap();
+    fs::write(catalogs.join("01-deadbeef.catalog"), b"garbage").unwrap();
+    fs::write(
+        catalogs.join("9-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.catalog"),
+        b"garbage",
+    )
+    .unwrap();
+    let orphan = wheat_core::SegmentCatalogRecord {
+        generation: 8,
+        previous: None,
+        segment: [9; 32],
+        stored_length: 123,
+    };
+    write_catalog_record(&catalogs, &orphan);
+
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_value(&mut reopened, value);
+}
+
+#[test]
+fn reopen_removes_only_authenticated_canonical_publications_unreachable_from_head() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"authoritative sealed publication");
+    {
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&[value]).unwrap();
+    }
+    let authoritative = publication_names(root.path());
+    assert_eq!(authoritative.0.len(), 1);
+    assert_eq!(authoritative.1.len(), 1);
+
+    let segments = root.path().join("segments");
+    let catalogs = root.path().join("catalog");
+    let segment_bytes = fs::read(segments.join(&authoritative.0[0])).unwrap();
+    let catalog_bytes = fs::read(catalogs.join(&authoritative.1[0])).unwrap();
+    let authority = wheat_core::decode_segment_catalog_record(&catalog_bytes).unwrap();
+    let head_digest = *blake3::hash(&catalog_bytes).as_bytes();
+    let segment_hex = authority
+        .segment
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    for generation in [authority.generation + 1, authority.generation + 2] {
+        let orphan_segment = format!("{generation}-{segment_hex}.segment");
+        fs::write(segments.join(&orphan_segment), &segment_bytes).unwrap();
+        write_catalog_record(
+            &catalogs,
+            &wheat_core::SegmentCatalogRecord {
+                generation,
+                previous: Some(head_digest),
+                segment: authority.segment,
+                stored_length: authority.stored_length,
+            },
         );
     }
+    // Fail closed for names or contents which cannot be proven to be a
+    // canonical, authenticated immutable publication.
+    fs::write(segments.join("01-deadbeef.segment"), b"preserve").unwrap();
+    let malformed_segment = format!("99-{}.segment", "0".repeat(64));
+    fs::write(segments.join(&malformed_segment), b"preserve").unwrap();
+    fs::write(catalogs.join("garbage.catalog"), b"preserve").unwrap();
+    let malformed_catalog = format!("99-{}.catalog", "0".repeat(64));
+    fs::write(catalogs.join(&malformed_catalog), b"preserve").unwrap();
+
+    for _ in 0..2 {
+        let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        assert_value(&mut reopened, value);
+        drop(reopened);
+        let names = publication_names(root.path());
+        assert_eq!(
+            names.0,
+            [
+                authoritative.0[0].clone(),
+                "01-deadbeef.segment".into(),
+                malformed_segment.clone(),
+            ]
+        );
+        assert_eq!(
+            names.1,
+            [
+                authoritative.1[0].clone(),
+                malformed_catalog.clone(),
+                "garbage.catalog".into(),
+            ]
+        );
+        assert!(root.path().join("catalog.head").exists());
+        assert!(root.path().join("active.segment").exists());
+    }
+}
+
+#[test]
+fn no_head_initial_state_removes_authenticated_orphan_segment_only() {
+    let donor = tempfile::tempdir().unwrap();
+    let value = record(b"orphan segment without catalog publication");
+    {
+        let mut store =
+            PackedCatalog::open_with_test_threshold(donor.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&[value]).unwrap();
+    }
+    let donor_segment = fs::read_dir(donor.path().join("segments"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    {
+        let _store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    }
+    let orphan_path = root.path().join("segments").join(donor_segment.file_name());
+    fs::copy(donor_segment.path(), &orphan_path).unwrap();
+    assert!(orphan_path.exists());
+
+    let _reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert!(!orphan_path.exists());
+    assert!(root.path().join("active.segment").exists());
+    assert!(root.path().join("catalog.head").exists());
+}
+
+#[test]
+fn authoritative_publication_survives_cleanup_after_head_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let first = record(b"first authoritative generation");
+    let second = record(b"second authoritative generation");
+    {
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&[first]).unwrap();
+        store.put_records(&[second]).unwrap();
+    }
+    let authoritative = publication_names(root.path());
+    assert_eq!(authoritative.0.len(), 2);
+    assert_eq!(authoritative.1.len(), 2);
+
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_value(&mut reopened, first);
+    assert_value(&mut reopened, second);
+    drop(reopened);
+    assert_eq!(publication_names(root.path()), authoritative);
+}
+
+#[test]
+fn legacy_head_discovery_rejects_duplicate_valid_latest_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let catalogs = root.path().join("catalog");
+    fs::create_dir_all(&catalogs).unwrap();
+    for segment in [[1; 32], [2; 32]] {
+        write_catalog_record(
+            &catalogs,
+            &wheat_core::SegmentCatalogRecord {
+                generation: 0,
+                previous: None,
+                segment,
+                stored_length: 1,
+            },
+        );
+    }
+    assert!(matches!(
+        PackedCatalog::open(root.path(), crate::Durability::Durable),
+        Err(CatalogError::Corrupt(
+            "multiple valid catalog heads at latest generation"
+        ))
+    ));
+}
+
+#[test]
+fn oversized_active_journal_is_rejected_before_allocation() {
+    let root = tempfile::tempdir().unwrap();
+    {
+        let _store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    }
+    let journal = fs::File::create(root.path().join("active.append")).unwrap();
+    journal.set_len(MAX_SEGMENT_TAIL_BYTES + 1024).unwrap();
+    assert!(matches!(
+        PackedCatalog::open(root.path(), crate::Durability::Durable),
+        Err(CatalogError::Corrupt("active journal exceeds tail limit"))
+    ));
+}
+
+#[test]
+fn duplicate_heavy_batch_does_not_false_preseal() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"one projected key");
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1_000)
+            .unwrap();
+    let duplicates = vec![value; 100];
+    store.put_records(&duplicates).unwrap();
+    assert_eq!(store.test_counts().unwrap(), (1, 1, 0));
+}
+
+#[test]
+fn one_durable_batch_rolls_at_target_count_and_payload_seams() {
+    for (target, max_entries, max_payload) in
+        [(1, 100, 100), (u64::MAX, 2, 100), (u64::MAX, 100, 3)]
+    {
+        let root = tempfile::tempdir().unwrap();
+        let values = [record(b"a"), record(b"bb"), record(b"c"), record(b"dd")];
+        let mut store = PackedCatalog::open_with_test_limits(
+            root.path(),
+            crate::Durability::Durable,
+            target,
+            max_entries,
+            max_payload,
+        )
+        .unwrap();
+        store.put_records(&values).unwrap();
+        for value in values {
+            assert_value(&mut store, value);
+        }
+        assert!(fs::read_dir(root.path().join("segments")).unwrap().count() >= 1);
+    }
+}
+
+#[test]
+fn impossible_record_leaves_prior_active_state_exact_and_usable() {
+    let root = tempfile::tempdir().unwrap();
+    let prior = record(b"old");
+    let impossible = record(b"12345");
+    let later = record(b"new");
+    let mut store = PackedCatalog::open_with_test_limits(
+        root.path(),
+        crate::Durability::Durable,
+        u64::MAX,
+        10,
+        4,
+    )
+    .unwrap();
+    store.put_records(&[prior]).unwrap();
+    let old_active = fs::read(root.path().join("active.segment")).unwrap();
+    let old_head = fs::read(root.path().join("active.head")).unwrap();
+    let old_counts = store.test_counts().unwrap();
+
+    assert!(matches!(
+        store.put_records(&[later, impossible]),
+        Err(CatalogError::Segment(SegmentError::TooLarge))
+    ));
+    assert_eq!(
+        fs::read(root.path().join("active.segment")).unwrap(),
+        old_active
+    );
+    assert_eq!(fs::read(root.path().join("active.head")).unwrap(), old_head);
+    assert_eq!(store.test_counts().unwrap(), old_counts);
+    assert_value(&mut store, prior);
+    store.put_records(&[later]).unwrap();
+    assert_value(&mut store, later);
+}
+
+#[test]
+fn deferred_close_failure_does_not_publish_unfinalized_bulk() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"unfinalized");
+    let mut store = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
+    store.put_records(&[value]).unwrap();
+    store.test_set_close_failpoint(CloseFailpoint::BeforeFinalize);
+    assert!(matches!(
+        store.close(),
+        Err(CatalogError::Corrupt(
+            "test failure before deferred bulk finalization"
+        ))
+    ));
+    assert_eq!(
+        fs::read_dir(root.path().join("catalog")).unwrap().count(),
+        0
+    );
+    let segments: Vec<_> = fs::read_dir(root.path().join("segments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(segments.len(), 1);
+    assert!(segments[0].starts_with("bulk-"));
+}
+
+#[test]
+fn threshold_seal_publishes_once_repoints_one_source_and_bounds_counts() {
+    let root = tempfile::tempdir().unwrap();
+    let first = record(b"seal me");
+    let second = record(b"remain active");
+    {
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&[first]).unwrap();
+        assert_eq!(store.test_counts().unwrap(), (1, 2, 1));
+        store.put_records(&[first]).unwrap();
+        assert_eq!(store.test_counts().unwrap(), (1, 2, 1));
+    }
+    {
+        let connection = Connection::open(root.path().join(LOCATOR_FILE)).unwrap();
+        let path: String = connection
+            .query_row(
+                "SELECT s.path FROM locator l JOIN physical_source s ON s.id=l.source_id WHERE l.digest=?1",
+                params![first.digest.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(path.starts_with("segments/"));
+    }
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    reopened.put_records(&[second]).unwrap();
+    assert_eq!(reopened.test_sealed_authentications(), 1);
+    assert_value(&mut reopened, first);
+    assert_eq!(reopened.test_sealed_authentications(), 1);
+    assert_value(&mut reopened, first);
+    assert_eq!(reopened.test_sealed_authentications(), 1);
+    assert_value(&mut reopened, second);
+    assert_eq!(reopened.test_counts().unwrap(), (2, 2, 1));
+    assert_eq!(
+        fs::read_dir(root.path().join("segments")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("catalog")).unwrap().count(),
+        1
+    );
 }

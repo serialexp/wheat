@@ -30,3 +30,14 @@ CREATE TABLE IF NOT EXISTS work_parent (
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS work_parent_parent_oid ON work_parent(parent_oid);
+
+-- Prepared mappings remain separate until backing-store proof and are gated by
+-- journal format version 2; older prototype journals are deliberately restarted.
+CREATE TABLE IF NOT EXISTS prepared_work (
+    oid BLOB PRIMARY KEY,
+    change_id BLOB NOT NULL,
+    revision_id BLOB NOT NULL,
+    view_id BLOB NOT NULL,
+    application_id BLOB NOT NULL,
+    FOREIGN KEY (oid) REFERENCES work(oid) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;

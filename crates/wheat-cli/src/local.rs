@@ -102,6 +102,12 @@ fn reject_legacy(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn projection_path(root: &Path) -> Result<std::path::PathBuf> {
+    reject_legacy(root)?;
+    repository_layout(root)?;
+    Ok(root.join(".wheat-git/projection.git"))
+}
+
 pub(crate) fn open(root: &Path) -> Result<LocalRepository> {
     reject_legacy(root)?;
     match repository_layout(root)? {

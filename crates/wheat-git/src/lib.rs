@@ -4,7 +4,10 @@
 //! Its first parent is the semantic dependency; additional merge parents are
 //! retained only as source provenance.
 
+pub mod bridge;
+pub mod export;
 pub mod journal;
+pub mod push;
 mod staged_import;
 pub use staged_import::{
     AtomicImportError, DEFAULT_STAGE_COMMITS, FinalizeImportError, FinalizePhase, StagedBranch,

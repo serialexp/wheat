@@ -112,8 +112,8 @@ pub enum StagedImportError {
     UnsupportedSubmodule(String),
 }
 
-/// Discover and stage at most `max_commits` additional commits. `None` uses
-/// [`DEFAULT_STAGE_COMMITS`], never an unbounded budget. Each invocation discovers at
+/// Discover and stage at most `max_commits` additional commits, capped at
+/// [`DEFAULT_STAGE_COMMITS`]. `None` uses that bound. Each invocation discovers at
 /// most one durable [`DISCOVERY_BATCH`] parent frontier; `complete` remains false until
 /// that frontier is exhausted. Reopening with changed refs, HEAD, repository path, or
 /// format is rejected.
@@ -192,7 +192,10 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     batch.flush().await.map_err(CommitWriterError::from)?;
     let cached = cache::CachedObjects::new(objects, CACHE_ENTRIES, CACHE_BYTES);
     let mut receipts = ProofReceipts::new(SET_RECEIPTS);
-    // A journal is only a hint: authenticate every reused object and relationship first.
+
+    // A journal is only a hint: authenticate every completed mapping before consulting
+    // crash-left prepared mappings. A prepared descendant must never mask corruption in
+    // ancestry that the journal already claims is durable.
     let mut after = None::<Vec<u8>>;
     loop {
         let page = journal.completed(after.as_deref(), DISCOVERY_BATCH)?;
@@ -208,14 +211,56 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
                 &oid,
                 native,
                 &mut receipts,
+                false,
             )
             .await?;
             after = Some(oid);
         }
     }
 
-    let budget = max_commits.unwrap_or(DEFAULT_STAGE_COMMITS);
+    // A crash after recording preparation but before promotion leaves mappings that
+    // are hints only. Reauthenticate them strictly against the backing store, promote
+    // the whole bounded group atomically, or reset all of them to pending work.
+    let prepared = journal.prepared(DEFAULT_STAGE_COMMITS + 1)?;
+    if !prepared.is_empty() {
+        let mut valid = prepared.len() <= DEFAULT_STAGE_COMMITS;
+        for (oid, native) in &prepared {
+            if !valid {
+                break;
+            }
+            if verify_mapping(
+                &cached,
+                content,
+                &journal,
+                empty,
+                oid,
+                *native,
+                &mut receipts,
+                true,
+            )
+            .await
+            .is_err()
+            {
+                valid = false;
+                break;
+            }
+        }
+        if valid {
+            journal.complete_many(&prepared)?;
+        } else {
+            journal.reset_prepared()?;
+            receipts = ProofReceipts::new(SET_RECEIPTS);
+        }
+    }
+
+    let budget = max_commits
+        .unwrap_or(DEFAULT_STAGE_COMMITS)
+        .min(DEFAULT_STAGE_COMMITS);
     let mut written = 0usize;
+    let mut prepared = Vec::with_capacity(budget.min(DEFAULT_STAGE_COMMITS));
+    if budget != 0 {
+        journal.begin_preparing()?;
+    }
     while written < budget {
         let Some(work) = journal.ready(1)?.into_iter().next() else {
             break;
@@ -225,7 +270,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
         let parent_native = work
             .parents
             .first()
-            .map(|p| journal.result(p))
+            .map(|p| journal.mapping(p))
             .transpose()?
             .flatten();
         let parent_view = parent_native.map_or(empty, |p| p.view_id);
@@ -253,21 +298,31 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
             view_id: persisted.resulting_view,
             application_id: persisted.application_id,
         };
-        // Buffered reads are not proof of durability. Flush before verification
-        // against the backing store, and only then acknowledge the journal row.
-        batch.flush().await.map_err(CommitWriterError::from)?;
-        verify_mapping(
-            &cached,
-            content,
-            &journal,
-            empty,
-            &work.oid,
-            native,
-            &mut receipts,
-        )
-        .await?;
-        journal.complete(&work.oid, native)?;
+        journal.prepare(&work.oid, native)?;
+        prepared.push((work.oid, native));
         written += 1;
+    }
+    if budget != 0 {
+        journal.commit_preparing()?;
+    }
+    if !prepared.is_empty() {
+        // Buffered reads are not proof of durability. One bounded flush covers the
+        // staged group, then every mapping is authenticated against the backing store.
+        batch.flush().await.map_err(CommitWriterError::from)?;
+        for (oid, native) in &prepared {
+            verify_mapping(
+                &cached,
+                content,
+                &journal,
+                empty,
+                oid,
+                *native,
+                &mut receipts,
+                true,
+            )
+            .await?;
+        }
+        journal.complete_many(&prepared)?;
     }
     let (completed_commits, pending_commits) = journal.progress()?;
     let complete = !discovery_pending && pending_commits == 0;
@@ -411,6 +466,7 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     oid: &[u8],
     n: NativeResult,
     receipts: &mut ProofReceipts,
+    allow_prepared_parent: bool,
 ) -> Result<(), StagedImportError> {
     let bad = |why: &str| StagedImportError::InvalidMapping(hex(oid), why.to_owned());
     if n.change_id != ChangeId::from_import_identity(NAMESPACE, oid) {
@@ -443,7 +499,13 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     let parents = journal.parents(oid)?;
     let parent_native = parents
         .first()
-        .map(|p| journal.result(p))
+        .map(|p| {
+            if allow_prepared_parent {
+                journal.mapping(p)
+            } else {
+                journal.result(p)
+            }
+        })
         .transpose()?
         .flatten();
     if !parents.is_empty() && parent_native.is_none() {
