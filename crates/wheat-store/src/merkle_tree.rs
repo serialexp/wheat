@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, btree_map},
+    iter::Peekable,
+};
 
 use thiserror::Error;
 use wheat_core::{
@@ -24,6 +27,16 @@ pub enum MerkleTreeError {
     PathBytesExceeded { size: usize, limit: usize },
     #[error("tree depth {depth} exceeds the limit of {limit}")]
     DepthExceeded { depth: usize, limit: usize },
+    #[error("tree diff contains more than {limit} changes")]
+    ChangeLimitExceeded { limit: usize },
+    #[error("tree diff reads more than {limit} nodes")]
+    NodeLimitExceeded { limit: usize },
+    #[error("tree diff visits more than {limit} directory entries")]
+    EntryLimitExceeded { limit: usize },
+    #[error("tree node is {size} bytes, exceeding the {limit}-byte limit")]
+    NodeBytesExceeded { size: usize, limit: usize },
+    #[error("tree diff buffers more than {limit} directory entries")]
+    BufferedEntriesExceeded { limit: usize },
 }
 
 /// Resource bounds for a complete Merkle tree walk.
@@ -55,6 +68,41 @@ pub struct TreeFile {
     pub value: FileValue,
 }
 
+/// One changed file leaf between two Merkle roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeDiff {
+    /// Canonical slash-separated repository-relative path.
+    pub path: String,
+    pub old: Option<FileValue>,
+    pub new: Option<FileValue>,
+}
+
+/// Resource bounds for a Merkle tree diff cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TreeDiffLimits {
+    pub max_changes: usize,
+    pub max_nodes: usize,
+    pub max_entries: usize,
+    pub max_path_bytes: usize,
+    pub max_depth: usize,
+    pub max_node_bytes: usize,
+    pub max_buffered_entries: usize,
+}
+
+impl Default for TreeDiffLimits {
+    fn default() -> Self {
+        Self {
+            max_changes: 250_000,
+            max_nodes: 250_000,
+            max_entries: 1_000_000,
+            max_path_bytes: 4_096,
+            max_depth: 128,
+            max_node_bytes: 16 * 1024 * 1024,
+            max_buffered_entries: 1_000_000,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeEdit {
     pub path: Vec<String>,
@@ -63,6 +111,51 @@ pub struct TreeEdit {
 
 pub struct MerkleTreeStore<'a, S> {
     objects: &'a S,
+}
+
+type EntryIter = Peekable<btree_map::IntoIter<String, DirectoryEntry>>;
+
+struct DiffFrame {
+    prefix_len: usize,
+    depth: usize,
+    old: EntryIter,
+    new: EntryIter,
+}
+
+// Keeping the iterator frame inline avoids one heap allocation per visited directory.
+#[allow(clippy::large_enum_variant)]
+enum DiffWork {
+    Directories {
+        old: Option<TreeId>,
+        new: Option<TreeId>,
+        prefix_len: usize,
+        depth: usize,
+    },
+    Entries(DiffFrame),
+    Compare {
+        path_len: usize,
+        depth: usize,
+        old: Option<DirectoryEntry>,
+        new: Option<DirectoryEntry>,
+    },
+    Emit {
+        path_len: usize,
+        old: Option<FileValue>,
+        new: Option<FileValue>,
+    },
+}
+
+/// Incremental, lexically ordered Merkle diff. An error permanently exhausts it.
+pub struct TreeDiffCursor<'a, S> {
+    objects: &'a S,
+    limits: TreeDiffLimits,
+    work: Vec<DiffWork>,
+    path: String,
+    nodes: usize,
+    entries: usize,
+    changes: usize,
+    buffered_entries: usize,
+    exhausted: bool,
 }
 
 impl<'a, S> MerkleTreeStore<'a, S>
@@ -242,7 +335,297 @@ where
         self.write_node(&root_node).await
     }
 
+    /// Create an incremental lexical diff from `old` to `new`.
+    ///
+    /// Equal roots are pruned without reading storage. Other equal directory IDs
+    /// are pruned as soon as their parent entries are merged.
+    #[must_use]
+    pub fn diff_cursor(
+        &self,
+        old: TreeId,
+        new: TreeId,
+        limits: TreeDiffLimits,
+    ) -> TreeDiffCursor<'a, S> {
+        let mut work = Vec::with_capacity(limits.max_depth.min(128).saturating_add(1));
+        if old != new {
+            work.push(DiffWork::Directories {
+                old: Some(old),
+                new: Some(new),
+                prefix_len: 0,
+                depth: 0,
+            });
+        }
+        TreeDiffCursor {
+            objects: self.objects,
+            limits,
+            work,
+            path: String::new(),
+            nodes: 0,
+            entries: 0,
+            changes: 0,
+            buffered_entries: 0,
+            exhausted: false,
+        }
+    }
+
     pub async fn contains_node(&self, id: TreeId) -> Result<bool, MerkleTreeError> {
         Ok(self.objects.exists_many(&[ObjectId::from(id)]).await?[0])
+    }
+}
+
+impl<S: ImmutableObjectStore> TreeDiffCursor<'_, S> {
+    async fn read_node(&mut self, id: TreeId) -> Result<DirectoryNode, MerkleTreeError> {
+        if self.nodes == self.limits.max_nodes {
+            return Err(MerkleTreeError::NodeLimitExceeded {
+                limit: self.limits.max_nodes,
+            });
+        }
+        self.nodes += 1;
+        let object = self.objects.get(id.into()).await?;
+        if object.kind != ObjectKind::Tree {
+            return Err(ObjectStoreError::WrongKind {
+                id: id.into(),
+                expected: ObjectKind::Tree,
+                actual: object.kind,
+            }
+            .into());
+        }
+        let size = object.canonical_bytes.len();
+        if size > self.limits.max_node_bytes {
+            return Err(MerkleTreeError::NodeBytesExceeded {
+                size,
+                limit: self.limits.max_node_bytes,
+            });
+        }
+        Ok(decode_directory_node(&object.canonical_bytes)?)
+    }
+
+    fn account_node(&mut self, node: &DirectoryNode) -> Result<(), MerkleTreeError> {
+        let count = node.entries.len();
+        let entries = self.entries.saturating_add(count);
+        if entries > self.limits.max_entries {
+            return Err(MerkleTreeError::EntryLimitExceeded {
+                limit: self.limits.max_entries,
+            });
+        }
+        let buffered = self.buffered_entries.saturating_add(count);
+        if buffered > self.limits.max_buffered_entries {
+            return Err(MerkleTreeError::BufferedEntriesExceeded {
+                limit: self.limits.max_buffered_entries,
+            });
+        }
+        self.entries = entries;
+        self.buffered_entries = buffered;
+        Ok(())
+    }
+
+    fn push_path(&mut self, prefix_len: usize, name: &str) -> Result<usize, MerkleTreeError> {
+        self.path.truncate(prefix_len);
+        let size = prefix_len
+            .checked_add(usize::from(prefix_len != 0))
+            .and_then(|size| size.checked_add(name.len()))
+            .unwrap_or(usize::MAX);
+        if size > self.limits.max_path_bytes {
+            return Err(MerkleTreeError::PathBytesExceeded {
+                size,
+                limit: self.limits.max_path_bytes,
+            });
+        }
+        self.path.reserve(size.saturating_sub(self.path.len()));
+        if prefix_len != 0 {
+            self.path.push('/');
+        }
+        self.path.push_str(name);
+        Ok(size)
+    }
+
+    /// Return the next changed file in lexical path order.
+    pub async fn next(&mut self) -> Result<Option<TreeDiff>, MerkleTreeError> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        let result = self.next_inner().await;
+        if result.is_err() || matches!(result, Ok(None)) {
+            self.exhausted = true;
+            self.work.clear();
+            self.buffered_entries = 0;
+        }
+        result
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<TreeDiff>, MerkleTreeError> {
+        while let Some(work) = self.work.pop() {
+            match work {
+                DiffWork::Emit { path_len, old, new } => {
+                    if self.changes == self.limits.max_changes {
+                        return Err(MerkleTreeError::ChangeLimitExceeded {
+                            limit: self.limits.max_changes,
+                        });
+                    }
+                    self.path.truncate(path_len);
+                    self.changes += 1;
+                    return Ok(Some(TreeDiff {
+                        path: self.path.clone(),
+                        old,
+                        new,
+                    }));
+                }
+                DiffWork::Directories {
+                    old,
+                    new,
+                    prefix_len,
+                    depth,
+                } => {
+                    if old.is_some() && old == new {
+                        continue;
+                    }
+                    if depth > self.limits.max_depth {
+                        return Err(MerkleTreeError::DepthExceeded {
+                            depth,
+                            limit: self.limits.max_depth,
+                        });
+                    }
+                    let old_node = match old {
+                        Some(id) => Some(self.read_node(id).await?),
+                        None => None,
+                    };
+                    let new_node = match new {
+                        Some(id) => Some(self.read_node(id).await?),
+                        None => None,
+                    };
+                    if let Some(node) = &old_node {
+                        self.account_node(node)?;
+                    }
+                    if let Some(node) = &new_node {
+                        self.account_node(node)?;
+                    }
+                    self.work.push(DiffWork::Entries(DiffFrame {
+                        prefix_len,
+                        depth,
+                        old: old_node.unwrap_or_default().entries.into_iter().peekable(),
+                        new: new_node.unwrap_or_default().entries.into_iter().peekable(),
+                    }));
+                }
+                DiffWork::Entries(mut frame) => {
+                    let old_name = frame.old.peek().map(|(name, _)| name.as_str());
+                    let new_name = frame.new.peek().map(|(name, _)| name.as_str());
+                    if old_name.is_none() && new_name.is_none() {
+                        continue;
+                    }
+                    let take_old =
+                        new_name.is_none() || old_name.is_some_and(|old| Some(old) <= new_name);
+                    let take_new =
+                        old_name.is_none() || new_name.is_some_and(|new| Some(new) <= old_name);
+                    if !take_old && !take_new {
+                        continue;
+                    }
+                    let old = take_old.then(|| frame.old.next().expect("peeked old entry"));
+                    let new = take_new.then(|| frame.new.next().expect("peeked new entry"));
+                    self.buffered_entries -=
+                        usize::from(old.is_some()) + usize::from(new.is_some());
+                    let name = old.as_ref().map_or_else(
+                        || &new.as_ref().expect("one entry exists").0,
+                        |entry| &entry.0,
+                    );
+                    let path_len = self.push_path(frame.prefix_len, name)?;
+                    let old = old.map(|(_, entry)| entry);
+                    let new = new.map(|(_, entry)| entry);
+                    let depth = frame.depth;
+                    self.work.push(DiffWork::Entries(frame));
+                    self.work.push(DiffWork::Compare {
+                        path_len,
+                        depth,
+                        old,
+                        new,
+                    });
+                }
+                DiffWork::Compare {
+                    path_len,
+                    depth,
+                    old,
+                    new,
+                } => {
+                    self.path.truncate(path_len);
+                    match (old, new) {
+                        (Some(DirectoryEntry::File(old)), Some(DirectoryEntry::File(new))) => {
+                            if old != new {
+                                self.work.push(DiffWork::Emit {
+                                    path_len,
+                                    old: Some(old),
+                                    new: Some(new),
+                                });
+                            }
+                        }
+                        (
+                            Some(DirectoryEntry::Directory(old)),
+                            Some(DirectoryEntry::Directory(new)),
+                        ) => {
+                            if old != new {
+                                self.work.push(DiffWork::Directories {
+                                    old: Some(old),
+                                    new: Some(new),
+                                    prefix_len: path_len,
+                                    depth: depth.saturating_add(1),
+                                });
+                            }
+                        }
+                        (Some(DirectoryEntry::File(old)), Some(DirectoryEntry::Directory(new))) => {
+                            self.work.push(DiffWork::Directories {
+                                old: None,
+                                new: Some(new),
+                                prefix_len: path_len,
+                                depth: depth.saturating_add(1),
+                            });
+                            self.work.push(DiffWork::Emit {
+                                path_len,
+                                old: Some(old),
+                                new: None,
+                            });
+                        }
+                        (Some(DirectoryEntry::Directory(old)), Some(DirectoryEntry::File(new))) => {
+                            self.work.push(DiffWork::Directories {
+                                old: Some(old),
+                                new: None,
+                                prefix_len: path_len,
+                                depth: depth.saturating_add(1),
+                            });
+                            self.work.push(DiffWork::Emit {
+                                path_len,
+                                old: None,
+                                new: Some(new),
+                            });
+                        }
+                        (Some(DirectoryEntry::File(old)), None) => self.work.push(DiffWork::Emit {
+                            path_len,
+                            old: Some(old),
+                            new: None,
+                        }),
+                        (None, Some(DirectoryEntry::File(new))) => self.work.push(DiffWork::Emit {
+                            path_len,
+                            old: None,
+                            new: Some(new),
+                        }),
+                        (Some(DirectoryEntry::Directory(old)), None) => {
+                            self.work.push(DiffWork::Directories {
+                                old: Some(old),
+                                new: None,
+                                prefix_len: path_len,
+                                depth: depth.saturating_add(1),
+                            });
+                        }
+                        (None, Some(DirectoryEntry::Directory(new))) => {
+                            self.work.push(DiffWork::Directories {
+                                old: None,
+                                new: Some(new),
+                                prefix_len: path_len,
+                                depth: depth.saturating_add(1),
+                            });
+                        }
+                        (None, None) => unreachable!("merged entry has at least one side"),
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 }

@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -6,8 +12,47 @@ use object_store::memory::InMemory;
 use wheat_core::{ContentId, DirectoryEntry, FileKind, FileValue, ObjectId};
 use wheat_store::{
     ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectKind,
-    ObjectStoreAdapter, ObjectStoreError, StoredObject, TreeEdit, TreeFile, TreeWalkLimits,
+    ObjectStoreAdapter, ObjectStoreError, StoredObject, TreeDiff, TreeDiffLimits, TreeEdit,
+    TreeFile, TreeWalkLimits,
 };
+
+struct CountingStore<S> {
+    inner: S,
+    reads: AtomicUsize,
+}
+
+impl<S> CountingStore<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl<S: ImmutableObjectStore> ImmutableObjectStore for CountingStore<S> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.inner.exists_many(ids).await
+    }
+}
 
 struct MalformedTreeStore;
 
@@ -401,6 +446,254 @@ async fn walk_files_propagates_missing_and_decode_errors() {
             .await,
         Err(MerkleTreeError::Decode(_))
     ));
+}
+
+async fn collect_diff<S: ImmutableObjectStore>(
+    trees: &MerkleTreeStore<'_, S>,
+    old: wheat_core::TreeId,
+    new: wheat_core::TreeId,
+    limits: TreeDiffLimits,
+) -> Result<Vec<TreeDiff>, MerkleTreeError> {
+    let mut cursor = trees.diff_cursor(old, new, limits);
+    let mut changes = Vec::new();
+    while let Some(change) = cursor.next().await? {
+        changes.push(change);
+    }
+    Ok(changes)
+}
+
+#[tokio::test]
+async fn diff_identical_root_performs_zero_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::new(directory.path()));
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees.empty_root().await.unwrap();
+    let before = objects.reads();
+    assert!(
+        collect_diff(&trees, root, root, TreeDiffLimits::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(objects.reads(), before);
+}
+
+#[tokio::test]
+async fn diff_is_lexical_and_covers_add_remove_modify_and_kind_transitions() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let empty = trees.empty_root().await.unwrap();
+    let old = trees
+        .apply_edits(
+            empty,
+            &[
+                edit(&["a"], Some("file-to-dir")),
+                edit(&["b", "old"], Some("dir-to-file")),
+                edit(&["c"], Some("removed")),
+                edit(&["m"], Some("old")),
+                edit(&["same"], Some("same")),
+            ],
+        )
+        .await
+        .unwrap();
+    let new = trees
+        .apply_edits(
+            empty,
+            &[
+                edit(&["a", "new"], Some("file-to-dir")),
+                edit(&["b"], Some("dir-to-file")),
+                edit(&["d"], Some("added")),
+                edit(&["m"], Some("new")),
+                edit(&["same"], Some("same")),
+            ],
+        )
+        .await
+        .unwrap();
+    let paths = collect_diff(&trees, old, new, TreeDiffLimits::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|change| (change.path, change.old, change.new))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            ("a".into(), Some(file("file-to-dir")), None),
+            ("a/new".into(), None, Some(file("file-to-dir"))),
+            ("b".into(), None, Some(file("dir-to-file"))),
+            ("b/old".into(), Some(file("dir-to-file")), None),
+            ("c".into(), Some(file("removed")), None),
+            ("d".into(), None, Some(file("added"))),
+            ("m".into(), Some(file("old")), Some(file("new"))),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn diff_prunes_shared_subtrees_and_obeys_all_limits() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::new(directory.path()));
+    let trees = MerkleTreeStore::new(&objects);
+    let empty = trees.empty_root().await.unwrap();
+    let old = trees
+        .apply_edits(
+            empty,
+            &[
+                edit(&["shared", "one"], Some("one")),
+                edit(&["shared", "two"], Some("two")),
+                edit(&["changed", "leaf"], Some("old")),
+            ],
+        )
+        .await
+        .unwrap();
+    let new = trees
+        .apply_edits(old, &[edit(&["changed", "leaf"], Some("new"))])
+        .await
+        .unwrap();
+    let before = objects.reads();
+    assert_eq!(
+        collect_diff(&trees, old, new, TreeDiffLimits::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        objects.reads() - before,
+        4,
+        "two roots and changed children"
+    );
+
+    let old_node = trees.read_node(old).await.unwrap();
+    let new_node = trees.read_node(new).await.unwrap();
+    let old_changed = match old_node.entries["changed"] {
+        DirectoryEntry::Directory(id) => id,
+        _ => panic!("changed is a directory"),
+    };
+    let new_changed = match new_node.entries["changed"] {
+        DirectoryEntry::Directory(id) => id,
+        _ => panic!("changed is a directory"),
+    };
+    let mut max_node_bytes = 0;
+    for id in [old, new, old_changed, new_changed] {
+        max_node_bytes =
+            max_node_bytes.max(objects.get(id.into()).await.unwrap().canonical_bytes.len());
+    }
+    let exact = TreeDiffLimits {
+        max_changes: 1,
+        max_nodes: 4,
+        max_entries: 6,
+        max_path_bytes: 12,
+        max_depth: 1,
+        max_node_bytes,
+        max_buffered_entries: 4,
+    };
+    assert_eq!(
+        collect_diff(&trees, old, new, exact).await.unwrap().len(),
+        1
+    );
+
+    for (limits, expected) in [
+        (
+            TreeDiffLimits {
+                max_changes: 0,
+                ..TreeDiffLimits::default()
+            },
+            "change",
+        ),
+        (
+            TreeDiffLimits {
+                max_nodes: 3,
+                ..TreeDiffLimits::default()
+            },
+            "node",
+        ),
+        (
+            TreeDiffLimits {
+                max_entries: 5,
+                ..TreeDiffLimits::default()
+            },
+            "entry",
+        ),
+        (
+            TreeDiffLimits {
+                max_path_bytes: 11,
+                ..TreeDiffLimits::default()
+            },
+            "path",
+        ),
+        (
+            TreeDiffLimits {
+                max_depth: 0,
+                ..TreeDiffLimits::default()
+            },
+            "depth",
+        ),
+        (
+            TreeDiffLimits {
+                max_node_bytes: 1,
+                ..TreeDiffLimits::default()
+            },
+            "bytes",
+        ),
+        (
+            TreeDiffLimits {
+                max_buffered_entries: 3,
+                ..TreeDiffLimits::default()
+            },
+            "buffered",
+        ),
+    ] {
+        let mut cursor = trees.diff_cursor(old, new, limits);
+        let error = loop {
+            match cursor.next().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("expected {expected} limit error"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(cursor.next().await.unwrap(), None);
+        assert!(
+            matches!(
+                (&error, expected),
+                (MerkleTreeError::ChangeLimitExceeded { .. }, "change")
+                    | (MerkleTreeError::NodeLimitExceeded { .. }, "node")
+                    | (MerkleTreeError::EntryLimitExceeded { .. }, "entry")
+                    | (MerkleTreeError::PathBytesExceeded { .. }, "path")
+                    | (MerkleTreeError::DepthExceeded { .. }, "depth")
+                    | (MerkleTreeError::NodeBytesExceeded { .. }, "bytes")
+                    | (MerkleTreeError::BufferedEntriesExceeded { .. }, "buffered")
+            ),
+            "expected {expected}, got {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn diff_storage_and_decode_errors_exhaust_the_cursor() {
+    let missing = wheat_core::TreeId::from_digest([6; 32]);
+    let other = wheat_core::TreeId::from_digest([7; 32]);
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let mut missing_cursor =
+        MerkleTreeStore::new(&objects).diff_cursor(missing, other, TreeDiffLimits::default());
+    assert!(matches!(
+        missing_cursor.next().await,
+        Err(MerkleTreeError::Store(ObjectStoreError::Missing(_)))
+    ));
+    assert_eq!(missing_cursor.next().await.unwrap(), None);
+
+    let mut malformed_cursor = MerkleTreeStore::new(&MalformedTreeStore).diff_cursor(
+        missing,
+        other,
+        TreeDiffLimits::default(),
+    );
+    assert!(matches!(
+        malformed_cursor.next().await,
+        Err(MerkleTreeError::Decode(_))
+    ));
+    assert_eq!(malformed_cursor.next().await.unwrap(), None);
 }
 
 #[tokio::test]

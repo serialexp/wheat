@@ -1,6 +1,13 @@
 //! Bounded, read-only snapshots of explicitly named workspace files.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::{fmt, io, path::Path};
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SNAPSHOT_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+}
 
 use wheat_core::FileKind;
 
@@ -66,6 +73,19 @@ pub(crate) fn read_workspace_file(
 ) -> Result<Option<WorkspaceFileSnapshot>, WorkspaceFileError> {
     let components = validate_path(path)?;
     platform::read(root, &components, byte_limit)
+}
+
+/// Authenticate a named workspace leaf without allocating its regular-file
+/// contents. Symlink targets remain bounded by `byte_limit` and are hashed from
+/// their small `readlinkat` buffer.
+pub(crate) fn authenticate_workspace_file(
+    root: &Path,
+    path: &Path,
+    expected: Option<(FileKind, &[u8])>,
+    byte_limit: usize,
+) -> Result<bool, WorkspaceFileError> {
+    let components = validate_path(path)?;
+    platform::authenticate(root, &components, expected, byte_limit)
 }
 
 fn validate_path(path: &Path) -> Result<Vec<&std::ffi::OsStr>, WorkspaceFileError> {
@@ -137,6 +157,117 @@ mod platform {
     };
 
     use super::{FileKind, WorkspaceFileError, WorkspaceFileSnapshot};
+
+    pub(super) fn authenticate(
+        root: &Path,
+        components: &[&OsStr],
+        expected: Option<(FileKind, &[u8])>,
+        limit: usize,
+    ) -> Result<bool, WorkspaceFileError> {
+        let mut directory = File::open(root)?;
+        for component in &components[..components.len() - 1] {
+            let name = c_name(component)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(expected.is_none()),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                        if is_symlink(directory.as_raw_fd(), &name) =>
+                    {
+                        Err(WorkspaceFileError::IntermediateSymlink)
+                    }
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::UnsupportedFileType),
+                    _ => Err(error.into()),
+                };
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+        let name = c_name(components.last().expect("validated nonempty path"))?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(expected.is_none())
+            } else {
+                Err(error.into())
+            };
+        }
+        let stat = unsafe { stat.assume_init() };
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => {
+                let bytes = read_link(directory.as_raw_fd(), &name, limit)?;
+                Ok(expected
+                    .is_some_and(|(kind, expected)| kind == FileKind::Symlink && expected == bytes))
+            }
+            libc::S_IFREG => {
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                let mut file = unsafe { File::from_raw_fd(fd) };
+                let opened = file.metadata()?;
+                if !opened.is_file() {
+                    return Err(WorkspaceFileError::UnsupportedFileType);
+                }
+                use std::os::unix::fs::MetadataExt as _;
+                let kind = if opened.mode() & 0o111 != 0 {
+                    FileKind::Executable
+                } else {
+                    FileKind::Regular
+                };
+                if opened.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
+                    return Err(WorkspaceFileError::TooLarge { limit });
+                }
+                let Some((expected_kind, expected)) = expected else {
+                    return Ok(false);
+                };
+                if expected_kind != kind
+                    || expected.len() > limit
+                    || opened.len() != expected.len() as u64
+                {
+                    return Ok(false);
+                }
+                let mut scratch = [0_u8; 64 * 1024];
+                let mut offset = 0_usize;
+                loop {
+                    let read = file.read(&mut scratch)?;
+                    if read == 0 {
+                        break;
+                    }
+                    let end = offset
+                        .checked_add(read)
+                        .ok_or(WorkspaceFileError::TooLarge { limit })?;
+                    if end > expected.len() || scratch[..read] != expected[offset..end] {
+                        return Ok(false);
+                    }
+                    offset = end;
+                }
+                Ok(offset == expected.len())
+            }
+            _ => Err(WorkspaceFileError::UnsupportedFileType),
+        }
+    }
 
     pub(super) fn read(
         root: &Path,
@@ -259,6 +390,9 @@ mod platform {
         if bytes.len() > limit {
             return Err(WorkspaceFileError::TooLarge { limit });
         }
+        #[cfg(test)]
+        super::TEST_SNAPSHOT_ALLOCATED_BYTES
+            .with(|allocated| allocated.set(allocated.get().saturating_add(bytes.capacity())));
         Ok(bytes)
     }
 
@@ -296,6 +430,19 @@ mod platform {
     use std::{ffi::OsStr, fs, io::Read, path::Path};
 
     use super::{FileKind, WorkspaceFileError, WorkspaceFileSnapshot};
+
+    pub(super) fn authenticate(
+        root: &Path,
+        components: &[&OsStr],
+        expected: Option<(FileKind, &[u8])>,
+        limit: usize,
+    ) -> Result<bool, WorkspaceFileError> {
+        Ok(match (read(root, components, limit)?, expected) {
+            (None, None) => true,
+            (Some(actual), Some((kind, bytes))) => actual.kind == kind && actual.bytes == bytes,
+            _ => false,
+        })
+    }
 
     pub(super) fn read(
         root: &Path,
@@ -343,6 +490,31 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::*;
+
+    #[test]
+    fn streaming_authentication_does_not_allocate_a_snapshot_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = vec![b'x'; 3 * 64 * 1024 + 7];
+        fs::write(root.path().join("file"), &bytes).unwrap();
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| allocated.set(0));
+        assert!(
+            read_workspace_file(root.path(), Path::new("file"), bytes.len())
+                .unwrap()
+                .is_some()
+        );
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| assert!(allocated.get() >= bytes.len()));
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| allocated.set(0));
+        assert!(
+            authenticate_workspace_file(
+                root.path(),
+                Path::new("file"),
+                Some((FileKind::Regular, &bytes)),
+                bytes.len(),
+            )
+            .unwrap()
+        );
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| assert_eq!(allocated.get(), 0));
+    }
 
     #[test]
     fn reads_regular_file_without_writing_it() {

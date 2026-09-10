@@ -38,7 +38,10 @@ pub use durability::{Durability, sync_directory, sync_filesystem};
 pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };
-pub use merkle_tree::{MerkleTreeError, MerkleTreeStore, TreeEdit, TreeFile, TreeWalkLimits};
+pub use merkle_tree::{
+    MerkleTreeError, MerkleTreeStore, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
+    TreeWalkLimits,
+};
 pub use mutation_publication::{
     PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,
 };

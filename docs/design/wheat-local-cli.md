@@ -23,12 +23,14 @@ both lists.
   local Git repository or temporary-mirrors a Git URL into a fresh packed Wheat
   repository; `wheat push` projects a selected clean native view and publishes
   one Git branch with exact force-with-lease semantics.
-- [x] **Linux workspace safety and initial materialization.** Explicit regular,
+- [x] **Linux workspace safety and materialization.** Explicit regular,
   executable, and symlink reads use descriptor-relative no-follow traversal;
   authority paths are reserved. Separate stores are linked from workspace-local
-  metadata, and fresh workspaces materialize one pinned view with crash-recoverable
-  monotonic roll-forward plus kernel-enforced no-replace installation. Updating an
-  already materialized workspace remains outstanding.
+  metadata. Fresh workspaces materialize one pinned view, and existing workspaces
+  move incrementally between published, working, and named-branch views using
+  bounded Merkle diffs, exact-preimage transactions, crash recovery, and
+  kernel-enforced no-replace/exchange operations. Changed or obstructed workspace
+  paths fail closed without overwriting user data.
 - [x] **Tracked workspace status foundation.** Human and versioned JSON status
   compare tracked paths with the pinned materialized tree, distinguish content,
   kind, and deletion changes, treat canonical-equivalent line endings as clean,
@@ -37,10 +39,10 @@ both lists.
 
 ### Outstanding
 
-- [ ] **Phase 1 — workspace rematerialization and restore.** Safely update an
-  existing workspace or restore selected paths from a published, working, or
-  named-branch view, preserving exact preimages and refusing to overwrite
-  unrecorded changes under concurrent editors.
+- [ ] **Phase 1 — selected-path restore.** Reuse the rematerialization transaction
+  machinery to restore selected paths from the pinned view after deciding whether
+  naming a dirty path is itself consent to discard its observed value or requires
+  an explicit expected-preimage/preview contract.
 - [ ] **Phase 1 — tracked workspace diff and conflict paths.** Render useful
   workspace/view and revision/revision diffs and map durable conflict evidence to
   affected paths. Untracked/ignored scanning follows complete ignore semantics in
@@ -224,8 +226,21 @@ cement either layout accidentally; the open question must be resolved first.
 
 ## Materialization and restore
 
-Materialization is the first missing end-to-end operation. It takes a pinned
-view and an observed workspace state and produces a plan before writing.
+Materialization takes a pinned view and an observed workspace state and produces
+an authenticated plan before writing. The Linux implementation materializes a
+fresh workspace and incrementally moves an existing workspace between published,
+working, and named-branch views. A bounded iterative Merkle diff prunes equal
+subtrees, so planning visits unequal directory nodes and mutation work is
+proportional to changed paths and bytes rather than the complete tree.
+
+Existing-workspace updates retain exact preimages in a private transaction,
+stream-authenticate workspace and transaction files with fixed scratch, and use
+`RENAME_NOREPLACE`/`RENAME_EXCHANGE` to preserve concurrent data. An immutable
+O(delta) journal plus fixed-width append-only progress records supports abrupt
+crash recovery. Workspace metadata becomes the commit marker only after every
+planned mutation is durable. Selected-path restore remains outstanding because
+its user-consent contract differs from a view switch, which always refuses dirty
+changed paths.
 
 The plan classifies each path as:
 
@@ -490,7 +505,8 @@ error chain to decide whether retry is safe.
 1. Decide the workspace model and metadata placement.
 2. Isolate all repository/projection authority paths and define supported-platform
    safety guarantees.
-3. Implement planned, crash-recoverable materialization and restore.
+3. Implement planned, crash-recoverable materialization and selected-path restore.
+   Materialization is complete; selected-path restore remains.
 4. Implement tracked-path workspace status and diff.
 5. Add complete native change/revision metadata and identity configuration.
 6. Add ergonomic selected-path capture using the current change and predecessor.
