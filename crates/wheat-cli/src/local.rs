@@ -52,6 +52,7 @@ impl ImmutableObjectStore for LocalObjects {
 }
 
 pub(crate) struct LocalRepository {
+    pub store_id: uuid::Uuid,
     pub objects: LocalObjects,
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
@@ -66,7 +67,7 @@ pub struct RepositorySummary {
 
 pub fn content_store(root: &Path) -> Result<ContentStore> {
     match repository_layout(root)? {
-        RepositoryLayout::Loose => Ok(ContentStore::new(root.join(".wheat/content"))),
+        RepositoryLayout::Loose => Ok(ContentStore::new(root.join("content"))),
         RepositoryLayout::Packed => {
             Ok(PackedObjectStore::open(root.join("storage"))?.content_store())
         }
@@ -80,46 +81,47 @@ enum RepositoryLayout {
 }
 
 fn repository_layout(root: &Path) -> Result<RepositoryLayout> {
-    let loose_head = root.join(".wheat/repository.head");
-    let packed_head = root.join("repository.head");
-    match (loose_head.is_file(), packed_head.is_file()) {
-        (true, false) => Ok(RepositoryLayout::Loose),
-        (false, true) if root.join("storage").is_dir() => Ok(RepositoryLayout::Packed),
-        (true, true) => bail!(
-            "ambiguous Wheat repository at {}: both loose and packed heads exist",
-            root.display()
-        ),
-        _ => bail!("cannot open Wheat repository: {}", root.display()),
-    }
-}
-
-fn reject_legacy(root: &Path) -> Result<()> {
-    if root.join(".wheat/repository.yaml").exists() {
+    if root.join(".wheat/repository.head").exists() || root.join(".wheat/repository.yaml").exists()
+    {
         bail!(
-            "legacy YAML Wheat repository detected; prototype formats are incompatible. Preserve it separately and initialize a fresh repository"
+            "embedded prototype Wheat repository detected at {}; discard it and re-import or re-initialize into a separate store",
+            root.display()
         );
     }
-    Ok(())
+    if !root.join("store.json").is_file() {
+        bail!("cannot open Wheat store: {}", root.display());
+    }
+    let head = root.join("repository.head");
+    match (
+        head.is_file(),
+        root.join("objects").is_dir(),
+        root.join("storage").is_dir(),
+    ) {
+        (true, true, false) => Ok(RepositoryLayout::Loose),
+        (true, false, true) => Ok(RepositoryLayout::Packed),
+        _ => bail!("invalid Wheat store layout at {}", root.display()),
+    }
 }
 
 pub(crate) fn projection_path(root: &Path) -> Result<std::path::PathBuf> {
-    reject_legacy(root)?;
     repository_layout(root)?;
-    Ok(root.join(".wheat-git/projection.git"))
+    Ok(root.join("projections/git.git"))
 }
 
 pub(crate) fn open(root: &Path) -> Result<LocalRepository> {
-    reject_legacy(root)?;
+    let store_id = crate::workspace_metadata::StoreMetadata::read(root)?.store_id;
     match repository_layout(root)? {
         RepositoryLayout::Loose => Ok(LocalRepository {
-            objects: LocalObjects::Loose(LooseObjectStore::new(root.join(".wheat/objects"))),
-            content: ContentStore::new(root.join(".wheat/content")),
-            heads: LocalPublicationStore::new(root.join(".wheat/repository.head")),
+            store_id,
+            objects: LocalObjects::Loose(LooseObjectStore::new(root.join("objects"))),
+            content: ContentStore::new(root.join("content")),
+            heads: LocalPublicationStore::new(root.join("repository.head")),
         }),
         RepositoryLayout::Packed => {
             let objects = PackedObjectStore::open(root.join("storage"))?;
             let content = objects.content_store();
             Ok(LocalRepository {
+                store_id,
                 objects: LocalObjects::Packed(objects),
                 content,
                 heads: LocalPublicationStore::new(root.join("repository.head")),
@@ -129,29 +131,26 @@ pub(crate) fn open(root: &Path) -> Result<LocalRepository> {
 }
 
 pub fn initialize(root: &Path) -> Result<()> {
-    reject_legacy(root)?;
-    let directory = root.join(".wheat");
-    let heads = LocalPublicationStore::new(directory.join("repository.head"));
-    if directory.join("repository.head").exists() || root.join("repository.head").exists() {
-        bail!("Wheat repository already exists at {}", root.display());
+    if root.exists() {
+        bail!("Wheat store destination already exists: {}", root.display());
     }
-    let objects = LooseObjectStore::new(directory.join("objects"));
-    let content = ContentStore::new(directory.join("content"));
+    std::fs::create_dir(root)?;
+    let heads = LocalPublicationStore::new(root.join("repository.head"));
+    let objects = LooseObjectStore::new(root.join("objects"));
+    let content = ContentStore::new(root.join("content"));
     runtime()?.block_on(
         RepositoryPublisher::new(&objects, &content, &heads)
             .initialize(&Repository::new(Tree::new())),
     )?;
-    println!("initialized Wheat repository in {}", directory.display());
     Ok(())
 }
 
 pub fn repository_summary(root: &Path) -> Result<RepositorySummary> {
-    reject_legacy(root)?;
     match repository_layout(root)? {
         RepositoryLayout::Loose => {
-            let objects = LooseObjectStore::new(root.join(".wheat/objects"));
-            let content = ContentStore::new(root.join(".wheat/content"));
-            let heads = LocalPublicationStore::new(root.join(".wheat/repository.head"));
+            let objects = LooseObjectStore::new(root.join("objects"));
+            let content = ContentStore::new(root.join("content"));
+            let heads = LocalPublicationStore::new(root.join("repository.head"));
             summarize(root, &objects, &content, &heads)
         }
         RepositoryLayout::Packed => {
@@ -207,11 +206,10 @@ pub fn revision_with_edits(
     RevisionRecord,
     Vec<(wheat_core::EditId, wheat_core::EditRecord)>,
 )> {
-    reject_legacy(root)?;
     match repository_layout(root)? {
         RepositoryLayout::Loose => read_revision_with_edits(
-            &LooseObjectStore::new(root.join(".wheat/objects")),
-            &ContentStore::new(root.join(".wheat/content")),
+            &LooseObjectStore::new(root.join("objects")),
+            &ContentStore::new(root.join("content")),
             revision,
         ),
         RepositoryLayout::Packed => {
@@ -242,13 +240,12 @@ fn read_revision_with_edits<O: ImmutableObjectStore>(
 }
 
 pub fn current_conflicts(root: &Path) -> Result<Vec<Conflict>> {
-    reject_legacy(root)?;
     match repository_layout(root)? {
         RepositoryLayout::Loose => read_current_conflicts(
             root,
-            &LooseObjectStore::new(root.join(".wheat/objects")),
-            &ContentStore::new(root.join(".wheat/content")),
-            &LocalPublicationStore::new(root.join(".wheat/repository.head")),
+            &LooseObjectStore::new(root.join("objects")),
+            &ContentStore::new(root.join("content")),
+            &LocalPublicationStore::new(root.join("repository.head")),
         ),
         RepositoryLayout::Packed => {
             let objects = PackedObjectStore::open(root.join("storage"))?;
@@ -288,12 +285,11 @@ fn read_current_conflicts<O: ImmutableObjectStore>(
 }
 
 pub fn current_revisions(root: &Path) -> Result<Vec<(ChangeId, RevisionId)>> {
-    reject_legacy(root)?;
     match repository_layout(root)? {
         RepositoryLayout::Loose => {
-            let objects = LooseObjectStore::new(root.join(".wheat/objects"));
-            let content = ContentStore::new(root.join(".wheat/content"));
-            let heads = LocalPublicationStore::new(root.join(".wheat/repository.head"));
+            let objects = LooseObjectStore::new(root.join("objects"));
+            let content = ContentStore::new(root.join("content"));
+            let heads = LocalPublicationStore::new(root.join("repository.head"));
             read_current_revisions(root, &objects, &content, &heads)
         }
         RepositoryLayout::Packed => {

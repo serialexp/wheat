@@ -93,7 +93,18 @@ fn validate_path(path: &Path) -> Result<Vec<&std::ffi::OsStr>, WorkspaceFileErro
     for component in path.components() {
         match component {
             Component::Normal(name) => {
-                if result.is_empty() && name == ".wheat" {
+                if result.is_empty()
+                    && matches!(
+                        name.to_str(),
+                        Some(
+                            ".wheat"
+                                | ".wheat-git"
+                                | "repository.head"
+                                | "repository.lock"
+                                | "storage"
+                        )
+                    )
+                {
                     return Err(WorkspaceFileError::InvalidPath);
                 }
                 result.push(name);
@@ -396,7 +407,21 @@ mod tests {
     #[test]
     fn rejects_unsafe_paths() {
         let root = tempfile::tempdir().unwrap();
-        for path in ["", ".", "../x", "a/../x", "a/./b", ".wheat", ".wheat/state"] {
+        for path in [
+            "",
+            ".",
+            "../x",
+            "a/../x",
+            "a/./b",
+            ".wheat",
+            ".wheat/state",
+            ".wheat-git",
+            ".wheat-git/projection.git",
+            "repository.head",
+            "repository.lock",
+            "storage",
+            "storage/packed",
+        ] {
             assert!(
                 matches!(
                     read_workspace_file(root.path(), Path::new(path), 10),

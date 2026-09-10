@@ -1196,10 +1196,10 @@ covers visible and historical trees, revision edit terms, and conflict terms.
 The local publisher writes and verifies the complete immutable closure and every
 required raw-content object before initializing or advancing the head. Missing or
 corrupt content leaves the head unchanged; a stale CAS leaves only harmless,
-retryable immutable objects. The local CLI does not use this head yet because
-canonical object-to-domain decoding and executable repository reconstruction
-remain to be implemented; it still persists the executable model as disposable
-YAML in parallel.
+retryable immutable objects. The local CLI now uses the canonical head directly:
+it reopens loose and packed stores through root-backed readers, performs daily
+copy-on-write mutation without reconstructing retained history, and rejects the
+obsolete disposable-YAML prototype format.
 
 A failed or partial upload stays unreachable; retrying writes the same bytes under
 the same ID. Bucket names, storage backend IDs, segment offsets, and locator rows
@@ -1485,6 +1485,11 @@ A standalone CLI is part of Phase 1, not polish after server integration. It
 exists to prove that the same model is ergonomic from both sides. Internal Rust
 APIs can hide chatty protocols, concepts no user can name, and conflict states
 that only a forge UI can repair.
+
+The detailed local workspace, command, configuration, lifecycle-tooling, and
+acceptance contract lives in
+[`wheat-local-cli.md`](./wheat-local-cli.md). This section retains the
+architecture-level requirements shared with the future remote client.
 
 The CLI should support two modes with matching semantics where applicable:
 

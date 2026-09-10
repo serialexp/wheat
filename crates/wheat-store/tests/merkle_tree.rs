@@ -1,11 +1,38 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use object_store::memory::InMemory;
 use wheat_core::{ContentId, DirectoryEntry, FileKind, FileValue, ObjectId};
 use wheat_store::{
-    ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectStoreAdapter,
-    TreeEdit,
+    ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectKind,
+    ObjectStoreAdapter, ObjectStoreError, StoredObject, TreeEdit, TreeFile, TreeWalkLimits,
 };
+
+struct MalformedTreeStore;
+
+#[async_trait]
+impl ImmutableObjectStore for MalformedTreeStore {
+    async fn put_if_absent(
+        &self,
+        _id: ObjectId,
+        _canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        unreachable!()
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        Ok(StoredObject {
+            id,
+            kind: ObjectKind::Tree,
+            canonical_bytes: Bytes::from_static(b"not a canonical directory node"),
+        })
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        Ok(vec![true; ids.len()])
+    }
+}
 
 fn content(value: &str) -> ContentId {
     ContentId::of(value.as_bytes())
@@ -213,6 +240,167 @@ async fn file_kind_changes_tree_identity_and_all_kinds_survive_reopen() {
             Some(FileValue { content: id, kind })
         );
     }
+}
+
+#[tokio::test]
+async fn walk_files_is_lexical_nested_and_preserves_all_file_kinds() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let id = content("same");
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[
+                TreeEdit {
+                    path: vec!["z-last".into()],
+                    value: Some(FileValue {
+                        content: id,
+                        kind: FileKind::Symlink,
+                    }),
+                },
+                TreeEdit {
+                    path: vec!["a-dir".into(), "z-executable".into()],
+                    value: Some(FileValue {
+                        content: id,
+                        kind: FileKind::Executable,
+                    }),
+                },
+                TreeEdit {
+                    path: vec!["a-dir".into(), "a-regular".into()],
+                    value: Some(FileValue {
+                        content: id,
+                        kind: FileKind::Regular,
+                    }),
+                },
+                TreeEdit {
+                    path: vec!["a-file".into()],
+                    value: Some(FileValue {
+                        content: id,
+                        kind: FileKind::Regular,
+                    }),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        trees
+            .walk_files(root, TreeWalkLimits::default())
+            .await
+            .unwrap(),
+        vec![
+            TreeFile {
+                path: "a-dir/a-regular".into(),
+                value: FileValue {
+                    content: id,
+                    kind: FileKind::Regular,
+                },
+            },
+            TreeFile {
+                path: "a-dir/z-executable".into(),
+                value: FileValue {
+                    content: id,
+                    kind: FileKind::Executable,
+                },
+            },
+            TreeFile {
+                path: "a-file".into(),
+                value: FileValue {
+                    content: id,
+                    kind: FileKind::Regular,
+                },
+            },
+            TreeFile {
+                path: "z-last".into(),
+                value: FileValue {
+                    content: id,
+                    kind: FileKind::Symlink,
+                },
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn walk_files_accepts_exact_limits_and_rejects_one_over() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[
+                edit(&["a", "one"], Some("one")),
+                edit(&["b", "two"], Some("two")),
+            ],
+        )
+        .await
+        .unwrap();
+    let exact = TreeWalkLimits {
+        max_files: 2,
+        max_path_bytes: 5,
+        max_depth: 1,
+    };
+    assert_eq!(trees.walk_files(root, exact).await.unwrap().len(), 2);
+
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_files: 1,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::FileLimitExceeded { limit: 1 })
+    ));
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_path_bytes: 4,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::PathBytesExceeded { size: 5, limit: 4 })
+    ));
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_depth: 0,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::DepthExceeded { depth: 1, limit: 0 })
+    ));
+}
+
+#[tokio::test]
+async fn walk_files_propagates_missing_and_decode_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let missing = wheat_core::TreeId::from_digest([7; 32]);
+    assert!(matches!(
+        trees.walk_files(missing, TreeWalkLimits::default()).await,
+        Err(MerkleTreeError::Store(ObjectStoreError::Missing(_)))
+    ));
+
+    let malformed_id = wheat_core::TreeId::from_digest([8; 32]);
+    assert!(matches!(
+        MerkleTreeStore::new(&MalformedTreeStore)
+            .walk_files(malformed_id, TreeWalkLimits::default())
+            .await,
+        Err(MerkleTreeError::Decode(_))
+    ));
 }
 
 #[tokio::test]

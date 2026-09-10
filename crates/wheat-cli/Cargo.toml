@@ -11,14 +11,17 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
 libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+thiserror = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-git = { path = "../wheat-git" }
 wheat-store = { path = "../wheat-store" }
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true

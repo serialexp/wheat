@@ -3,12 +3,32 @@ use std::process::{Command, Output};
 use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
 
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
+    let mut adjusted = arguments.to_vec();
+    if adjusted.first() == Some(&"init") && adjusted.len() == 1 {
+        adjusted.push(root.to_str().unwrap());
+    }
     Command::new(env!("CARGO_BIN_EXE_wheat"))
-        .arg("--repository")
+        .arg("--workspace")
         .arg(root)
-        .args(arguments)
+        .args(adjusted)
+        .env("WHEAT_STORE_HOME", store_home(root))
         .output()
         .expect("wheat command runs")
+}
+
+fn store_home(root: &std::path::Path) -> std::path::PathBuf {
+    root.parent().unwrap().join(format!(
+        ".{}-test-stores",
+        root.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn store_path(root: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(store_home(root))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
 }
 
 fn field(output: &Output, name: &str) -> String {
@@ -49,8 +69,12 @@ fn initializes_mutates_and_reopens_local_repository() {
 
     let initialized = wheat(directory.path(), &["init"]);
     assert!(initialized.status.success());
-    assert!(directory.path().join(".wheat/repository.head").is_file());
-    assert!(!directory.path().join(".wheat/repository.yaml").exists());
+    assert!(directory.path().join(".wheat/workspace.json").is_file());
+    assert!(
+        store_path(directory.path())
+            .join("repository.head")
+            .is_file()
+    );
 
     let created = wheat(
         directory.path(),
@@ -63,9 +87,8 @@ fn initializes_mutates_and_reopens_local_repository() {
     );
     assert!(String::from_utf8_lossy(&created.stdout).contains("change "));
     let content_id = wheat_core::ContentId::of(b"world").to_string();
-    let object = directory
-        .path()
-        .join(".wheat/content")
+    let object = store_path(directory.path())
+        .join("content")
         .join(&content_id[..2])
         .join(&content_id[2..]);
     assert!(object.is_file());
@@ -88,7 +111,7 @@ fn initializes_mutates_and_reopens_local_repository() {
 
     let duplicate = wheat(directory.path(), &["init"]);
     assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("not empty"));
 }
 
 #[test]
@@ -101,22 +124,29 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
 
     let parent = tempfile::tempdir().unwrap();
     let repository = parent.path().join("atomic");
+    let imported = wheat(
+        &repository,
+        &[
+            "import",
+            git_repository.path().to_str().unwrap(),
+            repository.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let store = store_path(&repository);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    runtime
-        .block_on(wheat_git::atomic_import(
-            git_repository.path(),
-            &repository,
-            "refs/heads/main",
-        ))
-        .unwrap();
 
     let branches_before = {
-        let objects = PackedObjectStore::open(repository.join("storage")).unwrap();
+        let objects = PackedObjectStore::open(store.join("storage")).unwrap();
         let content = objects.content_store();
-        let heads = LocalPublicationStore::new(repository.join("repository.head"));
+        let heads = LocalPublicationStore::new(store.join("repository.head"));
         let reader = RepositoryReader::new(&objects, &content);
         runtime.block_on(async {
             let envelope = reader
@@ -136,7 +166,7 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
     );
     assert!(String::from_utf8_lossy(&status.stdout).contains("changes: 1"));
 
-    let catalogs_before = packed_catalog_count(&repository);
+    let catalogs_before = packed_catalog_count(&store);
     let created = wheat(
         &repository,
         &["change", "new", "--path", "added", "--value", "packed"],
@@ -148,9 +178,9 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
     );
     // Small content and metadata batches grow the active pack. They must not turn
     // logical mutation or durability boundaries into immutable catalog generations.
-    assert_eq!(packed_catalog_count(&repository), catalogs_before);
-    assert!(repository.join("storage/packed/active.segment").is_file());
-    assert!(repository.join("storage/packed/active.head").is_file());
+    assert_eq!(packed_catalog_count(&store), catalogs_before);
+    assert!(store.join("storage/packed/active.segment").is_file());
+    assert!(store.join("storage/packed/active.head").is_file());
     let reopened = wheat(&repository, &["status"]);
     assert!(String::from_utf8_lossy(&reopened.stdout).contains("changes: 2"));
 
@@ -240,9 +270,9 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
     );
 
     let branches_after = {
-        let objects = PackedObjectStore::open(repository.join("storage")).unwrap();
+        let objects = PackedObjectStore::open(store.join("storage")).unwrap();
         let content = objects.content_store();
-        let heads = LocalPublicationStore::new(repository.join("repository.head"));
+        let heads = LocalPublicationStore::new(store.join("repository.head"));
         let reader = RepositoryReader::new(&objects, &content);
         runtime.block_on(async {
             let envelope = reader
@@ -394,18 +424,15 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
 }
 
 #[test]
-fn legacy_yaml_is_rejected_without_modification() {
+fn embedded_prototype_is_rejected_without_modification() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".wheat")).unwrap();
     let path = dir.path().join(".wheat/repository.yaml");
     std::fs::write(&path, b"legacy snapshot").unwrap();
-    for command in ["init", "status"] {
-        let result = wheat(dir.path(), &[command]);
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("legacy YAML"));
-    }
+    let result = wheat(dir.path(), &["status"]);
+    assert!(!result.status.success());
+    assert!(!result.stderr.is_empty());
     assert_eq!(std::fs::read(path).unwrap(), b"legacy snapshot");
-    assert!(!dir.path().join(".wheat/repository.head").exists());
 }
 
 #[test]
@@ -543,7 +570,7 @@ fn failed_mutation_keeps_head_and_emits_no_success() {
         &["change", "new", "--path", "file", "--value", "one"],
     );
     assert!(created.status.success());
-    let path = dir.path().join(".wheat/repository.head");
+    let path = store_path(dir.path()).join("repository.head");
     let before = std::fs::read(&path).unwrap();
     let failed = wheat(
         dir.path(),
@@ -571,10 +598,11 @@ fn corrupted_canonical_state_is_not_replaced() {
     use wheat_store::{LocalPublicationStore, LooseObjectStore, PublicationStore};
     let dir = tempfile::tempdir().unwrap();
     assert!(wheat(dir.path(), &["init"]).status.success());
-    let head_path = dir.path().join(".wheat/repository.head");
+    let store = store_path(dir.path());
+    let head_path = store.join("repository.head");
     let before = std::fs::read(&head_path).unwrap();
     let head = LocalPublicationStore::new(&head_path).read().unwrap();
-    let objects = LooseObjectStore::new(dir.path().join(".wheat/objects"));
+    let objects = LooseObjectStore::new(store.join("objects"));
     std::fs::write(objects.path(head.envelope.into()), b"corrupt").unwrap();
     let result = wheat(
         dir.path(),

@@ -4,13 +4,36 @@ use std::{
 };
 
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
+    let mut adjusted = arguments.to_vec();
+    if adjusted.first() == Some(&"init") && adjusted.len() == 1 {
+        adjusted.push(root.to_str().unwrap());
+    }
     Command::new(env!("CARGO_BIN_EXE_wheat"))
-        .arg("--repository")
+        .arg("--workspace")
         .arg(root)
-        .args(arguments)
+        .args(adjusted)
+        .env(
+            "WHEAT_STORE_HOME",
+            root.parent().unwrap().join(format!(
+                ".{}-test-stores",
+                root.file_name().unwrap().to_string_lossy()
+            )),
+        )
         .output()
         .expect("wheat command runs")
 }
+fn store_path(root: &std::path::Path) -> std::path::PathBuf {
+    let home = root.parent().unwrap().join(format!(
+        ".{}-test-stores",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::read_dir(home)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+}
+
 fn ok(root: &std::path::Path, arguments: &[&str]) -> Output {
     let output = wheat(root, arguments);
     assert!(
@@ -271,7 +294,8 @@ fn only_selected_paths_are_read_and_workspace_is_never_overwritten() {
 fn stale_or_invalid_add_leaves_published_head_unchanged() {
     let (dir, change, predecessor) = setup();
     fs::write(dir.path().join("file"), "top\nbaz\nbottom\n").unwrap();
-    let head = fs::read(dir.path().join(".wheat/repository.head")).unwrap();
+    let head_path = store_path(dir.path()).join("repository.head");
+    let head = fs::read(&head_path).unwrap();
     let failed = wheat(
         dir.path(),
         &[
@@ -284,10 +308,7 @@ fn stale_or_invalid_add_leaves_published_head_unchanged() {
         ],
     );
     assert!(!failed.status.success());
-    assert_eq!(
-        fs::read(dir.path().join(".wheat/repository.head")).unwrap(),
-        head
-    );
+    assert_eq!(fs::read(&head_path).unwrap(), head);
 
     let failed = wheat(
         dir.path(),
@@ -303,10 +324,7 @@ fn stale_or_invalid_add_leaves_published_head_unchanged() {
         ],
     );
     assert!(!failed.status.success());
-    assert_eq!(
-        fs::read(dir.path().join(".wheat/repository.head")).unwrap(),
-        head
-    );
+    assert_eq!(fs::read(&head_path).unwrap(), head);
 }
 
 #[test]

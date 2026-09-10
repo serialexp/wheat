@@ -24,11 +24,15 @@ fn git(directory: Option<&Path>, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
-fn wheat(repository: &Path, arguments: &[&str]) -> std::process::Output {
+fn wheat(workspace: &Path, arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_wheat"))
-        .arg("--repository")
-        .arg(repository)
+        .arg("--workspace")
+        .arg(workspace)
         .args(arguments)
+        .env(
+            "WHEAT_STORE_HOME",
+            workspace.parent().unwrap().join("stores"),
+        )
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .unwrap()
@@ -60,16 +64,21 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
         &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"],
     );
 
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(wheat_git::atomic_import(
-            &source,
-            &wheat_repository,
+    let imported = wheat(
+        &wheat_repository,
+        &[
+            "import",
+            source.to_str().unwrap(),
+            wheat_repository.to_str().unwrap(),
+            "--branch",
             "refs/heads/main",
-        ))
-        .unwrap();
+        ],
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
     let created = wheat(
         &wheat_repository,
         &["change", "new", "--path", "native", "--value", "from wheat"],
@@ -136,7 +145,11 @@ fn unknown_remote_tip_is_rejected_without_force_with_lease() {
     let repository = root.path().join("repository");
     let remote_work = root.path().join("remote-work");
     let remote = root.path().join("remote.git");
-    assert!(wheat(&repository, &["init"]).status.success());
+    assert!(
+        wheat(&repository, &["init", repository.to_str().unwrap()])
+            .status
+            .success()
+    );
     assert!(
         wheat(
             &repository,

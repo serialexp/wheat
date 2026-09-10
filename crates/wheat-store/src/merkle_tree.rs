@@ -18,6 +18,41 @@ pub enum MerkleTreeError {
     EmptyPath,
     #[error("tree path crosses file component {0:?}")]
     FileInPath(String),
+    #[error("tree contains more than {limit} files")]
+    FileLimitExceeded { limit: usize },
+    #[error("tree path is {size} bytes, exceeding the {limit}-byte limit")]
+    PathBytesExceeded { size: usize, limit: usize },
+    #[error("tree depth {depth} exceeds the limit of {limit}")]
+    DepthExceeded { depth: usize, limit: usize },
+}
+
+/// Resource bounds for a complete Merkle tree walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TreeWalkLimits {
+    /// Maximum number of file leaves returned by the walk.
+    pub max_files: usize,
+    /// Maximum byte length of any complete slash-separated path.
+    pub max_path_bytes: usize,
+    /// Maximum directory nesting, with the root directory at depth zero.
+    pub max_depth: usize,
+}
+
+impl Default for TreeWalkLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 250_000,
+            max_path_bytes: 4_096,
+            max_depth: 128,
+        }
+    }
+}
+
+/// One file leaf returned by [`MerkleTreeStore::walk_files`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeFile {
+    /// Canonical slash-separated repository-relative path.
+    pub path: String,
+    pub value: FileValue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +123,68 @@ where
             }
         }
         Ok(None)
+    }
+
+    /// Return every file below `root` in lexical full-path order.
+    ///
+    /// Traversal is iterative, and each bound is checked before the entry that
+    /// would exceed it is accepted. Directory storage and decoding failures are
+    /// returned unchanged.
+    pub async fn walk_files(
+        &self,
+        root: TreeId,
+        limits: TreeWalkLimits,
+    ) -> Result<Vec<TreeFile>, MerkleTreeError> {
+        let root_node = self.read_node(root).await?;
+        let mut files = Vec::new();
+        let mut pending = root_node
+            .entries
+            .into_iter()
+            .map(|(path, entry)| (path, (entry, 0usize)))
+            .collect::<BTreeMap<_, _>>();
+
+        while let Some((path, (entry, depth))) = pending.pop_first() {
+            if path.len() > limits.max_path_bytes {
+                return Err(MerkleTreeError::PathBytesExceeded {
+                    size: path.len(),
+                    limit: limits.max_path_bytes,
+                });
+            }
+
+            match entry {
+                DirectoryEntry::File(value) => {
+                    if files.len() == limits.max_files {
+                        return Err(MerkleTreeError::FileLimitExceeded {
+                            limit: limits.max_files,
+                        });
+                    }
+                    files.push(TreeFile { path, value });
+                }
+                DirectoryEntry::Directory(child) => {
+                    let child_depth =
+                        depth.checked_add(1).ok_or(MerkleTreeError::DepthExceeded {
+                            depth: usize::MAX,
+                            limit: limits.max_depth,
+                        })?;
+                    if child_depth > limits.max_depth {
+                        return Err(MerkleTreeError::DepthExceeded {
+                            depth: child_depth,
+                            limit: limits.max_depth,
+                        });
+                    }
+                    let child_node = self.read_node(child).await?;
+                    for (name, child_entry) in child_node.entries {
+                        let mut child_path = String::with_capacity(path.len() + 1 + name.len());
+                        child_path.push_str(&path);
+                        child_path.push('/');
+                        child_path.push_str(&name);
+                        pending.insert(child_path, (child_entry, child_depth));
+                    }
+                }
+            }
+        }
+
+        Ok(files)
     }
 
     pub async fn apply_edits(

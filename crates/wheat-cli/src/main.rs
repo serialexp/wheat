@@ -1,4 +1,9 @@
-use std::{fmt::Write as _, path::PathBuf, str::FromStr};
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -11,31 +16,42 @@ use wheat_store::{
     PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
     RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
+mod discovery;
 mod inspection;
 mod local;
+mod materialization;
 mod workspace;
 mod workspace_files;
+mod workspace_metadata;
+mod workspace_status;
+use discovery::{allocate_store_root, canonical_store_path, discover_workspace};
 use local::{
     content_store, current_conflicts, current_revisions, initialize, open, projection_path,
     repository_summary, revision_with_edits, runtime,
 };
+use workspace_metadata::{StoreMetadata, WorkspaceMetadata, WorkspaceSelection};
 
 #[derive(Debug, Parser)]
 #[command(name = "wheat", about = "Wheat source control prototype")]
 struct Cli {
-    /// Repository directory to operate on.
-    #[arg(long, default_value = ".")]
-    repository: PathBuf,
+    /// Explicit canonical Wheat store. Workspace discovery is used when omitted.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    /// Explicit workspace directory. Defaults to the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Initialize an empty native repository.
-    Init,
-    /// Show the current native repository state.
-    Status,
+    /// Initialize an empty native repository and workspace.
+    Init(InitArgs),
+    /// Materialize the selected native view into the workspace.
+    Materialize(MaterializeArgs),
+    /// Show repository and tracked workspace state.
+    Status(StatusArgs),
     /// Verify the complete retained repository state.
     Validate,
     /// Inspect logical changes and immutable revisions.
@@ -56,8 +72,36 @@ enum Command {
     Change(ChangeCommand),
     /// Resolve a durable conflict with an exact tree entry.
     Resolve(ResolveArgs),
+    /// Import a local Git repository into a fresh Wheat repository.
+    Import(ImportArgs),
     /// Project Wheat revision history and push it to a Git branch.
     Push(PushArgs),
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    /// Workspace to initialize. Defaults to the current directory.
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct MaterializeArgs {
+    /// Wheat source: published, working, or branch:<name>.
+    #[arg(long, default_value = "published")]
+    source: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[arg(long, value_enum, default_value_t)]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Subcommand)]
@@ -160,6 +204,17 @@ impl From<CliFileKind> for FileKind {
 }
 
 #[derive(Debug, Args)]
+struct ImportArgs {
+    /// Local Git repository path or remote Git URL to import.
+    source: String,
+    /// Fresh workspace to create. Defaults to the current directory.
+    workspace: Option<PathBuf>,
+    /// Full Git branch ref to select as Wheat's working and published view.
+    #[arg(long, default_value = "refs/heads/main")]
+    branch: String,
+}
+
+#[derive(Debug, Args)]
 struct PushArgs {
     /// Git remote URL. It is passed to Git and never persisted by Wheat.
     remote: String,
@@ -194,18 +249,55 @@ struct ResolveArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let requested_workspace = cli.workspace.unwrap_or_else(|| PathBuf::from("."));
     match cli.command {
-        Command::Init => initialize(&cli.repository),
-        Command::Status => {
-            let summary = repository_summary(&cli.repository)?;
-            println!("working view: {}", summary.working_view);
-            println!("published view: {}", summary.published_view);
-            println!("changes: {}", summary.changes);
-            println!("conflicts: {}", summary.conflicts);
+        Command::Init(arguments) => init_workspace(
+            arguments
+                .workspace
+                .as_deref()
+                .unwrap_or(&requested_workspace),
+            cli.store.as_deref(),
+        ),
+        Command::Materialize(arguments) => materialize_workspace(
+            &requested_workspace,
+            cli.store.as_deref(),
+            &arguments.source,
+        ),
+        Command::Status(arguments) => {
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let summary = repository_summary(&context.store_root)?;
+            let local = open(&context.store_root)?;
+            let status = workspace_status::inspect(&context.root, &local, &context.workspace)?;
+            match arguments.format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
+                OutputFormat::Human => {
+                    println!("working view: {}", summary.working_view);
+                    println!("published view: {}", summary.published_view);
+                    println!("changes: {}", summary.changes);
+                    println!("conflicts: {}", summary.conflicts);
+                    println!("tracked changes: {}", status.changes.len());
+                    if status.authority_advanced {
+                        println!("repository advanced since materialization");
+                    }
+                    for change in &status.changes {
+                        let kind = if change.deleted {
+                            "deleted"
+                        } else if change.content_changed && change.kind_changed {
+                            "modified+kind"
+                        } else if change.content_changed {
+                            "modified"
+                        } else {
+                            "kind"
+                        };
+                        println!("{kind} {}", change.path);
+                    }
+                }
+            }
             Ok(())
         }
         Command::Validate => {
-            let local = open(&cli.repository)?;
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&store_root)?;
             let head = local.heads.read()?;
             let runtime = runtime()?;
             let state = runtime.block_on(async {
@@ -218,29 +310,33 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Log => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let mut output = String::new();
-            for (change, revision) in current_revisions(&cli.repository)? {
+            for (change, revision) in current_revisions(&store_root)? {
                 writeln!(output, "{change} {revision}")?;
             }
             print!("{output}");
             Ok(())
         }
         Command::Conflicts => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let mut output = String::new();
-            inspection::conflicts(&current_conflicts(&cli.repository)?, &mut output)?;
+            inspection::conflicts(&current_conflicts(&store_root)?, &mut output)?;
             print!("{output}");
             Ok(())
         }
         Command::Edits { revision } => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let revision = RevisionId::from_str(&revision).context("invalid revision ID")?;
-            let (revision, edits) = revision_with_edits(&cli.repository, revision)?;
+            let (revision, edits) = revision_with_edits(&store_root, revision)?;
             let mut output = String::new();
             inspection::edits(&revision, &edits, &mut output)?;
             print!("{output}");
             Ok(())
         }
         Command::Add(arguments) => {
-            let local = open(&cli.repository)?;
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&context.store_root)?;
             let expected = local.heads.read()?;
             let change = ChangeId::from_str(&arguments.change).context("invalid change ID")?;
             let predecessor = RevisionId::from_str(&arguments.predecessor)
@@ -255,7 +351,7 @@ fn main() -> Result<()> {
             let runtime = runtime()?;
             let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
             let edits = runtime.block_on(workspace::author_from_workspace(
-                &cli.repository,
+                &context.root,
                 &objects,
                 &local.content,
                 expected,
@@ -292,14 +388,16 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Cat { content } => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let id = ContentId::from_str(&content).context("invalid content ID")?;
-            let bytes = content_store(&cli.repository)?.get(id)?;
+            let bytes = content_store(&store_root)?.get(id)?;
             use std::io::Write as _;
             std::io::stdout().write_all(&bytes)?;
             Ok(())
         }
         Command::Change(ChangeCommand::New(arguments)) => {
-            let local = open(&cli.repository)?;
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&store_root)?;
             let expected = local.heads.read()?;
             let dependencies = arguments
                 .dependencies
@@ -344,9 +442,219 @@ fn main() -> Result<()> {
             print!("{output}");
             Ok(())
         }
-        Command::Resolve(arguments) => resolve(&cli.repository, arguments),
-        Command::Push(arguments) => push(&cli.repository, arguments),
+        Command::Resolve(arguments) => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            resolve(&store_root, arguments)
+        }
+        Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
+        Command::Push(arguments) => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            push(&store_root, arguments)
+        }
     }
+}
+
+fn import(
+    arguments: ImportArgs,
+    explicit_store: Option<&Path>,
+    default_workspace: &Path,
+) -> Result<()> {
+    let workspace_root = arguments.workspace.as_deref().unwrap_or(default_workspace);
+    ensure_fresh_workspace(workspace_root)?;
+    let store_root = explicit_store
+        .map(Path::to_path_buf)
+        .unwrap_or(allocate_store_root()?);
+    if store_root.exists() {
+        bail!(
+            "Wheat store destination already exists: {}",
+            store_root.display()
+        );
+    }
+    let local_source = Path::new(&arguments.source);
+    let clone;
+    let source = if local_source.exists() {
+        local_source
+    } else {
+        clone = clone_remote_for_import(&arguments.source)?;
+        clone.path()
+    };
+    let runtime = runtime()?;
+    let head = runtime.block_on(wheat_git::atomic_import(
+        source,
+        &store_root,
+        &arguments.branch,
+    ))?;
+    let store = StoreMetadata::create(&store_root)?;
+    let canonical_store = canonical_store_path(&store_root)?;
+    let workspace = WorkspaceMetadata::new(
+        canonical_store,
+        store.store_id,
+        WorkspaceSelection::Branch {
+            name: arguments.branch.clone(),
+        },
+    );
+    initialize_workspace_directory(workspace_root)?;
+    workspace.initialize(workspace_root)?;
+    materialize_workspace(
+        workspace_root,
+        Some(&store_root),
+        &format!("branch:{}", arguments.branch),
+    )?;
+    println!(
+        "imported {} at generation {}",
+        arguments.branch, head.generation
+    );
+    println!("envelope {}", head.envelope);
+    Ok(())
+}
+
+fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<()> {
+    ensure_fresh_workspace(workspace_root)?;
+    let store_root = explicit_store
+        .map(Path::to_path_buf)
+        .unwrap_or(allocate_store_root()?);
+    initialize(&store_root)?;
+    let store = StoreMetadata::create(&store_root)?;
+    let canonical_store = canonical_store_path(&store_root)?;
+    initialize_workspace_directory(workspace_root)?;
+    WorkspaceMetadata::new(
+        canonical_store,
+        store.store_id,
+        WorkspaceSelection::Published,
+    )
+    .initialize(workspace_root)?;
+    materialize_workspace(workspace_root, Some(&store_root), "published")?;
+    println!(
+        "initialized Wheat workspace at {}",
+        workspace_root.display()
+    );
+    println!("store {}", store_root.display());
+    Ok(())
+}
+
+fn ensure_fresh_workspace(root: &Path) -> Result<()> {
+    if root.exists() && root.read_dir()?.next().is_some() {
+        bail!(
+            "Wheat workspace destination is not empty: {}",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+fn initialize_workspace_directory(root: &Path) -> Result<()> {
+    if !root.exists() {
+        std::fs::create_dir_all(root)?;
+    }
+    Ok(())
+}
+
+fn resolve_context(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+) -> Result<discovery::ResolvedWorkspace> {
+    let context = discover_workspace(workspace)?;
+    if let Some(store) = explicit_store {
+        let explicit = canonical_store_path(store)?;
+        if explicit != context.store_root {
+            bail!("explicit Wheat store does not match the discovered workspace link");
+        }
+    }
+    Ok(context)
+}
+
+fn resolve_store_root(workspace: &Path, explicit_store: Option<&Path>) -> Result<PathBuf> {
+    if let Some(store) = explicit_store {
+        let store = canonical_store_path(store)?;
+        StoreMetadata::read(&store)?;
+        return Ok(store);
+    }
+    Ok(discover_workspace(workspace)?.store_root)
+}
+
+fn materialize_workspace(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    source: &str,
+) -> Result<()> {
+    let mut context = resolve_context(workspace, explicit_store)?;
+    let requested_selection = parse_selection(source)?;
+    let repository = open(&context.store_root)?;
+    let head = repository.heads.read()?;
+    let runtime = runtime()?;
+    let (view, tree) = runtime.block_on(resolve_selected_view(
+        &repository,
+        head,
+        &requested_selection,
+    ))?;
+    runtime.block_on(materialization::materialize(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+        head,
+        view,
+        tree,
+        requested_selection,
+    ))?;
+    println!("materialized view {view} in {}", context.root.display());
+    Ok(())
+}
+
+fn parse_selection(source: &str) -> Result<WorkspaceSelection> {
+    match source {
+        "published" => Ok(WorkspaceSelection::Published),
+        "working" => Ok(WorkspaceSelection::Working),
+        value if value.starts_with("branch:") => Ok(WorkspaceSelection::Branch {
+            name: value
+                .strip_prefix("branch:")
+                .expect("matched prefix")
+                .into(),
+        }),
+        _ => bail!("source must be published, working, or branch:<name>"),
+    }
+}
+
+async fn resolve_selected_view(
+    repository: &local::LocalRepository,
+    head: wheat_store::RepositoryHead,
+    selection: &WorkspaceSelection,
+) -> Result<(wheat_core::ViewId, wheat_core::TreeId)> {
+    let reader = RepositoryReader::new(&repository.objects, &repository.content);
+    let envelope = reader.validate_envelope(head.envelope).await?;
+    let state = reader.state(envelope.state).await?;
+    let view = match selection {
+        WorkspaceSelection::Published => state.published_view,
+        WorkspaceSelection::Working => state.working_view,
+        WorkspaceSelection::Branch { name } => {
+            let branches = reader.branch_manifest(envelope.branches).await?;
+            *branches
+                .branches
+                .get(name)
+                .with_context(|| format!("unknown Wheat branch {name}"))?
+        }
+    };
+    Ok((view, reader.view(view).await?.tree))
+}
+
+fn clone_remote_for_import(remote: &str) -> Result<tempfile::TempDir> {
+    let directory = tempfile::tempdir().context("create temporary Git clone directory")?;
+    let status = ProcessCommand::new("git")
+        .arg("clone")
+        .arg("--mirror")
+        .arg("--")
+        .arg(remote)
+        .arg(directory.path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .status()
+        .context("spawn git clone for Wheat import")?;
+    if !status.success() {
+        bail!(
+            "git clone for Wheat import failed with status {:?}",
+            status.code()
+        );
+    }
+    Ok(directory)
 }
 
 fn push(root: &std::path::Path, arguments: PushArgs) -> Result<()> {
