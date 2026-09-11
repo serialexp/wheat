@@ -13,7 +13,7 @@ use wheat_core::{ContentId, DirectoryEntry, FileKind, FileValue, ObjectId};
 use wheat_store::{
     ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectKind,
     ObjectStoreAdapter, ObjectStoreError, StoredObject, TreeDiff, TreeDiffLimits, TreeEdit,
-    TreeFile, TreeWalkLimits,
+    TreeFile, TreePathLimits, TreePathSelection, TreeSelectionLimits, TreeWalkLimits,
 };
 
 struct CountingStore<S> {
@@ -425,6 +425,449 @@ async fn walk_files_accepts_exact_limits_and_rejects_one_over() {
             )
             .await,
         Err(MerkleTreeError::DepthExceeded { depth: 1, limit: 0 })
+    ));
+}
+
+#[tokio::test]
+async fn walk_path_distinguishes_kinds_is_lexical_and_confines_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[
+                edit(&["selected", "z"], Some("z")),
+                edit(&["selected", "nested", "b"], Some("b")),
+                edit(&["selected", "nested", "a"], Some("a")),
+                edit(&["outside", "deep", "unread"], Some("outside")),
+                edit(&["top"], Some("top")),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let objects = CountingStore::new(objects);
+    let trees = MerkleTreeStore::new(&objects);
+    assert_eq!(
+        trees
+            .walk_path(root, &["missing".into()], TreePathLimits::default())
+            .await
+            .unwrap(),
+        TreePathSelection::Missing
+    );
+    assert_eq!(objects.reads(), 1);
+
+    assert_eq!(
+        trees
+            .walk_path(root, &["top".into()], TreePathLimits::default())
+            .await
+            .unwrap(),
+        TreePathSelection::File(TreeFile {
+            path: "top".into(),
+            value: file("top"),
+        })
+    );
+    assert_eq!(objects.reads(), 2);
+
+    assert_eq!(
+        trees
+            .walk_path(root, &["selected".into()], TreePathLimits::default())
+            .await
+            .unwrap(),
+        TreePathSelection::Directory(vec![
+            TreeFile {
+                path: "selected/nested/a".into(),
+                value: file("a"),
+            },
+            TreeFile {
+                path: "selected/nested/b".into(),
+                value: file("b"),
+            },
+            TreeFile {
+                path: "selected/z".into(),
+                value: file("z"),
+            },
+        ])
+    );
+    // Root, selected, and selected/nested only: outside/deep is never read.
+    assert_eq!(objects.reads(), 5);
+
+    let root_selection = trees
+        .walk_path(root, &[], TreePathLimits::default())
+        .await
+        .unwrap();
+    let TreePathSelection::Directory(files) = root_selection else {
+        panic!("empty path selects the root directory")
+    };
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "outside/deep/unread",
+            "selected/nested/a",
+            "selected/nested/b",
+            "selected/z",
+            "top",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn walk_path_enforces_every_resource_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[
+                edit(&["dir", "a"], Some("a")),
+                edit(&["dir", "nested", "b"], Some("b")),
+            ],
+        )
+        .await
+        .unwrap();
+    let exact = TreePathLimits {
+        max_files: 2,
+        max_nodes: 3,
+        max_entries: 4,
+        max_path_bytes: 12,
+        max_depth: 2,
+        max_node_bytes: 16 * 1024 * 1024,
+        max_buffered_entries: 2,
+    };
+    assert!(matches!(
+        trees.walk_path(root, &["dir".into()], exact).await,
+        Ok(TreePathSelection::Directory(files)) if files.len() == 2
+    ));
+
+    for (limits, expected) in [
+        (
+            TreePathLimits {
+                max_files: 1,
+                ..exact
+            },
+            MerkleTreeError::FileLimitExceeded { limit: 1 },
+        ),
+        (
+            TreePathLimits {
+                max_nodes: 2,
+                ..exact
+            },
+            MerkleTreeError::NodeLimitExceeded { limit: 2 },
+        ),
+        (
+            TreePathLimits {
+                max_entries: 3,
+                ..exact
+            },
+            MerkleTreeError::EntryLimitExceeded { limit: 3 },
+        ),
+        (
+            TreePathLimits {
+                max_path_bytes: 11,
+                ..exact
+            },
+            MerkleTreeError::PathBytesExceeded {
+                size: 12,
+                limit: 11,
+            },
+        ),
+        (
+            TreePathLimits {
+                max_depth: 1,
+                ..exact
+            },
+            MerkleTreeError::DepthExceeded { depth: 2, limit: 1 },
+        ),
+        (
+            TreePathLimits {
+                max_node_bytes: 0,
+                ..exact
+            },
+            MerkleTreeError::NodeBytesExceeded { size: 0, limit: 0 },
+        ),
+        (
+            TreePathLimits {
+                max_buffered_entries: 1,
+                ..exact
+            },
+            MerkleTreeError::BufferedEntriesExceeded { limit: 1 },
+        ),
+    ] {
+        let error = trees
+            .walk_path(root, &["dir".into()], limits)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+        match (error, expected) {
+            (
+                MerkleTreeError::NodeBytesExceeded { limit: 0, size },
+                MerkleTreeError::NodeBytesExceeded { .. },
+            ) => assert!(size > 0),
+            (actual, expected) => assert_eq!(actual.to_string(), expected.to_string()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn walk_path_rejects_invalid_crossing_and_malformed_objects() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[edit(&["file"], Some("x"))],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        trees
+            .walk_path(root, &["file".into(), "child".into()], TreePathLimits::default())
+            .await,
+        Err(MerkleTreeError::FileInPath(path)) if path == "file"
+    ));
+    assert!(
+        trees
+            .walk_path(root, &["bad/name".into()], TreePathLimits::default())
+            .await
+            .is_err()
+    );
+    let missing = wheat_core::TreeId::from_digest([7; 32]);
+    assert!(matches!(
+        trees
+            .walk_path(missing, &[], TreePathLimits::default())
+            .await,
+        Err(MerkleTreeError::Store(ObjectStoreError::Missing(_)))
+    ));
+
+    let repository = wheat_core::Repository::new(BTreeMap::new());
+    let state = repository.canonical_closure().state;
+    objects
+        .put_if_absent(state.id.into(), &state.canonical_bytes())
+        .await
+        .unwrap();
+    let wrong_kind = wheat_core::TreeId::from_digest(*state.id.as_bytes());
+    assert!(matches!(
+        trees
+            .walk_path(wrong_kind, &[], TreePathLimits::default())
+            .await,
+        Err(MerkleTreeError::Store(ObjectStoreError::WrongKind { .. }))
+    ));
+
+    let malformed_id = wheat_core::TreeId::from_digest([8; 32]);
+    assert!(matches!(
+        MerkleTreeStore::new(&MalformedTreeStore)
+            .walk_path(malformed_id, &[], TreePathLimits::default())
+            .await,
+        Err(MerkleTreeError::Decode(_))
+    ));
+}
+
+#[tokio::test]
+async fn select_paths_shares_ancestors_deduplicates_and_skips_unrelated_subtrees() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let mut edits = Vec::new();
+    for index in 0..1_000 {
+        edits.push(edit(
+            &[&format!("unrelated-{index:04}"), "deep", "leaf"],
+            Some("outside"),
+        ));
+    }
+    edits.extend([
+        edit(&["selected", "a"], Some("a")),
+        edit(&["selected", "nested", "b"], Some("b")),
+        edit(&["selected", "nested", "c"], Some("c")),
+    ]);
+    let root = trees
+        .apply_edits(trees.empty_root().await.unwrap(), &edits)
+        .await
+        .unwrap();
+
+    let objects = CountingStore::new(objects);
+    let trees = MerkleTreeStore::new(&objects);
+    let files = trees
+        .select_paths(
+            root,
+            &["selected".into(), "selected/nested/b".into()],
+            TreeSelectionLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["selected/a", "selected/nested/b", "selected/nested/c"]
+    );
+    // Only root, selected, and selected/nested are read. None of the thousand
+    // unrelated directory roots (or their descendants) are fetched.
+    assert_eq!(objects.reads(), 3);
+}
+
+#[tokio::test]
+async fn select_paths_reports_each_missing_selector_even_under_selected_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[edit(&["dir", "file"], Some("file"))],
+        )
+        .await
+        .unwrap();
+
+    for selectors in [
+        vec![String::from("absent")],
+        vec![String::from("dir"), String::from("dir/absent")],
+        vec![String::from("dir/file"), String::from("later")],
+    ] {
+        let expected = selectors.last().unwrap().clone();
+        assert!(matches!(
+            trees
+                .select_paths(root, &selectors, TreeSelectionLimits::default())
+                .await,
+            Err(MerkleTreeError::MissingSelector(path)) if path == expected
+        ));
+    }
+}
+
+#[tokio::test]
+async fn select_paths_enforces_aggregate_and_selector_limits() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(directory.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[
+                edit(&["dir", "a"], Some("a")),
+                edit(&["dir", "nested", "b"], Some("b")),
+            ],
+        )
+        .await
+        .unwrap();
+    let exact = TreeSelectionLimits {
+        max_files: 2,
+        max_nodes: 3,
+        max_entries: 4,
+        max_path_bytes: 17,
+        max_depth: 2,
+        max_node_bytes: 16 * 1024 * 1024,
+        max_buffered_entries: 2,
+        max_selectors: 2,
+        max_selector_path_bytes: 12,
+        max_selector_components: 3,
+    };
+    assert_eq!(
+        trees
+            .select_paths(root, &["dir".into()], exact)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    for limits in [
+        TreeSelectionLimits {
+            max_files: 1,
+            ..exact
+        },
+        TreeSelectionLimits {
+            max_nodes: 2,
+            ..exact
+        },
+        TreeSelectionLimits {
+            max_entries: 3,
+            ..exact
+        },
+        TreeSelectionLimits {
+            max_path_bytes: 16,
+            ..exact
+        },
+        TreeSelectionLimits {
+            max_depth: 1,
+            ..exact
+        },
+        TreeSelectionLimits {
+            max_node_bytes: 0,
+            ..exact
+        },
+        TreeSelectionLimits {
+            max_buffered_entries: 1,
+            ..exact
+        },
+    ] {
+        assert!(
+            trees
+                .select_paths(root, &["dir".into()], limits)
+                .await
+                .is_err()
+        );
+    }
+    assert!(matches!(
+        trees
+            .select_paths(
+                root,
+                &["dir".into(), "dir/a".into()],
+                TreeSelectionLimits {
+                    max_selectors: 1,
+                    ..exact
+                }
+            )
+            .await,
+        Err(MerkleTreeError::SelectorLimitExceeded { limit: 1 })
+    ));
+    assert!(matches!(
+        trees
+            .select_paths(
+                root,
+                &["dir".into(), "dir/a".into()],
+                TreeSelectionLimits {
+                    max_selector_path_bytes: 7,
+                    ..exact
+                }
+            )
+            .await,
+        Err(MerkleTreeError::SelectorPathBytesExceeded { size: 8, limit: 7 })
+    ));
+    assert_eq!(
+        trees
+            .select_paths(root, &["dir".into(), "dir/a".into()], exact)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(matches!(
+        trees
+            .select_paths(
+                root,
+                &["dir".into(), "dir/a".into()],
+                TreeSelectionLimits {
+                    max_selector_components: 2,
+                    ..exact
+                }
+            )
+            .await,
+        Err(MerkleTreeError::SelectorComponentLimitExceeded { limit: 2 })
+    ));
+    assert!(matches!(
+        trees
+            .select_paths(root, &["dir/a".into(), "dir".into()], exact)
+            .await,
+        Err(MerkleTreeError::NonCanonicalSelectors)
     ));
 }
 

@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{FileKind, FileValue, TreeId, ViewId};
 use wheat_store::{
@@ -29,18 +30,25 @@ use wheat_store::{
 
 use crate::{
     local::LocalRepository,
-    workspace_files::{WorkspaceFileSnapshot, authenticate_workspace_file, read_workspace_file},
+    workspace_files::{
+        RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot, authenticate_preimage_at,
+        authenticate_workspace_file, authenticate_workspace_preimage, observe_workspace_file,
+        raw_preimage, read_workspace_file,
+    },
     workspace_metadata::{
         MaterializedState, WorkspaceMetadata, WorkspaceMetadataPublishError, WorkspaceSelection,
     },
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const JOURNAL_NAME: &str = "materialization.json";
 const TRANSACTIONS: &str = "materialization-transactions";
 const PROGRESS_NAME: &str = "progress.log";
 const PROGRESS_MAGIC: &[u8; 4] = b"WMI1";
 const PROGRESS_RECORD_BYTES: usize = 36;
+const PROGRESS_OPCODE_INSTALL_INTENT: u16 = 1;
+const PROGRESS_OPCODE_COMPLETE: u16 = 2;
+const PROGRESS_OPCODE_ABORTED: u16 = 3;
 const MAX_JOURNAL_BYTES: usize = 192 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 // ContentStore currently returns owned Vecs. A replacement needs old and new
@@ -58,6 +66,10 @@ const TEST_CHECKPOINT_MODE_ENV: &str = "WHEAT_TEST_MATERIALIZATION_FAIL_MODE";
 const TEST_PAUSE_ENV: &str = "WHEAT_TEST_MATERIALIZATION_PAUSE_AT";
 const TEST_PAUSE_FILE_ENV: &str = "WHEAT_TEST_MATERIALIZATION_PAUSE_FILE";
 const MAX_ORPHAN_TRANSACTIONS: usize = 1_024;
+const MAX_SELECTED_FILES: usize = 250_000;
+const MAX_SELECTORS: usize = 250_000;
+const MAX_PATH_BYTES: usize = 4_096;
+const MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
 static CHECKPOINT_OCCURRENCE: AtomicUsize = AtomicUsize::new(0);
 const RESERVED: &[&str] = &[
     ".wheat",
@@ -67,25 +79,117 @@ const RESERVED: &[&str] = &[
     "storage",
 ];
 
+#[derive(Debug, Error)]
+#[error("{message}")]
+struct RestoreInvalidated {
+    message: String,
+}
+
+fn restore_invalidated(message: impl Into<String>) -> anyhow::Error {
+    RestoreInvalidated {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn invalidated_install(install: &Install, message: String) -> anyhow::Error {
+    if install.restore_consent {
+        restore_invalidated(message)
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+fn path_is_absent(root: &Path, path: &str) -> Result<bool> {
+    match observe_workspace_file(root, Path::new(path), 0) {
+        Ok(None) => Ok(true),
+        Ok(Some(_))
+        | Err(
+            WorkspaceFileError::UnsupportedFileType
+            | WorkspaceFileError::TooLarge { .. }
+            | WorkspaceFileError::IntermediateSymlink,
+        ) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_shadowed_by_exact_obstruction(
+    path: &str,
+    obstructions: &HashSet<&str>,
+    mut inspected_ancestor: impl FnMut(&str),
+) -> bool {
+    let mut parent = Path::new(path).parent();
+    while let Some(relative_path) = parent {
+        let Some(relative) = relative_path.to_str().filter(|path| !path.is_empty()) else {
+            break;
+        };
+        inspected_ancestor(relative);
+        if obstructions.contains(relative) {
+            return true;
+        }
+        parent = relative_path.parent();
+    }
+    false
+}
+
+fn descendant_representatives<'a>(
+    selectors: &'a [String],
+    selected: &'a std::collections::BTreeMap<String, FileValue>,
+    mut inspected_ancestor: impl FnMut(&str),
+) -> HashMap<&'a str, FileValue> {
+    let selector_index = selectors.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut representatives = HashMap::with_capacity(selectors.len().min(selected.len()));
+    for (path, value) in selected {
+        let mut parent = Path::new(path).parent();
+        while let Some(relative_path) = parent {
+            let Some(relative) = relative_path.to_str().filter(|path| !path.is_empty()) else {
+                break;
+            };
+            inspected_ancestor(relative);
+            if selector_index.contains(relative) {
+                representatives.entry(relative).or_insert(*value);
+            }
+            parent = relative_path.parent();
+        }
+    }
+    representatives
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Install {
     path: String,
     old: Option<FileValue>,
     new: Option<FileValue>,
+    /// Restore consent authenticates the exact raw value observed before the
+    /// immutable journal was published, rather than merely the pinned value.
+    observed: Option<RawPreimage>,
+    restore_consent: bool,
+    /// The exact selected leaf was obstructed by an observed empty directory.
+    empty_directory: bool,
     staged: String,
     tombstone: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Operation {
+    Materialize,
+    Restore,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     version: u32,
+    operation: Operation,
     transaction_id: Uuid,
     workspace_id: Uuid,
     store_id: Uuid,
     source: Option<MaterializedState>,
     selection: WorkspaceSelection,
+    /// Canonical selectors authorizing a restore; empty for materialization.
+    selectors: Vec<String>,
     target: MaterializedState,
     installs: Vec<Install>,
 }
@@ -313,6 +417,9 @@ pub(crate) async fn materialize(
                 path: file.path,
                 old: None,
                 new: Some(file.value),
+                observed: None,
+                restore_consent: false,
+                empty_directory: false,
                 staged: format!("leaf-{index:08x}"),
                 tombstone: None,
             })
@@ -320,11 +427,13 @@ pub(crate) async fn materialize(
     };
     let journal = Journal {
         version: VERSION,
+        operation: Operation::Materialize,
         transaction_id,
         workspace_id: metadata.workspace_id,
         store_id: metadata.store.store_id,
         source,
         selection: requested_selection,
+        selectors: Vec::new(),
         target,
         installs,
     };
@@ -344,12 +453,250 @@ pub(crate) async fn materialize(
         return Err(error);
     }
     checkpoint("journal-created")?;
-    roll_forward(root, repository, &tx, &mut progress, &journal, &planner)?;
+    let complete = roll_forward(root, repository, &tx, &mut progress, &journal, &planner)?;
     checkpoint("all-installed")?;
     publish_target(root, metadata, &journal)?;
     checkpoint("target-published")?;
+    if !complete {
+        append_completion(
+            &mut progress,
+            journal.transaction_id,
+            journal.installs.len(),
+        )?;
+        checkpoint("completion-persisted")?;
+    }
     cleanup_committed(root, repository, &journal, &tx)?;
     Ok(())
+}
+
+pub(crate) async fn restore(
+    root: &Path,
+    repository: &LocalRepository,
+    metadata: &mut WorkspaceMetadata,
+    selectors: &[String],
+) -> Result<usize> {
+    let _lock = WorkspaceLock::acquire(root)?;
+    let persisted = WorkspaceMetadata::read(root)?;
+    ensure!(
+        persisted.workspace_id == metadata.workspace_id
+            && persisted.store == metadata.store
+            && persisted.store.store_id == repository.store_id,
+        "workspace/store identity changed while restore was resolved"
+    );
+    *metadata = persisted;
+    recover_locked(root, repository, metadata).await?;
+    let pinned = metadata
+        .materialized
+        .clone()
+        .context("workspace has no pinned materialized tree")?;
+    ensure!(
+        !selectors.is_empty(),
+        "at least one restore path is required"
+    );
+
+    let mut normalized_selectors = selectors.to_vec();
+    normalized_selectors.sort_unstable();
+    normalized_selectors.dedup();
+    validate_selectors(&normalized_selectors)?;
+    let selected = expand_restore_selectors(repository, pinned.tree, &normalized_selectors).await?;
+
+    let transaction_id = Uuid::now_v7();
+    let mut installs = Vec::with_capacity(selected.len() + normalized_selectors.len());
+    let representatives = descendant_representatives(&normalized_selectors, &selected, |_| {});
+    let mut structural_obstructions = HashSet::new();
+    for selector in &normalized_selectors {
+        let Some(representative) = representatives.get(selector.as_str()) else {
+            continue;
+        };
+        match observe_workspace_file(root, Path::new(selector), MAX_FILE_BYTES) {
+            Ok(Some(observed)) => {
+                structural_obstructions.insert(selector.as_str());
+                let index = installs.len();
+                installs.push(Install {
+                    path: selector.clone(),
+                    old: Some(*representative),
+                    new: None,
+                    observed: Some(observed),
+                    restore_consent: true,
+                    empty_directory: false,
+                    staged: format!("leaf-{index:08x}"),
+                    tombstone: Some(
+                        format!("wheat-delete-v1:{transaction_id}:{index:08x}").into_bytes(),
+                    ),
+                });
+            }
+            Ok(None) | Err(crate::workspace_files::WorkspaceFileError::UnsupportedFileType) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("observe restore structure {selector:?}"));
+            }
+        }
+    }
+    let mut total = 0_u64;
+    for (path, value) in selected {
+        let shadowed_by_obstruction =
+            is_shadowed_by_exact_obstruction(&path, &structural_obstructions, |_| {});
+        let (observed, empty_directory) = if shadowed_by_obstruction {
+            (None, false)
+        } else {
+            match observe_workspace_file(root, Path::new(&path), MAX_FILE_BYTES) {
+                Ok(observed) => (observed, false),
+                Err(crate::workspace_files::WorkspaceFileError::UnsupportedFileType)
+                    if path_is_directory(root, &path)? =>
+                {
+                    ensure!(
+                        directory_is_empty(root, &path)?,
+                        "refusing to replace nonempty workspace directory {path:?}"
+                    );
+                    (None, true)
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("observe restore path {path:?}"));
+                }
+            }
+        };
+        let bytes = repository.content.get(value.content)?;
+        ensure!(
+            bytes.len() <= MAX_FILE_BYTES,
+            "restored file exceeds byte limit"
+        );
+        if value.kind == FileKind::Symlink {
+            ensure!(
+                !bytes.is_empty() && !bytes.contains(&0) && bytes.len() <= 4_095,
+                "restored symlink target is not representable"
+            );
+        }
+        if observed.as_ref() == Some(&raw_preimage(value.kind, &bytes)) {
+            continue;
+        }
+        total = total
+            .checked_add(u64::try_from(bytes.len())?)
+            .context("restore byte count overflow")?;
+        ensure!(total <= MAX_TOTAL_BYTES, "restore exceeds total byte limit");
+        let index = installs.len();
+        installs.push(Install {
+            path,
+            old: observed.as_ref().map(|_| value),
+            new: Some(value),
+            observed,
+            restore_consent: true,
+            empty_directory,
+            staged: format!("leaf-{index:08x}"),
+            tombstone: None,
+        });
+    }
+    if installs.is_empty() {
+        return Ok(0);
+    }
+    installs.sort_by(|left, right| left.path.cmp(&right.path));
+    for (index, install) in installs.iter_mut().enumerate() {
+        install.staged = format!("leaf-{index:08x}");
+        if install.new.is_none() {
+            install.tombstone =
+                Some(format!("wheat-delete-v1:{transaction_id}:{index:08x}").into_bytes());
+        }
+    }
+    let journal = Journal {
+        version: VERSION,
+        operation: Operation::Restore,
+        transaction_id,
+        workspace_id: metadata.workspace_id,
+        store_id: metadata.store.store_id,
+        source: Some(pinned.clone()),
+        selection: metadata.selection.clone(),
+        selectors: normalized_selectors,
+        target: pinned,
+        installs,
+    };
+    let planner = PlannerContext::new(&journal.installs);
+    authenticate_preflight(root, repository, &journal.installs, &planner)?;
+    checkpoint("preflight-complete")?;
+    let journal_bytes = encode_journal(&journal)?;
+    let (tx, mut progress) = create_transaction(root, transaction_id)?;
+    if let Err(error) = write_journal(root, &journal_bytes) {
+        if !journal_exists(root)? {
+            cleanup_abandoned_transaction(root, transaction_id, &tx)?;
+        }
+        return Err(error);
+    }
+    checkpoint("journal-created")?;
+    let complete = match roll_forward(root, repository, &tx, &mut progress, &journal, &planner) {
+        Ok(complete) => complete,
+        Err(error) if error.downcast_ref::<RestoreInvalidated>().is_some() => {
+            abort_restore(root, repository, &tx, &mut progress, &journal)?;
+            return Err(error).context(
+                "restore plan was invalidated by a changed selected path; preserved the new value",
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    checkpoint("all-installed")?;
+    if !complete {
+        append_completion(
+            &mut progress,
+            journal.transaction_id,
+            journal.installs.len(),
+        )?;
+        checkpoint("completion-persisted")?;
+    }
+    cleanup_committed(root, repository, &journal, &tx)?;
+    Ok(journal
+        .installs
+        .iter()
+        .filter(|install| install.new.is_some())
+        .count())
+}
+
+fn validate_selectors(selectors: &[String]) -> Result<()> {
+    ensure!(!selectors.is_empty(), "restore selectors are empty");
+    ensure!(
+        selectors.len() <= MAX_SELECTORS,
+        "restore exceeds selector count limit"
+    );
+    let mut total = 0usize;
+    let mut previous: Option<&str> = None;
+    for selector in selectors {
+        validate_path(selector)?;
+        total = total
+            .checked_add(selector.len())
+            .context("restore selector byte count overflow")?;
+        ensure!(
+            total <= MAX_TOTAL_PATH_BYTES,
+            "restore selectors exceed path byte limit"
+        );
+        ensure!(
+            previous.is_none_or(|prior| prior < selector.as_str()),
+            "restore selectors are not canonical"
+        );
+        previous = Some(selector);
+    }
+    Ok(())
+}
+
+async fn expand_restore_selectors(
+    repository: &LocalRepository,
+    tree: TreeId,
+    selectors: &[String],
+) -> Result<std::collections::BTreeMap<String, FileValue>> {
+    use wheat_store::TreeSelectionLimits;
+
+    let files = MerkleTreeStore::new(&repository.objects)
+        .select_paths(
+            tree,
+            selectors,
+            TreeSelectionLimits {
+                max_files: MAX_SELECTED_FILES,
+                max_path_bytes: MAX_TOTAL_PATH_BYTES,
+                max_selectors: MAX_SELECTORS,
+                max_selector_path_bytes: MAX_TOTAL_PATH_BYTES,
+                ..TreeSelectionLimits::default()
+            },
+        )
+        .await?;
+    Ok(files
+        .into_iter()
+        .map(|file| (file.path, file.value))
+        .collect())
 }
 
 pub(crate) async fn recover(
@@ -372,7 +719,30 @@ async fn recover_locked(
     };
     authenticate_journal(repository, metadata, &journal).await?;
     let (tx, mut progress) = open_transaction(root, journal.transaction_id)?;
-    if metadata.materialized.as_ref() == Some(&journal.target) {
+    let progress_state = read_progress(
+        &mut progress,
+        journal.transaction_id,
+        journal.installs.len(),
+    )?;
+    if progress_state.complete {
+        return cleanup_committed(root, repository, &journal, &tx);
+    }
+    if progress_state.aborted {
+        return cleanup_aborted(root, repository, &journal, &tx, progress_state.intents);
+    }
+    if journal.operation == Operation::Materialize
+        && metadata.materialized.as_ref() == Some(&journal.target)
+    {
+        ensure!(
+            progress_state.intents == journal.installs.len(),
+            "published materialization is missing install intents"
+        );
+        append_completion(
+            &mut progress,
+            journal.transaction_id,
+            journal.installs.len(),
+        )?;
+        checkpoint("completion-persisted")?;
         return cleanup_committed(root, repository, &journal, &tx);
     }
     ensure!(
@@ -380,9 +750,31 @@ async fn recover_locked(
         "materialization journal conflicts with workspace metadata"
     );
     let planner = PlannerContext::new(&journal.installs);
-    roll_forward(root, repository, &tx, &mut progress, &journal, &planner)?;
-    publish_target(root, metadata, &journal)?;
-    checkpoint("target-published")?;
+    let complete = match roll_forward(root, repository, &tx, &mut progress, &journal, &planner) {
+        Ok(complete) => complete,
+        Err(error)
+            if journal.operation == Operation::Restore
+                && error.downcast_ref::<RestoreInvalidated>().is_some() =>
+        {
+            abort_restore(root, repository, &tx, &mut progress, &journal)?;
+            return Err(error).context(
+                "restore plan was invalidated by a changed selected path; preserved the new value",
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    if journal.operation == Operation::Materialize {
+        publish_target(root, metadata, &journal)?;
+        checkpoint("target-published")?;
+    }
+    if !complete {
+        append_completion(
+            &mut progress,
+            journal.transaction_id,
+            journal.installs.len(),
+        )?;
+        checkpoint("completion-persisted")?;
+    }
     cleanup_committed(root, repository, &journal, &tx)
 }
 
@@ -410,8 +802,16 @@ async fn target_files(repository: &LocalRepository, tree: TreeId) -> Result<Vec<
     let files = MerkleTreeStore::new(&repository.objects)
         .walk_files(tree, TreeWalkLimits::default())
         .await?;
+    let mut path_bytes = 0usize;
     for file in &files {
         validate_path(&file.path)?;
+        path_bytes = path_bytes
+            .checked_add(file.path.len())
+            .context("tree path byte count overflow")?;
+        ensure!(
+            path_bytes <= MAX_TOTAL_PATH_BYTES,
+            "tree exceeds aggregate path byte limit"
+        );
     }
     Ok(files)
 }
@@ -453,6 +853,9 @@ async fn plan_delta(
             path: change.path,
             old: change.old,
             new: change.new,
+            observed: None,
+            restore_consent: false,
+            empty_directory: false,
             staged: format!("leaf-{index:08x}"),
             tombstone: change
                 .new
@@ -506,29 +909,96 @@ async fn authenticate_journal(
                 || metadata.materialized.as_ref() == Some(&journal.target)),
         "materialization journal does not belong to this workspace/store state"
     );
-    authenticate_target(repository, journal).await?;
-    let expected = match &journal.source {
-        Some(source) => {
-            plan_delta(
-                repository,
-                source.tree,
-                journal.target.tree,
-                journal.transaction_id,
-            )
-            .await?
+    let expected = match journal.operation {
+        Operation::Materialize => {
+            ensure!(
+                journal.selectors.is_empty(),
+                "materialization journal contains restore selectors"
+            );
+            authenticate_target(repository, journal).await?;
+            match &journal.source {
+                Some(source) => {
+                    plan_delta(
+                        repository,
+                        source.tree,
+                        journal.target.tree,
+                        journal.transaction_id,
+                    )
+                    .await?
+                }
+                None => target_files(repository, journal.target.tree)
+                    .await?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, file)| Install {
+                        path: file.path,
+                        old: None,
+                        new: Some(file.value),
+                        observed: None,
+                        restore_consent: false,
+                        empty_directory: false,
+                        staged: format!("leaf-{index:08x}"),
+                        tombstone: None,
+                    })
+                    .collect(),
+            }
         }
-        None => target_files(repository, journal.target.tree)
-            .await?
-            .into_iter()
-            .enumerate()
-            .map(|(index, file)| Install {
-                path: file.path,
-                old: None,
-                new: Some(file.value),
-                staged: format!("leaf-{index:08x}"),
-                tombstone: None,
-            })
-            .collect(),
+        Operation::Restore => {
+            ensure!(
+                journal.source.as_ref() == Some(&journal.target)
+                    && journal.selection == metadata.selection,
+                "restore journal changes the pinned materialized state"
+            );
+            validate_selectors(&journal.selectors)?;
+            let selected =
+                expand_restore_selectors(repository, journal.target.tree, &journal.selectors)
+                    .await?;
+            ensure!(
+                journal.installs.iter().all(|install| match install.new {
+                    Some(value) => selected.get(&install.path).copied() == Some(value),
+                    None => journal.selectors.iter().any(|selector| {
+                        selector == &install.path
+                            && selected.keys().any(|path| {
+                                path.strip_prefix(selector)
+                                    .is_some_and(|suffix| suffix.starts_with('/'))
+                            })
+                    }),
+                }),
+                "restore journal install is outside its canonical selectors"
+            );
+            ensure!(
+                journal
+                    .installs
+                    .windows(2)
+                    .all(|pair| pair[0].path < pair[1].path),
+                "restore journal installs are not canonical"
+            );
+            journal
+                .installs
+                .iter()
+                .enumerate()
+                .map(|(index, install)| {
+                    let valid_leaf = install.new.is_some()
+                        && install.old.is_none_or(|old| Some(old) == install.new)
+                        && (install.empty_directory
+                            || install.old.is_some() == install.observed.is_some())
+                        && !(install.empty_directory && install.observed.is_some())
+                        && install.tombstone.is_none();
+                    let valid_structure = install.new.is_none()
+                        && install.old.is_some()
+                        && install.observed.is_some()
+                        && !install.empty_directory
+                        && install.tombstone.is_some();
+                    ensure!(
+                        install.restore_consent
+                            && (valid_leaf || valid_structure)
+                            && install.staged == format!("leaf-{index:08x}"),
+                        "invalid restore journal install"
+                    );
+                    Ok(install.clone())
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
     };
     ensure!(
         journal.installs == expected,
@@ -566,7 +1036,10 @@ async fn authenticate_target(repository: &LocalRepository, journal: &Journal) ->
 
 fn validate_path(path: &str) -> Result<()> {
     ensure!(
-        !path.is_empty() && !path.starts_with('/') && !path.as_bytes().contains(&0),
+        !path.is_empty()
+            && path.len() <= MAX_PATH_BYTES
+            && !path.starts_with('/')
+            && !path.as_bytes().contains(&0),
         "invalid materialized path"
     );
     let mut components = path.split('/');
@@ -629,6 +1102,42 @@ fn validate_initial_workspace(root: &Path, files: &[TreeFile]) -> Result<()> {
     Ok(())
 }
 
+fn authenticate_install_preimage(
+    root: &Path,
+    install: &Install,
+    expected_store_bytes: Option<&[u8]>,
+) -> Result<bool> {
+    if install.restore_consent {
+        return match &install.observed {
+            Some(observed) => match authenticate_workspace_preimage(
+                root,
+                Path::new(&install.path),
+                observed,
+                MAX_FILE_BYTES,
+            ) {
+                Ok(matches) => Ok(matches),
+                Err(
+                    WorkspaceFileError::IntermediateSymlink
+                    | WorkspaceFileError::UnsupportedFileType
+                    | WorkspaceFileError::TooLarge { .. },
+                ) => Ok(false),
+                Err(error) => Err(error.into()),
+            },
+            None => path_is_absent(root, &install.path),
+        };
+    }
+    let expected = install
+        .old
+        .zip(expected_store_bytes)
+        .map(|(value, bytes)| (value.kind, bytes));
+    Ok(authenticate_workspace_file(
+        root,
+        Path::new(&install.path),
+        expected,
+        MAX_FILE_BYTES,
+    )?)
+}
+
 fn authenticate_preflight(
     root: &Path,
     repository: &LocalRepository,
@@ -643,22 +1152,41 @@ fn authenticate_preflight(
             if !path_is_directory(root, &install.path)? {
                 // The planned replacement is already absent or a leaf.
             } else {
-                authenticate_replaced_directory(root, &install.path, replacement)?;
+                authenticate_replaced_directory(
+                    root,
+                    &install.path,
+                    replacement,
+                    install.restore_consent,
+                )?;
                 continue;
             }
+        }
+        if install.empty_directory {
+            let is_directory = path_is_directory(root, &install.path)?;
+            let is_absent = !is_directory && path_is_absent(root, &install.path)?;
+            if !is_absent && !(is_directory && directory_is_empty(root, &install.path)?) {
+                return Err(restore_invalidated(format!(
+                    "workspace directory {:?} changed from its exact observed structure",
+                    install.path
+                )));
+            }
+            continue;
         }
         let old_content = install
             .old
             .map(|value| repository.content.get(value.content))
             .transpose()?;
-        let expected = install
-            .old
-            .zip(old_content.as_deref())
-            .map(|(value, bytes)| (value.kind, bytes));
+        let matches = authenticate_install_preimage(root, install, old_content.as_deref())
+            .with_context(|| format!("preflight workspace path {:?}", install.path))?;
+        if !matches && install.restore_consent {
+            return Err(restore_invalidated(format!(
+                "workspace path {:?} changed from its exact observed value",
+                install.path
+            )));
+        }
         ensure!(
-            authenticate_workspace_file(root, Path::new(&install.path), expected, MAX_FILE_BYTES)
-                .with_context(|| format!("preflight workspace path {:?}", install.path))?,
-            "workspace path {:?} is dirty or untracked",
+            matches,
+            "workspace path {:?} changed from its exact observed value",
             install.path
         );
     }
@@ -672,8 +1200,12 @@ fn roll_forward(
     progress: &mut File,
     journal: &Journal,
     planner: &PlannerContext,
-) -> Result<()> {
-    let completed = read_progress(progress, journal.transaction_id, journal.installs.len())?;
+) -> Result<bool> {
+    let state = read_progress(progress, journal.transaction_id, journal.installs.len())?;
+    if state.complete {
+        return Ok(true);
+    }
+    let completed = state.intents;
     if completed == 0 {
         // Re-authenticate the entire plan immediately before its first mutation.
         // This preserves all-or-nothing refusal when recovery starts after a user
@@ -686,7 +1218,8 @@ fn roll_forward(
     checkpoint("before-structural-recheck")?;
     for (directory, replacement) in &planner.replaced_directories {
         if completed <= replacement.first_descendant_operation {
-            authenticate_replaced_directory(root, directory, replacement)?;
+            let restore_consent = journal.operation == Operation::Restore;
+            authenticate_replaced_directory(root, directory, replacement, restore_consent)?;
         }
     }
     checkpoint("structural-recheck-complete")?;
@@ -748,11 +1281,30 @@ fn roll_forward(
             checkpoint("staged")?;
             append_install_intent(progress, journal.transaction_id, index)?;
             checkpoint("intent-persisted")?;
+            if install.empty_directory {
+                let (parent, name) = open_parent(root, &install.path)?;
+                checkpoint("before-empty-directory-removal")?;
+                match unlinkat_if_exists(&parent, name, libc::AT_REMOVEDIR) {
+                    Ok(()) => {}
+                    Err(error) if is_directory_not_empty(&error) => {
+                        return Err(invalidated_install(
+                            install,
+                            format!(
+                                "refusing to replace nonempty workspace directory {:?}",
+                                install.path
+                            ),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                parent.sync_all()?;
+                checkpoint("empty-directory-removed")?;
+            }
         }
         apply_or_recover_install(root, tx, install, old_bytes, new_bytes, planner)?;
         checkpoint("installed")?;
     }
-    Ok(())
+    Ok(false)
 }
 
 fn prepare_install(
@@ -763,16 +1315,25 @@ fn prepare_install(
     new_bytes: Option<&[u8]>,
     planner: &PlannerContext,
 ) -> Result<()> {
-    remove_replaced_directory(root, tx, install, planner)?;
-    let expected = install
-        .old
-        .zip(old_bytes)
-        .map(|(value, bytes)| (value.kind, bytes));
-    ensure!(
-        authenticate_workspace_file(root, Path::new(&install.path), expected, MAX_FILE_BYTES)?,
-        "workspace path {:?} changed after preflight",
-        install.path
-    );
+    if !install.empty_directory {
+        remove_replaced_directory(root, tx, install, planner)?;
+    }
+    if install.empty_directory {
+        if !(path_is_directory(root, &install.path)? && directory_is_empty(root, &install.path)?) {
+            return Err(restore_invalidated(format!(
+                "workspace directory {:?} changed after consent",
+                install.path
+            )));
+        }
+    } else if !authenticate_install_preimage(root, install, old_bytes)? {
+        if install.restore_consent {
+            return Err(restore_invalidated(format!(
+                "workspace path {:?} changed after preflight",
+                install.path
+            )));
+        }
+        bail!("workspace path {:?} changed after preflight", install.path);
+    }
     if leaf_exists(tx, &install.staged)? {
         match (install.new, new_bytes, install.tombstone.as_deref()) {
             (Some(value), Some(bytes), None) => ensure!(
@@ -814,11 +1375,56 @@ fn apply_or_recover_install(
             let (parent, name) = open_parent(root, &install.path)?;
             let new_bytes = new_bytes.context("creation target content is unavailable")?;
             if leaf_exists(tx, &install.staged)? {
-                ensure!(
-                    read_workspace_file(root, Path::new(&install.path), 0)?.is_none(),
-                    "workspace collision while creating {:?}",
-                    install.path
-                );
+                if install.empty_directory {
+                    if path_is_directory(root, &install.path)? {
+                        if !directory_is_empty(root, &install.path)? {
+                            return Err(invalidated_install(
+                                install,
+                                format!(
+                                    "workspace directory {:?} changed after restore intent",
+                                    install.path
+                                ),
+                            ));
+                        }
+                        match unlinkat_if_exists(&parent, name, libc::AT_REMOVEDIR) {
+                            Ok(()) => parent.sync_all()?,
+                            Err(error)
+                                if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                                    matches!(
+                                        error.raw_os_error(),
+                                        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+                                    )
+                                }) =>
+                            {
+                                return Err(invalidated_install(
+                                    install,
+                                    format!(
+                                        "workspace directory {:?} changed after restore intent",
+                                        install.path
+                                    ),
+                                ));
+                            }
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!("remove observed empty directory {:?}", install.path)
+                                });
+                            }
+                        }
+                    } else if !path_is_absent(root, &install.path)? {
+                        return Err(invalidated_install(
+                            install,
+                            format!(
+                                "workspace directory {:?} changed after restore intent",
+                                install.path
+                            ),
+                        ));
+                    }
+                } else if !path_is_absent(root, &install.path)? {
+                    return Err(invalidated_install(
+                        install,
+                        format!("workspace collision while creating {:?}", install.path),
+                    ));
+                }
                 authenticate_exact_at_bytes(tx, &install.staged, new, new_bytes)?;
                 rename_noreplace(tx, &install.staged, &parent, name)?;
                 parent.sync_all()?;
@@ -834,16 +1440,11 @@ fn apply_or_recover_install(
                 "created workspace path is missing or changed"
             );
         }
-        (Some(old), Some(new)) => {
+        (Some(_old), Some(new)) => {
             let (parent, name) = open_parent(root, &install.path)?;
             let old_bytes = old_bytes.context("replacement preimage content is unavailable")?;
             let new_bytes = new_bytes.context("replacement target content is unavailable")?;
-            let workspace_is_old = authenticate_workspace_file(
-                root,
-                Path::new(&install.path),
-                Some((old.kind, old_bytes)),
-                MAX_FILE_BYTES,
-            )?;
+            let workspace_is_old = authenticate_install_preimage(root, install, Some(old_bytes))?;
             let staged_is_new =
                 authenticate_leaf_at_bytes(tx, &install.staged, new.kind, new_bytes)?;
             if workspace_is_old && staged_is_new {
@@ -852,7 +1453,7 @@ fn apply_or_recover_install(
                 parent.sync_all()?;
                 tx.sync_all()?;
                 checkpoint("exchanged")?;
-                if !authenticate_leaf_at_bytes(tx, &install.staged, old.kind, old_bytes)? {
+                if !authenticate_displaced_at(tx, &install.staged, install, old_bytes)? {
                     if authenticate_workspace_file(
                         root,
                         Path::new(&install.path),
@@ -862,30 +1463,45 @@ fn apply_or_recover_install(
                         rename_exchange(tx, &install.staged, &parent, name)?;
                         parent.sync_all()?;
                         tx.sync_all()?;
-                        bail!(
-                            "workspace path {:?} changed during replacement; restored concurrent data",
-                            install.path
-                        );
+                        return Err(invalidated_install(
+                            install,
+                            format!(
+                                "workspace path {:?} changed during replacement; restored concurrent data",
+                                install.path
+                            ),
+                        ));
                     }
-                    bail!(
-                        "workspace path {:?} changed during replacement; preserved both values",
-                        install.path
-                    );
+                    return Err(invalidated_install(
+                        install,
+                        format!(
+                            "workspace path {:?} changed during replacement; preserved both values",
+                            install.path
+                        ),
+                    ));
                 }
             } else {
+                if staged_is_new {
+                    return Err(invalidated_install(
+                        install,
+                        format!(
+                            "workspace path {:?} changed after replacement intent",
+                            install.path
+                        ),
+                    ));
+                }
                 ensure!(
                     authenticate_workspace_file(
                         root,
                         Path::new(&install.path),
                         Some((new.kind, new_bytes)),
                         MAX_FILE_BYTES
-                    )? && authenticate_leaf_at_bytes(tx, &install.staged, old.kind, old_bytes)?,
+                    )? && authenticate_displaced_at(tx, &install.staged, install, old_bytes)?,
                     "ambiguous interrupted replacement for {:?}",
                     install.path
                 );
             }
         }
-        (Some(old), None) => {
+        (Some(_old), None) => {
             // A completed descendant deletion may already have removed its empty
             // plan-owned parent before a crash. Recreate that directory only as
             // transaction scaffolding; the later directory-to-file install removes
@@ -897,12 +1513,7 @@ fn apply_or_recover_install(
                 .tombstone
                 .as_deref()
                 .context("deletion has no tombstone")?;
-            let workspace_is_old = authenticate_workspace_file(
-                root,
-                Path::new(&install.path),
-                Some((old.kind, old_bytes)),
-                MAX_FILE_BYTES,
-            )?;
+            let workspace_is_old = authenticate_install_preimage(root, install, Some(old_bytes))?;
             let staged_is_marker =
                 authenticate_leaf_at_bytes(tx, &install.staged, FileKind::Regular, marker)?;
             if workspace_is_old && staged_is_marker {
@@ -911,7 +1522,7 @@ fn apply_or_recover_install(
                 parent.sync_all()?;
                 tx.sync_all()?;
                 checkpoint("exchanged")?;
-                if !authenticate_leaf_at_bytes(tx, &install.staged, old.kind, old_bytes)? {
+                if !authenticate_displaced_at(tx, &install.staged, install, old_bytes)? {
                     if authenticate_workspace_file(
                         root,
                         Path::new(&install.path),
@@ -921,19 +1532,34 @@ fn apply_or_recover_install(
                         rename_exchange(tx, &install.staged, &parent, name)?;
                         parent.sync_all()?;
                         tx.sync_all()?;
-                        bail!(
-                            "workspace path {:?} changed during deletion exchange; restored concurrent data",
-                            install.path
-                        );
+                        return Err(invalidated_install(
+                            install,
+                            format!(
+                                "workspace path {:?} changed during deletion exchange; restored concurrent data",
+                                install.path
+                            ),
+                        ));
                     }
-                    bail!(
-                        "workspace path {:?} changed during deletion exchange; preserved both values",
-                        install.path
-                    );
+                    return Err(invalidated_install(
+                        install,
+                        format!(
+                            "workspace path {:?} changed during deletion exchange; preserved both values",
+                            install.path
+                        ),
+                    ));
                 }
             } else {
+                if staged_is_marker {
+                    return Err(invalidated_install(
+                        install,
+                        format!(
+                            "workspace path {:?} changed after deletion intent",
+                            install.path
+                        ),
+                    ));
+                }
                 ensure!(
-                    authenticate_leaf_at_bytes(tx, &install.staged, old.kind, old_bytes)?
+                    authenticate_displaced_at(tx, &install.staged, install, old_bytes)?
                         && (authenticate_workspace_file(
                             root,
                             Path::new(&install.path),
@@ -970,15 +1596,21 @@ fn apply_or_recover_install(
                         rename_noreplace(tx, &removed, &parent, name)?;
                         parent.sync_all()?;
                         tx.sync_all()?;
-                        bail!(
-                            "workspace path {:?} changed during deletion move; restored concurrent data",
-                            install.path
-                        );
+                        return Err(invalidated_install(
+                            install,
+                            format!(
+                                "workspace path {:?} changed during deletion move; restored concurrent data",
+                                install.path
+                            ),
+                        ));
                     }
-                    bail!(
-                        "workspace path {:?} changed during deletion move; preserved concurrent data",
-                        install.path
-                    );
+                    return Err(invalidated_install(
+                        install,
+                        format!(
+                            "workspace path {:?} changed during deletion move; preserved concurrent data",
+                            install.path
+                        ),
+                    ));
                 }
                 unlinkat_if_exists(tx, &removed, 0)?;
                 tx.sync_all()?;
@@ -990,13 +1622,25 @@ fn apply_or_recover_install(
     Ok(())
 }
 
-fn authenticate_snapshot_exact(
-    repository: &LocalRepository,
-    value: FileValue,
-    actual: &WorkspaceFileSnapshot,
-) -> Result<()> {
-    let expected = repository.content.get(value.content)?;
-    authenticate_snapshot_bytes(value, &expected, actual)
+fn authenticate_displaced_at(
+    directory: &File,
+    name: &str,
+    install: &Install,
+    old_bytes: &[u8],
+) -> Result<bool> {
+    if install.restore_consent {
+        let Some(observed) = &install.observed else {
+            return Ok(false);
+        };
+        return Ok(authenticate_preimage_at(
+            directory,
+            OsStr::new(name),
+            observed,
+            MAX_FILE_BYTES,
+        )?);
+    }
+    let old = install.old.context("install has no old value")?;
+    authenticate_leaf_at_bytes(directory, name, old.kind, old_bytes)
 }
 
 fn authenticate_snapshot_bytes(
@@ -1009,16 +1653,6 @@ fn authenticate_snapshot_bytes(
         "materialized target changed externally"
     );
     Ok(())
-}
-
-fn authenticate_exact_at(
-    directory: &File,
-    name: &str,
-    repository: &LocalRepository,
-    value: FileValue,
-) -> Result<()> {
-    let actual = read_leaf_at(directory, name, MAX_FILE_BYTES)?;
-    authenticate_snapshot_exact(repository, value, &actual)
 }
 
 fn authenticate_exact_at_bytes(
@@ -1086,12 +1720,41 @@ fn open_progress_with_flags(tx: &File, flags: libc::c_int) -> Result<File> {
     Ok(file)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProgressState {
+    intents: usize,
+    complete: bool,
+    aborted: bool,
+}
+
 fn append_install_intent(progress: &mut File, transaction_id: Uuid, index: usize) -> Result<()> {
+    append_progress_record(
+        progress,
+        transaction_id,
+        PROGRESS_OPCODE_INSTALL_INTENT,
+        index,
+    )
+}
+
+fn append_completion(progress: &mut File, transaction_id: Uuid, installs: usize) -> Result<()> {
+    append_progress_record(progress, transaction_id, PROGRESS_OPCODE_COMPLETE, installs)
+}
+
+fn append_aborted(progress: &mut File, transaction_id: Uuid, intents: usize) -> Result<()> {
+    append_progress_record(progress, transaction_id, PROGRESS_OPCODE_ABORTED, intents)
+}
+
+fn append_progress_record(
+    progress: &mut File,
+    transaction_id: Uuid,
+    opcode: u16,
+    index: usize,
+) -> Result<()> {
     let index = u64::try_from(index)?;
     let mut record = [0_u8; PROGRESS_RECORD_BYTES];
     record[..4].copy_from_slice(PROGRESS_MAGIC);
     record[4..6].copy_from_slice(&1_u16.to_le_bytes());
-    record[6..8].copy_from_slice(&1_u16.to_le_bytes());
+    record[6..8].copy_from_slice(&opcode.to_le_bytes());
     record[8..24].copy_from_slice(transaction_id.as_bytes());
     record[24..32].copy_from_slice(&index.to_le_bytes());
     let checksum = crc32fast::hash(&record[..32]);
@@ -1101,29 +1764,46 @@ fn append_install_intent(progress: &mut File, transaction_id: Uuid, index: usize
     Ok(())
 }
 
-fn read_progress(progress: &mut File, transaction_id: Uuid, installs: usize) -> Result<usize> {
+fn read_progress(
+    progress: &mut File,
+    transaction_id: Uuid,
+    installs: usize,
+) -> Result<ProgressState> {
     let length = usize::try_from(progress.metadata()?.len())?;
     let complete_bytes = length / PROGRESS_RECORD_BYTES * PROGRESS_RECORD_BYTES;
+    // One extra full-width tail beyond the maximum valid records may be a torn
+    // append and is parsed below so it receives the same final-record truncation.
     ensure!(
-        complete_bytes / PROGRESS_RECORD_BYTES <= installs,
+        complete_bytes / PROGRESS_RECORD_BYTES <= installs.saturating_add(2),
         "materialization progress exceeds install count"
     );
     progress.seek(SeekFrom::Start(0))?;
     let mut record = [0_u8; PROGRESS_RECORD_BYTES];
     let mut valid = 0usize;
+    let mut state = ProgressState {
+        intents: 0,
+        complete: false,
+        aborted: false,
+    };
     let complete_records = complete_bytes / PROGRESS_RECORD_BYTES;
-    for index in 0..complete_records {
+    for physical_index in 0..complete_records {
         progress.read_exact(&mut record)?;
-        if let Err(error) = validate_progress_record(&record, transaction_id, index) {
+        if let Err(error) = validate_progress_record(&record, transaction_id, installs, state) {
             // An interrupted append may leave a full-width record whose payload or
             // checksum never reached stable storage. Only the last physical record
             // can be such a torn append; corruption before it is unambiguously in
             // committed progress and remains a hard error.
-            if index + 1 == complete_records {
+            if physical_index + 1 == complete_records {
                 break;
             }
             return Err(error)
                 .context("materialization progress contains an invalid complete record");
+        }
+        match u16::from_le_bytes(record[6..8].try_into()?) {
+            PROGRESS_OPCODE_INSTALL_INTENT => state.intents += 1,
+            PROGRESS_OPCODE_COMPLETE => state.complete = true,
+            PROGRESS_OPCODE_ABORTED => state.aborted = true,
+            _ => unreachable!("validated progress opcode"),
         }
         valid += 1;
     }
@@ -1133,13 +1813,14 @@ fn read_progress(progress: &mut File, transaction_id: Uuid, installs: usize) -> 
         progress.sync_data()?;
     }
     progress.seek(SeekFrom::End(0))?;
-    Ok(valid)
+    Ok(state)
 }
 
 fn validate_progress_record(
     record: &[u8; PROGRESS_RECORD_BYTES],
     id: Uuid,
-    index: usize,
+    installs: usize,
+    state: ProgressState,
 ) -> Result<()> {
     ensure!(&record[..4] == PROGRESS_MAGIC, "invalid progress magic");
     ensure!(
@@ -1147,21 +1828,49 @@ fn validate_progress_record(
         "invalid progress version"
     );
     ensure!(
-        u16::from_le_bytes(record[6..8].try_into()?) == 1,
-        "invalid progress opcode"
-    );
-    ensure!(
         &record[8..24] == id.as_bytes(),
         "progress transaction mismatch"
-    );
-    ensure!(
-        u64::from_le_bytes(record[24..32].try_into()?) == u64::try_from(index)?,
-        "non-contiguous materialization progress"
     );
     ensure!(
         u32::from_le_bytes(record[32..36].try_into()?) == crc32fast::hash(&record[..32]),
         "invalid progress checksum"
     );
+    let opcode = u16::from_le_bytes(record[6..8].try_into()?);
+    let index = usize::try_from(u64::from_le_bytes(record[24..32].try_into()?))?;
+    match opcode {
+        PROGRESS_OPCODE_INSTALL_INTENT => {
+            ensure!(
+                !state.complete && !state.aborted,
+                "install intent follows terminal record"
+            );
+            ensure!(state.intents < installs, "too many install intents");
+            ensure!(
+                index == state.intents,
+                "non-contiguous materialization progress"
+            );
+        }
+        PROGRESS_OPCODE_COMPLETE => {
+            ensure!(
+                !state.complete && !state.aborted,
+                "duplicate terminal record"
+            );
+            ensure!(
+                state.intents == installs && index == installs,
+                "completion record precedes all install intents"
+            );
+        }
+        PROGRESS_OPCODE_ABORTED => {
+            ensure!(
+                !state.complete && !state.aborted,
+                "duplicate terminal record"
+            );
+            ensure!(
+                state.intents < installs && index == state.intents,
+                "invalid aborted record"
+            );
+        }
+        _ => bail!("invalid progress opcode"),
+    }
     Ok(())
 }
 
@@ -1200,19 +1909,94 @@ fn read_journal(root: &Path) -> Result<Option<Journal>> {
         bytes.len() <= MAX_JOURNAL_BYTES,
         "materialization journal exceeds byte limit"
     );
-    Ok(Some(
-        serde_json::from_slice(&bytes).context("decode materialization journal")?,
-    ))
+    let journal = serde_json::from_slice(&bytes).context("decode materialization journal")?;
+    validate_journal_bounds(&journal)?;
+    Ok(Some(journal))
+}
+
+fn validate_journal_bounds(journal: &Journal) -> Result<()> {
+    ensure!(
+        journal.installs.len() <= MAX_SELECTED_FILES,
+        "materialization journal exceeds install count"
+    );
+    let mut path_bytes = 0usize;
+    for install in &journal.installs {
+        validate_path(&install.path)?;
+        ensure!(
+            install.staged.len() <= 64,
+            "journal staged name exceeds byte limit"
+        );
+        ensure!(
+            install
+                .tombstone
+                .as_ref()
+                .is_none_or(|marker| marker.len() <= 128),
+            "journal tombstone exceeds byte limit"
+        );
+        path_bytes = path_bytes
+            .checked_add(install.path.len())
+            .context("journal path byte count overflow")?;
+        ensure!(
+            path_bytes <= MAX_TOTAL_PATH_BYTES,
+            "journal exceeds path byte limit"
+        );
+    }
+    match journal.operation {
+        Operation::Materialize => {
+            ensure!(
+                journal.selectors.is_empty(),
+                "materialization journal contains restore selectors"
+            );
+            ensure!(
+                journal
+                    .installs
+                    .iter()
+                    .all(|install| !install.empty_directory),
+                "materialization journal contains restore structure"
+            );
+        }
+        Operation::Restore => {
+            validate_selectors(&journal.selectors)?;
+            ensure!(
+                !journal.installs.is_empty(),
+                "restore journal contains no changed installs"
+            );
+        }
+    }
+    Ok(())
+}
+
+struct BoundedJournalWriter {
+    bytes: Vec<u8>,
+}
+
+impl Write for BoundedJournalWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = (MAX_JOURNAL_BYTES - 1).saturating_sub(self.bytes.len());
+        if buffer.len() > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "materialization journal exceeds byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn encode_journal(journal: &Journal) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec(journal)?;
-    ensure!(
-        bytes.len() < MAX_JOURNAL_BYTES,
-        "materialization journal exceeds byte limit"
-    );
-    bytes.push(b'\n');
-    Ok(bytes)
+    validate_journal_bounds(journal)?;
+    let mut writer = BoundedJournalWriter {
+        bytes: Vec::with_capacity(MAX_JOURNAL_BYTES.min(64 * 1024)),
+    };
+    serde_json::to_writer(&mut writer, journal)
+        .context("encode bounded materialization journal")?;
+    writer.bytes.push(b'\n');
+    Ok(writer.bytes)
 }
 
 fn write_journal(root: &Path, bytes: &[u8]) -> Result<()> {
@@ -1233,21 +2017,135 @@ fn write_journal(root: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-/// Remove the journal first. A crash can then leave only an empty transaction
-/// directory, which is inert and cannot trigger recovery or touch workspace data.
+fn abort_restore(
+    root: &Path,
+    repository: &LocalRepository,
+    tx: &File,
+    progress: &mut File,
+    journal: &Journal,
+) -> Result<()> {
+    ensure!(
+        journal.operation == Operation::Restore,
+        "cannot abort materialization"
+    );
+    let state = read_progress(progress, journal.transaction_id, journal.installs.len())?;
+    if !state.aborted {
+        append_aborted(progress, journal.transaction_id, state.intents)?;
+        checkpoint("abort-persisted")?;
+    }
+    cleanup_aborted(root, repository, journal, tx, state.intents)
+}
+
+fn cleanup_aborted(
+    root: &Path,
+    repository: &LocalRepository,
+    journal: &Journal,
+    tx: &File,
+    intents: usize,
+) -> Result<()> {
+    // Operations are prepared sequentially immediately before their intent is
+    // appended. Consequently the intended prefix may have apply debris, and
+    // exactly the operation at `intents` may have only its authenticated staged
+    // target. Later operation names are never authorized by an abort record.
+    for (index, install) in journal
+        .installs
+        .iter()
+        .take(intents.saturating_add(1))
+        .enumerate()
+    {
+        if leaf_exists(tx, &install.staged)? {
+            let is_staged_target = match install.new {
+                Some(target) => {
+                    let target_bytes = repository.content.get(target.content)?;
+                    authenticate_leaf_at_bytes(tx, &install.staged, target.kind, &target_bytes)?
+                }
+                None => false,
+            };
+            let is_tombstone = match install.tombstone.as_deref() {
+                Some(marker) => {
+                    authenticate_leaf_at_bytes(tx, &install.staged, FileKind::Regular, marker)?
+                }
+                None => false,
+            };
+            let is_displaced_preimage = if index < intents {
+                match &install.observed {
+                    Some(observed) => authenticate_preimage_at(
+                        tx,
+                        OsStr::new(&install.staged),
+                        observed,
+                        MAX_FILE_BYTES,
+                    )?,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            ensure!(
+                is_staged_target || is_tombstone || is_displaced_preimage,
+                "refusing to remove unauthenticated aborted restore debris for {:?}",
+                install.path
+            );
+            unlinkat_if_exists(tx, &install.staged, 0)?;
+            tx.sync_all()?;
+            checkpoint("aborted-preimage-unlinked")?;
+        }
+        if index >= intents {
+            continue;
+        }
+        let removed = install.staged.replacen("leaf-", "removed-", 1);
+        if leaf_exists(tx, &removed)? {
+            let marker = install
+                .tombstone
+                .as_deref()
+                .context("aborted deletion debris has no tombstone")?;
+            ensure!(
+                authenticate_leaf_at_bytes(tx, &removed, FileKind::Regular, marker)?,
+                "refusing to remove unauthenticated aborted deletion debris for {:?}",
+                install.path
+            );
+            unlinkat_if_exists(tx, &removed, 0)?;
+            tx.sync_all()?;
+            checkpoint("aborted-removed-unlinked")?;
+        }
+    }
+    ensure_progress_only(tx)?;
+    let control = open_directory(&root.join(".wheat"))?;
+    unlinkat_if_exists(&control, JOURNAL_NAME, 0)?;
+    control.sync_all()?;
+    checkpoint("aborted-journal-unlinked")?;
+    cleanup_abandoned_transaction(root, journal.transaction_id, tx)
+}
+
+/// Remove authenticated displaced leaves only after durable commit (the metadata
+/// publication for legacy/in-flight materializations or the progress completion
+/// record), then remove the journal that makes the transaction recoverable.
 fn cleanup_committed(
     root: &Path,
     repository: &LocalRepository,
     journal: &Journal,
     tx: &File,
 ) -> Result<()> {
+    let mut progress = open_progress(tx)?;
+    ensure!(
+        read_progress(
+            &mut progress,
+            journal.transaction_id,
+            journal.installs.len()
+        )?
+        .complete,
+        "refusing cleanup before durable completion"
+    );
     for install in &journal.installs {
         match install.old {
             Some(old) if leaf_exists(tx, &install.staged)? => {
-                authenticate_exact_at(tx, &install.staged, repository, old).with_context(|| {
-                    format!("authenticate displaced preimage {:?}", install.path)
-                })?;
+                let old_bytes = repository.content.get(old.content)?;
+                ensure!(
+                    authenticate_displaced_at(tx, &install.staged, install, &old_bytes)?,
+                    "displaced preimage for {:?} changed",
+                    install.path
+                );
                 unlinkat_if_exists(tx, &install.staged, 0)?;
+                checkpoint("staged-preimage-unlinked")?;
             }
             _ => {}
         }
@@ -1256,6 +2154,7 @@ fn cleanup_committed(
     ensure_progress_only(tx)?;
     let control = open_directory(&root.join(".wheat"))?;
     unlinkat_if_exists(&control, JOURNAL_NAME, 0)?;
+    checkpoint("journal-unlinked")?;
     control.sync_all()?;
     cleanup_abandoned_transaction(root, journal.transaction_id, tx)
 }
@@ -1308,11 +2207,33 @@ fn cleanup_orphan_transactions(root: &Path) -> Result<()> {
         match orphan_transaction_shape(&tx)? {
             OrphanTransactionShape::Empty => {}
             OrphanTransactionShape::EmptyProgress => {
-                let progress = open_progress(&tx)?;
-                ensure!(
-                    progress.metadata()?.len() == 0,
-                    "orphan materialization transaction has recorded intent"
-                );
+                let mut progress = open_progress(&tx)?;
+                let length = usize::try_from(progress.metadata()?.len())?;
+                if length != 0 {
+                    ensure!(
+                        length % PROGRESS_RECORD_BYTES == 0,
+                        "orphan materialization transaction has torn progress"
+                    );
+                    let records = length / PROGRESS_RECORD_BYTES;
+                    ensure!(records > 0, "orphan progress record count underflow");
+                    progress.seek(SeekFrom::End(-(PROGRESS_RECORD_BYTES as i64)))?;
+                    let mut terminal = [0_u8; PROGRESS_RECORD_BYTES];
+                    progress.read_exact(&mut terminal)?;
+                    let opcode = u16::from_le_bytes(terminal[6..8].try_into()?);
+                    let installs = match opcode {
+                        PROGRESS_OPCODE_COMPLETE => records - 1,
+                        // The journal is gone, so its total install count is unavailable.
+                        // One more than the authenticated intent prefix is a safe bound
+                        // that validates the abort terminal without authorizing debris.
+                        PROGRESS_OPCODE_ABORTED => records,
+                        _ => bail!("orphan materialization transaction has no terminal record"),
+                    };
+                    let state = read_progress(&mut progress, id, installs)?;
+                    ensure!(
+                        (state.complete || state.aborted) && state.intents + 1 == records,
+                        "orphan materialization transaction is not durably terminal"
+                    );
+                }
             }
         }
         cleanup_abandoned_transaction(root, id, &tx)?;
@@ -1324,15 +2245,21 @@ fn authenticate_replaced_directory(
     root: &Path,
     path: &str,
     replacement: &ReplacedDirectoryPlan,
+    restore_consent: bool,
 ) -> Result<()> {
     ensure!(
         !replacement.expected_leaves.is_empty(),
         "replacement directory has no tracked descendants"
     );
-    inventory_directory(root, path, replacement)
+    inventory_directory(root, path, replacement, restore_consent)
 }
 
-fn inventory_directory(root: &Path, path: &str, expected: &ReplacedDirectoryPlan) -> Result<()> {
+fn inventory_directory(
+    root: &Path,
+    path: &str,
+    expected: &ReplacedDirectoryPlan,
+    restore_consent: bool,
+) -> Result<()> {
     for entry in fs::read_dir(root.join(path)).context("inventory replacement directory")? {
         let entry = entry?;
         let name = entry
@@ -1342,19 +2269,45 @@ fn inventory_directory(root: &Path, path: &str, expected: &ReplacedDirectoryPlan
         let relative = format!("{path}/{name}");
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.is_dir() {
-            ensure!(
-                expected.expected_directories.contains(relative.as_str()),
-                "refusing to replace workspace directory {path:?} containing untracked entry {relative:?}"
-            );
-            inventory_directory(root, &relative, expected)?;
-        } else {
-            ensure!(
-                expected.expected_leaves.contains(relative.as_str()),
-                "refusing to replace workspace directory {path:?} containing untracked entry {relative:?}"
-            );
+            if !expected.expected_directories.contains(relative.as_str()) {
+                return Err(structural_inventory_invalidated(
+                    path,
+                    &relative,
+                    restore_consent,
+                ));
+            }
+            inventory_directory(root, &relative, expected, restore_consent)?;
+        } else if !expected.expected_leaves.contains(relative.as_str()) {
+            return Err(structural_inventory_invalidated(
+                path,
+                &relative,
+                restore_consent,
+            ));
         }
     }
     Ok(())
+}
+
+fn structural_inventory_invalidated(
+    directory: &str,
+    entry: &str,
+    restore_consent: bool,
+) -> anyhow::Error {
+    let message = format!(
+        "refusing to replace workspace directory {directory:?} containing untracked entry {entry:?}"
+    );
+    if restore_consent {
+        restore_invalidated(message)
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+fn directory_is_empty(root: &Path, path: &str) -> Result<bool> {
+    let (parent, name) = open_parent(root, path)?;
+    let directory = open_dir_at(&parent, name)?;
+    let proc_path = Path::new("/proc/self/fd").join(directory.as_raw_fd().to_string());
+    Ok(fs::read_dir(proc_path)?.next().transpose()?.is_none())
 }
 
 fn path_is_directory(root: &Path, path: &str) -> Result<bool> {
@@ -1400,6 +2353,15 @@ fn entry_is_directory(parent: &File, name: &str) -> Result<bool> {
     Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR)
 }
 
+fn is_directory_not_empty(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+        )
+    })
+}
+
 fn remove_replaced_directory(
     root: &Path,
     _tx: &File,
@@ -1420,20 +2382,17 @@ fn remove_replaced_directory(
     // this point. A nonempty directory is therefore preserved and recovery retains
     // those leaves rather than deleting concurrent workspace data.
     let (parent, name) = open_parent(root, &install.path)?;
+    checkpoint("before-replaced-directory-removal")?;
     match unlinkat_if_exists(&parent, name, libc::AT_REMOVEDIR) {
         Ok(()) => parent.sync_all()?,
-        Err(error)
-            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
-                )
-            }) =>
-        {
-            bail!(
-                "refusing to replace nonempty workspace directory {:?}",
-                install.path
-            )
+        Err(error) if is_directory_not_empty(&error) => {
+            return Err(invalidated_install(
+                install,
+                format!(
+                    "refusing to replace nonempty workspace directory {:?}",
+                    install.path
+                ),
+            ));
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -2006,7 +2965,14 @@ mod tests {
         progress.write_all(b"torn").unwrap();
         progress.sync_data().unwrap();
 
-        assert_eq!(read_progress(&mut progress, id, 3).unwrap(), 2);
+        assert_eq!(
+            read_progress(&mut progress, id, 3).unwrap(),
+            ProgressState {
+                intents: 2,
+                complete: false,
+                aborted: false
+            }
+        );
         assert_eq!(
             progress.metadata().unwrap().len(),
             u64::try_from(2 * PROGRESS_RECORD_BYTES).unwrap()
@@ -2032,7 +2998,14 @@ mod tests {
         corruptor.sync_data().unwrap();
         drop(corruptor);
 
-        assert_eq!(read_progress(&mut progress, id, 3).unwrap(), 1);
+        assert_eq!(
+            read_progress(&mut progress, id, 3).unwrap(),
+            ProgressState {
+                intents: 1,
+                complete: false,
+                aborted: false
+            }
+        );
         assert_eq!(
             progress.metadata().unwrap().len(),
             u64::try_from(PROGRESS_RECORD_BYTES).unwrap()
@@ -2053,6 +3026,9 @@ mod tests {
                 path: format!("root-{index:05}/nested/leaf"),
                 old: Some(value),
                 new: None,
+                observed: None,
+                restore_consent: false,
+                empty_directory: false,
                 staged: String::new(),
                 tombstone: Some(Vec::new()),
             });
@@ -2062,6 +3038,9 @@ mod tests {
                 path: format!("root-{index:05}"),
                 old: None,
                 new: Some(value),
+                observed: None,
+                restore_consent: false,
+                empty_directory: false,
                 staged: String::new(),
                 tombstone: None,
             });
@@ -2115,6 +3094,9 @@ mod tests {
                 path: leaf,
                 old: Some(value),
                 new: None,
+                observed: None,
+                restore_consent: false,
+                empty_directory: false,
                 staged: String::new(),
                 tombstone: Some(Vec::new()),
             },
@@ -2122,6 +3104,9 @@ mod tests {
                 path: String::from("root"),
                 old: None,
                 new: Some(value),
+                observed: None,
+                restore_consent: false,
+                empty_directory: false,
                 staged: String::new(),
                 tombstone: None,
             },
@@ -2129,6 +3114,9 @@ mod tests {
                 path: nearest_replacement.clone(),
                 old: None,
                 new: Some(value),
+                observed: None,
+                restore_consent: false,
+                empty_directory: false,
                 staged: String::new(),
                 tombstone: None,
             },
@@ -2196,6 +3184,41 @@ mod tests {
     }
 
     #[test]
+    fn restore_indices_check_only_path_ancestors_at_representative_scale() {
+        const LEAVES: usize = 20_000;
+        const CHECKS_TO_PINNED_BOUNDARY: usize = 2;
+        const FULL_DEPTH: usize = 3;
+        let value = FileValue {
+            content: wheat_core::ContentId::of(b"content"),
+            kind: FileKind::Regular,
+        };
+        let selectors = (0..LEAVES)
+            .map(|index| format!("root-{index:05}/pinned"))
+            .collect::<Vec<_>>();
+        let selected = (0..LEAVES)
+            .map(|index| (format!("root-{index:05}/pinned/nested/leaf"), value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let mut representative_checks = 0_usize;
+        let representatives = descendant_representatives(&selectors, &selected, |_| {
+            representative_checks += 1;
+        });
+        assert_eq!(representative_checks, LEAVES * FULL_DEPTH);
+        assert_eq!(representatives.len(), LEAVES);
+
+        let obstructions = selectors.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut obstruction_checks = 0_usize;
+        for path in selected.keys() {
+            assert!(is_shadowed_by_exact_obstruction(
+                path,
+                &obstructions,
+                |_| obstruction_checks += 1,
+            ));
+        }
+        assert_eq!(obstruction_checks, LEAVES * CHECKS_TO_PINNED_BOUNDARY);
+    }
+
+    #[test]
     fn operation_content_residency_counter_records_real_owned_buffers() {
         TEST_PEAK_OWNED_CONTENT_BYTES.store(0, Ordering::Relaxed);
         let old = [0_u8; 17];
@@ -2204,6 +3227,69 @@ mod tests {
         TEST_PEAK_OWNED_CONTENT_BYTES.fetch_max(resident, Ordering::Relaxed);
         assert_eq!(TEST_PEAK_OWNED_CONTENT_BYTES.load(Ordering::Relaxed), 46);
         assert!(resident as u64 <= MAX_OPERATION_RESIDENT_BYTES);
+    }
+
+    #[test]
+    fn completion_record_is_unique_final_and_follows_all_intents() {
+        let root = tempfile::tempdir().unwrap();
+        let tx = open_directory(root.path()).unwrap();
+        let id = Uuid::now_v7();
+        let mut progress = create_progress(&tx).unwrap();
+        append_install_intent(&mut progress, id, 0).unwrap();
+        append_completion(&mut progress, id, 2).unwrap();
+        assert_eq!(
+            read_progress(&mut progress, id, 2).unwrap(),
+            ProgressState {
+                intents: 1,
+                complete: false,
+                aborted: false
+            }
+        );
+
+        progress.set_len(PROGRESS_RECORD_BYTES as u64).unwrap();
+        progress.seek(SeekFrom::End(0)).unwrap();
+        append_install_intent(&mut progress, id, 1).unwrap();
+        append_completion(&mut progress, id, 2).unwrap();
+        assert_eq!(
+            read_progress(&mut progress, id, 2).unwrap(),
+            ProgressState {
+                intents: 2,
+                complete: true,
+                aborted: false
+            }
+        );
+        append_completion(&mut progress, id, 2).unwrap();
+        assert_eq!(
+            read_progress(&mut progress, id, 2).unwrap(),
+            ProgressState {
+                intents: 2,
+                complete: true,
+                aborted: false
+            }
+        );
+        assert_eq!(
+            progress.metadata().unwrap().len(),
+            u64::try_from(3 * PROGRESS_RECORD_BYTES).unwrap()
+        );
+    }
+
+    #[test]
+    fn bounded_journal_writer_refuses_growth_past_limit() {
+        let mut writer = BoundedJournalWriter { bytes: Vec::new() };
+        writer.bytes.resize(MAX_JOURNAL_BYTES - 2, 0);
+        assert_eq!(writer.write(&[1]).unwrap(), 1);
+        let error = writer.write(&[2]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(writer.bytes.len(), MAX_JOURNAL_BYTES - 1);
+    }
+
+    #[test]
+    fn selector_validation_rejects_noncanonical_and_oversized_inputs() {
+        assert!(validate_selectors(&[]).is_err());
+        assert!(validate_selectors(&[String::from("b"), String::from("a")]).is_err());
+        assert!(validate_selectors(&[String::from("a"), String::from("a")]).is_err());
+        assert!(validate_selectors(&["x".repeat(MAX_PATH_BYTES + 1)]).is_err());
+        validate_selectors(&[String::from("a"), String::from("a/b"), String::from("b")]).unwrap();
     }
 
     #[test]

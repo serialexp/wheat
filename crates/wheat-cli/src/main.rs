@@ -50,6 +50,8 @@ enum Command {
     Init(InitArgs),
     /// Materialize the selected native view into the workspace.
     Materialize(MaterializeArgs),
+    /// Restore tracked paths from the currently pinned materialized tree.
+    Restore(RestoreArgs),
     /// Show repository and tracked workspace state.
     Status(StatusArgs),
     /// Verify the complete retained repository state.
@@ -89,6 +91,13 @@ struct MaterializeArgs {
     /// Wheat source: published, working, or branch:<name>.
     #[arg(long, default_value = "published")]
     source: String,
+}
+
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    /// Tracked leaf or directory paths in the currently pinned tree.
+    #[arg(required = true)]
+    paths: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -263,6 +272,9 @@ fn main() -> Result<()> {
             cli.store.as_deref(),
             &arguments.source,
         ),
+        Command::Restore(arguments) => {
+            restore_workspace(&requested_workspace, cli.store.as_deref(), &arguments.paths)
+        }
         Command::Status(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let summary = repository_summary(&context.store_root)?;
@@ -335,8 +347,18 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Add(arguments) => {
-            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
+            // Recovery, capture, and publication are one workspace operation:
+            // otherwise pending or concurrent materialization can rewrite a selected
+            // leaf between capture and the repository-head compare-and-swap.
+            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
+            let runtime = runtime()?;
+            runtime.block_on(materialization::recover(
+                &context.root,
+                &local,
+                &mut context.workspace,
+            ))?;
             let expected = local.heads.read()?;
             let change = ChangeId::from_str(&arguments.change).context("invalid change ID")?;
             let predecessor = RevisionId::from_str(&arguments.predecessor)
@@ -348,7 +370,6 @@ fn main() -> Result<()> {
                     .or_insert_with(Vec::new)
                     .push(guard.range);
             }
-            let runtime = runtime()?;
             let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
             let edits = runtime.block_on(workspace::author_from_workspace(
                 &context.root,
@@ -597,6 +618,23 @@ fn materialize_workspace(
         requested_selection,
     ))?;
     println!("materialized view {view} in {}", context.root.display());
+    Ok(())
+}
+
+fn restore_workspace(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    paths: &[String],
+) -> Result<()> {
+    let mut context = resolve_context(workspace, explicit_store)?;
+    let repository = open(&context.store_root)?;
+    let restored = runtime()?.block_on(materialization::restore(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+        paths,
+    ))?;
+    println!("restored {restored} tracked path(s)");
     Ok(())
 }
 

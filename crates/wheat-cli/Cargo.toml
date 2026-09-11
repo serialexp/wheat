@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = "0.1"
+blake3 = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
 libc = { workspace = true }

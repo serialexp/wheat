@@ -36,13 +36,14 @@ both lists.
   kind, and deletion changes, treat canonical-equivalent line endings as clean,
   and report repository advancement. Diff rendering and conflict-path expansion
   remain outstanding.
+- [x] **Selected-path restore.** Explicit file and directory selectors authorize
+  restoring their tracked leaves from the pinned materialized tree. Workspace-only
+  paths and untracked siblings are preserved, exact observed preimages close
+  concurrent-write races, and durable intent/completion records support full
+  crash roll-forward without changing the selected view or workspace metadata.
 
 ### Outstanding
 
-- [ ] **Phase 1 — selected-path restore.** Reuse the rematerialization transaction
-  machinery to restore selected paths from the pinned view after deciding whether
-  naming a dirty path is itself consent to discard its observed value or requires
-  an explicit expected-preimage/preview contract.
 - [ ] **Phase 1 — tracked workspace diff and conflict paths.** Render useful
   workspace/view and revision/revision diffs and map durable conflict evidence to
   affected paths. Untracked/ignored scanning follows complete ignore semantics in
@@ -238,9 +239,24 @@ stream-authenticate workspace and transaction files with fixed scratch, and use
 `RENAME_NOREPLACE`/`RENAME_EXCHANGE` to preserve concurrent data. An immutable
 O(delta) journal plus fixed-width append-only progress records supports abrupt
 crash recovery. Workspace metadata becomes the commit marker only after every
-planned mutation is durable. Selected-path restore remains outstanding because
-its user-consent contract differs from a view switch, which always refuses dirty
-changed paths.
+planned view-switch mutation is durable.
+
+`wheat restore <paths...>` targets the workspace's pinned materialized tree even
+when repository authority has advanced. Naming a tracked file or directory is
+consent to discard the exact observed values of its selected tracked leaves;
+directories recursively select tracked descendants, while workspace-only paths
+and untracked siblings are never included. A validated, durably published restore
+journal records value-specific intent for the complete invocation. Recovery rolls
+that plan forward while not-yet-mutated paths still match their authorized exact
+preimages. A later edit invalidates the remaining plan: Wheat preserves that value,
+durably aborts and consumes the journal, retains any completed prefix, and requires
+an explicit rerun to renew consent. A completed plan writes a durable terminal
+record before cleanup and then consumes intent by durably removing the journal.
+This journal is recovery state owned by the same workspace principal that can
+invoke restore and edit the workspace, not a separate privilege boundary. Exact
+raw-byte-and-kind preimages prevent a concurrent writer from being mistaken for
+the value the invocation authorized. A clean selection is a true no-op and does
+not create recovery state or rewrite metadata.
 
 The plan classifies each path as:
 
@@ -506,7 +522,7 @@ error chain to decide whether retry is safe.
 2. Isolate all repository/projection authority paths and define supported-platform
    safety guarantees.
 3. Implement planned, crash-recoverable materialization and selected-path restore.
-   Materialization is complete; selected-path restore remains.
+   Both view switching and pinned selected-path restore are complete.
 4. Implement tracked-path workspace status and diff.
 5. Add complete native change/revision metadata and identity configuration.
 6. Add ergonomic selected-path capture using the current change and predecessor.

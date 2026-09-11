@@ -3,22 +3,24 @@ use std::{
     process::{Command, Output},
 };
 
-fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
+fn wheat_command(root: &std::path::Path, arguments: &[&str]) -> Command {
     let mut adjusted = arguments.to_vec();
     if adjusted.first() == Some(&"init") && adjusted.len() == 1 {
         adjusted.push(root.to_str().unwrap());
     }
-    Command::new(env!("CARGO_BIN_EXE_wheat"))
-        .arg("--workspace")
-        .arg(root)
-        .args(adjusted)
-        .env(
-            "WHEAT_STORE_HOME",
-            root.parent().unwrap().join(format!(
-                ".{}-test-stores",
-                root.file_name().unwrap().to_string_lossy()
-            )),
-        )
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wheat"));
+    command.arg("--workspace").arg(root).args(adjusted).env(
+        "WHEAT_STORE_HOME",
+        root.parent().unwrap().join(format!(
+            ".{}-test-stores",
+            root.file_name().unwrap().to_string_lossy()
+        )),
+    );
+    command
+}
+
+fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
+    wheat_command(root, arguments)
         .output()
         .expect("wheat command runs")
 }
@@ -325,6 +327,81 @@ fn stale_or_invalid_add_leaves_published_head_unchanged() {
     );
     assert!(!failed.status.success());
     assert_eq!(fs::read(&head_path).unwrap(), head);
+}
+
+#[test]
+fn add_recovers_pending_restore_before_capturing_workspace_bytes() {
+    let (dir, change, predecessor) = setup();
+    ok(dir.path(), &["materialize", "--source", "working"]);
+    fs::write(dir.path().join("file"), "discarded workspace bytes\n").unwrap();
+    let interrupted = wheat_command(dir.path(), &["restore", "file"])
+        .env(
+            "WHEAT_TEST_MATERIALIZATION_FAIL_AFTER",
+            "completion-persisted",
+        )
+        .env("WHEAT_TEST_MATERIALIZATION_FAIL_MODE", "sigkill")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    assert!(dir.path().join(".wheat/materialization.json").exists());
+
+    let added = ok(
+        dir.path(),
+        &[
+            "add",
+            "--change",
+            &change,
+            "--predecessor",
+            &predecessor,
+            "file",
+        ],
+    );
+    ok(
+        dir.path(),
+        &["edits", "--revision", &field(&added, "revision")],
+    );
+    assert_eq!(
+        fs::read(dir.path().join("file")).unwrap(),
+        b"top\nbar\nbottom\n"
+    );
+    assert!(!dir.path().join(".wheat/materialization.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn add_holds_the_workspace_operation_lock_across_capture_and_publication() {
+    use std::os::fd::AsRawFd as _;
+
+    let (dir, change, predecessor) = setup();
+    fs::write(dir.path().join("file"), "top\nbaz\nbottom\n").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.path().join(".wheat/workspace.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let head_path = store_path(dir.path()).join("repository.head");
+    let head = fs::read(&head_path).unwrap();
+
+    let blocked = wheat(
+        dir.path(),
+        &[
+            "add",
+            "--change",
+            &change,
+            "--predecessor",
+            &predecessor,
+            "file",
+        ],
+    );
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("workspace is locked"));
+    assert_eq!(fs::read(head_path).unwrap(), head);
 }
 
 #[test]

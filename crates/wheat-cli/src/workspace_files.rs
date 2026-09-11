@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 use std::cell::Cell;
+#[cfg(unix)]
+use std::{ffi::OsStr, fs::File};
 use std::{fmt, io, path::Path};
 
 #[cfg(test)]
@@ -9,7 +11,19 @@ thread_local! {
     static TEST_SNAPSHOT_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
+use serde::{Deserialize, Serialize};
 use wheat_core::FileKind;
+
+const RAW_PREIMAGE_DOMAIN: &[u8] = b"wheat-workspace-raw-preimage-v1\0";
+
+/// Exact, bounded authentication of a raw workspace leaf.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawPreimage {
+    pub(crate) kind: FileKind,
+    pub(crate) length: u64,
+    pub(crate) digest: [u8; 32],
+}
 
 /// An owned snapshot suitable for borrowing as an `edit_capture::FileSnapshot`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +102,50 @@ pub(crate) fn authenticate_workspace_file(
     platform::authenticate(root, &components, expected, byte_limit)
 }
 
+/// Observe a raw leaf with a domain-separated streaming digest. Missing paths
+/// are represented by `None`; regular contents are never collected.
+pub(crate) fn observe_workspace_file(
+    root: &Path,
+    path: &Path,
+    byte_limit: usize,
+) -> Result<Option<RawPreimage>, WorkspaceFileError> {
+    let components = validate_path(path)?;
+    platform::observe(root, &components, byte_limit)
+}
+
+pub(crate) fn authenticate_workspace_preimage(
+    root: &Path,
+    path: &Path,
+    expected: &RawPreimage,
+    byte_limit: usize,
+) -> Result<bool, WorkspaceFileError> {
+    Ok(observe_workspace_file(root, path, byte_limit)?.as_ref() == Some(expected))
+}
+
+/// Authenticate a leaf relative to an already-open directory descriptor.
+/// Regular contents are streamed through fixed scratch; symlink targets are
+/// bounded to the maximum portable target size used by materialization.
+#[cfg(unix)]
+pub(crate) fn authenticate_preimage_at(
+    directory: &File,
+    name: &OsStr,
+    expected: &RawPreimage,
+    byte_limit: usize,
+) -> Result<bool, WorkspaceFileError> {
+    Ok(platform::observe_at(directory, name, byte_limit)?.as_ref() == Some(expected))
+}
+
+pub(crate) fn raw_preimage(kind: FileKind, bytes: &[u8]) -> RawPreimage {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(RAW_PREIMAGE_DOMAIN);
+    hasher.update(bytes);
+    RawPreimage {
+        kind,
+        length: bytes.len() as u64,
+        digest: *hasher.finalize().as_bytes(),
+    }
+}
+
 fn validate_path(path: &Path) -> Result<Vec<&std::ffi::OsStr>, WorkspaceFileError> {
     use std::path::Component;
 
@@ -156,7 +214,165 @@ mod platform {
         path::Path,
     };
 
-    use super::{FileKind, WorkspaceFileError, WorkspaceFileSnapshot};
+    use super::{
+        FileKind, RAW_PREIMAGE_DOMAIN, RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot,
+    };
+
+    pub(super) fn observe(
+        root: &Path,
+        components: &[&OsStr],
+        limit: usize,
+    ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
+        let mut directory = File::open(root)?;
+        for component in &components[..components.len() - 1] {
+            let name = c_name(component)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(None),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                        if is_symlink(directory.as_raw_fd(), &name) =>
+                    {
+                        Err(WorkspaceFileError::IntermediateSymlink)
+                    }
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::UnsupportedFileType),
+                    _ => Err(error.into()),
+                };
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+        let name = c_name(components.last().expect("validated nonempty path"))?;
+        observe_leaf(directory.as_raw_fd(), &name, limit)
+    }
+
+    pub(super) fn observe_at(
+        directory: &File,
+        name: &OsStr,
+        limit: usize,
+    ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
+        observe_leaf(directory.as_raw_fd(), &c_name(name)?, limit)
+    }
+
+    fn observe_leaf(
+        directory: libc::c_int,
+        name: &CString,
+        limit: usize,
+    ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        let stat = unsafe { stat.assume_init() };
+        let (kind, length, digest) = match stat.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => {
+                const MAX_SYMLINK_BYTES: usize = 4_095;
+                let effective_limit = limit.min(MAX_SYMLINK_BYTES);
+                let mut scratch = [0_u8; MAX_SYMLINK_BYTES];
+                let length = unsafe {
+                    libc::readlinkat(
+                        directory,
+                        name.as_ptr(),
+                        scratch.as_mut_ptr().cast(),
+                        scratch.len(),
+                    )
+                };
+                if length < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                let length =
+                    usize::try_from(length).expect("readlinkat returned a nonnegative ssize_t");
+                if length > effective_limit
+                    || (length == scratch.len() && stat.st_size > length as libc::off_t)
+                {
+                    return Err(WorkspaceFileError::TooLarge {
+                        limit: effective_limit,
+                    });
+                }
+                (
+                    FileKind::Symlink,
+                    length as u64,
+                    digest_bytes(&scratch[..length]),
+                )
+            }
+            libc::S_IFREG => {
+                let fd = unsafe {
+                    libc::openat(
+                        directory,
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                let mut file = unsafe { File::from_raw_fd(fd) };
+                let opened = file.metadata()?;
+                if !opened.is_file() {
+                    return Err(WorkspaceFileError::UnsupportedFileType);
+                }
+                if opened.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
+                    return Err(WorkspaceFileError::TooLarge { limit });
+                }
+                use std::os::unix::fs::MetadataExt as _;
+                let kind = if opened.mode() & 0o111 != 0 {
+                    FileKind::Executable
+                } else {
+                    FileKind::Regular
+                };
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(RAW_PREIMAGE_DOMAIN);
+                let mut scratch = [0_u8; 64 * 1024];
+                let mut length = 0_u64;
+                loop {
+                    let read = file.read(&mut scratch)?;
+                    if read == 0 {
+                        break;
+                    }
+                    length = length
+                        .checked_add(read as u64)
+                        .ok_or(WorkspaceFileError::TooLarge { limit })?;
+                    if length > limit as u64 {
+                        return Err(WorkspaceFileError::TooLarge { limit });
+                    }
+                    hasher.update(&scratch[..read]);
+                }
+                (kind, length, *hasher.finalize().as_bytes())
+            }
+            _ => return Err(WorkspaceFileError::UnsupportedFileType),
+        };
+        Ok(Some(RawPreimage {
+            kind,
+            length,
+            digest,
+        }))
+    }
+
+    fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(RAW_PREIMAGE_DOMAIN);
+        hasher.update(bytes);
+        *hasher.finalize().as_bytes()
+    }
 
     pub(super) fn authenticate(
         root: &Path,
@@ -429,7 +645,16 @@ mod platform {
 mod platform {
     use std::{ffi::OsStr, fs, io::Read, path::Path};
 
-    use super::{FileKind, WorkspaceFileError, WorkspaceFileSnapshot};
+    use super::{FileKind, RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot, raw_preimage};
+
+    pub(super) fn observe(
+        root: &Path,
+        components: &[&OsStr],
+        limit: usize,
+    ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
+        Ok(read(root, components, limit)?
+            .map(|snapshot| raw_preimage(snapshot.kind, &snapshot.bytes)))
+    }
 
     pub(super) fn authenticate(
         root: &Path,
@@ -514,6 +739,69 @@ mod tests {
             .unwrap()
         );
         TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| assert_eq!(allocated.get(), 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_preimage_authentication_streams_without_snapshot_allocation() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let bytes = vec![b'x'; 3 * 64 * 1024 + 7];
+        fs::write(root.path().join("file"), &bytes).unwrap();
+        let directory = File::open(root.path()).unwrap();
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| allocated.set(0));
+        assert!(
+            authenticate_preimage_at(
+                &directory,
+                OsStr::from_bytes(b"file"),
+                &raw_preimage(FileKind::Regular, &bytes),
+                bytes.len(),
+            )
+            .unwrap()
+        );
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| assert_eq!(allocated.get(), 0));
+
+        std::os::unix::fs::symlink("target", root.path().join("link")).unwrap();
+        assert!(
+            authenticate_preimage_at(
+                &directory,
+                OsStr::from_bytes(b"link"),
+                &raw_preimage(FileKind::Symlink, b"target"),
+                usize::MAX,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_preimage_streams_kind_length_and_domain_separated_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = vec![b'x'; 2 * 64 * 1024 + 7];
+        std::fs::write(root.path().join("large"), &bytes).unwrap();
+        let observed =
+            observe_workspace_file(root.path(), Path::new("large"), bytes.len()).unwrap();
+        assert_eq!(observed, Some(raw_preimage(FileKind::Regular, &bytes)));
+        assert_eq!(observed.unwrap().length, bytes.len() as u64);
+        assert!(
+            authenticate_workspace_preimage(
+                root.path(),
+                Path::new("large"),
+                &raw_preimage(FileKind::Regular, &bytes),
+                bytes.len(),
+            )
+            .unwrap()
+        );
+        std::fs::write(root.path().join("large"), vec![b'y'; bytes.len()]).unwrap();
+        assert!(
+            !authenticate_workspace_preimage(
+                root.path(),
+                Path::new("large"),
+                &raw_preimage(FileKind::Regular, &bytes),
+                bytes.len(),
+            )
+            .unwrap()
+        );
     }
 
     #[test]

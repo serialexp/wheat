@@ -29,14 +29,24 @@ pub enum MerkleTreeError {
     DepthExceeded { depth: usize, limit: usize },
     #[error("tree diff contains more than {limit} changes")]
     ChangeLimitExceeded { limit: usize },
-    #[error("tree diff reads more than {limit} nodes")]
+    #[error("tree traversal reads more than {limit} nodes")]
     NodeLimitExceeded { limit: usize },
-    #[error("tree diff visits more than {limit} directory entries")]
+    #[error("tree traversal visits more than {limit} directory entries")]
     EntryLimitExceeded { limit: usize },
     #[error("tree node is {size} bytes, exceeding the {limit}-byte limit")]
     NodeBytesExceeded { size: usize, limit: usize },
-    #[error("tree diff buffers more than {limit} directory entries")]
+    #[error("tree traversal buffers more than {limit} directory entries")]
     BufferedEntriesExceeded { limit: usize },
+    #[error("tree selection contains more than {limit} selectors")]
+    SelectorLimitExceeded { limit: usize },
+    #[error("tree selection selectors contain {size} path bytes, exceeding the {limit}-byte limit")]
+    SelectorPathBytesExceeded { size: usize, limit: usize },
+    #[error("tree selection contains more than {limit} path components")]
+    SelectorComponentLimitExceeded { limit: usize },
+    #[error("tree selection selectors are not sorted and unique")]
+    NonCanonicalSelectors,
+    #[error("tree selector {0:?} is absent")]
+    MissingSelector(String),
 }
 
 /// Resource bounds for a complete Merkle tree walk.
@@ -60,12 +70,79 @@ impl Default for TreeWalkLimits {
     }
 }
 
+/// Resource bounds for resolving and walking one pinned tree path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TreePathLimits {
+    pub max_files: usize,
+    pub max_nodes: usize,
+    pub max_entries: usize,
+    pub max_path_bytes: usize,
+    pub max_depth: usize,
+    pub max_node_bytes: usize,
+    pub max_buffered_entries: usize,
+}
+
+impl Default for TreePathLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 250_000,
+            max_nodes: 250_000,
+            max_entries: 1_000_000,
+            max_path_bytes: 4_096,
+            max_depth: 128,
+            max_node_bytes: 16 * 1024 * 1024,
+            max_buffered_entries: 1_000_000,
+        }
+    }
+}
+
+/// Aggregate resource bounds for selecting multiple paths from one pinned tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TreeSelectionLimits {
+    pub max_files: usize,
+    pub max_nodes: usize,
+    pub max_entries: usize,
+    pub max_path_bytes: usize,
+    pub max_depth: usize,
+    pub max_node_bytes: usize,
+    pub max_buffered_entries: usize,
+    pub max_selectors: usize,
+    pub max_selector_path_bytes: usize,
+    /// Maximum total slash-separated components across all selectors.
+    pub max_selector_components: usize,
+}
+
+impl Default for TreeSelectionLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 250_000,
+            max_nodes: 250_000,
+            max_entries: 1_000_000,
+            max_path_bytes: 64 * 1024 * 1024,
+            max_depth: 128,
+            max_node_bytes: 16 * 1024 * 1024,
+            max_buffered_entries: 1_000_000,
+            max_selectors: 250_000,
+            max_selector_path_bytes: 64 * 1024 * 1024,
+            max_selector_components: 1_000_000,
+        }
+    }
+}
+
 /// One file leaf returned by [`MerkleTreeStore::walk_files`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeFile {
     /// Canonical slash-separated repository-relative path.
     pub path: String,
     pub value: FileValue,
+}
+
+/// The kind and selected contents of one path in a pinned Merkle tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TreePathSelection {
+    Missing,
+    File(TreeFile),
+    Directory(Vec<TreeFile>),
 }
 
 /// One changed file leaf between two Merkle roots.
@@ -114,6 +191,30 @@ pub struct MerkleTreeStore<'a, S> {
 }
 
 type EntryIter = Peekable<btree_map::IntoIter<String, DirectoryEntry>>;
+
+fn matching_selector_range(
+    cursor: &mut usize,
+    end: usize,
+    mut compare: impl FnMut(usize) -> std::cmp::Ordering,
+) -> std::ops::Range<usize> {
+    use std::cmp::Ordering;
+
+    while *cursor < end {
+        match compare(*cursor) {
+            Ordering::Less => *cursor += 1,
+            Ordering::Greater => return *cursor..*cursor,
+            Ordering::Equal => {
+                let first = *cursor;
+                *cursor += 1;
+                while *cursor < end && compare(*cursor) == Ordering::Equal {
+                    *cursor += 1;
+                }
+                return first..*cursor;
+            }
+        }
+    }
+    end..end
+}
 
 struct DiffFrame {
     prefix_len: usize,
@@ -191,6 +292,86 @@ where
         Ok(decode_directory_node(&object.canonical_bytes)?)
     }
 
+    async fn read_path_node(
+        &self,
+        id: TreeId,
+        limits: TreePathLimits,
+        nodes: &mut usize,
+        entries: &mut usize,
+    ) -> Result<DirectoryNode, MerkleTreeError> {
+        if *nodes == limits.max_nodes {
+            return Err(MerkleTreeError::NodeLimitExceeded {
+                limit: limits.max_nodes,
+            });
+        }
+        *nodes += 1;
+        let object = self.objects.get(id.into()).await?;
+        if object.kind != ObjectKind::Tree {
+            return Err(ObjectStoreError::WrongKind {
+                id: id.into(),
+                expected: ObjectKind::Tree,
+                actual: object.kind,
+            }
+            .into());
+        }
+        let size = object.canonical_bytes.len();
+        if size > limits.max_node_bytes {
+            return Err(MerkleTreeError::NodeBytesExceeded {
+                size,
+                limit: limits.max_node_bytes,
+            });
+        }
+        let node = decode_directory_node(&object.canonical_bytes)?;
+        let total = entries.saturating_add(node.entries.len());
+        if total > limits.max_entries {
+            return Err(MerkleTreeError::EntryLimitExceeded {
+                limit: limits.max_entries,
+            });
+        }
+        *entries = total;
+        Ok(node)
+    }
+
+    async fn read_selection_node(
+        &self,
+        id: TreeId,
+        limits: TreeSelectionLimits,
+        nodes: &mut usize,
+        entries: &mut usize,
+    ) -> Result<DirectoryNode, MerkleTreeError> {
+        if *nodes == limits.max_nodes {
+            return Err(MerkleTreeError::NodeLimitExceeded {
+                limit: limits.max_nodes,
+            });
+        }
+        *nodes += 1;
+        let object = self.objects.get(id.into()).await?;
+        if object.kind != ObjectKind::Tree {
+            return Err(ObjectStoreError::WrongKind {
+                id: id.into(),
+                expected: ObjectKind::Tree,
+                actual: object.kind,
+            }
+            .into());
+        }
+        let size = object.canonical_bytes.len();
+        if size > limits.max_node_bytes {
+            return Err(MerkleTreeError::NodeBytesExceeded {
+                size,
+                limit: limits.max_node_bytes,
+            });
+        }
+        let node = decode_directory_node(&object.canonical_bytes)?;
+        let total = entries.saturating_add(node.entries.len());
+        if total > limits.max_entries {
+            return Err(MerkleTreeError::EntryLimitExceeded {
+                limit: limits.max_entries,
+            });
+        }
+        *entries = total;
+        Ok(node)
+    }
+
     pub async fn lookup(
         &self,
         root: TreeId,
@@ -216,6 +397,383 @@ where
             }
         }
         Ok(None)
+    }
+
+    /// Resolve one path and, for a directory, return only its descendant files.
+    ///
+    /// Empty `path` selects the root directory. Output paths are canonical full
+    /// paths and lexical. The iterative walk retains one decoded node per open
+    /// directory and allocates per leaf only for the returned path.
+    pub async fn walk_path(
+        &self,
+        root: TreeId,
+        path: &[String],
+        limits: TreePathLimits,
+    ) -> Result<TreePathSelection, MerkleTreeError> {
+        let mut full_path = String::new();
+        for component in path {
+            validate_directory_component(component)?;
+            let size = full_path
+                .len()
+                .checked_add(usize::from(!full_path.is_empty()))
+                .and_then(|size| size.checked_add(component.len()))
+                .unwrap_or(usize::MAX);
+            if size > limits.max_path_bytes {
+                return Err(MerkleTreeError::PathBytesExceeded {
+                    size,
+                    limit: limits.max_path_bytes,
+                });
+            }
+            full_path.reserve(size.saturating_sub(full_path.len()));
+            if !full_path.is_empty() {
+                full_path.push('/');
+            }
+            full_path.push_str(component);
+        }
+
+        let mut nodes = 0usize;
+        let mut entries = 0usize;
+        let mut depth = 0usize;
+        let mut node = self
+            .read_path_node(root, limits, &mut nodes, &mut entries)
+            .await?;
+        if node.entries.len() > limits.max_buffered_entries {
+            return Err(MerkleTreeError::BufferedEntriesExceeded {
+                limit: limits.max_buffered_entries,
+            });
+        }
+
+        for (index, component) in path.iter().enumerate() {
+            let Some(entry) = node.entries.remove(component) else {
+                return Ok(TreePathSelection::Missing);
+            };
+            let last = index + 1 == path.len();
+            match entry {
+                DirectoryEntry::File(value) if last => {
+                    return Ok(TreePathSelection::File(TreeFile {
+                        path: full_path,
+                        value,
+                    }));
+                }
+                DirectoryEntry::File(_) => {
+                    return Err(MerkleTreeError::FileInPath(component.clone()));
+                }
+                DirectoryEntry::Directory(child) => {
+                    depth = depth.saturating_add(1);
+                    if depth > limits.max_depth {
+                        return Err(MerkleTreeError::DepthExceeded {
+                            depth,
+                            limit: limits.max_depth,
+                        });
+                    }
+                    node = self
+                        .read_path_node(child, limits, &mut nodes, &mut entries)
+                        .await?;
+                    if node.entries.len() > limits.max_buffered_entries {
+                        return Err(MerkleTreeError::BufferedEntriesExceeded {
+                            limit: limits.max_buffered_entries,
+                        });
+                    }
+                    if last {
+                        break;
+                    }
+                }
+            }
+        }
+
+        struct WalkFrame {
+            prefix_len: usize,
+            depth: usize,
+            entries: btree_map::IntoIter<String, DirectoryEntry>,
+        }
+
+        let mut buffered_entries = node.entries.len();
+        let mut stack = Vec::with_capacity(limits.max_depth.min(128).saturating_add(1));
+        stack.push(WalkFrame {
+            prefix_len: full_path.len(),
+            depth,
+            entries: node.entries.into_iter(),
+        });
+        let mut files = Vec::new();
+        while let Some(frame) = stack.last_mut() {
+            let Some((name, entry)) = frame.entries.next() else {
+                stack.pop();
+                continue;
+            };
+            buffered_entries -= 1;
+            full_path.truncate(frame.prefix_len);
+            let size = full_path
+                .len()
+                .checked_add(usize::from(!full_path.is_empty()))
+                .and_then(|size| size.checked_add(name.len()))
+                .unwrap_or(usize::MAX);
+            if size > limits.max_path_bytes {
+                return Err(MerkleTreeError::PathBytesExceeded {
+                    size,
+                    limit: limits.max_path_bytes,
+                });
+            }
+            full_path.reserve(size.saturating_sub(full_path.len()));
+            if !full_path.is_empty() {
+                full_path.push('/');
+            }
+            full_path.push_str(&name);
+            match entry {
+                DirectoryEntry::File(value) => {
+                    if files.len() == limits.max_files {
+                        return Err(MerkleTreeError::FileLimitExceeded {
+                            limit: limits.max_files,
+                        });
+                    }
+                    files.push(TreeFile {
+                        path: full_path.clone(),
+                        value,
+                    });
+                }
+                DirectoryEntry::Directory(child) => {
+                    let child_depth = frame.depth.saturating_add(1);
+                    if child_depth > limits.max_depth {
+                        return Err(MerkleTreeError::DepthExceeded {
+                            depth: child_depth,
+                            limit: limits.max_depth,
+                        });
+                    }
+                    let child_node = self
+                        .read_path_node(child, limits, &mut nodes, &mut entries)
+                        .await?;
+                    let buffered = buffered_entries.saturating_add(child_node.entries.len());
+                    if buffered > limits.max_buffered_entries {
+                        return Err(MerkleTreeError::BufferedEntriesExceeded {
+                            limit: limits.max_buffered_entries,
+                        });
+                    }
+                    buffered_entries = buffered;
+                    stack.push(WalkFrame {
+                        prefix_len: size,
+                        depth: child_depth,
+                        entries: child_node.entries.into_iter(),
+                    });
+                }
+            }
+        }
+        Ok(TreePathSelection::Directory(files))
+    }
+
+    /// Select multiple files or directory subtrees with one shared, bounded traversal.
+    ///
+    /// `selectors` must be sorted and unique canonical slash-separated paths. Only
+    /// selector ancestors and selected directory subtrees are read. Returned leaves
+    /// are deduplicated and lexically ordered, including for overlapping selectors.
+    pub async fn select_paths(
+        &self,
+        root: TreeId,
+        selectors: &[String],
+        limits: TreeSelectionLimits,
+    ) -> Result<Vec<TreeFile>, MerkleTreeError> {
+        if selectors.is_empty() || selectors.len() > limits.max_selectors {
+            return Err(MerkleTreeError::SelectorLimitExceeded {
+                limit: limits.max_selectors,
+            });
+        }
+
+        struct Selector {
+            component_start: usize,
+            component_len: usize,
+        }
+        #[derive(Clone, Copy)]
+        struct Component {
+            start: usize,
+            end: usize,
+        }
+        struct SelectionFrame {
+            prefix_len: usize,
+            depth: usize,
+            selector_cursor: usize,
+            selector_end: usize,
+            component_depth: usize,
+            selected: bool,
+            entries: btree_map::IntoIter<String, DirectoryEntry>,
+        }
+
+        let mut selector_path_bytes = 0usize;
+        let mut compact = Vec::new();
+        let mut parsed = Vec::with_capacity(selectors.len());
+        let mut previous: Option<&str> = None;
+        for selector in selectors {
+            if selector.is_empty() || previous.is_some_and(|prior| prior >= selector.as_str()) {
+                return Err(MerkleTreeError::NonCanonicalSelectors);
+            }
+            selector_path_bytes = selector_path_bytes.saturating_add(selector.len());
+            if selector_path_bytes > limits.max_selector_path_bytes {
+                return Err(MerkleTreeError::SelectorPathBytesExceeded {
+                    size: selector_path_bytes,
+                    limit: limits.max_selector_path_bytes,
+                });
+            }
+            let component_start = compact.len();
+            let mut offset = 0usize;
+            for component in selector.split('/') {
+                validate_directory_component(component)?;
+                if compact.len() == limits.max_selector_components {
+                    return Err(MerkleTreeError::SelectorComponentLimitExceeded {
+                        limit: limits.max_selector_components,
+                    });
+                }
+                let end = offset + component.len();
+                compact.push(Component { start: offset, end });
+                offset = end.saturating_add(1);
+            }
+            let component_len = compact.len() - component_start;
+            if component_len > limits.max_depth.saturating_add(1) {
+                return Err(MerkleTreeError::DepthExceeded {
+                    depth: component_len - 1,
+                    limit: limits.max_depth,
+                });
+            }
+            parsed.push(Selector {
+                component_start,
+                component_len,
+            });
+            previous = Some(selector);
+        }
+        let component = |selector_index: usize, depth: usize| {
+            let item = &parsed[selector_index];
+            let span = compact[item.component_start + depth];
+            &selectors[selector_index][span.start..span.end]
+        };
+
+        let mut nodes = 0usize;
+        let mut entries = 0usize;
+        let root_node = self
+            .read_selection_node(root, limits, &mut nodes, &mut entries)
+            .await?;
+        let mut buffered_entries = root_node.entries.len();
+        if buffered_entries > limits.max_buffered_entries {
+            return Err(MerkleTreeError::BufferedEntriesExceeded {
+                limit: limits.max_buffered_entries,
+            });
+        }
+        let mut stack = Vec::with_capacity(limits.max_depth.min(128).saturating_add(1));
+        stack.push(SelectionFrame {
+            prefix_len: 0,
+            depth: 0,
+            selector_cursor: 0,
+            selector_end: selectors.len(),
+            component_depth: 0,
+            selected: false,
+            entries: root_node.entries.into_iter(),
+        });
+        let mut matched = vec![false; selectors.len()];
+        let mut files = Vec::new();
+        let mut path = String::new();
+        let mut output_path_bytes = 0usize;
+
+        while let Some(frame) = stack.last_mut() {
+            let Some((name, entry)) = frame.entries.next() else {
+                stack.pop();
+                continue;
+            };
+            buffered_entries -= 1;
+            let frame_component_depth = frame.component_depth;
+            let frame_selected = frame.selected;
+            let range = matching_selector_range(
+                &mut frame.selector_cursor,
+                frame.selector_end,
+                |selector_index| {
+                    if parsed[selector_index].component_len <= frame_component_depth {
+                        std::cmp::Ordering::Less
+                    } else {
+                        component(selector_index, frame_component_depth).cmp(name.as_str())
+                    }
+                },
+            );
+            let first = range.start;
+            let end = range.end;
+            if !frame_selected && first == end {
+                continue;
+            }
+
+            path.truncate(frame.prefix_len);
+            let path_len = path
+                .len()
+                .checked_add(usize::from(!path.is_empty()))
+                .and_then(|size| size.checked_add(name.len()))
+                .unwrap_or(usize::MAX);
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(&name);
+
+            match entry {
+                DirectoryEntry::File(value) => {
+                    let mut terminal = false;
+                    for selector_index in first..end {
+                        if parsed[selector_index].component_len == frame_component_depth + 1 {
+                            matched[selector_index] = true;
+                            terminal = true;
+                        }
+                    }
+                    if frame_selected || terminal {
+                        if files.len() == limits.max_files {
+                            return Err(MerkleTreeError::FileLimitExceeded {
+                                limit: limits.max_files,
+                            });
+                        }
+                        output_path_bytes = output_path_bytes.saturating_add(path_len);
+                        if output_path_bytes > limits.max_path_bytes {
+                            return Err(MerkleTreeError::PathBytesExceeded {
+                                size: output_path_bytes,
+                                limit: limits.max_path_bytes,
+                            });
+                        }
+                        files.push(TreeFile {
+                            path: path.clone(),
+                            value,
+                        });
+                    }
+                }
+                DirectoryEntry::Directory(child) => {
+                    let child_depth = frame.depth.saturating_add(1);
+                    if child_depth > limits.max_depth {
+                        return Err(MerkleTreeError::DepthExceeded {
+                            depth: child_depth,
+                            limit: limits.max_depth,
+                        });
+                    }
+                    let mut selected = frame_selected;
+                    for selector_index in first..end {
+                        if parsed[selector_index].component_len == frame_component_depth + 1 {
+                            matched[selector_index] = true;
+                            selected = true;
+                        }
+                    }
+                    let child_node = self
+                        .read_selection_node(child, limits, &mut nodes, &mut entries)
+                        .await?;
+                    let buffered = buffered_entries.saturating_add(child_node.entries.len());
+                    if buffered > limits.max_buffered_entries {
+                        return Err(MerkleTreeError::BufferedEntriesExceeded {
+                            limit: limits.max_buffered_entries,
+                        });
+                    }
+                    buffered_entries = buffered;
+                    stack.push(SelectionFrame {
+                        prefix_len: path_len,
+                        depth: child_depth,
+                        selector_cursor: first,
+                        selector_end: end,
+                        component_depth: frame_component_depth + 1,
+                        selected,
+                        entries: child_node.entries.into_iter(),
+                    });
+                }
+            }
+        }
+
+        if let Some(index) = matched.iter().position(|matched| !matched) {
+            return Err(MerkleTreeError::MissingSelector(selectors[index].clone()));
+        }
+        Ok(files)
     }
 
     /// Return every file below `root` in lexical full-path order.
@@ -627,5 +1185,40 @@ impl<S: ImmutableObjectStore> TreeDiffCursor<'_, S> {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod selector_merge_tests {
+    use super::matching_selector_range;
+    use std::cell::Cell;
+
+    #[test]
+    fn flat_selector_merge_comparisons_are_linear() {
+        const ENTRY_COUNT: usize = 20_000;
+        const SELECTOR_COUNT: usize = ENTRY_COUNT / 2;
+
+        let comparisons = Cell::new(0usize);
+        let mut cursor = 0usize;
+        let mut matches = 0usize;
+        for entry in 0..ENTRY_COUNT {
+            let range = matching_selector_range(&mut cursor, SELECTOR_COUNT, |selector| {
+                comparisons.set(comparisons.get() + 1);
+                (selector * 2).cmp(&entry)
+            });
+            if !range.is_empty() {
+                matches += 1;
+            }
+        }
+
+        assert_eq!(matches, SELECTOR_COUNT);
+        assert_eq!(cursor, SELECTOR_COUNT);
+        // Every comparison either consumes a selector or rejects one entry. Equal
+        // selectors cost one additional look-ahead, so the merge remains linear.
+        assert!(
+            comparisons.get() <= ENTRY_COUNT + SELECTOR_COUNT * 2,
+            "{} comparisons exceeded the linear merge bound",
+            comparisons.get()
+        );
     }
 }

@@ -40,7 +40,7 @@ pub use loose::{
 };
 pub use merkle_tree::{
     MerkleTreeError, MerkleTreeStore, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
-    TreeWalkLimits,
+    TreePathLimits, TreePathSelection, TreeSelectionLimits, TreeWalkLimits,
 };
 pub use mutation_publication::{
     PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,
