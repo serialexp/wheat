@@ -2,9 +2,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::path::Path;
-use wheat_core::{
-    ChangeId, Conflict, ObjectId, Repository, RevisionId, RevisionRecord, Tree, ViewId,
-};
+use wheat_core::{ChangeId, ObjectId, Repository, RevisionId, RevisionRecord, Tree, ViewId};
 use wheat_store::{
     ConflictSetStore, ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
     ObjectStoreError, PackedObjectStore, PublicationStore, RepositoryPublisher, RepositoryReader,
@@ -236,51 +234,6 @@ fn read_revision_with_edits<O: ImmutableObjectStore>(
             edits.push((*id, reader.edit(*id).await?));
         }
         Ok::<_, wheat_store::RepositoryPublicationError>((revision, edits))
-    })?)
-}
-
-pub fn current_conflicts(root: &Path) -> Result<Vec<Conflict>> {
-    match repository_layout(root)? {
-        RepositoryLayout::Loose => read_current_conflicts(
-            root,
-            &LooseObjectStore::new(root.join("objects")),
-            &ContentStore::new(root.join("content")),
-            &LocalPublicationStore::new(root.join("repository.head")),
-        ),
-        RepositoryLayout::Packed => {
-            let objects = PackedObjectStore::open(root.join("storage"))?;
-            read_current_conflicts(
-                root,
-                &objects,
-                &objects.content_store(),
-                &LocalPublicationStore::new(root.join("repository.head")),
-            )
-        }
-    }
-}
-
-fn read_current_conflicts<O: ImmutableObjectStore>(
-    root: &Path,
-    objects: &O,
-    content: &ContentStore,
-    heads: &LocalPublicationStore,
-) -> Result<Vec<Conflict>> {
-    let runtime = runtime()?;
-    let reader = RepositoryReader::new(objects, content);
-    let expected = heads
-        .read()
-        .with_context(|| format!("cannot open Wheat repository: {}", root.display()))?;
-    let envelope = runtime.block_on(reader.envelope(expected.envelope))?;
-    let state = runtime.block_on(reader.state(envelope.state))?;
-    let working = runtime.block_on(reader.view(state.working_view))?;
-    let conflicts = ConflictSetStore::new(objects);
-    Ok(runtime.block_on(async {
-        let mut result = Vec::new();
-        let mut cursor = conflicts.cursor(working.unresolved_conflicts).await?;
-        while let Some(id) = cursor.next().await? {
-            result.push(reader.conflict(id).await?);
-        }
-        Ok::<_, wheat_store::RepositoryPublicationError>(result)
     })?)
 }
 

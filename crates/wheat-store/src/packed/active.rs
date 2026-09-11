@@ -450,10 +450,11 @@ impl ActiveSegment {
 
     /// Reads through the index already authenticated when this active segment
     /// was created, reopened, or last committed.
-    pub(crate) fn lookup_entry(
+    pub(crate) fn lookup_entry_bounded(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
+        max: usize,
     ) -> Result<Option<(SegmentIndexEntry, Vec<u8>)>, ActiveError> {
         let wanted = (namespace, digest);
         let Ok(index) = self
@@ -463,7 +464,12 @@ impl ActiveSegment {
             return Ok(None);
         };
         let entry = self.entries[index].clone();
-        let length = usize::try_from(entry.length).map_err(|_| SegmentError::TooLarge)?;
+        let length = usize::try_from(entry.length).map_err(|_| SegmentError::ReadLimit {
+            minimum: usize::MAX,
+        })?;
+        if length > max {
+            return Err(SegmentError::ReadLimit { minimum: length }.into());
+        }
         let mut bytes = vec![0; length];
         self.file.seek(SeekFrom::Start(entry.offset))?;
         self.file.read_exact(&mut bytes)?;
@@ -725,9 +731,10 @@ mod tests {
         assert_eq!(active.state().generation, 9);
         assert!(
             active
-                .lookup_entry(
+                .lookup_entry_bounded(
                     CONTENT_NAMESPACE,
                     *ContentId::of(b"usable afterward").as_bytes(),
+                    usize::MAX,
                 )
                 .unwrap()
                 .is_some()

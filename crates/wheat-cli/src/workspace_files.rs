@@ -9,11 +9,17 @@ use std::{fmt, io, path::Path};
 #[cfg(test)]
 thread_local! {
     static TEST_SNAPSHOT_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static TEST_STREAM_READS: Cell<usize> = const { Cell::new(0) };
+    static TEST_STREAM_SCRATCH_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 use serde::{Deserialize, Serialize};
-use wheat_core::FileKind;
+use wheat_core::{
+    ContentId, FileKind,
+    text_capture::{CaptureKind, StreamingCapture},
+};
 
+const STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 const RAW_PREIMAGE_DOMAIN: &[u8] = b"wheat-workspace-raw-preimage-v1\0";
 
 /// Exact, bounded authentication of a raw workspace leaf.
@@ -30,6 +36,16 @@ pub(crate) struct RawPreimage {
 pub(crate) struct WorkspaceFileSnapshot {
     pub(crate) kind: FileKind,
     pub(crate) bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalWorkspaceFile {
+    pub(crate) kind: FileKind,
+    pub(crate) content: ContentId,
+    pub(crate) bytes: usize,
+    pub(crate) read_bytes: usize,
+    pub(crate) text: bool,
+    pub(crate) retained_text: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -87,6 +103,21 @@ pub(crate) fn read_workspace_file(
 ) -> Result<Option<WorkspaceFileSnapshot>, WorkspaceFileError> {
     let components = validate_path(path)?;
     platform::read(root, &components, byte_limit)
+}
+
+/// Analyze one descriptor-relative workspace leaf with fixed read scratch.
+///
+/// Regular files are never collected. At most `retain_limit` canonical text
+/// bytes are retained for an inline diff. Symlink targets use their portable
+/// 4 KiB bound and are always classified as binary.
+pub(crate) fn analyze_workspace_file(
+    root: &Path,
+    path: &Path,
+    byte_limit: usize,
+    retain_limit: usize,
+) -> Result<Option<CanonicalWorkspaceFile>, WorkspaceFileError> {
+    let components = validate_path(path)?;
+    platform::analyze(root, &components, byte_limit, retain_limit)
 }
 
 /// Authenticate a named workspace leaf without allocating its regular-file
@@ -215,8 +246,139 @@ mod platform {
     };
 
     use super::{
-        FileKind, RAW_PREIMAGE_DOMAIN, RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot,
+        CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, RAW_PREIMAGE_DOMAIN, RawPreimage,
+        STREAM_SCRATCH_BYTES, StreamingCapture, WorkspaceFileError, WorkspaceFileSnapshot,
     };
+
+    pub(super) fn analyze(
+        root: &Path,
+        components: &[&OsStr],
+        limit: usize,
+        retain_limit: usize,
+    ) -> Result<Option<CanonicalWorkspaceFile>, WorkspaceFileError> {
+        let mut directory = File::open(root)?;
+        for component in &components[..components.len() - 1] {
+            let name = c_name(component)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(None),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                        if is_symlink(directory.as_raw_fd(), &name) =>
+                    {
+                        Err(WorkspaceFileError::IntermediateSymlink)
+                    }
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::UnsupportedFileType),
+                    _ => Err(error.into()),
+                };
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+        let name = c_name(components.last().expect("validated nonempty path"))?;
+        analyze_leaf(directory.as_raw_fd(), &name, limit, retain_limit)
+    }
+
+    fn analyze_leaf(
+        directory: libc::c_int,
+        name: &CString,
+        limit: usize,
+        retain_limit: usize,
+    ) -> Result<Option<CanonicalWorkspaceFile>, WorkspaceFileError> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            // Linux symlink targets are bounded independently of the regular-file
+            // scan cap; do not size an allocation from the 256 MiB file limit.
+            let bytes = read_link(directory, name, limit.min(4_095))?;
+            return Ok(Some(CanonicalWorkspaceFile {
+                kind: FileKind::Symlink,
+                content: ContentId::of(&bytes),
+                bytes: bytes.len(),
+                read_bytes: bytes.len(),
+                text: false,
+                retained_text: None,
+            }));
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(WorkspaceFileError::UnsupportedFileType);
+        }
+        let fd = unsafe {
+            libc::openat(
+                directory,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let opened = file.metadata()?;
+        if !opened.is_file() {
+            return Err(WorkspaceFileError::UnsupportedFileType);
+        }
+        if opened.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
+            return Err(WorkspaceFileError::TooLarge { limit });
+        }
+        use std::os::unix::fs::MetadataExt as _;
+        let kind = if opened.mode() & 0o111 != 0 {
+            FileKind::Executable
+        } else {
+            FileKind::Regular
+        };
+        let mut capture = StreamingCapture::new(retain_limit);
+        let mut scratch = [0_u8; STREAM_SCRATCH_BYTES];
+        #[cfg(test)]
+        super::TEST_STREAM_SCRATCH_BYTES.with(|size| size.set(scratch.len()));
+        let mut raw_length = 0usize;
+        loop {
+            let read = file.read(&mut scratch)?;
+            if read == 0 {
+                break;
+            }
+            #[cfg(test)]
+            super::TEST_STREAM_READS.with(|reads| reads.set(reads.get() + 1));
+            raw_length = raw_length
+                .checked_add(read)
+                .ok_or(WorkspaceFileError::TooLarge { limit })?;
+            if raw_length > limit {
+                return Err(WorkspaceFileError::TooLarge { limit });
+            }
+            capture.update(&scratch[..read]);
+        }
+        let result = capture.finish();
+        Ok(Some(CanonicalWorkspaceFile {
+            kind,
+            content: ContentId::from_digest(result.digest),
+            bytes: result.bytes,
+            read_bytes: raw_length,
+            text: result.kind == CaptureKind::Text,
+            retained_text: result.retained,
+        }))
+    }
 
     pub(super) fn observe(
         root: &Path,
@@ -645,7 +807,70 @@ mod platform {
 mod platform {
     use std::{ffi::OsStr, fs, io::Read, path::Path};
 
-    use super::{FileKind, RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot, raw_preimage};
+    use super::{
+        CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, RawPreimage,
+        STREAM_SCRATCH_BYTES, StreamingCapture, WorkspaceFileError, WorkspaceFileSnapshot,
+        raw_preimage,
+    };
+
+    pub(super) fn analyze(
+        root: &Path,
+        components: &[&OsStr],
+        limit: usize,
+        retain_limit: usize,
+    ) -> Result<Option<CanonicalWorkspaceFile>, WorkspaceFileError> {
+        let mut current = root.to_path_buf();
+        for component in &components[..components.len() - 1] {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(WorkspaceFileError::IntermediateSymlink);
+                }
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err(WorkspaceFileError::UnsupportedFileType),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        current.push(components.last().expect("validated nonempty path"));
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() {
+            return Err(WorkspaceFileError::UnsupportedFileType);
+        }
+        if metadata.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
+            return Err(WorkspaceFileError::TooLarge { limit });
+        }
+        let mut file = fs::File::open(current)?;
+        let mut capture = StreamingCapture::new(retain_limit);
+        let mut scratch = [0_u8; STREAM_SCRATCH_BYTES];
+        let mut raw_bytes = 0usize;
+        loop {
+            let read = file.read(&mut scratch)?;
+            if read == 0 {
+                break;
+            }
+            raw_bytes = raw_bytes
+                .checked_add(read)
+                .ok_or(WorkspaceFileError::TooLarge { limit })?;
+            if raw_bytes > limit {
+                return Err(WorkspaceFileError::TooLarge { limit });
+            }
+            capture.update(&scratch[..read]);
+        }
+        let result = capture.finish();
+        Ok(Some(CanonicalWorkspaceFile {
+            kind: FileKind::Regular,
+            content: ContentId::from_digest(result.digest),
+            bytes: result.bytes,
+            read_bytes: raw_bytes,
+            text: result.kind == CaptureKind::Text,
+            retained_text: result.retained,
+        }))
+    }
 
     pub(super) fn observe(
         root: &Path,
@@ -715,6 +940,64 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_analyzer_streams_oversized_text_without_snapshot_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        // Eight MiB is representative of a source/generated workspace leaf and
+        // is eight times the default diff inline cap. The analyzer must still
+        // retain no body and perform bounded reads.
+        let mut bytes = vec![b'x'; 8 * 1024 * 1024 + 7];
+        bytes[STREAM_SCRATCH_BYTES - 1] = b'\r';
+        bytes[STREAM_SCRATCH_BYTES] = b'\n';
+        fs::write(root.path().join("file"), &bytes).unwrap();
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| allocated.set(0));
+        TEST_STREAM_READS.with(|reads| reads.set(0));
+        TEST_STREAM_SCRATCH_BYTES.with(|size| size.set(0));
+        let analyzed = analyze_workspace_file(root.path(), Path::new("file"), bytes.len(), 32)
+            .unwrap()
+            .unwrap();
+        let expected = wheat_core::text_capture::capture(&bytes);
+        let wheat_core::text_capture::CapturedBytes::Text(expected) = expected else {
+            panic!()
+        };
+        assert_eq!(analyzed.content, ContentId::of(expected.as_bytes()));
+        assert_eq!(analyzed.bytes, expected.len());
+        assert_eq!(analyzed.read_bytes, bytes.len());
+        assert!(analyzed.text);
+        assert_eq!(analyzed.retained_text, None);
+        TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| assert_eq!(allocated.get(), 0));
+        TEST_STREAM_SCRATCH_BYTES.with(|size| assert_eq!(size.get(), 64 * 1024));
+        TEST_STREAM_READS.with(|reads| {
+            assert_eq!(
+                reads.get(),
+                bytes.len().div_ceil(STREAM_SCRATCH_BYTES),
+                "regular files must be consumed exactly once in 64 KiB reads"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_analyzer_late_binary_marker_hashes_raw_bytes() {
+        for marker in [0, 0xff] {
+            let root = tempfile::tempdir().unwrap();
+            let mut bytes = vec![b'x'; 8 * 1024 * 1024 + 1];
+            bytes[10] = b'\r';
+            let last = bytes.len() - 1;
+            bytes[last] = marker;
+            fs::write(root.path().join("file"), &bytes).unwrap();
+            let analyzed =
+                analyze_workspace_file(root.path(), Path::new("file"), bytes.len(), bytes.len())
+                    .unwrap()
+                    .unwrap();
+            assert!(!analyzed.text);
+            assert_eq!(analyzed.content, ContentId::of(&bytes));
+            assert_eq!(analyzed.bytes, bytes.len());
+            assert_eq!(analyzed.retained_text, None);
+        }
+    }
 
     #[test]
     fn streaming_authentication_does_not_allocate_a_snapshot_buffer() {

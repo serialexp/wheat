@@ -16,6 +16,7 @@ crc32fast = "1"
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+similar = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }

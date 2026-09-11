@@ -283,17 +283,29 @@ impl ContentBackend for PackedEngine {
         Ok(())
     }
 
-    fn get(&self, id: ContentId) -> Result<Vec<u8>, ContentStoreError> {
+    fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         let value = self
             .catalog
             .lock()
             .map_err(|_| ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned")))?
-            .get(CONTENT_NAMESPACE, *id.as_bytes())
-            .map_err(content_catalog_error)?;
+            .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), max)
+            .map_err(|error| match error {
+                CatalogError::Segment(super::segment::SegmentError::ReadLimit { minimum }) => {
+                    ContentStoreError::TooLarge { id, max, minimum }
+                }
+                error => content_catalog_error(error),
+            })?;
+        if let Some((_, bytes)) = value.as_ref().filter(|(_, bytes)| bytes.len() > max) {
+            return Err(ContentStoreError::TooLarge {
+                id,
+                max,
+                minimum: bytes.len(),
+            });
+        }
         let Some((_kind, bytes)) = value else {
             // Oversized content bypasses packed segments. As with metadata,
             // avoid a failed loose-file probe for every ordinary packed read.
-            return self.content.get(id);
+            return self.content.get_bounded(id, max);
         };
         // SegmentReader authenticated the immutable segment and verified this
         // payload against the requested content digest before returning it.

@@ -5,6 +5,173 @@
 
 use std::borrow::Cow;
 
+/// Incremental canonical capture result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamingCaptureResult {
+    pub kind: CaptureKind,
+    pub digest: [u8; 32],
+    pub bytes: usize,
+    pub retained: Option<Vec<u8>>,
+}
+
+/// Streaming counterpart to [`capture`].
+///
+/// It hashes raw and LF-normalized bytes in parallel because a NUL or invalid
+/// UTF-8 sequence near EOF retroactively makes the entire input binary. Only
+/// canonical text up to `retain_limit` is retained; larger and binary inputs
+/// have flat memory use regardless of input size.
+pub struct StreamingCapture {
+    raw: blake3::Hasher,
+    canonical: blake3::Hasher,
+    raw_bytes: usize,
+    canonical_bytes: usize,
+    retained: Option<Vec<u8>>,
+    retain_limit: usize,
+    pending_cr: bool,
+    utf8_tail: [u8; 4],
+    utf8_tail_len: usize,
+    binary: bool,
+}
+
+impl StreamingCapture {
+    #[must_use]
+    pub fn new(retain_limit: usize) -> Self {
+        Self {
+            raw: blake3::Hasher::new(),
+            canonical: blake3::Hasher::new(),
+            raw_bytes: 0,
+            canonical_bytes: 0,
+            // Reserve once: growth during `update` would otherwise reallocate on
+            // successive chunks. Callers already bound this inline-retention cap.
+            retained: Some(Vec::with_capacity(retain_limit)),
+            retain_limit,
+            pending_cr: false,
+            utf8_tail: [0; 4],
+            utf8_tail_len: 0,
+            binary: false,
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.raw.update(bytes);
+        self.raw_bytes = self
+            .raw_bytes
+            .checked_add(bytes.len())
+            .expect("captured byte length exceeds address space");
+        self.validate_utf8(bytes);
+        if bytes.contains(&0) {
+            self.binary = true;
+        }
+        // Once classification is irreversibly binary, canonical hashing and
+        // retention are wasted work. Raw hashing above must continue for every
+        // later chunk because binary identity is byte exact.
+        if self.binary {
+            self.retained = None;
+            return;
+        }
+        // An empty update is not an EOF marker. In particular, it must not
+        // resolve a trailing CR before a later chunk starts with LF.
+        if bytes.is_empty() {
+            return;
+        }
+
+        let mut start = 0;
+        if self.pending_cr {
+            self.emit(b"\n");
+            self.pending_cr = false;
+            if bytes.first() == Some(&b'\n') {
+                start = 1;
+            }
+        }
+        while start < bytes.len() {
+            let Some(offset) = bytes[start..].iter().position(|byte| *byte == b'\r') else {
+                self.emit(&bytes[start..]);
+                return;
+            };
+            let cr = start + offset;
+            self.emit(&bytes[start..cr]);
+            if cr + 1 == bytes.len() {
+                self.pending_cr = true;
+                return;
+            }
+            self.emit(b"\n");
+            start = cr + 1 + usize::from(bytes[cr + 1] == b'\n');
+        }
+    }
+
+    #[must_use]
+    pub fn finish(mut self) -> StreamingCaptureResult {
+        if self.pending_cr && !self.binary {
+            self.emit(b"\n");
+        }
+        if self.utf8_tail_len != 0 {
+            self.binary = true;
+        }
+        if self.binary {
+            StreamingCaptureResult {
+                kind: CaptureKind::Binary,
+                digest: *self.raw.finalize().as_bytes(),
+                bytes: self.raw_bytes,
+                retained: None,
+            }
+        } else {
+            StreamingCaptureResult {
+                kind: CaptureKind::Text,
+                digest: *self.canonical.finalize().as_bytes(),
+                bytes: self.canonical_bytes,
+                retained: self.retained,
+            }
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8]) {
+        self.canonical.update(bytes);
+        self.canonical_bytes = self
+            .canonical_bytes
+            .checked_add(bytes.len())
+            .expect("canonical byte length exceeds address space");
+        if let Some(retained) = &mut self.retained {
+            if retained.len().saturating_add(bytes.len()) <= self.retain_limit {
+                retained.extend_from_slice(bytes);
+            } else {
+                self.retained = None;
+            }
+        }
+    }
+
+    fn validate_utf8(&mut self, mut bytes: &[u8]) {
+        if self.binary {
+            return;
+        }
+        while self.utf8_tail_len != 0 && !bytes.is_empty() {
+            self.utf8_tail[self.utf8_tail_len] = bytes[0];
+            self.utf8_tail_len += 1;
+            bytes = &bytes[1..];
+            match std::str::from_utf8(&self.utf8_tail[..self.utf8_tail_len]) {
+                Ok(_) => self.utf8_tail_len = 0,
+                Err(error) if error.error_len().is_some() || self.utf8_tail_len == 4 => {
+                    self.binary = true;
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        if self.utf8_tail_len != 0 {
+            return;
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(_) => {}
+            Err(error) if error.error_len().is_some() => self.binary = true,
+            Err(error) => {
+                let valid = error.valid_up_to();
+                let tail = &bytes[valid..];
+                self.utf8_tail[..tail.len()].copy_from_slice(tail);
+                self.utf8_tail_len = tail.len();
+            }
+        }
+    }
+}
+
 /// The classification of bytes presented for capture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureKind {
@@ -87,7 +254,7 @@ pub fn capture(bytes: &[u8]) -> CapturedBytes<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureKind, CapturedBytes, capture, classify};
+    use super::{CaptureKind, CapturedBytes, StreamingCapture, capture, classify};
     use std::borrow::Cow;
 
     #[test]
@@ -167,6 +334,87 @@ mod tests {
                 assert_eq!(canonical.ends_with('\n'), !second.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn streaming_matches_capture_at_every_split_and_retention_bound() {
+        let fixtures: &[&[u8]] = &[
+            b"",
+            b"one\r\ntwo\rthree",
+            "héllo 世界\r\n".as_bytes(),
+            b"prefix\r\nsuffix\xff",
+            b"prefix\r\nsuffix\0",
+            b"last\r",
+            &[0xc2],
+            &[0xe2, 0x82],
+            &[0xf0, 0x9f, 0x92],
+            &[0xf0, 0x9f, 0x92, 0xa9],
+            &[0xe2, 0x28, 0xa1],
+            &[0xf4, 0x90, 0x80, 0x80],
+        ];
+        for input in fixtures {
+            for split in 0..=input.len() {
+                for limit in [0, 3, input.len(), input.len() + 1] {
+                    let mut stream = StreamingCapture::new(limit);
+                    stream.update(&input[..split]);
+                    stream.update(&[]);
+                    stream.update(&input[split..]);
+                    let result = stream.finish();
+                    match capture(input) {
+                        CapturedBytes::Text(expected) => {
+                            assert_eq!(result.kind, CaptureKind::Text);
+                            assert_eq!(
+                                result.digest,
+                                *blake3::hash(expected.as_bytes()).as_bytes()
+                            );
+                            assert_eq!(result.bytes, expected.len());
+                            assert_eq!(
+                                result.retained.as_deref(),
+                                (expected.len() <= limit).then_some(expected.as_bytes())
+                            );
+                        }
+                        CapturedBytes::Binary(expected) => {
+                            assert_eq!(result.kind, CaptureKind::Binary);
+                            assert_eq!(result.digest, *blake3::hash(&expected).as_bytes());
+                            assert_eq!(result.bytes, expected.len());
+                            assert_eq!(result.retained, None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_capture_drops_retention_immediately_and_keeps_raw_identity() {
+        let mut stream = StreamingCapture::new(1024 * 1024);
+        stream.update(b"text that had been retained\r\n");
+        stream.update(b"late nul\0");
+        stream.update(b"and all bytes after classification\r\n");
+        let raw =
+            b"text that had been retained\r\nlate nul\0and all bytes after classification\r\n";
+        let result = stream.finish();
+        assert_eq!(result.kind, CaptureKind::Binary);
+        assert_eq!(result.digest, *blake3::hash(raw).as_bytes());
+        assert_eq!(result.bytes, raw.len());
+        assert_eq!(result.retained, None);
+    }
+
+    #[test]
+    fn streaming_many_small_chunks_matches_capture() {
+        let input = "é\r\n世界\rstandalone\r\nend".as_bytes();
+        let mut stream = StreamingCapture::new(input.len());
+        for byte in input {
+            stream.update(std::slice::from_ref(byte));
+        }
+        let result = stream.finish();
+        let CapturedBytes::Text(expected) = capture(input) else {
+            panic!("fixture must be text")
+        };
+        assert_eq!(result.kind, CaptureKind::Text);
+        assert_eq!(result.digest, *blake3::hash(expected.as_bytes()).as_bytes());
+        assert_eq!(result.bytes, expected.len());
+        assert_eq!(result.retained.as_deref(), Some(expected.as_bytes()));
     }
 
     #[test]

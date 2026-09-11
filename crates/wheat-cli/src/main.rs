@@ -16,18 +16,23 @@ use wheat_store::{
     PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
     RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
+mod conflict_inspection;
+mod diff_render;
 mod discovery;
 mod inspection;
 mod local;
 mod materialization;
+mod repository_diff;
 mod workspace;
+mod workspace_diff;
 mod workspace_files;
 mod workspace_metadata;
+mod workspace_scan;
 mod workspace_status;
 use discovery::{allocate_store_root, canonical_store_path, discover_workspace};
 use local::{
-    content_store, current_conflicts, current_revisions, initialize, open, projection_path,
-    repository_summary, revision_with_edits, runtime,
+    content_store, current_revisions, initialize, open, projection_path, repository_summary,
+    revision_with_edits, runtime,
 };
 use workspace_metadata::{StoreMetadata, WorkspaceMetadata, WorkspaceSelection};
 
@@ -59,7 +64,9 @@ enum Command {
     /// Inspect logical changes and immutable revisions.
     Log,
     /// Inspect durable conflicts and per-edit failure evidence.
-    Conflicts,
+    Conflicts(ConflictsArgs),
+    /// Compare workspace or retained immutable repository trees.
+    Diff(DiffArgs),
     /// Inspect immutable edit definitions and lineage.
     Edits {
         #[arg(long)]
@@ -109,6 +116,24 @@ enum OutputFormat {
 
 #[derive(Debug, Args)]
 struct StatusArgs {
+    #[arg(long, value_enum, default_value_t)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ConflictsArgs {
+    #[arg(long, value_enum, default_value_t)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct DiffArgs {
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    revision: Option<String>,
+    #[arg(long, requires = "to", conflicts_with = "revision")]
+    from: Option<String>,
+    #[arg(long, requires = "from", conflicts_with = "revision")]
+    to: Option<String>,
     #[arg(long, value_enum, default_value_t)]
     format: OutputFormat,
 }
@@ -279,7 +304,12 @@ fn main() -> Result<()> {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let summary = repository_summary(&context.store_root)?;
             let local = open(&context.store_root)?;
-            let status = workspace_status::inspect(&context.root, &local, &context.workspace)?;
+            let status = workspace_status::WorkspaceStatus::from(workspace_scan::scan(
+                &context.root,
+                &local,
+                &context.workspace,
+                0,
+            )?);
             match arguments.format {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
                 OutputFormat::Human => {
@@ -330,12 +360,70 @@ fn main() -> Result<()> {
             print!("{output}");
             Ok(())
         }
-        Command::Conflicts => {
+        Command::Conflicts(arguments) => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            let mut output = String::new();
-            inspection::conflicts(&current_conflicts(&store_root)?, &mut output)?;
-            print!("{output}");
-            Ok(())
+            let local = open(&store_root)?;
+            let document = runtime()?.block_on(conflict_inspection::inspect(&local))?;
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            match arguments.format {
+                OutputFormat::Json => conflict_inspection::json(&document, &mut stdout),
+                OutputFormat::Human => conflict_inspection::human(&document, &mut stdout),
+            }
+        }
+        Command::Diff(arguments) => {
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&context.store_root)?;
+            let limits = wheat_core::diff_model::DiffLimits::default();
+            let deadline = std::time::Instant::now() + limits.deadline;
+            let document = if let Some(revision) = arguments.revision {
+                let revision = RevisionId::from_str(&revision).context("invalid revision ID")?;
+                let input =
+                    runtime()?.block_on(repository_diff::revision(&local, revision, deadline))?;
+                let comparison = match input.comparison {
+                    repository_diff::ComparisonInput::Revision { revision, from, to } => {
+                        wheat_core::diff_model::DiffComparison::Revision {
+                            revision,
+                            from_tree: from,
+                            to_tree: to,
+                            head_generation: input.head_generation,
+                        }
+                    }
+                    _ => unreachable!("revision resolver returns revision comparison"),
+                };
+                workspace_diff::build_repository(comparison, input.changes, limits, deadline)?
+            } else if let (Some(from), Some(to)) = (arguments.from, arguments.to) {
+                let input =
+                    runtime()?.block_on(repository_diff::views(&local, &from, &to, deadline))?;
+                let comparison = match input.comparison {
+                    repository_diff::ComparisonInput::Views {
+                        from_view,
+                        to_view,
+                        from,
+                        to,
+                    } => wheat_core::diff_model::DiffComparison::Views {
+                        from_view,
+                        to_view,
+                        from_tree: from,
+                        to_tree: to,
+                        head_generation: input.head_generation,
+                    },
+                    _ => unreachable!("view resolver returns view comparison"),
+                };
+                workspace_diff::build_repository(comparison, input.changes, limits, deadline)?
+            } else {
+                let scan = workspace_scan::scan(
+                    &context.root,
+                    &local,
+                    &context.workspace,
+                    limits.max_inline_bytes_per_side,
+                )?;
+                workspace_diff::build(scan, limits, deadline)?
+            };
+            match arguments.format {
+                OutputFormat::Human => diff_render::human(&document),
+                OutputFormat::Json => diff_render::json(&document),
+            }
         }
         Command::Edits { revision } => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;

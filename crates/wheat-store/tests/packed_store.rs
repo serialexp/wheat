@@ -1,5 +1,5 @@
 use wheat_core::{ContentId, DirectoryEntry, DirectoryNode, FileKind, FileValue, ObjectId};
-use wheat_store::{ImmutableObjectStore, PackedObjectStore};
+use wheat_store::{ContentStoreError, ImmutableObjectStore, PackedObjectStore};
 
 #[tokio::test]
 async fn metadata_and_content_share_segments_without_namespace_confusion() {
@@ -93,6 +93,47 @@ fn large_content_uses_standalone_fallback() {
     let id = content.put(&[9; 17]).unwrap();
     assert!(content.path(id).is_file());
     assert_eq!(content.get(id).unwrap(), [9; 17]);
+}
+
+#[test]
+fn bounded_content_reads_cover_active_packed_and_loose_backends() {
+    for threshold in [usize::MAX, 0] {
+        let root = tempfile::tempdir().unwrap();
+        let objects = PackedObjectStore::open_with_loose_threshold(root.path(), threshold).unwrap();
+        let content = objects.content_store();
+        let bytes = vec![11; 4096];
+        let id = content.put(&bytes).unwrap();
+
+        assert!(matches!(
+            content.get_bounded(id, bytes.len() - 1),
+            Err(ContentStoreError::TooLarge { id: actual, max, minimum })
+                if actual == id && max == bytes.len() - 1 && minimum == bytes.len()
+        ));
+        assert_eq!(content.get_bounded(id, bytes.len()).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn bounded_content_reads_cover_sealed_packs() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = vec![12; 4096];
+    let id;
+    {
+        let objects = PackedObjectStore::open_deferred(root.path()).unwrap();
+        let content = objects.content_store();
+        id = content.put(&bytes).unwrap();
+        drop(content);
+        objects.close().unwrap();
+    }
+    let objects = PackedObjectStore::open(root.path()).unwrap();
+    let content = objects.content_store();
+
+    assert!(matches!(
+        content.get_bounded(id, bytes.len() - 1),
+        Err(ContentStoreError::TooLarge { id: actual, minimum, .. })
+            if actual == id && minimum == bytes.len()
+    ));
+    assert_eq!(content.get_bounded(id, bytes.len()).unwrap(), bytes);
 }
 
 #[tokio::test]

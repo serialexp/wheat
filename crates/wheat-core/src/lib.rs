@@ -8,6 +8,7 @@ mod branch_records;
 mod collection;
 mod collection_builders;
 mod content_io;
+pub mod diff_model;
 pub mod edit_application;
 pub mod edit_capture;
 mod edit_records;

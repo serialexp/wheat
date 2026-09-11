@@ -63,6 +63,39 @@ fn distinguishes_missing_and_corrupt_content() {
 }
 
 #[test]
+fn bounded_read_rejects_loose_content_before_loading_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let bytes = vec![7; 64 * 1024];
+    let id = store.put(&bytes).unwrap();
+
+    assert!(matches!(
+        store.get_bounded(id, bytes.len() - 1),
+        Err(ContentStoreError::TooLarge { id: actual, max, minimum })
+            if actual == id && max == bytes.len() - 1 && minimum == bytes.len()
+    ));
+    assert_eq!(store.get_bounded(id, bytes.len()).unwrap(), bytes);
+}
+
+#[test]
+fn bounded_read_still_reports_missing_and_corrupt_loose_content() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let missing = ContentId::of(b"missing bounded");
+    assert!(matches!(
+        store.get_bounded(missing, 32),
+        Err(ContentStoreError::Missing(id)) if id == missing
+    ));
+
+    let id = store.put(b"original bounded").unwrap();
+    fs::write(store.path(id), b"different bounded").unwrap();
+    assert!(matches!(
+        store.get_bounded(id, 32),
+        Err(ContentStoreError::Corrupt { expected, .. }) if expected == id
+    ));
+}
+
+#[test]
 fn batch_retention_is_parallel_deduplicated_and_integrity_checked() {
     let directory = tempfile::tempdir().unwrap();
     let store = ContentStore::new(directory.path());

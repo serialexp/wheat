@@ -377,6 +377,32 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     );
     let conflicted = wheat(directory.path(), &["status"]);
     assert!(String::from_utf8_lossy(&conflicted.stdout).contains("conflicts: 1"));
+    let conflicts = wheat(directory.path(), &["conflicts"]);
+    assert!(conflicts.status.success());
+    assert!(String::from_utf8_lossy(&conflicts.stdout).contains("path=\"shared\""));
+    let conflicts_json_output = wheat(directory.path(), &["conflicts", "--format", "json"]);
+    assert!(conflicts_json_output.status.success());
+    let conflicts_json: serde_json::Value =
+        serde_json::from_slice(&conflicts_json_output.stdout).unwrap();
+    assert_eq!(conflicts_json["schema_version"], 1);
+    assert!(conflicts_json["head_generation"].as_u64().is_some());
+    let conflict = &conflicts_json["conflicts"][0];
+    assert_eq!(conflict["id"].as_array().unwrap().len(), 32);
+    assert_eq!(conflict["base_view"].as_array().unwrap().len(), 32);
+    let edit = &conflict["edits"][0];
+    assert_eq!(edit["id"].as_array().unwrap().len(), 32);
+    assert_eq!(edit["path"], "shared");
+    assert!(!edit["reason"].is_null());
+    assert!(!edit["target"].is_null());
+    assert!(edit.get("range").is_none());
+    assert!(edit.get("read").is_none());
+    assert!(edit.get("write").is_none());
+
+    // A separate process reopening the durable store must see byte-identical,
+    // deterministically ordered conflict output.
+    let reopened_conflicts = wheat(directory.path(), &["conflicts", "--format", "json"]);
+    assert!(reopened_conflicts.status.success());
+    assert_eq!(reopened_conflicts.stdout, conflicts_json_output.stdout);
 
     let resolved = wheat(
         directory.path(),
@@ -396,6 +422,11 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     );
     let reopened = wheat(directory.path(), &["status"]);
     assert!(String::from_utf8_lossy(&reopened.stdout).contains("conflicts: 0"));
+    let resolved_conflicts = wheat(directory.path(), &["conflicts", "--format", "json"]);
+    assert!(resolved_conflicts.status.success());
+    let resolved_conflicts: serde_json::Value =
+        serde_json::from_slice(&resolved_conflicts.stdout).unwrap();
+    assert_eq!(resolved_conflicts["conflicts"], serde_json::json!([]));
 
     // Omitting --kind preserves the target tree's executable kind. A follow-up
     // expecting that kind therefore applies cleanly.

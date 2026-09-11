@@ -75,6 +75,8 @@ pub(crate) enum SegmentError {
     TooManyEntries,
     #[error("segment exceeds the {MAX_SEGMENT_PAYLOAD_BYTES} byte payload limit")]
     TooLarge,
+    #[error("segment record is at least {minimum} bytes, exceeding the read limit")]
+    ReadLimit { minimum: usize },
     #[error("duplicate segment key")]
     DuplicateKey,
     #[error("invalid or unsupported segment format: {0}")]
@@ -466,17 +468,25 @@ impl SegmentReader {
     }
 
     /// Returns the authenticated index entry and its logically verified payload.
-    /// The index is neither read nor decoded again.
-    pub(crate) fn lookup_entry(
+    /// The index is neither read nor decoded again, and the payload length is
+    /// checked against `max` before allocating its output buffer.
+    pub(crate) fn lookup_entry_bounded(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
+        max: usize,
     ) -> Result<Option<(&SegmentIndexEntry, Vec<u8>)>, SegmentError> {
         let wanted = (namespace, digest);
         let Ok(index) = self.entries_by_key.binary_search_by_key(&wanted, key) else {
             return Ok(None);
         };
         let entry = &self.entries_by_key[index];
+        let length = usize::try_from(entry.length).map_err(|_| SegmentError::ReadLimit {
+            minimum: usize::MAX,
+        })?;
+        if length > max {
+            return Err(SegmentError::ReadLimit { minimum: length });
+        }
         let bytes = read_range(&mut self.file, entry.offset, entry.length)?;
         verify_logical(entry, &bytes)?;
         Ok(Some((entry, bytes)))
@@ -489,7 +499,7 @@ impl SegmentReader {
         digest: [u8; 32],
     ) -> Result<Option<(u16, Vec<u8>)>, SegmentError> {
         Ok(self
-            .lookup_entry(namespace, digest)?
+            .lookup_entry_bounded(namespace, digest, usize::MAX)?
             .map(|(entry, bytes)| (entry.kind, bytes)))
     }
 }

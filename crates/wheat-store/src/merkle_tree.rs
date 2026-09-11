@@ -54,18 +54,33 @@ pub enum MerkleTreeError {
 pub struct TreeWalkLimits {
     /// Maximum number of file leaves returned by the walk.
     pub max_files: usize,
+    /// Maximum tree nodes read during the walk.
+    pub max_nodes: usize,
+    /// Maximum directory entries visited during the walk.
+    pub max_entries: usize,
+    /// Maximum aggregate bytes retained in queued and returned full paths.
+    pub max_total_path_bytes: usize,
     /// Maximum byte length of any complete slash-separated path.
     pub max_path_bytes: usize,
     /// Maximum directory nesting, with the root directory at depth zero.
     pub max_depth: usize,
+    /// Maximum canonical bytes in one decoded tree node.
+    pub max_node_bytes: usize,
+    /// Maximum directory entries held by the lexical queue.
+    pub max_buffered_entries: usize,
 }
 
 impl Default for TreeWalkLimits {
     fn default() -> Self {
         Self {
             max_files: 250_000,
+            max_nodes: 250_000,
+            max_entries: 1_000_000,
+            max_total_path_bytes: 64 * 1024 * 1024,
             max_path_bytes: 4_096,
             max_depth: 128,
+            max_node_bytes: 16 * 1024 * 1024,
+            max_buffered_entries: 1_000_000,
         }
     }
 }
@@ -786,15 +801,37 @@ where
         root: TreeId,
         limits: TreeWalkLimits,
     ) -> Result<Vec<TreeFile>, MerkleTreeError> {
-        let root_node = self.read_node(root).await?;
+        let mut nodes = 0usize;
+        let mut entries = 0usize;
+        let mut retained_path_bytes = 0usize;
+        let root_node = self
+            .read_walk_node(root, limits, &mut nodes, &mut entries)
+            .await?;
         let mut files = Vec::new();
-        let mut pending = root_node
-            .entries
-            .into_iter()
-            .map(|(path, entry)| (path, (entry, 0usize)))
-            .collect::<BTreeMap<_, _>>();
+        let mut pending = BTreeMap::new();
+        for (path, entry) in root_node.entries {
+            retained_path_bytes = retained_path_bytes.checked_add(path.len()).ok_or(
+                MerkleTreeError::PathBytesExceeded {
+                    size: usize::MAX,
+                    limit: limits.max_total_path_bytes,
+                },
+            )?;
+            pending.insert(path, (entry, 0usize));
+        }
+        if pending.len() > limits.max_buffered_entries {
+            return Err(MerkleTreeError::BufferedEntriesExceeded {
+                limit: limits.max_buffered_entries,
+            });
+        }
+        if retained_path_bytes > limits.max_total_path_bytes {
+            return Err(MerkleTreeError::PathBytesExceeded {
+                size: retained_path_bytes,
+                limit: limits.max_total_path_bytes,
+            });
+        }
 
         while let Some((path, (entry, depth))) = pending.pop_first() {
+            retained_path_bytes -= path.len();
             if path.len() > limits.max_path_bytes {
                 return Err(MerkleTreeError::PathBytesExceeded {
                     size: path.len(),
@@ -807,6 +844,18 @@ where
                     if files.len() == limits.max_files {
                         return Err(MerkleTreeError::FileLimitExceeded {
                             limit: limits.max_files,
+                        });
+                    }
+                    retained_path_bytes = retained_path_bytes.checked_add(path.len()).ok_or(
+                        MerkleTreeError::PathBytesExceeded {
+                            size: usize::MAX,
+                            limit: limits.max_total_path_bytes,
+                        },
+                    )?;
+                    if retained_path_bytes > limits.max_total_path_bytes {
+                        return Err(MerkleTreeError::PathBytesExceeded {
+                            size: retained_path_bytes,
+                            limit: limits.max_total_path_bytes,
                         });
                     }
                     files.push(TreeFile { path, value });
@@ -823,12 +872,32 @@ where
                             limit: limits.max_depth,
                         });
                     }
-                    let child_node = self.read_node(child).await?;
+                    let child_node = self
+                        .read_walk_node(child, limits, &mut nodes, &mut entries)
+                        .await?;
+                    let buffered = pending.len().saturating_add(child_node.entries.len());
+                    if buffered > limits.max_buffered_entries {
+                        return Err(MerkleTreeError::BufferedEntriesExceeded {
+                            limit: limits.max_buffered_entries,
+                        });
+                    }
                     for (name, child_entry) in child_node.entries {
                         let mut child_path = String::with_capacity(path.len() + 1 + name.len());
                         child_path.push_str(&path);
                         child_path.push('/');
                         child_path.push_str(&name);
+                        retained_path_bytes = retained_path_bytes
+                            .checked_add(child_path.len())
+                            .ok_or(MerkleTreeError::PathBytesExceeded {
+                                size: usize::MAX,
+                                limit: limits.max_total_path_bytes,
+                            })?;
+                        if retained_path_bytes > limits.max_total_path_bytes {
+                            return Err(MerkleTreeError::PathBytesExceeded {
+                                size: retained_path_bytes,
+                                limit: limits.max_total_path_bytes,
+                            });
+                        }
                         pending.insert(child_path, (child_entry, child_depth));
                     }
                 }
@@ -836,6 +905,44 @@ where
         }
 
         Ok(files)
+    }
+
+    async fn read_walk_node(
+        &self,
+        id: TreeId,
+        limits: TreeWalkLimits,
+        nodes: &mut usize,
+        entries: &mut usize,
+    ) -> Result<DirectoryNode, MerkleTreeError> {
+        if *nodes == limits.max_nodes {
+            return Err(MerkleTreeError::NodeLimitExceeded {
+                limit: limits.max_nodes,
+            });
+        }
+        *nodes += 1;
+        let object = self.objects.get(id.into()).await?;
+        if object.kind != ObjectKind::Tree {
+            return Err(ObjectStoreError::WrongKind {
+                id: id.into(),
+                expected: ObjectKind::Tree,
+                actual: object.kind,
+            }
+            .into());
+        }
+        if object.canonical_bytes.len() > limits.max_node_bytes {
+            return Err(MerkleTreeError::NodeBytesExceeded {
+                size: object.canonical_bytes.len(),
+                limit: limits.max_node_bytes,
+            });
+        }
+        let node = decode_directory_node(&object.canonical_bytes)?;
+        *entries = entries.saturating_add(node.entries.len());
+        if *entries > limits.max_entries {
+            return Err(MerkleTreeError::EntryLimitExceeded {
+                limit: limits.max_entries,
+            });
+        }
+        Ok(node)
     }
 
     pub async fn apply_edits(

@@ -1,0 +1,286 @@
+//! Immutable repository comparison resolution and bounded Merkle traversal.
+//!
+//! Presentation deliberately lives in the shared diff model/renderer seam. This module only
+//! resolves user-facing selectors against one validated repository-head snapshot and produces
+//! neutral tree changes.
+
+use std::str::FromStr;
+
+use anyhow::{Context, Result, bail, ensure};
+use wheat_core::{FileValue, ObjectId, RevisionId, TreeId, ViewId};
+use wheat_store::{
+    ContentStoreError, MerkleTreeStore, PublicationStore, RepositoryReader, RetainedSetStore,
+    TreeDiffLimits,
+};
+
+use crate::local::LocalRepository;
+
+const MAX_DIFF_CHANGES: usize = 250_000;
+const MAX_DIFF_PATH_BYTES: usize = 4_096;
+const MAX_INLINE_CONTENT_BYTES: usize = 1024 * 1024;
+const MAX_TOTAL_INLINE_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TreeChangeInput {
+    pub path: String,
+    pub old: Option<TreeSideInput>,
+    pub new: Option<TreeSideInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TreeSideInput {
+    pub value: FileValue,
+    /// Present only when content fits both the per-side and command aggregate inline budgets.
+    pub bytes: Option<Vec<u8>>,
+    /// Exact when `bytes` is present; otherwise one more than the rejected bounded-read limit.
+    pub min_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ComparisonInput {
+    Revision {
+        revision: RevisionId,
+        from: TreeId,
+        to: TreeId,
+    },
+    Views {
+        from_view: ViewId,
+        to_view: ViewId,
+        from: TreeId,
+        to: TreeId,
+    },
+}
+
+pub(crate) struct RepositoryDiffInput {
+    pub head_generation: u64,
+    pub comparison: ComparisonInput,
+    pub changes: Vec<TreeChangeInput>,
+}
+
+pub(crate) async fn revision(
+    repository: &LocalRepository,
+    revision_id: RevisionId,
+    deadline: std::time::Instant,
+) -> Result<RepositoryDiffInput> {
+    let snapshot = Snapshot::read(repository).await?;
+    ensure!(
+        snapshot
+            .retained
+            .contains(
+                snapshot.state.retained_revisions,
+                ObjectId::from(revision_id)
+            )
+            .await?,
+        "revision is not retained by the current repository state"
+    );
+    let revision = snapshot.reader.revision(revision_id).await?;
+    ensure!(revision.id() == revision_id, "revision identity mismatch");
+    let from = if let Some(predecessor_id) = revision.predecessor {
+        ensure!(
+            snapshot
+                .retained
+                .contains(
+                    snapshot.state.retained_revisions,
+                    ObjectId::from(predecessor_id),
+                )
+                .await?,
+            "revision predecessor is not retained by the current repository state"
+        );
+        let predecessor = snapshot.reader.revision(predecessor_id).await?;
+        ensure!(
+            predecessor.id() == predecessor_id,
+            "revision predecessor identity mismatch"
+        );
+        predecessor.resulting_tree
+    } else {
+        snapshot
+            .resolve_retained_view(revision.authored_against)
+            .await?
+            .tree
+    };
+    finish(
+        repository,
+        snapshot.head_generation,
+        ComparisonInput::Revision {
+            revision: revision_id,
+            from,
+            to: revision.resulting_tree,
+        },
+        from,
+        revision.resulting_tree,
+        deadline,
+    )
+    .await
+}
+
+pub(crate) async fn views(
+    repository: &LocalRepository,
+    from: &str,
+    to: &str,
+    deadline: std::time::Instant,
+) -> Result<RepositoryDiffInput> {
+    let snapshot = Snapshot::read(repository).await?;
+    let (from_view, from_record) = snapshot.resolve_view(from).await?;
+    let (to_view, to_record) = snapshot.resolve_view(to).await?;
+    finish(
+        repository,
+        snapshot.head_generation,
+        ComparisonInput::Views {
+            from_view,
+            to_view,
+            from: from_record.tree,
+            to: to_record.tree,
+        },
+        from_record.tree,
+        to_record.tree,
+        deadline,
+    )
+    .await
+}
+
+async fn finish(
+    repository: &LocalRepository,
+    head_generation: u64,
+    comparison: ComparisonInput,
+    from: TreeId,
+    to: TreeId,
+    _deadline: std::time::Instant,
+) -> Result<RepositoryDiffInput> {
+    let trees = MerkleTreeStore::new(&repository.objects);
+    let mut cursor = trees.diff_cursor(
+        from,
+        to,
+        TreeDiffLimits {
+            max_changes: MAX_DIFF_CHANGES,
+            max_path_bytes: MAX_DIFF_PATH_BYTES,
+            ..TreeDiffLimits::default()
+        },
+    );
+    let mut changes = Vec::new();
+    let mut remaining_inline_bytes = MAX_TOTAL_INLINE_CONTENT_BYTES;
+    while let Some(change) = cursor.next().await? {
+        let old_value = change.old;
+        let new_value = change.new;
+        let old = read_side(repository, old_value, &mut remaining_inline_bytes)?;
+        let new = if old_value.as_ref().map(|value| value.content)
+            == new_value.as_ref().map(|value| value.content)
+        {
+            new_value.map(|value| reuse_side(value, old.as_ref()))
+        } else {
+            read_side(repository, new_value, &mut remaining_inline_bytes)?
+        };
+        changes.push(TreeChangeInput {
+            path: change.path,
+            old,
+            new,
+        });
+    }
+    Ok(RepositoryDiffInput {
+        head_generation,
+        comparison,
+        changes,
+    })
+}
+
+fn reuse_side(value: FileValue, source: Option<&TreeSideInput>) -> TreeSideInput {
+    let source = source.expect("equal content identity has an old side");
+    TreeSideInput {
+        value,
+        bytes: source.bytes.clone(),
+        min_bytes: source.min_bytes,
+    }
+}
+
+fn read_side(
+    repository: &LocalRepository,
+    value: Option<FileValue>,
+    remaining: &mut usize,
+) -> Result<Option<TreeSideInput>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let allowance = (*remaining).min(MAX_INLINE_CONTENT_BYTES);
+    let (bytes, min_bytes) = match repository.content.get_bounded(value.content, allowance) {
+        Ok(bytes) => {
+            *remaining = remaining
+                .checked_sub(bytes.len())
+                .context("repository diff inline byte budget underflow")?;
+            let len = bytes.len();
+            (Some(bytes), len)
+        }
+        Err(ContentStoreError::TooLarge { minimum, .. }) => (None, minimum),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(TreeSideInput {
+        value,
+        bytes,
+        min_bytes,
+    }))
+}
+
+struct Snapshot<'a> {
+    reader: RepositoryReader<'a, crate::local::LocalObjects>,
+    retained: RetainedSetStore<'a, crate::local::LocalObjects>,
+    head_generation: u64,
+    envelope: wheat_core::RepositoryEnvelopeRecord,
+    state: wheat_core::RepositoryStateRecord,
+}
+
+impl<'a> Snapshot<'a> {
+    async fn read(repository: &'a LocalRepository) -> Result<Self> {
+        let head = repository.heads.read()?;
+        let reader = RepositoryReader::new(&repository.objects, &repository.content);
+        let envelope = reader.envelope(head.envelope).await?;
+        ensure!(
+            envelope.id() == head.envelope,
+            "repository envelope identity mismatch"
+        );
+        let state = reader.state(envelope.state).await?;
+        ensure!(
+            state.id() == envelope.state,
+            "repository state identity mismatch"
+        );
+        // Diff follows only the requested retained roots. Complete history validation belongs to
+        // `wheat validate`; doing it here would make a sparse comparison scale with all history.
+        Ok(Self {
+            reader,
+            retained: RetainedSetStore::new(&repository.objects),
+            head_generation: head.generation,
+            envelope,
+            state,
+        })
+    }
+
+    async fn resolve_view(&self, selector: &str) -> Result<(ViewId, wheat_core::ViewRecord)> {
+        let id = match selector {
+            "published" => self.state.published_view,
+            "working" => self.state.working_view,
+            _ if selector.starts_with("branch:") => {
+                let name = selector.strip_prefix("branch:").expect("prefix checked");
+                ensure!(!name.is_empty(), "branch selector requires a name");
+                self.reader
+                    .branch_manifest(self.envelope.branches)
+                    .await?
+                    .branches
+                    .get(name)
+                    .copied()
+                    .with_context(|| format!("unknown branch {name}"))?
+            }
+            _ => ViewId::from_str(selector).context("invalid view selector")?,
+        };
+        Ok((id, self.resolve_retained_view(id).await?))
+    }
+
+    async fn resolve_retained_view(&self, id: ViewId) -> Result<wheat_core::ViewRecord> {
+        if !self
+            .retained
+            .contains(self.state.retained_views, ObjectId::from(id))
+            .await?
+        {
+            bail!("view is not retained by the current repository state");
+        }
+        let view = self.reader.view(id).await?;
+        ensure!(view.id() == id, "view identity mismatch");
+        Ok(view)
+    }
+}

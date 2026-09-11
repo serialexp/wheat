@@ -99,16 +99,22 @@ impl BulkSegment {
         Ok(entry)
     }
 
-    pub(crate) fn lookup(
+    pub(crate) fn lookup_bounded(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
+        max: usize,
     ) -> Result<Option<(u16, Vec<u8>)>, SegmentError> {
         let Some(&index) = self.entries_by_key.get(&(namespace, digest)) else {
             return Ok(None);
         };
         let entry = self.entries[index].clone();
-        let length = usize::try_from(entry.length).map_err(|_| SegmentError::TooLarge)?;
+        let length = usize::try_from(entry.length).map_err(|_| SegmentError::ReadLimit {
+            minimum: usize::MAX,
+        })?;
+        if length > max {
+            return Err(SegmentError::ReadLimit { minimum: length });
+        }
         let mut bytes = vec![0; length];
         self.file.seek(SeekFrom::Start(entry.offset))?;
         self.file.read_exact(&mut bytes)?;

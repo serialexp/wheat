@@ -21,13 +21,22 @@ pub enum ContentStoreError {
         expected: ContentId,
         actual: ContentId,
     },
+    #[error("content {id} changed while it was being read")]
+    Changed { id: ContentId },
+    #[error("content {id} is at least {minimum} bytes, exceeding the read limit of {max} bytes")]
+    TooLarge {
+        id: ContentId,
+        max: usize,
+        /// A trustworthy lower bound derived before rejecting the read.
+        minimum: usize,
+    },
     #[error("content store I/O failed")]
     Io(#[from] io::Error),
 }
 
 pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
     fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError>;
-    fn get(&self, id: ContentId) -> Result<Vec<u8>, ContentStoreError>;
+    fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -192,17 +201,39 @@ impl ContentStore {
     }
 
     pub fn get(&self, id: ContentId) -> Result<Vec<u8>, ContentStoreError> {
+        self.get_bounded(id, usize::MAX)
+    }
+
+    /// Reads and verifies content while refusing to allocate more than `max` bytes for it.
+    ///
+    /// Loose files are sized before allocation and an additional byte is probed after the
+    /// declared length, so concurrent growth cannot turn the bound into an allocation hint.
+    pub fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         if let Some(backend) = &self.backend {
-            return backend.get(id);
+            return backend.get_bounded(id, max);
         }
         let path = self.path(id);
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(ContentStoreError::Missing(id));
             }
             Err(error) => return Err(ContentStoreError::Io(error)),
         };
+        let size = file.metadata()?.len();
+        if size > max as u64 {
+            return Err(ContentStoreError::TooLarge {
+                id,
+                max,
+                minimum: usize::try_from(size).unwrap_or(usize::MAX),
+            });
+        }
+        let size = usize::try_from(size).map_err(|_| ContentStoreError::TooLarge {
+            id,
+            max,
+            minimum: usize::MAX,
+        })?;
+        let bytes = read_exact_content(&mut file, id, size)?;
         let actual = ContentId::of(&bytes);
         if actual != id {
             return Err(ContentStoreError::Corrupt {
@@ -216,7 +247,7 @@ impl ContentStore {
     #[must_use]
     pub fn contains(&self, id: ContentId) -> bool {
         if let Some(backend) = &self.backend {
-            return backend.get(id).is_ok();
+            return backend.get_bounded(id, usize::MAX).is_ok();
         }
         self.path(id).is_file()
     }
@@ -244,6 +275,26 @@ impl ContentStore {
     }
 }
 
+fn read_exact_content(
+    reader: &mut impl io::Read,
+    id: ContentId,
+    size: usize,
+) -> Result<Vec<u8>, ContentStoreError> {
+    let mut bytes = vec![0; size];
+    if let Err(error) = reader.read_exact(&mut bytes) {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            Err(ContentStoreError::Changed { id })
+        } else {
+            Err(ContentStoreError::Io(error))
+        };
+    }
+    let mut extra = [0_u8; 1];
+    if reader.read(&mut extra)? != 0 {
+        return Err(ContentStoreError::Changed { id });
+    }
+    Ok(bytes)
+}
+
 fn nonempty_parent(path: &Path) -> Option<&Path> {
     if path == Path::new(".") {
         None
@@ -257,5 +308,27 @@ fn nonempty_path(path: &Path) -> &Path {
         Path::new(".")
     } else {
         path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_content_reader_detects_shrink_and_growth() {
+        let id = ContentId::of(b"expected");
+        assert!(matches!(
+            read_exact_content(&mut &b"short"[..], id, 8),
+            Err(ContentStoreError::Changed { id: actual }) if actual == id
+        ));
+        assert!(matches!(
+            read_exact_content(&mut &b"too long"[..], id, 3),
+            Err(ContentStoreError::Changed { id: actual }) if actual == id
+        ));
+        assert_eq!(
+            read_exact_content(&mut &b"exact"[..], id, 5).unwrap(),
+            b"exact"
+        );
     }
 }

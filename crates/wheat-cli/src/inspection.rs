@@ -2,7 +2,7 @@
 use std::fmt::Write as _;
 
 use anyhow::Result;
-use wheat_core::{Conflict, EditOperation, EditRecord, RevisionRecord};
+use wheat_core::{EditOperation, EditRecord, RevisionRecord};
 
 pub(crate) fn edits(
     revision: &RevisionRecord,
@@ -65,19 +65,5 @@ fn write_ids<T: std::fmt::Display>(
         write!(output, " {id}")?;
     }
     writeln!(output)?;
-    Ok(())
-}
-
-pub(crate) fn conflicts(conflicts: &[Conflict], output: &mut String) -> Result<()> {
-    for conflict in conflicts {
-        writeln!(output, "conflict {} on {}", conflict.id, conflict.base_view)?;
-        for (edit, evidence) in &conflict.edits {
-            writeln!(
-                output,
-                "  edit {edit} target={:?} reason={:?}",
-                evidence.target, evidence.reason
-            )?;
-        }
-    }
     Ok(())
 }

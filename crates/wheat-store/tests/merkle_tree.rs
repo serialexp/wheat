@@ -385,8 +385,13 @@ async fn walk_files_accepts_exact_limits_and_rejects_one_over() {
         .unwrap();
     let exact = TreeWalkLimits {
         max_files: 2,
+        max_nodes: 3,
+        max_entries: 4,
+        max_total_path_bytes: 10,
         max_path_bytes: 5,
         max_depth: 1,
+        max_node_bytes: 1024,
+        max_buffered_entries: 2,
     };
     assert_eq!(trees.walk_files(root, exact).await.unwrap().len(), 2);
 
@@ -425,6 +430,66 @@ async fn walk_files_accepts_exact_limits_and_rejects_one_over() {
             )
             .await,
         Err(MerkleTreeError::DepthExceeded { depth: 1, limit: 0 })
+    ));
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_nodes: 2,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::NodeLimitExceeded { limit: 2 })
+    ));
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_entries: 3,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::EntryLimitExceeded { limit: 3 })
+    ));
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_total_path_bytes: 9,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::PathBytesExceeded { limit: 9, .. })
+    ));
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_buffered_entries: 1,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::BufferedEntriesExceeded { limit: 1 })
+    ));
+    assert!(matches!(
+        trees
+            .walk_files(
+                root,
+                TreeWalkLimits {
+                    max_node_bytes: 1,
+                    ..exact
+                },
+            )
+            .await,
+        Err(MerkleTreeError::NodeBytesExceeded { limit: 1, .. })
     ));
 }
 

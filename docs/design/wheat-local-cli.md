@@ -42,13 +42,16 @@ both lists.
   concurrent-write races, and durable terminal records complete valid plans or
   consume invalidated consent while retaining completed work. Restore never changes
   the selected view or workspace metadata.
+- [x] **Tracked workspace diff and conflict paths.** `diff` compares tracked workspace
+  paths with the pinned materialized tree, a retained revision with its predecessor,
+  or two retained views. Versioned JSON and Git-familiar human output share bounded
+  descriptors and contextual hunks; binary, symlink, oversized, over-complex, and
+  deadline-limited bodies remain explicit opaque metadata. Initial revisions compare
+  against their `authored_against` view. `conflicts` expands retained edit identities
+  to canonical affected paths while preserving exact failure evidence and never
+  fabricating unavailable ranges. Untracked/ignored scanning remains Phase 2 work.
 
 ### Outstanding
-
-- [ ] **Phase 1 — tracked workspace diff and conflict paths.** Render useful
-  workspace/view and revision/revision diffs and map durable conflict evidence to
-  affected paths. Untracked/ignored scanning follows complete ignore semantics in
-  Phase 2.
 - [ ] **Phase 1 — native change/revision metadata.** Define author versus
   committer behavior, creator, title/description, messages, timestamps and
   offsets; load required identity configuration and support flags plus
@@ -321,15 +324,19 @@ Machine-readable output should be versioned and opt-in, for example
 `wheat diff` needs three initial forms:
 
 ```text
-wheat diff                         # workspace vs materialized/current view
-wheat diff --revision <id>         # revision vs predecessor
+wheat diff                         # tracked workspace vs pinned materialized tree
+wheat diff --revision <id>         # revision vs predecessor/authored-against view
 wheat diff --from <view> --to <view>
 ```
 
-Text files use canonical-LF comparison while showing useful context. Binary and
-symlink changes report kind, identity, and size without forcing bytes through a
-text renderer. Rename detection is presentation evidence, not canonical
-identity. Every walk and rendered output has explicit limits.
+Exact retained view IDs and `published`, `working`, and `branch:<name>` selectors
+are resolved against one authority snapshot. Text files use canonical-LF
+comparison while showing useful context. Binary and symlink changes report kind,
+identity, and size without forcing bytes through a text renderer; content above
+the inline limit remains deliberately unclassified rather than being mislabeled
+binary. Rename detection is presentation evidence, not canonical identity. Tree
+walks, content reads, text work, model size, and atomic human/JSON output all have
+explicit command-wide limits.
 
 ## Capture and revision authoring
 

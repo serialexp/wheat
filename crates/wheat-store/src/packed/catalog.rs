@@ -670,10 +670,19 @@ impl PackedCatalog {
         namespace: u8,
         digest: [u8; 32],
     ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+        self.get_bounded(namespace, digest, usize::MAX)
+    }
+
+    pub(crate) fn get_bounded(
+        &mut self,
+        namespace: u8,
+        digest: [u8; 32],
+        max: usize,
+    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
         if let Some(value) = self
             .bulk
             .as_mut()
-            .map(|bulk| bulk.segment.lookup(namespace, digest))
+            .map(|bulk| bulk.segment.lookup_bounded(namespace, digest, max))
             .transpose()?
             .flatten()
         {
@@ -689,14 +698,18 @@ impl PackedCatalog {
                     .optional()?)
             })();
             if let Ok(location) = location {
-                if location.is_none() && self.lookup_authority(namespace, digest, None)?.is_some() {
+                if location.is_none()
+                    && self
+                        .lookup_authority_bounded(namespace, digest, None, max)?
+                        .is_some()
+                {
                     if attempt == 0 {
                         self.rebuild_index()?;
                         continue;
                     }
                     return Err(CatalogError::Corrupt("locator misses authoritative object"));
                 }
-                match self.read_authoritative_location(namespace, digest, location.as_ref()) {
+                match self.read_authoritative_location(namespace, digest, location.as_ref(), max) {
                     Ok(value) => return Ok(value),
                     Err(CatalogError::Corrupt(_)) | Err(CatalogError::Database(_))
                         if attempt == 0 => {}
@@ -715,6 +728,7 @@ impl PackedCatalog {
         namespace: u8,
         digest: [u8; 32],
         locator: Option<&(u16, u64, u64, String)>,
+        max: usize,
     ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
         let Some((kind, offset, length, source)) = locator else {
             // The locator checkpoint is advanced in the same SQLite transaction as
@@ -729,7 +743,14 @@ impl PackedCatalog {
                 "locator length exceeds segment limit",
             ));
         }
-        let Some((entry, bytes)) = self.lookup_authority(namespace, digest, Some(source))? else {
+        if *length > max as u64 {
+            return Err(CatalogError::Segment(SegmentError::ReadLimit {
+                minimum: usize::try_from(*length).unwrap_or(usize::MAX),
+            }));
+        }
+        let Some((entry, bytes)) =
+            self.lookup_authority_bounded(namespace, digest, Some(source), max)?
+        else {
             return Err(CatalogError::Corrupt(
                 "locator source or key is not authoritative",
             ));
@@ -743,14 +764,15 @@ impl PackedCatalog {
         Ok(Some((*kind, bytes)))
     }
 
-    fn lookup_authority(
+    fn lookup_authority_bounded(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
         requested_source: Option<&str>,
+        max: usize,
     ) -> Result<Option<(SegmentIndexEntry, Vec<u8>)>, CatalogError> {
         if requested_source.is_none_or(|source| source == ACTIVE_FILE) {
-            if let Some(value) = self.active.lookup_entry(namespace, digest)? {
+            if let Some(value) = self.active.lookup_entry_bounded(namespace, digest, max)? {
                 return Ok(Some(value));
             }
             if requested_source.is_some() {
@@ -792,7 +814,7 @@ impl PackedCatalog {
                 .sealed_readers
                 .get_mut(&source.segment)
                 .expect("reader was inserted");
-            if let Some((entry, bytes)) = reader.lookup_entry(namespace, digest)? {
+            if let Some((entry, bytes)) = reader.lookup_entry_bounded(namespace, digest, max)? {
                 return Ok(Some((entry.clone(), bytes)));
             }
         }
