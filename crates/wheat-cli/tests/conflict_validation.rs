@@ -16,11 +16,23 @@ fn store_path(workspace: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn wheat(workspace: &std::path::Path, arguments: &[&str]) -> Output {
+    let mut arguments = arguments.to_vec();
+    if arguments.starts_with(&["change", "new"]) {
+        arguments.extend(["--message", "test revision"]);
+    }
+    let config_home = workspace.parent().unwrap().join("conflict-test-config");
+    std::fs::create_dir_all(config_home.join("wheat")).unwrap();
+    std::fs::write(
+        config_home.join("wheat/config.json"),
+        r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Test","email":"wheat@example.invalid"}}"#,
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .arg("--workspace")
         .arg(workspace)
         .args(arguments)
         .env("WHEAT_STORE_HOME", store_home(workspace))
+        .env("XDG_CONFIG_HOME", config_home)
         .output()
         .expect("wheat command runs")
 }

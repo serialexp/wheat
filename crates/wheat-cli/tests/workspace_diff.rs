@@ -7,6 +7,20 @@ use std::{
 };
 
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
+    let mut arguments = arguments.to_vec();
+    if arguments.starts_with(&["change", "new"]) {
+        arguments.extend(["--message", "test revision"]);
+    }
+    let config_home = root.parent().unwrap().join(format!(
+        ".{}-test-config",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir_all(config_home.join("wheat")).unwrap();
+    fs::write(
+        config_home.join("wheat/config.json"),
+        r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Test","email":"wheat@example.invalid"}}"#,
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .arg("--workspace")
         .arg(root)
@@ -18,6 +32,7 @@ fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
                 root.file_name().unwrap().to_string_lossy()
             )),
         )
+        .env("XDG_CONFIG_HOME", config_home)
         .output()
         .unwrap()
 }

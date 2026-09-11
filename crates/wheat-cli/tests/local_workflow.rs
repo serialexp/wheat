@@ -7,13 +7,42 @@ fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
     if adjusted.first() == Some(&"init") && adjusted.len() == 1 {
         adjusted.push(root.to_str().unwrap());
     }
+    add_test_message(&mut adjusted);
+    let config_home = root.parent().unwrap().join(format!(
+        ".{}-test-config",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    write_test_actor(&config_home);
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .arg("--workspace")
         .arg(root)
         .args(adjusted)
         .env("WHEAT_STORE_HOME", store_home(root))
+        .env("XDG_CONFIG_HOME", config_home)
         .output()
         .expect("wheat command runs")
+}
+
+fn add_test_message(arguments: &mut Vec<&str>) {
+    let is_new = arguments.starts_with(&["change", "new"]);
+    let is_add = arguments.first() == Some(&"add");
+    if (is_new || is_add)
+        && !arguments
+            .iter()
+            .any(|argument| *argument == "--message" || *argument == "-m")
+    {
+        arguments.extend(["--message", "test revision"]);
+    }
+}
+
+fn write_test_actor(config_home: &std::path::Path) {
+    let directory = config_home.join("wheat");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Test","email":"wheat@example.invalid"}}"#,
+    )
+    .unwrap();
 }
 
 fn store_home(root: &std::path::Path) -> std::path::PathBuf {

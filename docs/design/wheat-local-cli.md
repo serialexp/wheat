@@ -50,12 +50,16 @@ both lists.
   against their `authored_against` view. `conflicts` expands retained edit identities
   to canonical affected paths while preserving exact failure evidence and never
   fabricating unavailable ranges. Untracked/ignored scanning remains Phase 2 work.
+- [x] **Native change/revision metadata.** Native changes derive their stable title
+  from the required revision message and may carry an explicit description;
+  revisions retain messages, actor attribution, and local or explicit RFC3339
+  timestamps with offsets. A versioned bounded config at the separate store and
+  XDG user scope supplies one default actor, with repository values taking
+  precedence per key. `wheat config set [--global] actor.name|actor.email VALUE`
+  updates it atomically. Phase 1 deliberately has no editor, identity environment
+  variables, or distinct author/committer overrides.
 
 ### Outstanding
-- [ ] **Phase 1 — native change/revision metadata.** Define author versus
-  committer behavior, creator, title/description, messages, timestamps and
-  offsets; load required identity configuration and support flags plus
-  editor-based entry instead of projection fallback metadata.
 - [ ] **Phase 1 — ergonomic selected-path capture.** Resolve the current logical
   change and predecessor without users manually copying opaque IDs. Workspace-wide
   capture follows ignore semantics in Phase 2.
@@ -372,27 +376,33 @@ workspace root.
 
 ## Identity, messages, and configuration
 
-Native authoring needs a deterministic precedence contract:
+Native authoring uses this Phase 1 identity precedence contract:
 
-1. explicit command flags;
-2. repository configuration;
-3. user configuration;
-4. environment intended for automation;
-5. otherwise a clear refusal when required identity is absent.
+1. repository configuration in the separate Wheat store;
+2. XDG user configuration;
+3. otherwise a clear refusal when either required actor field is absent.
 
-At minimum configuration covers actor name/email, editor, pager, default target,
-and output format. Native authoring must decide whether one configured actor fills
-creator, author, and committer roles or whether automation may supply distinct
-actors. Change creation records creator, created-at timestamp with offset, title,
-and description; revision creation records author/authored-at,
-committer/committed-at, message, and offsets. Revising a logical change must state
-which change metadata remains stable and which revision metadata is new. No
-native path may rely on Git projection fallback metadata. Automation needs flags
-or standard input so it never opens an editor unexpectedly.
+Configuration is set one typed key at a time with
+`wheat config set [--global] actor.name|actor.email VALUE`; repository values
+replace user values per key. One configured actor fills creator, author, and
+committer roles. Distinct-role overrides and environment identity are deferred.
 
-Configuration should be typed and versioned. Repository configuration belongs to
-Wheat, not `.git/config`. Secrets and credential material must not be copied into
-repository configuration or diagnostic output.
+`change new` and `add` require `--message`/`-m`, so automation never opens an
+editor unexpectedly. The first trimmed message line is the stable change title;
+`change new --description` supplies its optional long description. Change
+creation records creator and created-at, while every revision records author,
+authored-at, committer, committed-at, and its complete message. Timestamps default
+to the current local clock and accept explicit RFC3339 flags, preserving minute
+offsets. A revision leaves its logical change's metadata unchanged. `wheat log`
+shows the current revisions' title, author, timestamp, and message, so no native
+path relies on Git projection fallback metadata.
+
+Configuration files are versioned, bounded, strict JSON and published atomically
+under a per-config lock. Repository configuration belongs to Wheat, not
+`.git/config`; user configuration is `${XDG_CONFIG_HOME:-~/.config}/wheat/config.json`.
+Secrets and credential material must not be copied into repository configuration
+or diagnostic output. Editor, pager, default-target, and output-format settings
+remain part of the broader configuration work in Phase 2.
 
 ## Candidate named-target and integration workflow
 

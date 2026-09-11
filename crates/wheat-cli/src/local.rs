@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::path::Path;
-use wheat_core::{ChangeId, ObjectId, Repository, RevisionId, RevisionRecord, Tree, ViewId};
+use wheat_core::{Change, ObjectId, Repository, RevisionId, RevisionRecord, Tree, ViewId};
 use wheat_store::{
     ConflictSetStore, ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
     ObjectStoreError, PackedObjectStore, PublicationStore, RepositoryPublisher, RepositoryReader,
@@ -237,46 +237,68 @@ fn read_revision_with_edits<O: ImmutableObjectStore>(
     })?)
 }
 
-pub fn current_revisions(root: &Path) -> Result<Vec<(ChangeId, RevisionId)>> {
-    match repository_layout(root)? {
-        RepositoryLayout::Loose => {
-            let objects = LooseObjectStore::new(root.join("objects"));
-            let content = ContentStore::new(root.join("content"));
-            let heads = LocalPublicationStore::new(root.join("repository.head"));
-            read_current_revisions(root, &objects, &content, &heads)
-        }
-        RepositoryLayout::Packed => {
-            let objects = PackedObjectStore::open(root.join("storage"))?;
-            let content = objects.content_store();
-            let heads = LocalPublicationStore::new(root.join("repository.head"));
-            read_current_revisions(root, &objects, &content, &heads)
-        }
-    }
-}
+const MAX_LOG_REVISIONS: usize = 250_000;
+const MAX_LOG_CHANGES: usize = 250_000;
 
-fn read_current_revisions<O: ImmutableObjectStore>(
-    root: &Path,
-    objects: &O,
-    content: &ContentStore,
-    heads: &LocalPublicationStore,
-) -> Result<Vec<(ChangeId, RevisionId)>> {
-    let expected = heads
-        .read()
-        .with_context(|| format!("cannot open Wheat repository: {}", root.display()))?;
+pub fn current_revision_records(root: &Path) -> Result<Vec<(Change, RevisionId, RevisionRecord)>> {
+    let repository = open(root)?;
     let runtime = runtime()?;
-    let reader = RepositoryReader::new(objects, content);
-    let envelope = runtime.block_on(reader.envelope(expected.envelope))?;
-    let state = runtime.block_on(reader.state(envelope.state))?;
-    let working = runtime.block_on(reader.view(state.working_view))?;
-    let revisions = RevisionMapStore::new(objects);
-    Ok(runtime.block_on(async {
-        let mut result = Vec::new();
-        let mut cursor = revisions.cursor(working.revisions).await?;
-        while let Some(revision) = cursor.next().await? {
-            result.push(revision);
+    runtime.block_on(async {
+        let head = repository.heads.read()?;
+        let reader = RepositoryReader::new(&repository.objects, &repository.content);
+        let envelope = reader.envelope(head.envelope).await?;
+        if envelope.id() != head.envelope {
+            bail!("repository envelope identity mismatch");
         }
-        Ok::<_, wheat_store::RepositoryPublicationError>(result)
-    })?)
+        let state = reader.state(envelope.state).await?;
+        if state.id() != envelope.state {
+            bail!("repository state identity mismatch");
+        }
+        let working = reader.view(state.working_view).await?;
+        if working.id() != state.working_view {
+            bail!("working view identity mismatch");
+        }
+        let revisions = RevisionMapStore::new(&repository.objects);
+        let mut revision_cursor = revisions.cursor(working.revisions).await?;
+        let mut selected = Vec::new();
+        while let Some((change, revision_id)) = revision_cursor.next().await? {
+            if selected.len() == MAX_LOG_REVISIONS {
+                bail!("current revision count exceeds the log limit");
+            }
+            let revision = reader.revision(revision_id).await?;
+            if revision.id() != revision_id {
+                bail!("revision identity mismatch");
+            }
+            selected.push((change, revision_id, revision));
+        }
+        let retained = wheat_store::RetainedSetStore::new(&repository.objects);
+        let mut change_cursor = retained.cursor(state.retained_changes).await?;
+        let mut changes = std::collections::BTreeMap::new();
+        while let Some(object_id) = change_cursor.next().await? {
+            if changes.len() == MAX_LOG_CHANGES {
+                bail!("retained change count exceeds the log limit");
+            }
+            let object = repository.objects.get(object_id).await?;
+            if object.kind == wheat_store::ObjectKind::Change {
+                let change = wheat_core::decode_change(&object.canonical_bytes)?;
+                if wheat_core::ChangeObjectId::of_canonical_bytes(&change.canonical_bytes())
+                    != wheat_core::ChangeObjectId::from_digest(*object_id.as_bytes())
+                {
+                    bail!("logical change identity mismatch");
+                }
+                changes.insert(change.id, change);
+            }
+        }
+        selected
+            .into_iter()
+            .map(|(change_id, revision_id, revision)| {
+                let change = changes
+                    .remove(&change_id)
+                    .context("revision refers to a missing retained logical change")?;
+                Ok((change, revision_id, revision))
+            })
+            .collect::<Result<Vec<_>>>()
+    })
 }
 
 pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {

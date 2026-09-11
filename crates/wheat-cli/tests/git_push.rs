@@ -25,6 +25,17 @@ fn git(directory: Option<&Path>, arguments: &[&str]) -> String {
 }
 
 fn wheat(workspace: &Path, arguments: &[&str]) -> std::process::Output {
+    let mut arguments = arguments.to_vec();
+    if arguments.starts_with(&["change", "new"]) {
+        arguments.extend(["--message", "test revision"]);
+    }
+    let config_home = workspace.parent().unwrap().join("wheat-test-config");
+    std::fs::create_dir_all(config_home.join("wheat")).unwrap();
+    std::fs::write(
+        config_home.join("wheat/config.json"),
+        r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Test","email":"wheat@example.invalid"}}"#,
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .arg("--workspace")
         .arg(workspace)
@@ -33,6 +44,7 @@ fn wheat(workspace: &Path, arguments: &[&str]) -> std::process::Output {
             "WHEAT_STORE_HOME",
             workspace.parent().unwrap().join("stores"),
         )
+        .env("XDG_CONFIG_HOME", config_home)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .unwrap()

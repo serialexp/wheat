@@ -23,9 +23,35 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+fn adjusted_args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    let mut args = args.to_vec();
+    if args.windows(2).any(|pair| pair == ["change", "new"])
+        && !args
+            .iter()
+            .any(|argument| *argument == "--message" || *argument == "-m")
+    {
+        args.extend(["--message", "test revision"]);
+    }
+    args
+}
+
+fn test_config(stores: &Path) -> std::path::PathBuf {
+    let home = stores.join("test-config");
+    std::fs::create_dir_all(home.join("wheat")).unwrap();
+    std::fs::write(
+        home.join("wheat/config.json"),
+        r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Test","email":"wheat@example.invalid"}}"#,
+    )
+    .unwrap();
+    home
+}
+
 fn wheat(stores: &Path, args: &[&str], checkpoint: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_wheat"));
-    command.args(args).env("WHEAT_STORE_HOME", stores);
+    command
+        .args(adjusted_args(args))
+        .env("WHEAT_STORE_HOME", stores)
+        .env("XDG_CONFIG_HOME", test_config(stores));
     if let Some(checkpoint) = checkpoint {
         command
             .env("WHEAT_TEST_MATERIALIZATION_FAIL_AFTER", checkpoint)
@@ -43,8 +69,9 @@ fn paused_wheat(
 ) -> Child {
     std::fs::write(pause, b"wait\n").unwrap();
     Command::new(env!("CARGO_BIN_EXE_wheat"))
-        .args(args)
+        .args(adjusted_args(args))
         .env("WHEAT_STORE_HOME", stores)
+        .env("XDG_CONFIG_HOME", test_config(stores))
         .env("WHEAT_TEST_MATERIALIZATION_PAUSE_AT", checkpoint)
         .env(
             "WHEAT_TEST_MATERIALIZATION_FAIL_OCCURRENCE",

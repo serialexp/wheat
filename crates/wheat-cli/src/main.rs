@@ -8,14 +8,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use wheat_core::{
-    ApplicationResultRecord, ChangeId, ChangeMetadata, ChangeProposal, ContentId, EditTransition,
-    FileKind, FileValue, RevisionEdits, RevisionId, RevisionMetadata, guarded::Limits,
+    ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditTransition, FileKind,
+    FileValue, RevisionEdits, RevisionId, guarded::Limits,
 };
 use wheat_store::{
     ApplicationMapStore, BatchObjectStore, MerkleTreeStore, MutationTarget,
     PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
     RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
+mod authoring_metadata;
 mod conflict_inspection;
 mod diff_render;
 mod discovery;
@@ -31,7 +32,7 @@ mod workspace_scan;
 mod workspace_status;
 use discovery::{allocate_store_root, canonical_store_path, discover_workspace};
 use local::{
-    content_store, current_revisions, initialize, open, projection_path, repository_summary,
+    content_store, current_revision_records, initialize, open, projection_path, repository_summary,
     revision_with_edits, runtime,
 };
 use workspace_metadata::{StoreMetadata, WorkspaceMetadata, WorkspaceSelection};
@@ -67,6 +68,9 @@ enum Command {
     Conflicts(ConflictsArgs),
     /// Compare workspace or retained immutable repository trees.
     Diff(DiffArgs),
+    /// Read or write typed Wheat configuration.
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Inspect immutable edit definitions and lineage.
     Edits {
         #[arg(long)]
@@ -139,6 +143,19 @@ struct DiffArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Set one typed configuration key.
+    Set {
+        /// Write user configuration instead of the current repository configuration.
+        #[arg(long)]
+        global: bool,
+        /// Configuration key: actor.name or actor.email.
+        key: authoring_metadata::ConfigKey,
+        value: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ChangeCommand {
     /// Create a logical change.
     New(NewArgs),
@@ -153,7 +170,41 @@ struct NewArgs {
     #[arg(long)]
     independent: bool,
     #[command(flatten)]
+    metadata: NewMetadataArgs,
+    #[command(flatten)]
     edit: EditArgs,
+}
+
+#[derive(Debug, Args)]
+struct NewMetadataArgs {
+    /// Native revision message. Its first nonempty line is the stable change title.
+    #[arg(short = 'm', long)]
+    message: String,
+    /// Stable logical-change description.
+    #[arg(long)]
+    description: Option<String>,
+    /// Creator timestamp as RFC3339. Defaults to the current local time.
+    #[arg(long)]
+    created_at: Option<String>,
+    /// Author timestamp as RFC3339. Defaults to the current local time.
+    #[arg(long)]
+    authored_at: Option<String>,
+    /// Committer timestamp as RFC3339. Defaults to the current local time.
+    #[arg(long)]
+    committed_at: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RevisionMetadataArgs {
+    /// Native revision message.
+    #[arg(short = 'm', long)]
+    message: String,
+    /// Author timestamp as RFC3339. Defaults to the current local time.
+    #[arg(long)]
+    authored_at: Option<String>,
+    /// Committer timestamp as RFC3339. Defaults to the current local time.
+    #[arg(long)]
+    committed_at: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -167,6 +218,8 @@ struct AddArgs {
     /// Explicit repository-relative workspace paths. No other files are read or written.
     #[arg(required = true)]
     paths: Vec<String>,
+    #[command(flatten)]
+    metadata: RevisionMetadataArgs,
     /// Wider guard as PATH:START:END, using byte offsets in canonical-LF workspace content.
     #[arg(long = "guard", value_parser = parse_guard)]
     guards: Vec<GuardRange>,
@@ -354,8 +407,24 @@ fn main() -> Result<()> {
         Command::Log => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let mut output = String::new();
-            for (change, revision) in current_revisions(&store_root)? {
-                writeln!(output, "{change} {revision}")?;
+            for (change_record, revision, record) in current_revision_records(&store_root)? {
+                writeln!(
+                    output,
+                    "{} {revision} {}",
+                    change_record.id, change_record.metadata.title
+                )?;
+                writeln!(
+                    output,
+                    "  author {} <{}> {}",
+                    record.metadata.author.name,
+                    record.metadata.author.email,
+                    authoring_metadata::display_timestamp(record.metadata.authored_at)?
+                )?;
+                writeln!(
+                    output,
+                    "  {}",
+                    record.metadata.message.replace('\n', "\n  ")
+                )?;
             }
             print!("{output}");
             Ok(())
@@ -425,6 +494,17 @@ fn main() -> Result<()> {
                 OutputFormat::Json => diff_render::json(&document),
             }
         }
+        Command::Config(ConfigCommand::Set { global, key, value }) => {
+            let store_root = if global {
+                None
+            } else {
+                Some(resolve_store_root(
+                    &requested_workspace,
+                    cli.store.as_deref(),
+                )?)
+            };
+            authoring_metadata::set(store_root.as_deref(), global, key, &value)
+        }
         Command::Edits { revision } => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let revision = RevisionId::from_str(&revision).context("invalid revision ID")?;
@@ -469,13 +549,24 @@ fn main() -> Result<()> {
                 &arguments.paths,
                 &guards,
             ))?;
+            let (_, revision_metadata) = authoring_metadata::metadata(
+                &context.store_root,
+                authoring_metadata::MetadataArgs {
+                    message: arguments.metadata.message,
+                    description: None,
+                    created_at: None,
+                    authored_at: arguments.metadata.authored_at,
+                    committed_at: arguments.metadata.committed_at,
+                },
+                false,
+            )?;
             let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
                 .with_target(MutationTarget::PublishWorking);
             let (prepared, outcome) = runtime.block_on(mutator.revise(
                 expected,
                 change,
                 predecessor,
-                RevisionMetadata::default(),
+                revision_metadata,
                 edits,
             ))?;
             runtime.block_on(async {
@@ -514,13 +605,24 @@ fn main() -> Result<()> {
                 .map(|value| ChangeId::from_str(value).context("invalid dependency change ID"))
                 .collect::<Result<std::collections::BTreeSet<_>>>()?;
             let use_frontier = dependencies.is_empty() && !arguments.independent;
+            let (change_metadata, revision_metadata) = authoring_metadata::metadata(
+                &store_root,
+                authoring_metadata::MetadataArgs {
+                    message: arguments.metadata.message,
+                    description: arguments.metadata.description,
+                    created_at: arguments.metadata.created_at,
+                    authored_at: arguments.metadata.authored_at,
+                    committed_at: arguments.metadata.committed_at,
+                },
+                true,
+            )?;
             let edits = capture_initial_edit(&local.content, arguments.edit)?;
             let change = ChangeId::new();
             let proposal = ChangeProposal {
                 id: change,
-                metadata: ChangeMetadata::default(),
+                metadata: change_metadata.expect("new change metadata requested"),
                 dependencies,
-                revision_metadata: RevisionMetadata::default(),
+                revision_metadata,
                 edits,
             };
             let runtime = runtime()?;

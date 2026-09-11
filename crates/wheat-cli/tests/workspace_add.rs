@@ -8,14 +8,39 @@ fn wheat_command(root: &std::path::Path, arguments: &[&str]) -> Command {
     if adjusted.first() == Some(&"init") && adjusted.len() == 1 {
         adjusted.push(root.to_str().unwrap());
     }
+    let is_new = adjusted.starts_with(&["change", "new"]);
+    let is_add = adjusted.first() == Some(&"add");
+    if (is_new || is_add)
+        && !adjusted
+            .iter()
+            .any(|argument| *argument == "--message" || *argument == "-m")
+    {
+        adjusted.extend(["--message", "test revision"]);
+    }
+    let config_home = root.parent().unwrap().join(format!(
+        ".{}-test-config",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    let config_directory = config_home.join("wheat");
+    std::fs::create_dir_all(&config_directory).unwrap();
+    std::fs::write(
+        config_directory.join("config.json"),
+        r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Test","email":"wheat@example.invalid"}}"#,
+    )
+    .unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_wheat"));
-    command.arg("--workspace").arg(root).args(adjusted).env(
-        "WHEAT_STORE_HOME",
-        root.parent().unwrap().join(format!(
-            ".{}-test-stores",
-            root.file_name().unwrap().to_string_lossy()
-        )),
-    );
+    command
+        .arg("--workspace")
+        .arg(root)
+        .args(adjusted)
+        .env(
+            "WHEAT_STORE_HOME",
+            root.parent().unwrap().join(format!(
+                ".{}-test-stores",
+                root.file_name().unwrap().to_string_lossy()
+            )),
+        )
+        .env("XDG_CONFIG_HOME", config_home);
     command
 }
 

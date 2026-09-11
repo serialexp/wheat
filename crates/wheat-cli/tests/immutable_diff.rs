@@ -1,6 +1,17 @@
 use std::process::{Command, Output};
 
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
+    let mut arguments = arguments.to_vec();
+    if arguments.starts_with(&["change", "new"]) || arguments.first() == Some(&"add") {
+        arguments.extend(["--message", "test revision"]);
+    }
+    let config_home = root.parent().unwrap().join("test-config");
+    std::fs::create_dir_all(config_home.join("wheat")).unwrap();
+    std::fs::write(
+        config_home.join("wheat/config.json"),
+        r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Test","email":"wheat@example.invalid"}}"#,
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .arg("--workspace")
         .arg(root)
@@ -9,6 +20,7 @@ fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
             "WHEAT_STORE_HOME",
             root.parent().unwrap().join("test-stores"),
         )
+        .env("XDG_CONFIG_HOME", config_home)
         .output()
         .expect("wheat command runs")
 }
