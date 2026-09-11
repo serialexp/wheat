@@ -39,8 +39,9 @@ both lists.
 - [x] **Selected-path restore.** Explicit file and directory selectors authorize
   restoring their tracked leaves from the pinned materialized tree. Workspace-only
   paths and untracked siblings are preserved, exact observed preimages close
-  concurrent-write races, and durable intent/completion records support full
-  crash roll-forward without changing the selected view or workspace metadata.
+  concurrent-write races, and durable terminal records complete valid plans or
+  consume invalidated consent while retaining completed work. Restore never changes
+  the selected view or workspace metadata.
 
 ### Outstanding
 
