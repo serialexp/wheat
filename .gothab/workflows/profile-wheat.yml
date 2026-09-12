@@ -6,7 +6,8 @@ on:
 jobs:
   profile:
     name: Wheat Gothab workflow
-    runs-on: performance-profile
+    # Keep profile comparisons on the pinned c8id.xlarge performance pool.
+    runs-on: pt-heavy
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
