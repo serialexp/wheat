@@ -1,0 +1,28 @@
+name: Wheat Gothab Workflow Performance Profile
+
+on:
+  workflow_dispatch:
+
+jobs:
+  profile:
+    name: Wheat Gothab workflow
+    runs-on: performance-profile
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Wheat profile binaries
+        run: cargo build --release -p wheat-cli --bin wheat --example wheat_gothab_profile
+
+      - name: Run Wheat Gothab workflow profile
+        run: target/release/examples/wheat_gothab_profile "$GITHUB_WORKSPACE" profile.json
+
+      - uses: actions/profile@v1
+        with:
+          path: profile.json
+          name: wheat-gothab-workflow
