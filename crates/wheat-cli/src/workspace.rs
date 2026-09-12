@@ -17,7 +17,7 @@ use wheat_store::{
     RepositoryReader, RevisionMapStore,
 };
 
-use crate::workspace_files::read_workspace_file;
+use crate::{command_output::CliFailure, workspace_files::read_workspace_file};
 
 pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     root: &Path,
@@ -30,7 +30,9 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     guards: &BTreeMap<String, Vec<Range<usize>>>,
 ) -> Result<RevisionEdits> {
     if paths.is_empty() {
-        bail!("at least one explicit workspace path is required");
+        return Err(CliFailure::invalid(
+            "at least one explicit workspace path is required",
+        ));
     }
     let reader = RepositoryReader::new(objects, store);
     let envelope = reader.envelope(head.envelope).await?;
@@ -40,7 +42,9 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
         .get(working.revisions, change)
         .await?;
     if current != Some(predecessor) {
-        bail!("predecessor is not the exact current revision of the change");
+        return Err(CliFailure::stale(
+            "predecessor is not the exact current revision of the change; refresh and retry",
+        ));
     }
     let revision = reader.revision(predecessor).await?;
     let application_id = ApplicationMapStore::new(objects)
@@ -49,20 +53,28 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
         .context("change has no current application")?;
     let application = reader.application(application_id).await?;
     if application.revision_id != predecessor {
-        bail!("current application does not correspond to predecessor");
+        return Err(CliFailure::corrupt(
+            "current application does not correspond to predecessor",
+        ));
     }
     if revision.authored_against != application.target_view {
-        bail!("predecessor authored base does not match its current application target");
+        return Err(CliFailure::corrupt(
+            "predecessor authored base does not match its current application target",
+        ));
     }
     let published = reader.view(state.published_view).await?;
     let published_application = ApplicationMapStore::new(objects)
         .get(published.applications, change)
         .await?;
     if published_application != Some(application_id) {
-        bail!("current application is not recorded by the published head");
+        return Err(CliFailure::stale(
+            "current application is not recorded by the published head; refresh and retry",
+        ));
     }
     let ApplicationResultRecord::Clean { tree: baseline } = application.result else {
-        bail!("current application is conflicted; resolve it before adding");
+        return Err(CliFailure::conflict(
+            "current application is conflicted; resolve it before adding",
+        ));
     };
     let authored = reader.view(application.target_view).await?;
     let trees = MerkleTreeStore::new(objects);
@@ -73,10 +85,10 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
 
     let selected = paths.iter().cloned().collect::<BTreeSet<_>>();
     if selected.len() != paths.len() {
-        bail!("workspace paths must be unique");
+        return Err(CliFailure::invalid("workspace paths must be unique"));
     }
     if guards.keys().any(|path| !selected.contains(path)) {
-        bail!("a guard refers to an unselected path");
+        return Err(CliFailure::invalid("a guard refers to an unselected path"));
     }
 
     let limits = Limits::default();

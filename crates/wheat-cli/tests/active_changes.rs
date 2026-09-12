@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::{fs, process::Command};
 
 fn command(
@@ -69,6 +71,7 @@ fn selected_change_survives_reopen_and_drives_flagless_add() {
 
     let json = ok(root.path(), config.path(), &["changes", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let document = &document["result"];
     assert_eq!(document["format"], "wheat-active-changes");
     assert_eq!(document["version"], 1);
     assert_eq!(document["changes"][0]["change"], change);
@@ -106,6 +109,7 @@ fn explicit_add_to_prior_change_keeps_selection_and_absorbs_descendant_edit() {
 
     let listed = ok(root.path(), config.path(), &["changes", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let document = &document["result"];
     assert_eq!(document["selected"], b_id);
     let b = document["changes"]
         .as_array()
@@ -138,6 +142,7 @@ fn change_selection_can_switch_without_changing_repository_authority() {
     assert!(String::from_utf8_lossy(&selected.stdout).contains(&a_id));
     let listed = ok(root.path(), config.path(), &["changes", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let document = &document["result"];
     assert_eq!(document["selected"], a_id);
     assert!(
         document["changes"]
@@ -224,5 +229,6 @@ fn imported_history_is_the_basis_and_is_not_listed_active() {
     );
     let listed = ok(&workspace, config.path(), &["changes", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let document = &document["result"];
     assert!(document["changes"].as_array().unwrap().is_empty());
 }

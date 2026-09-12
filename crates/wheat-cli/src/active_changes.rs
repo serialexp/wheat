@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::Serialize;
 use wheat_core::{ChangeId, RevisionId, ViewId};
 use wheat_store::{
-    ApplicationMapStore, ChangeMapStore, RepositoryHead, RepositoryReader, RevisionMapStore,
+    ApplicationMapStore, ChangeMapStore, ObjectStoreError, RepositoryHead,
+    RepositoryPublicationError, RepositoryReader, RevisionMapStore,
 };
 
-use crate::local::LocalRepository;
+use crate::{command_output::CliFailure, local::LocalRepository};
 
 const MAX_ACTIVE_CHANGES: usize = 250_000;
 const MAX_TITLE_BYTES: usize = 1024 * 1024;
@@ -42,15 +43,6 @@ pub(crate) struct ActiveChanges {
     pub changes: Vec<ActiveChange>,
 }
 
-pub(crate) fn render_json(document: &ActiveChanges) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec_pretty(document)?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_OUTPUT_BYTES,
-        "active-change JSON exceeds the output limit"
-    );
-    Ok(bytes)
-}
-
 pub(crate) fn render_human(document: &ActiveChanges) -> Result<Vec<u8>> {
     use std::fmt::Write as _;
     let mut output = String::new();
@@ -67,10 +59,9 @@ pub(crate) fn render_human(document: &ActiveChanges) -> Result<Vec<u8>> {
             change.change, change.title
         )?;
         writeln!(output, "    revision {}", change.revision)?;
-        anyhow::ensure!(
-            output.len() <= MAX_OUTPUT_BYTES,
-            "active-change output exceeds the limit"
-        );
+        if output.len() > MAX_OUTPUT_BYTES {
+            return Err(CliFailure::limit("active-change output exceeds the limit"));
+        }
     }
     Ok(output.into_bytes())
 }
@@ -112,10 +103,13 @@ pub(crate) async fn inspect(
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
     let envelope = reader.envelope(head.envelope).await?;
     let state = reader.state(envelope.state).await?;
-    let basis_view = reader
-        .view(basis)
-        .await
-        .context("authoring basis is not retained")?;
+    let basis_view = match reader.view(basis).await {
+        Ok(view) => view,
+        Err(RepositoryPublicationError::Object(ObjectStoreError::Missing(_))) => {
+            return Err(CliFailure::corrupt("authoring basis is not retained"));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let working = reader.view(state.working_view).await?;
     let published = reader.view(state.published_view).await?;
     let revisions = RevisionMapStore::new(&repository.objects);
@@ -130,27 +124,34 @@ pub(crate) async fn inspect(
             continue;
         }
         if active.len() == MAX_ACTIVE_CHANGES {
-            bail!("active change count exceeds the command limit");
+            return Err(CliFailure::limit(
+                "active change count exceeds the command limit",
+            ));
         }
         let record = reader.revision(revision).await?;
         if record.change_id != change {
-            bail!("working revision-map change identity mismatch");
+            return Err(CliFailure::corrupt(
+                "working revision-map change identity mismatch",
+            ));
         }
-        let object = changes
-            .get(state.changes, change)
-            .await?
-            .context("active revision refers to an unindexed logical change")?;
+        let object = changes.get(state.changes, change).await?.ok_or_else(|| {
+            CliFailure::corrupt("active revision refers to an unindexed logical change")
+        })?;
         let change_record = reader.change(object).await?;
         if change_record.id != change {
-            bail!("change-map key does not match logical change identity");
+            return Err(CliFailure::corrupt(
+                "change-map key does not match logical change identity",
+            ));
         }
         if change_record.metadata.title.len() > MAX_TITLE_BYTES {
-            bail!("active change title exceeds the command limit");
+            return Err(CliFailure::limit(
+                "active change title exceeds the command limit",
+            ));
         }
         let application = applications
             .get(working.applications, change)
             .await?
-            .context("active change has no working application")?;
+            .ok_or_else(|| CliFailure::corrupt("active change has no working application"))?;
         let application = reader.application(application).await?;
         let conflicted = matches!(
             application.result,
@@ -188,7 +189,9 @@ async fn collect_revisions<S: wheat_store::ImmutableObjectStore>(
     let mut cursor = revisions.cursor(root).await?;
     while let Some((change, revision)) = cursor.next().await? {
         if values.len() == MAX_ACTIVE_CHANGES {
-            bail!("revision count exceeds the active-change command limit");
+            return Err(CliFailure::limit(
+                "revision count exceeds the active-change command limit",
+            ));
         }
         values.insert(change, revision);
     }
@@ -238,7 +241,9 @@ fn topological(mut changes: BTreeMap<ChangeId, ActiveChange>) -> Result<Vec<Acti
         }
     }
     if !changes.is_empty() {
-        bail!("active change dependencies contain a cycle");
+        return Err(CliFailure::corrupt(
+            "active change dependencies contain a cycle",
+        ));
     }
     Ok(ordered)
 }

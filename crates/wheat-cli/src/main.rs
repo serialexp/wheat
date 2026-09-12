@@ -2,12 +2,13 @@ use std::{
     fmt::Write as _,
     io::{BufRead as _, IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Command as ProcessCommand, ExitCode, Stdio},
     str::FromStr,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde_json::json;
 use wheat_core::{
     ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditTransition, FileKind,
     FileValue, RevisionEdits, RevisionId, guarded::Limits,
@@ -19,6 +20,7 @@ use wheat_store::{
 };
 mod active_changes;
 mod authoring_metadata;
+mod command_output;
 mod conflict_inspection;
 mod diff_render;
 mod discovery;
@@ -33,6 +35,10 @@ mod workspace_files;
 mod workspace_metadata;
 mod workspace_scan;
 mod workspace_status;
+use command_output::{
+    CliFailure, OutputFormat, Success, clap_error, emit_error, emit_success, requested_format,
+    require_supported_platform,
+};
 use discovery::{allocate_store_root, canonical_store_path, discover_workspace};
 use local::{
     content_store, current_revision_records, initialize, open, projection_path, repository_summary,
@@ -44,11 +50,14 @@ use workspace_metadata::{PendingSelection, StoreMetadata, WorkspaceMetadata, Wor
 #[command(name = "wheat", about = "Wheat source control prototype")]
 struct Cli {
     /// Explicit canonical Wheat store. Workspace discovery is used when omitted.
-    #[arg(long)]
+    #[arg(long, global = true)]
     store: Option<PathBuf>,
     /// Explicit workspace directory. Defaults to the current directory.
-    #[arg(long)]
+    #[arg(long, global = true)]
     workspace: Option<PathBuf>,
+    /// Output format for people or automation.
+    #[arg(long, value_enum, default_value_t, global = true)]
+    format: OutputFormat,
     #[command(subcommand)]
     command: Command,
 }
@@ -62,15 +71,15 @@ enum Command {
     /// Restore tracked paths from the currently pinned materialized tree.
     Restore(RestoreArgs),
     /// Show repository and tracked workspace state.
-    Status(StatusArgs),
+    Status,
     /// Verify the complete retained repository state.
     Validate,
     /// Inspect logical changes and immutable revisions.
     Log,
     /// List changes active relative to this workspace's authoring basis.
-    Changes(StatusArgs),
+    Changes,
     /// Inspect durable conflicts and per-edit failure evidence.
-    Conflicts(ConflictsArgs),
+    Conflicts,
     /// Compare workspace or retained immutable repository trees.
     Diff(DiffArgs),
     /// Read or write typed Wheat configuration.
@@ -116,25 +125,6 @@ struct RestoreArgs {
     paths: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum OutputFormat {
-    #[default]
-    Human,
-    Json,
-}
-
-#[derive(Debug, Args)]
-struct StatusArgs {
-    #[arg(long, value_enum, default_value_t)]
-    format: OutputFormat,
-}
-
-#[derive(Debug, Args)]
-struct ConflictsArgs {
-    #[arg(long, value_enum, default_value_t)]
-    format: OutputFormat,
-}
-
 #[derive(Debug, Args)]
 struct DiffArgs {
     #[arg(long, conflicts_with_all = ["from", "to"])]
@@ -143,8 +133,6 @@ struct DiffArgs {
     from: Option<String>,
     #[arg(long, requires = "from", conflicts_with = "revision")]
     to: Option<String>,
-    #[arg(long, value_enum, default_value_t)]
-    format: OutputFormat,
 }
 
 #[derive(Debug, Subcommand)]
@@ -238,12 +226,19 @@ struct GuardRange {
     range: std::ops::Range<usize>,
 }
 
-fn change_message(value: Option<String>) -> Result<String> {
+fn change_message(value: Option<String>, format: OutputFormat) -> Result<String> {
     if let Some(value) = value {
         return Ok(value);
     }
+    if format == OutputFormat::Json {
+        return Err(CliFailure::invalid(
+            "change message is required for JSON output; pass --message <message>",
+        ));
+    }
     if !std::io::stdin().is_terminal() {
-        bail!("change message is required in non-interactive use; pass --message <message>");
+        return Err(CliFailure::invalid(
+            "change message is required in non-interactive use; pass --message <message>",
+        ));
     }
     eprint!("Change message: ");
     std::io::stderr().flush()?;
@@ -360,8 +355,49 @@ struct ResolveArgs {
     delete: bool,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let requested = requested_format(&args);
+    if let Err(error) = require_supported_platform() {
+        return emit_error(requested, "cli", &error);
+    }
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => return clap_error(requested, error),
+    };
+    let format = cli.format;
+    let command = command_name(&cli.command);
+    match execute(cli) {
+        Ok(success) => emit_success(format, &success),
+        Err(error) => emit_error(format, command, &error),
+    }
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Init(_) => "init",
+        Command::Materialize(_) => "materialize",
+        Command::Restore(_) => "restore",
+        Command::Status => "status",
+        Command::Validate => "validate",
+        Command::Log => "log",
+        Command::Changes => "changes",
+        Command::Conflicts => "conflicts",
+        Command::Diff(_) => "diff",
+        Command::Config(ConfigCommand::Set { .. }) => "config.set",
+        Command::Edits { .. } => "edits",
+        Command::Add(_) => "add",
+        Command::Cat { .. } => "cat",
+        Command::Change(ChangeCommand::New(_)) => "change.new",
+        Command::Change(ChangeCommand::Select { .. }) => "change.select",
+        Command::Resolve(_) => "resolve",
+        Command::Import(_) => "import",
+        Command::Push(_) => "push",
+    }
+}
+
+fn execute(cli: Cli) -> Result<Success> {
+    let format = cli.format;
     let requested_workspace = cli.workspace.unwrap_or_else(|| PathBuf::from("."));
     match cli.command {
         Command::Init(arguments) => init_workspace(
@@ -371,15 +407,28 @@ fn main() -> Result<()> {
                 .unwrap_or(&requested_workspace),
             cli.store.as_deref(),
         ),
-        Command::Materialize(arguments) => materialize_workspace(
-            &requested_workspace,
-            cli.store.as_deref(),
-            &arguments.source,
-        ),
-        Command::Restore(arguments) => {
-            restore_workspace(&requested_workspace, cli.store.as_deref(), &arguments.paths)
+        Command::Materialize(arguments) => {
+            let (view, root) = materialize_workspace(
+                &requested_workspace,
+                cli.store.as_deref(),
+                &arguments.source,
+            )?;
+            Success::new(
+                "materialize",
+                json!({ "view": view.to_string() }),
+                format!("materialized view {view} in {}\n", root.display()),
+            )
         }
-        Command::Status(arguments) => {
+        Command::Restore(arguments) => {
+            let restored =
+                restore_workspace(&requested_workspace, cli.store.as_deref(), &arguments.paths)?;
+            Success::new(
+                "restore",
+                json!({ "restored": restored }),
+                format!("restored {restored} tracked path(s)\n"),
+            )
+        }
+        Command::Status => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let summary = repository_summary(&context.store_root)?;
             let local = open(&context.store_root)?;
@@ -389,32 +438,28 @@ fn main() -> Result<()> {
                 &context.workspace,
                 0,
             )?);
-            match arguments.format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
-                OutputFormat::Human => {
-                    println!("working view: {}", summary.working_view);
-                    println!("published view: {}", summary.published_view);
-                    println!("changes: {}", summary.changes);
-                    println!("conflicts: {}", summary.conflicts);
-                    println!("tracked changes: {}", status.changes.len());
-                    if status.authority_advanced {
-                        println!("repository advanced since materialization");
-                    }
-                    for change in &status.changes {
-                        let kind = if change.deleted {
-                            "deleted"
-                        } else if change.content_changed && change.kind_changed {
-                            "modified+kind"
-                        } else if change.content_changed {
-                            "modified"
-                        } else {
-                            "kind"
-                        };
-                        println!("{kind} {}", change.path);
-                    }
-                }
+            let mut output = String::new();
+            writeln!(output, "working view: {}", summary.working_view)?;
+            writeln!(output, "published view: {}", summary.published_view)?;
+            writeln!(output, "changes: {}", summary.changes)?;
+            writeln!(output, "conflicts: {}", summary.conflicts)?;
+            writeln!(output, "tracked changes: {}", status.changes.len())?;
+            if status.authority_advanced {
+                writeln!(output, "repository advanced since materialization")?;
             }
-            Ok(())
+            for change in &status.changes {
+                let kind = if change.deleted {
+                    "deleted"
+                } else if change.content_changed && change.kind_changed {
+                    "modified+kind"
+                } else if change.content_changed {
+                    "modified"
+                } else {
+                    "kind"
+                };
+                writeln!(output, "{kind} {}", change.path)?;
+            }
+            Success::new("status", &status, output)
         }
         Command::Validate => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
@@ -427,8 +472,11 @@ fn main() -> Result<()> {
                 reader.validate_complete(envelope.state).await?;
                 Ok::<_, wheat_store::RepositoryPublicationError>(envelope.state)
             })?;
-            println!("valid state: {state}");
-            Ok(())
+            Success::new(
+                "validate",
+                json!({ "state": state.to_string() }),
+                format!("valid state: {state}\n"),
+            )
         }
         Command::Log => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
@@ -454,10 +502,9 @@ fn main() -> Result<()> {
                     )?;
                 }
             }
-            print!("{output}");
-            Ok(())
+            Success::new("log", json!({ "text": output }), output.clone())
         }
-        Command::Changes(arguments) => {
+        Command::Changes => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
@@ -474,26 +521,16 @@ fn main() -> Result<()> {
                 basis,
                 context.workspace.selected_change,
             ))?;
-            let mut bytes = match arguments.format {
-                OutputFormat::Json => active_changes::render_json(&document)?,
-                OutputFormat::Human => active_changes::render_human(&document)?,
-            };
-            if matches!(arguments.format, OutputFormat::Json) {
-                bytes.push(b'\n');
-            }
-            std::io::stdout().write_all(&bytes)?;
-            Ok(())
+            let human = active_changes::render_human(&document)?;
+            Success::new("changes", &document, human)
         }
-        Command::Conflicts(arguments) => {
+        Command::Conflicts => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let local = open(&store_root)?;
             let document = runtime()?.block_on(conflict_inspection::inspect(&local))?;
-            let stdout = std::io::stdout();
-            let mut stdout = stdout.lock();
-            match arguments.format {
-                OutputFormat::Json => conflict_inspection::json(&document, &mut stdout),
-                OutputFormat::Human => conflict_inspection::human(&document, &mut stdout),
-            }
+            let mut human = Vec::new();
+            conflict_inspection::human(&document, &mut human)?;
+            Success::new("conflicts", &document, human)
         }
         Command::Diff(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
@@ -501,7 +538,8 @@ fn main() -> Result<()> {
             let limits = wheat_core::diff_model::DiffLimits::default();
             let deadline = std::time::Instant::now() + limits.deadline;
             let document = if let Some(revision) = arguments.revision {
-                let revision = RevisionId::from_str(&revision).context("invalid revision ID")?;
+                let revision = RevisionId::from_str(&revision)
+                    .map_err(|_| CliFailure::invalid("invalid revision ID"))?;
                 let input =
                     runtime()?.block_on(repository_diff::revision(&local, revision, deadline))?;
                 let comparison = match input.comparison {
@@ -544,10 +582,8 @@ fn main() -> Result<()> {
                 )?;
                 workspace_diff::build(scan, limits, deadline)?
             };
-            match arguments.format {
-                OutputFormat::Human => diff_render::human(&document),
-                OutputFormat::Json => diff_render::json(&document),
-            }
+            let human = diff_render::human_bytes(&document)?;
+            Success::new("diff", &document, human)
         }
         Command::Config(ConfigCommand::Set { global, key, value }) => {
             let store_root = if global {
@@ -558,16 +594,29 @@ fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )?)
             };
-            authoring_metadata::set(store_root.as_deref(), global, key, &value)
+            let key_name = match key {
+                authoring_metadata::ConfigKey::ActorName => "actor.name",
+                authoring_metadata::ConfigKey::ActorEmail => "actor.email",
+            };
+            authoring_metadata::set(store_root.as_deref(), global, key, &value)?;
+            Success::new(
+                "config.set",
+                json!({ "global": global, "key": key_name }),
+                Vec::new(),
+            )
         }
         Command::Edits { revision } => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            let revision = RevisionId::from_str(&revision).context("invalid revision ID")?;
+            let revision = RevisionId::from_str(&revision)
+                .map_err(|_| CliFailure::invalid("invalid revision ID"))?;
             let (revision, edits) = revision_with_edits(&store_root, revision)?;
             let mut output = String::new();
             inspection::edits(&revision, &edits, &mut output)?;
-            print!("{output}");
-            Ok(())
+            Success::new(
+                "edits",
+                json!({ "revision": revision.id().to_string(), "text": output }),
+                output.clone(),
+            )
         }
         Command::Add(arguments) => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
@@ -681,16 +730,30 @@ fn main() -> Result<()> {
                 writeln!(output, "selected change remains {selected}")?;
             }
             print_reapplied(&mut output, &outcome.reapplied)?;
-            print!("{output}");
-            Ok(())
+            Success::new(
+                "add",
+                json!({
+                    "change": change.to_string(),
+                    "revision": outcome.revision_id.to_string(),
+                    "paths": arguments.paths.len(),
+                    "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                }),
+                output,
+            )
         }
         Command::Cat { content } => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            let id = ContentId::from_str(&content).context("invalid content ID")?;
-            let bytes = content_store(&store_root)?.get(id)?;
-            use std::io::Write as _;
-            std::io::stdout().write_all(&bytes)?;
-            Ok(())
+            let id = ContentId::from_str(&content)
+                .map_err(|_| CliFailure::invalid("invalid content ID"))?;
+            let store = content_store(&store_root)?;
+            let limit = if format == OutputFormat::Json {
+                command_output::MAX_OUTPUT_BYTES / 4
+            } else {
+                command_output::MAX_OUTPUT_BYTES
+            };
+            let bytes = store.get_bounded(id, limit)?;
+            let result = json!({ "content_id": id.to_string(), "bytes": &bytes });
+            Success::raw("cat", result, bytes)
         }
         Command::Change(ChangeCommand::New(arguments)) => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
@@ -710,7 +773,7 @@ fn main() -> Result<()> {
                 .map(|value| ChangeId::from_str(value).context("invalid dependency change ID"))
                 .collect::<Result<std::collections::BTreeSet<_>>>()?;
             let use_frontier = dependencies.is_empty() && !arguments.independent;
-            let message = change_message(arguments.metadata.message)?;
+            let message = change_message(arguments.metadata.message, format)?;
             let (change_metadata, revision_metadata) = authoring_metadata::metadata(
                 &context.store_root,
                 authoring_metadata::MetadataArgs {
@@ -782,12 +845,20 @@ fn main() -> Result<()> {
             writeln!(output, "change {change}")?;
             writeln!(output, "revision {}", outcome.revision_id)?;
             print_reapplied(&mut output, &outcome.reapplied)?;
-            print!("{output}");
-            Ok(())
+            Success::new(
+                "change.new",
+                json!({
+                    "change": change.to_string(),
+                    "revision": outcome.revision_id.to_string(),
+                    "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                }),
+                output,
+            )
         }
         Command::Change(ChangeCommand::Select { change }) => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let change = ChangeId::from_str(&change).context("invalid change ID")?;
+            let change = ChangeId::from_str(&change)
+                .map_err(|_| CliFailure::invalid("invalid change ID"))?;
             let local = open(&context.store_root)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
@@ -814,8 +885,11 @@ fn main() -> Result<()> {
                 .replace_prepared(&context.root)?
                 .publish()
                 .map_err(|error| anyhow::anyhow!(error))?;
-            println!("selected change {change} — {}", selected.title);
-            Ok(())
+            Success::new(
+                "change.select",
+                json!({ "change": change.to_string(), "title": selected.title }),
+                format!("selected change {change} — {}\n", selected.title),
+            )
         }
         Command::Resolve(arguments) => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
@@ -833,17 +907,17 @@ fn import(
     arguments: ImportArgs,
     explicit_store: Option<&Path>,
     default_workspace: &Path,
-) -> Result<()> {
+) -> Result<Success> {
     let workspace_root = arguments.workspace.as_deref().unwrap_or(default_workspace);
     ensure_fresh_workspace(workspace_root)?;
     let store_root = explicit_store
         .map(Path::to_path_buf)
         .unwrap_or(allocate_store_root()?);
     if store_root.exists() {
-        bail!(
+        return Err(CliFailure::invalid(format!(
             "Wheat store destination already exists: {}",
             store_root.display()
-        );
+        )));
     }
     let local_source = Path::new(&arguments.source);
     let clone;
@@ -870,20 +944,30 @@ fn import(
     );
     initialize_workspace_directory(workspace_root)?;
     workspace.initialize(workspace_root)?;
-    materialize_workspace(
+    let (view, materialized_root) = materialize_workspace(
         workspace_root,
         Some(&store_root),
         &format!("branch:{}", arguments.branch),
     )?;
-    println!(
-        "imported {} at generation {}",
-        arguments.branch, head.generation
+    let human = format!(
+        "materialized view {view} in {}\nimported {} at generation {}\nenvelope {}\n",
+        materialized_root.display(),
+        arguments.branch,
+        head.generation,
+        head.envelope,
     );
-    println!("envelope {}", head.envelope);
-    Ok(())
+    Success::new(
+        "import",
+        json!({
+            "branch": arguments.branch,
+            "generation": head.generation,
+            "envelope": head.envelope.to_string(),
+        }),
+        human,
+    )
 }
 
-fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<()> {
+fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Success> {
     ensure_fresh_workspace(workspace_root)?;
     let store_root = explicit_store
         .map(Path::to_path_buf)
@@ -898,21 +982,26 @@ fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Resul
         WorkspaceSelection::Published,
     )
     .initialize(workspace_root)?;
-    materialize_workspace(workspace_root, Some(&store_root), "published")?;
-    println!(
-        "initialized Wheat workspace at {}",
-        workspace_root.display()
-    );
-    println!("store {}", store_root.display());
-    Ok(())
+    let (view, materialized_root) =
+        materialize_workspace(workspace_root, Some(&store_root), "published")?;
+    Success::new(
+        "init",
+        json!({ "view": view.to_string() }),
+        format!(
+            "materialized view {view} in {}\ninitialized Wheat workspace at {}\nstore {}\n",
+            materialized_root.display(),
+            workspace_root.display(),
+            store_root.display(),
+        ),
+    )
 }
 
 fn ensure_fresh_workspace(root: &Path) -> Result<()> {
     if root.exists() && root.read_dir()?.next().is_some() {
-        bail!(
+        return Err(CliFailure::invalid(format!(
             "Wheat workspace destination is not empty: {}",
             root.display()
-        );
+        )));
     }
     Ok(())
 }
@@ -932,7 +1021,9 @@ fn resolve_context(
     if let Some(store) = explicit_store {
         let explicit = canonical_store_path(store)?;
         if explicit != context.store_root {
-            bail!("explicit Wheat store does not match the discovered workspace link");
+            return Err(CliFailure::invalid(
+                "explicit Wheat store does not match the discovered workspace link",
+            ));
         }
     }
     Ok(context)
@@ -951,7 +1042,7 @@ fn materialize_workspace(
     workspace: &Path,
     explicit_store: Option<&Path>,
     source: &str,
-) -> Result<()> {
+) -> Result<(wheat_core::ViewId, PathBuf)> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let requested_selection = parse_selection(source)?;
     let repository = open(&context.store_root)?;
@@ -971,15 +1062,14 @@ fn materialize_workspace(
         tree,
         requested_selection,
     ))?;
-    println!("materialized view {view} in {}", context.root.display());
-    Ok(())
+    Ok((view, context.root))
 }
 
 fn restore_workspace(
     workspace: &Path,
     explicit_store: Option<&Path>,
     paths: &[String],
-) -> Result<()> {
+) -> Result<usize> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
     let restored = runtime()?.block_on(materialization::restore(
@@ -988,8 +1078,7 @@ fn restore_workspace(
         &mut context.workspace,
         paths,
     ))?;
-    println!("restored {restored} tracked path(s)");
-    Ok(())
+    Ok(restored)
 }
 
 fn parse_selection(source: &str) -> Result<WorkspaceSelection> {
@@ -1002,7 +1091,9 @@ fn parse_selection(source: &str) -> Result<WorkspaceSelection> {
                 .expect("matched prefix")
                 .into(),
         }),
-        _ => bail!("source must be published, working, or branch:<name>"),
+        _ => Err(CliFailure::invalid(
+            "source must be published, working, or branch:<name>",
+        )),
     }
 }
 
@@ -1038,18 +1129,20 @@ fn clone_remote_for_import(remote: &str) -> Result<tempfile::TempDir> {
         .arg(directory.path())
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("spawn git clone for Wheat import")?;
     if !status.success() {
-        bail!(
+        return Err(CliFailure::transport(format!(
             "git clone for Wheat import failed with status {:?}",
             status.code()
-        );
+        )));
     }
     Ok(directory)
 }
 
-fn push(root: &std::path::Path, arguments: PushArgs) -> Result<()> {
+fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
     let local = open(root)?;
     let expected = local.heads.read()?;
     let runtime = runtime()?;
@@ -1068,7 +1161,11 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<()> {
                     .get(name)
                     .with_context(|| format!("unknown Wheat branch {name}"))?
             }
-            _ => bail!("source must be published, working, or branch:<name>"),
+            _ => {
+                return Err(CliFailure::invalid(
+                    "source must be published, working, or branch:<name>",
+                ));
+            }
         };
         Ok::<_, anyhow::Error>((state.base_view, selected))
     })?;
@@ -1084,7 +1181,9 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<()> {
     ))?;
     let actual = local.heads.read()?;
     if actual != expected {
-        bail!("Wheat repository changed while preparing the Git projection; retry the push");
+        return Err(CliFailure::stale(
+            "Wheat repository changed while preparing the Git projection; retry the push",
+        ));
     }
     let projected = prepared
         .export
@@ -1098,24 +1197,32 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<()> {
         .context("projection did not produce a Git commit")?;
     let report = wheat_git::bridge::publish_prepared(prepared)?;
     let outcome = report.refs.first().context("git returned no ref status")?;
-    match outcome.status {
-        wheat_git::push::RefStatus::UpToDate => {
-            println!("{} is already at {tip}", arguments.to);
-        }
-        _ => {
-            println!(
-                "pushed {projected} Wheat revisions to {} at {tip}",
-                arguments.to
-            );
-        }
-    }
-    Ok(())
+    let up_to_date = matches!(outcome.status, wheat_git::push::RefStatus::UpToDate);
+    let human = if up_to_date {
+        format!("{} is already at {tip}\n", arguments.to)
+    } else {
+        format!(
+            "pushed {projected} Wheat revisions to {} at {tip}\n",
+            arguments.to
+        )
+    };
+    Success::new(
+        "push",
+        json!({
+            "destination": arguments.to,
+            "tip": tip.to_string(),
+            "projected_revisions": projected,
+            "up_to_date": up_to_date,
+        }),
+        human,
+    )
 }
 
-fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<()> {
+fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<Success> {
     let local = open(root)?;
     let expected = local.heads.read()?;
-    let revision = RevisionId::from_str(&arguments.revision).context("invalid revision ID")?;
+    let revision = RevisionId::from_str(&arguments.revision)
+        .map_err(|_| CliFailure::invalid("invalid revision ID"))?;
     let runtime = runtime()?;
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
     let reader = RepositoryReader::new(&objects, &local.content);
@@ -1128,7 +1235,9 @@ fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<()> {
             .get(working.revisions, record.change_id)
             .await?;
         if current != Some(revision) {
-            bail!("revision is not the current conflicted application");
+            return Err(CliFailure::conflict(
+                "revision is not the current conflicted application",
+            ));
         }
         let application_id = ApplicationMapStore::new(&objects)
             .get(working.applications, record.change_id)
@@ -1141,7 +1250,9 @@ fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<()> {
                 ApplicationResultRecord::Conflicted { .. }
             )
         {
-            bail!("revision is not the current conflicted application");
+            return Err(CliFailure::conflict(
+                "revision is not the current conflicted application",
+            ));
         }
         let target = reader.view(application.target_view).await?;
         let components = arguments
@@ -1166,7 +1277,7 @@ fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<()> {
             Some(FileValue { content, kind })
         }
         None if arguments.delete => None,
-        None => bail!("a value or --delete is required"),
+        None => return Err(CliFailure::invalid("a value or --delete is required")),
     };
     let resolution = PersistedConflictResolution {
         conflict_revision: revision,
@@ -1191,8 +1302,14 @@ fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<()> {
     let mut output = String::new();
     writeln!(output, "revision {}", outcome.revision_id)?;
     print_reapplied(&mut output, &outcome.reapplied)?;
-    print!("{output}");
-    Ok(())
+    Success::new(
+        "resolve",
+        json!({
+            "revision": outcome.revision_id.to_string(),
+            "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }),
+        output,
+    )
 }
 
 /// Captures the initial whole-file edit for `change new`.
@@ -1224,7 +1341,9 @@ fn capture_initial_edit(
         .path
         .context("--path is required when supplying an initial edit")?;
     if !arguments.delete && arguments.value.is_none() && arguments.replacement_kind.is_none() {
-        bail!("--value, --replacement-kind, or --delete is required for an initial edit");
+        return Err(CliFailure::invalid(
+            "--value, --replacement-kind, or --delete is required for an initial edit",
+        ));
     }
     let captured =
         wheat_core::edit_capture::capture_edit(&path, before, after, None, Limits::default())?;

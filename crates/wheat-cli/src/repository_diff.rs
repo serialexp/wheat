@@ -6,14 +6,14 @@
 
 use std::str::FromStr;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Result;
 use wheat_core::{FileValue, ObjectId, RevisionId, TreeId, ViewId};
 use wheat_store::{
-    ContentStoreError, MerkleTreeStore, PublicationStore, RepositoryReader, RetainedSetStore,
-    TreeDiffLimits,
+    ContentStoreError, MerkleTreeError, MerkleTreeStore, PublicationStore, RepositoryReader,
+    RetainedSetStore, TreeDiffLimits,
 };
 
-use crate::local::LocalRepository;
+use crate::{command_output::CliFailure, local::LocalRepository};
 
 const MAX_DIFF_CHANGES: usize = 250_000;
 const MAX_DIFF_PATH_BYTES: usize = 4_096;
@@ -63,34 +63,41 @@ pub(crate) async fn revision(
     deadline: std::time::Instant,
 ) -> Result<RepositoryDiffInput> {
     let snapshot = Snapshot::read(repository).await?;
-    ensure!(
-        snapshot
+    if !snapshot
+        .retained
+        .contains(
+            snapshot.state.retained_revisions,
+            ObjectId::from(revision_id),
+        )
+        .await?
+    {
+        return Err(CliFailure::invalid(
+            "revision is not retained by the current repository state",
+        ));
+    }
+    let revision = snapshot.reader.revision(revision_id).await?;
+    if revision.id() != revision_id {
+        return Err(CliFailure::corrupt("revision identity mismatch"));
+    }
+    let from = if let Some(predecessor_id) = revision.predecessor {
+        if !snapshot
             .retained
             .contains(
                 snapshot.state.retained_revisions,
-                ObjectId::from(revision_id)
+                ObjectId::from(predecessor_id),
             )
-            .await?,
-        "revision is not retained by the current repository state"
-    );
-    let revision = snapshot.reader.revision(revision_id).await?;
-    ensure!(revision.id() == revision_id, "revision identity mismatch");
-    let from = if let Some(predecessor_id) = revision.predecessor {
-        ensure!(
-            snapshot
-                .retained
-                .contains(
-                    snapshot.state.retained_revisions,
-                    ObjectId::from(predecessor_id),
-                )
-                .await?,
-            "revision predecessor is not retained by the current repository state"
-        );
+            .await?
+        {
+            return Err(CliFailure::corrupt(
+                "revision predecessor is not retained by the current repository state",
+            ));
+        }
         let predecessor = snapshot.reader.revision(predecessor_id).await?;
-        ensure!(
-            predecessor.id() == predecessor_id,
-            "revision predecessor identity mismatch"
-        );
+        if predecessor.id() != predecessor_id {
+            return Err(CliFailure::corrupt(
+                "revision predecessor identity mismatch",
+            ));
+        }
         predecessor.resulting_tree
     } else {
         snapshot
@@ -158,7 +165,7 @@ async fn finish(
     );
     let mut changes = Vec::new();
     let mut remaining_inline_bytes = MAX_TOTAL_INLINE_CONTENT_BYTES;
-    while let Some(change) = cursor.next().await? {
+    while let Some(change) = cursor.next().await.map_err(classify_diff_error)? {
         let old_value = change.old;
         let new_value = change.new;
         let old = read_side(repository, old_value, &mut remaining_inline_bytes)?;
@@ -182,6 +189,19 @@ async fn finish(
     })
 }
 
+fn classify_diff_error(error: MerkleTreeError) -> anyhow::Error {
+    match error {
+        error @ (MerkleTreeError::ChangeLimitExceeded { .. }
+        | MerkleTreeError::NodeLimitExceeded { .. }
+        | MerkleTreeError::EntryLimitExceeded { .. }
+        | MerkleTreeError::PathBytesExceeded { .. }
+        | MerkleTreeError::DepthExceeded { .. }
+        | MerkleTreeError::NodeBytesExceeded { .. }
+        | MerkleTreeError::BufferedEntriesExceeded { .. }) => CliFailure::limit(error.to_string()),
+        error => error.into(),
+    }
+}
+
 fn reuse_side(value: FileValue, source: Option<&TreeSideInput>) -> TreeSideInput {
     let source = source.expect("equal content identity has an old side");
     TreeSideInput {
@@ -202,9 +222,9 @@ fn read_side(
     let allowance = (*remaining).min(MAX_INLINE_CONTENT_BYTES);
     let (bytes, min_bytes) = match repository.content.get_bounded(value.content, allowance) {
         Ok(bytes) => {
-            *remaining = remaining
-                .checked_sub(bytes.len())
-                .context("repository diff inline byte budget underflow")?;
+            *remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
+                CliFailure::corrupt("repository diff inline byte budget underflow")
+            })?;
             let len = bytes.len();
             (Some(bytes), len)
         }
@@ -231,15 +251,13 @@ impl<'a> Snapshot<'a> {
         let head = repository.heads.read()?;
         let reader = RepositoryReader::new(&repository.objects, &repository.content);
         let envelope = reader.envelope(head.envelope).await?;
-        ensure!(
-            envelope.id() == head.envelope,
-            "repository envelope identity mismatch"
-        );
+        if envelope.id() != head.envelope {
+            return Err(CliFailure::corrupt("repository envelope identity mismatch"));
+        }
         let state = reader.state(envelope.state).await?;
-        ensure!(
-            state.id() == envelope.state,
-            "repository state identity mismatch"
-        );
+        if state.id() != envelope.state {
+            return Err(CliFailure::corrupt("repository state identity mismatch"));
+        }
         // Diff follows only the requested retained roots. Complete history validation belongs to
         // `wheat validate`; doing it here would make a sparse comparison scale with all history.
         Ok(Self {
@@ -257,18 +275,34 @@ impl<'a> Snapshot<'a> {
             "working" => self.state.working_view,
             _ if selector.starts_with("branch:") => {
                 let name = selector.strip_prefix("branch:").expect("prefix checked");
-                ensure!(!name.is_empty(), "branch selector requires a name");
+                if name.is_empty() {
+                    return Err(CliFailure::invalid("branch selector requires a name"));
+                }
                 self.reader
                     .branch_manifest(self.envelope.branches)
                     .await?
                     .branches
                     .get(name)
                     .copied()
-                    .with_context(|| format!("unknown branch {name}"))?
+                    .ok_or_else(|| CliFailure::invalid(format!("unknown branch {name}")))?
             }
-            _ => ViewId::from_str(selector).context("invalid view selector")?,
+            _ => ViewId::from_str(selector)
+                .map_err(|_| CliFailure::invalid("invalid view selector"))?,
         };
-        Ok((id, self.resolve_retained_view(id).await?))
+        if !self
+            .retained
+            .contains(self.state.retained_views, ObjectId::from(id))
+            .await?
+        {
+            return Err(CliFailure::invalid(
+                "view is not retained by the current repository state",
+            ));
+        }
+        let view = self.reader.view(id).await?;
+        if view.id() != id {
+            return Err(CliFailure::corrupt("view identity mismatch"));
+        }
+        Ok((id, view))
     }
 
     async fn resolve_retained_view(&self, id: ViewId) -> Result<wheat_core::ViewRecord> {
@@ -277,10 +311,14 @@ impl<'a> Snapshot<'a> {
             .contains(self.state.retained_views, ObjectId::from(id))
             .await?
         {
-            bail!("view is not retained by the current repository state");
+            return Err(CliFailure::corrupt(
+                "view is not retained by the current repository state",
+            ));
         }
         let view = self.reader.view(id).await?;
-        ensure!(view.id() == id, "view identity mismatch");
+        if view.id() != id {
+            return Err(CliFailure::corrupt("view identity mismatch"));
+        }
         Ok(view)
     }
 }

@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::process::{Command, Output};
 
 use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
@@ -413,6 +415,7 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     assert!(conflicts_json_output.status.success());
     let conflicts_json: serde_json::Value =
         serde_json::from_slice(&conflicts_json_output.stdout).unwrap();
+    let conflicts_json = &conflicts_json["result"];
     assert_eq!(conflicts_json["schema_version"], 1);
     assert!(conflicts_json["head_generation"].as_u64().is_some());
     let conflict = &conflicts_json["conflicts"][0];
@@ -455,7 +458,10 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     assert!(resolved_conflicts.status.success());
     let resolved_conflicts: serde_json::Value =
         serde_json::from_slice(&resolved_conflicts.stdout).unwrap();
-    assert_eq!(resolved_conflicts["conflicts"], serde_json::json!([]));
+    assert_eq!(
+        resolved_conflicts["result"]["conflicts"],
+        serde_json::json!([])
+    );
 
     // Omitting --kind preserves the target tree's executable kind. A follow-up
     // expecting that kind therefore applies cleanly.

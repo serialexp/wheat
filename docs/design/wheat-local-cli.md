@@ -65,14 +65,18 @@ both lists.
   Explicit adds report their destination while preserving the workspace selection.
   Descendant edits already absorbed by an amended ancestor reapply as authenticated
   no-ops rather than false conflicts. Workspace-wide capture remains Phase 2 work.
+- [x] **Linux-only platform contract.** The entire reference CLI fails before
+  parsing or filesystem side effects on non-Linux platforms. macOS is Unix, but
+  does not provide the Linux `renameat2` primitives on which crash-safe
+  materialization depends; neither it nor Windows is currently supported. A
+  non-Linux-only black-box test fixes the refusal contract for native CI.
+- [x] **Structured automation contract.** Global `--format human|json` selects
+  either the existing human presentation or one bounded, versioned terminal JSON
+  document for success and expected failure. Stable categories, symbolic error
+  codes, retryability, and exit classes have black-box coverage, including
+  retryable stale-predecessor refusal without repository-head mutation.
 
 ### Outstanding
-- [ ] **Phase 1 — cross-platform workspace contract.** Provide equivalent
-  non-Linux safety/file-kind guarantees or continue to fail closed for workspace
-  mutation on unsupported platforms.
-- [ ] **Phase 1 — structured automation contract.** Version machine-readable
-  outcomes and error categories, stabilize exit behavior, bound diagnostics, and
-  cover retryable stale-state outcomes in black-box tests.
 - [ ] **Phase 2 — branch and target workflow.** List, create, rename, delete, and
   switch named targets; define which target mutations advance and materialize it
   without treating a mutable name as change identity.
@@ -325,8 +329,12 @@ human view should answer:
 - whether repository authority changed since the workspace was materialized;
 - which state is local-only versus represented by a configured remote target.
 
-Machine-readable output should be versioned and opt-in, for example
-`--format=json`, with stable status categories rather than parsing prose.
+Machine-readable output is versioned and opt-in through the global
+`--format=json` option. Every invocation emits exactly one terminal document on
+stdout and no prose diagnostics on stderr. Success nests the command-specific
+result; failure carries a stable category, symbolic code, retryability, and a
+bounded human diagnostic. Callers branch on those fields rather than parsing
+prose. The default remains `--format=human`.
 
 `wheat diff` needs three initial forms:
 
@@ -555,6 +563,21 @@ mistaken for permission to modify them.
 
 ## Errors and automation
 
+The JSON terminal envelope is `wheat-command-result` version 1. It contains
+`ok`, the resolved command name, and either `result` or `error`. Error objects
+contain `category`, `code`, `retryable`, and `message`. Exit classes are stable:
+0 success; 2 invalid invocation/input; 3 retryable stale state; 4 unresolved
+conflict; 5 configured limit; 6 integrity failure; 7 unsupported platform; 8
+I/O or transport failure; and 1 unexpected internal failure. The symbolic error
+code remains the finer-grained automation key.
+
+`cat` is bounded by the same terminal-output budget: human mode writes raw bytes,
+while JSON mode represents them as a structured byte array until the native
+client/protocol introduces a streaming binary response. Help/version are terminal
+success documents in JSON mode; parser failures are terminal error documents.
+A downstream stdout write failure may necessarily leave an OS-level partial write;
+JSON mode never follows such a failure with prose on stderr.
+
 Routine failures need distinct structured categories:
 
 - workspace dirty or blocked path;
@@ -587,8 +610,13 @@ error chain to decide whether retry is safe.
    Complete: workspace selection, active listing, explicit one-shot override, and
    absorbed descendant no-op evidence are implemented.
 7. Add versioned structured outcomes, stable error categories, and bounded output.
+   Complete: one global human/JSON switch covers parser, read, mutation, raw-content,
+   and failure outcomes; diagnostics, exit classes, and retryable stale predecessor
+   behavior are qualified at the binary boundary.
 8. Run a black-box Git-import → materialize → edit → diff → revise → push flow,
-   including machine-readable retryable failures.
+   including machine-readable retryable failures. The existing black-box suites
+   exercise every stage and the automation corpus covers structured success and
+   stale refusal; the complete acceptance sequence remains the Phase 1 closure run.
 
 ### Phase 2 — multiple targets and repository tooling
 

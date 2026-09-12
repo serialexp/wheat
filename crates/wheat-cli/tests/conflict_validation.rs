@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::process::{Command, Output};
 
 fn store_home(workspace: &std::path::Path) -> std::path::PathBuf {
@@ -86,7 +88,7 @@ fn conflict_inspection_does_not_read_unselected_retained_history() {
     std::fs::write(object_path(&store_path(&workspace), &revision), b"corrupt").unwrap();
     let output = ok(&workspace, &["conflicts", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["conflicts"], serde_json::json!([]));
+    assert_eq!(document["result"]["conflicts"], serde_json::json!([]));
 }
 
 #[test]
@@ -95,7 +97,7 @@ fn conflict_inspection_rejects_a_corrupt_selected_working_view() {
     let status: serde_json::Value =
         serde_json::from_slice(&ok(&workspace, &["status", "--format", "json"]).stdout).unwrap();
     let working: wheat_core::ViewId =
-        serde_json::from_value(status["working_view"].clone()).unwrap();
+        serde_json::from_value(status["result"]["working_view"].clone()).unwrap();
     std::fs::write(
         object_path(&store_path(&workspace), &working.to_string()),
         b"corrupt",

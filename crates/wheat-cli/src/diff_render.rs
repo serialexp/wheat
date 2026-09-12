@@ -7,32 +7,31 @@ use wheat_core::diff_model::{
     DiffDocument, DiffLineOperation, DiffOmissionReason, DiffPresentation, DiffText,
 };
 
+use crate::command_output::CliFailure;
+
 pub(crate) const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-pub(crate) fn human(document: &DiffDocument) -> Result<()> {
-    emit(render_human(document, MAX_OUTPUT_BYTES)?)
-}
-pub(crate) fn json(document: &DiffDocument) -> Result<()> {
-    emit(render_json(document, MAX_OUTPUT_BYTES)?)
+pub(crate) fn human_bytes(document: &DiffDocument) -> Result<Vec<u8>> {
+    render_human(document)
 }
 
-fn emit(bytes: Vec<u8>) -> Result<()> {
-    let stdout = io::stdout();
-    commit(&mut stdout.lock(), &bytes)
+fn render_human(document: &DiffDocument) -> Result<Vec<u8>> {
+    render_human_with_limit(document, MAX_OUTPUT_BYTES)
 }
 
-fn commit(destination: &mut impl Write, bytes: &[u8]) -> Result<()> {
-    // Rendering has completed successfully. Commit with exactly one destination write so an
-    // overflow or serialization error can never expose a prefix of the document.
-    let written = destination.write(bytes)?;
-    if written != bytes.len() {
-        return Err(io::Error::new(io::ErrorKind::WriteZero, "short diff output write").into());
-    }
-    Ok(())
-}
-
-fn render_human(document: &DiffDocument, limit: usize) -> Result<Vec<u8>> {
+fn render_human_with_limit(document: &DiffDocument, limit: usize) -> Result<Vec<u8>> {
     let mut output = LimitedBuffer::new(limit);
+    let result = render_human_into(document, &mut output);
+    if output.limit_exceeded {
+        return Err(CliFailure::limit(
+            "diff output exceeded configured byte limit",
+        ));
+    }
+    result?;
+    Ok(output.into_inner())
+}
+
+fn render_human_into(document: &DiffDocument, output: &mut LimitedBuffer) -> Result<()> {
     for file in &document.files {
         let old_path = display_path("a", &file.path);
         let new_path = display_path("b", &file.path);
@@ -62,7 +61,7 @@ fn render_human(document: &DiffDocument, limit: usize) -> Result<Vec<u8>> {
                 } else if file.new.is_none() {
                     writeln!(output, "File deleted")?;
                 }
-                render_text(&mut output, diff)?;
+                render_text(&mut *output, diff)?;
             }
             DiffPresentation::Binary => match (&file.old, &file.new) {
                 (Some(old), Some(new)) => writeln!(
@@ -72,7 +71,9 @@ fn render_human(document: &DiffDocument, limit: usize) -> Result<Vec<u8>> {
                 )?,
                 (None, Some(new)) => writeln!(output, "Binary file added ({})", new.content)?,
                 (Some(old), None) => writeln!(output, "Binary file deleted ({})", old.content)?,
-                (None, None) => unreachable!("diff has at least one side"),
+                (None, None) => {
+                    return Err(CliFailure::corrupt("diff file has neither side"));
+                }
             },
             DiffPresentation::Symlink => match (&file.old, &file.new) {
                 (Some(old), Some(new)) => writeln!(
@@ -82,18 +83,23 @@ fn render_human(document: &DiffDocument, limit: usize) -> Result<Vec<u8>> {
                 )?,
                 (None, Some(new)) => writeln!(output, "Symlink added ({})", new.content)?,
                 (Some(old), None) => writeln!(output, "Symlink deleted ({})", old.content)?,
-                (None, None) => unreachable!("diff has at least one side"),
+                (None, None) => {
+                    return Err(CliFailure::corrupt("diff file has neither side"));
+                }
             },
             DiffPresentation::Kind { diff } => {
-                let old = file.old.as_ref().expect("kind change old side");
-                let new = file.new.as_ref().expect("kind change new side");
+                let (Some(old), Some(new)) = (&file.old, &file.new) else {
+                    return Err(CliFailure::corrupt(
+                        "kind-change diff does not contain both sides",
+                    ));
+                };
                 writeln!(
                     output,
                     "File kind changed ({:?} {} -> {:?} {})",
                     old.kind, old.content, new.kind, new.content
                 )?;
                 if let Some(diff) = diff {
-                    render_text(&mut output, diff)?;
+                    render_text(&mut *output, diff)?;
                 }
             }
             DiffPresentation::Omitted { reason } => {
@@ -101,7 +107,7 @@ fn render_human(document: &DiffDocument, limit: usize) -> Result<Vec<u8>> {
             }
         }
     }
-    Ok(output.into_inner())
+    Ok(())
 }
 
 fn render_text(output: &mut impl Write, diff: &DiffText) -> Result<()> {
@@ -117,7 +123,11 @@ fn render_text(output: &mut impl Write, diff: &DiffText) -> Result<()> {
                 DiffLineOperation::Delete => '-',
                 DiffLineOperation::Insert => '+',
             };
-            let text = &diff.text[line.text_start..line.text_end];
+            let Some(text) = diff.text.get(line.text_start..line.text_end) else {
+                return Err(CliFailure::corrupt(
+                    "diff line range is outside authenticated text",
+                ));
+            };
             write!(output, "{prefix}{text}")?;
             if !text.ends_with('\n') {
                 writeln!(output)?;
@@ -140,13 +150,6 @@ fn display_path(prefix: &str, path: &str) -> String {
     }
 }
 
-fn render_json(document: &DiffDocument, limit: usize) -> Result<Vec<u8>> {
-    let mut output = LimitedBuffer::new(limit);
-    serde_json::to_writer_pretty(&mut output, document)?;
-    writeln!(output)?;
-    Ok(output.into_inner())
-}
-
 fn omission(reason: DiffOmissionReason) -> &'static str {
     match reason {
         DiffOmissionReason::InlineBytes => "inline byte limit",
@@ -160,12 +163,14 @@ fn omission(reason: DiffOmissionReason) -> &'static str {
 struct LimitedBuffer {
     bytes: Vec<u8>,
     limit: usize,
+    limit_exceeded: bool,
 }
 impl LimitedBuffer {
     fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::new(),
             limit,
+            limit_exceeded: false,
         }
     }
     fn into_inner(self) -> Vec<u8> {
@@ -174,12 +179,12 @@ impl LimitedBuffer {
 }
 impl Write for LimitedBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let end = self
-            .bytes
-            .len()
-            .checked_add(bytes.len())
-            .ok_or_else(|| io::Error::other("diff output size overflow"))?;
+        let Some(end) = self.bytes.len().checked_add(bytes.len()) else {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("diff output size overflow"));
+        };
         if end > self.limit {
+            self.limit_exceeded = true;
             return Err(io::Error::other(
                 "diff output exceeded configured byte limit",
             ));
@@ -194,8 +199,16 @@ impl Write for LimitedBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{LimitedBuffer, commit};
-    use std::io::{self, Write};
+    use super::{LimitedBuffer, render_human_with_limit};
+    use crate::command_output::CliFailure;
+    use std::io::Write;
+    use wheat_core::{
+        ContentId, FileKind,
+        diff_model::{
+            DiffComparison, DiffDescriptor, DiffDocument, DiffHunk, DiffLine, DiffLineOperation,
+            DiffPresentation, DiffText, FileChangeKind, FileDiff,
+        },
+    };
 
     #[test]
     fn output_limit_is_enforced_without_partial_write() {
@@ -209,26 +222,89 @@ mod tests {
     }
 
     #[test]
-    fn successful_output_is_committed_with_one_destination_write() {
-        #[derive(Default)]
-        struct Counted {
-            writes: usize,
-            bytes: Vec<u8>,
-        }
-        impl Write for Counted {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.writes += 1;
-                self.bytes.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
+    fn renderer_returns_typed_output_limit_failure() {
+        let descriptor = DiffDescriptor {
+            kind: FileKind::Regular,
+            content: ContentId::from_digest([1; 32]),
+            bytes: 1,
+            text: Some(false),
+        };
+        let document = DiffDocument {
+            schema_version: 1,
+            comparison: DiffComparison::WorkspaceVsPinned {
+                materialized_view: wheat_core::ViewId::from_digest([2; 32]),
+                materialized_head_generation: 1,
+                current_head_generation: 1,
+                authority_advanced: false,
+            },
+            files: vec![FileDiff {
+                path: "path".into(),
+                change: FileChangeKind::Added,
+                old: None,
+                new: Some(descriptor),
+                content_changed: true,
+                kind_changed: false,
+                presentation: DiffPresentation::Binary,
+                truncated: false,
+            }],
+        };
 
-        let mut destination = Counted::default();
-        commit(&mut destination, b"complete\n").unwrap();
-        assert_eq!(destination.writes, 1);
-        assert_eq!(destination.bytes, b"complete\n");
+        let error = render_human_with_limit(&document, 1).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<CliFailure>(),
+            Some(CliFailure::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn renderer_returns_typed_corruption_for_invalid_text_ranges() {
+        let descriptor = DiffDescriptor {
+            kind: FileKind::Regular,
+            content: ContentId::from_digest([1; 32]),
+            bytes: 2,
+            text: Some(true),
+        };
+        let document = DiffDocument {
+            schema_version: 1,
+            comparison: DiffComparison::WorkspaceVsPinned {
+                materialized_view: wheat_core::ViewId::from_digest([2; 32]),
+                materialized_head_generation: 1,
+                current_head_generation: 1,
+                authority_advanced: false,
+            },
+            files: vec![FileDiff {
+                path: "path".into(),
+                change: FileChangeKind::Modified,
+                old: Some(descriptor.clone()),
+                new: Some(descriptor),
+                content_changed: true,
+                kind_changed: false,
+                presentation: DiffPresentation::Text {
+                    diff: DiffText {
+                        text: "ø".into(),
+                        hunks: vec![DiffHunk {
+                            old_start: 1,
+                            old_count: 1,
+                            new_start: 1,
+                            new_count: 1,
+                            lines: vec![DiffLine {
+                                operation: DiffLineOperation::Context,
+                                old_line: Some(1),
+                                new_line: Some(1),
+                                text_start: 1,
+                                text_end: 2,
+                            }],
+                        }],
+                    },
+                },
+                truncated: false,
+            }],
+        };
+
+        let error = render_human_with_limit(&document, 1024).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<CliFailure>(),
+            Some(CliFailure::CorruptState(_))
+        ));
     }
 }

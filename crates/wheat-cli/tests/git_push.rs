@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::{path::Path, process::Command};
 
 fn git(directory: Option<&Path>, arguments: &[&str]) -> String {

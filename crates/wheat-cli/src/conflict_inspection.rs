@@ -5,12 +5,12 @@ use std::{
     io::{self, Write},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use serde::Serialize;
 use wheat_core::{EditFailure, EditId, FileValue, ObjectId, ViewId};
 use wheat_store::{ConflictSetStore, PublicationStore, RepositoryReader, RetainedSetStore};
 
-use crate::local::LocalRepository;
+use crate::{command_output::CliFailure, local::LocalRepository};
 
 const MAX_CONFLICTS: usize = 100_000;
 const MAX_DISTINCT_EDITS: usize = 250_000;
@@ -49,27 +49,26 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
     // Follow only the roots selected by this head: complete validation is deliberately reserved
     // for `wheat validate`, since walking unrelated retained history makes inspection unbounded.
     let envelope = reader.envelope(head.envelope).await?;
-    ensure!(
-        envelope.id() == head.envelope,
-        "repository envelope identity mismatch"
-    );
+    if envelope.id() != head.envelope {
+        return Err(CliFailure::corrupt("repository envelope identity mismatch"));
+    }
     let state = reader.state(envelope.state).await?;
-    ensure!(
-        state.id() == envelope.state,
-        "repository state identity mismatch"
-    );
+    if state.id() != envelope.state {
+        return Err(CliFailure::corrupt("repository state identity mismatch"));
+    }
     let retained = RetainedSetStore::new(&repository.objects);
-    ensure!(
-        retained
-            .contains(state.retained_views, ObjectId::from(state.working_view))
-            .await?,
-        "working view is not retained by the current repository state"
-    );
+    if !retained
+        .contains(state.retained_views, ObjectId::from(state.working_view))
+        .await?
+    {
+        return Err(CliFailure::corrupt(
+            "working view is not retained by the current repository state",
+        ));
+    }
     let working = reader.view(state.working_view).await?;
-    ensure!(
-        working.id() == state.working_view,
-        "working view identity mismatch"
-    );
+    if working.id() != state.working_view {
+        return Err(CliFailure::corrupt("working view identity mismatch"));
+    }
     let conflicts = ConflictSetStore::new(&repository.objects);
     let mut cursor = conflicts.cursor(working.unresolved_conflicts).await?;
     let mut entries = Vec::new();
@@ -80,24 +79,26 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
     let mut aggregate_path_bytes = 0usize;
     let mut model_bytes = 0usize;
     while let Some(id) = cursor.next().await? {
-        ensure!(
-            entries.len() < MAX_CONFLICTS,
-            "conflict count exceeds inspection limit"
-        );
+        if entries.len() >= MAX_CONFLICTS {
+            return Err(CliFailure::limit("conflict count exceeds inspection limit"));
+        }
         let conflict = reader.conflict(id).await?;
-        ensure!(conflict.id == id, "conflict identity mismatch");
+        if conflict.id != id {
+            return Err(CliFailure::corrupt("conflict identity mismatch"));
+        }
         if retained_base_views.insert(conflict.base_view) {
-            ensure!(
-                retained
-                    .contains(state.retained_views, ObjectId::from(conflict.base_view))
-                    .await?,
-                "conflict base view is not retained by the current repository state"
-            );
+            if !retained
+                .contains(state.retained_views, ObjectId::from(conflict.base_view))
+                .await?
+            {
+                return Err(CliFailure::corrupt(
+                    "conflict base view is not retained by the current repository state",
+                ));
+            }
             let base_view = reader.view(conflict.base_view).await?;
-            ensure!(
-                base_view.id() == conflict.base_view,
-                "conflict base view identity mismatch"
-            );
+            if base_view.id() != conflict.base_view {
+                return Err(CliFailure::corrupt("conflict base view identity mismatch"));
+            }
         }
         model_bytes = bounded_add(model_bytes, 64, MAX_MODEL_BYTES, "conflict model")?;
         let mut edits = Vec::new();
@@ -111,15 +112,17 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
             let path = if let Some(path) = paths.get(&edit_id) {
                 path.clone()
             } else {
-                ensure!(
-                    paths.len() < MAX_DISTINCT_EDITS,
-                    "distinct conflict edit count exceeds inspection limit"
-                );
+                if paths.len() >= MAX_DISTINCT_EDITS {
+                    return Err(CliFailure::limit(
+                        "distinct conflict edit count exceeds inspection limit",
+                    ));
+                }
                 let path = reader.edit(edit_id).await?.path;
-                ensure!(
-                    path.len() <= MAX_PATH_BYTES,
-                    "conflict edit path exceeds inspection limit"
-                );
+                if path.len() > MAX_PATH_BYTES {
+                    return Err(CliFailure::limit(
+                        "conflict edit path exceeds inspection limit",
+                    ));
+                }
                 aggregate_path_bytes = bounded_add(
                     aggregate_path_bytes,
                     path.len(),
@@ -138,13 +141,16 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
             // IDs, target, enum tag and interference IDs are all retained in the output model.
             let reason_bytes = match &evidence.reason {
                 EditFailure::Interference { with } => {
-                    ensure!(!with.is_empty(), "empty edit interference evidence");
+                    if with.is_empty() {
+                        return Err(CliFailure::corrupt("empty edit interference evidence"));
+                    }
                     for referenced in with {
                         if validated_edits.insert(*referenced) {
-                            ensure!(
-                                validated_edits.len() <= MAX_DISTINCT_EDITS,
-                                "distinct conflict edit count exceeds inspection limit"
-                            );
+                            if validated_edits.len() > MAX_DISTINCT_EDITS {
+                                return Err(CliFailure::limit(
+                                    "distinct conflict edit count exceeds inspection limit",
+                                ));
+                            }
                             reader.edit(*referenced).await?;
                         }
                     }
@@ -152,15 +158,19 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
                 }
                 _ => Some(0),
             }
-            .ok_or_else(|| anyhow::anyhow!("conflict model size overflow"))?;
-            validated_edits.insert(edit_id);
+            .ok_or_else(|| CliFailure::limit("conflict model size overflow"))?;
+            if validated_edits.insert(edit_id) && validated_edits.len() > MAX_DISTINCT_EDITS {
+                return Err(CliFailure::limit(
+                    "distinct conflict edit count exceeds inspection limit",
+                ));
+            }
             model_bytes = bounded_add(
                 model_bytes,
                 32usize
                     .checked_add(path.len())
                     .and_then(|size| size.checked_add(34))
                     .and_then(|size| size.checked_add(reason_bytes))
-                    .ok_or_else(|| anyhow::anyhow!("conflict model size overflow"))?,
+                    .ok_or_else(|| CliFailure::limit("conflict model size overflow"))?,
                 MAX_MODEL_BYTES,
                 "conflict model",
             )?;
@@ -189,8 +199,12 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
 fn bounded_add(current: usize, added: usize, limit: usize, name: &str) -> Result<usize> {
     let total = current
         .checked_add(added)
-        .ok_or_else(|| anyhow::anyhow!("{name} overflow"))?;
-    ensure!(total <= limit, "{name} exceeds inspection limit");
+        .ok_or_else(|| CliFailure::limit(format!("{name} overflow")))?;
+    if total > limit {
+        return Err(CliFailure::limit(format!(
+            "{name} exceeds inspection limit"
+        )));
+    }
     Ok(total)
 }
 
@@ -211,7 +225,8 @@ pub(crate) fn human(document: &ConflictDocument, destination: &mut impl Write) -
     })
 }
 
-pub(crate) fn json(document: &ConflictDocument, destination: &mut impl Write) -> Result<()> {
+#[cfg(test)]
+fn json(document: &ConflictDocument, destination: &mut impl Write) -> Result<()> {
     atomic_render(destination, MAX_OUTPUT_BYTES, |output| {
         serde_json::to_writer_pretty(&mut *output, document)?;
         writeln!(output)?;
@@ -225,7 +240,13 @@ fn atomic_render(
     render: impl FnOnce(&mut BoundedBuffer) -> Result<()>,
 ) -> Result<()> {
     let mut output = BoundedBuffer::new(limit);
-    render(&mut output)?;
+    let result = render(&mut output);
+    if output.limit_exceeded {
+        return Err(CliFailure::limit(
+            "conflict output exceeded configured byte limit",
+        ));
+    }
+    result?;
     destination.write_all(&output.bytes)?;
     Ok(())
 }
@@ -233,6 +254,7 @@ fn atomic_render(
 struct BoundedBuffer {
     bytes: Vec<u8>,
     limit: usize,
+    limit_exceeded: bool,
 }
 
 impl BoundedBuffer {
@@ -240,18 +262,19 @@ impl BoundedBuffer {
         Self {
             bytes: Vec::new(),
             limit,
+            limit_exceeded: false,
         }
     }
 }
 
 impl Write for BoundedBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let new_len = self
-            .bytes
-            .len()
-            .checked_add(bytes.len())
-            .ok_or_else(|| io::Error::other("conflict output size overflow"))?;
+        let Some(new_len) = self.bytes.len().checked_add(bytes.len()) else {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("conflict output size overflow"));
+        };
         if new_len > self.limit {
+            self.limit_exceeded = true;
             return Err(io::Error::other(
                 "conflict output exceeded configured byte limit",
             ));
@@ -291,10 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_bounds_accept_the_limit_and_reject_the_next_unit() {
+    fn aggregate_bounds_accept_the_limit_and_return_typed_failures() {
         assert_eq!(bounded_add(7, 3, 10, "test").unwrap(), 10);
-        assert!(bounded_add(10, 1, 10, "test").is_err());
-        assert!(bounded_add(usize::MAX, 1, usize::MAX, "test").is_err());
+        for error in [
+            bounded_add(10, 1, 10, "test").unwrap_err(),
+            bounded_add(usize::MAX, 1, usize::MAX, "test").unwrap_err(),
+        ] {
+            assert!(matches!(
+                error.downcast_ref::<CliFailure>(),
+                Some(CliFailure::LimitExceeded(_))
+            ));
+        }
     }
 
     #[test]
@@ -431,11 +461,19 @@ mod tests {
     fn output_limit_refuses_human_and_json_atomically() {
         let oversized = document(&"x".repeat(MAX_OUTPUT_BYTES));
         let mut human_destination = Vec::new();
-        assert!(human(&oversized, &mut human_destination).is_err());
+        let human_error = human(&oversized, &mut human_destination).unwrap_err();
+        assert!(matches!(
+            human_error.downcast_ref::<CliFailure>(),
+            Some(CliFailure::LimitExceeded(_))
+        ));
         assert!(human_destination.is_empty());
 
         let mut json_destination = Vec::new();
-        assert!(json(&oversized, &mut json_destination).is_err());
+        let json_error = json(&oversized, &mut json_destination).unwrap_err();
+        assert!(matches!(
+            json_error.downcast_ref::<CliFailure>(),
+            Some(CliFailure::LimitExceeded(_))
+        ));
         assert!(json_destination.is_empty());
     }
 }

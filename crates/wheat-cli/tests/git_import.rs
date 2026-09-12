@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::{path::Path, process::Command};
 
 fn git(directory: Option<&Path>, arguments: &[&str]) -> String {
@@ -130,8 +132,8 @@ fn imports_and_materializes_a_selected_git_branch_in_a_separate_store() {
     );
     assert!(dirty.status.success());
     let json: serde_json::Value = serde_json::from_slice(&dirty.stdout).unwrap();
-    assert_eq!(json["changes"][0]["path"], "main.txt");
-    assert_eq!(json["changes"][0]["content_changed"], true);
+    assert_eq!(json["result"]["changes"][0]["path"], "main.txt");
+    assert_eq!(json["result"]["changes"][0]["content_changed"], true);
 }
 
 #[test]

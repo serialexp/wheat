@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::process::{Command, Output};
 
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
@@ -123,6 +125,7 @@ fn immutable_diff_classifies_utf8_with_nul_as_binary_and_emits_complete_json() {
         &["diff", "--revision", &revision, "--format", "json"],
     );
     let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let document = &document["result"];
     assert_eq!(document["files"][0]["change"], "modified");
     assert_eq!(document["files"][0]["presentation"]["type"], "binary");
 }
@@ -141,9 +144,9 @@ fn compares_symbolic_and_exact_retained_views_and_rejects_unknown_ids() {
     let status: serde_json::Value =
         serde_json::from_slice(&ok(&root, &["status", "--format", "json"]).stdout).unwrap();
     let published: wheat_core::ViewId =
-        serde_json::from_value(status["published_view"].clone()).unwrap();
+        serde_json::from_value(status["result"]["published_view"].clone()).unwrap();
     let working: wheat_core::ViewId =
-        serde_json::from_value(status["working_view"].clone()).unwrap();
+        serde_json::from_value(status["result"]["working_view"].clone()).unwrap();
     let published = published.to_string();
     let working = working.to_string();
     let symbolic = ok(&root, &["diff", "--from", "published", "--to", "working"]);

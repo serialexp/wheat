@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::{
     fs,
@@ -111,6 +111,7 @@ fn workspace_diff_covers_text_binary_symlink_kind_delete_crlf_and_json_v1() {
 
     let json = ok(dir.path(), &["diff", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let document = &document["result"];
     assert_eq!(document["schema_version"], 1);
     assert_eq!(document["comparison"]["type"], "workspace_vs_pinned");
     assert_eq!(document["comparison"]["authority_advanced"], false);
@@ -146,7 +147,7 @@ fn workspace_diff_is_lexical_ignores_untracked_files_and_does_not_change_metadat
 
     let output = ok(dir.path(), &["diff", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let paths = document["files"]
+    let paths = document["result"]["files"]
         .as_array()
         .unwrap()
         .iter()
@@ -173,7 +174,7 @@ fn oversized_workspace_text_is_identified_without_inline_capture() {
 
     let output = ok(dir.path(), &["diff", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let file = document["files"]
+    let file = document["result"]["files"]
         .as_array()
         .unwrap()
         .iter()
@@ -186,7 +187,7 @@ fn oversized_workspace_text_is_identified_without_inline_capture() {
 
     let status = ok(dir.path(), &["status", "--format", "json"]);
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    let tracked = status["changes"]
+    let tracked = status["result"]["changes"]
         .as_array()
         .unwrap()
         .iter()
@@ -207,7 +208,7 @@ fn oversized_workspace_binary_reports_raw_identity_and_length() {
 
     let output = ok(dir.path(), &["diff", "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let file = document["files"]
+    let file = document["result"]["files"]
         .as_array()
         .unwrap()
         .iter()
@@ -240,7 +241,7 @@ fn diff_uses_the_pinned_tree_when_repository_authority_advances() {
     assert!(ok(dir.path(), &["diff"]).stdout.is_empty());
     let status = ok(dir.path(), &["status", "--format", "json"]);
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["authority_advanced"], true);
+    assert_eq!(status["result"]["authority_advanced"], true);
 }
 
 #[test]
