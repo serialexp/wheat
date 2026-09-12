@@ -7,18 +7,27 @@ use std::{
 
 use anyhow::Result;
 use serde::Serialize;
-use wheat_core::{EditFailure, EditId, FileValue, ObjectId, ViewId};
-use wheat_store::{ConflictSetStore, PublicationStore, RepositoryReader, RetainedSetStore};
+use wheat_core::{
+    ApplicationId, ApplicationResultRecord, ChangeId, EditFailure, EditId, FileValue, ObjectId,
+    RevisionId, ViewId,
+};
+use wheat_store::{
+    ApplicationMapStore, ConflictSetStore, PublicationStore, RepositoryReader, RetainedSetStore,
+    RevisionMapStore,
+};
 
 use crate::{command_output::CliFailure, local::LocalRepository};
 
-const MAX_CONFLICTS: usize = 100_000;
-const MAX_DISTINCT_EDITS: usize = 250_000;
-const MAX_EDIT_OCCURRENCES: usize = 250_000;
-const MAX_PATH_BYTES: usize = 4_096;
+pub(crate) const MAX_CONFLICTS: usize = 100_000;
+const MAX_CURRENT_APPLICATIONS: usize = 250_000;
+pub(crate) const MAX_DISTINCT_EDITS: usize = 250_000;
+pub(crate) const MAX_EDIT_OCCURRENCES: usize = 250_000;
+pub(crate) const MAX_PATH_BYTES: usize = 4_096;
 const MAX_AGGREGATE_PATH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+type CurrentApplication = (ChangeId, RevisionId, ApplicationId, ViewId);
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ConflictDocument {
@@ -31,6 +40,9 @@ pub(crate) struct ConflictDocument {
 pub(crate) struct ConflictEntry {
     pub id: wheat_core::ConflictId,
     pub base_view: ViewId,
+    pub change_id: ChangeId,
+    pub revision_id: RevisionId,
+    pub application_id: ApplicationId,
     pub edits: Vec<ConflictEdit>,
 }
 
@@ -68,6 +80,44 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
     let working = reader.view(state.working_view).await?;
     if working.id() != state.working_view {
         return Err(CliFailure::corrupt("working view identity mismatch"));
+    }
+    let applications = ApplicationMapStore::new(&repository.objects);
+    let mut application_cursor = applications.cursor(working.applications).await?;
+    let mut conflicted_applications = BTreeMap::<wheat_core::ConflictId, CurrentApplication>::new();
+    let mut application_count = 0usize;
+    while let Some((change_id, application_id)) = application_cursor.next().await? {
+        application_count = bounded_add(
+            application_count,
+            1,
+            MAX_CURRENT_APPLICATIONS,
+            "current application count",
+        )?;
+        let application = reader.application(application_id).await?;
+        let current_revision = RevisionMapStore::new(&repository.objects)
+            .get(working.revisions, change_id)
+            .await?;
+        if current_revision != Some(application.revision_id) {
+            return Err(CliFailure::corrupt(
+                "current application does not refer to the current revision",
+            ));
+        }
+        if let ApplicationResultRecord::Conflicted { conflict, .. } = application.result
+            && conflicted_applications
+                .insert(
+                    conflict,
+                    (
+                        change_id,
+                        application.revision_id,
+                        application_id,
+                        application.target_view,
+                    ),
+                )
+                .is_some()
+        {
+            return Err(CliFailure::corrupt(
+                "conflict is referenced by multiple current applications",
+            ));
+        }
     }
     let conflicts = ConflictSetStore::new(&repository.objects);
     let mut cursor = conflicts.cursor(working.unresolved_conflicts).await?;
@@ -182,11 +232,24 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
             });
         }
         edits.sort_by_key(|edit| edit.id);
+        let (change_id, revision_id, application_id) = correlate_conflict(
+            &mut conflicted_applications,
+            conflict.id,
+            conflict.base_view,
+        )?;
         entries.push(ConflictEntry {
             id: conflict.id,
             base_view: conflict.base_view,
+            change_id,
+            revision_id,
+            application_id,
             edits,
         });
+    }
+    if !conflicted_applications.is_empty() {
+        return Err(CliFailure::corrupt(
+            "current conflicted application is absent from the unresolved conflict set",
+        ));
     }
     entries.sort_by_key(|conflict| conflict.id);
     Ok(ConflictDocument {
@@ -194,6 +257,23 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
         head_generation: head.generation,
         conflicts: entries,
     })
+}
+
+fn correlate_conflict(
+    applications: &mut BTreeMap<wheat_core::ConflictId, CurrentApplication>,
+    conflict_id: wheat_core::ConflictId,
+    base_view: ViewId,
+) -> Result<(ChangeId, RevisionId, ApplicationId)> {
+    let (change_id, revision_id, application_id, target_view) =
+        applications.remove(&conflict_id).ok_or_else(|| {
+            CliFailure::corrupt("unresolved conflict has no current conflicted application")
+        })?;
+    if base_view != target_view {
+        return Err(CliFailure::corrupt(
+            "conflict base view does not match its current application's target view",
+        ));
+    }
+    Ok((change_id, revision_id, application_id))
 }
 
 fn bounded_add(current: usize, added: usize, limit: usize, name: &str) -> Result<usize> {
@@ -300,6 +380,9 @@ mod tests {
             conflicts: vec![ConflictEntry {
                 id: ConflictId::from_digest([1; 32]),
                 base_view: ViewId::from_digest([2; 32]),
+                change_id: ChangeId::from_bytes([5; 16]),
+                revision_id: RevisionId::from_digest([6; 32]),
+                application_id: ApplicationId::from_digest([7; 32]),
                 edits: vec![ConflictEdit {
                     id: EditId::from_digest([3; 32]),
                     path: path.to_owned(),
@@ -328,6 +411,32 @@ mod tests {
     }
 
     #[test]
+    fn conflict_correlation_requires_an_application_and_matching_target_view() {
+        let conflict = ConflictId::from_digest([1; 32]);
+        let application = (
+            ChangeId::from_bytes([2; 16]),
+            RevisionId::from_digest([3; 32]),
+            ApplicationId::from_digest([4; 32]),
+            ViewId::from_digest([5; 32]),
+        );
+
+        let missing = correlate_conflict(&mut BTreeMap::new(), conflict, application.3)
+            .expect_err("missing application must be corrupt state");
+        assert!(matches!(
+            missing.downcast_ref::<CliFailure>(),
+            Some(CliFailure::CorruptState(_))
+        ));
+
+        let mut mismatched = BTreeMap::from([(conflict, application)]);
+        let mismatch = correlate_conflict(&mut mismatched, conflict, ViewId::from_digest([6; 32]))
+            .expect_err("base and target views must match");
+        assert!(matches!(
+            mismatch.downcast_ref::<CliFailure>(),
+            Some(CliFailure::CorruptState(_))
+        ));
+    }
+
+    #[test]
     fn human_paths_are_quoted_and_control_characters_are_escaped() {
         let mut output = Vec::new();
         human(&document("line\n\tname"), &mut output).unwrap();
@@ -347,6 +456,18 @@ mod tests {
         assert_eq!(
             conflict["base_view"],
             serde_json::to_value([2_u8; 32]).unwrap()
+        );
+        assert_eq!(
+            conflict["change_id"],
+            serde_json::to_value(ChangeId::from_bytes([5; 16])).unwrap()
+        );
+        assert_eq!(
+            conflict["revision_id"],
+            serde_json::to_value([6_u8; 32]).unwrap()
+        );
+        assert_eq!(
+            conflict["application_id"],
+            serde_json::to_value([7_u8; 32]).unwrap()
         );
         let edit = &conflict["edits"][0];
         assert_eq!(edit["id"], serde_json::to_value([3_u8; 32]).unwrap());
@@ -388,11 +509,17 @@ mod tests {
                 ConflictEntry {
                     id: ConflictId::from_digest([20; 32]),
                     base_view: ViewId::from_digest([21; 32]),
+                    change_id: ChangeId::from_bytes([24; 16]),
+                    revision_id: RevisionId::from_digest([25; 32]),
+                    application_id: ApplicationId::from_digest([26; 32]),
                     edits: vec![first_edit],
                 },
                 ConflictEntry {
                     id: ConflictId::from_digest([22; 32]),
                     base_view: ViewId::from_digest([23; 32]),
+                    change_id: ChangeId::from_bytes([27; 16]),
+                    revision_id: RevisionId::from_digest([28; 32]),
+                    application_id: ApplicationId::from_digest([29; 32]),
                     edits: vec![second_edit],
                 },
             ],

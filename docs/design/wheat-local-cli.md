@@ -1,8 +1,8 @@
 # Wheat Local CLI — Design
 
-Status: partial — low-level repository and change workflows exist; editable workspace workflow remains outstanding
+Status: partial — the Phase 1 single-target local workflow is implemented and accepted; Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-09-09
+Last updated: 2026-09-11
 
 ## Implementation status
 
@@ -18,7 +18,9 @@ both lists.
   immutable revision predecessors, dependency declaration, descendant
   reapplication, and durable head publication are implemented.
 - [x] **Conflict evidence and resolution.** `conflicts`, `edits`, and `resolve`
-  expose retained edit/application evidence and publish exact resolutions.
+  expose retained edit/application evidence and publish exact resolutions. Routine
+  resolution infers the unique conflicted revision from its selected path; an
+  explicit immutable revision remains available only for disambiguation.
 - [x] **Git bootstrap and publication compatibility.** `wheat import` accepts a
   local Git repository or temporary-mirrors a Git URL into a fresh packed Wheat
   repository; `wheat push` projects a selected clean native view and publishes
@@ -34,8 +36,7 @@ both lists.
 - [x] **Tracked workspace status foundation.** Human and versioned JSON status
   compare tracked paths with the pinned materialized tree, distinguish content,
   kind, and deletion changes, treat canonical-equivalent line endings as clean,
-  and report repository advancement. Diff rendering and conflict-path expansion
-  remain outstanding.
+  and report repository advancement.
 - [x] **Selected-path restore.** Explicit file and directory selectors authorize
   restoring their tracked leaves from the pinned materialized tree. Workspace-only
   paths and untracked siblings are preserved, exact observed preimages close
@@ -75,6 +76,13 @@ both lists.
   document for success and expected failure. Stable categories, symbolic error
   codes, retryability, and exit classes have black-box coverage, including
   retryable stale-predecessor refusal without repository-head mutation.
+- [x] **Phase 1 acceptance — routine single-target dogfooding.** One Linux-only
+  black-box test runs the complete Git URL import through Git publication workflow
+  across separate CLI processes. It proves exact regular/executable/symlink
+  materialization and capture, read-only status/diff, complete structured authoring
+  metadata, descendant reapplication, durable ID-free conflict inspection and
+  resolution, clean working-view projection with strict Git validation, pinned
+  reopen, and the versioned retryable stale-state contract.
 
 ### Outstanding
 - [ ] **Phase 2 — branch and target workflow.** List, create, rename, delete, and
@@ -614,9 +622,10 @@ error chain to decide whether retry is safe.
    and failure outcomes; diagnostics, exit classes, and retryable stale predecessor
    behavior are qualified at the binary boundary.
 8. Run a black-box Git-import → materialize → edit → diff → revise → push flow,
-   including machine-readable retryable failures. The existing black-box suites
-   exercise every stage and the automation corpus covers structured success and
-   stale refusal; the complete acceptance sequence remains the Phase 1 closure run.
+   including machine-readable retryable failures. Complete: the unified Linux-only
+   acceptance test exercises the sequence across separate processes, including
+   ID-free durable conflict resolution, strict Git validation, exact pinned reopen,
+   and a stale refusal that leaves the repository head unchanged.
 
 ### Phase 2 — multiple targets and repository tooling
 
@@ -642,7 +651,9 @@ error chain to decide whether retry is safe.
 
 ### Phase 1 — routine single-target dogfooding
 
-This workflow must work without direct object IDs in ordinary commands:
+This workflow works without direct object IDs in ordinary commands. The executable
+acceptance contract is
+`crates/wheat-cli/tests/phase1_acceptance.rs::phase_one_routine_single_target_workflow_across_processes`:
 
 1. Import a Git URL or initialize Wheat.
 2. Materialize the selected view into a fresh workspace without exposing authority

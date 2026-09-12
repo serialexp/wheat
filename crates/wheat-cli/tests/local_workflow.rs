@@ -421,6 +421,12 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     let conflict = &conflicts_json["conflicts"][0];
     assert_eq!(conflict["id"].as_array().unwrap().len(), 32);
     assert_eq!(conflict["base_view"].as_array().unwrap().len(), 32);
+    assert_eq!(conflict["change_id"], b_change);
+    assert_eq!(
+        conflict["revision_id"],
+        serde_json::to_value(b_revision.parse::<wheat_core::RevisionId>().unwrap()).unwrap()
+    );
+    assert_eq!(conflict["application_id"].as_array().unwrap().len(), 32);
     let edit = &conflict["edits"][0];
     assert_eq!(edit["id"].as_array().unwrap().len(), 32);
     assert_eq!(edit["path"], "shared");
@@ -436,16 +442,35 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     assert!(reopened_conflicts.status.success());
     assert_eq!(reopened_conflicts.stdout, conflicts_json_output.stdout);
 
-    let resolved = wheat(
+    let head_path = store_home(directory.path())
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("repository.head");
+    let head_before_refusal = std::fs::read(&head_path).unwrap();
+    let absent = wheat(
         directory.path(),
         &[
+            "--format",
+            "json",
             "resolve",
-            &b_revision,
             "--path",
-            "shared",
+            "not-conflicted",
             "--value",
-            "resolved",
+            "unreachable",
         ],
+    );
+    assert!(!absent.status.success());
+    let absent: serde_json::Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert_eq!(absent["error"]["category"], "conflict");
+    assert_eq!(std::fs::read(&head_path).unwrap(), head_before_refusal);
+
+    let resolved = wheat(
+        directory.path(),
+        &["resolve", "--path", "shared", "--value", "resolved"],
     );
     assert!(
         resolved.status.success(),

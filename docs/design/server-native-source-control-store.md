@@ -1,8 +1,8 @@
 # Wheat — Server-Native Source Control
 
-Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, CLI workflow, Git import paths, and local active-pack growth/sealing are implemented and qualified in the Wheat prototype; forge review policy, optional LSP/structural warnings, broader remote-store/protocol qualification, and product commitment remain open
+Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, Phase 1 local CLI workflow, Git import paths, and local active-pack growth/sealing are implemented and qualified in the Wheat prototype; model/store qualification, concurrency, retention/recovery, forge review policy, remote protocol work, and product commitment remain open
 Owner: bart
-Last updated: 2026-09-09
+Last updated: 2026-09-11
 
 ## Implementation status
 
@@ -50,6 +50,15 @@ described here.
   required visible content as well as the tree and revision selection. Core
   queries enumerate conflicts by view, change, and path, and a pure policy
   predicate evaluates whether a view has zero unresolved conflicts.
+- [x] **Phase 1 — complete the reference CLI and local workflow.** The Linux-only
+  reference CLI has explicit selected-path capture, persisted composition and mutation,
+  working-view publication, durable ID-free conflict inspection/resolution, complete
+  metadata and validation, loose/packed reopen, and bounded versioned automation output.
+  A unified black-box acceptance test qualifies Git URL import, exact workspace kinds,
+  read-only status/diff, descendant reapplication, conflict materialization/resolution,
+  clean Git projection plus strict validation, pinned reopen, and retryable stale refusal.
+  Workspace-wide capture, explicit multi-target publication, and remote mode belong to
+  later phases rather than this single-target Phase 1 contract.
 
 ### Outstanding
 
@@ -116,13 +125,6 @@ described here.
   metadata/content publication, dependency validation, and property tests. The
   prototype now retains verified content bytes, but does not yet prove ownership,
   recovery, or safe reclamation; Git and gix remain outside the core.
-- [~] **Phase 1 — complete the reference CLI and local workflow.** The local CLI now
-  has explicit-path workspace capture, persisted composition and mutation, working-view
-  publication, durable conflict inspection/resolution, complete validation, loose/packed reopen,
-  and black-box lifecycle/scaling coverage. Workspace-selected active changes, basis-relative
-  listing, ID-free selected-path revision, and authenticated already-satisfied descendant
-  reapplication now complete the ergonomic single-workspace authoring seam. Workspace-wide
-  capture, explicit multi-target publication, and the remote mode remain.
 - [ ] **Phase 1 — complete the conflict and concurrency corpus.** Extend the
   current chain/branch/join/conflict/CAS tests to concurrent human/agent
   mutations, independent simultaneous conflicts, retries, dependency movement,

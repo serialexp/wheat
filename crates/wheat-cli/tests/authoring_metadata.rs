@@ -148,6 +148,29 @@ async fn repository_config_overrides_global_and_metadata_round_trips() {
         log.contains("author Repository Name <global@example.invalid> 2026-09-02T02:03:04+05:30")
     );
     assert!(log.contains("Revision body"));
+
+    let log = ok(&root, &config_home, &["log", "--format", "json"]);
+    let log: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
+    let entry = &log["result"]["entries"][0];
+    assert_eq!(entry["change_id"], change.id.to_string());
+    assert_eq!(entry["change"]["title"], "Stable title");
+    assert_eq!(entry["change"]["description"], "Change body");
+    assert_eq!(entry["change"]["created_at"]["seconds"], 1_788_238_923_i64);
+    assert_eq!(entry["change"]["created_at"]["offset_minutes"], -240);
+    assert_eq!(entry["revision_id"], revision.to_string());
+    assert!(entry["predecessor"].is_null());
+    assert_eq!(entry["revision"]["author"]["name"], "Repository Name");
+    assert_eq!(
+        entry["revision"]["author"]["email"],
+        "global@example.invalid"
+    );
+    assert_eq!(entry["revision"]["authored_at"]["offset_minutes"], 330);
+    assert_eq!(entry["revision"]["committed_at"]["offset_minutes"], 0);
+    assert_eq!(
+        entry["revision"]["message"],
+        "Stable title\n\nRevision body"
+    );
+    assert!(log["result"].get("text").is_none());
 }
 
 #[test]

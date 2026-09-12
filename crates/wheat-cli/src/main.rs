@@ -26,6 +26,7 @@ mod diff_render;
 mod discovery;
 mod inspection;
 mod local;
+mod log_inspection;
 mod materialization;
 mod repository_diff;
 mod selection_recovery;
@@ -41,8 +42,8 @@ use command_output::{
 };
 use discovery::{allocate_store_root, canonical_store_path, discover_workspace};
 use local::{
-    content_store, current_revision_records, initialize, open, projection_path, repository_summary,
-    revision_with_edits, runtime,
+    content_store, initialize, open, projection_path, repository_summary, revision_with_edits,
+    runtime,
 };
 use workspace_metadata::{PendingSelection, StoreMetadata, WorkspaceMetadata, WorkspaceSelection};
 
@@ -339,8 +340,8 @@ struct PushArgs {
 
 #[derive(Debug, Args)]
 struct ResolveArgs {
-    /// Conflicted immutable revision.
-    revision: String,
+    /// Conflicted immutable revision (advanced disambiguation; inferred from --path when omitted).
+    revision: Option<String>,
     /// Path whose resolved value should be recorded.
     #[arg(long)]
     path: String,
@@ -480,29 +481,7 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Log => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            let mut output = String::new();
-            for (change_record, revision, record) in current_revision_records(&store_root)? {
-                writeln!(
-                    output,
-                    "{} {revision} {}",
-                    change_record.id, change_record.metadata.title
-                )?;
-                writeln!(
-                    output,
-                    "  author {} <{}> {}",
-                    record.metadata.author.name,
-                    record.metadata.author.email,
-                    authoring_metadata::display_timestamp(record.metadata.authored_at)?
-                )?;
-                if !record.metadata.message.is_empty() {
-                    writeln!(
-                        output,
-                        "  {}",
-                        record.metadata.message.replace('\n', "\n  ")
-                    )?;
-                }
-            }
-            Success::new("log", json!({ "text": output }), output.clone())
+            log_inspection::inspect(&store_root, format)
         }
         Command::Changes => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
@@ -1219,11 +1198,42 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
 }
 
 fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<Success> {
+    if arguments.path.len() > conflict_inspection::MAX_PATH_BYTES {
+        return Err(CliFailure::limit(
+            "resolution path exceeds conflict inspection limit",
+        ));
+    }
     let local = open(root)?;
-    let expected = local.heads.read()?;
-    let revision = RevisionId::from_str(&arguments.revision)
-        .map_err(|_| CliFailure::invalid("invalid revision ID"))?;
     let runtime = runtime()?;
+    let revision = if let Some(revision) = arguments.revision.as_deref() {
+        RevisionId::from_str(revision).map_err(|_| CliFailure::invalid("invalid revision ID"))?
+    } else {
+        let document = runtime.block_on(conflict_inspection::inspect(&local))?;
+        let mut matches = std::collections::BTreeSet::new();
+        for conflict in document.conflicts {
+            if conflict
+                .edits
+                .iter()
+                .any(|edit| edit.path == arguments.path)
+            {
+                matches.insert(conflict.revision_id);
+            }
+        }
+        match matches.len() {
+            1 => matches.into_iter().next().expect("one matching revision"),
+            0 => {
+                return Err(CliFailure::conflict(
+                    "no current conflicted revision affects the requested path",
+                ));
+            }
+            _ => {
+                return Err(CliFailure::conflict(
+                    "multiple current conflicted revisions affect the requested path; specify a revision ID",
+                ));
+            }
+        }
+    };
+    let expected = local.heads.read()?;
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
     let reader = RepositoryReader::new(&objects, &local.content);
     let (application_id, existing) = runtime.block_on(async {
