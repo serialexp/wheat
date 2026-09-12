@@ -5,11 +5,11 @@ use wheat_binschema::generated as wire;
 
 use crate::{
     Actor, Application, ApplicationMapChild, ApplicationMapNode, ApplicationResult, Change,
-    ChangeId, ChangeMetadata, ChangeRevision, Conflict, ConflictSetChild, ConflictSetNode,
-    ContentId, ContentManifestId, ContentSetChild, ContentSetNode, DirectoryEntry, DirectoryNode,
-    EditOperation, EditRecord, FileKind, FileValue, RepositoryState, RepositoryView,
-    RetainedSetChild, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapNode,
-    RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId,
+    ChangeId, ChangeMapChild, ChangeMapNode, ChangeMetadata, ChangeRevision, Conflict,
+    ConflictSetChild, ConflictSetNode, ContentId, ContentManifestId, ContentSetChild,
+    ContentSetNode, DirectoryEntry, DirectoryNode, EditOperation, EditRecord, FileKind, FileValue,
+    RepositoryState, RepositoryView, RetainedSetChild, RetainedSetNode, RevisionId,
+    RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId,
 };
 
 const BLAKE3_256: u8 = 1;
@@ -49,6 +49,7 @@ pub enum CanonicalObjectKind {
     BranchManifest,
     RepositoryEnvelope,
     RevisionMapNode,
+    ChangeMapNode,
     ApplicationMapNode,
     ConflictSetNode,
     ContentSetNode,
@@ -147,7 +148,7 @@ pub fn decode_repository_state_record(
     bytes: &[u8],
 ) -> Result<crate::RepositoryStateRecord, CanonicalObjectError> {
     let object = decode_validated(bytes)?;
-    let wire::WheatObject::RepositoryStateV1(v) = object else {
+    let wire::WheatObject::RepositoryStateV2(v) = object else {
         return Err(CanonicalObjectError::WrongKind {
             expected: CanonicalObjectKind::RepositoryState,
             actual: object_kind(&object),
@@ -159,6 +160,7 @@ pub fn decode_repository_state_record(
         base_view: crate::ViewId::from_digest(digest_domain(&v.base_view.digest)?),
         working_view: crate::ViewId::from_digest(digest_domain(&v.working_view.digest)?),
         published_view: crate::ViewId::from_digest(digest_domain(&v.published_view.digest)?),
+        changes: crate::ChangeMapId::from_digest(digest_domain(&v.changes.digest)?),
         required_content: ContentManifestId::from_digest(digest_domain(
             &v.required_content.digest,
         )?),
@@ -296,6 +298,67 @@ pub(crate) fn revision_map_node_bytes(node: &RevisionMapNode) -> Vec<u8> {
                 .map(|child| wire::RevisionMapChildV1 {
                     edge: child.edge,
                     child: revision_map_id(child.child),
+                })
+                .collect(),
+        }
+        .into(),
+    ))
+}
+
+pub fn decode_change_map_node(bytes: &[u8]) -> Result<ChangeMapNode, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::ChangeMapNodeV1(node) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::ChangeMapNode,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(ChangeMapNode {
+        prefix: node.prefix,
+        value: node.value.first().map(|value| {
+            crate::ChangeObjectId::from_digest(
+                digest_domain(&value.digest).expect("validated digest"),
+            )
+        }),
+        children: node
+            .children
+            .iter()
+            .map(|child| ChangeMapChild {
+                edge: child.edge,
+                child: crate::ChangeMapId::from_digest(
+                    digest_domain(&child.child.digest).expect("validated digest"),
+                ),
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn validate_change_map_node(node: &ChangeMapNode) -> Result<(), CanonicalObjectError> {
+    validate_radix_node(
+        &node.prefix,
+        node.value.is_some(),
+        &node
+            .children
+            .iter()
+            .map(|child| child.edge)
+            .collect::<Vec<_>>(),
+        16,
+        "change map node",
+    )
+}
+
+pub(crate) fn change_map_node_bytes(node: &ChangeMapNode) -> Vec<u8> {
+    validate_change_map_node(node).expect("change map node violates canonical invariants");
+    encode(wire::WheatObject::ChangeMapNodeV1(
+        wire::ChangeMapNodeV1Input {
+            prefix: node.prefix.clone(),
+            value: node.value.into_iter().map(change_object_id).collect(),
+            children: node
+                .children
+                .iter()
+                .map(|child| wire::ChangeMapChildV1 {
+                    edge: child.edge,
+                    child: change_map_id(child.child),
                 })
                 .collect(),
         }
@@ -819,11 +882,12 @@ pub(crate) fn repository_envelope_record_bytes(
 }
 
 pub(crate) fn repository_state_record_bytes(record: &crate::RepositoryStateRecord) -> Vec<u8> {
-    encode(wire::WheatObject::RepositoryStateV1(
-        wire::RepositoryStateV1Input {
+    encode(wire::WheatObject::RepositoryStateV2(
+        wire::RepositoryStateV2Input {
             base_view: view_id(record.base_view),
             working_view: view_id(record.working_view),
             published_view: view_id(record.published_view),
+            changes: change_map_id(record.changes),
             required_content: content_manifest_id_wire(record.required_content),
             retained_changes: retained_set_id(record.retained_changes),
             retained_views: retained_set_id(record.retained_views),
@@ -1043,6 +1107,20 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "revision map node",
             )?;
         }
+        wire::WheatObject::ChangeMapNodeV1(node) => {
+            if node.value.len() > 1 {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "change map must have at most one value",
+                ));
+            }
+            validate_radix_node(
+                &node.prefix,
+                !node.value.is_empty(),
+                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                16,
+                "change map node",
+            )?;
+        }
         wire::WheatObject::ApplicationMapNodeV1(node) => {
             if node.value.len() > 1 {
                 return Err(CanonicalObjectError::InvalidCollection(
@@ -1084,7 +1162,9 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "retained set node",
             )?;
         }
-        wire::WheatObject::RepositoryStateV1(_) | wire::WheatObject::RepositoryEnvelopeV1(_) => {}
+        wire::WheatObject::RepositoryStateV1(_)
+        | wire::WheatObject::RepositoryStateV2(_)
+        | wire::WheatObject::RepositoryEnvelopeV1(_) => {}
         wire::WheatObject::BranchManifestV1(manifest) => {
             validate_sorted_unique_by(
                 &manifest.branches,
@@ -1109,10 +1189,13 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ConflictV1(_) => CanonicalObjectKind::Conflict,
         wire::WheatObject::ViewV1(_) => CanonicalObjectKind::View,
         wire::WheatObject::ContentManifestV1(_) => CanonicalObjectKind::ContentManifest,
-        wire::WheatObject::RepositoryStateV1(_) => CanonicalObjectKind::RepositoryState,
+        wire::WheatObject::RepositoryStateV1(_) | wire::WheatObject::RepositoryStateV2(_) => {
+            CanonicalObjectKind::RepositoryState
+        }
         wire::WheatObject::BranchManifestV1(_) => CanonicalObjectKind::BranchManifest,
         wire::WheatObject::RepositoryEnvelopeV1(_) => CanonicalObjectKind::RepositoryEnvelope,
         wire::WheatObject::RevisionMapNodeV1(_) => CanonicalObjectKind::RevisionMapNode,
+        wire::WheatObject::ChangeMapNodeV1(_) => CanonicalObjectKind::ChangeMapNode,
         wire::WheatObject::ApplicationMapNodeV1(_) => CanonicalObjectKind::ApplicationMapNode,
         wire::WheatObject::ConflictSetNodeV1(_) => CanonicalObjectKind::ConflictSetNode,
         wire::WheatObject::ContentSetNodeV1(_) => CanonicalObjectKind::ContentSetNode,
@@ -1404,6 +1487,8 @@ macro_rules! wire_digest_id {
 wire_digest_id!(revision_id, RevisionId, RevisionId);
 wire_digest_id!(edit_id, crate::EditId, EditId);
 wire_digest_id!(revision_map_id, crate::RevisionMapId, RevisionMapId);
+wire_digest_id!(change_map_id, crate::ChangeMapId, ChangeMapId);
+wire_digest_id!(change_object_id, crate::ChangeObjectId, ChangeObjectId);
 wire_digest_id!(
     application_map_id,
     crate::ApplicationMapId,

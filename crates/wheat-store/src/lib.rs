@@ -5,6 +5,7 @@
 
 mod application_map;
 mod batch;
+mod change_map;
 mod commit_content;
 mod commit_writer;
 mod content_batch;
@@ -33,6 +34,7 @@ mod sets;
 
 pub use application_map::{ApplicationMapCursor, ApplicationMapError, ApplicationMapStore};
 pub use batch::BatchObjectStore;
+pub use change_map::{ChangeMapCursor, ChangeMapError, ChangeMapStore};
 pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
 pub use durability::{Durability, sync_directory, sync_filesystem};
 pub use loose::{

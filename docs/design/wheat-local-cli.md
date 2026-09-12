@@ -58,11 +58,15 @@ both lists.
   precedence per key. `wheat config set [--global] actor.name|actor.email VALUE`
   updates it atomically. Phase 1 deliberately has no editor, identity environment
   variables, or distinct author/committer overrides.
+- [x] **Ergonomic selected-path capture.** Each workspace retains an immutable
+  authoring basis and one selected active logical change. `wheat changes` lists the
+  basis-relative revision delta, `change new` selects its new identity, and
+  `add [--change ID] PATH...` resolves the exact predecessor without copied IDs.
+  Explicit adds report their destination while preserving the workspace selection.
+  Descendant edits already absorbed by an amended ancestor reapply as authenticated
+  no-ops rather than false conflicts. Workspace-wide capture remains Phase 2 work.
 
 ### Outstanding
-- [ ] **Phase 1 — ergonomic selected-path capture.** Resolve the current logical
-  change and predecessor without users manually copying opaque IDs. Workspace-wide
-  capture follows ignore semantics in Phase 2.
 - [ ] **Phase 1 — cross-platform workspace contract.** Provide equivalent
   non-Linux safety/file-kind guarantees or continue to fail closed for workspace
   mutation on unsupported platforms.
@@ -122,13 +126,12 @@ question large enough to deserve its own contract: can a person use Wheat for
 ordinary local development without manually assembling internal object IDs or
 falling back to Git for every workspace operation?
 
-The current reference CLI proves durable storage, stable logical changes,
-revision application, conflict retention, Git import, and Git projection. It is
-still a plumbing interface. A freshly imported repository has native authority
-but no materialized source tree; `status` does not inspect the filesystem;
-`add` requires a change ID and exact predecessor revision; and locally authored
-revisions do not yet collect useful attribution or messages. Those are product
-semantics and safety boundaries, not merely command-line polish.
+The reference CLI now proves durable storage, stable logical changes, revision
+application, conflict retention, Git import/projection, safe materialization,
+tracked status and diff, native attribution, and selected-path authoring without
+copied object IDs. The remaining Phase 1 boundary is a stable structured
+success/error contract; workspace-wide untracked capture, named targets, and
+native synchronization deliberately remain later phases.
 
 This document specifies the local client experience. The parent architecture
 remains [`server-native-source-control-store.md`](./server-native-source-control-store.md).
@@ -350,12 +353,15 @@ The existing plumbing remains useful:
 wheat add --change <id> --predecessor <id> PATH...
 ```
 
-The routine interface should infer safe values from workspace state:
+The routine interface resolves the selected change and exact predecessor from
+one authenticated head snapshot:
 
 ```text
-wheat change new -m "message" [PATH ...]
-wheat change revise [CHANGE] -m "message" [PATH ...]
-wheat capture [PATH ...]
+wheat change new [-m "message"]
+wheat add [-m "optional revision note"] PATH...
+wheat add --change <active-change-id> PATH...
+wheat changes [--format human|json]
+wheat change select <active-change-id>
 ```
 
 Exact names remain open, but the behavior should:
@@ -387,15 +393,18 @@ Configuration is set one typed key at a time with
 replace user values per key. One configured actor fills creator, author, and
 committer roles. Distinct-role overrides and environment identity are deferred.
 
-`change new` and `add` require `--message`/`-m`, so automation never opens an
-editor unexpectedly. The first trimmed message line is the stable change title;
-`change new --description` supplies its optional long description. Change
-creation records creator and created-at, while every revision records author,
-authored-at, committer, committed-at, and its complete message. Timestamps default
-to the current local clock and accept explicit RFC3339 flags, preserving minute
-offsets. A revision leaves its logical change's metadata unchanged. `wheat log`
-shows the current revisions' title, author, timestamp, and message, so no native
-path relies on Git projection fallback metadata.
+`change new -m` is the non-interactive form; without `-m`, a terminal invocation
+prompts for one bounded line while non-terminal input refuses rather than blocking.
+The first trimmed message line is the stable change title; `change new
+--description` supplies its optional long description. `add` needs no repeated
+message because the logical change carries enduring intent, but accepts `-m` as
+an optional revision note. An absent note remains empty rather than copying the
+change title or inventing prose. Change creation records creator and created-at,
+while every revision records author, authored-at, committer, committed-at, and
+its optional message. Timestamps default to the current local clock and accept
+explicit RFC3339 flags, preserving minute offsets. A revision leaves its logical
+change's metadata unchanged. `wheat log` shows the current revisions' title,
+author, timestamp, and any nonempty revision note.
 
 Configuration files are versioned, bounded, strict JSON and published atomically
 under a per-config lock. Repository configuration belongs to Wheat, not
@@ -403,6 +412,37 @@ under a per-config lock. Repository configuration belongs to Wheat, not
 Secrets and credential material must not be copied into repository configuration
 or diagnostic output. Editor, pager, default-target, and output-format settings
 remain part of the broader configuration work in Phase 2.
+
+## Active workspace changes
+
+A workspace fixes an `authoring_basis` to the exact first materialized view and
+stores one optional `selected_change`. Active state is derived, never stamped on
+a logical change: a change is active when the working view selects a revision
+that is absent from or differs from the basis selection. This makes a Git import's
+selected tip the basis rather than incorrectly listing all imported commits above
+the repository's empty global base.
+
+`wheat changes` reports this identity-preserving revision delta in deterministic
+dependency order and marks the workspace selection. It distinguishes current
+published-revision equality from active state, but does not call a change landed,
+closed, or withdrawn; those are target-relative lifecycle facts that require the
+Phase 2 publication-target contract. Explicit `add --change A` is a one-operation
+override and does not replace selected change B.
+
+When amending A causes an unchanged descendant B's intended replacement to be
+present already, B's immutable edit is recorded as successfully satisfied against
+the authenticated target view. Exact edits require complete `FileValue` equality;
+guarded text requires a unique replacement match in the original context. The
+application records its target and read evidence with no write. This permits the
+common correction of adding a forgotten file to an earlier change while B becomes
+a semantic no-op after reapplication. Incompatible or ambiguous effects remain
+durable conflicts. Authored revisions stay strict: only descendant reapplication
+may accept already-satisfied edits.
+
+Every successful add prints the destination change ID and title after repository
+publication, including implicit adds, so a mistaken selection is immediately
+visible. Adding to the intended earlier change is the normal correction path; no
+mutable revision or imperative transfer is fabricated.
 
 ## Candidate named-target and integration workflow
 
@@ -544,6 +584,8 @@ error chain to decide whether retry is safe.
 4. Implement tracked-path workspace status and diff.
 5. Add complete native change/revision metadata and identity configuration.
 6. Add ergonomic selected-path capture using the current change and predecessor.
+   Complete: workspace selection, active listing, explicit one-shot override, and
+   absorbed descendant no-op evidence are implemented.
 7. Add versioned structured outcomes, stable error categories, and bounded output.
 8. Run a black-box Git-import → materialize → edit → diff → revise → push flow,
    including machine-readable retryable failures.

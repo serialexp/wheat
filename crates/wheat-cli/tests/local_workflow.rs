@@ -512,7 +512,7 @@ fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
     assert!(add_help.status.success());
     let add_help = String::from_utf8_lossy(&add_help.stdout);
     assert!(add_help.contains("--change"));
-    assert!(add_help.contains("--predecessor"));
+    assert!(!add_help.contains("--predecessor"));
     assert!(add_help.contains("Explicit repository-relative workspace paths"));
 }
 

@@ -13,7 +13,8 @@ use wheat_store::RepositoryHead;
 
 const STORE_FORMAT: &str = "wheat-store";
 const WORKSPACE_FORMAT: &str = "wheat-workspace";
-const FORMAT_VERSION: u32 = 1;
+const STORE_FORMAT_VERSION: u32 = 1;
+const WORKSPACE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +33,16 @@ pub(crate) struct WorkspaceMetadata {
     pub store: WorkspaceStore,
     pub selection: WorkspaceSelection,
     pub materialized: Option<MaterializedState>,
+    pub authoring_basis: Option<ViewId>,
+    pub selected_change: Option<wheat_core::ChangeId>,
+    pub pending_selection: Option<PendingSelection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingSelection {
+    pub change: wheat_core::ChangeId,
+    pub expected_head: SerializedHead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,7 +110,7 @@ impl StoreMetadata {
     pub(crate) fn create(root: &Path) -> Result<Self> {
         let metadata = Self {
             format: STORE_FORMAT.into(),
-            version: FORMAT_VERSION,
+            version: STORE_FORMAT_VERSION,
             store_id: Uuid::now_v7(),
         };
         write_json_new(&root.join("store.json"), &metadata)?;
@@ -109,7 +120,7 @@ impl StoreMetadata {
     pub(crate) fn read(root: &Path) -> Result<Self> {
         let path = root.join("store.json");
         let metadata: Self = read_json(&path)?;
-        if metadata.format != STORE_FORMAT || metadata.version != FORMAT_VERSION {
+        if metadata.format != STORE_FORMAT || metadata.version != STORE_FORMAT_VERSION {
             bail!("unsupported Wheat store metadata at {}", path.display());
         }
         Ok(metadata)
@@ -120,7 +131,7 @@ impl WorkspaceMetadata {
     pub(crate) fn new(store_path: PathBuf, store_id: Uuid, selection: WorkspaceSelection) -> Self {
         Self {
             format: WORKSPACE_FORMAT.into(),
-            version: FORMAT_VERSION,
+            version: WORKSPACE_FORMAT_VERSION,
             workspace_id: Uuid::now_v7(),
             store: WorkspaceStore {
                 path: store_path,
@@ -128,13 +139,16 @@ impl WorkspaceMetadata {
             },
             selection,
             materialized: None,
+            authoring_basis: None,
+            selected_change: None,
+            pending_selection: None,
         }
     }
 
     pub(crate) fn read(root: &Path) -> Result<Self> {
         let path = root.join(".wheat/workspace.json");
         let metadata: Self = read_json(&path)?;
-        if metadata.format != WORKSPACE_FORMAT || metadata.version != FORMAT_VERSION {
+        if metadata.format != WORKSPACE_FORMAT || metadata.version != WORKSPACE_FORMAT_VERSION {
             bail!("unsupported Wheat workspace metadata at {}", path.display());
         }
         Ok(metadata)
@@ -237,5 +251,20 @@ mod tests {
             .publish()
             .unwrap();
         assert_eq!(WorkspaceMetadata::read(root.path()).unwrap(), replacement);
+    }
+
+    #[test]
+    fn workspace_v2_round_trips_authoring_basis_and_selected_change() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".wheat")).unwrap();
+        let mut metadata = WorkspaceMetadata::new(
+            PathBuf::from("/store"),
+            Uuid::now_v7(),
+            WorkspaceSelection::Working,
+        );
+        metadata.authoring_basis = Some(ViewId::from_digest([7; 32]));
+        metadata.selected_change = Some(wheat_core::ChangeId::new());
+        write_json_new(&root.path().join(".wheat/workspace.json"), &metadata).unwrap();
+        assert_eq!(WorkspaceMetadata::read(root.path()).unwrap(), metadata);
     }
 }

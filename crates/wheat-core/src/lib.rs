@@ -26,19 +26,19 @@ mod wire;
 
 pub use branch_records::{BranchManifestRecord, RepositoryEnvelopeRecord};
 pub use collection::{
-    ApplicationMapChild, ApplicationMapNode, ConflictSetChild, ConflictSetNode, ContentSetChild,
-    ContentSetNode, RetainedSetChild, RetainedSetNode,
+    ApplicationMapChild, ApplicationMapNode, ChangeMapChild, ChangeMapNode, ConflictSetChild,
+    ConflictSetNode, ContentSetChild, ContentSetNode, RetainedSetChild, RetainedSetNode,
 };
 pub use collection_builders::{
-    build_application_map, build_conflict_set, build_content_set, build_retained_set,
-    build_revision_map,
+    build_application_map, build_change_map, build_conflict_set, build_content_set,
+    build_retained_set, build_revision_map,
 };
 pub use content_io::{ApplicationContext, ContentIo};
 pub use edit_records::{EditOperation, EditRecord, decode_edit_record};
 pub use hydration::{hydrate_application, hydrate_revision};
 pub use id::{
-    ApplicationId, ApplicationMapId, BranchManifestId, ChangeId, ChangeObjectId, ConflictId,
-    ConflictSetId, ContentId, ContentManifestId, ContentSetId, EditId, ObjectId,
+    ApplicationId, ApplicationMapId, BranchManifestId, ChangeId, ChangeMapId, ChangeObjectId,
+    ConflictId, ConflictSetId, ContentId, ContentManifestId, ContentSetId, EditId, ObjectId,
     ParseContentIdError, ParseDigestIdError, RepositoryEnvelopeId, RepositoryStateId,
     RetainedSetId, RevisionId, RevisionMapId, TreeId, ViewId,
 };
@@ -73,8 +73,9 @@ pub use semantic_records::{
 };
 pub use wire::{
     CanonicalObjectError, CanonicalObjectKind, decode_application_map_node,
-    decode_branch_manifest_record, decode_conflict_set_node, decode_content_manifest_record,
-    decode_content_set_node, decode_directory_node, decode_repository_envelope_record,
-    decode_repository_state_record, decode_retained_set_node, decode_revision_map_node,
-    decode_view_record, validate_canonical_object, validate_directory_component,
+    decode_branch_manifest_record, decode_change_map_node, decode_conflict_set_node,
+    decode_content_manifest_record, decode_content_set_node, decode_directory_node,
+    decode_repository_envelope_record, decode_repository_state_record, decode_retained_set_node,
+    decode_revision_map_node, decode_view_record, validate_canonical_object,
+    validate_directory_component,
 };

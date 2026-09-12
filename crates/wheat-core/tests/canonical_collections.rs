@@ -1,6 +1,24 @@
 use wheat_core::*;
 
 #[test]
+fn change_nodes_roundtrip_and_enforce_terminal_rules() {
+    let value = ChangeObjectId::from_digest([7; 32]);
+    let terminal = ChangeMapNode::new(vec![7; 16], Some(value), vec![]).unwrap();
+    assert_eq!(
+        decode_change_map_node(&terminal.canonical_bytes()).unwrap(),
+        terminal
+    );
+    assert!(ChangeMapNode::new(vec![0; 17], None, vec![]).is_err());
+    assert!(ChangeMapNode::new(vec![], None, vec![]).is_ok());
+    let edge = ChangeMapChild {
+        edge: 3,
+        child: terminal.id(),
+    };
+    assert!(ChangeMapNode::new(vec![0; 16], None, vec![edge]).is_err());
+    assert!(ChangeMapNode::new(vec![], None, vec![edge, edge]).is_err());
+}
+
+#[test]
 fn application_nodes_roundtrip_and_enforce_terminal_rules() {
     let value = ApplicationId::from_digest([7; 32]);
     let terminal = ApplicationMapNode::new(vec![7; 16], Some(value), vec![]).unwrap();

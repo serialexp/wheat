@@ -103,6 +103,7 @@ impl SegmentIndexEntry {
             crate::CanonicalObjectKind::BranchManifest => 14,
             crate::CanonicalObjectKind::RepositoryEnvelope => 15,
             crate::CanonicalObjectKind::Edit => 16,
+            crate::CanonicalObjectKind::ChangeMapNode => 17,
         }
     }
 
@@ -125,6 +126,7 @@ impl SegmentIndexEntry {
             14 => crate::CanonicalObjectKind::BranchManifest,
             15 => crate::CanonicalObjectKind::RepositoryEnvelope,
             16 => crate::CanonicalObjectKind::Edit,
+            17 => crate::CanonicalObjectKind::ChangeMapNode,
             _ => return None,
         })
     }

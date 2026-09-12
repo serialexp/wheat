@@ -36,6 +36,7 @@ pub enum ObjectKind {
     BranchManifest = 14,
     RepositoryEnvelope = 15,
     Edit = 16,
+    ChangeMapNode = 17,
 }
 
 impl ObjectKind {
@@ -57,6 +58,7 @@ impl ObjectKind {
             14 => Self::BranchManifest,
             15 => Self::RepositoryEnvelope,
             16 => Self::Edit,
+            17 => Self::ChangeMapNode,
             _ => return None,
         })
     }
@@ -81,6 +83,7 @@ impl From<CanonicalObjectKind> for ObjectKind {
             CanonicalObjectKind::BranchManifest => Self::BranchManifest,
             CanonicalObjectKind::RepositoryEnvelope => Self::RepositoryEnvelope,
             CanonicalObjectKind::Edit => Self::Edit,
+            CanonicalObjectKind::ChangeMapNode => Self::ChangeMapNode,
         }
     }
 }

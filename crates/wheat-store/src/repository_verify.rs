@@ -439,11 +439,15 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
             .collect();
         self.verify_untouched(target_root, result_root, &touched)
             .await?;
+        let limits = wheat_core::edit_application::ApplicationLimits {
+            allow_already_satisfied: true,
+            ..Default::default()
+        };
         let replay = wheat_core::edit_application::apply_edits(
             &target,
             definitions.iter().cloned(),
             |id| self.reader.content.get(id),
-            wheat_core::edit_application::ApplicationLimits::default(),
+            limits,
         )
         .map_err(|_| invalid("edit replay failed"))?;
         for (_, edit) in &definitions {
@@ -510,12 +514,32 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
         // before checking references, and reject every duplicate logical identity.
         let retained = RetainedSetStore::new(self.reader.objects);
         let mut cursor = retained.cursor(state.retained_changes).await?;
+        let mut retained_change_count = 0usize;
         while let Some(id) = cursor.next().await? {
             let object = ChangeObjectId::from_digest(*id.as_bytes());
             let change = self.reader.change(object).await?;
             if !self.scratch.insert_change(change.id, object)? {
                 return Err(invalid("duplicate logical change id"));
             }
+            retained_change_count += 1;
+        }
+        let mut indexed = crate::ChangeMapStore::new(self.reader.objects)
+            .cursor(state.changes)
+            .await?;
+        let mut indexed_count = 0usize;
+        while let Some((change_id, object)) = indexed.next().await? {
+            let change = self.reader.change(object).await?;
+            if change.id != change_id {
+                return Err(invalid("change-map key does not match logical change id"));
+            }
+            self.retained(RETAINED_CHANGES, object.into())?;
+            if !self.scratch.contains_change(change_id)? {
+                return Err(invalid("change map differs from retained logical changes"));
+            }
+            indexed_count += 1;
+        }
+        if indexed_count != retained_change_count {
+            return Err(invalid("change map omits a retained logical change"));
         }
 
         for id in [state.base_view, state.working_view, state.published_view] {
@@ -695,6 +719,19 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
                             },
                         );
                     }
+                    wheat_core::edit_application::ApplicationOutcome::AlreadySatisfied { read } => {
+                        replay_applied.insert(
+                            edit,
+                            AppliedEditEvidence {
+                                target: target_value,
+                                read: read.map(|r| ByteRange {
+                                    start: r.start as u64,
+                                    end: r.end as u64,
+                                }),
+                                write: None,
+                            },
+                        );
+                    }
                     outcome => {
                         let reason = match outcome {
                             wheat_core::edit_application::ApplicationOutcome::NoMatch => EditFailure::NoMatch,
@@ -702,7 +739,8 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
                             wheat_core::edit_application::ApplicationOutcome::Interference { with } => EditFailure::Interference { with: with.into_iter().collect() },
                             wheat_core::edit_application::ApplicationOutcome::KindMismatch { .. } => EditFailure::KindMismatch,
                             wheat_core::edit_application::ApplicationOutcome::ExpectedFileMismatch { .. } => EditFailure::ExpectedFileMismatch,
-                            wheat_core::edit_application::ApplicationOutcome::Applied { .. } => unreachable!(),
+                            wheat_core::edit_application::ApplicationOutcome::Applied { .. }
+                            | wheat_core::edit_application::ApplicationOutcome::AlreadySatisfied { .. } => unreachable!(),
                         };
                         replay_failed.insert(
                             edit,

@@ -188,6 +188,46 @@ fn revising_a_reapplies_b_and_c_without_replacing_change_identity() {
 }
 
 #[test]
+fn revising_an_ancestor_can_absorb_a_descendant_edit_as_a_clean_noop() {
+    let io = Memory::default();
+    let ctx = ApplicationContext::new(&io);
+    let mut repository = Repository::new(Tree::new());
+    let (a, a1) = repository
+        .create_change([], exact(&io, "file", None, Some("middle")), ctx)
+        .unwrap();
+    let (b, b1) = repository
+        .create_change([a], exact(&io, "file", Some("middle"), Some("final")), ctx)
+        .unwrap();
+    let old = current_edits(&repository, a);
+    let outcome = repository
+        .revise_change(
+            a,
+            a1.revision_id,
+            replacement(&io, &old, "file", None, Some("final")),
+            ctx,
+        )
+        .unwrap();
+    assert_eq!(outcome.reapplied, vec![b]);
+    assert_eq!(repository.current_revision(b), Some(b1.revision_id));
+    assert!(repository.conflicts().next().is_none());
+    assert_eq!(repository.working_view().tree["file"], value(&io, "final"));
+    let application = repository
+        .applications_for_revision(b1.revision_id)
+        .last()
+        .unwrap();
+    assert!(matches!(
+        application.result,
+        ApplicationResult::Clean { .. }
+    ));
+    assert!(
+        application
+            .applied
+            .values()
+            .all(|evidence| evidence.write.is_none())
+    );
+}
+
+#[test]
 fn conflict_is_durable_and_resolution_continues_descendant_application() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);

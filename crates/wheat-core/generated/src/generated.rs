@@ -20,6 +20,7 @@ pub enum WheatObject {
     ViewV1(ViewV1Output),
     ContentManifestV1(ContentManifestV1Output),
     RepositoryStateV1(RepositoryStateV1Output),
+    RepositoryStateV2(RepositoryStateV2Output),
     RevisionMapNodeV1(RevisionMapNodeV1Output),
     ApplicationMapNodeV1(ApplicationMapNodeV1Output),
     ConflictSetNodeV1(ConflictSetNodeV1Output),
@@ -28,6 +29,7 @@ pub enum WheatObject {
     BranchManifestV1(BranchManifestV1Output),
     RepositoryEnvelopeV1(RepositoryEnvelopeV1Output),
     EditV1(EditV1Output),
+    ChangeMapNodeV1(ChangeMapNodeV1Output),
 }
 
 impl WheatObject {
@@ -106,6 +108,18 @@ impl WheatObject {
                 v.base_view.encode_into(encoder)?;
                 v.working_view.encode_into(encoder)?;
                 v.published_view.encode_into(encoder)?;
+                v.required_content.encode_into(encoder)?;
+                v.retained_changes.encode_into(encoder)?;
+                v.retained_views.encode_into(encoder)?;
+                v.retained_revisions.encode_into(encoder)?;
+                v.retained_applications.encode_into(encoder)?;
+            }
+            WheatObject::RepositoryStateV2(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                v.base_view.encode_into(encoder)?;
+                v.working_view.encode_into(encoder)?;
+                v.published_view.encode_into(encoder)?;
+                v.changes.encode_into(encoder)?;
                 v.required_content.encode_into(encoder)?;
                 v.retained_changes.encode_into(encoder)?;
                 v.retained_views.encode_into(encoder)?;
@@ -199,6 +213,21 @@ impl WheatObject {
                 }
                 v.operation.encode_into(encoder)?;
             }
+            WheatObject::ChangeMapNodeV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint32(v.value.len() as u32, Endianness::BigEndian);
+                for item in &v.value {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
+                for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+            }
         }
         Ok(())
     }
@@ -243,6 +272,10 @@ impl WheatObject {
             Ok(WheatObject::RepositoryStateV1(
                 RepositoryStateV1Output::decode_with_decoder(decoder)?,
             ))
+        } else if value == 0x0802 {
+            Ok(WheatObject::RepositoryStateV2(
+                RepositoryStateV2Output::decode_with_decoder(decoder)?,
+            ))
         } else if value == 0x0901 {
             Ok(WheatObject::RevisionMapNodeV1(
                 RevisionMapNodeV1Output::decode_with_decoder(decoder)?,
@@ -275,6 +308,10 @@ impl WheatObject {
             Ok(WheatObject::EditV1(EditV1Output::decode_with_decoder(
                 decoder,
             )?))
+        } else if value == 0x1101 {
+            Ok(WheatObject::ChangeMapNodeV1(
+                ChangeMapNodeV1Output::decode_with_decoder(decoder)?,
+            ))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
                 "unknown discriminator value: {}",
@@ -633,6 +670,34 @@ pub struct RevisionMapId {
 }
 
 impl RevisionMapId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self { digest })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeMapId {
+    pub digest: Digest256,
+}
+
+impl ChangeMapId {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3189,6 +3254,147 @@ impl RevisionMapChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ChangeMapNodeV1Input {
+    pub prefix: Vec<u8>,
+    pub value: Vec<ChangeObjectId>,
+    pub children: Vec<ChangeMapChildV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeMapNodeV1Output {
+    pub wire_tag: u16,
+    pub prefix: Vec<u8>,
+    pub value: Vec<ChangeObjectId>,
+    pub children: Vec<ChangeMapChildV1>,
+}
+
+pub type ChangeMapNodeV1 = ChangeMapNodeV1Output;
+
+impl ChangeMapNodeV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(4353);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.value.len() as u32);
+        for item in &self.value {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.children.len() as u32);
+        for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ChangeMapNodeV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 4353u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 4353, got {}",
+                wire_tag
+            )));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut prefix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            prefix.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut value = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ChangeObjectId::decode_with_decoder(decoder)?;
+            value.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut children = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ChangeMapChildV1::decode_with_decoder(decoder)?;
+            children.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            prefix,
+            value,
+            children,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ChangeMapNodeV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ChangeMapNodeV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ChangeMapNodeV1Output> for ChangeMapNodeV1Input {
+    fn from(o: ChangeMapNodeV1Output) -> Self {
+        Self {
+            prefix: o.prefix,
+            value: o.value,
+            children: o.children,
+        }
+    }
+}
+
+impl From<ChangeMapNodeV1Input> for ChangeMapNodeV1Output {
+    fn from(i: ChangeMapNodeV1Input) -> Self {
+        Self {
+            wire_tag: 4353u16,
+            prefix: i.prefix,
+            value: i.value,
+            children: i.children,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeMapChildV1 {
+    pub edge: u8,
+    pub child: ChangeMapId,
+}
+
+impl ChangeMapChildV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.edge);
+        self.child.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edge = decoder.read_byte()?;
+        let child = ChangeMapId::decode_with_decoder(decoder)?;
+        Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApplicationMapNodeV1Input {
     pub prefix: Vec<u8>,
     pub value: Vec<ApplicationId>,
@@ -3840,6 +4046,134 @@ impl From<RepositoryStateV1Input> for RepositoryStateV1Output {
             base_view: i.base_view,
             working_view: i.working_view,
             published_view: i.published_view,
+            required_content: i.required_content,
+            retained_changes: i.retained_changes,
+            retained_views: i.retained_views,
+            retained_revisions: i.retained_revisions,
+            retained_applications: i.retained_applications,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryStateV2Input {
+    pub base_view: ViewId,
+    pub working_view: ViewId,
+    pub published_view: ViewId,
+    pub changes: ChangeMapId,
+    pub required_content: ContentManifestId,
+    pub retained_changes: RetainedSetId,
+    pub retained_views: RetainedSetId,
+    pub retained_revisions: RetainedSetId,
+    pub retained_applications: RetainedSetId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryStateV2Output {
+    pub wire_tag: u16,
+    pub base_view: ViewId,
+    pub working_view: ViewId,
+    pub published_view: ViewId,
+    pub changes: ChangeMapId,
+    pub required_content: ContentManifestId,
+    pub retained_changes: RetainedSetId,
+    pub retained_views: RetainedSetId,
+    pub retained_revisions: RetainedSetId,
+    pub retained_applications: RetainedSetId,
+}
+
+pub type RepositoryStateV2 = RepositoryStateV2Output;
+
+impl RepositoryStateV2Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(2050);
+        self.base_view.encode_into(encoder)?;
+        self.working_view.encode_into(encoder)?;
+        self.published_view.encode_into(encoder)?;
+        self.changes.encode_into(encoder)?;
+        self.required_content.encode_into(encoder)?;
+        self.retained_changes.encode_into(encoder)?;
+        self.retained_views.encode_into(encoder)?;
+        self.retained_revisions.encode_into(encoder)?;
+        self.retained_applications.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl RepositoryStateV2Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 2050u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 2050, got {}",
+                wire_tag
+            )));
+        }
+        let base_view = ViewId::decode_with_decoder(decoder)?;
+        let working_view = ViewId::decode_with_decoder(decoder)?;
+        let published_view = ViewId::decode_with_decoder(decoder)?;
+        let changes = ChangeMapId::decode_with_decoder(decoder)?;
+        let required_content = ContentManifestId::decode_with_decoder(decoder)?;
+        let retained_changes = RetainedSetId::decode_with_decoder(decoder)?;
+        let retained_views = RetainedSetId::decode_with_decoder(decoder)?;
+        let retained_revisions = RetainedSetId::decode_with_decoder(decoder)?;
+        let retained_applications = RetainedSetId::decode_with_decoder(decoder)?;
+        Ok(Self {
+            wire_tag,
+            base_view,
+            working_view,
+            published_view,
+            changes,
+            required_content,
+            retained_changes,
+            retained_views,
+            retained_revisions,
+            retained_applications,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        RepositoryStateV2Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        RepositoryStateV2Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<RepositoryStateV2Output> for RepositoryStateV2Input {
+    fn from(o: RepositoryStateV2Output) -> Self {
+        Self {
+            base_view: o.base_view,
+            working_view: o.working_view,
+            published_view: o.published_view,
+            changes: o.changes,
+            required_content: o.required_content,
+            retained_changes: o.retained_changes,
+            retained_views: o.retained_views,
+            retained_revisions: o.retained_revisions,
+            retained_applications: o.retained_applications,
+        }
+    }
+}
+
+impl From<RepositoryStateV2Input> for RepositoryStateV2Output {
+    fn from(i: RepositoryStateV2Input) -> Self {
+        Self {
+            wire_tag: 2050u16,
+            base_view: i.base_view,
+            working_view: i.working_view,
+            published_view: i.published_view,
+            changes: i.changes,
             required_content: i.required_content,
             retained_changes: i.retained_changes,
             retained_views: i.retained_views,

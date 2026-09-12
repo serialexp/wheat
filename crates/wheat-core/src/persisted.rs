@@ -1,6 +1,6 @@
 use crate::{
-    ApplicationMapId, ConflictSetId, ContentManifestId, ContentSetId, RepositoryStateId,
-    RetainedSetId, RevisionMapId, TreeId, ViewId,
+    ApplicationMapId, ChangeMapId, ConflictSetId, ContentManifestId, ContentSetId,
+    RepositoryStateId, RetainedSetId, RevisionMapId, TreeId, ViewId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +44,7 @@ pub struct RepositoryStateRecord {
     pub base_view: ViewId,
     pub working_view: ViewId,
     pub published_view: ViewId,
+    pub changes: ChangeMapId,
     pub required_content: ContentManifestId,
     pub retained_changes: RetainedSetId,
     pub retained_views: RetainedSetId,

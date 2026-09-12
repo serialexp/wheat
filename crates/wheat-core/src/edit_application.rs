@@ -16,6 +16,9 @@ pub struct ApplicationLimits {
     /// Maximum content bytes held while applying one path group.
     pub max_resolved_bytes: usize,
     pub max_generated_bytes: usize,
+    /// Accept edits whose intended replacement is already present. This is for
+    /// descendant reapplication only; authored revisions remain strict.
+    pub allow_already_satisfied: bool,
     pub guarded: guarded::Limits,
 }
 
@@ -25,6 +28,7 @@ impl Default for ApplicationLimits {
             max_edits: guarded::DEFAULT_MAX_EDITS,
             max_resolved_bytes: 64 * 1024 * 1024,
             max_generated_bytes: 16 * 1024 * 1024,
+            allow_already_satisfied: false,
             guarded: guarded::Limits::default(),
         }
     }
@@ -35,6 +39,9 @@ pub enum ApplicationOutcome {
     Applied {
         read: Option<Range<usize>>,
         write: Option<Range<usize>>,
+    },
+    AlreadySatisfied {
+        read: Option<Range<usize>>,
     },
     NoMatch,
     Ambiguous,
@@ -232,7 +239,9 @@ where
             } = &record.operation
         {
             let actual = target.get(&path).copied();
-            if actual != *expected {
+            if limits.allow_already_satisfied && actual == *replacement {
+                outcomes.insert(*id, ApplicationOutcome::AlreadySatisfied { read: None });
+            } else if actual != *expected {
                 outcomes.insert(
                     *id,
                     ApplicationOutcome::ExpectedFileMismatch {
@@ -309,6 +318,7 @@ where
             limits.guarded,
             remaining_generated,
             &mut guarded_work,
+            limits.allow_already_satisfied,
         )
         .map_err(|error| match error {
             guarded::Error::OutputTooLarge { actual, limit: _ } => {
@@ -326,6 +336,11 @@ where
                     read: Some(read.clone()),
                     write: Some(write.clone()),
                 },
+                guarded::EditOutcome::AlreadySatisfied { read } => {
+                    ApplicationOutcome::AlreadySatisfied {
+                        read: Some(read.clone()),
+                    }
+                }
                 guarded::EditOutcome::NoMatch => ApplicationOutcome::NoMatch,
                 guarded::EditOutcome::Ambiguous => ApplicationOutcome::Ambiguous,
                 guarded::EditOutcome::Interference { with } => ApplicationOutcome::Interference {

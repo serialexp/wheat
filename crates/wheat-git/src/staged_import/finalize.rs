@@ -227,6 +227,7 @@ where
     }
 
     observer(FinalizePhase::JournalAuthenticationAccumulation);
+    let mut change_objects = Vec::new();
     let mut after = None::<Vec<u8>>;
     loop {
         let page = journal.completed(after.as_deref(), PAGE)?;
@@ -253,6 +254,7 @@ where
                 metadata: change_metadata,
             };
             let change_id = ChangeObjectId::of_canonical_bytes(&change.canonical_bytes());
+            change_objects.push((native.change_id, change_id));
             authenticate_exact(
                 objects,
                 change_id.into(),
@@ -333,6 +335,18 @@ where
         .build_retained(&retained, RetainedTable::Applications)
         .await?;
 
+    let mut change_map_objects = Vec::new();
+    let changes =
+        wheat_core::build_change_map(change_objects, |object| change_map_objects.push(object));
+    objects
+        .put_batch(
+            &change_map_objects
+                .into_iter()
+                .map(|object| (object.id, object.bytes))
+                .collect::<Vec<_>>(),
+            8,
+        )
+        .await?;
     let aggregate_manifest = ContentManifestRecord {
         content: all_content,
     };
@@ -346,6 +360,7 @@ where
         base_view: empty,
         working_view: selected.view_id,
         published_view: selected.view_id,
+        changes,
         required_content: aggregate_manifest.id(),
         retained_changes,
         retained_views,

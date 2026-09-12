@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplicationId, ApplicationMapId, CanonicalObjectError, ConflictSetId, ContentSetId,
-    RetainedSetId,
+    ApplicationId, ApplicationMapId, CanonicalObjectError, ChangeMapId, ChangeObjectId,
+    ConflictSetId, ContentSetId, RetainedSetId,
 };
 
 macro_rules! child {
@@ -16,6 +16,7 @@ macro_rules! child {
 }
 
 child!(ApplicationMapChild, ApplicationMapId);
+child!(ChangeMapChild, ChangeMapId);
 child!(ConflictSetChild, ConflictSetId);
 child!(ContentSetChild, ContentSetId);
 child!(RetainedSetChild, RetainedSetId);
@@ -51,6 +52,40 @@ impl ApplicationMapNode {
     #[must_use]
     pub fn id(&self) -> ApplicationMapId {
         ApplicationMapId::of_canonical_bytes(&self.canonical_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeMapNode {
+    pub prefix: Vec<u8>,
+    pub value: Option<ChangeObjectId>,
+    pub children: Vec<ChangeMapChild>,
+}
+
+impl ChangeMapNode {
+    pub fn new(
+        prefix: Vec<u8>,
+        value: Option<ChangeObjectId>,
+        mut children: Vec<ChangeMapChild>,
+    ) -> Result<Self, CanonicalObjectError> {
+        children.sort_by_key(|child| child.edge);
+        let node = Self {
+            prefix,
+            value,
+            children,
+        };
+        crate::wire::validate_change_map_node(&node)?;
+        Ok(node)
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::change_map_node_bytes(self)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> ChangeMapId {
+        ChangeMapId::of_canonical_bytes(&self.canonical_bytes())
     }
 }
 

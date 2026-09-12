@@ -782,6 +782,9 @@ fn publish_target(root: &Path, metadata: &mut WorkspaceMetadata, journal: &Journ
     let mut next = metadata.clone();
     next.selection = journal.selection.clone();
     next.materialized = Some(journal.target.clone());
+    if next.authoring_basis.is_none() {
+        next.authoring_basis = Some(journal.target.view);
+    }
     let prepared = next.replace_prepared(root)?;
     match prepared.publish() {
         Ok(()) => {

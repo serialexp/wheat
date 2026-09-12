@@ -1,5 +1,6 @@
 use std::{
     fmt::Write as _,
+    io::{BufRead as _, IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     str::FromStr,
@@ -16,6 +17,7 @@ use wheat_store::{
     PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
     RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
+mod active_changes;
 mod authoring_metadata;
 mod conflict_inspection;
 mod diff_render;
@@ -24,6 +26,7 @@ mod inspection;
 mod local;
 mod materialization;
 mod repository_diff;
+mod selection_recovery;
 mod workspace;
 mod workspace_diff;
 mod workspace_files;
@@ -35,7 +38,7 @@ use local::{
     content_store, current_revision_records, initialize, open, projection_path, repository_summary,
     revision_with_edits, runtime,
 };
-use workspace_metadata::{StoreMetadata, WorkspaceMetadata, WorkspaceSelection};
+use workspace_metadata::{PendingSelection, StoreMetadata, WorkspaceMetadata, WorkspaceSelection};
 
 #[derive(Debug, Parser)]
 #[command(name = "wheat", about = "Wheat source control prototype")]
@@ -64,6 +67,8 @@ enum Command {
     Validate,
     /// Inspect logical changes and immutable revisions.
     Log,
+    /// List changes active relative to this workspace's authoring basis.
+    Changes(StatusArgs),
     /// Inspect durable conflicts and per-edit failure evidence.
     Conflicts(ConflictsArgs),
     /// Compare workspace or retained immutable repository trees.
@@ -157,8 +162,10 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum ChangeCommand {
-    /// Create a logical change.
-    New(NewArgs),
+    /// Create a logical change and select it in this workspace.
+    New(Box<NewArgs>),
+    /// Select an existing active change for subsequent `wheat add` commands.
+    Select { change: String },
 }
 
 #[derive(Debug, Args)]
@@ -179,7 +186,7 @@ struct NewArgs {
 struct NewMetadataArgs {
     /// Native revision message. Its first nonempty line is the stable change title.
     #[arg(short = 'm', long)]
-    message: String,
+    message: Option<String>,
     /// Stable logical-change description.
     #[arg(long)]
     description: Option<String>,
@@ -196,9 +203,9 @@ struct NewMetadataArgs {
 
 #[derive(Debug, Args)]
 struct RevisionMetadataArgs {
-    /// Native revision message.
+    /// Optional note for this immutable revision.
     #[arg(short = 'm', long)]
-    message: String,
+    message: Option<String>,
     /// Author timestamp as RFC3339. Defaults to the current local time.
     #[arg(long)]
     authored_at: Option<String>,
@@ -209,12 +216,12 @@ struct RevisionMetadataArgs {
 
 #[derive(Debug, Args)]
 struct AddArgs {
-    /// Stable logical change identity.
+    /// Active logical change to revise instead of the workspace selection.
     #[arg(long)]
-    change: String,
-    /// Exact current immutable revision.
-    #[arg(long)]
-    predecessor: String,
+    change: Option<String>,
+    /// Advanced stale-state assertion retained for low-level automation.
+    #[arg(long, hide = true)]
+    predecessor: Option<String>,
     /// Explicit repository-relative workspace paths. No other files are read or written.
     #[arg(required = true)]
     paths: Vec<String>,
@@ -229,6 +236,29 @@ struct AddArgs {
 struct GuardRange {
     path: String,
     range: std::ops::Range<usize>,
+}
+
+fn change_message(value: Option<String>) -> Result<String> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("change message is required in non-interactive use; pass --message <message>");
+    }
+    eprint!("Change message: ");
+    std::io::stderr().flush()?;
+    let mut value = String::new();
+    std::io::stdin()
+        .lock()
+        .take(1024 * 1024 + 1)
+        .read_line(&mut value)?;
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    Ok(value)
 }
 
 fn parse_guard(value: &str) -> std::result::Result<GuardRange, String> {
@@ -250,7 +280,7 @@ fn parse_guard(value: &str) -> std::result::Result<GuardRange, String> {
 struct EditArgs {
     /// Repository-relative path to edit.
     #[arg(long)]
-    path: String,
+    path: Option<String>,
     /// Expected current UTF-8 content; omit when creating a path.
     #[arg(long)]
     expected: Option<String>,
@@ -258,11 +288,7 @@ struct EditArgs {
     #[arg(long, value_enum)]
     expected_kind: Option<CliFileKind>,
     /// Replacement UTF-8 content; omit with --delete or for a mode-only edit.
-    #[arg(
-        long,
-        conflicts_with = "delete",
-        required_unless_present_any = ["delete", "replacement_kind"]
-    )]
+    #[arg(long, conflicts_with = "delete")]
     value: Option<String>,
     /// Replacement file kind (defaults to the expected kind for an existing path, regular for a new path).
     #[arg(long, value_enum)]
@@ -420,13 +446,42 @@ fn main() -> Result<()> {
                     record.metadata.author.email,
                     authoring_metadata::display_timestamp(record.metadata.authored_at)?
                 )?;
-                writeln!(
-                    output,
-                    "  {}",
-                    record.metadata.message.replace('\n', "\n  ")
-                )?;
+                if !record.metadata.message.is_empty() {
+                    writeln!(
+                        output,
+                        "  {}",
+                        record.metadata.message.replace('\n', "\n  ")
+                    )?;
+                }
             }
             print!("{output}");
+            Ok(())
+        }
+        Command::Changes(arguments) => {
+            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&context.store_root)?;
+            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
+            context.workspace = WorkspaceMetadata::read(&context.root)?;
+            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
+            let basis = context
+                .workspace
+                .authoring_basis
+                .context("workspace has no authoring basis; materialize it first")?;
+            let head = local.heads.read()?;
+            let document = runtime()?.block_on(active_changes::inspect(
+                &local,
+                head,
+                basis,
+                context.workspace.selected_change,
+            ))?;
+            let mut bytes = match arguments.format {
+                OutputFormat::Json => active_changes::render_json(&document)?,
+                OutputFormat::Human => active_changes::render_human(&document)?,
+            };
+            if matches!(arguments.format, OutputFormat::Json) {
+                bytes.push(b'\n');
+            }
+            std::io::stdout().write_all(&bytes)?;
             Ok(())
         }
         Command::Conflicts(arguments) => {
@@ -527,10 +582,41 @@ fn main() -> Result<()> {
                 &local,
                 &mut context.workspace,
             ))?;
+            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
             let expected = local.heads.read()?;
-            let change = ChangeId::from_str(&arguments.change).context("invalid change ID")?;
-            let predecessor = RevisionId::from_str(&arguments.predecessor)
-                .context("invalid predecessor revision ID")?;
+            let basis = context
+                .workspace
+                .authoring_basis
+                .context("workspace has no authoring basis; materialize it first")?;
+            let active = runtime.block_on(active_changes::inspect(
+                &local,
+                expected,
+                basis,
+                context.workspace.selected_change,
+            ))?;
+            let change = arguments
+                .change
+                .as_deref()
+                .map(ChangeId::from_str)
+                .transpose()
+                .context("invalid change ID")?
+                .or(context.workspace.selected_change)
+                .context(
+                    "workspace has no selected change; run `wheat change new` or pass --change",
+                )?;
+            let destination = active
+                .changes
+                .iter()
+                .find(|candidate| candidate.change == change)
+                .with_context(|| format!("change {change} is not active in this workspace"))?;
+            let predecessor = arguments
+                .predecessor
+                .as_deref()
+                .map(RevisionId::from_str)
+                .transpose()
+                .context("invalid predecessor revision ID")?
+                .unwrap_or(destination.revision);
+            let title = destination.title.clone();
             let mut guards = std::collections::BTreeMap::new();
             for guard in arguments.guards {
                 guards
@@ -552,7 +638,7 @@ fn main() -> Result<()> {
             let (_, revision_metadata) = authoring_metadata::metadata(
                 &context.store_root,
                 authoring_metadata::MetadataArgs {
-                    message: arguments.metadata.message,
+                    message: arguments.metadata.message.unwrap_or_default(),
                     description: None,
                     created_at: None,
                     authored_at: arguments.metadata.authored_at,
@@ -582,7 +668,18 @@ fn main() -> Result<()> {
                 finalize_mutation_publication(&local.heads, publication)
             })?;
             let mut output = String::new();
+            writeln!(
+                output,
+                "added {} path(s) to change {change} — {title}",
+                arguments.paths.len()
+            )?;
             writeln!(output, "revision {}", outcome.revision_id)?;
+            if arguments.change.is_some()
+                && context.workspace.selected_change != Some(change)
+                && let Some(selected) = context.workspace.selected_change
+            {
+                writeln!(output, "selected change remains {selected}")?;
+            }
             print_reapplied(&mut output, &outcome.reapplied)?;
             print!("{output}");
             Ok(())
@@ -596,8 +693,16 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Change(ChangeCommand::New(arguments)) => {
-            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            let local = open(&store_root)?;
+            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&context.store_root)?;
+            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
+            let runtime = runtime()?;
+            runtime.block_on(materialization::recover(
+                &context.root,
+                &local,
+                &mut context.workspace,
+            ))?;
+            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
             let expected = local.heads.read()?;
             let dependencies = arguments
                 .dependencies
@@ -605,10 +710,11 @@ fn main() -> Result<()> {
                 .map(|value| ChangeId::from_str(value).context("invalid dependency change ID"))
                 .collect::<Result<std::collections::BTreeSet<_>>>()?;
             let use_frontier = dependencies.is_empty() && !arguments.independent;
+            let message = change_message(arguments.metadata.message)?;
             let (change_metadata, revision_metadata) = authoring_metadata::metadata(
-                &store_root,
+                &context.store_root,
                 authoring_metadata::MetadataArgs {
-                    message: arguments.metadata.message,
+                    message,
                     description: arguments.metadata.description,
                     created_at: arguments.metadata.created_at,
                     authored_at: arguments.metadata.authored_at,
@@ -616,8 +722,28 @@ fn main() -> Result<()> {
                 },
                 true,
             )?;
-            let edits = capture_initial_edit(&local.content, arguments.edit)?;
+            let edit = arguments.edit;
+            let has_edit = edit.path.is_some()
+                || edit.expected.is_some()
+                || edit.expected_kind.is_some()
+                || edit.value.is_some()
+                || edit.replacement_kind.is_some()
+                || edit.delete;
+            let edits = if has_edit {
+                capture_initial_edit(&local.content, edit)?
+            } else {
+                RevisionEdits::default()
+            };
             let change = ChangeId::new();
+            context.workspace.pending_selection = Some(PendingSelection {
+                change,
+                expected_head: expected.into(),
+            });
+            context
+                .workspace
+                .replace_prepared(&context.root)?
+                .publish()
+                .map_err(|error| anyhow::anyhow!(error))?;
             let proposal = ChangeProposal {
                 id: change,
                 metadata: change_metadata.expect("new change metadata requested"),
@@ -625,7 +751,6 @@ fn main() -> Result<()> {
                 revision_metadata,
                 edits,
             };
-            let runtime = runtime()?;
             let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
             let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
                 .with_target(MutationTarget::PublishWorking);
@@ -646,11 +771,50 @@ fn main() -> Result<()> {
                 objects.flush().await?;
                 finalize_mutation_publication(&local.heads, publication)
             })?;
+            context.workspace.selected_change = Some(change);
+            context.workspace.pending_selection = None;
+            context
+                .workspace
+                .replace_prepared(&context.root)?
+                .publish()
+                .map_err(|error| anyhow::anyhow!(error))?;
             let mut output = String::new();
             writeln!(output, "change {change}")?;
             writeln!(output, "revision {}", outcome.revision_id)?;
             print_reapplied(&mut output, &outcome.reapplied)?;
             print!("{output}");
+            Ok(())
+        }
+        Command::Change(ChangeCommand::Select { change }) => {
+            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let change = ChangeId::from_str(&change).context("invalid change ID")?;
+            let local = open(&context.store_root)?;
+            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
+            context.workspace = WorkspaceMetadata::read(&context.root)?;
+            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
+            let basis = context
+                .workspace
+                .authoring_basis
+                .context("workspace has no authoring basis; materialize it first")?;
+            let head = local.heads.read()?;
+            let active = runtime()?.block_on(active_changes::inspect(
+                &local,
+                head,
+                basis,
+                context.workspace.selected_change,
+            ))?;
+            let selected = active
+                .changes
+                .iter()
+                .find(|candidate| candidate.change == change)
+                .with_context(|| format!("change {change} is not active in this workspace"))?;
+            context.workspace.selected_change = Some(change);
+            context
+                .workspace
+                .replace_prepared(&context.root)?
+                .publish()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            println!("selected change {change} — {}", selected.title);
             Ok(())
         }
         Command::Resolve(arguments) => {
@@ -1056,13 +1220,14 @@ fn capture_initial_edit(
             kind: replacement_kind,
             bytes: bytes.as_bytes(),
         });
-    let captured = wheat_core::edit_capture::capture_edit(
-        &arguments.path,
-        before,
-        after,
-        None,
-        Limits::default(),
-    )?;
+    let path = arguments
+        .path
+        .context("--path is required when supplying an initial edit")?;
+    if !arguments.delete && arguments.value.is_none() && arguments.replacement_kind.is_none() {
+        bail!("--value, --replacement-kind, or --delete is required for an initial edit");
+    }
+    let captured =
+        wheat_core::edit_capture::capture_edit(&path, before, after, None, Limits::default())?;
     workspace::persist_content(store, captured.content)?;
     Ok(RevisionEdits {
         transition: EditTransition {

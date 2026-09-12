@@ -119,8 +119,10 @@ described here.
 - [~] **Phase 1 — complete the reference CLI and local workflow.** The local CLI now
   has explicit-path workspace capture, persisted composition and mutation, working-view
   publication, durable conflict inspection/resolution, complete validation, loose/packed reopen,
-  and black-box lifecycle/scaling coverage. Workspace-wide capture, ergonomic change selection,
-  explicit multi-target publication, and the remote mode remain.
+  and black-box lifecycle/scaling coverage. Workspace-selected active changes, basis-relative
+  listing, ID-free selected-path revision, and authenticated already-satisfied descendant
+  reapplication now complete the ergonomic single-workspace authoring seam. Workspace-wide
+  capture, explicit multi-target publication, and the remote mode remain.
 - [ ] **Phase 1 — complete the conflict and concurrency corpus.** Extend the
   current chain/branch/join/conflict/CAS tests to concurrent human/agent
   mutations, independent simultaneous conflicts, retries, dependency movement,
@@ -838,6 +840,14 @@ requires fresh review; constituent approvals do not automatically approve it.
 No new edit identity is required before addition/normalization. Explicit wider
 guards are supplied at this boundary through the CLI, not registered in advance.
 
+Reapplying a descendant after an ancestor revision may find the descendant's
+intended result already present. This is a successful authenticated no-op, not a
+conflict: exact edits require full replacement `FileValue` equality, while guarded
+text requires the replacement to match uniquely under the original context and
+anchors. Application evidence retains the target value and guarded read range but
+has no write range. Authored revision validation remains strict and cannot use
+this outcome to publish an edit which contributed nothing at its authored base.
+
 Consolidation assumes an intended final result is available, as with local
 workspace additions. Canonical edits are not an ordered script: a later edit may
 not silently consume text introduced by an earlier edit and thereby bypass its own
@@ -1077,7 +1087,13 @@ content:
 ```text
 TreeEntry::File { content: ContentId, mode }
 RepositoryView { root_tree, change_frontier, content_manifest }
+RepositoryState { changes: ChangeMap<ChangeId, ChangeObjectId>, ... }
 ```
+
+The canonical change map provides bounded stable-ID lookup without scanning the
+append-only retained-change inventory. Retained sets remain the historical
+reachability authority; the map indexes each retained logical change exactly once
+and complete validation proves key/object identity and inventory coverage.
 
 `ContentId` is native and algorithm-tagged. Git SHA-1/SHA-256 blob IDs are
 projection identities computed by the compatibility adapter, not native content

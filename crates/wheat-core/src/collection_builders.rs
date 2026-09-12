@@ -7,9 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ApplicationId, ApplicationMapChild, ApplicationMapId, ApplicationMapNode, CanonicalObject,
-    ChangeId, ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId,
-    ContentSetChild, ContentSetId, ContentSetNode, ObjectId, RetainedSetChild, RetainedSetId,
-    RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapId, RevisionMapNode,
+    ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ConflictId,
+    ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentSetChild, ContentSetId,
+    ContentSetNode, ObjectId, RetainedSetChild, RetainedSetId, RetainedSetNode, RevisionId,
+    RevisionMapChild, RevisionMapId, RevisionMapNode,
 };
 
 trait RadixShape {
@@ -128,6 +129,35 @@ impl RadixShape for RevisionShape {
     }
 }
 
+struct ChangeShape;
+impl RadixShape for ChangeShape {
+    type Key = ChangeId;
+    type Value = ChangeObjectId;
+    type Id = ChangeMapId;
+
+    fn key_bytes(key: &Self::Key) -> &[u8] {
+        key.as_bytes()
+    }
+
+    fn node(
+        prefix: Vec<u8>,
+        value: Option<Self::Value>,
+        children: Vec<(u8, Self::Id)>,
+    ) -> (Self::Id, Vec<u8>) {
+        let node = ChangeMapNode::new(
+            prefix,
+            value,
+            children
+                .into_iter()
+                .map(|(edge, child)| ChangeMapChild { edge, child })
+                .collect(),
+        )
+        .expect("builder produces a valid change-map node");
+        let bytes = node.canonical_bytes();
+        (ChangeMapId::of_canonical_bytes(&bytes), bytes)
+    }
+}
+
 struct ApplicationShape;
 impl RadixShape for ApplicationShape {
     type Key = ChangeId;
@@ -224,6 +254,19 @@ pub fn build_revision_map(
         .into_iter()
         .collect();
     build_sorted::<RevisionShape, _>(entries, emit)
+}
+
+/// Builds a canonical stable-change lookup map.
+pub fn build_change_map(
+    entries: impl IntoIterator<Item = (ChangeId, ChangeObjectId)>,
+    emit: impl FnMut(CanonicalObject),
+) -> ChangeMapId {
+    let entries = entries
+        .into_iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    build_sorted::<ChangeShape, _>(entries, emit)
 }
 
 /// Builds a canonical application map. If a change occurs more than once, its

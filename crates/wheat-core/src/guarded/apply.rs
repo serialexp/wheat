@@ -8,7 +8,14 @@ use super::{ApplyResult, EditOutcome, Error, GuardedEdit, Limits, MatchStatus, M
 pub fn apply(target: &[u8], edits: &[GuardedEdit], limits: Limits) -> Result<ApplyResult, Error> {
     let borrowed: Vec<_> = edits.iter().map(GuardedEditRef::from).collect();
     let mut work = WorkBudget::new(limits.max_work);
-    ApplyResult::apply_borrowed(target, &borrowed, limits, limits.max_input_bytes, &mut work)
+    ApplyResult::apply_borrowed(
+        target,
+        &borrowed,
+        limits,
+        limits.max_input_bytes,
+        &mut work,
+        false,
+    )
 }
 
 /// Apply borrowed edits while charging an adapter-wide work budget.
@@ -23,6 +30,7 @@ impl ApplyResult {
         limits: Limits,
         max_output_bytes: usize,
         work: &mut WorkBudget,
+        allow_already_satisfied: bool,
     ) -> Result<Self, Error> {
         validate_text(target, limits)?;
         if edits.len() > limits.max_edits {
@@ -31,7 +39,7 @@ impl ApplyResult {
                 limit: limits.max_edits,
             });
         }
-        let mut matched: Vec<Option<MatchedGuard>> = Vec::with_capacity(edits.len());
+        let mut matched: Vec<Option<(MatchedGuard, bool)>> = Vec::with_capacity(edits.len());
         let mut outcomes = Vec::with_capacity(edits.len());
         for edit in edits {
             validate_fragment(edit.before, limits)?;
@@ -53,7 +61,34 @@ impl ApplyResult {
                         read: m.read.clone(),
                         write: m.write.clone(),
                     });
-                    matched.push(Some(m));
+                    matched.push(Some((m, false)));
+                }
+                MatchStatus::NoMatch if allow_already_satisfied => {
+                    match match_parts_budget(
+                        target,
+                        edit.before,
+                        edit.replacement,
+                        edit.after,
+                        edit.start_anchor,
+                        edit.end_anchor,
+                        limits,
+                        work,
+                    )? {
+                        MatchStatus::Unique(m) => {
+                            outcomes.push(EditOutcome::AlreadySatisfied {
+                                read: m.read.clone(),
+                            });
+                            matched.push(Some((m, true)));
+                        }
+                        MatchStatus::NoMatch => {
+                            outcomes.push(EditOutcome::NoMatch);
+                            matched.push(None);
+                        }
+                        MatchStatus::Ambiguous => {
+                            outcomes.push(EditOutcome::Ambiguous);
+                            matched.push(None);
+                        }
+                    }
                 }
                 MatchStatus::NoMatch => {
                     outcomes.push(EditOutcome::NoMatch);
@@ -67,13 +102,17 @@ impl ApplyResult {
         }
         let mut conflicts = vec![Vec::new(); edits.len()];
         for i in 0..edits.len() {
-            let Some(a) = &matched[i] else { continue };
+            let Some((a, a_satisfied)) = &matched[i] else {
+                continue;
+            };
             for j in i + 1..edits.len() {
-                let Some(b) = &matched[j] else { continue };
+                let Some((b, b_satisfied)) = &matched[j] else {
+                    continue;
+                };
                 work.charge(1)?;
-                if write_touches_read(&a.write, &b.read)
-                    || write_touches_read(&b.write, &a.read)
-                    || writes_overlap(&a.write, &b.write)
+                if (!a_satisfied && write_touches_read(&a.write, &b.read))
+                    || (!b_satisfied && write_touches_read(&b.write, &a.read))
+                    || (!a_satisfied && !b_satisfied && writes_overlap(&a.write, &b.write))
                 {
                     conflicts[i].push(j);
                     conflicts[j].push(i);
@@ -90,7 +129,7 @@ impl ApplyResult {
             .enumerate()
             .filter_map(|(i, matched)| {
                 if matches!(outcomes[i], EditOutcome::Applied { .. }) {
-                    matched.map(|value| (i, value))
+                    matched.map(|(value, _)| (i, value))
                 } else {
                     None
                 }

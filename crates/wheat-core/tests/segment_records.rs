@@ -72,7 +72,12 @@ fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
         Some(CanonicalObjectKind::Edit)
     );
 
-    for kind in [0, 17, u16::MAX] {
+    assert_eq!(
+        SegmentIndexEntry::canonical_kind(17),
+        Some(CanonicalObjectKind::ChangeMapNode)
+    );
+
+    for kind in [0, 18, u16::MAX] {
         let invalid = SegmentIndexPage {
             entries: vec![SegmentIndexEntry {
                 namespace: SEGMENT_NAMESPACE_METADATA,

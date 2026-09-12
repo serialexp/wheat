@@ -128,7 +128,11 @@ pub(crate) fn metadata(
     arguments: MetadataArgs,
     include_change: bool,
 ) -> Result<(Option<ChangeMetadata>, RevisionMetadata)> {
-    ensure_text("revision message", &arguments.message, MAX_MESSAGE_BYTES)?;
+    if include_change {
+        ensure_text("revision message", &arguments.message, MAX_MESSAGE_BYTES)?;
+    } else {
+        ensure_bounded("revision message", &arguments.message, MAX_MESSAGE_BYTES)?;
+    }
     let actor = actor(store_root)?;
     let now = Local::now().fixed_offset();
     let authored_at = parse_timestamp(arguments.authored_at.as_deref(), now, "authored-at")?;

@@ -5,12 +5,15 @@ pub(super) fn execute<C: ContentIo + ?Sized>(
     target: &RepositoryView,
     edits: &BTreeMap<EditId, EditRecord>,
     context: ApplicationContext<'_, C>,
+    allow_already_satisfied: bool,
 ) -> Result<Application, RepositoryError> {
+    let mut limits = context.limits;
+    limits.allow_already_satisfied = allow_already_satisfied;
     let output = crate::edit_application::apply_edits(
         &target.tree,
         edits.iter().map(|(id, edit)| (*id, edit.clone())),
         |id| context.content.resolve(id),
-        context.limits,
+        limits,
     )
     .map_err(|error| RepositoryError::EditApplication(format!("{error:?}")))?;
 
@@ -46,6 +49,16 @@ pub(super) fn execute<C: ContentIo + ?Sized>(
                     },
                 );
             }
+            crate::edit_application::ApplicationOutcome::AlreadySatisfied { read } => {
+                applied.insert(
+                    id,
+                    AppliedEditEvidence {
+                        target: target_value,
+                        read: read.map(byte_range),
+                        write: None,
+                    },
+                );
+            }
             outcome => {
                 let reason = match outcome {
                     crate::edit_application::ApplicationOutcome::NoMatch => EditFailure::NoMatch,
@@ -63,7 +76,10 @@ pub(super) fn execute<C: ContentIo + ?Sized>(
                     crate::edit_application::ApplicationOutcome::ExpectedFileMismatch {
                         ..
                     } => EditFailure::ExpectedFileMismatch,
-                    crate::edit_application::ApplicationOutcome::Applied { .. } => unreachable!(),
+                    crate::edit_application::ApplicationOutcome::Applied { .. }
+                    | crate::edit_application::ApplicationOutcome::AlreadySatisfied { .. } => {
+                        unreachable!()
+                    }
                 };
                 failed.insert(
                     id,

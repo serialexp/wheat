@@ -148,6 +148,92 @@ fn exact_symlink_replacement_uses_full_file_value() {
 }
 
 #[test]
+fn exact_and_guarded_reapplication_recognize_already_satisfied_edits() {
+    let final_bytes = b"top\nfinal\nbottom\n";
+    let final_id = ContentId::of(final_bytes);
+    let exact = EditRecord::new(
+        "exact",
+        EditOperation::ExactFile {
+            expected: None,
+            replacement: Some(FileValue {
+                content: final_id,
+                kind: FileKind::Regular,
+            }),
+        },
+    )
+    .unwrap();
+    let guarded = EditRecord::new(
+        "guarded",
+        EditOperation::GuardedText {
+            kind: FileKind::Regular,
+            before: ContentId::of(b"top\n"),
+            expected: ContentId::of(b"middle\n"),
+            replacement: ContentId::of(b"final\n"),
+            after: ContentId::of(b"bottom\n"),
+            start_anchor: true,
+            end_anchor: true,
+        },
+    )
+    .unwrap();
+    let tree = BTreeMap::from([
+        (
+            "exact".into(),
+            FileValue {
+                content: final_id,
+                kind: FileKind::Regular,
+            },
+        ),
+        (
+            "guarded".into(),
+            FileValue {
+                content: final_id,
+                kind: FileKind::Regular,
+            },
+        ),
+    ]);
+    let blobs = BTreeMap::from([
+        blob(final_bytes),
+        blob(b"top\n"),
+        blob(b"middle\n"),
+        blob(b"final\n"),
+        blob(b"bottom\n"),
+    ]);
+    let limits = ApplicationLimits {
+        allow_already_satisfied: true,
+        ..ApplicationLimits::default()
+    };
+    let result = apply_edits(
+        &tree,
+        [(exact.id(), exact.clone()), (guarded.id(), guarded.clone())],
+        |id| blobs.get(&id).cloned().ok_or("missing"),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(result.tree, tree);
+    assert_eq!(
+        result.outcomes[&exact.id()],
+        ApplicationOutcome::AlreadySatisfied { read: None }
+    );
+    assert!(matches!(
+        result.outcomes[&guarded.id()],
+        ApplicationOutcome::AlreadySatisfied { read: Some(_) }
+    ));
+    assert!(result.generated_content.is_empty());
+
+    let strict = apply_edits(
+        &tree,
+        [(exact.id(), exact)],
+        |id| blobs.get(&id).cloned().ok_or("missing"),
+        ApplicationLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        strict.outcomes.values().next().unwrap(),
+        ApplicationOutcome::ExpectedFileMismatch { .. }
+    ));
+}
+
+#[test]
 fn aggregate_work_budget_is_shared_across_paths() {
     let source = b"abc";
     let source_id = ContentId::of(source);

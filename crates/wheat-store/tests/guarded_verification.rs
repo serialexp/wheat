@@ -98,6 +98,7 @@ async fn extend_state(
         base_view: state.base_view,
         working_view: state.working_view,
         published_view: state.published_view,
+        change_objects: state.change_objects.clone(),
         required_content: state.required_content,
         retained_changes: state.retained_changes.clone(),
         retained_views: state.retained_views.clone(),

@@ -104,6 +104,7 @@ digest_id!(RepositoryStateId);
 digest_id!(BranchManifestId);
 digest_id!(RepositoryEnvelopeId);
 digest_id!(RevisionMapId);
+digest_id!(ChangeMapId);
 digest_id!(ApplicationMapId);
 digest_id!(ConflictSetId);
 digest_id!(ContentSetId);
@@ -134,6 +135,7 @@ object_id_from!(
     BranchManifestId,
     RepositoryEnvelopeId,
     RevisionMapId,
+    ChangeMapId,
     ApplicationMapId,
     ConflictSetId,
     ContentSetId,

@@ -46,6 +46,13 @@ pub fn build_repository_state_record(
         base_view: state.base_view,
         working_view: state.working_view,
         published_view: state.published_view,
+        changes: crate::build_change_map(
+            state
+                .change_objects
+                .iter()
+                .map(|(change, object)| (*change, *object)),
+            &mut *sink,
+        ),
         required_content: state.required_content,
         retained_changes: crate::build_retained_set(
             state.retained_changes.iter().copied().map(ObjectId::from),

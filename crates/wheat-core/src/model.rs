@@ -499,6 +499,7 @@ pub struct RepositoryState {
     pub base_view: ViewId,
     pub working_view: ViewId,
     pub published_view: ViewId,
+    pub change_objects: BTreeMap<ChangeId, crate::ChangeObjectId>,
     pub required_content: ContentManifestId,
     pub retained_changes: BTreeSet<crate::ChangeObjectId>,
     pub retained_views: BTreeSet<ViewId>,

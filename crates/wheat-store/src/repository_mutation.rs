@@ -24,6 +24,8 @@ pub enum RepositoryMutationError {
     #[error(transparent)]
     Revisions(#[from] crate::RevisionMapError),
     #[error(transparent)]
+    Changes(#[from] crate::ChangeMapError),
+    #[error(transparent)]
     Applications(#[from] crate::ApplicationMapError),
     #[error(transparent)]
     Collections(#[from] crate::CollectionError),
@@ -225,6 +227,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             .await?;
         fresh.objects += 1;
         fresh.changes.insert(change_id);
+        active.state.changes = crate::ChangeMapStore::new(self.objects)
+            .insert(active.state.changes, proposal.id, change_id)
+            .await?;
         active
             .revisions
             .insert(proposal.id, (revision_id, revision));
@@ -647,11 +652,15 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             }
         }
         let before = flat.clone();
+        let limits = wheat_core::edit_application::ApplicationLimits {
+            allow_already_satisfied: persist,
+            ..Default::default()
+        };
         let output = wheat_core::edit_application::apply_edits(
             &flat,
             edits.iter().map(|(id, edit)| (*id, edit.clone())),
             |id| self.content.resolve(id),
-            wheat_core::edit_application::ApplicationLimits::default(),
+            limits,
         )
         .map_err(|error| RepositoryError::EditApplication(format!("{error:?}")))?;
         for (id, bytes) in &output.generated_content {
@@ -689,6 +698,16 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                         },
                     );
                 }
+                wheat_core::edit_application::ApplicationOutcome::AlreadySatisfied { read } => {
+                    applied.insert(
+                        id,
+                        AppliedEditEvidence {
+                            target: target_value,
+                            read: read.map(byte_range),
+                            write: None,
+                        },
+                    );
+                }
                 outcome => {
                     let reason = match outcome {
                         wheat_core::edit_application::ApplicationOutcome::NoMatch => EditFailure::NoMatch,
@@ -696,7 +715,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                         wheat_core::edit_application::ApplicationOutcome::Interference { with } => EditFailure::Interference { with: with.into_iter().collect() },
                         wheat_core::edit_application::ApplicationOutcome::KindMismatch { .. } => EditFailure::KindMismatch,
                         wheat_core::edit_application::ApplicationOutcome::ExpectedFileMismatch { .. } => EditFailure::ExpectedFileMismatch,
-                        wheat_core::edit_application::ApplicationOutcome::Applied { .. } => unreachable!(),
+                        wheat_core::edit_application::ApplicationOutcome::Applied { .. }
+                        | wheat_core::edit_application::ApplicationOutcome::AlreadySatisfied { .. } => unreachable!(),
                     };
                     if let Some(value) = target_value {
                         fresh.content.insert(value.content);
@@ -955,6 +975,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             base_view: old.base_view,
             working_view: working,
             published_view,
+            changes: old.changes,
             required_content: manifest.id(),
             retained_changes,
             retained_views,

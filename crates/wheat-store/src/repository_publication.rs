@@ -27,6 +27,8 @@ pub enum RepositoryPublicationError {
     #[error(transparent)]
     Revisions(#[from] crate::RevisionMapError),
     #[error(transparent)]
+    Changes(#[from] crate::ChangeMapError),
+    #[error(transparent)]
     Applications(#[from] crate::ApplicationMapError),
     #[error(transparent)]
     Tree(#[from] crate::MerkleTreeError),

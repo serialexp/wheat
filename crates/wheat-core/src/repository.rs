@@ -258,11 +258,13 @@ impl Repository {
         let mut objects = BTreeMap::<ObjectId, Vec<u8>>::new();
         let mut required_content = BTreeSet::new();
         let mut retained_changes = BTreeSet::new();
+        let mut change_objects = BTreeMap::new();
 
         for change in self.changes.values() {
             let bytes = change.canonical_bytes();
             let id = crate::ChangeObjectId::of_canonical_bytes(&bytes);
             retained_changes.insert(id);
+            change_objects.insert(change.id, id);
             insert_canonical_object(&mut objects, id.into(), bytes);
         }
         for revision in self.revisions.values() {
@@ -356,6 +358,7 @@ impl Repository {
             base_view: self.base_view,
             working_view: self.working_view,
             published_view: self.published_view,
+            change_objects,
             required_content: aggregate_manifest_id,
             retained_changes,
             retained_views: self.views.keys().copied().collect(),
@@ -555,7 +558,7 @@ impl Repository {
             .revisions
             .get(&revision)
             .ok_or(RepositoryError::UnknownRevision(revision))?;
-        application::execute(revision.id, target, revision.edits(), context)
+        application::execute(revision.id, target, revision.edits(), context, false)
     }
 
     pub fn create_change<C: ContentIo + ?Sized>(
@@ -864,7 +867,7 @@ impl Repository {
             };
             let pending_id = RevisionId::from_digest([0; 32]);
             let preliminary =
-                application::execute(pending_id, &target, &proposal.edits.edits, context)?;
+                application::execute(pending_id, &target, &proposal.edits.edits, context, false)?;
             let ApplicationResult::Clean { tree } = &preliminary.result else {
                 return Err(RepositoryError::InvalidEdits);
             };
@@ -880,7 +883,7 @@ impl Repository {
             };
             revision.id = RevisionId::of_canonical_bytes(&revision.canonical_bytes());
             let application =
-                application::execute(revision.id, &target, revision.edits(), context)?;
+                application::execute(revision.id, &target, revision.edits(), context, true)?;
             let mut frontier = target.frontier.clone();
             frontier.insert(proposal.id, revision.id);
             let mut applications = target.applications.clone();
@@ -953,6 +956,7 @@ impl Repository {
             &target,
             &edits.edits,
             context,
+            false,
         )?;
         let ApplicationResult::Clean {
             tree: authored_tree,
@@ -1008,7 +1012,7 @@ impl Repository {
             let revision_id = self.current_revisions[&change];
             let revision = &self.revisions[&revision_id];
             let application =
-                application::execute(revision_id, &target, revision.edits(), context)?;
+                application::execute(revision_id, &target, revision.edits(), context, true)?;
             self.applications
                 .insert(application.id, application.clone());
             self.current_applications.insert(change, application);
@@ -1058,7 +1062,7 @@ impl Repository {
             );
             debug_assert_eq!(target.id, target_id);
             let application =
-                application::execute(revision_id, &target, revision.edits(), context)?;
+                application::execute(revision_id, &target, revision.edits(), context, true)?;
             if let ApplicationResult::Conflicted { conflict, .. } = &application.result {
                 conflicts.insert(conflict.id);
             }

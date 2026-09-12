@@ -145,6 +145,9 @@ pub enum EditOutcome {
         read: Range<usize>,
         write: Range<usize>,
     },
+    AlreadySatisfied {
+        read: Range<usize>,
+    },
     NoMatch,
     Ambiguous,
     Interference {
