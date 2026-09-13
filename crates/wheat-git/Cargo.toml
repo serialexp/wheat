@@ -8,7 +8,7 @@ async-trait = "0.1"
 gix = { workspace = true }
 libc = { workspace = true }
 lru = "0.12"
-rusqlite = "0.32"
+rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }

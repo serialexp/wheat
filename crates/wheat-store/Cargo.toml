@@ -11,7 +11,7 @@ futures = "0.3"
 libc = { workspace = true }
 lru = "0.12"
 object_store = { version = "0.14.1", features = ["aws"] }
-rusqlite = "0.32"
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
