@@ -12,6 +12,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: "true"
+      # The runner checkout is a mounted workspace whose filesystem rejects
+      # directory fsync; profile the durable store on the runner's local disk.
+      WHEAT_PROFILE_SCRATCH_ROOT: /tmp
     steps:
       - uses: actions/checkout@v5
 
