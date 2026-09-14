@@ -19,7 +19,7 @@ pub(crate) fn write_report(
     reachable_commits: u64,
     total_seconds: f64,
     peak_rss_bytes: f64,
-) -> Result<ContractOutcome> {
+) -> Result<()> {
     let report = build_report(
         timings,
         parameters,
@@ -31,7 +31,12 @@ pub(crate) fn write_report(
     // Canonicalize and persist before evaluating. A failed contract is still a
     // valid profile result and must remain available to workflow ingestion.
     fs::write(output, report.canonical_json()?)?;
-    Ok(report.evaluate()?)
+    match report.evaluate()? {
+        ContractOutcome::Passed => Ok(()),
+        ContractOutcome::Failed { violations } => {
+            anyhow::bail!("performance contract failed: {violations:?}")
+        }
+    }
 }
 
 fn build_report(
@@ -220,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn failing_report_is_written_canonically_and_evaluates_failed() {
+    fn failing_report_is_written_canonically_and_returns_failure() {
         let directory = tempdir().unwrap();
         let output = directory.path().join("profile.json");
         let timings = all_timings(700.0);
@@ -228,9 +233,10 @@ mod tests {
             .unwrap()
             .canonical_json()
             .unwrap();
-        let outcome =
-            write_report(&output, &timings, BTreeMap::new(), 42, 10, 700.0, 2048.0).unwrap();
-        assert!(matches!(outcome, ContractOutcome::Failed { .. }));
+
+        let error =
+            write_report(&output, &timings, BTreeMap::new(), 42, 10, 700.0, 2048.0).unwrap_err();
+        assert!(error.to_string().contains("performance contract failed"));
 
         let bytes = fs::read(&output).unwrap();
         assert_eq!(bytes, expected);

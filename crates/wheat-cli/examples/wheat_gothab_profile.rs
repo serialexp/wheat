@@ -13,7 +13,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use gothab_profile::ContractOutcome;
 use serde_json::{Value, json};
 use wheat_gothab_profile::{
     command::{BoundedOutput, ProfileRun, peak_process_rss_bytes},
@@ -244,7 +243,7 @@ fn main() -> Result<()> {
     run.wheat_ok(
         "materialize.conflicted_working",
         &workspace,
-        &["materialize", "--source", "working"],
+        &["materialize"],
     )?;
     ensure!(
         workspace.join("wheat-profile-added").is_file(),
@@ -261,11 +260,7 @@ fn main() -> Result<()> {
             "Wheat profile resolved value\n",
         ],
     )?;
-    run.wheat_ok(
-        "materialize.resolved_working",
-        &workspace,
-        &["materialize", "--source", "working"],
-    )?;
+    run.wheat_ok("materialize.resolved_working", &workspace, &["materialize"])?;
     assert_clean_status(&run.json("status.resolved_clean", &workspace, &["status"])?)?;
 
     git_init_bare(&remote)?;
@@ -273,14 +268,7 @@ fn main() -> Result<()> {
     run.wheat_ok(
         "push.working",
         &workspace,
-        &[
-            "push",
-            remote_s,
-            "--to",
-            "refs/heads/main",
-            "--source",
-            "working",
-        ],
+        &["push", remote_s, "--to", "refs/heads/main"],
     )?;
     git(&remote, &["fsck", "--strict"])?;
     let remote_tip = git(&remote, &["rev-parse", "refs/heads/main"])?;
@@ -333,7 +321,7 @@ fn main() -> Result<()> {
     let storage_bytes = directory_size(run.store_home())?;
     let total_seconds = full_run_started.elapsed().as_secs_f64();
     let peak_rss_bytes = peak_process_rss_bytes(&run.timings);
-    let outcome = write_report(
+    write_report(
         &output,
         &run.timings,
         BTreeMap::from([
@@ -351,9 +339,6 @@ fn main() -> Result<()> {
         total_seconds,
         peak_rss_bytes,
     )?;
-    if let ContractOutcome::Failed { violations } = outcome {
-        eprintln!("performance contract failed: {violations:?}");
-    }
     Ok(())
 }
 

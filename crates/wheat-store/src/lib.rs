@@ -16,6 +16,12 @@ mod loose;
 mod merkle_tree;
 mod mutation_publication;
 mod object_store_adapter;
+mod ownership;
+pub use ownership::{
+    LivenessProof, Owner, OwnerId, OwnerKind, OwnershipError, OwnershipLimits, OwnershipManifest,
+    OwnershipManifestId, prove_union_liveness, prove_union_liveness_bounded,
+    prove_union_liveness_with,
+};
 mod packed;
 pub use packed::PackedObjectStore;
 mod publication;
@@ -31,6 +37,12 @@ mod verification_scratch;
 pub use repository_reader::RepositoryReader;
 mod revision_map;
 mod sets;
+mod snapshot;
+pub use snapshot::{
+    ContentBatch, InventoryEntry, MemorySnapshotSink, NativeSnapshot, ObjectBatch, SnapshotError,
+    SnapshotId, SnapshotLimits, SnapshotManifest, SnapshotSink, SnapshotSource, export_snapshot,
+    export_snapshot_to, restore_snapshot, restore_snapshot_from,
+};
 mod view_lineage;
 
 pub use application_map::{ApplicationMapCursor, ApplicationMapError, ApplicationMapStore};

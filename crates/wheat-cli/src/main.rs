@@ -381,6 +381,28 @@ struct ImportArgs {
     branch: String,
 }
 
+#[derive(Clone, Debug)]
+enum PushSource {
+    Label(String),
+    View(ViewId),
+}
+
+impl FromStr for PushSource {
+    type Err = String;
+
+    fn from_str(source: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some(name) = source.strip_prefix("label:") {
+            if name.is_empty() {
+                return Err("label selector requires a name".into());
+            }
+            return Ok(Self::Label(name.into()));
+        }
+        ViewId::from_str(source)
+            .map(Self::View)
+            .map_err(|_| "source must be label:<name> or an exact view ID".into())
+    }
+}
+
 #[derive(Debug, Args)]
 struct PushArgs {
     /// Git remote URL. It is passed to Git and never persisted by Wheat.
@@ -388,9 +410,9 @@ struct PushArgs {
     /// Full destination branch ref, for example refs/heads/main.
     #[arg(long)]
     to: String,
-    /// Wheat source: label:<name> or an exact retained view ID.
-    #[arg(long, default_value = "label:main")]
-    source: String,
+    /// Advanced source override: label:<name> or an exact retained view ID.
+    #[arg(long)]
+    source: Option<PushSource>,
     /// Replace an unknown/diverged destination only if it still has the observed OID.
     #[arg(long)]
     force_with_lease: bool,
@@ -1037,8 +1059,20 @@ fn execute(cli: Cli) -> Result<Success> {
             resolve(&context.root, &context.store_root, arguments)
         }
         Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
-        Command::Push(arguments) => {
-            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+        Command::Push(mut arguments) => {
+            let store_root = if arguments.source.is_none() {
+                let context = resolve_context(&requested_workspace, cli.store.as_deref()).map_err(
+                    |_| {
+                        CliFailure::invalid(
+                            "push without --source requires a discoverable matching Wheat workspace",
+                        )
+                    },
+                )?;
+                arguments.source = Some(PushSource::View(context.workspace.effective_view()));
+                context.store_root
+            } else {
+                resolve_store_root(&requested_workspace, cli.store.as_deref())?
+            };
             push(&store_root, arguments)
         }
     }
@@ -1365,23 +1399,19 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         let reader = RepositoryReader::new(&local.objects, &local.content);
         let envelope = reader.validate_envelope(expected.envelope).await?;
         let state = reader.state(envelope.state).await?;
-        let selected = match arguments.source.as_str() {
-            source if source.starts_with("label:") => {
-                let name = source.strip_prefix("label:").expect("matched prefix");
-                if name.is_empty() {
-                    return Err(CliFailure::invalid("label selector requires a name"));
-                }
-                reader
-                    .view_label_manifest(envelope.labels)
-                    .await?
-                    .labels
-                    .get(name)
-                    .map(|label| label.view)
-                    .with_context(|| format!("unknown Wheat label {name}"))?
-            }
-            source => ViewId::from_str(source).map_err(|_| {
-                CliFailure::invalid("source must be label:<name> or an exact view ID")
-            })?,
+        let selected = match arguments
+            .source
+            .as_ref()
+            .context("push source was not resolved")?
+        {
+            PushSource::Label(name) => reader
+                .view_label_manifest(envelope.labels)
+                .await?
+                .labels
+                .get(name)
+                .map(|label| label.view)
+                .with_context(|| format!("unknown Wheat label {name}"))?,
+            PushSource::View(view) => *view,
         };
         Ok::<_, anyhow::Error>((state.base_view, selected))
     })?;

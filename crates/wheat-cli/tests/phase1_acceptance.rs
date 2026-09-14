@@ -744,9 +744,6 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         clean_before_push["result"]["changes"],
         serde_json::json!([])
     );
-    let effective_view: wheat_core::ViewId =
-        serde_json::from_value(clean_before_push["result"]["effective_view"].clone()).unwrap();
-    let effective_view = effective_view.to_string();
     assert_eq!(
         harness.json_ok(&harness.workspace, &["conflicts"])["result"]["conflicts"],
         serde_json::json!([])
@@ -779,8 +776,6 @@ fn phase_one_routine_single_target_workflow_across_processes() {
             push_remote.to_str().unwrap(),
             "--to",
             "refs/heads/main",
-            "--source",
-            &effective_view,
         ],
     );
     assert_eq!(pushed["command"], "push");

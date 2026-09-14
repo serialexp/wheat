@@ -69,6 +69,109 @@ fn effective_view(workspace: &Path) -> String {
     view.to_string()
 }
 
+fn store_path(workspace: &Path) -> String {
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.join(".wheat/workspace.json")).unwrap())
+            .unwrap();
+    metadata["store"]["path"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn push_source_is_typed_and_store_only_push_requires_an_explicit_selector() {
+    let root = tempfile::tempdir().unwrap();
+    let repository = root.path().join("repository");
+    let elsewhere = root.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    assert!(
+        wheat(&repository, &["init", repository.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let store = store_path(&repository);
+
+    let store_only = wheat(
+        &elsewhere,
+        &[
+            "--store",
+            &store,
+            "push",
+            "unused",
+            "--to",
+            "refs/heads/main",
+        ],
+    );
+    assert_eq!(store_only.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&store_only.stderr)
+            .contains("push without --source requires a discoverable matching Wheat workspace")
+    );
+
+    let command_words = wheat(
+        &repository,
+        &[
+            "push",
+            "unused",
+            "--to",
+            "refs/heads/main",
+            "source",
+            "label:main",
+        ],
+    );
+    assert_eq!(command_words.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&command_words.stderr).contains("unexpected argument 'source'")
+    );
+
+    let label_selector = wheat(
+        &repository,
+        &[
+            "push",
+            "unused",
+            "--to",
+            "refs/heads/main",
+            "--source",
+            "label:missing",
+        ],
+    );
+    assert!(!label_selector.status.success());
+    assert!(
+        String::from_utf8_lossy(&label_selector.stderr).contains("unknown Wheat label missing")
+    );
+
+    let empty_label = wheat(
+        &repository,
+        &[
+            "push",
+            "unused",
+            "--to",
+            "refs/heads/main",
+            "--source",
+            "label:",
+        ],
+    );
+    assert_eq!(empty_label.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&empty_label.stderr).contains("label selector requires a name")
+    );
+
+    let invalid_selector = wheat(
+        &repository,
+        &[
+            "push",
+            "unused",
+            "--to",
+            "refs/heads/main",
+            "--source",
+            "current",
+        ],
+    );
+    assert_eq!(invalid_selector.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&invalid_selector.stderr)
+            .contains("source must be label:<name> or an exact view ID")
+    );
+}
+
 #[test]
 fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
     let root = tempfile::tempdir().unwrap();
@@ -113,17 +216,9 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
     );
     let revision = field(&created, "revision");
 
-    let selected = effective_view(&wheat_repository);
     let pushed = wheat(
         &wheat_repository,
-        &[
-            "push",
-            remote.to_str().unwrap(),
-            "--to",
-            "refs/heads/main",
-            "--source",
-            &selected,
-        ],
+        &["push", remote.to_str().unwrap(), "--to", "refs/heads/main"],
     );
     assert!(
         pushed.status.success(),
@@ -157,14 +252,7 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
     assert!(String::from_utf8_lossy(&log.stdout).contains(&revision));
     let repeated = wheat(
         &wheat_repository,
-        &[
-            "push",
-            remote.to_str().unwrap(),
-            "--to",
-            "refs/heads/main",
-            "--source",
-            &selected,
-        ],
+        &["push", remote.to_str().unwrap(), "--to", "refs/heads/main"],
     );
     assert!(
         repeated.status.success(),
