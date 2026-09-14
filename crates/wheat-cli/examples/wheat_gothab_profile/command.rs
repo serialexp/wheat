@@ -96,11 +96,7 @@ impl ProfileRun {
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdout(Stdio::from(stdout_file.try_clone()?));
-        if name == "import.initial_materialize" {
-            command.stderr(Stdio::inherit());
-        } else {
-            command.stderr(Stdio::from(stderr_file.try_clone()?));
-        }
+        command.stderr(Stdio::from(stderr_file.try_clone()?));
         let status = command
             .status()
             .with_context(|| format!("run timed Wheat phase {name}"))?;

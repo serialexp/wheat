@@ -371,45 +371,6 @@ async fn authenticate_tree_once<O: ImmutableObjectStore>(
     Ok(())
 }
 
-pub(super) async fn authenticate_completed_mappings<O: ImmutableObjectStore>(
-    objects: &O,
-    content: &ContentStore,
-    journal: &ImportJournal,
-    empty: wheat_core::ViewId,
-) -> Result<(), StagedImportError> {
-    let cached = cache::CachedObjects::new(objects, CACHE_ENTRIES, CACHE_BYTES);
-    // The final publisher's complete repository verifier authenticates every
-    // retained tree and radix closure before authority becomes visible. This pass
-    // binds every journal mapping to its pinned Git commit and replays edits;
-    // avoid quadratic re-walks of persistent structural roots here.
-    let mut receipts = ProofReceipts::new(PROOF_RECEIPTS);
-    receipts.skip_structural_walks = true;
-    let mut tree_work = Vec::new();
-    let mut after = None::<Vec<u8>>;
-    loop {
-        let page = journal.completed(after.as_deref(), DISCOVERY_BATCH)?;
-        if page.is_empty() {
-            break;
-        }
-        for (oid, native) in page {
-            verify_mapping(
-                &cached,
-                content,
-                journal,
-                empty,
-                &oid,
-                native,
-                &mut receipts,
-                false,
-                &mut tree_work,
-            )
-            .await?;
-            after = Some(oid);
-        }
-    }
-    Ok(())
-}
-
 async fn verify_durable_mapping<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
@@ -548,7 +509,6 @@ fn push(out: &mut Vec<u8>, bytes: &[u8]) {
 struct ProofReceipts {
     max: usize,
     successful: HashSet<(u8, ObjectId)>,
-    skip_structural_walks: bool,
 }
 
 impl ProofReceipts {
@@ -556,7 +516,6 @@ impl ProofReceipts {
         Self {
             max,
             successful: HashSet::new(),
-            skip_structural_walks: false,
         }
     }
 
@@ -655,27 +614,25 @@ async fn verify_mapping<O: ImmutableObjectStore>(
         .await
         .map_err(|e| bad(&e.to_string()))?
         .content;
-    if !receipts.skip_structural_walks {
-        authenticate_tree_once(&MerkleTreeStore::new(objects), tree, receipts, tree_work)
-            .await
-            .map_err(|error| bad(&error.to_string()))?;
-        authenticate_set_once(
-            &ContentSetStore::new(objects),
-            required_content,
-            receipts,
-            1,
-        )
+    authenticate_tree_once(&MerkleTreeStore::new(objects), tree, receipts, tree_work)
         .await
         .map_err(|error| bad(&error.to_string()))?;
-        authenticate_set_once(
-            &ConflictSetStore::new(objects),
-            view.unresolved_conflicts,
-            receipts,
-            2,
-        )
-        .await
-        .map_err(|error| bad(&error.to_string()))?;
-    }
+    authenticate_set_once(
+        &ContentSetStore::new(objects),
+        required_content,
+        receipts,
+        1,
+    )
+    .await
+    .map_err(|error| bad(&error.to_string()))?;
+    authenticate_set_once(
+        &ConflictSetStore::new(objects),
+        view.unresolved_conflicts,
+        receipts,
+        2,
+    )
+    .await
+    .map_err(|error| bad(&error.to_string()))?;
 
     // Neither the journal nor the claimed trees are authoritative. Authenticate every selected
     // definition and replay it against the authenticated parent before accepting this mapping.
