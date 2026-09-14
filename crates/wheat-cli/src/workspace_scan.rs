@@ -24,8 +24,13 @@ pub(crate) struct WorkspaceScan {
     pub materialized_head_generation: u64,
     pub current_head_generation: u64,
     pub authority_advanced: bool,
-    pub working_view: ViewId,
-    pub published_view: ViewId,
+    pub active_label: String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub current_label_binding: Option<ViewId>,
+    pub label_binding_drifted: bool,
+    pub selected_frontier: Option<ViewId>,
+    pub effective_view: ViewId,
     pub changes: Vec<ScannedChange>,
 }
 
@@ -50,11 +55,26 @@ pub(crate) fn scan(
     let _lock = crate::materialization::WorkspaceLock::acquire(workspace_root)?;
     let runtime = crate::local::runtime()?;
     let mut workspace = workspace.clone();
-    runtime.block_on(crate::materialization::recover(
+    runtime.block_on(crate::materialization::recover_locked(
         workspace_root,
         repository,
         &mut workspace,
     ))?;
+    scan_locked(
+        workspace_root,
+        repository,
+        &workspace,
+        max_inline_text_bytes,
+    )
+}
+
+pub(crate) fn scan_locked(
+    workspace_root: &Path,
+    repository: &LocalRepository,
+    workspace: &WorkspaceMetadata,
+    max_inline_text_bytes: usize,
+) -> Result<WorkspaceScan> {
+    let runtime = crate::local::runtime()?;
     anyhow::ensure!(
         workspace.store.store_id == repository.store_id,
         "workspace store identity does not match the opened store"
@@ -65,7 +85,7 @@ pub(crate) fn scan(
         .context("Wheat workspace has not been materialized")?;
     let materialized_head: RepositoryHead = materialized.repository_head.clone().into();
     let current_head = repository.heads.read()?;
-    let (current_state, files) = runtime.block_on(async {
+    let (current_label_binding, files) = runtime.block_on(async {
         let reader = RepositoryReader::new(&repository.objects, &repository.content);
         // Authenticate only the selected publication roots. Full retained-history validation is
         // intentionally reserved for `wheat validate`, otherwise status/diff latency grows with
@@ -87,15 +107,15 @@ pub(crate) fn scan(
             } else {
                 materialized_envelope
             };
-        let current_state = reader.state(current_envelope.state).await?;
-        anyhow::ensure!(
-            current_state.id() == current_envelope.state,
-            "current repository state identity mismatch"
-        );
+        let labels = reader.view_label_manifest(current_envelope.labels).await?;
+        let current_label_binding = labels
+            .labels
+            .get(&workspace.active_label)
+            .map(|label| label.view);
         let files = MerkleTreeStore::new(&repository.objects)
             .walk_files(materialized.tree, TreeWalkLimits::default())
             .await?;
-        Ok::<_, anyhow::Error>((current_state, files))
+        Ok::<_, anyhow::Error>((current_label_binding, files))
     })?;
 
     let mut read_budget = ScanReadBudget::new(MAX_TOTAL_READ_BYTES);
@@ -176,8 +196,13 @@ pub(crate) fn scan(
         materialized_head_generation: materialized_head.generation,
         current_head_generation: current_head.generation,
         authority_advanced: materialized_head != current_head,
-        working_view: current_state.working_view,
-        published_view: current_state.published_view,
+        active_label: workspace.active_label.clone(),
+        basis: workspace.basis,
+        observed_label_binding: workspace.observed_label_binding,
+        current_label_binding,
+        label_binding_drifted: current_label_binding != Some(workspace.observed_label_binding),
+        selected_frontier: workspace.selected_frontier,
+        effective_view: workspace.effective_view(),
         changes,
     })
 }

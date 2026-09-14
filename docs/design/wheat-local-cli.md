@@ -1,8 +1,8 @@
 # Wheat Local CLI — Design
 
-Status: partial — the Phase 1 single-target local workflow is implemented and accepted; Phases 2–3 remain outstanding
+Status: partial — the Phase 1 local workflow is implemented and accepted; the Phase 2 label/workspace model is settled, while its CLI and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-09-11
+Last updated: 2026-09-14
 
 ## Implementation status
 
@@ -29,14 +29,15 @@ both lists.
   executable, and symlink reads use descriptor-relative no-follow traversal;
   authority paths are reserved. Separate stores are linked from workspace-local
   metadata. Fresh workspaces materialize one pinned view, and existing workspaces
-  move incrementally between published, working, and named-branch views using
-  bounded Merkle diffs, exact-preimage transactions, crash recovery, and
+  move incrementally between pinned views using bounded Merkle diffs,
+  exact-preimage transactions, crash recovery, and
   kernel-enforced no-replace/exchange operations. Changed or obstructed workspace
   paths fail closed without overwriting user data.
 - [x] **Tracked workspace status foundation.** Human and versioned JSON status
   compare tracked paths with the pinned materialized tree, distinguish content,
   kind, and deletion changes, treat canonical-equivalent line endings as clean,
-  and report repository advancement.
+  and report repository-head advancement. Phase 2 status will distinguish unrelated
+  repository movement from drift of the active label's binding.
 - [x] **Selected-path restore.** Explicit file and directory selectors authorize
   restoring their tracked leaves from the pinned materialized tree. Workspace-only
   paths and untracked siblings are preserved, exact observed preimages close
@@ -81,13 +82,21 @@ both lists.
   across separate CLI processes. It proves exact regular/executable/symlink
   materialization and capture, read-only status/diff, complete structured authoring
   metadata, descendant reapplication, durable ID-free conflict inspection and
-  resolution, clean working-view projection with strict Git validation, pinned
+  resolution, clean selected-view projection with strict Git validation, pinned
   reopen, and the versioned retryable stale-state contract.
+- [x] **Phase 2 model decision — immutable labels and workspace frontiers.** Bart
+  settled short repository-local labels bound to immutable views, imported Git-ref
+  provenance, per-workspace basis and selected frontier, and the zero/one/many
+  selection rule. Label advancement and frontier consolidation remain deferred.
 
 ### Outstanding
-- [ ] **Phase 2 — branch and target workflow.** List, create, rename, delete, and
-  switch named targets; define which target mutations advance and materialize it
-  without treating a mutable name as change identity.
+- [ ] **Phase 2 — label and frontier workflow.** List, create, rename, delete, and
+  switch short repository-local labels bound to immutable views. Use the active
+  label's view as workspace basis; select retained descendant frontiers by the
+  settled zero/one/many rule, and require an explicit choice when several exist.
+- [ ] **Phase 2 — imported-label provenance.** Preserve the original Git ref on
+  every imported label without making the ref or its branch semantics native
+  authority.
 - [ ] **Phase 2 — dependency and integration workflow.** Expose stack revision,
   dependency movement, joins, deterministic descendant reapplication, and durable
   conflict outcomes as Wheat operations rather than Git-shaped rebase state.
@@ -104,7 +113,7 @@ both lists.
   `wheat-protocol`, move local workspace operations behind the client contract,
   and remove the CLI's direct dependence on production store capabilities before
   adding remote mode.
-- [ ] **Phase 3 — local synchronization.** Add persisted remote/target metadata
+- [ ] **Phase 3 — local synchronization.** Add persisted remote-view observations
   and incremental synchronization once the versioned native protocol exists;
   one-shot Git import remains a compatibility bootstrap, not native clone/pull.
 - [ ] **Phase 3 — multiple workspaces.** Define workspace identity, concurrent
@@ -113,13 +122,12 @@ both lists.
 - [ ] **Open question — lifecycle tooling shape.** Choose Git-compatible
   executables, declarative repository tasks, a structured versioned hook
   protocol, or a deliberate combination.
-- [ ] **Open question — workspace model and metadata location.** Decide whether
-  Wheat needs a durable workspace record at all and, if so, whether it contains
-  repository authority, points at a separate store, or is a named object within
-  a local client database.
-- [ ] **Open question — publication-target model.** Close the parent design's
-  canonical-primitives gate for named publication, target policy, detached views,
-  and workspace association before making branch-like commands normative.
+- [ ] **Open question — workspace metadata location.** Decide whether the settled
+  workspace record (basis plus selected frontier) points at a separate store or is
+  a named object within a local client database.
+- [ ] **Defer — label advancement and frontier consolidation.** Do not define
+  automatic label movement or combine retained descendant frontiers until an
+  explicit later workflow and policy decision.
 - [ ] **Open question — staging semantics.** Decide whether Wheat needs a
   persistent index-like state or whether explicit change/revision capture makes
   one unnecessary.
@@ -141,9 +149,9 @@ falling back to Git for every workspace operation?
 The reference CLI now proves durable storage, stable logical changes, revision
 application, conflict retention, Git import/projection, safe materialization,
 tracked status and diff, native attribution, and selected-path authoring without
-copied object IDs. The remaining Phase 1 boundary is a stable structured
-success/error contract; workspace-wide untracked capture, named targets, and
-native synchronization deliberately remain later phases.
+copied object IDs. The Phase 1 boundary includes a stable structured success/error contract;
+workspace-wide untracked capture, immutable-label/frontier switching, and native
+synchronization deliberately remain later phases.
 
 This document specifies the local client experience. The parent architecture
 remains [`server-native-source-control-store.md`](./server-native-source-control-store.md).
@@ -184,11 +192,11 @@ document.
 
 ### Commands express Wheat concepts
 
-Where Git's terms fit the user intent—`status`, `diff`, `branch`, `push`—using
-familiar names is useful. Where they encode Git's storage accidents—index,
-detached HEAD, rebase todo files, force-updating commits—the CLI should expose
-Wheat concepts directly: logical changes, immutable revisions, dependencies,
-applications, views, conflicts, and publication targets.
+Where Git's terms fit the user intent—`status`, `diff`, `push`—using familiar
+names is useful. Where they encode Git's storage accidents—mutable branches,
+index, detached HEAD, rebase todo files, force-updating commits—the CLI should
+expose Wheat concepts directly: logical changes, immutable revisions,
+dependencies, applications, views, conflicts, labels, and frontiers.
 
 ### Readable defaults, explicit stale-state handling
 
@@ -209,30 +217,50 @@ correctness.
 
 Interactive commands should be composed from testable operations also available
 to automation: inspect status, plan materialization, verify a plan, capture a
-revision, apply dependencies, and publish a target. Human-readable output is a
-view over structured outcomes, not the only API contract.
+revision, apply dependencies, bind a label, and select a frontier. Human-readable
+output is a view over structured outcomes, not the only API contract.
 
-## Candidate workspace model
+## Workspace model
 
-One candidate is an explicit local workspace record. This is not yet a settled
-canonical primitive; the parent design's workspace decision gate remains open.
-If selected, the record would identify at minimum:
+The original Phase 1 candidate was a workspace record carrying a selected mutable
+target, materialized view, and expected repository head. That framing was useful
+for proving pinned materialization and interruption safety, but it left Git-like
+target movement and repository-global working/published views in the local model.
+
+**Phase 2 follow-up (settled 2026-09-14):** a workspace instead records the active
+label's immutable view as its `basis` and, when applicable, one explicitly
+`selected_frontier`:
 
 ```text
 Workspace {
     repository_identity
-    selected_target?       // named target, not canonical change identity
+    active_label
+    basis                 // exact immutable view observed from that label
+    selected_frontier?    // retained descendant view; never a synthesized union
+    observed_label_binding
     materialized_view
-    expected_repository_head
-    sparse_paths?          // deferred unless needed early
+    selected_change?
+    sparse_paths?         // deferred unless needed early
 }
 ```
 
-If this model is selected, the record must not claim that the filesystem still
-matches `materialized_view`; status verifies that. Its publication must be atomic
-with respect to a completed materialization, or recoverably journaled so an
-interrupted checkout cannot masquerade as clean. Alternatives without a durable
-workspace record must provide the same pinned-base and interruption guarantees.
+The active label name and its observed binding are client-local state; unrelated
+repository-head movement does not by itself stale the workspace. The binding
+supplies the workspace basis. Retained descendant views form the available
+frontiers. Zero frontiers selects the basis itself; one existing frontier is
+selected automatically; multiple frontiers require an explicit user choice.
+Wheat never synthesizes or combines all frontiers implicitly. The
+workspace's effective view is its selected frontier when present and otherwise
+its basis. A newly created label defaults to that current selected/effective view.
+Label advancement and consolidation of multiple frontiers are deferred rather
+than smuggled into switching or capture.
+
+The record does not claim that filesystem bytes still match the effective view;
+status verifies that. Its update is atomic with completed materialization, or
+recoverably journaled so an interrupted switch cannot masquerade as clean.
+Repository-store placement remains open, but the semantic record itself is no
+longer optional: repository state has no global workspace working or published
+view from which this state could be reconstructed.
 
 ### Repository layout decision
 
@@ -252,9 +280,9 @@ cement either layout accidentally; the open question must be resolved first.
 
 Materialization takes a pinned view and an observed workspace state and produces
 an authenticated plan before writing. The Linux implementation materializes a
-fresh workspace and incrementally moves an existing workspace between published,
-working, and named-branch views. A bounded iterative Merkle diff prunes equal
-subtrees, so planning visits unequal directory nodes and mutation work is
+fresh workspace and incrementally moves an existing workspace between pinned
+immutable views. A bounded iterative Merkle diff prunes equal subtrees, so planning
+visits unequal directory nodes and mutation work is
 proportional to changed paths and bytes rather than the complete tree.
 
 Existing-workspace updates retain exact preimages in a private transaction,
@@ -317,25 +345,26 @@ Filesystem requirements:
 Initial commands may be:
 
 ```text
-wheat materialize [--source published|working|branch:<name>] [DIRECTORY]
+wheat materialize [--source <view-or-label>] [DIRECTORY]
 wheat restore [PATH ...]          # restore from the pinned workspace view
-wheat switch <target>             # target selection plus safe materialization
+wheat switch <label> [--frontier <view>]  # label activation plus safe materialization
 ```
 
-Names are provisional; the safety and pinned-view semantics are not.
+Names are provisional; the safety, immutable-label, and explicit-frontier
+semantics are not.
 
 ## Status and diff
 
 `wheat status` should combine repository state with a workspace comparison. Its
 human view should answer:
 
-- which named target and exact view are selected;
-- whether working and published views differ;
+- which active label supplied the basis and which exact frontier/effective view is selected;
+- whether zero, one, or multiple retained descendant frontiers exist;
 - which tracked paths are modified, deleted, kind-changed, or conflicted;
 - once Phase 2 ignore semantics land, which paths are untracked or ignored;
 - which logical change/revision is the default capture target;
 - whether repository authority changed since the workspace was materialized;
-- which state is local-only versus represented by a configured remote target.
+- which state is local-only versus observed from a configured remote.
 
 Machine-readable output is versioned and opt-in through the global
 `--format=json` option. Every invocation emits exactly one terminal document on
@@ -352,8 +381,9 @@ wheat diff --revision <id>         # revision vs predecessor/authored-against vi
 wheat diff --from <view> --to <view>
 ```
 
-Exact retained view IDs and `published`, `working`, and `branch:<name>` selectors
-are resolved against one authority snapshot. Text files use canonical-LF
+Exact retained view IDs and repository-local label selectors are resolved against
+one authority snapshot. A label resolves to its immutable bound view; choosing
+among multiple descendant frontiers remains explicit. Text files use canonical-LF
 comparison while showing useful context. Binary and symlink changes report kind,
 identity, and size without forcing bytes through a text renderer; content above
 the inline limit remains deliberately unclassified rather than being mislabeled
@@ -426,24 +456,29 @@ Configuration files are versioned, bounded, strict JSON and published atomically
 under a per-config lock. Repository configuration belongs to Wheat, not
 `.git/config`; user configuration is `${XDG_CONFIG_HOME:-~/.config}/wheat/config.json`.
 Secrets and credential material must not be copied into repository configuration
-or diagnostic output. Editor, pager, default-target, and output-format settings
+or diagnostic output. Editor, pager, default-label, and output-format settings
 remain part of the broader configuration work in Phase 2.
 
 ## Active workspace changes
 
-A workspace fixes an `authoring_basis` to the exact first materialized view and
-stores one optional `selected_change`. Active state is derived, never stamped on
-a logical change: a change is active when the working view selects a revision
-that is absent from or differs from the basis selection. This makes a Git import's
-selected tip the basis rather than incorrectly listing all imported commits above
-the repository's empty global base.
+Phase 1 fixed an `authoring_basis` to the first materialized view and derived an
+active change delta against a repository-global working view. That proved the
+basis-relative listing behavior, especially for Git imports, but the global
+working/published distinction is not part of the settled Phase 2 model.
 
-`wheat changes` reports this identity-preserving revision delta in deterministic
-dependency order and marks the workspace selection. It distinguishes current
-published-revision equality from active state, but does not call a change landed,
-closed, or withdrawn; those are target-relative lifecycle facts that require the
-Phase 2 publication-target contract. Explicit `add --change A` is a one-operation
-override and does not replace selected change B.
+**Phase 2 follow-up:** the active label supplies the workspace `basis`; the
+workspace stores a selected retained descendant frontier when one is available.
+The selected frontier, or the basis when none exists, is the effective view.
+`wheat changes` reports the effective-view delta from the basis in deterministic
+dependency order and marks the selected logical change. Explicit `add --change A`
+is a one-operation override and does not replace selected change B.
+
+Captured changes are repository graph state, not disposable workspace state. They
+remain retained when another label is activated and reappear when switching back
+to a basis/frontier that reaches them. By contrast, uncaptured filesystem edits
+are not graph state and block switching; Wheat must not overwrite, hide, carry, or
+implicitly capture them. Landed/closed/withdrawn lifecycle remains undefined until
+a later label-advancement policy exists.
 
 When amending A causes an unchanged descendant B's intended replacement to be
 present already, B's immutable edit is recorded as successfully satisfied against
@@ -460,29 +495,35 @@ publication, including implicit adds, so a mistaken selection is immediately
 visible. Adding to the intended earlier change is the normal correction path; no
 mutable revision or imperative transfer is fabricated.
 
-## Candidate named-target and integration workflow
+## Repository labels and integration workflow
 
-The parent design has not yet closed the canonical publication-target gate. A
-candidate model treats a branch-like name as a mutable publication target
-pointing to a native view, distinct from change, revision, workspace, and review
-identity. If selected, initial target commands should support list, create,
-rename, delete, and switch with compare-and-swap updates.
+The earlier candidate treated a branch-like name as a mutable publication target
+and asked whether capture advanced that target, a separate working view, or both.
+That reasoning exposed the ambiguity, but Phase 2 deliberately does not adopt the
+candidate.
 
-Mutations need an explicit target policy. The current prototype advances working
-and published views together for daily mutations and preserves imported branch
-manifests without moving them. Before branch commands ship, define:
+**Phase 2 follow-up (settled 2026-09-14):** labels are short names scoped to one
+repository and bound to immutable views. They are navigation and provenance
+handles, not change identity and not implicitly advancing branches. Imported
+labels retain the exact original Git ref as provenance while exposing a short
+repository-local name; the provenance does not make that ref native authority.
+Creating a label without an explicit view binds it to the workspace's current
+selected/effective view.
 
-- whether a workspace follows one target or can be detached at a pinned view;
-- whether capture advances a target, only a working view, or both;
-- how a clean integration becomes published;
-- which targets may point to conflicted views;
-- how target deletion interacts with retained reachability.
+Activating a label installs its bound view as workspace basis and considers only
+retained descendant views as frontiers. With no descendant frontier, the basis is
+effective. With exactly one existing frontier, Wheat auto-selects it. With more
+than one, switching requires an explicit frontier; it never synthesizes a union or
+silently composes every tip. Captured graph changes survive switching and reappear
+when reached again, while any uncaptured filesystem edit blocks the switch.
 
-Stack editing and integration should then expose dependency changes and
-application outcomes directly. Revising the bottom of `A -> B -> C` should show
-new applications of descendants without pretending that old revisions ceased to
-exist. Combining independent tips should create an explicit integration/join
-operation with durable conflicts, not an interrupted merge directory.
+Label advancement and consolidation of multiple frontiers are explicit deferred
+work. When designed, stack editing and integration should expose dependency
+changes and application outcomes directly. Revising the bottom of `A -> B -> C`
+should show new applications of descendants without pretending that old revisions
+ceased to exist. Combining independent tips requires an explicit integration/join
+operation with durable conflicts, not an interrupted merge directory or an
+implicit "all frontiers" result.
 
 ## Ignore semantics
 
@@ -509,7 +550,7 @@ lifecycle events rather than copying filenames from `.git/hooks`:
 - before capture;
 - before immutable revision publication;
 - after revision publication, including descendant/conflict outcomes;
-- before target publication;
+- before future label advancement or frontier consolidation;
 - before and after Git compatibility push.
 
 Three implementation shapes are viable:
@@ -591,7 +632,7 @@ Routine failures need distinct structured categories:
 - workspace dirty or blocked path;
 - repository head changed;
 - predecessor revision stale;
-- target compare-and-swap failed;
+- label/frontier selection became stale or is ambiguous;
 - conflict produced;
 - content missing or corrupt;
 - policy/tool check failed;
@@ -627,14 +668,19 @@ error chain to decide whether retry is safe.
    ID-free durable conflict resolution, strict Git validation, exact pinned reopen,
    and a stale refusal that leaves the repository head unchanged.
 
-### Phase 2 — multiple targets and repository tooling
+### Phase 2 — labels, frontiers, and repository tooling
 
-1. Define and implement named-target operations and switching.
-2. Add workspace-wide status/capture with complete ignore semantics.
-3. Add dependency movement and integration commands with durable conflict output.
-4. Add repository discovery and typed local configuration.
-5. Choose and implement lifecycle tooling/hooks.
-6. Qualify concurrent workspaces and stale-head outcomes locally.
+1. Implement short repository-local labels bound to immutable views, preserving
+   original Git ref provenance for imported labels.
+2. Implement workspace basis/frontier switching: zero uses basis, one existing
+   frontier auto-selects, and multiple require an explicit choice; never synthesize
+   an all-frontier view. Uncaptured filesystem edits block every switch.
+3. Add workspace-wide status/capture with complete ignore semantics.
+4. Add dependency movement and explicit integration commands with durable conflict
+   output; label advancement and frontier consolidation remain deferred.
+5. Add repository discovery and typed local configuration.
+6. Choose and implement lifecycle tooling/hooks.
+7. Qualify concurrent workspaces and stale-head outcomes locally.
 
 ### Phase 3 — native synchronization
 
@@ -643,7 +689,7 @@ error chain to decide whether retry is safe.
    production store implementation.
 2. Run the same semantic operations through the versioned native protocol.
 3. Add native clone/fetch/publish with resumable bounded object transfer.
-4. Persist remote-target observations without treating them as local authority.
+4. Persist remote-view observations without treating them as local authority.
 5. Exercise interruption, authentication failure, concurrent publication, and
    server restart against an ephemeral repository daemon.
 
@@ -670,9 +716,12 @@ acceptance contract is
 
 ### Phase 2 — complete local workflow
 
-Add workspace-wide status/capture with ignore rules, switching between two named
-targets without overwriting local changes, configured lifecycle tooling, two
-concurrent workspaces, target CAS failure, and dependency movement.
+Add workspace-wide status/capture with ignore rules; switch between immutable
+labels using basis plus the zero/one/many frontier rule; prove that captured graph
+state reappears when switching back and uncaptured filesystem edits block a
+switch; preserve imported Git-ref provenance; and exercise configured lifecycle
+tooling, two concurrent workspaces, stale selection, and dependency movement.
+Label advancement and multi-frontier consolidation are not acceptance requirements.
 
 ### Phase 3 — native client/server workflow
 
@@ -685,21 +734,17 @@ and repository-daemon restart.
 1. Does a workspace embed a repository store, or point to one?
 2. Is there any persistent index/staging state, or only workspace differences
    selected into a logical revision?
-3. Which target does a routine revision advance, and when does publication occur?
-4. Are imported Git branch names immediately mutable native targets, or retained
-   provenance until explicitly adopted?
-5. Which ignore syntax is the native contract?
-6. Which lifecycle tooling shape should Wheat standardize?
-7. Can repository-declared executable tooling run without explicit local trust?
-8. What machine-readable output and exit-code compatibility is promised before
+3. Which ignore syntax is the native contract?
+4. Which lifecycle tooling shape should Wheat standardize?
+5. Can repository-declared executable tooling run without explicit local trust?
+6. What machine-readable output and exit-code compatibility is promised before
    the native schema and protocol are locked?
-9. When capture starts from a materialized view that is no longer the current
-   working/published target, must it refuse, explicitly reapply onto the new view,
-   or create a detached revision/application?
-10. Does the current requirement that `add` find the change's application in the
-    published view survive once working and published views can diverge?
-11. Which advanced Git conveniences are genuinely required for the first Gothab
-    dogfooding repository?
+7. What explicit operation eventually advances a label, and what review/policy
+   evidence does it require?
+8. What explicit operation consolidates multiple frontiers, and how does it retain
+   each source frontier and conflict outcome?
+9. Which advanced Git conveniences are genuinely required for the first Gothab
+   dogfooding repository?
 
 ## References
 

@@ -76,8 +76,14 @@ async fn persisted_clean_commit_stores_definitions_and_evidence() {
     let edit_id = record.id();
     let authored = proposal(1, None, vec![record.clone()]);
     let mut reference = Repository::new(Tree::new());
+    let reference_base = reference.base_view().id;
     let expected = reference
-        .import_changes([authored.clone()], ApplicationContext::new(&content))
+        .import_changes(
+            reference_base,
+            reference_base,
+            [authored.clone()],
+            ApplicationContext::new(&content),
+        )
         .unwrap()[&authored.id]
         .clone();
     let commit = writer.write(base, authored.clone()).await.unwrap();

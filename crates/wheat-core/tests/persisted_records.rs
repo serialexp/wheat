@@ -52,14 +52,16 @@ fn edit(io: &TestContent, path: &str, bytes: &[u8]) -> RevisionEdits {
 fn identity_and_emitted_view_roots_use_the_same_builder() {
     let io = TestContent::default();
     let mut repository = Repository::new(Tree::new());
-    repository
+    let (_, outcome) = repository
         .create_change(
+            repository.base_view().id,
+            repository.base_view().id,
             [],
             edit(&io, "dir/file", b"value"),
             ApplicationContext::new(&io),
         )
         .unwrap();
-    let view = repository.working_view();
+    let view = repository.view(outcome.resulting_view).unwrap();
     let mut objects = BTreeMap::new();
     let record = build_view_record(view, &mut |object: CanonicalObject| {
         objects.insert(object.id, object.bytes);
@@ -119,6 +121,8 @@ fn every_semantic_record_roundtrips_canonical_bytes() {
     let mut repository = Repository::new(Tree::new());
     repository
         .create_change(
+            repository.base_view().id,
+            repository.base_view().id,
             [],
             edit(&io, "file", b"value"),
             ApplicationContext::new(&io),

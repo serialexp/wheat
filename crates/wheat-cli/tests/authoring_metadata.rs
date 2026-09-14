@@ -254,7 +254,7 @@ async fn add_records_new_revision_metadata_without_changing_change_metadata() {
     );
     let change = field(&created, "change");
     let predecessor = field(&created, "revision");
-    ok(&root, &config_home, &["materialize", "--source", "working"]);
+    ok(&root, &config_home, &["materialize"]);
     std::fs::write(root.join("file"), b"two").unwrap();
     let revised = ok(
         &root,

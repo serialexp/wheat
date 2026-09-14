@@ -18,6 +18,12 @@ pub enum RevisionMapError {
     InvalidChildDepth,
     #[error("revision-map node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("revision-map delta contains more than {limit} selections")]
+    DeltaSelectionLimitExceeded { limit: usize },
+    #[error("revision-map delta reads more than {limit} nodes")]
+    DeltaNodeLimitExceeded { limit: usize },
+    #[error("revision-map delta queues more than {limit} pending subtrees")]
+    DeltaPendingLimitExceeded { limit: usize },
 }
 
 impl From<radix::Error> for RevisionMapError {
@@ -28,6 +34,21 @@ impl From<radix::Error> for RevisionMapError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+        }
+    }
+}
+
+impl From<radix::DiffError> for RevisionMapError {
+    fn from(error: radix::DiffError) -> Self {
+        match error {
+            radix::DiffError::Radix(error) => error.into(),
+            radix::DiffError::ChangeLimitExceeded { limit } => {
+                Self::DeltaSelectionLimitExceeded { limit }
+            }
+            radix::DiffError::NodeLimitExceeded { limit } => Self::DeltaNodeLimitExceeded { limit },
+            radix::DiffError::PendingLimitExceeded { limit } => {
+                Self::DeltaPendingLimitExceeded { limit }
+            }
         }
     }
 }
@@ -84,6 +105,43 @@ impl radix::Collection for RevisionCollection {
 
 pub struct RevisionMapStore<'a, S> {
     inner: radix::Store<'a, S, RevisionCollection>,
+}
+
+/// Bounds for comparing a label basis revision map with a selected frontier map.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RevisionMapDeltaLimits {
+    pub max_selections: usize,
+    pub max_nodes: usize,
+    pub max_pending: usize,
+}
+
+impl Default for RevisionMapDeltaLimits {
+    fn default() -> Self {
+        let limits = radix::DiffLimits::default();
+        Self {
+            max_selections: limits.max_changes,
+            max_nodes: limits.max_nodes,
+            max_pending: limits.max_pending,
+        }
+    }
+}
+
+/// One deterministic selection difference from basis (old) to frontier (new).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevisionMapDelta {
+    Added {
+        change: ChangeId,
+        revision: RevisionId,
+    },
+    Changed {
+        change: ChangeId,
+        basis: RevisionId,
+        frontier: RevisionId,
+    },
+    Removed {
+        change: ChangeId,
+        revision: RevisionId,
+    },
 }
 
 /// Ordered, disk-backed traversal retaining at most one node per key byte.
@@ -148,6 +206,42 @@ impl<'a, S: ImmutableObjectStore> RevisionMapStore<'a, S> {
         edits: impl IntoIterator<Item = (ChangeId, Option<RevisionId>)>,
     ) -> Result<RevisionMapId, RevisionMapError> {
         Ok(self.inner.update_batch(root, edits).await?)
+    }
+    /// Return lexicographically ordered selection changes from `basis` to `frontier`.
+    pub async fn delta(
+        &self,
+        basis: RevisionMapId,
+        frontier: RevisionMapId,
+        limits: RevisionMapDeltaLimits,
+    ) -> Result<Vec<RevisionMapDelta>, RevisionMapError> {
+        let entries = self
+            .inner
+            .paired_diff(
+                basis,
+                frontier,
+                radix::DiffLimits {
+                    max_changes: limits.max_selections,
+                    max_nodes: limits.max_nodes,
+                    max_pending: limits.max_pending,
+                },
+            )
+            .await?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| match entry {
+                radix::DiffEntry::Added(change, revision) => {
+                    RevisionMapDelta::Added { change, revision }
+                }
+                radix::DiffEntry::Changed(change, basis, frontier) => RevisionMapDelta::Changed {
+                    change,
+                    basis,
+                    frontier,
+                },
+                radix::DiffEntry::Removed(change, revision) => {
+                    RevisionMapDelta::Removed { change, revision }
+                }
+            })
+            .collect())
     }
     pub async fn contains_node(&self, id: RevisionMapId) -> Result<bool, RevisionMapError> {
         Ok(self.inner.contains_node(id).await?)

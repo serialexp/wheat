@@ -79,7 +79,7 @@ fn setup() -> tempfile::TempDir {
         dir.path(),
         &["change", "new", "--path", "kind", "--value", "same"],
     );
-    ok(dir.path(), &["materialize", "--source", "working"]);
+    ok(dir.path(), &["materialize"]);
     dir
 }
 
@@ -301,7 +301,7 @@ fn diff_validates_revision_and_view_forms() {
     let invalid = wheat(dir.path(), &["diff", "--revision", "anything"]);
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid revision ID"));
-    let incomplete = wheat(dir.path(), &["diff", "--from", "working"]);
+    let incomplete = wheat(dir.path(), &["diff", "--from", "label:main"]);
     assert!(!incomplete.status.success());
     assert!(incomplete.stdout.is_empty());
     let conflicting = wheat(
@@ -311,9 +311,9 @@ fn diff_validates_revision_and_view_forms() {
             "--revision",
             "anything",
             "--from",
-            "working",
+            "label:main",
             "--to",
-            "published",
+            "label:main",
         ],
     );
     assert!(!conflicting.status.success());
@@ -321,7 +321,7 @@ fn diff_validates_revision_and_view_forms() {
     assert!(
         wheat(
             dir.path(),
-            &["diff", "--from", "working", "--to", "published"]
+            &["diff", "--from", "label:main", "--to", "label:main"]
         )
         .status
         .success()

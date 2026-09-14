@@ -1,44 +1,34 @@
 use anyhow::{Context, Result};
-use wheat_store::{ChangeMapStore, PublicationStore, RepositoryReader, RevisionMapStore};
+use wheat_store::PublicationStore;
 
 use crate::{local::LocalRepository, workspace_metadata::WorkspaceMetadata};
 
+/// Complete or discard a workspace publication intent after an interrupted repository CAS.
 pub(crate) fn recover(
     root: &std::path::Path,
     repository: &LocalRepository,
     metadata: &mut WorkspaceMetadata,
 ) -> Result<()> {
-    let Some(pending) = metadata.pending_selection.clone() else {
+    let Some(pending) = metadata.pending_repository_operation.clone() else {
         return Ok(());
     };
     let head = repository.heads.read()?;
-    let runtime = crate::local::runtime()?;
-    let present = runtime.block_on(async {
-        let reader = RepositoryReader::new(&repository.objects, &repository.content);
-        let envelope = reader.envelope(head.envelope).await?;
-        let state = reader.state(envelope.state).await?;
-        let working = reader.view(state.working_view).await?;
-        let revision = RevisionMapStore::new(&repository.objects)
-            .get(working.revisions, pending.change)
-            .await?;
-        let object = ChangeMapStore::new(&repository.objects)
-            .get(state.changes, pending.change)
-            .await?;
-        Ok::<_, anyhow::Error>(revision.is_some() && object.is_some())
-    })?;
-    if present {
-        metadata.selected_change = Some(pending.change);
+    let expected: wheat_store::RepositoryHead = pending.expected_head.into();
+    let proposed: wheat_store::RepositoryHead = pending.proposed_head.into();
+    if head == proposed {
+        metadata.selected_frontier =
+            (pending.resulting_frontier != metadata.basis).then_some(pending.resulting_frontier);
+        metadata.selected_change = pending.selected_change;
     } else {
-        let expected: wheat_store::RepositoryHead = pending.expected_head.into();
         anyhow::ensure!(
             head == expected,
-            "pending change selection is absent after unrelated repository advancement"
+            "pending workspace operation is unresolved after unrelated repository advancement"
         );
     }
-    metadata.pending_selection = None;
+    metadata.pending_repository_operation = None;
     metadata
         .replace_prepared(root)
-        .context("prepare recovered workspace selection")?
+        .context("prepare recovered workspace operation")?
         .publish()
         .map_err(|error| anyhow::anyhow!(error))
 }

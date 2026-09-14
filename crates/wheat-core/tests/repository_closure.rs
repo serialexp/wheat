@@ -92,8 +92,15 @@ fn closure_emits_standalone_definitions_and_retains_fragments() {
         },
     };
     let mut repo = Repository::new(Tree::from_iter([("f".into(), captured.before.unwrap())]));
-    repo.create_change([], edits, ApplicationContext::new(&io))
-        .unwrap();
+    let effective = repo.base_view().id;
+    repo.create_change(
+        repo.base_view().id,
+        effective,
+        [],
+        edits,
+        ApplicationContext::new(&io),
+    )
+    .unwrap();
     let closure = repo.canonical_closure();
     for id in ids {
         assert!(closure.objects.iter().any(|o| o.id == id.into()));
@@ -118,9 +125,9 @@ fn empty_repository_closure_contains_root_state_view_tree_and_manifest() {
         .collect::<Vec<_>>();
 
     // Four semantic objects, four empty view collections, the empty change
-    // lookup, an empty retained root, and one compressed retained leaf naming
-    // the base view.
-    assert_eq!(closure.objects.len(), 11);
+    // lookup, an empty view-lineage map, an empty retained root, and one
+    // compressed retained leaf naming the base view.
+    assert_eq!(closure.objects.len(), 12);
     assert!(kinds.contains(&CanonicalObjectKind::RepositoryState));
     assert!(kinds.contains(&CanonicalObjectKind::View));
     assert!(kinds.contains(&CanonicalObjectKind::Tree));
@@ -133,11 +140,24 @@ fn closure_is_deterministic_sorted_and_deduplicated() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let effective = repository.base_view().id;
     repository
-        .create_change([], exact(&io, "a", None, Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "a", None, Some("a1")),
+            ctx,
+        )
         .unwrap();
     repository
-        .create_change([], exact(&io, "b", None, Some("b1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "b", None, Some("b1")),
+            ctx,
+        )
         .unwrap();
 
     let first = repository.canonical_closure();
@@ -162,12 +182,27 @@ fn aggregate_manifest_retains_revision_and_conflict_terms() {
     let mut base = Tree::new();
     base.insert("shared".into(), value(&io, "base"));
     let mut repository = Repository::new(base);
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "shared", Some("base"), Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "shared", Some("base"), Some("a1")),
+            ctx,
+        )
         .unwrap();
+    effective = a1.resulting_view;
     let (_, b1) = repository
-        .create_change([a], exact(&io, "shared", Some("a1"), Some("b1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "shared", Some("a1"), Some("b1")),
+            ctx,
+        )
         .unwrap();
+    effective = b1.resulting_view;
     let old = repository
         .revision(a1.revision_id)
         .unwrap()
@@ -177,6 +212,8 @@ fn aggregate_manifest_retains_revision_and_conflict_terms() {
         .collect();
     repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, old, "shared", Some("base"), Some("a2")),
@@ -215,9 +252,17 @@ fn closure_retains_superseded_revisions_and_historical_applications() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let mut effective = repository.base_view().id;
     let (change, first) = repository
-        .create_change([], exact(&io, "file", None, Some("one")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "file", None, Some("one")),
+            ctx,
+        )
         .unwrap();
+    effective = first.resulting_view;
     let applications_before = repository
         .applications_for_revision(first.revision_id)
         .count();
@@ -230,6 +275,8 @@ fn closure_retains_superseded_revisions_and_historical_applications() {
         .collect();
     let second = repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             change,
             first.revision_id,
             replacement(&io, old, "file", None, Some("two")),
@@ -237,7 +284,19 @@ fn closure_retains_superseded_revisions_and_historical_applications() {
         )
         .unwrap();
     let closure = repository.canonical_closure();
+    let empty_lineage = build_view_lineage_map([], |_| {});
 
+    assert_ne!(closure.state.view_lineage, empty_lineage);
+    assert!(closure.state.retained_views.contains(&first.resulting_view));
+    assert!(
+        closure
+            .state
+            .retained_views
+            .contains(&second.resulting_view)
+    );
+    assert!(closure.objects.iter().any(|object| {
+        validate_canonical_object(&object.bytes) == Ok(CanonicalObjectKind::ViewLineageMapNode)
+    }));
     assert!(
         closure
             .state

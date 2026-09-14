@@ -48,10 +48,13 @@ impl Corpus {
         let content = ContentStore::new(directory.path());
         for index in 0..count {
             let mut repository = Repository::new(Tree::new());
+            let basis = repository.base_view().id;
             let value = format!("value-{index}");
             content.put(value.as_bytes()).unwrap();
             let outcome = repository
                 .create_change_with_id(
+                    basis,
+                    basis,
                     ChangeId::new(),
                     [],
                     revision_edits(&format!("src/{index:06}.rs"), value.as_bytes()),

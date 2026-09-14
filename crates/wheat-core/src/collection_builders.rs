@@ -10,7 +10,8 @@ use crate::{
     ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ConflictId,
     ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentSetChild, ContentSetId,
     ContentSetNode, ObjectId, RetainedSetChild, RetainedSetId, RetainedSetNode, RevisionId,
-    RevisionMapChild, RevisionMapId, RevisionMapNode,
+    RevisionMapChild, RevisionMapId, RevisionMapNode, ViewId, ViewLineageMapChild,
+    ViewLineageMapId, ViewLineageMapNode,
 };
 
 trait RadixShape {
@@ -187,6 +188,35 @@ impl RadixShape for ApplicationShape {
     }
 }
 
+struct ViewLineageShape;
+impl RadixShape for ViewLineageShape {
+    type Key = ViewId;
+    type Value = RetainedSetId;
+    type Id = ViewLineageMapId;
+
+    fn key_bytes(key: &Self::Key) -> &[u8] {
+        key.as_bytes()
+    }
+
+    fn node(
+        prefix: Vec<u8>,
+        value: Option<Self::Value>,
+        children: Vec<(u8, Self::Id)>,
+    ) -> (Self::Id, Vec<u8>) {
+        let node = ViewLineageMapNode::new(
+            prefix,
+            value,
+            children
+                .into_iter()
+                .map(|(edge, child)| ViewLineageMapChild { edge, child })
+                .collect(),
+        )
+        .expect("builder produces a valid view-lineage map node");
+        let bytes = node.canonical_bytes();
+        (ViewLineageMapId::of_canonical_bytes(&bytes), bytes)
+    }
+}
+
 macro_rules! set_shape {
     ($shape:ident, $key:ty, $id:ty, $node:ty, $child:ident) => {
         struct $shape;
@@ -281,6 +311,35 @@ pub fn build_application_map(
         .into_iter()
         .collect();
     build_sorted::<ApplicationShape, _>(entries, emit)
+}
+
+/// Builds the canonical parent-view to child-view-set map and emits both object families.
+pub fn build_view_lineage_map(
+    edges: impl IntoIterator<Item = (ViewId, ViewId)>,
+    mut emit: impl FnMut(CanonicalObject),
+) -> ViewLineageMapId {
+    let mut edges: Vec<_> = edges.into_iter().collect();
+    edges.sort_unstable();
+    edges.dedup();
+
+    let mut entries = Vec::new();
+    let mut start = 0;
+    while start < edges.len() {
+        let parent = edges[start].0;
+        let mut end = start + 1;
+        while end < edges.len() && edges[end].0 == parent {
+            end += 1;
+        }
+        let child_set = build_retained_set(
+            edges[start..end]
+                .iter()
+                .map(|(_, child)| ObjectId::from(*child)),
+            &mut emit,
+        );
+        entries.push((parent, child_set));
+        start = end;
+    }
+    build_sorted::<ViewLineageShape, _>(entries, emit)
 }
 
 macro_rules! set_builder {

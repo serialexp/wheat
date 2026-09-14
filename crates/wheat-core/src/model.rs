@@ -497,9 +497,8 @@ impl RepositoryView {
 pub struct RepositoryState {
     pub id: crate::RepositoryStateId,
     pub base_view: ViewId,
-    pub working_view: ViewId,
-    pub published_view: ViewId,
     pub change_objects: BTreeMap<ChangeId, crate::ChangeObjectId>,
+    pub view_lineage: crate::ViewLineageMapId,
     pub required_content: ContentManifestId,
     pub retained_changes: BTreeSet<crate::ChangeObjectId>,
     pub retained_views: BTreeSet<ViewId>,

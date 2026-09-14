@@ -60,7 +60,7 @@ pub async fn prepare_mutation_publication<O: ImmutableObjectStore, P: Publicatio
         .await?;
     let envelope = RepositoryEnvelopeRecord {
         state: mutation.state(),
-        branches: old.branches,
+        labels: old.labels,
     };
     objects
         .put_if_absent(envelope.id().into(), &envelope.canonical_bytes())

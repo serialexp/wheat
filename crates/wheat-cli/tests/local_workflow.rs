@@ -130,8 +130,8 @@ fn initializes_mutates_and_reopens_local_repository() {
     let reopened = wheat(directory.path(), &["status"]);
     assert!(reopened.status.success());
     let status = String::from_utf8_lossy(&reopened.stdout);
-    assert!(status.contains("changes: 1"));
-    assert!(status.contains("conflicts: 0"));
+    assert!(status.contains("active label: main"));
+    assert!(status.contains("tracked changes: 0"));
     let validated = wheat(directory.path(), &["validate"]);
     assert!(
         validated.status.success(),
@@ -184,10 +184,10 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
                 .envelope(heads.read().unwrap().envelope)
                 .await
                 .unwrap();
-            reader.branch_manifest(envelope.branches).await.unwrap()
+            reader.view_label_manifest(envelope.labels).await.unwrap()
         })
     };
-    assert!(branches_before.branches.contains_key("refs/heads/main"));
+    assert!(branches_before.labels.contains_key("main"));
 
     let status = wheat(&repository, &["status"]);
     assert!(
@@ -195,7 +195,7 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
         "{}",
         String::from_utf8_lossy(&status.stderr)
     );
-    assert!(String::from_utf8_lossy(&status.stdout).contains("changes: 1"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("active label: main"));
 
     let catalogs_before = packed_catalog_count(&store);
     let created = wheat(
@@ -213,7 +213,7 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
     assert!(store.join("storage/packed/active.segment").is_file());
     assert!(store.join("storage/packed/active.head").is_file());
     let reopened = wheat(&repository, &["status"]);
-    assert!(String::from_utf8_lossy(&reopened.stdout).contains("changes: 2"));
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("active label: main"));
 
     let log = wheat(&repository, &["log"]);
     assert!(
@@ -274,7 +274,13 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
         String::from_utf8_lossy(&revised.stderr)
     );
     let conflicted = wheat(&repository, &["status"]);
-    assert!(String::from_utf8_lossy(&conflicted.stdout).contains("conflicts: 1"));
+    assert!(String::from_utf8_lossy(&conflicted.stdout).contains("active label: main"));
+    let conflicts = wheat(&repository, &["conflicts", "--format", "json"]);
+    let conflicts: serde_json::Value = serde_json::from_slice(&conflicts.stdout).unwrap();
+    assert_eq!(
+        conflicts["result"]["conflicts"].as_array().unwrap().len(),
+        1
+    );
     let resolved = wheat(
         &repository,
         &[
@@ -292,7 +298,10 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
         String::from_utf8_lossy(&resolved.stderr)
     );
     let reopened = wheat(&repository, &["status"]);
-    assert!(String::from_utf8_lossy(&reopened.stdout).contains("conflicts: 0"));
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("active label: main"));
+    let conflicts = wheat(&repository, &["conflicts", "--format", "json"]);
+    let conflicts: serde_json::Value = serde_json::from_slice(&conflicts.stdout).unwrap();
+    assert_eq!(conflicts["result"]["conflicts"], serde_json::json!([]));
     let validated = wheat(&repository, &["validate"]);
     assert!(
         validated.status.success(),
@@ -310,7 +319,7 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
                 .envelope(heads.read().unwrap().envelope)
                 .await
                 .unwrap();
-            reader.branch_manifest(envelope.branches).await.unwrap()
+            reader.view_label_manifest(envelope.labels).await.unwrap()
         })
     };
     assert_eq!(branches_after, branches_before);
@@ -407,7 +416,7 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
             .contains("transition preserved=0 added=1 removed=1 subsumed=0")
     );
     let conflicted = wheat(directory.path(), &["status"]);
-    assert!(String::from_utf8_lossy(&conflicted.stdout).contains("conflicts: 1"));
+    assert!(String::from_utf8_lossy(&conflicted.stdout).contains("active label: main"));
     let conflicts = wheat(directory.path(), &["conflicts"]);
     assert!(conflicts.status.success());
     assert!(String::from_utf8_lossy(&conflicts.stdout).contains("path=\"shared\""));
@@ -478,7 +487,7 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
         String::from_utf8_lossy(&resolved.stderr)
     );
     let reopened = wheat(directory.path(), &["status"]);
-    assert!(String::from_utf8_lossy(&reopened.stdout).contains("conflicts: 0"));
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("active label: main"));
     let resolved_conflicts = wheat(directory.path(), &["conflicts", "--format", "json"]);
     assert!(resolved_conflicts.status.success());
     let resolved_conflicts: serde_json::Value =

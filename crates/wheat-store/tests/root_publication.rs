@@ -64,7 +64,10 @@ async fn root_publication_rejects_missing_descendant_even_when_head_requests_cla
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     content.put(b"hello").unwrap();
     let mut repo = Repository::new(Tree::new());
+    let basis = repo.base_view().id;
     repo.create_change(
+        basis,
+        basis,
         [],
         edit(None, b"hello", []),
         ApplicationContext::new(&content),
@@ -106,8 +109,11 @@ async fn reopen_and_publish_only_persisted_roots_without_repository() {
     content.put(b"second").unwrap();
     let (first, second) = {
         let mut repo = Repository::new(Tree::new());
+        let basis = repo.base_view().id;
         let (change, outcome) = repo
             .create_change(
+                basis,
+                basis,
                 [],
                 edit(None, b"first", []),
                 ApplicationContext::new(&content),
@@ -117,6 +123,8 @@ async fn reopen_and_publish_only_persisted_roots_without_repository() {
         let first = publisher.prepare(&repo).await.unwrap().state.id;
         let removed = predecessor_edits(&repo, outcome.revision_id);
         repo.revise_change(
+            basis,
+            outcome.resulting_view,
             change,
             outcome.revision_id,
             edit(None, b"second", removed),
@@ -161,21 +169,29 @@ async fn conflicted_history_retains_conflict_terms_and_rejects_incomplete_aggreg
             kind: wheat_core::FileKind::Regular,
         },
     )]));
+    let basis = repo.base_view().id;
     let (a, first) = repo
         .create_change(
+            basis,
+            basis,
             [],
             edit(Some(b"base"), b"a1", []),
             ApplicationContext::new(&content),
         )
         .unwrap();
-    repo.create_change(
-        [a],
-        edit(Some(b"a1"), b"b1", []),
-        ApplicationContext::new(&content),
-    )
-    .unwrap();
+    let (_, second) = repo
+        .create_change(
+            basis,
+            first.resulting_view,
+            [a],
+            edit(Some(b"a1"), b"b1", []),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
     let removed = predecessor_edits(&repo, first.revision_id);
     repo.revise_change(
+        basis,
+        second.resulting_view,
         a,
         first.revision_id,
         edit(Some(b"base"), b"a2", removed),
@@ -223,7 +239,10 @@ async fn ordinary_publication_cannot_discard_history() {
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     content.put(b"retained").unwrap();
     let mut repo = Repository::new(Tree::new());
+    let basis = repo.base_view().id;
     repo.create_change(
+        basis,
+        basis,
         [],
         edit(None, b"retained", []),
         ApplicationContext::new(&content),

@@ -332,7 +332,9 @@ pub fn import_open_repository_with_limits(
         );
     }
     let materialize_started = Instant::now();
-    let outcomes = repository.import_changes(proposals, ApplicationContext::new(content))?;
+    let base = repository.base_view().id;
+    let outcomes =
+        repository.import_changes(base, base, proposals, ApplicationContext::new(content))?;
     if profile {
         eprintln!(
             "materialize_ms={:.3}",

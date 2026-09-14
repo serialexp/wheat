@@ -8,13 +8,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-use wheat_core::{RepositoryEnvelopeId, TreeId, ViewId};
+use wheat_core::{ChangeId, RepositoryEnvelopeId, TreeId, ViewId};
 use wheat_store::RepositoryHead;
 
 const STORE_FORMAT: &str = "wheat-store";
 const WORKSPACE_FORMAT: &str = "wheat-workspace";
 const STORE_FORMAT_VERSION: u32 = 1;
-const WORKSPACE_FORMAT_VERSION: u32 = 2;
+const WORKSPACE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,18 +31,22 @@ pub(crate) struct WorkspaceMetadata {
     version: u32,
     pub workspace_id: Uuid,
     pub store: WorkspaceStore,
-    pub selection: WorkspaceSelection,
+    pub active_label: String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub selected_frontier: Option<ViewId>,
     pub materialized: Option<MaterializedState>,
-    pub authoring_basis: Option<ViewId>,
-    pub selected_change: Option<wheat_core::ChangeId>,
-    pub pending_selection: Option<PendingSelection>,
+    pub selected_change: Option<ChangeId>,
+    pub pending_repository_operation: Option<PendingRepositoryOperation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PendingSelection {
-    pub change: wheat_core::ChangeId,
+pub(crate) struct PendingRepositoryOperation {
     pub expected_head: SerializedHead,
+    pub proposed_head: SerializedHead,
+    pub resulting_frontier: ViewId,
+    pub selected_change: Option<ChangeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,14 +54,6 @@ pub(crate) struct PendingSelection {
 pub(crate) struct WorkspaceStore {
     pub path: PathBuf,
     pub store_id: Uuid,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum WorkspaceSelection {
-    Published,
-    Working,
-    Branch { name: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,7 +124,12 @@ impl StoreMetadata {
 }
 
 impl WorkspaceMetadata {
-    pub(crate) fn new(store_path: PathBuf, store_id: Uuid, selection: WorkspaceSelection) -> Self {
+    pub(crate) fn new(
+        store_path: PathBuf,
+        store_id: Uuid,
+        active_label: String,
+        basis: ViewId,
+    ) -> Self {
         Self {
             format: WORKSPACE_FORMAT.into(),
             version: WORKSPACE_FORMAT_VERSION,
@@ -137,12 +138,18 @@ impl WorkspaceMetadata {
                 path: store_path,
                 store_id,
             },
-            selection,
+            active_label,
+            basis,
+            observed_label_binding: basis,
+            selected_frontier: None,
             materialized: None,
-            authoring_basis: None,
             selected_change: None,
-            pending_selection: None,
+            pending_repository_operation: None,
         }
+    }
+
+    pub(crate) fn effective_view(&self) -> ViewId {
+        self.selected_frontier.unwrap_or(self.basis)
     }
 
     pub(crate) fn read(root: &Path) -> Result<Self> {
@@ -237,14 +244,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join(".wheat")).unwrap();
         let store_id = Uuid::now_v7();
-        let original = WorkspaceMetadata::new(
-            PathBuf::from("/store"),
-            store_id,
-            WorkspaceSelection::Published,
-        );
+        let basis = ViewId::from_digest([3; 32]);
+        let original =
+            WorkspaceMetadata::new(PathBuf::from("/store"), store_id, "main".into(), basis);
         write_json_new(&root.path().join(".wheat/workspace.json"), &original).unwrap();
         let mut replacement = original.clone();
-        replacement.selection = WorkspaceSelection::Working;
+        replacement.selected_frontier = Some(ViewId::from_digest([4; 32]));
         replacement
             .replace_prepared(root.path())
             .unwrap()
@@ -254,17 +259,28 @@ mod tests {
     }
 
     #[test]
-    fn workspace_v2_round_trips_authoring_basis_and_selected_change() {
+    fn workspace_v3_round_trips_pinned_label_and_effective_view() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join(".wheat")).unwrap();
+        let basis = ViewId::from_digest([7; 32]);
+        let frontier = ViewId::from_digest([8; 32]);
         let mut metadata = WorkspaceMetadata::new(
             PathBuf::from("/store"),
             Uuid::now_v7(),
-            WorkspaceSelection::Working,
+            "main".into(),
+            basis,
         );
-        metadata.authoring_basis = Some(ViewId::from_digest([7; 32]));
+        metadata.selected_frontier = Some(frontier);
         metadata.selected_change = Some(wheat_core::ChangeId::new());
         write_json_new(&root.path().join(".wheat/workspace.json"), &metadata).unwrap();
         assert_eq!(WorkspaceMetadata::read(root.path()).unwrap(), metadata);
+        assert_eq!(metadata.effective_view(), frontier);
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join(".wheat/workspace.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["version"], 3);
+        assert_eq!(document["active_label"], "main");
+        assert!(document.get("selection").is_none());
     }
 }

@@ -25,6 +25,11 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
     ) -> Result<()> {
         let old = self.state(old).await?;
         let new = self.state(new).await?;
+        if old.base_view != new.base_view {
+            return Err(RepositoryPublicationError::InvalidReferences(
+                "publication changes repository base view",
+            ));
+        }
         for (old, new) in [
             (old.retained_changes, new.retained_changes),
             (old.retained_views, new.retained_views),
@@ -33,6 +38,16 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         ] {
             self.retained_subset(old, new).await?;
         }
+        crate::ViewLineageMapStore::new(self.objects)
+            .validate_extension(
+                old.view_lineage,
+                new.view_lineage,
+                crate::ViewLineageLimits::default(),
+            )
+            .await
+            .map_err(|_| {
+                RepositoryPublicationError::InvalidReferences("publication drops view lineage")
+            })?;
         let old = self.manifest(old.required_content).await?.content;
         let new = self.manifest(new.required_content).await?.content;
         let sets = ContentSetStore::new(self.objects);

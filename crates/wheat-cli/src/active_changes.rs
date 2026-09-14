@@ -25,7 +25,7 @@ pub(crate) struct ActiveChange {
     pub dependencies: Vec<ChangeId>,
     pub conflicted: bool,
     #[serde(serialize_with = "display_optional_id")]
-    pub published_revision: Option<RevisionId>,
+    pub basis_revision: Option<RevisionId>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -35,9 +35,7 @@ pub(crate) struct ActiveChanges {
     #[serde(serialize_with = "display_id")]
     pub basis: ViewId,
     #[serde(serialize_with = "display_id")]
-    pub working: ViewId,
-    #[serde(serialize_with = "display_id")]
-    pub published: ViewId,
+    pub effective: ViewId,
     #[serde(serialize_with = "display_optional_id")]
     pub selected: Option<ChangeId>,
     pub changes: Vec<ActiveChange>,
@@ -98,6 +96,7 @@ pub(crate) async fn inspect(
     repository: &LocalRepository,
     head: RepositoryHead,
     basis: ViewId,
+    effective: ViewId,
     selected: Option<ChangeId>,
 ) -> Result<ActiveChanges> {
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
@@ -110,13 +109,11 @@ pub(crate) async fn inspect(
         }
         Err(error) => return Err(error.into()),
     };
-    let working = reader.view(state.working_view).await?;
-    let published = reader.view(state.published_view).await?;
+    let working = reader.view(effective).await?;
     let revisions = RevisionMapStore::new(&repository.objects);
     let applications = ApplicationMapStore::new(&repository.objects);
     let changes = ChangeMapStore::new(&repository.objects);
     let basis_revisions = collect_revisions(&revisions, basis_view.revisions).await?;
-    let published_revisions = collect_revisions(&revisions, published.revisions).await?;
     let mut cursor = revisions.cursor(working.revisions).await?;
     let mut active = BTreeMap::new();
     while let Some((change, revision)) = cursor.next().await? {
@@ -165,7 +162,7 @@ pub(crate) async fn inspect(
                 title: change_record.metadata.title,
                 dependencies: record.dependencies.iter().copied().collect(),
                 conflicted,
-                published_revision: published_revisions.get(&change).copied(),
+                basis_revision: basis_revisions.get(&change).copied(),
             },
         );
     }
@@ -174,8 +171,7 @@ pub(crate) async fn inspect(
         format: "wheat-active-changes",
         version: 1,
         basis,
-        working: state.working_view,
-        published: state.published_view,
+        effective,
         selected,
         changes: ordered,
     })

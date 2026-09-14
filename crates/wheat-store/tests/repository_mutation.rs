@@ -110,7 +110,7 @@ fn proposal(
 }
 
 #[tokio::test]
-async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_branches() {
+async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_labels() {
     let dir = tempfile::tempdir().unwrap();
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
@@ -120,31 +120,40 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     }
 
     let mut reference = Repository::new(Tree::new());
+    let base = reference.base_view().id;
+    let mut effective = base;
     let a = ChangeId::new();
     let a1_edits = exact("a", None, b"a1");
     let a1_edit = *a1_edits.edits.keys().next().unwrap();
     let a1 = reference
-        .create_change_with_id(a, [], a1_edits, ApplicationContext::new(&content))
-        .unwrap();
-    let b = ChangeId::new();
-    reference
         .create_change_with_id(
+            base,
+            effective,
+            a,
+            [],
+            a1_edits,
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    effective = a1.resulting_view;
+    let b = ChangeId::new();
+    let b1 = reference
+        .create_change_with_id(
+            base,
+            effective,
             b,
             [],
             exact("b", None, b"b1"),
             ApplicationContext::new(&content),
         )
         .unwrap();
+    effective = b1.resulting_view;
 
-    let branches = BranchManifestRecord::new([
-        ("refs/heads/main", reference.working_view().id),
-        ("refs/heads/archive", reference.published_view().id),
-    ])
-    .unwrap();
+    let labels = ViewLabelManifestRecord::new([("main", effective), ("archive", base)]).unwrap();
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let initial_closure = publisher.prepare(&reference).await.unwrap();
     let initial_envelope = publisher
-        .prepare_envelope(initial_closure.state.id, &branches)
+        .prepare_envelope(initial_closure.state.id, &labels)
         .await
         .unwrap();
     let initial = publisher
@@ -154,8 +163,11 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
 
     let c = ChangeId::new();
     let c_proposal = proposal(c, [a, b], exact("a", Some(b"a1"), b"c1"));
+    let mutation_effective = effective;
     let expected_create = reference
         .create_change_with_metadata(
+            base,
+            effective,
             c,
             ChangeMetadata::default(),
             [a, b],
@@ -164,10 +176,14 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
             ApplicationContext::new(&content),
         )
         .unwrap();
+    effective = expected_create.resulting_view;
     let expected_create_state = reference.canonical_closure().state.id;
 
     let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
-    let (prepared, actual_create) = mutator.create(initial, c_proposal).await.unwrap();
+    let (prepared, actual_create) = mutator
+        .create(initial, base, mutation_effective, c_proposal)
+        .await
+        .unwrap();
     assert_eq!(actual_create, expected_create);
     assert_eq!(prepared.state(), expected_create_state);
     // Preparing immutable objects does not publish anything.
@@ -176,15 +192,12 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
 
     let reader = RepositoryReader::new(&objects, &content);
     let create_envelope = reader.envelope(after_create.envelope).await.unwrap();
-    assert_eq!(create_envelope.branches, branches.id());
+    assert_eq!(create_envelope.labels, labels.id());
     let create_state = reader.state(create_envelope.state).await.unwrap();
     let retained = RetainedSetStore::new(&objects);
     assert!(
         retained
-            .contains(
-                create_state.retained_views,
-                initial_closure.state.working_view.into()
-            )
+            .contains(create_state.retained_views, effective.into())
             .await
             .unwrap()
     );
@@ -196,21 +209,33 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     );
 
     let a2_edits = revision("a", None, b"a2", a1_edit);
+    let mutation_effective = effective;
     let expected_revise = reference
         .revise_change(
+            base,
+            effective,
             a,
             a1.revision_id,
             a2_edits.clone(),
             ApplicationContext::new(&content),
         )
         .unwrap();
+    effective = expected_revise.resulting_view;
     assert_eq!(expected_revise.reapplied, vec![c]);
-    assert!(!reference.working_view().unresolved_conflicts.is_empty());
+    assert!(
+        !reference
+            .view(effective)
+            .unwrap()
+            .unresolved_conflicts
+            .is_empty()
+    );
     let expected_revise_state = reference.canonical_closure().state.id;
 
     let (prepared, actual_revise) = mutator
         .revise(
             after_create,
+            base,
+            mutation_effective,
             a,
             a1.revision_id,
             RevisionMetadata::default(),
@@ -222,7 +247,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     assert_eq!(prepared.state(), expected_revise_state);
     let after_revise = mutator.publish(prepared).await.unwrap();
     let envelope = reader.envelope(after_revise.envelope).await.unwrap();
-    assert_eq!(envelope.branches, branches.id());
+    assert_eq!(envelope.labels, labels.id());
     reader.validate_complete(envelope.state).await.unwrap();
     assert_eq!(
         reader
@@ -235,9 +260,9 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
         expected_revise_state
     );
 
-    let conflict_revision = reference.current_revision(c).unwrap();
+    let conflict_revision = reference.current_revision(effective, c).unwrap();
     let conflicted = reference
-        .conflicted_application(conflict_revision)
+        .conflicted_application(effective, conflict_revision)
         .unwrap()
         .clone();
     let resolved_value = FileValue {
@@ -246,10 +271,12 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     };
     let mut resolved_tree = conflicted.result.materialized_tree().clone();
     resolved_tree.insert("a".into(), resolved_value);
-    let clean_application = reference.current_application(a).unwrap().id;
+    let clean_application = reference.current_application(effective, a).unwrap().id;
     let stale = mutator
         .resolve_conflict(
             after_revise,
+            base,
+            effective,
             PersistedConflictResolution {
                 conflict_revision: a1.revision_id,
                 application: conflicted.id,
@@ -266,6 +293,8 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     let not_conflicted = mutator
         .resolve_conflict(
             after_revise,
+            base,
+            effective,
             PersistedConflictResolution {
                 conflict_revision: expected_revise.revision_id,
                 application: clean_application,
@@ -283,6 +312,8 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     let outside = mutator
         .resolve_conflict(
             after_revise,
+            base,
+            effective,
             PersistedConflictResolution {
                 conflict_revision,
                 application: conflicted.id,
@@ -299,6 +330,8 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     let missing_content = mutator
         .resolve_conflict(
             after_revise,
+            base,
+            effective,
             PersistedConflictResolution {
                 conflict_revision,
                 application: conflicted.id,
@@ -323,6 +356,8 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
 
     let expected_resolution = reference
         .resolve_conflict(
+            base,
+            effective,
             ConflictResolution {
                 conflict_revision,
                 resolved_tree,
@@ -335,6 +370,8 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
     let (prepared, actual_resolution) = mutator
         .resolve_conflict(
             after_revise,
+            base,
+            effective,
             PersistedConflictResolution {
                 conflict_revision,
                 application: conflicted.id,
@@ -362,42 +399,59 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_br
 }
 
 #[tokio::test]
-async fn publication_target_defaults_to_working_only_and_can_publish_working() {
-    for target in [MutationTarget::WorkingOnly, MutationTarget::PublishWorking] {
-        let dir = tempfile::tempdir().unwrap();
-        let objects = LooseObjectStore::new(dir.path().join("objects"));
-        let content = ContentStore::new(dir.path().join("content"));
-        let heads = LocalPublicationStore::new(dir.path().join("head"));
-        content.put(b"value").unwrap();
-        let initial = RepositoryPublisher::new(&objects, &content, &heads)
-            .initialize(&Repository::new(Tree::new()))
+async fn mutation_returns_and_retains_result_without_moving_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let heads = LocalPublicationStore::new(dir.path().join("head"));
+    content.put(b"value").unwrap();
+    let repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    let labels = ViewLabelManifestRecord::new([("main", base)]).unwrap();
+    let publisher = RepositoryPublisher::new(&objects, &content, &heads);
+    let closure = publisher.prepare(&repository).await.unwrap();
+    let envelope = publisher
+        .prepare_envelope(closure.state.id, &labels)
+        .await
+        .unwrap();
+    let initial = publisher
+        .initialize_prepared_envelope(envelope)
+        .await
+        .unwrap();
+    let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
+    let (prepared, outcome) = mutator
+        .create(
+            initial,
+            base,
+            base,
+            proposal(ChangeId::new(), [], exact("path", None, b"value")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.resulting_view(), outcome.resulting_view);
+    let resulting = prepared.resulting_view();
+    let head = mutator.publish(prepared).await.unwrap();
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    assert_eq!(envelope.labels, labels.id());
+    let state = reader.state(envelope.state).await.unwrap();
+    assert!(
+        RetainedSetStore::new(&objects)
+            .contains(state.retained_views, resulting.into())
             .await
-            .unwrap();
-        let mutator =
-            PersistedRepositoryMutator::new(&objects, &content, &heads).with_target(target);
-        let (prepared, _) = mutator
-            .create(
-                initial,
-                proposal(ChangeId::new(), [], exact("path", None, b"value")),
+            .unwrap()
+    );
+    assert!(
+        ViewLineageMapStore::new(&objects)
+            .is_descendant(
+                state.view_lineage,
+                base,
+                resulting,
+                ViewLineageLimits::default(),
             )
             .await
-            .unwrap();
-        let head = mutator.publish(prepared).await.unwrap();
-        let reader = RepositoryReader::new(&objects, &content);
-        let state = reader
-            .state(reader_state(&objects, &content, head).await)
-            .await
-            .unwrap();
-        let initial_state = reader
-            .state(reader_state(&objects, &content, initial).await)
-            .await
-            .unwrap();
-        assert_ne!(state.working_view, initial_state.working_view);
-        match target {
-            MutationTarget::WorkingOnly => assert_ne!(state.working_view, state.published_view),
-            MutationTarget::PublishWorking => assert_eq!(state.working_view, state.published_view),
-        }
-    }
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -407,15 +461,17 @@ async fn failed_content_resolution_never_prepares_or_advances_metadata() {
     let content = ContentStore::new(dir.path().join("content"));
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
-    let initial = publisher
-        .initialize(&Repository::new(Tree::new()))
-        .await
-        .unwrap();
+    let repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    let effective = base;
+    let initial = publisher.initialize(&repository).await.unwrap();
     let before = reader_state(&objects, &content, initial).await;
 
     let result = PersistedRepositoryMutator::new(&objects, &content, &heads)
         .create(
             initial,
+            base,
+            effective,
             proposal(ChangeId::new(), [], exact("missing", None, b"not retained")),
         )
         .await;
@@ -440,37 +496,56 @@ async fn conflict_resolution_deletion_mode_and_symlink_match_hydrated_reference(
         }
 
         let mut reference = Repository::new(Tree::new());
+        let base = reference.base_view().id;
+        let mut effective = base;
         let parent = ChangeId::new();
         let parent_edits = exact("file", None, b"base");
         let parent_edit = *parent_edits.edits.keys().next().unwrap();
         let parent_outcome = reference
-            .create_change_with_id(parent, [], parent_edits, ApplicationContext::new(&content))
-            .unwrap();
-        let child = ChangeId::new();
-        reference
             .create_change_with_id(
+                base,
+                effective,
+                parent,
+                [],
+                parent_edits,
+                ApplicationContext::new(&content),
+            )
+            .unwrap();
+        effective = parent_outcome.resulting_view;
+        let child = ChangeId::new();
+        let child_outcome = reference
+            .create_change_with_id(
+                base,
+                effective,
                 child,
                 [parent],
                 exact("file", Some(b"base"), b"authored"),
                 ApplicationContext::new(&content),
             )
             .unwrap();
+        effective = child_outcome.resulting_view;
         let publisher = RepositoryPublisher::new(&objects, &content, &heads);
         let head = publisher.initialize(&reference).await.unwrap();
 
         let parent_revision = revision("file", None, b"upstream", parent_edit);
+        let mutation_effective = effective;
         let expected_revise = reference
             .revise_change(
+                base,
+                effective,
                 parent,
                 parent_outcome.revision_id,
                 parent_revision.clone(),
                 ApplicationContext::new(&content),
             )
             .unwrap();
+        effective = expected_revise.resulting_view;
         let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
         let (prepared, actual_revise) = mutator
             .revise(
                 head,
+                base,
+                mutation_effective,
                 parent,
                 parent_outcome.revision_id,
                 RevisionMetadata::default(),
@@ -481,9 +556,9 @@ async fn conflict_resolution_deletion_mode_and_symlink_match_hydrated_reference(
         assert_eq!(actual_revise, expected_revise);
         let conflicted_head = mutator.publish(prepared).await.unwrap();
 
-        let conflict_revision = reference.current_revision(child).unwrap();
+        let conflict_revision = reference.current_revision(effective, child).unwrap();
         let application = reference
-            .conflicted_application(conflict_revision)
+            .conflicted_application(effective, conflict_revision)
             .unwrap()
             .clone();
         let value = resolved.map(|(bytes, kind)| FileValue {
@@ -498,6 +573,8 @@ async fn conflict_resolution_deletion_mode_and_symlink_match_hydrated_reference(
         }
         let expected = reference
             .resolve_conflict(
+                base,
+                effective,
                 ConflictResolution {
                     conflict_revision,
                     resolved_tree,
@@ -509,6 +586,8 @@ async fn conflict_resolution_deletion_mode_and_symlink_match_hydrated_reference(
         let (prepared, actual) = mutator
             .resolve_conflict(
                 conflicted_head,
+                base,
+                effective,
                 PersistedConflictResolution {
                     conflict_revision,
                     application: application.id,
@@ -555,15 +634,17 @@ async fn stale_prepare_and_stale_publish_never_advance_the_head() {
     let content = ContentStore::new(dir.path().join("content"));
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
-    let initial = publisher
-        .initialize(&Repository::new(Tree::new()))
-        .await
-        .unwrap();
+    let repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    let effective = base;
+    let initial = publisher.initialize(&repository).await.unwrap();
     let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
 
     let (first, _) = mutator
         .create(
             initial,
+            base,
+            effective,
             proposal(ChangeId::new(), BTreeSet::new(), RevisionEdits::default()),
         )
         .await
@@ -571,6 +652,8 @@ async fn stale_prepare_and_stale_publish_never_advance_the_head() {
     let (loser, _) = mutator
         .create(
             initial,
+            base,
+            effective,
             proposal(ChangeId::new(), BTreeSet::new(), RevisionEdits::default()),
         )
         .await
@@ -584,6 +667,8 @@ async fn stale_prepare_and_stale_publish_never_advance_the_head() {
         mutator
             .create(
                 initial,
+                base,
+                effective,
                 proposal(ChangeId::new(), [], RevisionEdits::default())
             )
             .await,
@@ -615,17 +700,22 @@ async fn mutation_reads_only_touched_tree_paths_and_current_records() {
         content.put(bytes).unwrap();
     }
     let mut reference = Repository::new(tree);
+    let base = reference.base_view().id;
+    let mut effective = base;
     let change = ChangeId::new();
     let first = reference
         .create_change_with_id(
+            base,
+            effective,
             change,
             [],
             exact("touched", None, b"one"),
             ApplicationContext::new(&content),
         )
         .unwrap();
-    let first_view = reference.working_view().id;
-    let first_application = reference.current_application(change).unwrap().id;
+    effective = first.resulting_view;
+    let first_view = effective;
+    let first_application = reference.current_application(effective, change).unwrap().id;
     let first_edit = *reference
         .revision(first.revision_id)
         .unwrap()
@@ -635,12 +725,15 @@ async fn mutation_reads_only_touched_tree_paths_and_current_records() {
         .unwrap();
     let second = reference
         .revise_change(
+            base,
+            effective,
             change,
             first.revision_id,
             revision("touched", None, b"two", first_edit),
             ApplicationContext::new(&content),
         )
         .unwrap();
+    effective = second.resulting_view;
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let head = publisher.initialize(&reference).await.unwrap();
     objects.reset(BTreeSet::from([
@@ -660,6 +753,8 @@ async fn mutation_reads_only_touched_tree_paths_and_current_records() {
     mutator
         .revise(
             head,
+            base,
+            effective,
             change,
             second.revision_id,
             RevisionMetadata::default(),
@@ -680,6 +775,8 @@ async fn frontier_create_and_tail_revision_reuse_a_long_persisted_prefix() {
     let content = ContentStore::new(dir.path().join("content"));
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     let mut reference = Repository::new(Tree::new());
+    let base = reference.base_view().id;
+    let mut effective = base;
     let mut previous = None;
     let mut old_objects = BTreeSet::new();
 
@@ -689,9 +786,17 @@ async fn frontier_create_and_tail_revision_reuse_a_long_persisted_prefix() {
         content.put(&bytes).unwrap();
         let edits = exact(&format!("file-{index}"), None, &bytes);
         old_objects.extend(edits.edits.keys().copied().map(ObjectId::from));
-        reference
-            .create_change_with_id(change, previous, edits, ApplicationContext::new(&content))
+        let outcome = reference
+            .create_change_with_id(
+                base,
+                effective,
+                change,
+                previous,
+                edits,
+                ApplicationContext::new(&content),
+            )
             .unwrap();
+        effective = outcome.resulting_view;
         previous = Some(change);
     }
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
@@ -703,19 +808,28 @@ async fn frontier_create_and_tail_revision_reuse_a_long_persisted_prefix() {
     let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
     let tail_edits = exact("tail", None, b"tail-one");
     let tail_edit = *tail_edits.edits.keys().next().unwrap();
+    let mutation_effective = effective;
     let expected = reference
         .create_change_with_id(
+            base,
+            effective,
             tail,
             previous,
             tail_edits.clone(),
             ApplicationContext::new(&content),
         )
         .unwrap();
+    effective = expected.resulting_view;
     let expected_state = reference.canonical_closure().state.id;
     // Frontier creation derives the chain tip after opening the persisted state. The canonical
     // reference proposal names that tip explicitly, proving both dependency and identity parity.
     let (prepared, actual) = mutator
-        .create_on_frontier(head, proposal(tail, [], tail_edits))
+        .create_on_frontier(
+            head,
+            base,
+            mutation_effective,
+            proposal(tail, [], tail_edits),
+        )
         .await
         .unwrap();
     assert_eq!(actual, expected);
@@ -733,6 +847,8 @@ async fn frontier_create_and_tail_revision_reuse_a_long_persisted_prefix() {
     let predecessor = expected.revision_id;
     let expected = reference
         .revise_change(
+            base,
+            effective,
             tail,
             predecessor,
             revised.clone(),
@@ -743,6 +859,8 @@ async fn frontier_create_and_tail_revision_reuse_a_long_persisted_prefix() {
     let (prepared, actual) = mutator
         .revise(
             head,
+            base,
+            effective,
             tail,
             predecessor,
             RevisionMetadata::default(),

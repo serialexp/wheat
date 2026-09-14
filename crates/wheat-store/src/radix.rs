@@ -16,6 +16,19 @@ pub(crate) enum Error {
     InvalidTerminalNode,
 }
 
+pub(crate) enum DiffError {
+    Radix(Error),
+    ChangeLimitExceeded { limit: usize },
+    NodeLimitExceeded { limit: usize },
+    PendingLimitExceeded { limit: usize },
+}
+
+impl From<Error> for DiffError {
+    fn from(value: Error) -> Self {
+        Self::Radix(value)
+    }
+}
+
 impl From<ObjectStoreError> for Error {
     fn from(value: ObjectStoreError) -> Self {
         Self::Store(value)
@@ -74,6 +87,42 @@ type Frame<C> = (
     bool,
 );
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DiffLimits {
+    pub max_changes: usize,
+    pub max_nodes: usize,
+    pub max_pending: usize,
+}
+
+impl Default for DiffLimits {
+    fn default() -> Self {
+        Self {
+            max_changes: 250_000,
+            max_nodes: 500_000,
+            // A radix node has at most 256 children; leave room for several
+            // divergent levels while still bounding adversarial inputs.
+            max_pending: 4_096,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiffEntry<K, V> {
+    Added(K, V),
+    Changed(K, V, V),
+    Removed(K, V),
+}
+
+enum DiffSide<C: Collection> {
+    Id(C::Id),
+    Loaded(Node<C::Id, C::Value>, usize),
+}
+
+enum DiffTask<C: Collection> {
+    Pair(DiffSide<C>, DiffSide<C>, usize, Option<u8>),
+    One(DiffSide<C>, usize, Option<u8>, bool),
+}
+
 pub(crate) struct Cursor<'a, S, C: Collection> {
     store: Store<'a, S, C>,
     stack: Vec<Frame<C>>,
@@ -124,10 +173,30 @@ where
         id: C::Id,
         position: usize,
     ) -> Result<C::PublicNode, Error> {
-        let public = self.read_public(id).await?;
+        self.read_public_at_with_size(id, position)
+            .await
+            .map(|(node, _)| node)
+    }
+
+    pub(crate) async fn read_public_at_with_size(
+        &self,
+        id: C::Id,
+        position: usize,
+    ) -> Result<(C::PublicNode, usize), Error> {
+        let object = self.objects.get(id.into()).await?;
+        if object.kind != C::KIND {
+            return Err(ObjectStoreError::WrongKind {
+                id: id.into(),
+                expected: C::KIND,
+                actual: object.kind,
+            }
+            .into());
+        }
+        let decoded_bytes = object.canonical_bytes.len();
+        let public = C::decode(&object.canonical_bytes)?;
         let node = C::unpack(public.clone());
         self.validate_at(&node, position)?;
-        Ok(public)
+        Ok((public, decoded_bytes))
     }
 
     async fn read_at(&self, id: C::Id, position: usize) -> Result<Node<C::Id, C::Value>, Error> {
@@ -413,6 +482,323 @@ where
                 .await?,
             ))
         })
+    }
+
+    /// Compares two persistent roots without reading subtrees whose identities match.
+    ///
+    /// Traversal is iterative, lexicographically ordered, and bounded independently
+    /// by decoded nodes, pending work, and reported changes.
+    pub(crate) async fn paired_diff(
+        &self,
+        left: C::Id,
+        right: C::Id,
+        limits: DiffLimits,
+    ) -> Result<Vec<DiffEntry<C::Key, C::Value>>, DiffError> {
+        if left == right {
+            return Ok(Vec::new());
+        }
+
+        let mut pending = Vec::with_capacity(C::Key::LEN * 2);
+        pending.push(DiffTask::Pair(
+            DiffSide::Id(left),
+            DiffSide::Id(right),
+            0,
+            None,
+        ));
+        let mut key = vec![0; C::Key::LEN];
+        let mut changes = Vec::new();
+        let mut nodes_read = 0usize;
+
+        while let Some(task) = pending.pop() {
+            match task {
+                DiffTask::One(side, position, edge, added) => {
+                    if let Some(edge) = edge {
+                        key[position - 1] = edge;
+                    }
+                    let (node, skip) = self
+                        .diff_load(side, position, &mut nodes_read, limits)
+                        .await?;
+                    let end = position + node.prefix.len() - skip;
+                    key[position..end].copy_from_slice(&node.prefix[skip..]);
+                    if let Some(value) = node.value {
+                        Self::diff_emit(
+                            &mut changes,
+                            if added {
+                                DiffEntry::Added(C::Key::from_bytes(&key), value)
+                            } else {
+                                DiffEntry::Removed(C::Key::from_bytes(&key), value)
+                            },
+                            limits,
+                        )?;
+                    }
+                    for &(edge, id) in node.children.iter().rev() {
+                        pending.push(DiffTask::One(DiffSide::Id(id), end + 1, Some(edge), added));
+                    }
+                }
+                DiffTask::Pair(left_side, right_side, position, edge) => {
+                    if let Some(edge) = edge {
+                        key[position - 1] = edge;
+                    }
+                    if let (DiffSide::Id(left), DiffSide::Id(right)) = (&left_side, &right_side)
+                        && left == right
+                    {
+                        continue;
+                    }
+                    let (left, left_skip) = self
+                        .diff_load(left_side, position, &mut nodes_read, limits)
+                        .await?;
+                    let (right, right_skip) = self
+                        .diff_load(right_side, position, &mut nodes_read, limits)
+                        .await?;
+                    let left_prefix = &left.prefix[left_skip..];
+                    let right_prefix = &right.prefix[right_skip..];
+                    let common = left_prefix
+                        .iter()
+                        .zip(right_prefix)
+                        .take_while(|(left, right)| left == right)
+                        .count();
+                    key[position..position + common].copy_from_slice(&left_prefix[..common]);
+
+                    if common < left_prefix.len() && common < right_prefix.len() {
+                        let (first, second) = if left_prefix[common] < right_prefix[common] {
+                            (
+                                DiffTask::One(
+                                    DiffSide::Loaded(left, left_skip + common),
+                                    position + common,
+                                    None,
+                                    false,
+                                ),
+                                DiffTask::One(
+                                    DiffSide::Loaded(right, right_skip + common),
+                                    position + common,
+                                    None,
+                                    true,
+                                ),
+                            )
+                        } else {
+                            (
+                                DiffTask::One(
+                                    DiffSide::Loaded(right, right_skip + common),
+                                    position + common,
+                                    None,
+                                    true,
+                                ),
+                                DiffTask::One(
+                                    DiffSide::Loaded(left, left_skip + common),
+                                    position + common,
+                                    None,
+                                    false,
+                                ),
+                            )
+                        };
+                        pending.push(second);
+                        pending.push(first);
+                    } else if common == left_prefix.len() && common == right_prefix.len() {
+                        let end = position + common;
+                        match (left.value, right.value) {
+                            (Some(old), Some(new)) if old != new => Self::diff_emit(
+                                &mut changes,
+                                DiffEntry::Changed(C::Key::from_bytes(&key), old, new),
+                                limits,
+                            )?,
+                            (Some(old), None) => Self::diff_emit(
+                                &mut changes,
+                                DiffEntry::Removed(C::Key::from_bytes(&key), old),
+                                limits,
+                            )?,
+                            (None, Some(new)) => Self::diff_emit(
+                                &mut changes,
+                                DiffEntry::Added(C::Key::from_bytes(&key), new),
+                                limits,
+                            )?,
+                            _ => {}
+                        }
+                        let mut left_index = left.children.len();
+                        let mut right_index = right.children.len();
+                        while left_index != 0 || right_index != 0 {
+                            let left_child = left_index.checked_sub(1).map(|i| left.children[i]);
+                            let right_child = right_index.checked_sub(1).map(|i| right.children[i]);
+                            match (left_child, right_child) {
+                                (Some((le, li)), Some((re, ri))) if le == re => {
+                                    left_index -= 1;
+                                    right_index -= 1;
+                                    if li != ri {
+                                        pending.push(DiffTask::Pair(
+                                            DiffSide::Id(li),
+                                            DiffSide::Id(ri),
+                                            end + 1,
+                                            Some(le),
+                                        ));
+                                    }
+                                }
+                                (Some((le, li)), Some((re, _))) if le > re => {
+                                    left_index -= 1;
+                                    pending.push(DiffTask::One(
+                                        DiffSide::Id(li),
+                                        end + 1,
+                                        Some(le),
+                                        false,
+                                    ));
+                                }
+                                (Some(_), Some((re, ri))) => {
+                                    right_index -= 1;
+                                    pending.push(DiffTask::One(
+                                        DiffSide::Id(ri),
+                                        end + 1,
+                                        Some(re),
+                                        true,
+                                    ));
+                                }
+                                (Some((le, li)), None) => {
+                                    left_index -= 1;
+                                    pending.push(DiffTask::One(
+                                        DiffSide::Id(li),
+                                        end + 1,
+                                        Some(le),
+                                        false,
+                                    ));
+                                }
+                                (None, Some((re, ri))) => {
+                                    right_index -= 1;
+                                    pending.push(DiffTask::One(
+                                        DiffSide::Id(ri),
+                                        end + 1,
+                                        Some(re),
+                                        true,
+                                    ));
+                                }
+                                (None, None) => break,
+                            }
+                        }
+                    } else if common == left_prefix.len() {
+                        let end = position + common;
+                        let edge = right_prefix[common];
+                        let matching = left
+                            .children
+                            .binary_search_by_key(&edge, |child| child.0)
+                            .ok();
+                        let mut divergent = Some(right);
+                        for (index, &(child_edge, id)) in left.children.iter().enumerate().rev() {
+                            if matching.is_none() && child_edge < edge {
+                                pending.push(DiffTask::One(
+                                    DiffSide::Loaded(
+                                        divergent.take().expect("divergent side is queued once"),
+                                        right_skip + common + 1,
+                                    ),
+                                    end + 1,
+                                    Some(edge),
+                                    true,
+                                ));
+                            }
+                            pending.push(if Some(index) == matching {
+                                DiffTask::Pair(
+                                    DiffSide::Id(id),
+                                    DiffSide::Loaded(
+                                        divergent.take().expect("matching side is queued once"),
+                                        right_skip + common + 1,
+                                    ),
+                                    end + 1,
+                                    Some(edge),
+                                )
+                            } else {
+                                DiffTask::One(DiffSide::Id(id), end + 1, Some(child_edge), false)
+                            });
+                        }
+                        if let Some(divergent) = divergent {
+                            pending.push(DiffTask::One(
+                                DiffSide::Loaded(divergent, right_skip + common + 1),
+                                end + 1,
+                                Some(edge),
+                                true,
+                            ));
+                        }
+                    } else {
+                        let end = position + common;
+                        let edge = left_prefix[common];
+                        let matching = right
+                            .children
+                            .binary_search_by_key(&edge, |child| child.0)
+                            .ok();
+                        let mut divergent = Some(left);
+                        for (index, &(child_edge, id)) in right.children.iter().enumerate().rev() {
+                            if matching.is_none() && child_edge < edge {
+                                pending.push(DiffTask::One(
+                                    DiffSide::Loaded(
+                                        divergent.take().expect("divergent side is queued once"),
+                                        left_skip + common + 1,
+                                    ),
+                                    end + 1,
+                                    Some(edge),
+                                    false,
+                                ));
+                            }
+                            pending.push(if Some(index) == matching {
+                                DiffTask::Pair(
+                                    DiffSide::Loaded(
+                                        divergent.take().expect("matching side is queued once"),
+                                        left_skip + common + 1,
+                                    ),
+                                    DiffSide::Id(id),
+                                    end + 1,
+                                    Some(edge),
+                                )
+                            } else {
+                                DiffTask::One(DiffSide::Id(id), end + 1, Some(child_edge), true)
+                            });
+                        }
+                        if let Some(divergent) = divergent {
+                            pending.push(DiffTask::One(
+                                DiffSide::Loaded(divergent, left_skip + common + 1),
+                                end + 1,
+                                Some(edge),
+                                false,
+                            ));
+                        }
+                    }
+                }
+            }
+            if pending.len() > limits.max_pending {
+                return Err(DiffError::PendingLimitExceeded {
+                    limit: limits.max_pending,
+                });
+            }
+        }
+        Ok(changes)
+    }
+
+    async fn diff_load(
+        &self,
+        side: DiffSide<C>,
+        position: usize,
+        nodes_read: &mut usize,
+        limits: DiffLimits,
+    ) -> Result<(Node<C::Id, C::Value>, usize), DiffError> {
+        match side {
+            DiffSide::Loaded(node, skip) => Ok((node, skip)),
+            DiffSide::Id(id) => {
+                if *nodes_read == limits.max_nodes {
+                    return Err(DiffError::NodeLimitExceeded {
+                        limit: limits.max_nodes,
+                    });
+                }
+                *nodes_read += 1;
+                Ok((self.read_at(id, position).await?, 0))
+            }
+        }
+    }
+
+    fn diff_emit(
+        changes: &mut Vec<DiffEntry<C::Key, C::Value>>,
+        entry: DiffEntry<C::Key, C::Value>,
+        limits: DiffLimits,
+    ) -> Result<(), DiffError> {
+        if changes.len() == limits.max_changes {
+            return Err(DiffError::ChangeLimitExceeded {
+                limit: limits.max_changes,
+            });
+        }
+        changes.push(entry);
+        Ok(())
     }
 
     /// Authentically merges two radix roots and emits the unique canonical union shape.

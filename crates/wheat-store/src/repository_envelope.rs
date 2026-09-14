@@ -4,7 +4,7 @@ use crate::{
     RepositoryPublicationError, RepositoryPublisher, RepositoryReader, RetainedSetStore,
 };
 use wheat_core::{
-    BranchManifestRecord, RepositoryEnvelopeId, RepositoryEnvelopeRecord, RepositoryStateId,
+    RepositoryEnvelopeId, RepositoryEnvelopeRecord, RepositoryStateId, ViewLabelManifestRecord,
 };
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
 impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
@@ -15,18 +15,18 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         let envelope = self.envelope(id).await?;
         self.validate_complete(envelope.state).await?;
         let state = self.state(envelope.state).await?;
-        let branches = self.branch_manifest(envelope.branches).await?;
+        let labels = self.view_label_manifest(envelope.labels).await?;
         let retained = RetainedSetStore::new(self.objects);
-        for target in branches.branches.values() {
+        for label in labels.labels.values() {
             if !retained
-                .contains(state.retained_views, (*target).into())
+                .contains(state.retained_views, label.view.into())
                 .await?
             {
                 return Err(RepositoryPublicationError::InvalidReferences(
-                    "branch target not retained",
+                    "view label target not retained",
                 ));
             }
-            self.view(*target).await?;
+            self.view(label.view).await?;
         }
         Ok(envelope)
     }
@@ -35,14 +35,12 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
     pub async fn prepare_envelope(
         &self,
         state: RepositoryStateId,
-        branches: &BranchManifestRecord,
+        labels: &ViewLabelManifestRecord,
     ) -> Result<RepositoryEnvelopeId> {
         self.objects
-            .put_if_absent(branches.id().into(), &branches.canonical_bytes())
+            .put_if_absent(labels.id().into(), &labels.canonical_bytes())
             .await?;
-        let id = self
-            .prepare_envelope_unchecked(state, branches.id())
-            .await?;
+        let id = self.prepare_envelope_unchecked(state, labels.id()).await?;
         RepositoryReader::new(self.objects, self.content)
             .validate_envelope(id)
             .await?;
@@ -52,9 +50,9 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
     pub(crate) async fn prepare_envelope_unchecked(
         &self,
         state: RepositoryStateId,
-        branches: wheat_core::BranchManifestId,
+        labels: wheat_core::ViewLabelManifestId,
     ) -> Result<RepositoryEnvelopeId> {
-        let envelope = RepositoryEnvelopeRecord { state, branches };
+        let envelope = RepositoryEnvelopeRecord { state, labels };
         self.objects
             .put_if_absent(envelope.id().into(), &envelope.canonical_bytes())
             .await?;
@@ -79,7 +77,7 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
             .await?;
         self.initialize_prepared_envelope(root).await
     }
-    /// Explicit branch-manifest publication. Ordinary model publication preserves
+    /// Explicit view-label publication. Ordinary model publication preserves
     /// the authenticated old manifest through `publish_root` instead.
     pub async fn publish_envelope(
         &self,

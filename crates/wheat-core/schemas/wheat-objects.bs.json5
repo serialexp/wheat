@@ -27,17 +27,17 @@
         { type: "ConflictV1", when: "value == 0x0501" },
         { type: "ViewV1", when: "value == 0x0601" },
         { type: "ContentManifestV1", when: "value == 0x0701" },
-        { type: "RepositoryStateV1", when: "value == 0x0801" },
-        { type: "RepositoryStateV2", when: "value == 0x0802" },
+        { type: "RepositoryStateV3", when: "value == 0x0803" },
         { type: "RevisionMapNodeV1", when: "value == 0x0901" },
         { type: "ApplicationMapNodeV1", when: "value == 0x0a01" },
         { type: "ConflictSetNodeV1", when: "value == 0x0b01" },
         { type: "ContentSetNodeV1", when: "value == 0x0c01" },
         { type: "RetainedSetNodeV1", when: "value == 0x0d01" },
-        { type: "BranchManifestV1", when: "value == 0x0e01" },
+        { type: "ViewLabelManifestV1", when: "value == 0x0e01" },
         { type: "RepositoryEnvelopeV1", when: "value == 0x0f01" },
         { type: "EditV1", when: "value == 0x1001" },
         { type: "ChangeMapNodeV1", when: "value == 0x1101" },
+        { type: "ViewLineageMapNodeV1", when: "value == 0x1201" },
       ],
     },
 
@@ -76,8 +76,9 @@
     ConflictSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ContentSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RetainedSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ViewLineageMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RepositoryStateId: { sequence: [{ name: "digest", type: "Digest256" }] },
-    BranchManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ViewLabelManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
 
     TreeV1: {
       sequence: [
@@ -380,6 +381,21 @@
       ],
     },
 
+    ViewLineageMapNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x1201 },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "RetainedSetId" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ViewLineageMapChildV1" } },
+      ],
+    },
+    ViewLineageMapChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ViewLineageMapId" },
+      ],
+    },
+
     ConflictSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0b01 },
@@ -425,27 +441,12 @@
       ],
     },
 
-    RepositoryStateV1: {
+    RepositoryStateV3: {
       sequence: [
-        { name: "wire_tag", type: "uint16", const: 0x0801 },
+        { name: "wire_tag", type: "uint16", const: 0x0803 },
         { name: "base_view", type: "ViewId" },
-        { name: "working_view", type: "ViewId" },
-        { name: "published_view", type: "ViewId" },
-        { name: "required_content", type: "ContentManifestId" },
-        { name: "retained_changes", type: "RetainedSetId" },
-        { name: "retained_views", type: "RetainedSetId" },
-        { name: "retained_revisions", type: "RetainedSetId" },
-        { name: "retained_applications", type: "RetainedSetId" },
-      ],
-    },
-
-    RepositoryStateV2: {
-      sequence: [
-        { name: "wire_tag", type: "uint16", const: 0x0802 },
-        { name: "base_view", type: "ViewId" },
-        { name: "working_view", type: "ViewId" },
-        { name: "published_view", type: "ViewId" },
         { name: "changes", type: "ChangeMapId" },
+        { name: "view_lineage", type: "ViewLineageMapId" },
         { name: "required_content", type: "ContentManifestId" },
         { name: "retained_changes", type: "RetainedSetId" },
         { name: "retained_views", type: "RetainedSetId" },
@@ -454,23 +455,26 @@
       ],
     },
 
-    BranchManifestV1: {
+    ViewLabelManifestV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0e01 },
-        { name: "branches", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "BranchManifestEntryV1" } },
+        { name: "labels", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ViewLabelManifestEntryV1" } },
       ],
     },
-    BranchManifestEntryV1: {
+    ViewLabelManifestEntryV1: {
       sequence: [
         { name: "name", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
         { name: "view", type: "ViewId" },
+        // Zero or one full source ref (for example `refs/heads/main`). Native
+        // labels remain short (`main`); this field only records import provenance.
+        { name: "original_git_refs", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" } },
       ],
     },
     RepositoryEnvelopeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0f01 },
         { name: "state", type: "RepositoryStateId" },
-        { name: "branches", type: "BranchManifestId" },
+        { name: "labels", type: "ViewLabelManifestId" },
       ],
     },
 

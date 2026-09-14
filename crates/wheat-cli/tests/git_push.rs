@@ -60,6 +60,15 @@ fn field(output: &std::process::Output, name: &str) -> String {
         .to_owned()
 }
 
+fn effective_view(workspace: &Path) -> String {
+    let output = wheat(workspace, &["--format=json", "status"]);
+    assert!(output.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let view: wheat_core::ViewId =
+        serde_json::from_value(document["result"]["effective_view"].clone()).unwrap();
+    view.to_string()
+}
+
 #[test]
 fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
     let root = tempfile::tempdir().unwrap();
@@ -104,9 +113,17 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
     );
     let revision = field(&created, "revision");
 
+    let selected = effective_view(&wheat_repository);
     let pushed = wheat(
         &wheat_repository,
-        &["push", remote.to_str().unwrap(), "--to", "refs/heads/main"],
+        &[
+            "push",
+            remote.to_str().unwrap(),
+            "--to",
+            "refs/heads/main",
+            "--source",
+            &selected,
+        ],
     );
     assert!(
         pushed.status.success(),
@@ -140,7 +157,14 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
     assert!(String::from_utf8_lossy(&log.stdout).contains(&revision));
     let repeated = wheat(
         &wheat_repository,
-        &["push", remote.to_str().unwrap(), "--to", "refs/heads/main"],
+        &[
+            "push",
+            remote.to_str().unwrap(),
+            "--to",
+            "refs/heads/main",
+            "--source",
+            &selected,
+        ],
     );
     assert!(
         repeated.status.success(),
@@ -183,9 +207,17 @@ fn unknown_remote_tip_is_rejected_without_force_with_lease() {
         &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"],
     );
 
+    let selected = effective_view(&repository);
     let rejected = wheat(
         &repository,
-        &["push", remote.to_str().unwrap(), "--to", "refs/heads/main"],
+        &[
+            "push",
+            remote.to_str().unwrap(),
+            "--to",
+            "refs/heads/main",
+            "--source",
+            &selected,
+        ],
     );
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("unknown commit"));
@@ -201,6 +233,8 @@ fn unknown_remote_tip_is_rejected_without_force_with_lease() {
             remote.to_str().unwrap(),
             "--to",
             "refs/heads/main",
+            "--source",
+            &selected,
             "--force-with-lease",
         ],
     );

@@ -11,12 +11,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
     ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditTransition, FileKind,
-    FileValue, RevisionEdits, RevisionId, guarded::Limits,
+    FileValue, RevisionEdits, RevisionId, ViewId, guarded::Limits,
 };
 use wheat_store::{
-    ApplicationMapStore, BatchObjectStore, MerkleTreeStore, MutationTarget,
-    PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
-    RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
+    ApplicationMapStore, BatchObjectStore, MerkleTreeStore, PersistedConflictResolution,
+    PersistedRepositoryMutator, PublicationStore, RepositoryReader, RevisionMapStore,
+    finalize_mutation_publication, prepare_mutation_publication,
 };
 mod active_changes;
 mod authoring_metadata;
@@ -24,7 +24,9 @@ mod command_output;
 mod conflict_inspection;
 mod diff_render;
 mod discovery;
+mod frontier_service;
 mod inspection;
+mod label_service;
 mod local;
 mod log_inspection;
 mod materialization;
@@ -41,11 +43,8 @@ use command_output::{
     require_supported_platform,
 };
 use discovery::{allocate_store_root, canonical_store_path, discover_workspace};
-use local::{
-    content_store, initialize, open, projection_path, repository_summary, revision_with_edits,
-    runtime,
-};
-use workspace_metadata::{PendingSelection, StoreMetadata, WorkspaceMetadata, WorkspaceSelection};
+use local::{content_store, initialize, open, projection_path, revision_with_edits, runtime};
+use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
 
 #[derive(Debug, Parser)]
 #[command(name = "wheat", about = "Wheat source control prototype")]
@@ -67,8 +66,15 @@ struct Cli {
 enum Command {
     /// Initialize an empty native repository and workspace.
     Init(InitArgs),
-    /// Materialize the selected native view into the workspace.
-    Materialize(MaterializeArgs),
+    /// Materialize the active label and its selected descendant frontier.
+    Materialize,
+    /// Switch to a label and one exact descendant frontier.
+    Switch(FrontierSelectionArgs),
+    /// Refresh the active label binding and descendant-frontier selection.
+    Refresh(RefreshArgs),
+    /// Inspect descendant frontiers of a native label.
+    #[command(subcommand)]
+    Frontier(FrontierCommand),
     /// Restore tracked paths from the currently pinned materialized tree.
     Restore(RestoreArgs),
     /// Show repository and tracked workspace state.
@@ -79,6 +85,11 @@ enum Command {
     Log,
     /// List changes active relative to this workspace's authoring basis.
     Changes,
+    /// List native short labels in deterministic name order.
+    Labels,
+    /// Create, rename, or delete native short labels.
+    #[command(subcommand)]
+    Label(LabelCommand),
     /// Inspect durable conflicts and per-edit failure evidence.
     Conflicts,
     /// Compare workspace or retained immutable repository trees.
@@ -113,10 +124,28 @@ struct InitArgs {
 }
 
 #[derive(Debug, Args)]
-struct MaterializeArgs {
-    /// Wheat source: published, working, or branch:<name>.
-    #[arg(long, default_value = "published")]
-    source: String,
+struct FrontierSelectionArgs {
+    label: String,
+    /// Exact descendant frontier view. Required when more than one exists.
+    #[arg(long)]
+    frontier: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RefreshArgs {
+    /// Exact descendant frontier view. Required when more than one exists.
+    #[arg(long)]
+    frontier: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum FrontierCommand {
+    /// List bounded descendant frontier views.
+    List {
+        /// Label to inspect; defaults to the workspace's active label.
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -155,6 +184,35 @@ enum ChangeCommand {
     New(Box<NewArgs>),
     /// Select an existing active change for subsequent `wheat add` commands.
     Select { change: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum LabelCommand {
+    /// Bind a new short label to an immutable retained view.
+    Create {
+        name: String,
+        /// Exact retained view; defaults to the workspace's selected view.
+        #[arg(long)]
+        view: Option<String>,
+        /// Full repository head CAS guard: <generation>:<envelope>.
+        #[arg(long, value_parser = label_service::parse_expected_head)]
+        expected_head: Option<wheat_store::RepositoryHead>,
+    },
+    /// Rename a label without changing its view or import provenance.
+    Rename {
+        old: String,
+        new: String,
+        /// Full repository head CAS guard: <generation>:<envelope>.
+        #[arg(long, value_parser = label_service::parse_expected_head)]
+        expected_head: Option<wheat_store::RepositoryHead>,
+    },
+    /// Delete a label, unless it is selected by the current workspace.
+    Delete {
+        name: String,
+        /// Full repository head CAS guard: <generation>:<envelope>.
+        #[arg(long, value_parser = label_service::parse_expected_head)]
+        expected_head: Option<wheat_store::RepositoryHead>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -318,7 +376,7 @@ struct ImportArgs {
     source: String,
     /// Fresh workspace to create. Defaults to the current directory.
     workspace: Option<PathBuf>,
-    /// Full Git branch ref to select as Wheat's working and published view.
+    /// Full Git branch ref to import and select as a native label.
     #[arg(long, default_value = "refs/heads/main")]
     branch: String,
 }
@@ -330,8 +388,8 @@ struct PushArgs {
     /// Full destination branch ref, for example refs/heads/main.
     #[arg(long)]
     to: String,
-    /// Wheat source: published, working, or branch:<name>.
-    #[arg(long, default_value = "published")]
+    /// Wheat source: label:<name> or an exact retained view ID.
+    #[arg(long, default_value = "label:main")]
     source: String,
     /// Replace an unknown/diverged destination only if it still has the observed OID.
     #[arg(long)]
@@ -377,12 +435,19 @@ fn main() -> ExitCode {
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Init(_) => "init",
-        Command::Materialize(_) => "materialize",
+        Command::Materialize => "materialize",
+        Command::Switch(_) => "switch",
+        Command::Refresh(_) => "refresh",
+        Command::Frontier(FrontierCommand::List { .. }) => "frontier.list",
         Command::Restore(_) => "restore",
         Command::Status => "status",
         Command::Validate => "validate",
         Command::Log => "log",
         Command::Changes => "changes",
+        Command::Labels => "labels",
+        Command::Label(LabelCommand::Create { .. }) => "label.create",
+        Command::Label(LabelCommand::Rename { .. }) => "label.rename",
+        Command::Label(LabelCommand::Delete { .. }) => "label.delete",
         Command::Conflicts => "conflicts",
         Command::Diff(_) => "diff",
         Command::Config(ConfigCommand::Set { .. }) => "config.set",
@@ -408,17 +473,36 @@ fn execute(cli: Cli) -> Result<Success> {
                 .unwrap_or(&requested_workspace),
             cli.store.as_deref(),
         ),
-        Command::Materialize(arguments) => {
-            let (view, root) = materialize_workspace(
+        Command::Materialize => {
+            materialize_active_workspace(&requested_workspace, cli.store.as_deref(), "materialize")
+        }
+        Command::Switch(arguments) => switch_workspace(
+            &requested_workspace,
+            cli.store.as_deref(),
+            arguments.label,
+            parse_optional_view(arguments.frontier)?,
+            "switch",
+        ),
+        Command::Refresh(arguments) => {
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            switch_workspace(
                 &requested_workspace,
                 cli.store.as_deref(),
-                &arguments.source,
-            )?;
-            Success::new(
-                "materialize",
-                json!({ "view": view.to_string() }),
-                format!("materialized view {view} in {}\n", root.display()),
+                context.workspace.active_label,
+                parse_optional_view(arguments.frontier)?,
+                "refresh",
             )
+        }
+        Command::Frontier(FrontierCommand::List { label }) => {
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let label = label.unwrap_or(context.workspace.active_label);
+            let local = open(&context.store_root)?;
+            let document = runtime()?.block_on(frontier_service::list(&local, &label))?;
+            let mut human = String::new();
+            for frontier in &document.frontiers {
+                writeln!(human, "{frontier}")?;
+            }
+            Success::new("frontier.list", &document, human)
         }
         Command::Restore(arguments) => {
             let restored =
@@ -431,7 +515,6 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Status => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let summary = repository_summary(&context.store_root)?;
             let local = open(&context.store_root)?;
             let status = workspace_status::WorkspaceStatus::from(workspace_scan::scan(
                 &context.root,
@@ -440,11 +523,13 @@ fn execute(cli: Cli) -> Result<Success> {
                 0,
             )?);
             let mut output = String::new();
-            writeln!(output, "working view: {}", summary.working_view)?;
-            writeln!(output, "published view: {}", summary.published_view)?;
-            writeln!(output, "changes: {}", summary.changes)?;
-            writeln!(output, "conflicts: {}", summary.conflicts)?;
+            writeln!(output, "active label: {}", status.active_label)?;
+            writeln!(output, "basis view: {}", status.basis)?;
+            writeln!(output, "effective view: {}", status.effective_view)?;
             writeln!(output, "tracked changes: {}", status.changes.len())?;
+            if status.label_binding_drifted {
+                writeln!(output, "active label binding changed since refresh")?;
+            }
             if status.authority_advanced {
                 writeln!(output, "repository advanced since materialization")?;
             }
@@ -480,8 +565,12 @@ fn execute(cli: Cli) -> Result<Success> {
             )
         }
         Command::Log => {
-            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            log_inspection::inspect(&store_root, format)
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            log_inspection::inspect(
+                &context.store_root,
+                context.workspace.effective_view(),
+                format,
+            )
         }
         Command::Changes => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
@@ -489,24 +578,78 @@ fn execute(cli: Cli) -> Result<Success> {
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
             selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
-            let basis = context
-                .workspace
-                .authoring_basis
-                .context("workspace has no authoring basis; materialize it first")?;
+            let basis = context.workspace.basis;
             let head = local.heads.read()?;
             let document = runtime()?.block_on(active_changes::inspect(
                 &local,
                 head,
                 basis,
+                context.workspace.effective_view(),
                 context.workspace.selected_change,
             ))?;
             let human = active_changes::render_human(&document)?;
             Success::new("changes", &document, human)
         }
-        Command::Conflicts => {
+        Command::Labels => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            label_service::list(&open(&store_root)?)
+        }
+        Command::Label(arguments) => {
+            let explicit_store = cli.store.as_deref().map(canonical_store_path).transpose()?;
+            let context = if let Some(store) = &explicit_store {
+                discover_workspace(&requested_workspace)
+                    .ok()
+                    .filter(|context| &context.store_root == store)
+            } else {
+                Some(resolve_context(&requested_workspace, None)?)
+            };
+            let store_root = explicit_store
+                .or_else(|| context.as_ref().map(|context| context.store_root.clone()))
+                .expect("workspace resolution is required without --store");
             let local = open(&store_root)?;
-            let document = runtime()?.block_on(conflict_inspection::inspect(&local))?;
+            match arguments {
+                LabelCommand::Create {
+                    name,
+                    view,
+                    expected_head,
+                } => {
+                    let view = match view {
+                        Some(view) => ViewId::from_str(&view).context("invalid view ID")?,
+                        None => context
+                            .as_ref()
+                            .map(|context| context.workspace.effective_view())
+                            .ok_or_else(|| {
+                                CliFailure::invalid(
+                                    "label create without a workspace requires an explicit --view",
+                                )
+                            })?,
+                    };
+                    label_service::create(&local, name, view, expected_head)
+                }
+                LabelCommand::Rename {
+                    old,
+                    new,
+                    expected_head,
+                } => {
+                    reject_selected_label_mutation(context.as_ref(), &old, "rename")?;
+                    label_service::rename(&local, old, new, expected_head)
+                }
+                LabelCommand::Delete {
+                    name,
+                    expected_head,
+                } => {
+                    reject_selected_label_mutation(context.as_ref(), &name, "delete")?;
+                    label_service::delete(&local, name, expected_head)
+                }
+            }
+        }
+        Command::Conflicts => {
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&context.store_root)?;
+            let document = runtime()?.block_on(conflict_inspection::inspect(
+                &local,
+                context.workspace.effective_view(),
+            ))?;
             let mut human = Vec::new();
             conflict_inspection::human(&document, &mut human)?;
             Success::new("conflicts", &document, human)
@@ -612,14 +755,12 @@ fn execute(cli: Cli) -> Result<Success> {
             ))?;
             selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
             let expected = local.heads.read()?;
-            let basis = context
-                .workspace
-                .authoring_basis
-                .context("workspace has no authoring basis; materialize it first")?;
+            let basis = context.workspace.basis;
             let active = runtime.block_on(active_changes::inspect(
                 &local,
                 expected,
                 basis,
+                context.workspace.effective_view(),
                 context.workspace.selected_change,
             ))?;
             let change = arguments
@@ -658,6 +799,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 &objects,
                 &local.content,
                 expected,
+                context.workspace.effective_view(),
                 change,
                 predecessor,
                 &arguments.paths,
@@ -674,27 +816,45 @@ fn execute(cli: Cli) -> Result<Success> {
                 },
                 false,
             )?;
-            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
-                .with_target(MutationTarget::PublishWorking);
+            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
             let (prepared, outcome) = runtime.block_on(mutator.revise(
                 expected,
+                context.workspace.basis,
+                context.workspace.effective_view(),
                 change,
                 predecessor,
                 revision_metadata,
                 edits,
             ))?;
-            runtime.block_on(async {
-                let publication = prepare_mutation_publication(
-                    &objects,
-                    &local.content,
-                    &local.heads,
-                    expected,
-                    prepared,
-                )
-                .await?;
-                objects.flush().await?;
-                finalize_mutation_publication(&local.heads, publication)
-            })?;
+            let resulting_frontier = prepared.resulting_view();
+            let publication = runtime.block_on(prepare_mutation_publication(
+                &objects,
+                &local.content,
+                &local.heads,
+                expected,
+                prepared,
+            ))?;
+            context.workspace.pending_repository_operation = Some(PendingRepositoryOperation {
+                expected_head: publication.expected().into(),
+                proposed_head: publication.proposed().into(),
+                resulting_frontier,
+                selected_change: context.workspace.selected_change,
+            });
+            context
+                .workspace
+                .replace_prepared(&context.root)?
+                .publish()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            runtime.block_on(objects.flush())?;
+            finalize_mutation_publication(&local.heads, publication)?;
+            context.workspace.selected_frontier =
+                (resulting_frontier != context.workspace.basis).then_some(resulting_frontier);
+            context.workspace.pending_repository_operation = None;
+            context
+                .workspace
+                .replace_prepared(&context.root)?
+                .publish()
+                .map_err(|error| anyhow::anyhow!(error))?;
             let mut output = String::new();
             writeln!(
                 output,
@@ -777,15 +937,6 @@ fn execute(cli: Cli) -> Result<Success> {
                 RevisionEdits::default()
             };
             let change = ChangeId::new();
-            context.workspace.pending_selection = Some(PendingSelection {
-                change,
-                expected_head: expected.into(),
-            });
-            context
-                .workspace
-                .replace_prepared(&context.root)?
-                .publish()
-                .map_err(|error| anyhow::anyhow!(error))?;
             let proposal = ChangeProposal {
                 id: change,
                 metadata: change_metadata.expect("new change metadata requested"),
@@ -794,27 +945,40 @@ fn execute(cli: Cli) -> Result<Success> {
                 edits,
             };
             let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
-            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
-                .with_target(MutationTarget::PublishWorking);
+            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
+            let basis = context.workspace.basis;
+            let effective = context.workspace.effective_view();
             let (prepared, outcome) = if use_frontier {
-                runtime.block_on(mutator.create_on_frontier(expected, proposal))?
+                runtime
+                    .block_on(mutator.create_on_frontier(expected, basis, effective, proposal))?
             } else {
-                runtime.block_on(mutator.create(expected, proposal))?
+                runtime.block_on(mutator.create(expected, basis, effective, proposal))?
             };
-            runtime.block_on(async {
-                let publication = prepare_mutation_publication(
-                    &objects,
-                    &local.content,
-                    &local.heads,
-                    expected,
-                    prepared,
-                )
-                .await?;
-                objects.flush().await?;
-                finalize_mutation_publication(&local.heads, publication)
-            })?;
+            let resulting_frontier = prepared.resulting_view();
+            let publication = runtime.block_on(prepare_mutation_publication(
+                &objects,
+                &local.content,
+                &local.heads,
+                expected,
+                prepared,
+            ))?;
+            context.workspace.pending_repository_operation = Some(PendingRepositoryOperation {
+                expected_head: publication.expected().into(),
+                proposed_head: publication.proposed().into(),
+                resulting_frontier,
+                selected_change: Some(change),
+            });
+            context
+                .workspace
+                .replace_prepared(&context.root)?
+                .publish()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            runtime.block_on(objects.flush())?;
+            finalize_mutation_publication(&local.heads, publication)?;
+            context.workspace.selected_frontier =
+                (resulting_frontier != context.workspace.basis).then_some(resulting_frontier);
             context.workspace.selected_change = Some(change);
-            context.workspace.pending_selection = None;
+            context.workspace.pending_repository_operation = None;
             context
                 .workspace
                 .replace_prepared(&context.root)?
@@ -842,15 +1006,13 @@ fn execute(cli: Cli) -> Result<Success> {
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
             selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
-            let basis = context
-                .workspace
-                .authoring_basis
-                .context("workspace has no authoring basis; materialize it first")?;
+            let basis = context.workspace.basis;
             let head = local.heads.read()?;
             let active = runtime()?.block_on(active_changes::inspect(
                 &local,
                 head,
                 basis,
+                context.workspace.effective_view(),
                 context.workspace.selected_change,
             ))?;
             let selected = active
@@ -871,8 +1033,8 @@ fn execute(cli: Cli) -> Result<Success> {
             )
         }
         Command::Resolve(arguments) => {
-            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            resolve(&store_root, arguments)
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            resolve(&context.root, &context.store_root, arguments)
         }
         Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
         Command::Push(arguments) => {
@@ -914,20 +1076,28 @@ fn import(
     ))?;
     let store = StoreMetadata::create(&store_root)?;
     let canonical_store = canonical_store_path(&store_root)?;
+    let selected_label = arguments
+        .branch
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&arguments.branch)
+        .to_owned();
+    let repository = open(&store_root)?;
+    let resolved = runtime.block_on(frontier_service::resolve(
+        &repository,
+        &selected_label,
+        None,
+    ))?;
     let workspace = WorkspaceMetadata::new(
         canonical_store,
         store.store_id,
-        WorkspaceSelection::Branch {
-            name: arguments.branch.clone(),
-        },
+        selected_label.clone(),
+        resolved.basis,
     );
+    drop(repository);
     initialize_workspace_directory(workspace_root)?;
     workspace.initialize(workspace_root)?;
-    let (view, materialized_root) = materialize_workspace(
-        workspace_root,
-        Some(&store_root),
-        &format!("branch:{}", arguments.branch),
-    )?;
+    let (view, materialized_root) =
+        materialize_resolved(workspace_root, Some(&store_root), selected_label, resolved)?;
     let human = format!(
         "materialized view {view} in {}\nimported {} at generation {}\nenvelope {}\n",
         materialized_root.display(),
@@ -954,15 +1124,19 @@ fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Resul
     initialize(&store_root)?;
     let store = StoreMetadata::create(&store_root)?;
     let canonical_store = canonical_store_path(&store_root)?;
+    let repository = open(&store_root)?;
+    let resolved = runtime()?.block_on(frontier_service::resolve(&repository, "main", None))?;
+    drop(repository);
     initialize_workspace_directory(workspace_root)?;
     WorkspaceMetadata::new(
         canonical_store,
         store.store_id,
-        WorkspaceSelection::Published,
+        "main".into(),
+        resolved.basis,
     )
     .initialize(workspace_root)?;
     let (view, materialized_root) =
-        materialize_workspace(workspace_root, Some(&store_root), "published")?;
+        materialize_resolved(workspace_root, Some(&store_root), "main".into(), resolved)?;
     Success::new(
         "init",
         json!({ "view": view.to_string() }),
@@ -992,6 +1166,19 @@ fn initialize_workspace_directory(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn reject_selected_label_mutation(
+    context: Option<&discovery::ResolvedWorkspace>,
+    name: &str,
+    operation: &str,
+) -> Result<()> {
+    if context.is_some_and(|context| context.workspace.active_label == name) {
+        return Err(CliFailure::invalid(format!(
+            "cannot {operation} label {name}: it is selected by this workspace"
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_context(
     workspace: &Path,
     explicit_store: Option<&Path>,
@@ -1017,31 +1204,118 @@ fn resolve_store_root(workspace: &Path, explicit_store: Option<&Path>) -> Result
     Ok(discover_workspace(workspace)?.store_root)
 }
 
-fn materialize_workspace(
+fn materialize_active_workspace(
     workspace: &Path,
     explicit_store: Option<&Path>,
-    source: &str,
-) -> Result<(wheat_core::ViewId, PathBuf)> {
-    let mut context = resolve_context(workspace, explicit_store)?;
-    let requested_selection = parse_selection(source)?;
+    command: &'static str,
+) -> Result<Success> {
+    let context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
-    let head = repository.heads.read()?;
-    let runtime = runtime()?;
-    let (view, tree) = runtime.block_on(resolve_selected_view(
+    let resolved = runtime()?.block_on(frontier_service::resolve(
         &repository,
-        head,
-        &requested_selection,
+        &context.workspace.active_label,
+        context.workspace.selected_frontier,
     ))?;
-    runtime.block_on(materialization::materialize(
+    // Packed repositories hold an exclusive catalog lock for the lifetime of the
+    // handle. Release it before materialization reopens the same store.
+    drop(repository);
+    let (view, root) = materialize_resolved(
+        workspace,
+        explicit_store,
+        context.workspace.active_label,
+        resolved,
+    )?;
+    Success::new(
+        command,
+        json!({ "view": view.to_string() }),
+        format!("materialized view {view} in {}\n", root.display()),
+    )
+}
+
+fn switch_workspace(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    label: String,
+    requested_frontier: Option<ViewId>,
+    command: &'static str,
+) -> Result<Success> {
+    let mut context = resolve_context(workspace, explicit_store)?;
+    let repository = open(&context.store_root)?;
+    let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
+    context.workspace = WorkspaceMetadata::read(&context.root)?;
+    runtime()?.block_on(materialization::recover_locked(
         &context.root,
         &repository,
         &mut context.workspace,
-        head,
-        view,
-        tree,
-        requested_selection,
+    ))?;
+    ensure_workspace_clean_locked(&context.root, &repository, &context.workspace)?;
+    let resolved = runtime()?.block_on(frontier_service::resolve(
+        &repository,
+        &label,
+        requested_frontier,
+    ))?;
+    let view = resolved.effective_view();
+    runtime()?.block_on(materialization::materialize_locked(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+        resolved.head,
+        label.clone(),
+        resolved.basis,
+        resolved.selected_frontier,
+        resolved.tree,
+    ))?;
+    let root = context.root;
+    Success::new(
+        command,
+        json!({ "label": label, "view": view.to_string() }),
+        format!(
+            "{command} selected label {label} at view {view} in {}\n",
+            root.display()
+        ),
+    )
+}
+
+fn materialize_resolved(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    label: String,
+    resolved: frontier_service::ResolvedFrontier,
+) -> Result<(ViewId, PathBuf)> {
+    let mut context = resolve_context(workspace, explicit_store)?;
+    let repository = open(&context.store_root)?;
+    let view = resolved.effective_view();
+    runtime()?.block_on(materialization::materialize(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+        resolved.head,
+        label,
+        resolved.basis,
+        resolved.selected_frontier,
+        resolved.tree,
     ))?;
     Ok((view, context.root))
+}
+
+fn ensure_workspace_clean_locked(
+    root: &Path,
+    repository: &local::LocalRepository,
+    workspace: &WorkspaceMetadata,
+) -> Result<()> {
+    let scan = workspace_scan::scan_locked(root, repository, workspace, 0)?;
+    if !scan.changes.is_empty() {
+        return Err(CliFailure::invalid(
+            "uncaptured tracked workspace edits block switch or refresh",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_optional_view(value: Option<String>) -> Result<Option<ViewId>> {
+    value
+        .map(|value| ViewId::from_str(&value).context("invalid frontier view ID"))
+        .transpose()
 }
 
 fn restore_workspace(
@@ -1058,44 +1332,6 @@ fn restore_workspace(
         paths,
     ))?;
     Ok(restored)
-}
-
-fn parse_selection(source: &str) -> Result<WorkspaceSelection> {
-    match source {
-        "published" => Ok(WorkspaceSelection::Published),
-        "working" => Ok(WorkspaceSelection::Working),
-        value if value.starts_with("branch:") => Ok(WorkspaceSelection::Branch {
-            name: value
-                .strip_prefix("branch:")
-                .expect("matched prefix")
-                .into(),
-        }),
-        _ => Err(CliFailure::invalid(
-            "source must be published, working, or branch:<name>",
-        )),
-    }
-}
-
-async fn resolve_selected_view(
-    repository: &local::LocalRepository,
-    head: wheat_store::RepositoryHead,
-    selection: &WorkspaceSelection,
-) -> Result<(wheat_core::ViewId, wheat_core::TreeId)> {
-    let reader = RepositoryReader::new(&repository.objects, &repository.content);
-    let envelope = reader.validate_envelope(head.envelope).await?;
-    let state = reader.state(envelope.state).await?;
-    let view = match selection {
-        WorkspaceSelection::Published => state.published_view,
-        WorkspaceSelection::Working => state.working_view,
-        WorkspaceSelection::Branch { name } => {
-            let branches = reader.branch_manifest(envelope.branches).await?;
-            *branches
-                .branches
-                .get(name)
-                .with_context(|| format!("unknown Wheat branch {name}"))?
-        }
-    };
-    Ok((view, reader.view(view).await?.tree))
 }
 
 fn clone_remote_for_import(remote: &str) -> Result<tempfile::TempDir> {
@@ -1130,21 +1366,22 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         let envelope = reader.validate_envelope(expected.envelope).await?;
         let state = reader.state(envelope.state).await?;
         let selected = match arguments.source.as_str() {
-            "published" => state.published_view,
-            "working" => state.working_view,
-            source if source.starts_with("branch:") => {
-                let name = source.strip_prefix("branch:").expect("matched prefix");
-                let branches = reader.branch_manifest(envelope.branches).await?;
-                *branches
-                    .branches
+            source if source.starts_with("label:") => {
+                let name = source.strip_prefix("label:").expect("matched prefix");
+                if name.is_empty() {
+                    return Err(CliFailure::invalid("label selector requires a name"));
+                }
+                reader
+                    .view_label_manifest(envelope.labels)
+                    .await?
+                    .labels
                     .get(name)
-                    .with_context(|| format!("unknown Wheat branch {name}"))?
+                    .map(|label| label.view)
+                    .with_context(|| format!("unknown Wheat label {name}"))?
             }
-            _ => {
-                return Err(CliFailure::invalid(
-                    "source must be published, working, or branch:<name>",
-                ));
-            }
+            source => ViewId::from_str(source).map_err(|_| {
+                CliFailure::invalid("source must be label:<name> or an exact view ID")
+            })?,
         };
         Ok::<_, anyhow::Error>((state.base_view, selected))
     })?;
@@ -1197,18 +1434,26 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
     )
 }
 
-fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<Success> {
+fn resolve(
+    workspace_root: &std::path::Path,
+    store_root: &std::path::Path,
+    arguments: ResolveArgs,
+) -> Result<Success> {
     if arguments.path.len() > conflict_inspection::MAX_PATH_BYTES {
         return Err(CliFailure::limit(
             "resolution path exceeds conflict inspection limit",
         ));
     }
-    let local = open(root)?;
+    let mut metadata = WorkspaceMetadata::read(workspace_root)?;
+    let local = open(store_root)?;
     let runtime = runtime()?;
     let revision = if let Some(revision) = arguments.revision.as_deref() {
         RevisionId::from_str(revision).map_err(|_| CliFailure::invalid("invalid revision ID"))?
     } else {
-        let document = runtime.block_on(conflict_inspection::inspect(&local))?;
+        let document = runtime.block_on(conflict_inspection::inspect(
+            &local,
+            metadata.effective_view(),
+        ))?;
         let mut matches = std::collections::BTreeSet::new();
         for conflict in document.conflicts {
             if conflict
@@ -1237,9 +1482,7 @@ fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<Success> {
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
     let reader = RepositoryReader::new(&objects, &local.content);
     let (application_id, existing) = runtime.block_on(async {
-        let envelope = reader.envelope(expected.envelope).await?;
-        let state = reader.state(envelope.state).await?;
-        let working = reader.view(state.working_view).await?;
+        let working = reader.view(metadata.effective_view()).await?;
         let record = reader.revision(revision).await?;
         let current = RevisionMapStore::new(&objects)
             .get(working.revisions, record.change_id)
@@ -1294,21 +1537,40 @@ fn resolve(root: &std::path::Path, arguments: ResolveArgs) -> Result<Success> {
         application: application_id,
         resolved: std::collections::BTreeMap::from([(arguments.path, value)]),
     };
-    let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads)
-        .with_target(MutationTarget::PublishWorking);
-    let (prepared, outcome) = runtime.block_on(mutator.resolve_conflict(expected, resolution))?;
-    runtime.block_on(async {
-        let publication = prepare_mutation_publication(
-            &objects,
-            &local.content,
-            &local.heads,
-            expected,
-            prepared,
-        )
-        .await?;
-        objects.flush().await?;
-        finalize_mutation_publication(&local.heads, publication)
-    })?;
+    let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
+    let (prepared, outcome) = runtime.block_on(mutator.resolve_conflict(
+        expected,
+        metadata.basis,
+        metadata.effective_view(),
+        resolution,
+    ))?;
+    let resulting_frontier = prepared.resulting_view();
+    let publication = runtime.block_on(prepare_mutation_publication(
+        &objects,
+        &local.content,
+        &local.heads,
+        expected,
+        prepared,
+    ))?;
+    metadata.pending_repository_operation = Some(PendingRepositoryOperation {
+        expected_head: publication.expected().into(),
+        proposed_head: publication.proposed().into(),
+        resulting_frontier,
+        selected_change: metadata.selected_change,
+    });
+    metadata
+        .replace_prepared(workspace_root)?
+        .publish()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    runtime.block_on(objects.flush())?;
+    finalize_mutation_publication(&local.heads, publication)?;
+    metadata.selected_frontier =
+        (resulting_frontier != metadata.basis).then_some(resulting_frontier);
+    metadata.pending_repository_operation = None;
+    metadata
+        .replace_prepared(workspace_root)?
+        .publish()
+        .map_err(|error| anyhow::anyhow!(error))?;
     let mut output = String::new();
     writeln!(output, "revision {}", outcome.revision_id)?;
     print_reapplied(&mut output, &outcome.reapplied)?;

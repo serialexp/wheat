@@ -8,13 +8,13 @@ use content_accumulator::{ContentAccumulator, ContentAccumulatorError, RetainedT
 
 use thiserror::Error;
 use wheat_core::{
-    ApplicationRecord, BranchManifestRecord, Change, ChangeObjectId, ContentId,
-    ContentManifestRecord, EditOperation, EditRecord, ObjectId, RepositoryStateRecord,
+    ApplicationRecord, Change, ChangeObjectId, ContentId, ContentManifestRecord, EditOperation,
+    EditRecord, ObjectId, RepositoryStateRecord, ViewLabel, ViewLabelManifestRecord,
 };
 use wheat_store::{
     CollectionError, CommitWriterError, ContentSetStore, ContentStore, ImmutableObjectStore,
     ObjectKind, ObjectStoreError, PublicationStore, RepositoryHead, RepositoryPublicationError,
-    RepositoryPublisher, RepositoryReader, RetainedSetStore,
+    RepositoryPublisher, RepositoryReader, RetainedSetStore, ViewLineageMapStore,
 };
 
 use crate::{
@@ -36,6 +36,8 @@ pub enum FinalizeImportError {
     #[error(transparent)]
     Collection(#[from] CollectionError),
     #[error(transparent)]
+    ViewLineage(#[from] wheat_store::ViewLineageError),
+    #[error(transparent)]
     Writer(#[from] CommitWriterError),
     #[error(transparent)]
     Publication(#[from] RepositoryPublicationError),
@@ -49,8 +51,8 @@ pub enum FinalizeImportError {
     UnfinishedWorkingBranch(String),
     #[error("completed Git mapping for {oid} is invalid: {reason}")]
     InvalidMapping { oid: String, reason: String },
-    #[error("branch manifest is invalid: {0}")]
-    InvalidBranchManifest(String),
+    #[error("view label manifest is invalid: {0}")]
+    InvalidViewLabelManifest(String),
     #[error("Git import failed: {0}")]
     Git(String),
 }
@@ -192,7 +194,7 @@ where
             pending_commits: staged.pending_commits,
         });
     }
-    let selected = staged
+    staged
         .branches
         .get(working_branch)
         .ok_or_else(|| FinalizeImportError::UnknownWorkingBranch(working_branch.to_owned()))?
@@ -228,6 +230,7 @@ where
 
     observer(FinalizePhase::JournalAuthenticationAccumulation);
     let mut change_objects = Vec::new();
+    let mut view_edges = Vec::new();
     let mut after = None::<Vec<u8>>;
     loop {
         let page = journal.completed(after.as_deref(), PAGE)?;
@@ -277,6 +280,9 @@ where
                 .map_err(|e| bad(e.to_string()))?;
             if application.revision_id != native.revision_id {
                 return Err(bad("application does not select the mapped revision".into()));
+            }
+            if application.target_view != native.view_id {
+                view_edges.push((application.target_view, native.view_id));
             }
             let view = reader
                 .view(native.view_id)
@@ -356,11 +362,13 @@ where
             &aggregate_manifest.canonical_bytes(),
         )
         .await?;
+    let lineage = ViewLineageMapStore::new(objects);
+    let view_lineage = lineage.empty_root().await?;
+    let view_lineage = lineage.insert_edges(view_lineage, view_edges).await?;
     let state = RepositoryStateRecord {
         base_view: empty,
-        working_view: selected.view_id,
-        published_view: selected.view_id,
         changes,
+        view_lineage,
         required_content: aggregate_manifest.id(),
         retained_changes,
         retained_views,
@@ -371,21 +379,32 @@ where
         .put_if_absent(state.id().into(), &state.canonical_bytes())
         .await?;
 
-    let branches = BranchManifestRecord::new(staged.branches.into_iter().map(|(name, branch)| {
-        let view = branch
-            .native
-            .expect("complete import has every branch tip")
-            .view_id;
-        (name, view)
-    }))
-    .map_err(|e| FinalizeImportError::InvalidBranchManifest(e.to_string()))?;
+    let labels =
+        ViewLabelManifestRecord::new(staged.branches.into_iter().map(|(original_ref, branch)| {
+            let view = branch
+                .native
+                .expect("complete import has every branch tip")
+                .view_id;
+            let name = original_ref
+                .strip_prefix("refs/heads/")
+                .expect("staged branches are local branch refs")
+                .to_owned();
+            (
+                name,
+                ViewLabel {
+                    view,
+                    original_git_ref: Some(original_ref),
+                },
+            )
+        }))
+        .map_err(|e| FinalizeImportError::InvalidViewLabelManifest(e.to_string()))?;
     // Final validation/publication must read durable backing objects, not the
     // read-your-writes buffer used while constructing retained inventories.
     observer(FinalizePhase::BatchFlush);
     batch.flush().await?;
     let publisher = RepositoryPublisher::new(backing, content, publications);
     observer(FinalizePhase::PrepareEnvelopeValidation);
-    let envelope = publisher.prepare_envelope(state.id(), &branches).await?;
+    let envelope = publisher.prepare_envelope(state.id(), &labels).await?;
     observer(FinalizePhase::HeadInitialize);
     Ok(publisher.initialize_prepared_envelope(envelope).await?)
 }

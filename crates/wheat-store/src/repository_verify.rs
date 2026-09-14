@@ -460,6 +460,81 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
         Ok(replay)
     }
 
+    async fn verify_lineage_semantics(&self, state: &RepositoryStateRecord) -> Result<()> {
+        let retained = RetainedSetStore::new(self.reader.objects);
+        let lineage = crate::ViewLineageMapStore::new(self.reader.objects);
+        let mut retained_views = BTreeSet::new();
+        let mut views = retained.cursor(state.retained_views).await?;
+        while let Some(id) = views.next().await? {
+            retained_views.insert(ViewId::from_digest(*id.as_bytes()));
+        }
+
+        let mut children_by_parent = BTreeMap::<ViewId, Vec<ViewId>>::new();
+        let mut incoming = BTreeMap::<ViewId, usize>::new();
+        for parent in &retained_views {
+            let Some(children_root) = lineage
+                .get(state.view_lineage, *parent)
+                .await
+                .map_err(|_| invalid("invalid view lineage"))?
+            else {
+                continue;
+            };
+            let mut children = retained.cursor(children_root).await?;
+            while let Some(child) = children.next().await? {
+                let child = ViewId::from_digest(*child.as_bytes());
+                *incoming.entry(child).or_default() += 1;
+                children_by_parent.entry(*parent).or_default().push(child);
+            }
+        }
+        for view in &retained_views {
+            if *view != state.base_view && incoming.get(view).copied().unwrap_or_default() == 0 {
+                return Err(invalid("retained non-base view lacks incoming lineage"));
+            }
+        }
+
+        let applications = ApplicationMapStore::new(self.reader.objects);
+        let mut retained_applications = retained.cursor(state.retained_applications).await?;
+        while let Some(id) = retained_applications.next().await? {
+            let application_id = ApplicationId::from_digest(*id.as_bytes());
+            let application = self.reader.application(application_id).await?;
+            let revision = self.reader.revision(application.revision_id).await?;
+            let parent = self.reader.view(application.target_view).await?;
+            if applications
+                .get(parent.applications, revision.change_id)
+                .await?
+                == Some(application_id)
+            {
+                return Err(invalid("application target already selects application"));
+            }
+            let mut matches = 0usize;
+            for child in children_by_parent
+                .get(&application.target_view)
+                .into_iter()
+                .flatten()
+            {
+                let view = self.reader.view(*child).await?;
+                let result_tree = match application.result {
+                    ApplicationResultRecord::Clean { tree } => tree,
+                    ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
+                };
+                if view.tree == result_tree
+                    && applications
+                        .get(view.applications, revision.change_id)
+                        .await?
+                        == Some(application_id)
+                {
+                    matches += 1;
+                }
+            }
+            if matches != 1 {
+                return Err(invalid(
+                    "retained application does not have exactly one lineage edge",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn verify_conflict(&self, id: ConflictId, _state: &RepositoryStateRecord) -> Result<()> {
         let conflict = self.reader.conflict(id).await?;
         self.retained(RETAINED_VIEWS, conflict.base_view.into())?;
@@ -542,9 +617,16 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
             return Err(invalid("change map omits a retained logical change"));
         }
 
-        for id in [state.base_view, state.working_view, state.published_view] {
-            self.retained(RETAINED_VIEWS, id.into())?;
-        }
+        self.retained(RETAINED_VIEWS, state.base_view.into())?;
+        crate::ViewLineageMapStore::new(self.reader.objects)
+            .validate(
+                state.view_lineage,
+                state.retained_views,
+                crate::ViewLineageLimits::default(),
+            )
+            .await
+            .map_err(|_| invalid("invalid view lineage"))?;
+        self.verify_lineage_semantics(&state).await?;
         let mut cursor = retained.cursor(state.retained_views).await?;
         while let Some(id) = cursor.next().await? {
             self.verify_view(ViewId::from_digest(*id.as_bytes()), &state, aggregate)

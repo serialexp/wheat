@@ -54,7 +54,10 @@ pub(crate) struct ConflictEdit {
     pub reason: EditFailure,
 }
 
-pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocument> {
+pub(crate) async fn inspect(
+    repository: &LocalRepository,
+    effective_view: ViewId,
+) -> Result<ConflictDocument> {
     let head = repository.heads.read()?;
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
     // Every typed read authenticates the immutable object's bytes against the requested ID.
@@ -70,16 +73,16 @@ pub(crate) async fn inspect(repository: &LocalRepository) -> Result<ConflictDocu
     }
     let retained = RetainedSetStore::new(&repository.objects);
     if !retained
-        .contains(state.retained_views, ObjectId::from(state.working_view))
+        .contains(state.retained_views, ObjectId::from(effective_view))
         .await?
     {
         return Err(CliFailure::corrupt(
-            "working view is not retained by the current repository state",
+            "effective view is not retained by the current repository state",
         ));
     }
-    let working = reader.view(state.working_view).await?;
-    if working.id() != state.working_view {
-        return Err(CliFailure::corrupt("working view identity mismatch"));
+    let working = reader.view(effective_view).await?;
+    if working.id() != effective_view {
+        return Err(CliFailure::corrupt("effective view identity mismatch"));
     }
     let applications = ApplicationMapStore::new(&repository.objects);
     let mut application_cursor = applications.cursor(working.applications).await?;

@@ -3,7 +3,7 @@ use std::{fmt::Write as _, path::Path};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
-use wheat_core::{Change, ChangeMetadata, RevisionId, RevisionMetadata, RevisionRecord};
+use wheat_core::{Change, ChangeMetadata, RevisionId, RevisionMetadata, RevisionRecord, ViewId};
 use wheat_store::{PublicationStore, RepositoryReader, RevisionMapStore};
 
 use crate::{
@@ -65,7 +65,11 @@ impl std::fmt::Write for BoundedLogText {
     }
 }
 
-pub(crate) fn inspect(root: &Path, format: OutputFormat) -> Result<Success> {
+pub(crate) fn inspect(
+    root: &Path,
+    effective_view: ViewId,
+    format: OutputFormat,
+) -> Result<Success> {
     let repository = open(root)?;
     let runtime = runtime()?;
     runtime.block_on(async {
@@ -79,9 +83,9 @@ pub(crate) fn inspect(root: &Path, format: OutputFormat) -> Result<Success> {
         if state.id() != envelope.state {
             return Err(CliFailure::corrupt("repository state identity mismatch"));
         }
-        let working = reader.view(state.working_view).await?;
-        if working.id() != state.working_view {
-            return Err(CliFailure::corrupt("working view identity mismatch"));
+        let working = reader.view(effective_view).await?;
+        if working.id() != effective_view {
+            return Err(CliFailure::corrupt("effective view identity mismatch"));
         }
         let revisions = RevisionMapStore::new(&repository.objects);
         let changes = wheat_store::ChangeMapStore::new(&repository.objects);

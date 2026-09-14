@@ -33,10 +33,11 @@ pub enum ObjectKind {
     ConflictSetNode = 11,
     ContentSetNode = 12,
     RetainedSetNode = 13,
-    BranchManifest = 14,
+    ViewLabelManifest = 14,
     RepositoryEnvelope = 15,
     Edit = 16,
     ChangeMapNode = 17,
+    ViewLineageMapNode = 18,
 }
 
 impl ObjectKind {
@@ -55,10 +56,11 @@ impl ObjectKind {
             11 => Self::ConflictSetNode,
             12 => Self::ContentSetNode,
             13 => Self::RetainedSetNode,
-            14 => Self::BranchManifest,
+            14 => Self::ViewLabelManifest,
             15 => Self::RepositoryEnvelope,
             16 => Self::Edit,
             17 => Self::ChangeMapNode,
+            18 => Self::ViewLineageMapNode,
             _ => return None,
         })
     }
@@ -80,10 +82,11 @@ impl From<CanonicalObjectKind> for ObjectKind {
             CanonicalObjectKind::ConflictSetNode => Self::ConflictSetNode,
             CanonicalObjectKind::ContentSetNode => Self::ContentSetNode,
             CanonicalObjectKind::RetainedSetNode => Self::RetainedSetNode,
-            CanonicalObjectKind::BranchManifest => Self::BranchManifest,
+            CanonicalObjectKind::ViewLabelManifest => Self::ViewLabelManifest,
             CanonicalObjectKind::RepositoryEnvelope => Self::RepositoryEnvelope,
             CanonicalObjectKind::Edit => Self::Edit,
             CanonicalObjectKind::ChangeMapNode => Self::ChangeMapNode,
+            CanonicalObjectKind::ViewLineageMapNode => Self::ViewLineageMapNode,
         }
     }
 }

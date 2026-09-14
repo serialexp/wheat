@@ -68,7 +68,7 @@ fn compares_initial_and_successor_revisions_without_workspace_reads() {
     assert!(!root.join("file").exists());
 
     // Materialize before authoring a successor from the selected workspace path.
-    ok(&root, &["materialize", "--source", "working"]);
+    ok(&root, &["materialize"]);
     std::fs::write(root.join("file"), "two\n").unwrap();
     let successor = ok(
         &root,
@@ -103,7 +103,7 @@ fn immutable_diff_classifies_utf8_with_nul_as_binary_and_emits_complete_json() {
     );
     let change = field(&created, "change");
     let predecessor = field(&created, "revision");
-    ok(&root, &["materialize", "--source", "working"]);
+    ok(&root, &["materialize"]);
     std::fs::write(root.join("nul"), b"left\0right").unwrap();
     let updated = ok(
         &root,
@@ -143,14 +143,14 @@ fn compares_symbolic_and_exact_retained_views_and_rejects_unknown_ids() {
 
     let status: serde_json::Value =
         serde_json::from_slice(&ok(&root, &["status", "--format", "json"]).stdout).unwrap();
-    let published: wheat_core::ViewId =
-        serde_json::from_value(status["result"]["published_view"].clone()).unwrap();
-    let working: wheat_core::ViewId =
-        serde_json::from_value(status["result"]["working_view"].clone()).unwrap();
-    let published = published.to_string();
-    let working = working.to_string();
-    let symbolic = ok(&root, &["diff", "--from", "published", "--to", "working"]);
-    let exact = ok(&root, &["diff", "--from", &published, "--to", &working]);
+    let basis: wheat_core::ViewId =
+        serde_json::from_value(status["result"]["basis"].clone()).unwrap();
+    let effective: wheat_core::ViewId =
+        serde_json::from_value(status["result"]["effective_view"].clone()).unwrap();
+    let basis = basis.to_string();
+    let effective = effective.to_string();
+    let symbolic = ok(&root, &["diff", "--from", "label:main", "--to", &effective]);
+    let exact = ok(&root, &["diff", "--from", &basis, "--to", &effective]);
     assert_eq!(symbolic.stdout, exact.stdout);
 
     let unknown = wheat(
@@ -160,7 +160,7 @@ fn compares_symbolic_and_exact_retained_views_and_rejects_unknown_ids() {
             "--from",
             &wheat_core::ViewId::from_digest([0x55; 32]).to_string(),
             "--to",
-            "working",
+            &effective,
         ],
     );
     assert!(!unknown.status.success());

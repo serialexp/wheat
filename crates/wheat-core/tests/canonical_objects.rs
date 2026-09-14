@@ -184,6 +184,8 @@ fn identical_revisions_have_content_identity() {
 
     let first_revision = first
         .create_change_with_id(
+            first.base_view().id,
+            first.base_view().id,
             change,
             [],
             edit(&io, "file", "value"),
@@ -192,6 +194,8 @@ fn identical_revisions_have_content_identity() {
         .unwrap();
     let second_revision = second
         .create_change_with_id(
+            second.base_view().id,
+            second.base_view().id,
             change,
             [],
             edit(&io, "file", "value"),
@@ -219,6 +223,8 @@ fn canonical_revision_has_a_pinned_encoding_and_id() {
     let change = wheat_core::ChangeId::from_str("01890f2d-3c4b-7a68-9abc-def012345678").unwrap();
     let outcome = repository
         .create_change_with_id(
+            repository.base_view().id,
+            repository.base_view().id,
             change,
             [],
             edit(&io, "file", "value"),
@@ -242,7 +248,13 @@ fn decoded_repository_rejects_forged_identity_fields() {
     let io = TestContent::default();
     let mut repository = Repository::new(Tree::new());
     let _ = repository
-        .create_change([], edit(&io, "file", "value"), ApplicationContext::new(&io))
+        .create_change(
+            repository.base_view().id,
+            repository.base_view().id,
+            [],
+            edit(&io, "file", "value"),
+            ApplicationContext::new(&io),
+        )
         .unwrap();
     let mut value = serde_yaml::to_value(&repository).unwrap();
     let revisions = value
@@ -280,6 +292,8 @@ fn file_kind_changes_tree_and_revision_identity() {
     let mut second = first.clone();
     let regular_revision = first
         .create_change_with_id(
+            first.base_view().id,
+            first.base_view().id,
             change,
             [],
             exact_edit(&io, "file", "same", FileKind::Regular),
@@ -288,6 +302,8 @@ fn file_kind_changes_tree_and_revision_identity() {
         .unwrap();
     let executable_revision = second
         .create_change_with_id(
+            second.base_view().id,
+            second.base_view().id,
             change,
             [],
             exact_edit(&io, "file", "same", FileKind::Executable),
@@ -309,6 +325,8 @@ fn revision_identity_changes_with_encoded_intent() {
 
     let left = first
         .create_change_with_id(
+            first.base_view().id,
+            first.base_view().id,
             change,
             [],
             edit(&io, "file", "left"),
@@ -317,6 +335,8 @@ fn revision_identity_changes_with_encoded_intent() {
         .unwrap();
     let right = second
         .create_change_with_id(
+            second.base_view().id,
+            second.base_view().id,
             change,
             [],
             edit(&io, "file", "right"),

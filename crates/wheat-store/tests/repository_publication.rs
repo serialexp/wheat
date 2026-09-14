@@ -46,8 +46,11 @@ async fn publishes_complete_canonical_closure_before_head() {
     let (objects, content, heads) = stores(directory.path());
     content.put(b"value").unwrap();
     let mut repository = Repository::new(Tree::new());
+    let basis = repository.base_view().id;
     repository
         .create_change_with_id(
+            basis,
+            basis,
             ChangeId::from_str("01890f2d-3c4b-7a68-9abc-def012345678").unwrap(),
             [],
             edit("file", b"value"),
@@ -96,8 +99,11 @@ async fn missing_required_content_prevents_head_creation_but_leaves_retryable_ob
     let authoring_content = ContentStore::new(directory.path().join("authoring-content"));
     authoring_content.put(b"missing").unwrap();
     let mut repository = Repository::new(Tree::new());
+    let basis = repository.base_view().id;
     repository
         .create_change(
+            basis,
+            basis,
             [],
             edit("file", b"missing"),
             ApplicationContext::new(&authoring_content),
@@ -138,18 +144,25 @@ async fn stale_publication_keeps_the_winning_head_and_retains_prepared_objects()
     content.put(b"winner").unwrap();
     content.put(b"loser").unwrap();
     let mut base = Repository::new(Tree::new());
-    base.create_change(
-        [],
-        edit("first", b"first"),
-        ApplicationContext::new(&content),
-    )
-    .unwrap();
+    let basis = base.base_view().id;
+    let (_, base_outcome) = base
+        .create_change(
+            basis,
+            basis,
+            [],
+            edit("first", b"first"),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    let effective = base_outcome.resulting_view;
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let initial = publisher.initialize(&base).await.unwrap();
 
     let mut winner = base.clone();
     winner
         .create_change(
+            basis,
+            effective,
             [],
             edit("winner", b"winner"),
             ApplicationContext::new(&content),
@@ -160,6 +173,8 @@ async fn stale_publication_keeps_the_winning_head_and_retains_prepared_objects()
     let mut loser = base;
     loser
         .create_change(
+            basis,
+            effective,
             [],
             edit("loser", b"loser"),
             ApplicationContext::new(&content),
@@ -182,8 +197,11 @@ async fn repeated_preparation_and_initialization_are_idempotent_across_reopen() 
     let (objects, content, heads) = stores(directory.path());
     content.put(b"value").unwrap();
     let mut repository = Repository::new(Tree::new());
+    let basis = repository.base_view().id;
     repository
         .create_change(
+            basis,
+            basis,
             [],
             edit("file", b"value"),
             ApplicationContext::new(&content),
@@ -209,8 +227,11 @@ async fn corrupt_required_content_prevents_publication() {
     let authoring_content = ContentStore::new(directory.path().join("authoring-content"));
     authoring_content.put(b"value").unwrap();
     let mut repository = Repository::new(Tree::new());
+    let basis = repository.base_view().id;
     repository
         .create_change(
+            basis,
+            basis,
             [],
             edit("file", b"value"),
             ApplicationContext::new(&authoring_content),

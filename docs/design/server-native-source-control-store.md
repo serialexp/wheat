@@ -1,8 +1,8 @@
 # Wheat — Server-Native Source Control
 
-Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, Phase 1 local CLI workflow, Git import paths, and local active-pack growth/sealing are implemented and qualified in the Wheat prototype; model/store qualification, concurrency, retention/recovery, forge review policy, remote protocol work, and product commitment remain open
+Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, Phase 1 local CLI workflow, Git import paths, and local active-pack growth/sealing are implemented and qualified; the Phase 2 immutable-label and workspace-frontier model is settled but not implemented, and model/store qualification, concurrency, retention/recovery, forge review policy, remote protocol work, and product commitment remain open
 Owner: bart
-Last updated: 2026-09-11
+Last updated: 2026-09-14
 
 ## Implementation status
 
@@ -52,13 +52,17 @@ described here.
   predicate evaluates whether a view has zero unresolved conflicts.
 - [x] **Phase 1 — complete the reference CLI and local workflow.** The Linux-only
   reference CLI has explicit selected-path capture, persisted composition and mutation,
-  working-view publication, durable ID-free conflict inspection/resolution, complete
+  retained-view publication, durable ID-free conflict inspection/resolution, complete
   metadata and validation, loose/packed reopen, and bounded versioned automation output.
   A unified black-box acceptance test qualifies Git URL import, exact workspace kinds,
   read-only status/diff, descendant reapplication, conflict materialization/resolution,
   clean Git projection plus strict validation, pinned reopen, and retryable stale refusal.
-  Workspace-wide capture, explicit multi-target publication, and remote mode belong to
-  later phases rather than this single-target Phase 1 contract.
+  Workspace-wide capture, immutable-label/frontier switching, and remote mode belong to
+  later phases rather than this Phase 1 contract.
+- [x] **Phase 2 model decision — immutable labels and workspace frontiers.** Bart
+  settled short repository-local labels bound to immutable views, imported Git-ref
+  provenance, per-workspace basis and selected frontier, and the zero/one/many
+  selection rule. Label advancement and frontier consolidation remain deferred.
 
 ### Outstanding
 
@@ -75,8 +79,9 @@ described here.
 - [x] **Persisted daily mutation path.** Local loose and atomic packed repositories support
   root-backed `change new`, `add`, and conflict resolution without hydrating retained history.
   Composition preserves the longest unchanged authenticated prefix, loads edit bodies only for
-  the affected suffix, batches metadata before head CAS, and preserves branch manifests. A fresh
-  1,607-change Gothab import qualified frontier creation in 12.91 seconds, revision in 3.75
+  the affected suffix, batches metadata before head CAS, and preserves imported-ref
+  manifests. A fresh 1,607-change Gothab import qualified frontier creation in 12.91
+  seconds, revision in 3.75
   seconds, reopen/status in 3.19 seconds, and explicit complete validation in 757.35 seconds;
   the retained-history audit remains deliberately distinct from interactive mutation latency.
 - [~] **Guarded edits — interdiff and review continuity.** Revision transitions expose
@@ -133,11 +138,15 @@ described here.
   publication, crash recovery, content manifests, shared-content retention,
   snapshot/restore, and deletion as native store invariants rather than adding
   them after the format is fixed.
-- [ ] **Defer until publication targets exist — native target invariants.** Make
-  rules such as “`main` never points to a view with unresolved conflicts” part
-  of the repository's fenced target-advance operation, while allowing other
-  targets to publish conflicted views; the forge presents and administers these
-  policies but is not their sole enforcement boundary.
+- [ ] **Phase 2 — immutable labels and workspace frontiers.** Implement short
+  repository-local labels bound to immutable views, retain original Git ref
+  provenance on imported labels, and store workspace basis plus selected frontier.
+  Zero descendant frontiers selects the basis, one existing frontier auto-selects,
+  and multiple require an explicit choice; never synthesize their union.
+- [ ] **Defer — label advancement and frontier consolidation.** Define explicit
+  operations and policy for moving a label or consolidating several retained
+  descendant frontiers. Repository state has no global workspace working/published
+  view and routine mutation must not introduce one implicitly.
 - [ ] **Phase 2 — immutable-object and publication-store interfaces.** Keep
   content-addressed reads/writes independent from the tiny mutable repository
   head. Portable async traits, local loose-object/locked-head implementations,
@@ -151,7 +160,7 @@ described here.
   conflict/content/retained sets, root-backed persisted views/manifests/state,
   shared identity/closure builders, and verified root-only publication/readback
   are implemented. A resumable disk-journaled Git importer now stages canonical
-  commits without executable hydration and publishes retained named branches.
+  commits without executable hydration and retains imported refs with their provenance.
   Interactive executable models remain hydrated, while CLI reads and daily mutations operate
   directly over persisted roots with copy-on-write prefix reuse. Change-ID indexing, compressed
   radix qualification and wide-directory sharding remain.
@@ -669,17 +678,33 @@ identities and automatically derive applications of `B` and `C` on the changed
 parent results. A conflict is a durable successful application outcome, not a
 half-completed rebase or an error state that prevents unrelated work.
 
-Publication targets should ultimately be native, policy-constrained repository
-objects rather than untyped forge-owned branch labels. For example, `main` may
-carry a repository invariant that it can point only to a complete view with zero
-unresolved conflicts, while feature and agent targets remain free to publish
-conflicted views for browsing, review, assignment, and collaborative resolution.
-Every mutation path—including the native CLI/API, merge queue, recovery, and Git
-compatibility adapter—must pass through the same fenced target-advance operation.
-The active policy on the current target governs an update; a proposed view cannot
-weaken its own protection merely by changing a versioned policy file. This is a
-later publication-model requirement, not part of the current content-retention
-slice.
+The original target candidate made branch-like names mutable, policy-constrained
+repository objects and routed every mutation through a fenced target advance. It
+was intended to prevent forge-only policy bypass, but it also recreated branch
+movement and encouraged a repository-global working/published view.
+
+**Phase 2 follow-up (settled 2026-09-14):** replace that candidate with short
+repository-local **labels bound to immutable views**. Labels identify useful views
+without becoming change identity or mutable branch heads. A label created by Git
+import retains the complete original Git ref as provenance even when its native
+label is shortened; the ref remains import evidence, not native authority. A new
+label defaults to the caller workspace's selected/effective view unless an exact
+view is supplied.
+
+Activating a label establishes that immutable view as the workspace basis.
+Retained descendant views form its frontiers: zero selects the basis, exactly one
+existing frontier auto-selects, and multiple require an explicit selection. No
+operation may synthesize or combine all frontiers implicitly. Captured changes are
+retained repository graph state and therefore reappear when switching back to a
+basis/frontier that reaches them. Uncaptured filesystem edits are outside that
+graph and block switching rather than being overwritten or transported.
+
+The repository has no global workspace working view or published view. Each
+workspace stores its own basis and selected frontier; its effective view is the
+selected frontier when present and otherwise the basis. Label advancement and
+explicit frontier consolidation, including any policy such as requiring a
+conflict-free `main`, are deferred follow-ups rather than hidden effects of
+capture, publication, or switching.
 
 A revision preserves both its selected immutable edits and its materialized result:
 
@@ -862,7 +887,7 @@ provenance, consolidates guard/write interference to a fixed point, and records
 only component-proven subsumption. Unaffected definitions retain their IDs.
 
 Keep stable changes, immutable revisions, exact authored views/results,
-deterministic applications, and immutable published views. Dependency movement
+deterministic applications, and immutable retained views. Dependency movement
 continues to create new applications of unchanged revisions rather than new
 descendant revisions merely to encode a rebase. A revision should preserve its
 constituent immutable edits, while an application exposes successful evidence and
@@ -1106,9 +1131,10 @@ objects require. The object router owns **where** durable and cached copies live
 Bucket, backend, and gitd-host placement must not enter native repository
 identity.
 
-Every published view must commit to an immutable, incrementally transitionable
-content manifest. Required content includes at least visible tree closure,
-retained revisions, unresolved conflict terms, snapshots/archives under policy,
+Every retained view reachable from repository state must commit to an immutable,
+incrementally transitionable content manifest. Required content includes at least
+visible tree closure, retained revisions, unresolved conflict terms,
+snapshots/archives under policy,
 and compatibility projections while leased. Publication ordering must guarantee
 that a crash may over-retain bytes but cannot expose a view whose required
 content is reclaimable:
@@ -1183,23 +1209,29 @@ concurrency or a backend-specific batch strategy before large closures.
 A memory-backed publication store must declare its durability. Periodic
 checkpoints alone are process-local or asynchronously durable: a crash can lose
 an acknowledged advance. A durable configuration appends and flushes a small
-fenced target-advance record before acknowledgement, updates memory, and later
-compacts the journal into an immutable checkpoint. Recovery loads the newest
+fenced repository-head-advance record before acknowledgement, updates memory, and
+later compacts the journal into an immutable checkpoint. Recovery loads the newest
 checkpoint and replays later records. Multiple writers additionally require an
 ownership epoch or another fencing mechanism; routing to one repository owner is
 an optimization, not correctness by itself.
 
-Repository publication can reduce multi-target state to one mutable CAS value:
+Repository publication reduces repository graph state to one mutable CAS value.
+The earlier sketch included target and policy maps; after the Phase 2 label decision,
+the head instead reaches immutable label bindings and retained graph roots, never a
+global workspace working/published view:
 
 ```text
 RepositoryHead { generation, repository_state_id }
     -> immutable RepositoryState
-         -> target-map root
-         -> policy-map root
+         -> label-map root          // short name -> immutable view + provenance
+         -> retained graph roots
          -> previous state/publication
+
+WorkspaceState { basis_view, selected_frontier? }
 ```
 
-All immutable objects are written and verified before `RepositoryHead` advances.
+Workspace state is per workspace rather than part of the repository head. All
+immutable objects are written and verified before `RepositoryHead` advances.
 The first local `PublicationStore` uses an advisory file lock, an exact
 `RepositoryHead { generation, repository_state_id }` comparison, a fixed
 versioned head encoding, and temp-write/fsync/rename/directory-fsync publication.

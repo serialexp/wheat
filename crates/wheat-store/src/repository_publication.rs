@@ -90,10 +90,10 @@ where
         &self,
         root: wheat_core::RepositoryStateId,
     ) -> Result<RepositoryHead, RepositoryPublicationError> {
-        let branches = wheat_core::BranchManifestRecord {
-            branches: Default::default(),
+        let labels = wheat_core::ViewLabelManifestRecord {
+            labels: Default::default(),
         };
-        let envelope = self.prepare_envelope(root, &branches).await?;
+        let envelope = self.prepare_envelope(root, &labels).await?;
         self.initialize_prepared_envelope(envelope).await
     }
 
@@ -104,8 +104,8 @@ where
     ) -> Result<RepositoryHead, RepositoryPublicationError> {
         let reader = crate::RepositoryReader::new(self.objects, self.content);
         let old = reader.envelope(expected.envelope).await?;
-        let branches = reader.branch_manifest(old.branches).await?;
-        let envelope = self.prepare_envelope(root, &branches).await?;
+        let labels = reader.view_label_manifest(old.labels).await?;
+        let envelope = self.prepare_envelope(root, &labels).await?;
         self.publish_envelope(expected, envelope).await
     }
 

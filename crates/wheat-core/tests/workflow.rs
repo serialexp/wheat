@@ -69,9 +69,9 @@ fn proposal(
         edits: exact(io, path, before, after),
     }
 }
-fn current_edits(repository: &Repository, change: ChangeId) -> BTreeSet<EditId> {
+fn current_edits(repository: &Repository, effective: ViewId, change: ChangeId) -> BTreeSet<EditId> {
     repository
-        .revision(repository.current_revision(change).unwrap())
+        .revision(repository.current_revision(effective, change).unwrap())
         .unwrap()
         .edits()
         .keys()
@@ -84,8 +84,11 @@ fn bulk_import_materializes_each_commit_view_and_the_combined_working_view() {
     let io = Memory::default();
     let (root, left, right) = (ChangeId::new(), ChangeId::new(), ChangeId::new());
     let mut repository = Repository::new(Tree::new());
+    let effective = repository.base_view().id;
     let outcomes = repository
         .import_changes(
+            repository.base_view().id,
+            effective,
             [
                 proposal(&io, root, [], "root", None, Some("root")),
                 proposal(&io, left, [root], "left", None, Some("left")),
@@ -116,7 +119,9 @@ fn bulk_import_materializes_each_commit_view_and_the_combined_working_view() {
             .tree
             .contains_key("right")
     );
-    assert_eq!(repository.working_view().tree.len(), 3);
+    assert_eq!(repository.base_view().id, effective);
+    assert_eq!(repository.base_view().tree.len(), 0);
+    assert!(repository.view(outcomes[&right].resulting_view).is_some());
     repository.validate().unwrap();
 }
 
@@ -124,10 +129,13 @@ fn bulk_import_materializes_each_commit_view_and_the_combined_working_view() {
 fn failed_bulk_import_rolls_back_the_whole_batch() {
     let io = Memory::default();
     let mut repository = Repository::new(Tree::new());
+    let effective = repository.base_view().id;
     let before = repository.canonical_closure();
     let (valid, missing) = (ChangeId::new(), ChangeId::new());
     let error = repository
         .import_changes(
+            repository.base_view().id,
+            effective,
             [
                 proposal(&io, valid, [], "valid", None, Some("valid")),
                 proposal(
@@ -144,7 +152,7 @@ fn failed_bulk_import_rolls_back_the_whole_batch() {
         .unwrap_err();
     assert_eq!(error, RepositoryError::UnknownDependency(missing));
     assert_eq!(repository.canonical_closure(), before);
-    assert_eq!(repository.current_revision(valid), None);
+    assert_eq!(repository.current_revision(effective, valid), None);
 }
 
 #[test]
@@ -152,37 +160,68 @@ fn revising_a_reapplies_b_and_c_without_replacing_change_identity() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "a", None, Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "a", None, Some("a1")),
+            ctx,
+        )
         .unwrap();
+    effective = a1.resulting_view;
     let (b, b1) = repository
-        .create_change([a], exact(&io, "b", None, Some("b1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "b", None, Some("b1")),
+            ctx,
+        )
         .unwrap();
+    effective = b1.resulting_view;
     let (c, c1) = repository
-        .create_change([b], exact(&io, "c", None, Some("c1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [b],
+            exact(&io, "c", None, Some("c1")),
+            ctx,
+        )
         .unwrap();
-    let old = current_edits(&repository, a);
+    effective = c1.resulting_view;
+    let old = current_edits(&repository, effective, a);
     let outcome = repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, &old, "a", None, Some("a2")),
             ctx,
         )
         .unwrap();
+    effective = outcome.resulting_view;
     assert_eq!(outcome.reapplied, vec![b, c]);
-    assert_eq!(repository.current_revision(b), Some(b1.revision_id));
-    assert_eq!(repository.current_revision(c), Some(c1.revision_id));
     assert_eq!(
-        repository.working_view().tree.get("a"),
+        repository.current_revision(effective, b),
+        Some(b1.revision_id)
+    );
+    assert_eq!(
+        repository.current_revision(effective, c),
+        Some(c1.revision_id)
+    );
+    assert_eq!(
+        repository.view(effective).unwrap().tree.get("a"),
         Some(&value(&io, "a2"))
     );
     assert_eq!(
-        repository.working_view().tree.get("b"),
+        repository.view(effective).unwrap().tree.get("b"),
         Some(&value(&io, "b1"))
     );
     assert_eq!(
-        repository.working_view().tree.get("c"),
+        repository.view(effective).unwrap().tree.get("c"),
         Some(&value(&io, "c1"))
     );
 }
@@ -192,25 +231,49 @@ fn revising_an_ancestor_can_absorb_a_descendant_edit_as_a_clean_noop() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "file", None, Some("middle")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "file", None, Some("middle")),
+            ctx,
+        )
         .unwrap();
+    effective = a1.resulting_view;
     let (b, b1) = repository
-        .create_change([a], exact(&io, "file", Some("middle"), Some("final")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "file", Some("middle"), Some("final")),
+            ctx,
+        )
         .unwrap();
-    let old = current_edits(&repository, a);
+    effective = b1.resulting_view;
+    let old = current_edits(&repository, effective, a);
     let outcome = repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, &old, "file", None, Some("final")),
             ctx,
         )
         .unwrap();
+    effective = outcome.resulting_view;
     assert_eq!(outcome.reapplied, vec![b]);
-    assert_eq!(repository.current_revision(b), Some(b1.revision_id));
-    assert!(repository.conflicts().next().is_none());
-    assert_eq!(repository.working_view().tree["file"], value(&io, "final"));
+    assert_eq!(
+        repository.current_revision(effective, b),
+        Some(b1.revision_id)
+    );
+    assert!(repository.conflicts(effective).unwrap().next().is_none());
+    assert_eq!(
+        repository.view(effective).unwrap().tree["file"],
+        value(&io, "final")
+    );
     let application = repository
         .applications_for_revision(b1.revision_id)
         .last()
@@ -232,24 +295,49 @@ fn conflict_is_durable_and_resolution_continues_descendant_application() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::from_iter([("shared".into(), value(&io, "base"))]));
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "shared", Some("base"), Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "shared", Some("base"), Some("a1")),
+            ctx,
+        )
         .unwrap();
+    effective = a1.resulting_view;
     let (b, b1) = repository
-        .create_change([a], exact(&io, "shared", Some("a1"), Some("b1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "shared", Some("a1"), Some("b1")),
+            ctx,
+        )
         .unwrap();
-    let (c, _) = repository
-        .create_change([b], exact(&io, "c", None, Some("c1")), ctx)
+    effective = b1.resulting_view;
+    let (c, c_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [b],
+            exact(&io, "c", None, Some("c1")),
+            ctx,
+        )
         .unwrap();
-    let old = current_edits(&repository, a);
+    effective = c_outcome.resulting_view;
+    let old = current_edits(&repository, effective, a);
     let revised = repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, &old, "shared", Some("base"), Some("a2")),
             ctx,
         )
         .unwrap();
+    effective = revised.resulting_view;
     assert_eq!(revised.reapplied, vec![b, c]);
     let application = repository
         .applications_for_revision(b1.revision_id)
@@ -270,6 +358,8 @@ fn conflict_is_durable_and_resolution_continues_descendant_application() {
     resolved.insert("shared".into(), value(&io, "resolved"));
     let outcome = repository
         .resolve_conflict(
+            repository.base_view().id,
+            effective,
             ConflictResolution {
                 conflict_revision: b1.revision_id,
                 resolved_tree: resolved,
@@ -277,17 +367,24 @@ fn conflict_is_durable_and_resolution_continues_descendant_application() {
             ctx,
         )
         .unwrap();
+    effective = outcome.resulting_view;
     assert_eq!(outcome.reapplied, vec![c]);
     assert_eq!(
-        repository.working_view().tree.get("shared"),
+        repository.view(effective).unwrap().tree.get("shared"),
         Some(&value(&io, "resolved"))
     );
     assert_eq!(
-        repository.working_view().tree.get("c"),
+        repository.view(effective).unwrap().tree.get("c"),
         Some(&value(&io, "c1"))
     );
-    assert_eq!(repository.conflicts().count(), 0);
-    assert!(repository.working_view().unresolved_conflicts.is_empty());
+    assert_eq!(repository.conflicts(effective).unwrap().count(), 0);
+    assert!(
+        repository
+            .view(effective)
+            .unwrap()
+            .unresolved_conflicts
+            .is_empty()
+    );
 }
 
 #[test]
@@ -295,22 +392,40 @@ fn conflicted_view_is_self_describing_and_queryable() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::from_iter([("shared".into(), value(&io, "base"))]));
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "shared", Some("base"), Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "shared", Some("base"), Some("a1")),
+            ctx,
+        )
         .unwrap();
+    effective = a1.resulting_view;
     let (b, b1) = repository
-        .create_change([a], exact(&io, "shared", Some("a1"), Some("b1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "shared", Some("a1"), Some("b1")),
+            ctx,
+        )
         .unwrap();
-    let old = current_edits(&repository, a);
-    repository
+    effective = b1.resulting_view;
+    let old = current_edits(&repository, effective, a);
+    let outcome = repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, &old, "shared", Some("base"), Some("a2")),
             ctx,
         )
         .unwrap();
-    let view = repository.working_view();
+    effective = outcome.resulting_view;
+    let view = repository.view(effective).unwrap();
     assert_eq!(view.unresolved_conflicts.len(), 1);
     assert_eq!(view.applications.len(), 2);
     assert!(view.required_content.contains(&value(&io, "a2").content));
@@ -332,7 +447,10 @@ fn conflicted_view_is_self_describing_and_queryable() {
             unresolved_conflicts: 1
         }
     );
-    assert_eq!(repository.current_revision(b), Some(b1.revision_id));
+    assert_eq!(
+        repository.current_revision(effective, b),
+        Some(b1.revision_id)
+    );
 }
 
 #[test]
@@ -341,8 +459,15 @@ fn view_identity_covers_the_application_and_conflict_manifest() {
     let ctx = ApplicationContext::new(&io);
     let tree = BTreeMap::from([("file".into(), value(&io, "visible"))]);
     let mut source = Repository::new(Tree::new());
+    let base = source.base_view().id;
     let (change, outcome) = source
-        .create_change([], exact(&io, "file", None, Some("visible")), ctx)
+        .create_change(
+            base,
+            base,
+            [],
+            exact(&io, "file", None, Some("visible")),
+            ctx,
+        )
         .unwrap();
     let revision = outcome.revision_id;
     let frontier = BTreeMap::from([(change, revision)]);
@@ -389,10 +514,17 @@ fn one_revision_can_be_applied_to_unrelated_target_views() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let effective = repository.base_view().id;
     let (_, created) = repository
-        .create_change([], exact(&io, "new", None, Some("value")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "new", None, Some("value")),
+            ctx,
+        )
         .unwrap();
-    let first_target = repository.published_view().clone();
+    let first_target = repository.base_view().clone();
     let unrelated = RepositoryView::new(
         Tree::from_iter([("unrelated".into(), value(&io, "other"))]),
         BTreeMap::new(),
@@ -413,18 +545,33 @@ fn independent_roots_remain_composed_in_the_working_view() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
-    repository
-        .create_change([], exact(&io, "a", None, Some("a")), ctx)
+    let mut effective = repository.base_view().id;
+    let (_, outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "a", None, Some("a")),
+            ctx,
+        )
         .unwrap();
-    repository
-        .create_change([], exact(&io, "b", None, Some("b")), ctx)
+    effective = outcome.resulting_view;
+    let (_, outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "b", None, Some("b")),
+            ctx,
+        )
         .unwrap();
+    effective = outcome.resulting_view;
     assert_eq!(
-        repository.working_view().tree.get("a"),
+        repository.view(effective).unwrap().tree.get("a"),
         Some(&value(&io, "a"))
     );
     assert_eq!(
-        repository.working_view().tree.get("b"),
+        repository.view(effective).unwrap().tree.get("b"),
         Some(&value(&io, "b"))
     );
 }
@@ -434,54 +581,61 @@ fn sibling_branches_are_applied_to_their_declared_parent_not_each_other() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "base", None, Some("a1")), ctx)
-        .unwrap();
-    let (b, _) = repository
-        .create_change([a], exact(&io, "shared", None, Some("b")), ctx)
-        .unwrap();
-    let (c, _) = repository
-        .create_change([a], exact(&io, "shared", None, Some("c")), ctx)
-        .unwrap();
-    let old = current_edits(&repository, a);
-    repository
-        .revise_change(
-            a,
-            a1.revision_id,
-            replacement(&io, &old, "base", None, Some("a2")),
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "base", None, Some("a1")),
             ctx,
         )
         .unwrap();
-    assert!(matches!(
-        repository.current_application(b).unwrap().result,
-        ApplicationResult::Clean { .. }
-    ));
-    assert!(matches!(
-        repository.current_application(c).unwrap().result,
-        ApplicationResult::Clean { .. }
-    ));
-    let working = repository.working_view().id;
+    effective = a1.resulting_view;
+    let (b, b_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "shared", None, Some("b")),
+            ctx,
+        )
+        .unwrap();
+    let (c, c_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            a1.resulting_view,
+            [a],
+            exact(&io, "shared", None, Some("c")),
+            ctx,
+        )
+        .unwrap();
+
+    let b_view = repository.view(b_outcome.resulting_view).unwrap();
+    let c_view = repository.view(c_outcome.resulting_view).unwrap();
+    assert_eq!(b_view.tree.get("shared"), Some(&value(&io, "b")));
+    assert_eq!(c_view.tree.get("shared"), Some(&value(&io, "c")));
     assert_eq!(
-        repository.view(working).unwrap().unresolved_conflicts.len(),
-        1
+        repository.current_revision(b_outcome.resulting_view, c),
+        None
     );
-    assert_eq!(repository.conflicts_in_view(working).unwrap().count(), 1);
     assert_eq!(
+        repository.current_revision(c_outcome.resulting_view, b),
+        None
+    );
+    assert!(
         repository
-            .conflicts_for_path(working, "shared")
+            .conflicts(b_outcome.resulting_view)
             .unwrap()
-            .count(),
-        1
+            .next()
+            .is_none()
     );
-    assert_eq!(
-        [b, c]
-            .into_iter()
-            .map(|change| repository
-                .conflicts_for_change(working, change)
-                .unwrap()
-                .count())
-            .sum::<usize>(),
-        1
+    assert!(
+        repository
+            .conflicts(c_outcome.resulting_view)
+            .unwrap()
+            .next()
+            .is_none()
     );
 }
 
@@ -490,25 +644,47 @@ fn join_change_composes_both_dependency_closures() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
-    let (a, _) = repository
-        .create_change([], exact(&io, "a", None, Some("a")), ctx)
+    let mut effective = repository.base_view().id;
+    let (a, a_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "a", None, Some("a")),
+            ctx,
+        )
         .unwrap();
-    let (b, _) = repository
-        .create_change([], exact(&io, "b", None, Some("b")), ctx)
+    effective = a_outcome.resulting_view;
+    let (b, b_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "b", None, Some("b")),
+            ctx,
+        )
         .unwrap();
-    repository
-        .create_change([a, b], exact(&io, "join", None, Some("joined")), ctx)
+    effective = b_outcome.resulting_view;
+    let (_, outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a, b],
+            exact(&io, "join", None, Some("joined")),
+            ctx,
+        )
         .unwrap();
+    effective = outcome.resulting_view;
     assert_eq!(
-        repository.working_view().tree.get("a"),
+        repository.view(effective).unwrap().tree.get("a"),
         Some(&value(&io, "a"))
     );
     assert_eq!(
-        repository.working_view().tree.get("b"),
+        repository.view(effective).unwrap().tree.get("b"),
         Some(&value(&io, "b"))
     );
     assert_eq!(
-        repository.working_view().tree.get("join"),
+        repository.view(effective).unwrap().tree.get("join"),
         Some(&value(&io, "joined"))
     );
 }
@@ -518,21 +694,52 @@ fn descendant_reapplication_order_is_topological_not_breadth_first() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "a", None, Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "a", None, Some("a1")),
+            ctx,
+        )
         .unwrap();
-    let (b, _) = repository
-        .create_change([a], exact(&io, "b", None, Some("b")), ctx)
+    effective = a1.resulting_view;
+    let (b, b_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "b", None, Some("b")),
+            ctx,
+        )
         .unwrap();
-    let (c, _) = repository
-        .create_change([b], exact(&io, "c", None, Some("c")), ctx)
+    effective = b_outcome.resulting_view;
+    let (c, c_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [b],
+            exact(&io, "c", None, Some("c")),
+            ctx,
+        )
         .unwrap();
-    let (d, _) = repository
-        .create_change([a, c], exact(&io, "d", None, Some("d")), ctx)
+    effective = c_outcome.resulting_view;
+    let (d, d_outcome) = repository
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a, c],
+            exact(&io, "d", None, Some("d")),
+            ctx,
+        )
         .unwrap();
-    let old = current_edits(&repository, a);
+    effective = d_outcome.resulting_view;
+    let old = current_edits(&repository, effective, a);
     let outcome = repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, &old, "a", None, Some("a2")),
@@ -547,23 +754,39 @@ fn failed_creation_does_not_leave_a_descendant_that_panics_on_reapplication() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::new());
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "a", None, Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "a", None, Some("a1")),
+            ctx,
+        )
         .unwrap();
+    effective = a1.resulting_view;
     assert_eq!(
-        repository.create_change([a], exact(&io, "missing", Some("nope"), Some("value")), ctx),
+        repository.create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "missing", Some("nope"), Some("value")),
+            ctx
+        ),
         Err(RepositoryError::InvalidEdits)
     );
-    let old = current_edits(&repository, a);
+    let old = current_edits(&repository, effective, a);
     repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, &old, "a", None, Some("a2")),
             ctx,
         )
         .unwrap();
-    assert_eq!(repository.current_revisions().count(), 1);
+    assert_eq!(repository.current_revisions(effective).unwrap().count(), 1);
 }
 
 #[test]
@@ -571,29 +794,49 @@ fn resolving_a_stale_conflicted_revision_is_rejected() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(Tree::from_iter([("shared".into(), value(&io, "base"))]));
+    let mut effective = repository.base_view().id;
     let (a, a1) = repository
-        .create_change([], exact(&io, "shared", Some("base"), Some("a1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [],
+            exact(&io, "shared", Some("base"), Some("a1")),
+            ctx,
+        )
         .unwrap();
+    effective = a1.resulting_view;
     let (b, b1) = repository
-        .create_change([a], exact(&io, "shared", Some("a1"), Some("b1")), ctx)
+        .create_change(
+            repository.base_view().id,
+            effective,
+            [a],
+            exact(&io, "shared", Some("a1"), Some("b1")),
+            ctx,
+        )
         .unwrap();
-    let old = current_edits(&repository, a);
-    repository
+    effective = b1.resulting_view;
+    let old = current_edits(&repository, effective, a);
+    let revised = repository
         .revise_change(
+            repository.base_view().id,
+            effective,
             a,
             a1.revision_id,
             replacement(&io, &old, "shared", Some("base"), Some("a2")),
             ctx,
         )
         .unwrap();
+    effective = revised.resulting_view;
     let target = repository
-        .conflicted_application(b1.revision_id)
+        .conflicted_application(effective, b1.revision_id)
         .unwrap()
         .target_view;
     let mut resolved = repository.view(target).unwrap().tree.clone();
     resolved.insert("shared".into(), value(&io, "resolved"));
     let b2 = repository
         .resolve_conflict(
+            repository.base_view().id,
+            effective,
             ConflictResolution {
                 conflict_revision: b1.revision_id,
                 resolved_tree: resolved.clone(),
@@ -601,8 +844,11 @@ fn resolving_a_stale_conflicted_revision_is_rejected() {
             ctx,
         )
         .unwrap();
+    effective = b2.resulting_view;
     assert_eq!(
         repository.resolve_conflict(
+            repository.base_view().id,
+            effective,
             ConflictResolution {
                 conflict_revision: b1.revision_id,
                 resolved_tree: resolved
@@ -611,27 +857,52 @@ fn resolving_a_stale_conflicted_revision_is_rejected() {
         ),
         Err(RepositoryError::StaleRevision(b))
     );
-    assert_eq!(repository.current_revision(b), Some(b2.revision_id));
+    assert_eq!(
+        repository.current_revision(effective, b),
+        Some(b2.revision_id)
+    );
 }
 
 #[test]
-fn publication_is_compare_and_swap() {
+fn mutations_return_retained_views_without_changing_the_base_selection() {
     let io = Memory::default();
     let ctx = ApplicationContext::new(&io);
     let mut repository = Repository::new(BTreeMap::new());
-    let original = repository.published_view().id;
-    repository
-        .create_change([], exact(&io, "a", None, Some("a")), ctx)
+    let base = repository.base_view().id;
+    let (_, first) = repository
+        .create_change(base, base, [], exact(&io, "a", None, Some("a")), ctx)
         .unwrap();
-    let published = repository.publish(original).unwrap();
-    repository
-        .create_change([], exact(&io, "b", None, Some("b")), ctx)
+    let (_, sibling) = repository
+        .create_change(base, base, [], exact(&io, "b", None, Some("b")), ctx)
         .unwrap();
-    assert_eq!(
-        repository.publish(original),
-        Err(RepositoryError::StalePublication {
-            expected: original,
-            actual: published
-        })
+
+    assert_eq!(repository.base_view().id, base);
+    assert!(
+        repository
+            .view(first.resulting_view)
+            .unwrap()
+            .tree
+            .contains_key("a")
+    );
+    assert!(
+        !repository
+            .view(first.resulting_view)
+            .unwrap()
+            .tree
+            .contains_key("b")
+    );
+    assert!(
+        repository
+            .view(sibling.resulting_view)
+            .unwrap()
+            .tree
+            .contains_key("b")
+    );
+    assert!(
+        !repository
+            .view(sibling.resulting_view)
+            .unwrap()
+            .tree
+            .contains_key("a")
     );
 }

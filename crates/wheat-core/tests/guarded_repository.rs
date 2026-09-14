@@ -98,9 +98,17 @@ fn guarded_edit_moves_with_unique_context() {
     };
     io.objects.borrow_mut().insert(mv.content, moved.to_vec());
     let mut repo = Repository::new(Tree::from_iter([("f".into(), mv)]));
-    repo.create_change([], edits, ApplicationContext::new(&io))
+    let effective = repo.base_view().id;
+    let (_, outcome) = repo
+        .create_change(
+            repo.base_view().id,
+            effective,
+            [],
+            edits,
+            ApplicationContext::new(&io),
+        )
         .unwrap();
-    let value = repo.working_view().tree["f"];
+    let value = repo.view(outcome.resulting_view).unwrap().tree["f"];
     assert_eq!(
         io.resolve(value.content).unwrap(),
         b"prefix\na\nb\nc\nd\ne\nhead\nnew\ntail\nf\ng\nh\ni\nj\n"
@@ -116,11 +124,18 @@ fn failed_generated_sink_rolls_back_metadata() {
         kind: FileKind::Regular,
     };
     let mut repo = Repository::new(Tree::from_iter([("f".into(), base)]));
+    let effective = repo.base_view().id;
     let prior = repo.canonical_closure();
     io.fail_store.set(true);
     assert!(
-        repo.create_change([], edits, ApplicationContext::new(&io))
-            .is_err()
+        repo.create_change(
+            repo.base_view().id,
+            effective,
+            [],
+            edits,
+            ApplicationContext::new(&io)
+        )
+        .is_err()
     );
     assert_eq!(repo.canonical_closure(), prior);
 }
@@ -131,6 +146,7 @@ fn invalid_initial_transitions_are_rejected_before_content_io() {
     for case in cases {
         let io = Io::default();
         let mut repo = Repository::new(Tree::new());
+        let effective = repo.base_view().id;
         let prior = repo.canonical_closure();
         let mut edits = exact(&io, "f", None, Some(b"new"));
         let id = *edits.edits.keys().next().unwrap();
@@ -165,7 +181,13 @@ fn invalid_initial_transitions_are_rejected_before_content_io() {
             "initial revision has predecessor lineage"
         };
         assert_eq!(
-            repo.create_change([], edits, ApplicationContext::new(&io)),
+            repo.create_change(
+                repo.base_view().id,
+                effective,
+                [],
+                edits,
+                ApplicationContext::new(&io)
+            ),
             Err(RepositoryError::InvalidEditTransition(reason))
         );
         assert_eq!(io.calls(), (0, 0), "{case}");
@@ -177,12 +199,19 @@ fn invalid_initial_transitions_are_rejected_before_content_io() {
 fn malformed_edit_key_and_local_transition_are_preflighted() {
     let io = Io::default();
     let mut repo = Repository::new(Tree::new());
+    let effective = repo.base_view().id;
     let prior = repo.canonical_closure();
     let mut malformed = exact(&io, "f", None, Some(b"new"));
     let (_, edit) = malformed.edits.pop_first().unwrap();
     malformed.edits.insert(EditId::from_digest([4; 32]), edit);
     assert_eq!(
-        repo.create_change([], malformed, ApplicationContext::new(&io)),
+        repo.create_change(
+            repo.base_view().id,
+            effective,
+            [],
+            malformed,
+            ApplicationContext::new(&io)
+        ),
         Err(RepositoryError::InvalidEditTransition(
             "invalid local edit selection"
         ))
@@ -192,7 +221,13 @@ fn malformed_edit_key_and_local_transition_are_preflighted() {
     local.transition.added.clear();
     local.transition.preserved.insert(id);
     assert_eq!(
-        repo.create_change([], local, ApplicationContext::new(&io)),
+        repo.create_change(
+            repo.base_view().id,
+            effective,
+            [],
+            local,
+            ApplicationContext::new(&io)
+        ),
         Err(RepositoryError::InvalidEditTransition(
             "initial revision has predecessor lineage"
         ))
@@ -205,13 +240,17 @@ fn malformed_edit_key_and_local_transition_are_preflighted() {
 fn revision_transition_preflight_rejects_false_partition_and_preserved_key() {
     let io = Io::default();
     let mut repo = Repository::new(Tree::new());
+    let effective = repo.base_view().id;
     let (change, outcome) = repo
         .create_change(
+            repo.base_view().id,
+            effective,
             [],
             exact(&io, "f", None, Some(b"old")),
             ApplicationContext::new(&io),
         )
         .unwrap();
+    let effective = outcome.resulting_view;
     let prior = repo.canonical_closure();
     let old = *repo
         .revision(outcome.revision_id)
@@ -226,6 +265,8 @@ fn revision_transition_preflight_rejects_false_partition_and_preserved_key() {
     partition.transition.preserved.insert(replacement);
     assert_eq!(
         repo.revise_change(
+            repo.base_view().id,
+            effective,
             change,
             outcome.revision_id,
             partition,
@@ -242,6 +283,8 @@ fn revision_transition_preflight_rejects_false_partition_and_preserved_key() {
     preserved.transition.removed.insert(old);
     assert_eq!(
         repo.revise_change(
+            repo.base_view().id,
+            effective,
             change,
             outcome.revision_id,
             preserved,
@@ -260,6 +303,8 @@ fn revision_transition_preflight_rejects_false_partition_and_preserved_key() {
     changed_key.transition.preserved.insert(old);
     assert_eq!(
         repo.revise_change(
+            repo.base_view().id,
+            effective,
             change,
             outcome.revision_id,
             changed_key,
@@ -276,8 +321,11 @@ fn revision_transition_preflight_rejects_false_partition_and_preserved_key() {
 fn invalid_resolution_evidence_is_rejected_before_content_io() {
     let io = Io::default();
     let mut repo = Repository::new(Tree::new());
+    let effective = repo.base_view().id;
     let (change, outcome) = repo
         .create_change(
+            repo.base_view().id,
+            effective,
             [],
             exact(&io, "f", None, Some(b"old")),
             ApplicationContext::new(&io),
@@ -290,15 +338,24 @@ fn invalid_resolution_evidence_is_rejected_before_content_io() {
         .keys()
         .next()
         .unwrap();
-    let clean_application = repo.current_application(change).unwrap().id;
-    let (other_change, _) = repo
+    let clean_application = repo
+        .current_application(outcome.resulting_view, change)
+        .unwrap()
+        .id;
+    let (other_change, other_outcome) = repo
         .create_change(
+            repo.base_view().id,
+            outcome.resulting_view,
             [],
             exact(&io, "g", None, Some(b"other")),
             ApplicationContext::new(&io),
         )
         .unwrap();
-    let wrong_change_application = repo.current_application(other_change).unwrap().id;
+    let effective = other_outcome.resulting_view;
+    let wrong_change_application = repo
+        .current_application(effective, other_change)
+        .unwrap()
+        .id;
     let prior = repo.canonical_closure();
 
     for (application, reason) in [
@@ -308,7 +365,7 @@ fn invalid_resolution_evidence_is_rejected_before_content_io() {
         ),
         (
             wrong_change_application,
-            "resolution application is not current for the change",
+            "resolution application does not match the predecessor",
         ),
         (
             clean_application,
@@ -329,6 +386,8 @@ fn invalid_resolution_evidence_is_rejected_before_content_io() {
         let calls = io.calls();
         assert_eq!(
             repo.revise_change(
+                repo.base_view().id,
+                effective,
                 change,
                 outcome.revision_id,
                 edits,
@@ -345,6 +404,7 @@ fn invalid_resolution_evidence_is_rejected_before_content_io() {
 fn invalid_import_batch_does_no_content_io_or_mutate_repository() {
     let io = Io::default();
     let mut repo = Repository::new(Tree::new());
+    let effective = repo.base_view().id;
     let prior = repo.canonical_closure();
     let valid = ChangeProposal {
         id: ChangeId::new(),
@@ -365,7 +425,12 @@ fn invalid_import_batch_does_no_content_io_or_mutate_repository() {
         edits: invalid_edits,
     };
     assert_eq!(
-        repo.import_changes([valid, invalid], ApplicationContext::new(&io)),
+        repo.import_changes(
+            repo.base_view().id,
+            effective,
+            [valid, invalid],
+            ApplicationContext::new(&io)
+        ),
         Err(RepositoryError::InvalidEditTransition(
             "initial revision has predecessor lineage"
         ))

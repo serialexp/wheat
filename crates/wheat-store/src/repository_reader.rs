@@ -41,11 +41,11 @@ impl<'a, O: ImmutableObjectStore> RepositoryReader<'a, O> {
     );
     read_record!(view, ViewId, ViewRecord, View, decode_view_record);
     read_record!(
-        branch_manifest,
-        BranchManifestId,
-        BranchManifestRecord,
-        BranchManifest,
-        decode_branch_manifest_record
+        view_label_manifest,
+        ViewLabelManifestId,
+        ViewLabelManifestRecord,
+        ViewLabelManifest,
+        decode_view_label_manifest_record
     );
     read_record!(
         envelope,

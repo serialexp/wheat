@@ -1,12 +1,11 @@
 //! Canonical local repository authority; YAML snapshots are never read or written.
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::path::Path;
-use wheat_core::{ObjectId, Repository, RevisionId, RevisionRecord, Tree, ViewId};
+use wheat_core::{ObjectId, Repository, RevisionId, RevisionRecord, Tree};
 use wheat_store::{
-    ConflictSetStore, ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
-    ObjectStoreError, PackedObjectStore, PublicationStore, RepositoryPublisher, RepositoryReader,
-    RevisionMapStore, StoredObject,
+    ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, ObjectStoreError,
+    PackedObjectStore, RepositoryPublisher, RepositoryReader, StoredObject,
 };
 
 pub(crate) enum LocalObjects {
@@ -54,13 +53,6 @@ pub(crate) struct LocalRepository {
     pub objects: LocalObjects,
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
-}
-
-pub struct RepositorySummary {
-    pub working_view: ViewId,
-    pub published_view: ViewId,
-    pub changes: usize,
-    pub conflicts: usize,
 }
 
 pub fn content_store(root: &Path) -> Result<ContentStore> {
@@ -136,65 +128,19 @@ pub fn initialize(root: &Path) -> Result<()> {
     let heads = LocalPublicationStore::new(root.join("repository.head"));
     let objects = LooseObjectStore::new(root.join("objects"));
     let content = ContentStore::new(root.join("content"));
-    runtime()?.block_on(
-        RepositoryPublisher::new(&objects, &content, &heads)
-            .initialize(&Repository::new(Tree::new())),
-    )?;
-    Ok(())
-}
-
-pub fn repository_summary(root: &Path) -> Result<RepositorySummary> {
-    match repository_layout(root)? {
-        RepositoryLayout::Loose => {
-            let objects = LooseObjectStore::new(root.join("objects"));
-            let content = ContentStore::new(root.join("content"));
-            let heads = LocalPublicationStore::new(root.join("repository.head"));
-            summarize(root, &objects, &content, &heads)
-        }
-        RepositoryLayout::Packed => {
-            let objects = PackedObjectStore::open(root.join("storage"))?;
-            let content = objects.content_store();
-            let heads = LocalPublicationStore::new(root.join("repository.head"));
-            summarize(root, &objects, &content, &heads)
-        }
-    }
-}
-
-fn summarize<O: ImmutableObjectStore>(
-    root: &Path,
-    objects: &O,
-    content: &ContentStore,
-    heads: &LocalPublicationStore,
-) -> Result<RepositorySummary> {
-    let expected = heads
-        .read()
-        .with_context(|| format!("cannot open Wheat repository: {}", root.display()))?;
-    let runtime = runtime()?;
-    let reader = RepositoryReader::new(objects, content);
-    let envelope = runtime.block_on(reader.envelope(expected.envelope))?;
-    let state = runtime.block_on(reader.state(envelope.state))?;
-    let working = runtime.block_on(reader.view(state.working_view))?;
-    let revision_store = RevisionMapStore::new(objects);
-    let conflict_store = ConflictSetStore::new(objects);
-    let (changes, conflicts) = runtime.block_on(async {
-        let mut change_count = 0;
-        let mut revisions = revision_store.cursor(working.revisions).await?;
-        while revisions.next().await?.is_some() {
-            change_count += 1;
-        }
-        let mut conflict_count = 0;
-        let mut conflicts = conflict_store.cursor(working.unresolved_conflicts).await?;
-        while conflicts.next().await?.is_some() {
-            conflict_count += 1;
-        }
-        Ok::<_, wheat_store::RepositoryPublicationError>((change_count, conflict_count))
+    runtime()?.block_on(async {
+        let publisher = RepositoryPublisher::new(&objects, &content, &heads);
+        let repository = Repository::new(Tree::new());
+        let base = repository.base_view().id;
+        let closure = publisher.prepare(&repository).await?;
+        let labels = wheat_core::ViewLabelManifestRecord::new([("main", base)])
+            .map_err(wheat_store::ObjectStoreError::from)?;
+        let envelope = publisher
+            .prepare_envelope(closure.state.id, &labels)
+            .await?;
+        publisher.initialize_prepared_envelope(envelope).await
     })?;
-    Ok(RepositorySummary {
-        working_view: state.working_view,
-        published_view: state.published_view,
-        changes,
-        conflicts,
-    })
+    Ok(())
 }
 
 pub fn revision_with_edits(

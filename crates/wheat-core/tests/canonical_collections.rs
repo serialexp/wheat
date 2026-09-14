@@ -36,6 +36,56 @@ fn application_nodes_roundtrip_and_enforce_terminal_rules() {
     assert!(ApplicationMapNode::new(vec![], None, vec![edge, edge]).is_err());
 }
 
+#[test]
+fn view_lineage_nodes_roundtrip_and_enforce_terminal_rules() {
+    let value = RetainedSetId::from_digest([7; 32]);
+    let terminal = ViewLineageMapNode::new(vec![7; 32], Some(value), vec![]).unwrap();
+    let bytes = terminal.canonical_bytes();
+    assert_eq!(decode_view_lineage_map_node(&bytes).unwrap(), terminal);
+    assert_eq!(&bytes[..2], &[18, 1]);
+    assert!(ViewLineageMapNode::new(vec![0; 33], None, vec![]).is_err());
+    assert!(ViewLineageMapNode::new(vec![], None, vec![]).is_ok());
+    let edge = ViewLineageMapChild {
+        edge: 3,
+        child: terminal.id(),
+    };
+    assert!(ViewLineageMapNode::new(vec![0; 32], None, vec![edge]).is_err());
+    assert!(ViewLineageMapNode::new(vec![], None, vec![edge, edge]).is_err());
+    assert!(decode_application_map_node(&bytes).is_err());
+}
+
+#[test]
+fn view_lineage_builder_groups_edges_and_emits_child_sets() {
+    let parent = ViewId::from_digest([1; 32]);
+    let first = ViewId::from_digest([2; 32]);
+    let second = ViewId::from_digest([3; 32]);
+    let mut objects = Vec::new();
+    let root = build_view_lineage_map(
+        [(parent, second), (parent, first), (parent, first)],
+        |object| objects.push(object),
+    );
+    let map = objects
+        .iter()
+        .find_map(|object| decode_view_lineage_map_node(&object.bytes).ok())
+        .unwrap();
+    assert_eq!(map.id(), root);
+    let child_root = map.value.unwrap();
+    let retained_nodes: Vec<_> = objects
+        .iter()
+        .filter_map(|object| decode_retained_set_node(&object.bytes).ok())
+        .collect();
+    assert!(retained_nodes.iter().any(|node| node.id() == child_root));
+
+    let mut reordered = Vec::new();
+    assert_eq!(
+        build_view_lineage_map([(parent, first), (parent, second)], |object| {
+            reordered.push(object)
+        }),
+        root
+    );
+    assert_eq!(objects, reordered);
+}
+
 macro_rules! set_rules {
     ($test:ident, $node:ident, $child:ident, $decode:ident, $tag:expr) => {
         #[test]

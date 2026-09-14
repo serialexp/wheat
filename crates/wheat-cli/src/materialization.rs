@@ -35,12 +35,10 @@ use crate::{
         authenticate_workspace_file, authenticate_workspace_preimage, observe_workspace_file,
         raw_preimage, read_workspace_file,
     },
-    workspace_metadata::{
-        MaterializedState, WorkspaceMetadata, WorkspaceMetadataPublishError, WorkspaceSelection,
-    },
+    workspace_metadata::{MaterializedState, WorkspaceMetadata, WorkspaceMetadataPublishError},
 };
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const JOURNAL_NAME: &str = "materialization.json";
 const TRANSACTIONS: &str = "materialization-transactions";
 const PROGRESS_NAME: &str = "progress.log";
@@ -187,7 +185,10 @@ struct Journal {
     workspace_id: Uuid,
     store_id: Uuid,
     source: Option<MaterializedState>,
-    selection: WorkspaceSelection,
+    active_label: String,
+    basis: ViewId,
+    observed_label_binding: ViewId,
+    selected_frontier: Option<ViewId>,
     /// Canonical selectors authorizing a restore; empty for materialization.
     selectors: Vec<String>,
     target: MaterializedState,
@@ -373,11 +374,35 @@ pub(crate) async fn materialize(
     repository: &LocalRepository,
     metadata: &mut WorkspaceMetadata,
     head: RepositoryHead,
-    view: ViewId,
+    active_label: String,
+    basis: ViewId,
+    selected_frontier: Option<ViewId>,
     tree: TreeId,
-    requested_selection: WorkspaceSelection,
 ) -> Result<()> {
     let _lock = WorkspaceLock::acquire(root)?;
+    materialize_locked(
+        root,
+        repository,
+        metadata,
+        head,
+        active_label,
+        basis,
+        selected_frontier,
+        tree,
+    )
+    .await
+}
+
+pub(crate) async fn materialize_locked(
+    root: &Path,
+    repository: &LocalRepository,
+    metadata: &mut WorkspaceMetadata,
+    head: RepositoryHead,
+    active_label: String,
+    basis: ViewId,
+    selected_frontier: Option<ViewId>,
+    tree: TreeId,
+) -> Result<()> {
     let persisted = WorkspaceMetadata::read(root)?;
     ensure!(
         persisted.workspace_id == metadata.workspace_id
@@ -388,12 +413,17 @@ pub(crate) async fn materialize(
     *metadata = persisted;
     recover_locked(root, repository, metadata).await?;
 
+    let view = selected_frontier.unwrap_or(basis);
     let target = MaterializedState {
         repository_head: head.into(),
         view,
         tree,
     };
-    if metadata.materialized.as_ref() == Some(&target) && metadata.selection == requested_selection
+    if metadata.materialized.as_ref() == Some(&target)
+        && metadata.active_label == active_label
+        && metadata.basis == basis
+        && metadata.observed_label_binding == basis
+        && metadata.selected_frontier == selected_frontier
     {
         ensure!(
             repository.heads.read()? == head,
@@ -432,7 +462,10 @@ pub(crate) async fn materialize(
         workspace_id: metadata.workspace_id,
         store_id: metadata.store.store_id,
         source,
-        selection: requested_selection,
+        active_label,
+        basis,
+        observed_label_binding: basis,
+        selected_frontier,
         selectors: Vec::new(),
         target,
         installs,
@@ -603,7 +636,10 @@ pub(crate) async fn restore(
         workspace_id: metadata.workspace_id,
         store_id: metadata.store.store_id,
         source: Some(pinned.clone()),
-        selection: metadata.selection.clone(),
+        active_label: metadata.active_label.clone(),
+        basis: metadata.basis,
+        observed_label_binding: metadata.observed_label_binding,
+        selected_frontier: metadata.selected_frontier,
         selectors: normalized_selectors,
         target: pinned,
         installs,
@@ -708,7 +744,7 @@ pub(crate) async fn recover(
     recover_locked(root, repository, metadata).await
 }
 
-async fn recover_locked(
+pub(crate) async fn recover_locked(
     root: &Path,
     repository: &LocalRepository,
     metadata: &mut WorkspaceMetadata,
@@ -780,11 +816,11 @@ async fn recover_locked(
 
 fn publish_target(root: &Path, metadata: &mut WorkspaceMetadata, journal: &Journal) -> Result<()> {
     let mut next = metadata.clone();
-    next.selection = journal.selection.clone();
+    next.active_label.clone_from(&journal.active_label);
+    next.basis = journal.basis;
+    next.observed_label_binding = journal.observed_label_binding;
+    next.selected_frontier = journal.selected_frontier;
     next.materialized = Some(journal.target.clone());
-    if next.authoring_basis.is_none() {
-        next.authoring_basis = Some(journal.target.view);
-    }
     let prepared = next.replace_prepared(root)?;
     match prepared.publish() {
         Ok(()) => {
@@ -949,7 +985,10 @@ async fn authenticate_journal(
         Operation::Restore => {
             ensure!(
                 journal.source.as_ref() == Some(&journal.target)
-                    && journal.selection == metadata.selection,
+                    && journal.active_label == metadata.active_label
+                    && journal.basis == metadata.basis
+                    && journal.observed_label_binding == metadata.observed_label_binding
+                    && journal.selected_frontier == metadata.selected_frontier,
                 "restore journal changes the pinned materialized state"
             );
             validate_selectors(&journal.selectors)?;
@@ -1014,21 +1053,26 @@ async fn authenticate_target(repository: &LocalRepository, journal: &Journal) ->
     let head: RepositoryHead = journal.target.repository_head.clone().into();
     let reader = wheat_store::RepositoryReader::new(&repository.objects, &repository.content);
     let envelope = reader.validate_envelope(head.envelope).await?;
-    let state = reader.state(envelope.state).await?;
-    let selected = match &journal.selection {
-        WorkspaceSelection::Published => state.published_view,
-        WorkspaceSelection::Working => state.working_view,
-        WorkspaceSelection::Branch { name } => {
-            let branches = reader.branch_manifest(envelope.branches).await?;
-            *branches
-                .branches
-                .get(name)
-                .with_context(|| format!("journal references unknown Wheat branch {name}"))?
-        }
-    };
+    let labels = reader.view_label_manifest(envelope.labels).await?;
+    let pinned_binding = labels
+        .labels
+        .get(&journal.active_label)
+        .map(|label| label.view)
+        .with_context(|| {
+            format!(
+                "journal references unknown Wheat label {}",
+                journal.active_label
+            )
+        })?;
+    ensure!(
+        pinned_binding == journal.observed_label_binding
+            && journal.basis == journal.observed_label_binding,
+        "journal label binding does not match its pinned basis"
+    );
+    let selected = journal.selected_frontier.unwrap_or(journal.basis);
     ensure!(
         selected == journal.target.view,
-        "journal selection does not resolve to target view"
+        "journal pinned frontier does not match its target view"
     );
     ensure!(
         reader.view(selected).await?.tree == journal.target.tree,

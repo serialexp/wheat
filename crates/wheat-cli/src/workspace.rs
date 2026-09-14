@@ -23,7 +23,8 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     root: &Path,
     objects: &O,
     store: &ContentStore,
-    head: RepositoryHead,
+    _head: RepositoryHead,
+    effective_view: wheat_core::ViewId,
     change: wheat_core::ChangeId,
     predecessor: RevisionId,
     paths: &[String],
@@ -35,9 +36,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
         ));
     }
     let reader = RepositoryReader::new(objects, store);
-    let envelope = reader.envelope(head.envelope).await?;
-    let state = reader.state(envelope.state).await?;
-    let working = reader.view(state.working_view).await?;
+    let working = reader.view(effective_view).await?;
     let current = RevisionMapStore::new(objects)
         .get(working.revisions, change)
         .await?;
@@ -60,15 +59,6 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     if revision.authored_against != application.target_view {
         return Err(CliFailure::corrupt(
             "predecessor authored base does not match its current application target",
-        ));
-    }
-    let published = reader.view(state.published_view).await?;
-    let published_application = ApplicationMapStore::new(objects)
-        .get(published.applications, change)
-        .await?;
-    if published_application != Some(application_id) {
-        return Err(CliFailure::stale(
-            "current application is not recorded by the published head; refresh and retry",
         ));
     }
     let ApplicationResultRecord::Clean { tree: baseline } = application.result else {

@@ -133,12 +133,31 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             };
             applications.push((record, tree, conflict));
         }
+        let lineage = crate::ViewLineageMapStore::new(self.objects);
+        let mut view_lineage = BTreeSet::new();
+        for parent in &views {
+            let Some(children) =
+                lineage
+                    .get(state.view_lineage, parent.id)
+                    .await
+                    .map_err(|_| {
+                        RepositoryPublicationError::InvalidReferences("invalid view lineage")
+                    })?
+            else {
+                continue;
+            };
+            let mut children = retained.cursor(children).await?;
+            while let Some(child) = children.next().await? {
+                view_lineage.insert((parent.id, ViewId::from_digest(*child.as_bytes())));
+            }
+        }
         let repository = Repository::from_parts(RepositoryParts {
             state,
             changes,
             views,
             revisions,
             applications,
+            view_lineage,
         })?;
         // A reconstruction must not silently invent or drop retained commitments.
         if repository.canonical_closure().state.id != root {

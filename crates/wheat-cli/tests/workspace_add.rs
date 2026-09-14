@@ -359,7 +359,7 @@ fn stale_or_invalid_add_leaves_published_head_unchanged() {
 #[test]
 fn add_recovers_pending_restore_before_capturing_workspace_bytes() {
     let (dir, change, predecessor) = setup();
-    ok(dir.path(), &["materialize", "--source", "working"]);
+    ok(dir.path(), &["materialize"]);
     fs::write(dir.path().join("file"), "discarded workspace bytes\n").unwrap();
     let interrupted = wheat_command(dir.path(), &["restore", "file"])
         .env(

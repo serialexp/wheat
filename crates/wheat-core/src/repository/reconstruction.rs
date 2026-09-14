@@ -1,7 +1,7 @@
 use super::*;
 
 impl Repository {
-    /// Reconstruct an executable repository from persisted records and their referenced objects.
+    /// Reconstruct an executable graph from persisted records and all referenced objects.
     pub fn from_parts(parts: RepositoryParts) -> Result<Self, RepositoryError> {
         let mut changes = BTreeMap::new();
         for change in parts.changes {
@@ -48,66 +48,13 @@ impl Repository {
             }
         }
 
-        let working =
-            views
-                .get(&parts.state.working_view)
-                .ok_or(RepositoryError::InvalidRepositoryState(
-                    "repository working view root",
-                ))?;
-        let current_revisions = working.frontier.clone();
-        let mut dependencies = DependencyGraph::default();
-        let mut current_applications = BTreeMap::new();
-
-        for (change_id, revision_id) in &current_revisions {
-            let revision =
-                revisions
-                    .get(revision_id)
-                    .ok_or(RepositoryError::InvalidRepositoryState(
-                        "working view revision reference",
-                    ))?;
-            if revision.change_id() != *change_id || !changes.contains_key(change_id) {
-                return Err(RepositoryError::InvalidRepositoryState(
-                    "working view revision change reference",
-                ));
-            }
-            dependencies.add_change(*change_id, revision.dependencies().clone());
-        }
-        for (change_id, application_id) in &working.applications {
-            let application =
-                applications
-                    .get(application_id)
-                    .ok_or(RepositoryError::InvalidRepositoryState(
-                        "working view application reference",
-                    ))?;
-            let revision = revisions.get(&application.revision_id).ok_or(
-                RepositoryError::InvalidRepositoryState("application revision reference"),
-            )?;
-            if revision.change_id() != *change_id
-                || current_revisions.get(change_id) != Some(&application.revision_id)
-            {
-                return Err(RepositoryError::InvalidRepositoryState(
-                    "working view application change reference",
-                ));
-            }
-            current_applications.insert(*change_id, application.clone());
-        }
-        if working.applications.keys().ne(working.frontier.keys()) {
-            return Err(RepositoryError::InvalidRepositoryState(
-                "working view application selection",
-            ));
-        }
-
         let repository = Self {
             changes,
             views,
             revisions,
-            current_revisions,
-            dependencies,
             applications,
-            current_applications,
             base_view: parts.state.base_view,
-            working_view: parts.state.working_view,
-            published_view: parts.state.published_view,
+            view_lineage: parts.view_lineage,
         };
         repository.validate()?;
         repository.validate_references()?;
@@ -148,8 +95,24 @@ impl Repository {
                     "application object reference",
                 ));
             }
+            let has_resulting_edge = self.view_lineage.iter().any(|(parent, child)| {
+                *parent == application.target_view
+                    && self.views.get(child).is_some_and(|view| {
+                        view.applications.values().any(|id| *id == application.id)
+                    })
+            });
+            if !has_resulting_edge {
+                return Err(RepositoryError::InvalidRepositoryState(
+                    "application view lineage reference",
+                ));
+            }
         }
         for view in self.views.values() {
+            if view.applications.keys().ne(view.frontier.keys()) {
+                return Err(RepositoryError::InvalidRepositoryState(
+                    "view application selection",
+                ));
+            }
             for (change, revision) in &view.frontier {
                 if self.revisions.get(revision).map(ChangeRevision::change_id) != Some(*change) {
                     return Err(RepositoryError::InvalidRepositoryState(
@@ -178,9 +141,7 @@ impl Repository {
                 if !self.applications.values().any(|application| {
                     matches!(&application.result, ApplicationResult::Conflicted { conflict, .. } if conflict.id == *conflict_id)
                 }) {
-                    return Err(RepositoryError::InvalidRepositoryState(
-                        "view conflict reference",
-                    ));
+                    return Err(RepositoryError::InvalidRepositoryState("view conflict reference"));
                 }
             }
         }

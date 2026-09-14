@@ -84,16 +84,49 @@ fn paused_wheat(
         .unwrap()
 }
 
-fn release_pause(child: Child, pause: &Path) -> Output {
+fn wait_for_pause(child: &mut Child, pause: &Path) {
     let reached = pause.with_extension("reached");
     for _ in 0..5_000 {
         if reached.exists() {
-            std::fs::remove_file(pause).unwrap();
-            return child.wait_with_output().unwrap();
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("materialization exited with {status} before synchronization checkpoint");
         }
         thread::sleep(Duration::from_millis(2));
     }
+    child.kill().unwrap();
+    child.wait().unwrap();
     panic!("materialization did not reach synchronization checkpoint");
+}
+
+fn release_pause(mut child: Child, pause: &Path) -> Output {
+    wait_for_pause(&mut child, pause);
+    std::fs::remove_file(pause).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn label_view(stores: &Path, workspace: &Path, label: &str) -> String {
+    let output = wheat(
+        stores,
+        &[
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--format=json",
+            "labels",
+        ],
+        None,
+    );
+    assert!(output.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    document["result"]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == label)
+        .and_then(|entry| entry["view"].as_str())
+        .unwrap()
+        .to_owned()
 }
 
 fn source(root: &Path) -> std::path::PathBuf {
@@ -132,6 +165,11 @@ fn source_with_delta(root: &Path) -> std::path::PathBuf {
     std::fs::write(source.join("create"), b"create\n").unwrap();
     git(&source, &["add", "-A"]);
     git(&source, &["commit", "-m", "feature"]);
+    git(&source, &["checkout", "main"]);
+    // Keep the imported labels on sibling frontiers. A descendant feature view is
+    // also a valid frontier of `main`, which would require every test to select
+    // the historical main frontier explicitly just to establish this fixture.
+    git(&source, &["commit", "--allow-empty", "-m", "main frontier"]);
     source
 }
 
@@ -249,9 +287,8 @@ fn rematerializes_only_the_delta_and_round_trips_a_to_b_to_a() {
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ],
         None,
     );
@@ -271,14 +308,16 @@ fn rematerializes_only_the_delta_and_round_trips_a_to_b_to_a() {
         std::fs::metadata(workspace.join("same")).unwrap().ino()
     );
 
+    let main_view = label_view(&stores, &workspace, "main");
     let to_main = wheat(
         &stores,
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/main",
+            "switch",
+            "main",
+            "--frontier",
+            &main_view,
         ],
         None,
     );
@@ -379,13 +418,7 @@ fn rematerializes_file_directory_transitions_and_preserves_untracked_directories
     }
     let switched = wheat(
         &stores,
-        &[
-            "--workspace",
-            workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "working",
-        ],
+        &["--workspace", workspace.to_str().unwrap(), "materialize"],
         None,
     );
     assert!(
@@ -409,13 +442,7 @@ fn rematerializes_file_directory_transitions_and_preserves_untracked_directories
     std::fs::write(workspace.join("dir-to-file/untracked"), b"mine\n").unwrap();
     let blocked = wheat(
         &stores,
-        &[
-            "--workspace",
-            workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/main",
-        ],
+        &["--workspace", workspace.to_str().unwrap(), "switch", "main"],
         None,
     );
     assert!(!blocked.status.success());
@@ -498,13 +525,7 @@ fn directory_to_file_rejects_untracked_sibling_without_mutation_or_journal() {
 
     let blocked = wheat(
         &stores,
-        &[
-            "--workspace",
-            workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "working",
-        ],
+        &["--workspace", workspace.to_str().unwrap(), "materialize"],
         None,
     );
     assert!(!blocked.status.success());
@@ -584,27 +605,14 @@ fn directory_to_file_mutation_recheck_preserves_tracked_files() {
         );
     }
     let pause = root.path().join("structural.pause");
-    let child = paused_wheat(
+    let mut child = paused_wheat(
         &stores,
-        &[
-            "--workspace",
-            workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "working",
-        ],
+        &["--workspace", workspace.to_str().unwrap(), "materialize"],
         "before-structural-recheck",
         1,
         &pause,
     );
-    let reached = pause.with_extension("reached");
-    for _ in 0..5_000 {
-        if reached.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    assert!(reached.exists());
+    wait_for_pause(&mut child, &pause);
     std::fs::write(workspace.join("node/untracked"), b"mine\n").unwrap();
     let output = release_pause(child, &pause);
     assert!(!output.status.success());
@@ -687,13 +695,7 @@ fn interrupted_directory_to_file_transition_recovers_structurally() {
             );
         }
         let interrupted = Command::new(env!("CARGO_BIN_EXE_wheat"))
-            .args([
-                "--workspace",
-                workspace.to_str().unwrap(),
-                "materialize",
-                "--source",
-                "working",
-            ])
+            .args(["--workspace", workspace.to_str().unwrap(), "materialize"])
             .env("WHEAT_STORE_HOME", &stores)
             .env("WHEAT_TEST_MATERIALIZATION_FAIL_AFTER", checkpoint)
             .env("WHEAT_TEST_MATERIALIZATION_FAIL_MODE", "sigkill")
@@ -745,9 +747,8 @@ fn rematerialization_refuses_the_whole_plan_when_any_delta_path_is_dirty() {
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ],
         None,
     );
@@ -792,9 +793,8 @@ fn recovery_truncates_corrupt_final_full_width_progress_record() {
         .args([
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ])
         .env("WHEAT_STORE_HOME", &stores)
         .env("WHEAT_TEST_MATERIALIZATION_FAIL_AFTER", "intent-persisted")
@@ -868,9 +868,8 @@ fn interrupted_rematerialization_recovers_exchange_and_deletion() {
             .args([
                 "--workspace",
                 workspace.to_str().unwrap(),
-                "materialize",
-                "--source",
-                "branch:refs/heads/feature",
+                "switch",
+                "feature",
             ])
             .env("WHEAT_STORE_HOME", &stores)
             .env("WHEAT_TEST_MATERIALIZATION_FAIL_AFTER", checkpoint)
@@ -929,9 +928,8 @@ fn rematerialization_recovery_refuses_create_collision_and_toctou_change() {
             &[
                 "--workspace",
                 workspace.to_str().unwrap(),
-                "materialize",
-                "--source",
-                "branch:refs/heads/feature"
+                "switch",
+                "feature"
             ],
             Some("journal-created")
         )
@@ -987,9 +985,8 @@ fn rematerialization_recovery_refuses_replacement_toctou() {
             &[
                 "--workspace",
                 workspace.to_str().unwrap(),
-                "materialize",
-                "--source",
-                "branch:refs/heads/feature"
+                "switch",
+                "feature"
             ],
             Some("journal-created")
         )
@@ -1011,7 +1008,7 @@ fn rematerialization_recovery_refuses_replacement_toctou() {
     let metadata: serde_json::Value =
         serde_json::from_slice(&std::fs::read(workspace.join(".wheat/workspace.json")).unwrap())
             .unwrap();
-    assert_eq!(metadata["selection"]["name"], "refs/heads/main");
+    assert_eq!(metadata["active_label"], "main");
     assert!(workspace.join(".wheat/materialization.json").is_file());
 }
 
@@ -1037,23 +1034,19 @@ fn concurrent_writer_between_authentication_and_exchange_is_restored() {
         .success()
     );
     let pause = root.path().join("pause");
-    let child = paused_wheat(
+    let mut child = paused_wheat(
         &stores,
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ],
         "before-exchange",
         1,
         &pause,
     );
-    let reached = pause.with_extension("reached");
-    while !reached.exists() {
-        thread::sleep(Duration::from_millis(2));
-    }
+    wait_for_pause(&mut child, &pause);
     std::fs::write(workspace.join("delete"), b"concurrent\n").unwrap();
     let output = release_pause(child, &pause);
     assert!(!output.status.success());
@@ -1099,23 +1092,19 @@ fn concurrent_writer_between_authentication_and_replacement_exchange_is_restored
         .success()
     );
     let pause = root.path().join("replacement-pause");
-    let child = paused_wheat(
+    let mut child = paused_wheat(
         &stores,
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ],
         "before-exchange",
         2,
         &pause,
     );
-    let reached = pause.with_extension("reached");
-    while !reached.exists() {
-        thread::sleep(Duration::from_millis(2));
-    }
+    wait_for_pause(&mut child, &pause);
     std::fs::write(workspace.join("replace"), b"concurrent replacement\n").unwrap();
     let output = release_pause(child, &pause);
     assert!(!output.status.success());
@@ -1147,23 +1136,19 @@ fn changed_workspace_after_exchange_preserves_both_values() {
         .success()
     );
     let pause = root.path().join("post-exchange-pause");
-    let child = paused_wheat(
+    let mut child = paused_wheat(
         &stores,
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ],
         "exchanged",
         2,
         &pause,
     );
-    let reached = pause.with_extension("reached");
-    while !reached.exists() {
-        thread::sleep(Duration::from_millis(2));
-    }
+    wait_for_pause(&mut child, &pause);
     let transaction = std::fs::read_dir(workspace.join(".wheat/materialization-transactions"))
         .unwrap()
         .next()
@@ -1208,23 +1193,19 @@ fn concurrent_writer_between_marker_authentication_and_move_is_restored() {
         .success()
     );
     let pause = root.path().join("move-pause");
-    let child = paused_wheat(
+    let mut child = paused_wheat(
         &stores,
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ],
         "before-deletion-move",
         1,
         &pause,
     );
-    let reached = pause.with_extension("reached");
-    while !reached.exists() {
-        thread::sleep(Duration::from_millis(2));
-    }
+    wait_for_pause(&mut child, &pause);
     std::fs::write(workspace.join("delete"), b"concurrent move\n").unwrap();
     let output = release_pause(child, &pause);
     assert!(!output.status.success());
@@ -1260,9 +1241,8 @@ fn published_metadata_allows_workspace_edits_while_private_debris_is_cleaned() {
         &[
             "--workspace",
             workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/feature",
+            "switch",
+            "feature",
         ],
         Some("target-published"),
     );
@@ -1310,13 +1290,7 @@ fn no_op_materialization_does_not_rewrite_workspace_or_metadata() {
     let metadata = std::fs::read(workspace.join(".wheat/workspace.json")).unwrap();
     let noop = wheat(
         &stores,
-        &[
-            "--workspace",
-            workspace.to_str().unwrap(),
-            "materialize",
-            "--source",
-            "branch:refs/heads/main",
-        ],
+        &["--workspace", workspace.to_str().unwrap(), "switch", "main"],
         None,
     );
     assert!(

@@ -48,16 +48,22 @@ async fn verification_indexes_changes_once_and_reuses_identical_tree_contexts() 
         trees: AtomicUsize::new(0),
     };
     let mut repo = Repository::new(Tree::new());
+    let basis = repo.base_view().id;
+    let mut effective = basis;
     let mut parent = None;
     for n in 1..=12u8 {
         let id = ChangeId::from_bytes([n; 16]);
-        repo.create_change_with_id(
-            id,
-            parent,
-            RevisionEdits::default(),
-            ApplicationContext::new(&content),
-        )
-        .unwrap();
+        let outcome = repo
+            .create_change_with_id(
+                basis,
+                effective,
+                id,
+                parent,
+                RevisionEdits::default(),
+                ApplicationContext::new(&content),
+            )
+            .unwrap();
+        effective = outcome.resulting_view;
         parent = Some(id);
     }
     let closure = repo.canonical_closure();
@@ -93,16 +99,22 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
         trees: AtomicUsize::new(0),
     };
     let mut repo = Repository::new(Tree::new());
+    let basis = repo.base_view().id;
+    let mut effective = basis;
     let mut parent = None;
     for n in 1..=64u8 {
         let id = ChangeId::from_bytes([n; 16]);
-        repo.create_change_with_id(
-            id,
-            parent,
-            RevisionEdits::default(),
-            ApplicationContext::new(&content),
-        )
-        .unwrap();
+        let outcome = repo
+            .create_change_with_id(
+                basis,
+                effective,
+                id,
+                parent,
+                RevisionEdits::default(),
+                ApplicationContext::new(&content),
+            )
+            .unwrap();
+        effective = outcome.resulting_view;
         parent = Some(id);
     }
     let closure = repo.canonical_closure();
@@ -153,8 +165,11 @@ async fn duplicate_logical_changes_are_rejected_by_verified_index() {
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
     let mut repo = Repository::new(Tree::new());
+    let basis = repo.base_view().id;
     let (change, _) = repo
         .create_change(
+            basis,
+            basis,
             [],
             RevisionEdits::default(),
             ApplicationContext::new(&content),

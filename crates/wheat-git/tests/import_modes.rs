@@ -123,11 +123,15 @@ async fn atomic_and_resumable_imports_publish_the_same_envelope() {
         .validate_complete(atomic_envelope.state)
         .await
         .unwrap();
-    let branches = atomic_reader
-        .branch_manifest(atomic_envelope.branches)
+    let labels = atomic_reader
+        .view_label_manifest(atomic_envelope.labels)
         .await
         .unwrap();
-    assert_eq!(branches.branches.len(), 2);
+    assert_eq!(labels.labels.len(), 2);
+    assert_eq!(
+        labels.labels["main"].original_git_ref.as_deref(),
+        Some("refs/heads/main")
+    );
     assert_eq!(
         LocalPublicationStore::new(atomic.join("repository.head"))
             .read()
@@ -218,9 +222,11 @@ async fn atomic_import_retains_binary_content_above_the_guarded_text_limit() {
     let content = objects.content_store();
     let reader = RepositoryReader::new(&objects, &content);
     let envelope = reader.envelope(head.envelope).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
     let repository = reader.hydrate(envelope.state).await.unwrap();
     let value = repository
-        .working_view()
+        .view(labels.labels["main"].view)
+        .unwrap()
         .tree
         .get("model.bin")
         .expect("large file is visible");

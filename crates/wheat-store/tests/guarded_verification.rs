@@ -50,8 +50,11 @@ async fn fixture(
             kind: FileKind::Regular,
         },
     )]));
+    let basis = repository.base_view().id;
     repository
         .create_change(
+            basis,
+            basis,
             [],
             exact(Some(b"before"), b"after"),
             ApplicationContext::new(&content),
@@ -96,9 +99,8 @@ async fn extend_state(
     let replacement = RepositoryState {
         id: RepositoryStateId::from_digest([0; 32]),
         base_view: state.base_view,
-        working_view: state.working_view,
-        published_view: state.published_view,
         change_objects: state.change_objects.clone(),
+        view_lineage: state.view_lineage,
         required_content: state.required_content,
         retained_changes: state.retained_changes.clone(),
         retained_views: state.retained_views.clone(),
@@ -238,8 +240,11 @@ async fn verifier_accepts_empty_to_nested_exact_edit() {
     let content = ContentStore::new(dir.path().join("content"));
     content.put(b"nested").unwrap();
     let mut repository = Repository::new(Tree::new());
+    let basis = repository.base_view().id;
     repository
         .create_change(
+            basis,
+            basis,
             [],
             edits(vec![exact_at("empty/nested", None, Some(b"nested"))]),
             ApplicationContext::new(&content),
@@ -272,8 +277,11 @@ async fn verifier_accepts_nested_directory_to_missing_exact_edit() {
             kind: FileKind::Regular,
         },
     )]));
+    let basis = repository.base_view().id;
     repository
         .create_change(
+            basis,
+            basis,
             [],
             edits(vec![exact_at("empty/nested", Some(b"nested"), None)]),
             ApplicationContext::new(&content),

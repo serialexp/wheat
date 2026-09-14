@@ -271,20 +271,18 @@ impl<'a> Snapshot<'a> {
 
     async fn resolve_view(&self, selector: &str) -> Result<(ViewId, wheat_core::ViewRecord)> {
         let id = match selector {
-            "published" => self.state.published_view,
-            "working" => self.state.working_view,
-            _ if selector.starts_with("branch:") => {
-                let name = selector.strip_prefix("branch:").expect("prefix checked");
+            _ if selector.starts_with("label:") => {
+                let name = selector.strip_prefix("label:").expect("prefix checked");
                 if name.is_empty() {
-                    return Err(CliFailure::invalid("branch selector requires a name"));
+                    return Err(CliFailure::invalid("label selector requires a name"));
                 }
                 self.reader
-                    .branch_manifest(self.envelope.branches)
+                    .view_label_manifest(self.envelope.labels)
                     .await?
-                    .branches
+                    .labels
                     .get(name)
-                    .copied()
-                    .ok_or_else(|| CliFailure::invalid(format!("unknown branch {name}")))?
+                    .map(|label| label.view)
+                    .ok_or_else(|| CliFailure::invalid(format!("unknown label {name}")))?
             }
             _ => ViewId::from_str(selector)
                 .map_err(|_| CliFailure::invalid("invalid view selector"))?,

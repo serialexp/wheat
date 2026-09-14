@@ -31,6 +31,7 @@ mod verification_scratch;
 pub use repository_reader::RepositoryReader;
 mod revision_map;
 mod sets;
+mod view_lineage;
 
 pub use application_map::{ApplicationMapCursor, ApplicationMapError, ApplicationMapStore};
 pub use batch::BatchObjectStore;
@@ -52,14 +53,19 @@ pub use object_store_adapter::{
 };
 pub use publication::{LocalPublicationStore, PublicationError, PublicationStore, RepositoryHead};
 pub use repository_mutation::{
-    MutationTarget, PersistedConflictResolution, PersistedRepositoryMutator,
-    PreparedRepositoryMutation, RepositoryMutationError,
+    PersistedConflictResolution, PersistedRepositoryMutator, PreparedRepositoryMutation,
+    RepositoryMutationError,
 };
 pub use repository_publication::{RepositoryPublicationError, RepositoryPublisher};
-pub use revision_map::{RevisionMapCursor, RevisionMapError, RevisionMapStore};
+pub use revision_map::{
+    RevisionMapCursor, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore,
+};
 pub use sets::{
     CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetStore,
     RetainedSetCursor, RetainedSetStore,
+};
+pub use view_lineage::{
+    ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,
 };
 
 mod content_store;

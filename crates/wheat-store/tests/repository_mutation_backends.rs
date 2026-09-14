@@ -9,7 +9,7 @@ const LARGE_LEN: usize = 128 * 1024 + 1;
 struct LifecycleTrace {
     states: Vec<RepositoryStateId>,
     envelopes: Vec<RepositoryEnvelopeId>,
-    branch_manifest: BranchManifestId,
+    view_label_manifest: ViewLabelManifestId,
 }
 
 fn exact(path: &str, expected: Option<&[u8]>, replacement: &[u8]) -> RevisionEdits {
@@ -61,11 +61,11 @@ async fn inspect<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
     head: RepositoryHead,
-    branches: BranchManifestId,
+    labels: ViewLabelManifestId,
 ) -> RepositoryStateId {
     let reader = RepositoryReader::new(objects, content);
     let envelope = reader.envelope(head.envelope).await.unwrap();
-    assert_eq!(envelope.branches, branches);
+    assert_eq!(envelope.labels, labels);
     reader.validate_complete(envelope.state).await.unwrap();
     assert_eq!(
         reader
@@ -106,21 +106,25 @@ where
         }
     }
 
-    let branches;
+    let labels;
+    let base;
+    let mut effective;
     let mut head;
     {
         let (objects, content) = open();
         let heads = LocalPublicationStore::new(head_path);
         let repository = Repository::new(Tree::new());
-        branches = BranchManifestRecord::new([
-            ("refs/heads/main", repository.working_view().id),
-            ("refs/heads/saved", repository.published_view().id),
+        base = repository.base_view().id;
+        effective = base;
+        labels = ViewLabelManifestRecord::new([
+            ("main", repository.base_view().id),
+            ("saved", repository.base_view().id),
         ])
         .unwrap();
         let publisher = RepositoryPublisher::new(&objects, &content, &heads);
         let closure = publisher.prepare(&repository).await.unwrap();
         let envelope = publisher
-            .prepare_envelope(closure.state.id, &branches)
+            .prepare_envelope(closure.state.id, &labels)
             .await
             .unwrap();
         head = publisher
@@ -135,16 +139,17 @@ where
     let parent_edit;
     {
         let (objects, content) = open();
-        states.push(inspect(&objects, &content, head, branches.id()).await);
+        states.push(inspect(&objects, &content, head, labels.id()).await);
         let heads = LocalPublicationStore::new(head_path);
         let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
         let parent_edits = exact("file", None, &large);
         parent_edit = *parent_edits.edits.keys().next().unwrap();
         let (prepared, parent_outcome) = mutator
-            .create(head, proposal(parent, [], parent_edits))
+            .create(head, base, effective, proposal(parent, [], parent_edits))
             .await
             .unwrap();
         parent_revision = parent_outcome.revision_id;
+        effective = prepared.resulting_view();
         assert_eq!(heads.read().unwrap(), head, "prepare must not publish");
         head = mutator.publish(prepared).await.unwrap();
         envelopes.push(head.envelope);
@@ -154,27 +159,32 @@ where
     // that the in-memory store instance can read its own writes.
     {
         let (objects, content) = open();
-        states.push(inspect(&objects, &content, head, branches.id()).await);
+        states.push(inspect(&objects, &content, head, labels.id()).await);
         let heads = LocalPublicationStore::new(head_path);
         let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
         let (prepared, _) = mutator
             .create(
                 head,
+                base,
+                effective,
                 proposal(child, [parent], exact("file", Some(&large), small)),
             )
             .await
             .unwrap();
+        effective = prepared.resulting_view();
         head = mutator.publish(prepared).await.unwrap();
         envelopes.push(head.envelope);
     }
     {
         let (objects, content) = open();
-        states.push(inspect(&objects, &content, head, branches.id()).await);
+        states.push(inspect(&objects, &content, head, labels.id()).await);
         let heads = LocalPublicationStore::new(head_path);
         let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
         let (prepared, outcome) = mutator
             .revise(
                 head,
+                base,
+                effective,
                 parent,
                 parent_revision,
                 RevisionMetadata::default(),
@@ -183,19 +193,20 @@ where
             .await
             .unwrap();
         assert_eq!(outcome.reapplied, vec![child]);
+        effective = prepared.resulting_view();
         head = mutator.publish(prepared).await.unwrap();
         envelopes.push(head.envelope);
     }
     {
         let (objects, content) = open();
-        states.push(inspect(&objects, &content, head, branches.id()).await);
+        states.push(inspect(&objects, &content, head, labels.id()).await);
         let repository = RepositoryReader::new(&objects, &content)
             .hydrate(*states.last().unwrap())
             .await
             .unwrap();
-        let conflict_revision = repository.current_revision(child).unwrap();
+        let conflict_revision = repository.current_revision(effective, child).unwrap();
         let application = repository
-            .conflicted_application(conflict_revision)
+            .conflicted_application(effective, conflict_revision)
             .expect("revising the dependency must conflict the child")
             .id;
         let heads = LocalPublicationStore::new(head_path);
@@ -203,6 +214,8 @@ where
         let (prepared, _) = mutator
             .resolve_conflict(
                 head,
+                base,
+                effective,
                 PersistedConflictResolution {
                     conflict_revision,
                     application,
@@ -218,6 +231,7 @@ where
             )
             .await
             .unwrap();
+        effective = prepared.resulting_view();
         head = mutator.publish(prepared).await.unwrap();
         envelopes.push(head.envelope);
     }
@@ -226,12 +240,14 @@ where
     // is returned, and the durable head remains exactly unchanged.
     {
         let (objects, content) = open();
-        states.push(inspect(&objects, &content, head, branches.id()).await);
+        states.push(inspect(&objects, &content, head, labels.id()).await);
         let heads = LocalPublicationStore::new(head_path);
         let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
         let failed = mutator
             .create(
                 head,
+                base,
+                effective,
                 proposal(
                     ChangeId::new(),
                     [],
@@ -245,7 +261,7 @@ where
         );
         assert_eq!(heads.read().unwrap(), head);
         assert_eq!(
-            inspect(&objects, &content, head, branches.id()).await,
+            inspect(&objects, &content, head, labels.id()).await,
             *states.last().unwrap()
         );
     }
@@ -258,11 +274,21 @@ where
         let heads = LocalPublicationStore::new(head_path);
         let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
         let (winner, _) = mutator
-            .create(head, proposal(winner_id, [], RevisionEdits::default()))
+            .create(
+                head,
+                base,
+                effective,
+                proposal(winner_id, [], RevisionEdits::default()),
+            )
             .await
             .unwrap();
         let (loser, _) = mutator
-            .create(head, proposal(loser_id, [], RevisionEdits::default()))
+            .create(
+                head,
+                base,
+                effective,
+                proposal(loser_id, [], RevisionEdits::default()),
+            )
             .await
             .unwrap();
         let winner_head = mutator.publish(winner).await.unwrap();
@@ -274,7 +300,9 @@ where
             mutator
                 .create(
                     head,
-                    proposal(ChangeId::new(), [], RevisionEdits::default())
+                    base,
+                    effective,
+                    proposal(ChangeId::new(), [], RevisionEdits::default()),
                 )
                 .await,
             Err(RepositoryMutationError::Stale { .. })
@@ -285,13 +313,13 @@ where
     }
     {
         let (objects, content) = open();
-        states.push(inspect(&objects, &content, head, branches.id()).await);
+        states.push(inspect(&objects, &content, head, labels.id()).await);
     }
 
     LifecycleTrace {
         states,
         envelopes,
-        branch_manifest: branches.id(),
+        view_label_manifest: labels.id(),
     }
 }
 

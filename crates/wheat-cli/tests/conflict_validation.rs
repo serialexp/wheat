@@ -96,10 +96,10 @@ fn conflict_inspection_rejects_a_corrupt_selected_working_view() {
     let (_parent, workspace) = initialized_workspace();
     let status: serde_json::Value =
         serde_json::from_slice(&ok(&workspace, &["status", "--format", "json"]).stdout).unwrap();
-    let working: wheat_core::ViewId =
-        serde_json::from_value(status["result"]["working_view"].clone()).unwrap();
+    let effective: wheat_core::ViewId =
+        serde_json::from_value(status["result"]["effective_view"].clone()).unwrap();
     std::fs::write(
-        object_path(&store_path(&workspace), &working.to_string()),
+        object_path(&store_path(&workspace), &effective.to_string()),
         b"corrupt",
     )
     .unwrap();

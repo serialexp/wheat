@@ -41,8 +41,9 @@ fn hydration_requires_authenticated_selected_edit_definitions() {
         },
     };
     let mut repo = Repository::new(Tree::new());
+    let base = repo.base_view().id;
     let (_, out) = repo
-        .create_change([], edits, ApplicationContext::new(&io))
+        .create_change(base, base, [], edits, ApplicationContext::new(&io))
         .unwrap();
     let revision = repo.revision(out.revision_id).unwrap();
     let record = decode_revision_record(&revision.canonical_bytes()).unwrap();
@@ -82,19 +83,17 @@ fn reconstruction_rejects_duplicate_and_missing_view_roots() {
         views,
         revisions: vec![],
         applications: vec![],
+        view_lineage: BTreeSet::new(),
     };
     assert!(Repository::from_parts(parts(vec![])).is_err());
     assert!(
         Repository::from_parts(parts(vec![
-            repo.working_view().clone(),
-            repo.working_view().clone(),
+            repo.base_view().clone(),
+            repo.base_view().clone(),
         ]))
         .is_err()
     );
-    let restored = Repository::from_parts(parts(vec![repo.working_view().clone()])).unwrap();
+    let restored = Repository::from_parts(parts(vec![repo.base_view().clone()])).unwrap();
     assert_eq!(restored.canonical_closure(), repo.canonical_closure());
-    assert_eq!(
-        restored.working_view().unresolved_conflicts,
-        BTreeSet::new()
-    );
+    assert_eq!(restored.base_view().unresolved_conflicts, BTreeSet::new());
 }

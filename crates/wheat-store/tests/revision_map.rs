@@ -13,8 +13,8 @@ use wheat_core::{
     ChangeId, ObjectId, RevisionId, RevisionMapChild, RevisionMapId, RevisionMapNode,
 };
 use wheat_store::{
-    ImmutableObjectStore, LooseObjectStore, ObjectStoreAdapter, ObjectStoreError, RevisionMapError,
-    RevisionMapStore, StoredObject,
+    ImmutableObjectStore, LooseObjectStore, ObjectStoreAdapter, ObjectStoreError, RevisionMapDelta,
+    RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore, StoredObject,
 };
 
 fn change(value: &str) -> ChangeId {
@@ -54,6 +54,7 @@ async fn conformance<S: ImmutableObjectStore>(objects: &S) {
 
 struct CountingStore<S> {
     inner: S,
+    reads: AtomicUsize,
     writes: AtomicUsize,
 }
 
@@ -61,8 +62,13 @@ impl<S> CountingStore<S> {
     fn new(inner: S) -> Self {
         Self {
             inner,
+            reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
         }
+    }
+
+    fn take_reads(&self) -> usize {
+        self.reads.swap(0, Ordering::SeqCst)
     }
 
     fn take_writes(&self) -> usize {
@@ -82,6 +88,7 @@ impl<S: ImmutableObjectStore> ImmutableObjectStore for CountingStore<S> {
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.get(id).await
     }
 
@@ -327,6 +334,164 @@ async fn cursor_reports_a_missing_child_during_iteration() {
     assert!(matches!(
         cursor.next().await,
         Err(RevisionMapError::Store(ObjectStoreError::Missing(id))) if id == missing.into()
+    ));
+}
+
+#[tokio::test]
+async fn delta_reports_ordered_added_changed_and_removed_selections() {
+    let objects = CountingStore::new(memory_store("revision-map-delta"));
+    let maps = RevisionMapStore::new(&objects);
+    let empty = maps.empty_root().await.unwrap();
+    let keys = [1_u8, 2, 3].map(|byte| ChangeId::from_bytes([byte; 16]));
+    let revisions = [1_u8, 2, 3, 4].map(|byte| RevisionId::from_digest([byte; 32]));
+    let basis = maps
+        .update_batch(
+            empty,
+            [(keys[0], Some(revisions[0])), (keys[1], Some(revisions[1]))],
+        )
+        .await
+        .unwrap();
+    let frontier = maps
+        .update_batch(
+            basis,
+            [
+                (keys[0], None),
+                (keys[1], Some(revisions[2])),
+                (keys[2], Some(revisions[3])),
+            ],
+        )
+        .await
+        .unwrap();
+    objects.take_reads();
+
+    assert_eq!(
+        maps.delta(basis, frontier, RevisionMapDeltaLimits::default())
+            .await
+            .unwrap(),
+        vec![
+            RevisionMapDelta::Removed {
+                change: keys[0],
+                revision: revisions[0],
+            },
+            RevisionMapDelta::Changed {
+                change: keys[1],
+                basis: revisions[1],
+                frontier: revisions[2],
+            },
+            RevisionMapDelta::Added {
+                change: keys[2],
+                revision: revisions[3],
+            },
+        ]
+    );
+
+    objects.take_reads();
+    assert!(
+        maps.delta(basis, basis, RevisionMapDeltaLimits::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        objects.take_reads(),
+        0,
+        "equal roots require no store reads"
+    );
+}
+
+#[tokio::test]
+async fn delta_prunes_a_representative_ten_thousand_entry_map() {
+    let objects = CountingStore::new(memory_store("revision-map-delta-large"));
+    let maps = RevisionMapStore::new(&objects);
+    let empty = maps.empty_root().await.unwrap();
+    let entries = (0_u32..10_000).map(|number| {
+        let mut bytes = [0_u8; 16];
+        bytes[12..].copy_from_slice(&number.to_be_bytes());
+        (
+            ChangeId::from_bytes(bytes),
+            Some(RevisionId::from_digest([number as u8; 32])),
+        )
+    });
+    let basis = maps.update_batch(empty, entries).await.unwrap();
+    let changed_key = {
+        let mut bytes = [0_u8; 16];
+        bytes[12..].copy_from_slice(&5_000_u32.to_be_bytes());
+        ChangeId::from_bytes(bytes)
+    };
+    let replacement = RevisionId::from_digest([0xfe; 32]);
+    let frontier = maps.insert(basis, changed_key, replacement).await.unwrap();
+    objects.take_reads();
+
+    assert_eq!(
+        maps.delta(basis, frontier, RevisionMapDeltaLimits::default())
+            .await
+            .unwrap(),
+        vec![RevisionMapDelta::Changed {
+            change: changed_key,
+            basis: RevisionId::from_digest([5_000_u32 as u8; 32]),
+            frontier: replacement,
+        }]
+    );
+    let reads = objects.take_reads();
+    assert!(
+        reads <= 34,
+        "one-key delta read {reads} nodes, expected O(key depth)"
+    );
+}
+
+#[tokio::test]
+async fn delta_enforces_selection_node_and_pending_bounds() {
+    let objects = memory_store("revision-map-delta-bounds");
+    let maps = RevisionMapStore::new(&objects);
+    let empty = maps.empty_root().await.unwrap();
+    let first = ChangeId::from_bytes([1; 16]);
+    let second = ChangeId::from_bytes([2; 16]);
+    let root = maps
+        .update_batch(
+            empty,
+            [
+                (first, Some(RevisionId::from_digest([1; 32]))),
+                (second, Some(RevisionId::from_digest([2; 32]))),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        maps.delta(
+            empty,
+            root,
+            RevisionMapDeltaLimits {
+                max_selections: 1,
+                ..Default::default()
+            },
+        )
+        .await,
+        Err(RevisionMapError::DeltaSelectionLimitExceeded { limit: 1 })
+    ));
+    assert!(matches!(
+        maps.delta(
+            empty,
+            root,
+            RevisionMapDeltaLimits {
+                max_nodes: 1,
+                ..Default::default()
+            },
+        )
+        .await,
+        Err(RevisionMapError::DeltaNodeLimitExceeded { limit: 1 })
+    ));
+    assert!(matches!(
+        maps.delta(
+            empty,
+            root,
+            RevisionMapDeltaLimits {
+                max_pending: 0,
+                ..Default::default()
+            },
+        )
+        .await,
+        Err(RevisionMapError::DeltaPendingLimitExceeded { limit: 0 })
     ));
 }
 

@@ -100,10 +100,11 @@ impl SegmentIndexEntry {
             crate::CanonicalObjectKind::ConflictSetNode => 11,
             crate::CanonicalObjectKind::ContentSetNode => 12,
             crate::CanonicalObjectKind::RetainedSetNode => 13,
-            crate::CanonicalObjectKind::BranchManifest => 14,
+            crate::CanonicalObjectKind::ViewLabelManifest => 14,
             crate::CanonicalObjectKind::RepositoryEnvelope => 15,
             crate::CanonicalObjectKind::Edit => 16,
             crate::CanonicalObjectKind::ChangeMapNode => 17,
+            crate::CanonicalObjectKind::ViewLineageMapNode => 18,
         }
     }
 
@@ -123,10 +124,11 @@ impl SegmentIndexEntry {
             11 => crate::CanonicalObjectKind::ConflictSetNode,
             12 => crate::CanonicalObjectKind::ContentSetNode,
             13 => crate::CanonicalObjectKind::RetainedSetNode,
-            14 => crate::CanonicalObjectKind::BranchManifest,
+            14 => crate::CanonicalObjectKind::ViewLabelManifest,
             15 => crate::CanonicalObjectKind::RepositoryEnvelope,
             16 => crate::CanonicalObjectKind::Edit,
             17 => crate::CanonicalObjectKind::ChangeMapNode,
+            18 => crate::CanonicalObjectKind::ViewLineageMapNode,
             _ => return None,
         })
     }

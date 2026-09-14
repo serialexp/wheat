@@ -321,12 +321,9 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         ],
     );
 
-    // Import currently materializes as a convenience; Phase 1 must also support the explicit command.
-    let materialized = harness.json_ok(
-        &harness.workspace,
-        &["materialize", "--source", "branch:refs/heads/main"],
-    );
-    assert_eq!(materialized["command"], "materialize");
+    // Import currently materializes as a convenience; Phase 1 must also support an explicit switch.
+    let materialized = harness.json_ok(&harness.workspace, &["switch", "main"]);
+    assert_eq!(materialized["command"], "switch");
     assert_workspace_entries(
         &harness.workspace,
         vec![
@@ -659,7 +656,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
 
     // JSON status intentionally has no conflict count; durable conflict detail is a separate contract.
     let conflicted_status = harness.json_ok(&harness.workspace, &["status"]);
-    assert!(conflicted_status["result"]["working_view"].is_array());
+    assert!(conflicted_status["result"]["effective_view"].is_array());
     let conflicts_first = harness.ok(&harness.workspace, &["conflicts", "--format=json"]);
     let conflicts_first_document = json_document(&conflicts_first);
     assert_eq!(conflicts_first_document["ok"], true);
@@ -714,7 +711,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     fs::remove_file(harness.workspace.join("nested/created.txt")).unwrap();
 
     // Conflicted working state remains materializable and includes successful descendant paths.
-    harness.ok(&harness.workspace, &["materialize", "--source", "working"]);
+    harness.ok(&harness.workspace, &["materialize"]);
     assert_eq!(
         fs::read(harness.workspace.join("shared.txt")).unwrap(),
         b"ancestor revised\n"
@@ -740,13 +737,16 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         harness.json_ok(&harness.workspace, &["conflicts"])["result"]["conflicts"],
         serde_json::json!([])
     );
-    harness.ok(&harness.workspace, &["materialize", "--source", "working"]);
+    harness.ok(&harness.workspace, &["materialize"]);
     let clean_before_push = harness.json_ok(&harness.workspace, &["status"]);
     assert_eq!(clean_before_push["result"]["authority_advanced"], false);
     assert_eq!(
         clean_before_push["result"]["changes"],
         serde_json::json!([])
     );
+    let effective_view: wheat_core::ViewId =
+        serde_json::from_value(clean_before_push["result"]["effective_view"].clone()).unwrap();
+    let effective_view = effective_view.to_string();
     assert_eq!(
         harness.json_ok(&harness.workspace, &["conflicts"])["result"]["conflicts"],
         serde_json::json!([])
@@ -780,7 +780,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
             "--to",
             "refs/heads/main",
             "--source",
-            "working",
+            &effective_view,
         ],
     );
     assert_eq!(pushed["command"], "push");
@@ -836,13 +836,21 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     let pinned_metadata = fs::read(harness.workspace.join(".wheat/workspace.json")).unwrap();
     let metadata_document: Value = serde_json::from_slice(&pinned_metadata).unwrap();
     assert_eq!(metadata_document["format"], "wheat-workspace");
-    assert_eq!(metadata_document["version"], 2);
+    assert_eq!(metadata_document["version"], 3);
+    assert_eq!(metadata_document["active_label"], "main");
     assert_eq!(
-        metadata_document["selection"],
-        serde_json::json!({"kind": "working"})
+        metadata_document["basis"],
+        expected_reopened["result"]["basis"]
+    );
+    assert_eq!(
+        metadata_document["selected_frontier"],
+        expected_reopened["result"]["selected_frontier"]
     );
     assert_eq!(metadata_document["selected_change"], descendant_change);
-    assert_eq!(metadata_document["pending_selection"], Value::Null);
+    assert_eq!(
+        metadata_document["pending_repository_operation"],
+        Value::Null
+    );
     assert_eq!(
         metadata_document["materialized"]["repository_head"]["generation"],
         expected_reopened["result"]["materialized_head_generation"]
@@ -860,7 +868,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     assert_eq!(reopened, expected_reopened);
     assert_eq!(
         reopened["result"]["materialized_view"],
-        reopened["result"]["working_view"]
+        reopened["result"]["effective_view"]
     );
     assert_eq!(
         reopened["result"]["materialized_head_generation"],

@@ -101,7 +101,7 @@ digest_id!(ConflictId);
 digest_id!(ViewId);
 digest_id!(ContentManifestId);
 digest_id!(RepositoryStateId);
-digest_id!(BranchManifestId);
+digest_id!(ViewLabelManifestId);
 digest_id!(RepositoryEnvelopeId);
 digest_id!(RevisionMapId);
 digest_id!(ChangeMapId);
@@ -109,6 +109,7 @@ digest_id!(ApplicationMapId);
 digest_id!(ConflictSetId);
 digest_id!(ContentSetId);
 digest_id!(RetainedSetId);
+digest_id!(ViewLineageMapId);
 
 macro_rules! object_id_from {
     ($($name:ident),+ $(,)?) => {
@@ -132,7 +133,7 @@ object_id_from!(
     ViewId,
     ContentManifestId,
     RepositoryStateId,
-    BranchManifestId,
+    ViewLabelManifestId,
     RepositoryEnvelopeId,
     RevisionMapId,
     ChangeMapId,
@@ -140,6 +141,7 @@ object_id_from!(
     ConflictSetId,
     ContentSetId,
     RetainedSetId,
+    ViewLineageMapId,
 );
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

@@ -29,8 +29,11 @@ fn revision_and_view_bytes() -> (Vec<u8>, Vec<u8>) {
     let content = wheat_store::ContentStore::new(tempfile::tempdir().unwrap().keep());
     content.put(b"value").unwrap();
     let mut repository = Repository::new(Tree::new());
+    let basis = repository.base_view().id;
     let (_, outcome) = repository
         .create_change(
+            basis,
+            basis,
             [],
             revision_edits("file", b"value"),
             ApplicationContext::new(&content),
@@ -41,7 +44,10 @@ fn revision_and_view_bytes() -> (Vec<u8>, Vec<u8>) {
             .revision(outcome.revision_id)
             .unwrap()
             .canonical_bytes(),
-        repository.working_view().canonical_bytes(),
+        repository
+            .view(outcome.resulting_view)
+            .unwrap()
+            .canonical_bytes(),
     )
 }
 

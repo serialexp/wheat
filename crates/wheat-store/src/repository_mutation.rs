@@ -30,6 +30,8 @@ pub enum RepositoryMutationError {
     #[error(transparent)]
     Collections(#[from] crate::CollectionError),
     #[error(transparent)]
+    ViewLineage(#[from] crate::ViewLineageError),
+    #[error(transparent)]
     Trees(#[from] MerkleTreeError),
     #[error(transparent)]
     Objects(#[from] crate::ObjectStoreError),
@@ -50,6 +52,7 @@ type Result<T> = std::result::Result<T, RepositoryMutationError>;
 pub struct PreparedRepositoryMutation {
     expected: RepositoryHead,
     state: RepositoryStateId,
+    resulting_view: ViewId,
     objects: usize,
     content: usize,
     _sealed: (),
@@ -59,6 +62,10 @@ impl PreparedRepositoryMutation {
     #[must_use]
     pub fn state(&self) -> RepositoryStateId {
         self.state
+    }
+    #[must_use]
+    pub fn resulting_view(&self) -> ViewId {
+        self.resulting_view
     }
     #[must_use]
     pub fn object_count(&self) -> usize {
@@ -74,17 +81,6 @@ pub struct PersistedRepositoryMutator<'a, O, P> {
     objects: &'a O,
     content: &'a ContentStore,
     publications: &'a P,
-    target: MutationTarget,
-}
-
-/// Which repository view a persisted mutation advances.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MutationTarget {
-    /// Advance only the mutable working view, leaving the published view unchanged.
-    #[default]
-    WorkingOnly,
-    /// Advance the working and published views to the mutation's resulting view.
-    PublishWorking,
 }
 
 /// A conflict-resolution intent over the paths whose edits failed in one exact application.
@@ -102,9 +98,9 @@ pub struct PersistedConflictResolution {
 struct Active {
     state: RepositoryStateRecord,
     base: ViewRecord,
-    working: ViewRecord,
+    effective: ViewRecord,
     revisions: BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
-    /// The revision identities and canonical order represented by `working` before this mutation.
+    /// The revision identities and canonical order represented by `effective` before this mutation.
     persisted_revisions: BTreeMap<ChangeId, RevisionId>,
     persisted_order: Vec<ChangeId>,
     reverse_dependencies: BTreeMap<ChangeId, BTreeSet<ChangeId>>,
@@ -113,6 +109,7 @@ struct Active {
 #[derive(Default)]
 struct Fresh {
     changes: BTreeSet<ChangeObjectId>,
+    view_edges: BTreeSet<(ViewId, ViewId)>,
     views: BTreeSet<ViewId>,
     revisions: BTreeSet<RevisionId>,
     applications: BTreeSet<ApplicationId>,
@@ -127,23 +124,17 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             objects,
             content,
             publications,
-            target: MutationTarget::default(),
         }
-    }
-
-    /// Configure whether successful mutations also publish their resulting working view.
-    #[must_use]
-    pub fn with_target(mut self, target: MutationTarget) -> Self {
-        self.target = target;
-        self
     }
 
     pub async fn create(
         &self,
         expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
         proposal: ChangeProposal,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        let active = self.open(expected).await?;
+        let active = self.open(expected, basis_view, effective_view).await?;
         self.create_opened(expected, active, proposal, false).await
     }
 
@@ -155,9 +146,11 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     pub async fn create_on_frontier(
         &self,
         expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
         mut proposal: ChangeProposal,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        let active = self.open(expected).await?;
+        let active = self.open(expected, basis_view, effective_view).await?;
         if !proposal.dependencies.is_empty() {
             return Err(RepositoryMutationError::FrontierDependencies);
         }
@@ -174,7 +167,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         expected: RepositoryHead,
         mut active: Active,
         proposal: ChangeProposal,
-        authored_against_working: bool,
+        authored_against_effective: bool,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
         if active.revisions.contains_key(&proposal.id) {
             return Err(RepositoryError::DuplicateChange(proposal.id).into());
@@ -186,8 +179,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
         validate_initial(&proposal.edits)?;
         let mut fresh = Fresh::default();
-        let target = if authored_against_working {
-            active.working
+        let target = if authored_against_effective {
+            active.effective
         } else {
             self.compose(&active, &proposal.dependencies, &mut fresh)
                 .await?
@@ -235,14 +228,14 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             .insert(proposal.id, (revision_id, revision));
         active.rebuild_graph();
         let selected = active.revisions.keys().copied().collect();
-        let working = self.compose(&active, &selected, &mut fresh).await?;
+        let resulting = self.compose(&active, &selected, &mut fresh).await?;
         let outcome = RevisionOutcome {
             revision_id,
-            resulting_view: working.id(),
+            resulting_view: resulting.id(),
             reapplied: Vec::new(),
         };
         let prepared = self
-            .finish(expected, active.state, working.id(), fresh)
+            .finish(expected, active.state, resulting.id(), fresh)
             .await?;
         Ok((prepared, outcome))
     }
@@ -250,9 +243,11 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     pub async fn resolve_conflict(
         &self,
         expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
         resolution: PersistedConflictResolution,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        let active = self.open(expected).await?;
+        let active = self.open(expected, basis_view, effective_view).await?;
         let reader = RepositoryReader::new(self.objects, self.content);
         let revision = reader.revision(resolution.conflict_revision).await?;
         let change = revision.change_id;
@@ -266,7 +261,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
 
         let applications = ApplicationMapStore::new(self.objects);
         let current_application = applications
-            .get(active.working.applications, change)
+            .get(active.effective.applications, change)
             .await?;
         if current_application != Some(resolution.application) {
             return Err(RepositoryError::NotConflicted(resolution.conflict_revision).into());
@@ -373,6 +368,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         };
         self.revise_at(
             expected,
+            basis_view,
+            effective_view,
             change,
             resolution.conflict_revision,
             RevisionMetadata::default(),
@@ -385,25 +382,38 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     pub async fn revise(
         &self,
         expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
         change: ChangeId,
         predecessor: RevisionId,
         metadata: RevisionMetadata,
         edits: RevisionEdits,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        self.revise_at(expected, change, predecessor, metadata, edits, None)
-            .await
+        self.revise_at(
+            expected,
+            basis_view,
+            effective_view,
+            change,
+            predecessor,
+            metadata,
+            edits,
+            None,
+        )
+        .await
     }
 
     async fn revise_at(
         &self,
         expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
         change: ChangeId,
         predecessor: RevisionId,
         metadata: RevisionMetadata,
         edits: RevisionEdits,
         target_override: Option<ViewId>,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        let mut active = self.open(expected).await?;
+        let mut active = self.open(expected, basis_view, effective_view).await?;
         let Some((current, old)) = active.revisions.get(&change).cloned() else {
             return Err(RepositoryError::UnknownChange(change).into());
         };
@@ -447,17 +457,17 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         active.rebuild_graph();
         let descendants = descendants(change, &active.reverse_dependencies);
         let selected = active.revisions.keys().copied().collect();
-        let working = self.compose(&active, &selected, &mut fresh).await?;
+        let resulting = self.compose(&active, &selected, &mut fresh).await?;
         let outcome = RevisionOutcome {
             revision_id,
-            resulting_view: working.id(),
+            resulting_view: resulting.id(),
             reapplied: topological(&active.revisions, &descendants)?
                 .into_iter()
                 .filter(|id| *id != change)
                 .collect(),
         };
         let prepared = self
-            .finish(expected, active.state, working.id(), fresh)
+            .finish(expected, active.state, resulting.id(), fresh)
             .await?;
         Ok((prepared, outcome))
     }
@@ -476,7 +486,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let reader = RepositoryReader::new(self.objects, self.content);
         let old = reader.envelope(prepared.expected.envelope).await?;
         let envelope = RepositoryPublisher::new(self.objects, self.content, self.publications)
-            .prepare_envelope_unchecked(prepared.state, old.branches)
+            .prepare_envelope_unchecked(prepared.state, old.labels)
             .await?;
         let proposed = prepared
             .expected
@@ -488,7 +498,12 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(proposed)
     }
 
-    async fn open(&self, expected: RepositoryHead) -> Result<Active> {
+    async fn open(
+        &self,
+        expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
+    ) -> Result<Active> {
         let actual = self
             .publications
             .read()
@@ -500,11 +515,35 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let state = reader
             .state(reader.envelope(expected.envelope).await?.state)
             .await?;
-        let base = reader.view(state.base_view).await?;
-        let working = reader.view(state.working_view).await?;
+        let retained = RetainedSetStore::new(self.objects);
+        for view in [basis_view, effective_view] {
+            if !retained.contains(state.retained_views, view.into()).await? {
+                return Err(RepositoryPublicationError::InvalidReferences(
+                    "mutation view is not retained",
+                )
+                .into());
+            }
+        }
+        if effective_view != basis_view
+            && !crate::ViewLineageMapStore::new(self.objects)
+                .is_descendant(
+                    state.view_lineage,
+                    basis_view,
+                    effective_view,
+                    crate::ViewLineageLimits::default(),
+                )
+                .await?
+        {
+            return Err(RepositoryPublicationError::InvalidReferences(
+                "effective view does not descend from basis view",
+            )
+            .into());
+        }
+        let base = reader.view(basis_view).await?;
+        let effective = reader.view(effective_view).await?;
         let mut revisions = BTreeMap::new();
         let mut cursor = RevisionMapStore::new(self.objects)
-            .cursor(working.revisions)
+            .cursor(effective.revisions)
             .await?;
         while let Some((change, id)) = cursor.next().await? {
             let record = reader.revision(id).await?;
@@ -523,7 +562,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let mut active = Active {
             state,
             base,
-            working,
+            effective,
             revisions,
             persisted_revisions,
             persisted_order: Vec::new(),
@@ -572,14 +611,14 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let mut view = if prefix == 0 {
             active.base
         } else if prefix == active.persisted_order.len() {
-            active.working
+            active.effective
         } else {
             let next = active.persisted_order[prefix];
             let application = applications
-                .get(active.working.applications, next)
+                .get(active.effective.applications, next)
                 .await?
                 .ok_or(RepositoryError::InvalidRepositoryState(
-                    "working view lacks canonical application",
+                    "effective view lacks canonical application",
                 ))?;
             let application = RepositoryReader::new(self.objects, self.content)
                 .application(application)
@@ -614,6 +653,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             let content = self
                 .update_visible_manifest(view.required_content, &edits, tree, &view, fresh)
                 .await?;
+            let parent = view.id();
             view = ViewRecord {
                 tree,
                 revisions: revision_root,
@@ -622,6 +662,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 required_content: content,
             };
             self.put_view(&view, fresh).await?;
+            if parent != view.id() {
+                fresh.view_edges.insert((parent, view.id()));
+            }
         }
         Ok(view)
     }
@@ -881,7 +924,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let reader = RepositoryReader::new(self.objects, self.content);
         for evidence in &edits.transition.resolutions {
             let current = applications
-                .get(active.working.applications, change)
+                .get(active.effective.applications, change)
                 .await?;
             if current != Some(evidence.application) {
                 return Err(RepositoryError::InvalidEditTransition(
@@ -920,7 +963,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         &self,
         expected: RepositoryHead,
         old: RepositoryStateRecord,
-        working: ViewId,
+        resulting_view: ViewId,
         fresh: Fresh,
     ) -> Result<PreparedRepositoryMutation> {
         for id in &fresh.content {
@@ -967,15 +1010,13 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         self.objects
             .put_if_absent(manifest.id().into(), &manifest.canonical_bytes())
             .await?;
-        let published_view = match self.target {
-            MutationTarget::WorkingOnly => old.published_view,
-            MutationTarget::PublishWorking => working,
-        };
+        let view_lineage = crate::ViewLineageMapStore::new(self.objects)
+            .insert_edges(old.view_lineage, fresh.view_edges.iter().copied())
+            .await?;
         let state = RepositoryStateRecord {
             base_view: old.base_view,
-            working_view: working,
-            published_view,
             changes: old.changes,
+            view_lineage,
             required_content: manifest.id(),
             retained_changes,
             retained_views,
@@ -988,6 +1029,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(PreparedRepositoryMutation {
             expected,
             state: state.id(),
+            resulting_view,
             objects: fresh.objects + 2,
             content: fresh.content.len(),
             _sealed: (),

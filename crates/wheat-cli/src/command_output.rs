@@ -496,9 +496,7 @@ fn classify(error: &Error) -> Classification {
         }
         if let Some(repository) = cause.downcast_ref::<RepositoryError>() {
             return match repository {
-                RepositoryError::StaleRevision(_) | RepositoryError::StalePublication { .. } => {
-                    class("state", "stale_revision", true, 3)
-                }
+                RepositoryError::StaleRevision(_) => class("state", "stale_revision", true, 3),
                 RepositoryError::NotConflicted(_) | RepositoryError::InvalidConflictResolution => {
                     class("input", "invalid_conflict_resolution", false, 2)
                 }

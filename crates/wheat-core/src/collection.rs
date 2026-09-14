@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApplicationId, ApplicationMapId, CanonicalObjectError, ChangeMapId, ChangeObjectId,
-    ConflictSetId, ContentSetId, RetainedSetId,
+    ConflictSetId, ContentSetId, RetainedSetId, ViewLineageMapId,
 };
 
 macro_rules! child {
@@ -20,6 +20,7 @@ child!(ChangeMapChild, ChangeMapId);
 child!(ConflictSetChild, ConflictSetId);
 child!(ContentSetChild, ContentSetId);
 child!(RetainedSetChild, RetainedSetId);
+child!(ViewLineageMapChild, ViewLineageMapId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationMapNode {
@@ -52,6 +53,40 @@ impl ApplicationMapNode {
     #[must_use]
     pub fn id(&self) -> ApplicationMapId {
         ApplicationMapId::of_canonical_bytes(&self.canonical_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ViewLineageMapNode {
+    pub prefix: Vec<u8>,
+    pub value: Option<RetainedSetId>,
+    pub children: Vec<ViewLineageMapChild>,
+}
+
+impl ViewLineageMapNode {
+    pub fn new(
+        prefix: Vec<u8>,
+        value: Option<RetainedSetId>,
+        mut children: Vec<ViewLineageMapChild>,
+    ) -> Result<Self, CanonicalObjectError> {
+        children.sort_by_key(|child| child.edge);
+        let node = Self {
+            prefix,
+            value,
+            children,
+        };
+        crate::wire::validate_view_lineage_map_node(&node)?;
+        Ok(node)
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::view_lineage_map_node_bytes(self)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> ViewLineageMapId {
+        ViewLineageMapId::of_canonical_bytes(&self.canonical_bytes())
     }
 }
 

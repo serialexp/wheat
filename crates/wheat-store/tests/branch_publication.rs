@@ -2,28 +2,29 @@ use wheat_core::*;
 use wheat_store::*;
 
 #[tokio::test]
-async fn named_branches_survive_reopen_and_ordinary_mutations() {
+async fn named_labels_survive_reopen_and_ordinary_mutations() {
     let dir = tempfile::tempdir().unwrap();
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
     let heads = LocalPublicationStore::new(dir.path().join("head"));
     let mut repo = Repository::new(Tree::new());
+    let basis = repo.base_view().id;
     let (_, outcome) = repo
         .create_change(
+            basis,
+            basis,
             [],
             RevisionEdits::default(),
             ApplicationContext::new(&content),
         )
         .unwrap();
-    let branches = BranchManifestRecord::new([
-        ("refs/heads/main", outcome.resulting_view),
-        ("refs/heads/archive", repo.published_view().id),
-    ])
-    .unwrap();
+    let labels =
+        ViewLabelManifestRecord::new([("main", outcome.resulting_view), ("archive", basis)])
+            .unwrap();
     let publisher = RepositoryPublisher::new(&objects, &content, &heads);
     let closure = publisher.prepare(&repo).await.unwrap();
     let envelope = publisher
-        .prepare_envelope(closure.state.id, &branches)
+        .prepare_envelope(closure.state.id, &labels)
         .await
         .unwrap();
     let initial = publisher
@@ -35,12 +36,14 @@ async fn named_branches_survive_reopen_and_ordinary_mutations() {
     let reader = RepositoryReader::new(&reopened, &content);
     let record = reader.envelope(initial.envelope).await.unwrap();
     assert_eq!(
-        reader.branch_manifest(record.branches).await.unwrap(),
-        branches
+        reader.view_label_manifest(record.labels).await.unwrap(),
+        labels
     );
     let mut editable = reader.hydrate(record.state).await.unwrap();
-    editable
+    let (new_change, new_outcome) = editable
         .create_change(
+            basis,
+            outcome.resulting_view,
             [],
             RevisionEdits::default(),
             ApplicationContext::new(&content),
@@ -51,16 +54,22 @@ async fn named_branches_survive_reopen_and_ordinary_mutations() {
         .await
         .unwrap();
     let updated = reader.envelope(next.envelope).await.unwrap();
-    assert_eq!(updated.branches, record.branches);
+    let updated_repository = reader.hydrate(updated.state).await.unwrap();
     assert_eq!(
-        reader.branch_manifest(updated.branches).await.unwrap(),
-        branches
+        updated_repository.current_revision(new_outcome.resulting_view, new_change),
+        Some(new_outcome.revision_id),
+        "the explicitly selected effective view must survive publication and reopen"
+    );
+    assert_eq!(updated.labels, record.labels);
+    assert_eq!(
+        reader.view_label_manifest(updated.labels).await.unwrap(),
+        labels
     );
     assert_ne!(updated.state, record.state);
 }
 
 #[tokio::test]
-async fn dangling_branch_target_never_creates_head() {
+async fn dangling_label_target_never_creates_head() {
     let dir = tempfile::tempdir().unwrap();
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
@@ -70,11 +79,9 @@ async fn dangling_branch_target_never_creates_head() {
         .prepare(&Repository::new(Tree::new()))
         .await
         .unwrap();
-    let branches =
-        BranchManifestRecord::new([("refs/heads/missing", ViewId::from_digest([42; 32]))]).unwrap();
-    let prepared = publisher
-        .prepare_envelope(closure.state.id, &branches)
-        .await;
+    let labels =
+        ViewLabelManifestRecord::new([("missing", ViewId::from_digest([42; 32]))]).unwrap();
+    let prepared = publisher.prepare_envelope(closure.state.id, &labels).await;
     if let Ok(envelope) = prepared {
         assert!(publisher.initialize_envelope(envelope).await.is_err());
     }

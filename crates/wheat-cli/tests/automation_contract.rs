@@ -174,7 +174,7 @@ fn human_output_and_raw_cat_remain_the_defaults() {
     let (root, config) = setup();
     let status = command(root.path(), config.path(), &["status"]);
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("working view:"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("effective view:"));
     assert!(!String::from_utf8_lossy(&status.stdout).contains("wheat-command-result"));
 
     let created = command(

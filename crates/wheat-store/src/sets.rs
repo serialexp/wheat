@@ -151,6 +151,14 @@ macro_rules! set_api {
             ) -> Result<$node, CollectionError> {
                 Ok(self.inner.read_public_at(id, position).await?)
             }
+            #[allow(dead_code)] // Only retained sets currently need byte-accounted lineage reads.
+            pub(crate) async fn read_node_at_with_size(
+                &self,
+                id: $id,
+                position: usize,
+            ) -> Result<($node, usize), CollectionError> {
+                Ok(self.inner.read_public_at_with_size(id, position).await?)
+            }
             /// Persist one already-canonical node produced by a sorted collection builder.
             pub async fn write_node(&self, node: $node) -> Result<$id, CollectionError> {
                 let id = node.id();

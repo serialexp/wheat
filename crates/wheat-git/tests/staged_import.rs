@@ -9,7 +9,7 @@ use wheat_core::{EditOperation, ObjectId, RevisionId, ViewId};
 use wheat_git::{DEFAULT_STAGE_COMMITS, import_repository, stage_import};
 use wheat_store::{
     ContentStore, ImmutableObjectStore, LooseObjectStore, ObjectStoreError, PackedObjectStore,
-    RepositoryReader, StoredObject,
+    RepositoryReader, RetainedSetStore, StoredObject,
 };
 
 #[derive(Clone, Copy)]
@@ -800,16 +800,23 @@ async fn finalization_retains_branches_without_journal_and_refuses_partial_impor
     std::fs::rename(&journal, dir.path().join("inspection.sqlite")).unwrap();
     let reader = RepositoryReader::new(&objects, &content);
     let envelope = reader.envelope(head.envelope).await.unwrap();
-    let branches = reader.branch_manifest(envelope.branches).await.unwrap();
-    assert_eq!(branches.branches.len(), 2);
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    assert_eq!(labels.labels.len(), 2);
     for (name, branch) in reference.branches {
+        let label = &labels.labels[&name];
+        assert_eq!(label.view, branch.tip.resulting_view);
         assert_eq!(
-            branches.branches[&format!("refs/heads/{name}")],
-            branch.tip.resulting_view
+            label.original_git_ref.as_deref(),
+            Some(format!("refs/heads/{name}").as_str())
         );
     }
     let state = reader.state(envelope.state).await.unwrap();
-    assert_eq!(state.working_view, branches.branches["refs/heads/main"]);
+    assert!(
+        RetainedSetStore::new(&objects)
+            .contains(state.retained_views, labels.labels["main"].view.into())
+            .await
+            .unwrap()
+    );
     reader.validate_complete(envelope.state).await.unwrap();
     // Complete-state validation above proves the aggregate contains every historical
     // edit/evidence reference even though individual views contain visible tree content only.
