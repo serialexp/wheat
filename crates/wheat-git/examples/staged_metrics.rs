@@ -9,7 +9,7 @@ use wheat_core::ObjectId;
 use wheat_git::{FinalizePhase, finalize_import_with_observer, stage_import};
 use wheat_store::*;
 
-const OBJECT_KIND_COUNT: usize = 16;
+const OBJECT_KIND_COUNT: usize = 18;
 
 struct Meter {
     inner: PackedObjectStore,
@@ -94,7 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let journal = output.join("import.sqlite");
     let start = Instant::now();
     println!("starting=stage");
-    let staged = stage_import(&source, &journal, &objects, &content, None).await?;
+    let mut staged = stage_import(&source, &journal, &objects, &content, None).await?;
+    while !staged.complete {
+        staged = stage_import(&source, &journal, &objects, &content, None).await?;
+        println!(
+            "stage_progress completed={} pending={} discovery_pending={}",
+            staged.completed_commits, staged.pending_commits, staged.discovery_pending
+        );
+    }
     objects.report("stage", start);
     println!(
         "commits={} branches={} complete={}",
