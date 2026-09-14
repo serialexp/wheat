@@ -27,9 +27,15 @@ impl Default for ExportLimits {
     fn default() -> Self {
         Self {
             max_applications: 10_000,
-            max_tree_entries: 250_000,
+            // This counts unique directory entries across path-shared trees in one
+            // projection. The qualified Gothab history exceeds 250k while remaining
+            // bounded well below this explicit ceiling.
+            max_tree_entries: 1_000_000,
             max_tree_depth: 128,
-            max_content_bytes: 256 * 1024 * 1024,
+            // This bounds distinct content read during one projection, not peak
+            // residency: blobs are written to Git and released one at a time.
+            // Keep headroom for the qualified Gothab history's distinct revisions.
+            max_content_bytes: 1024 * 1024 * 1024,
         }
     }
 }

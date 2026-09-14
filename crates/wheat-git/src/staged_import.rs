@@ -1,7 +1,7 @@
 //! Resumable import into immutable storage. This module deliberately does not publish a repository head.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     path::Path,
 };
 
@@ -37,7 +37,7 @@ mod tree_diff;
 // shared collection nodes seen during staged-import resume.
 const CACHE_ENTRIES: usize = 16_384;
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
-const SET_RECEIPTS: usize = 4_096;
+const PROOF_RECEIPTS: usize = 65_536;
 
 const NAMESPACE: Uuid = Uuid::from_u128(0xc245_a89b_519f_5a4b_9b36_d62b_78f5_2901);
 const SNAPSHOT_VERSION: &[u8] = b"wheat-git-staged-import-v1\0";
@@ -191,36 +191,14 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     let empty = writer.empty_view().await?;
     batch.flush().await.map_err(CommitWriterError::from)?;
     let cached = cache::CachedObjects::new(objects, CACHE_ENTRIES, CACHE_BYTES);
-    let mut receipts = ProofReceipts::new(SET_RECEIPTS);
-
-    // A journal is only a hint: authenticate every completed mapping before consulting
-    // crash-left prepared mappings. A prepared descendant must never mask corruption in
-    // ancestry that the journal already claims is durable.
-    let mut after = None::<Vec<u8>>;
-    loop {
-        let page = journal.completed(after.as_deref(), DISCOVERY_BATCH)?;
-        if page.is_empty() {
-            break;
-        }
-        for (oid, native) in page {
-            verify_mapping(
-                &cached,
-                content,
-                &journal,
-                empty,
-                &oid,
-                native,
-                &mut receipts,
-                false,
-            )
-            .await?;
-            after = Some(oid);
-        }
-    }
+    let mut receipts = ProofReceipts::new(PROOF_RECEIPTS);
+    let mut verified_completed = HashSet::new();
+    let mut tree_work = Vec::new();
 
     // A crash after recording preparation but before promotion leaves mappings that
-    // are hints only. Reauthenticate them strictly against the backing store, promote
-    // the whole bounded group atomically, or reset all of them to pending work.
+    // are hints only. Reauthenticate their completed frontier and then the prepared
+    // group strictly against the backing store. Cold completed history is verified
+    // once at final publication rather than quadratically on every bounded resume.
     let prepared = journal.prepared(DEFAULT_STAGE_COMMITS + 1)?;
     if !prepared.is_empty() {
         let mut valid = prepared.len() <= DEFAULT_STAGE_COMMITS;
@@ -228,18 +206,31 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
             if !valid {
                 break;
             }
-            if verify_mapping(
+            if authenticate_completed_parents(
                 &cached,
                 content,
                 &journal,
                 empty,
                 oid,
-                *native,
                 &mut receipts,
-                true,
+                &mut verified_completed,
+                &mut tree_work,
             )
             .await
             .is_err()
+                || verify_mapping(
+                    &cached,
+                    content,
+                    &journal,
+                    empty,
+                    oid,
+                    *native,
+                    &mut receipts,
+                    true,
+                    &mut tree_work,
+                )
+                .await
+                .is_err()
             {
                 valid = false;
                 break;
@@ -249,7 +240,8 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
             journal.complete_many(&prepared)?;
         } else {
             journal.reset_prepared()?;
-            receipts = ProofReceipts::new(SET_RECEIPTS);
+            receipts = ProofReceipts::new(PROOF_RECEIPTS);
+            verified_completed.clear();
         }
     }
 
@@ -265,6 +257,17 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
         let Some(work) = journal.ready(1)?.into_iter().next() else {
             break;
         };
+        authenticate_completed_parents(
+            &cached,
+            content,
+            &journal,
+            empty,
+            &work.oid,
+            &mut receipts,
+            &mut verified_completed,
+            &mut tree_work,
+        )
+        .await?;
         let oid = gix::ObjectId::from_bytes_or_panic(&work.oid);
         let commit = git.find_commit(oid).map_err(git_error_local)?;
         let parent_native = work
@@ -307,20 +310,13 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     }
     if !prepared.is_empty() {
         // Buffered reads are not proof of durability. One bounded flush covers the
-        // staged group, then every mapping is authenticated against the backing store.
+        // staged group. Freshly written mappings were derived from authenticated
+        // parents by PersistedCommitWriter; verify their top-level durable records
+        // before promotion. Final publication performs the exhaustive replay/tree
+        // authentication once across the whole pinned import.
         batch.flush().await.map_err(CommitWriterError::from)?;
         for (oid, native) in &prepared {
-            verify_mapping(
-                &cached,
-                content,
-                &journal,
-                empty,
-                oid,
-                *native,
-                &mut receipts,
-                true,
-            )
-            .await?;
+            verify_durable_mapping(&cached, content, oid, *native).await?;
         }
         journal.complete_many(&prepared)?;
     }
@@ -347,20 +343,137 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     })
 }
 
-async fn collect_tree_content<O: ImmutableObjectStore>(
+async fn authenticate_tree_once<O: ImmutableObjectStore>(
     trees: &MerkleTreeStore<'_, O>,
     root: wheat_core::TreeId,
-    visible: &mut std::collections::BTreeSet<wheat_core::ContentId>,
+    receipts: &mut ProofReceipts,
+    pending: &mut Vec<(wheat_core::TreeId, bool)>,
 ) -> Result<(), CommitWriterError> {
-    for entry in trees.read_node(root).await?.entries.values() {
-        match entry {
-            wheat_core::DirectoryEntry::File(value) => {
-                visible.insert(value.content);
-            }
-            wheat_core::DirectoryEntry::Directory(child) => {
-                Box::pin(collect_tree_content(trees, *child, visible)).await?;
-            }
+    pending.clear();
+    pending.push((root, false));
+    while let Some((tree, visited)) = pending.pop() {
+        let object_id = tree.into();
+        if receipts.contains(3, object_id) {
+            continue;
         }
+        if visited {
+            // Record only after every descendant has authenticated successfully.
+            receipts.record(3, object_id);
+            continue;
+        }
+        let node = trees.read_node(tree).await?;
+        pending.push((tree, true));
+        pending.extend(node.entries.values().filter_map(|entry| match entry {
+            wheat_core::DirectoryEntry::Directory(child) => Some((*child, false)),
+            wheat_core::DirectoryEntry::File(_) => None,
+        }));
+    }
+    Ok(())
+}
+
+pub(super) async fn authenticate_completed_mappings<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    journal: &ImportJournal,
+    empty: wheat_core::ViewId,
+) -> Result<(), StagedImportError> {
+    let cached = cache::CachedObjects::new(objects, CACHE_ENTRIES, CACHE_BYTES);
+    // The final publisher's complete repository verifier authenticates every
+    // retained tree and radix closure before authority becomes visible. This pass
+    // binds every journal mapping to its pinned Git commit and replays edits;
+    // avoid quadratic re-walks of persistent structural roots here.
+    let mut receipts = ProofReceipts::new(PROOF_RECEIPTS);
+    receipts.skip_structural_walks = true;
+    let mut tree_work = Vec::new();
+    let mut after = None::<Vec<u8>>;
+    loop {
+        let page = journal.completed(after.as_deref(), DISCOVERY_BATCH)?;
+        if page.is_empty() {
+            break;
+        }
+        for (oid, native) in page {
+            verify_mapping(
+                &cached,
+                content,
+                journal,
+                empty,
+                &oid,
+                native,
+                &mut receipts,
+                false,
+                &mut tree_work,
+            )
+            .await?;
+            after = Some(oid);
+        }
+    }
+    Ok(())
+}
+
+async fn verify_durable_mapping<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    oid: &[u8],
+    mapping: NativeResult,
+) -> Result<(), StagedImportError> {
+    let bad = |why: &str| StagedImportError::InvalidMapping(hex(oid), why.to_owned());
+    if mapping.change_id != ChangeId::from_import_identity(NAMESPACE, oid) {
+        return Err(bad("change identity"));
+    }
+    let reader = RepositoryReader::new(objects, content);
+    let revision = reader
+        .revision(mapping.revision_id)
+        .await
+        .map_err(|error| bad(&error.to_string()))?;
+    let application = reader
+        .application(mapping.application_id)
+        .await
+        .map_err(|error| bad(&error.to_string()))?;
+    let view = reader
+        .view(mapping.view_id)
+        .await
+        .map_err(|error| bad(&error.to_string()))?;
+    if revision.change_id != mapping.change_id
+        || application.revision_id != mapping.revision_id
+        || !matches!(
+            application.result,
+            ApplicationResultRecord::Clean { tree }
+                if tree == revision.resulting_tree && tree == view.tree
+        )
+    {
+        return Err(bad("durable revision/application/view relationship"));
+    }
+    Ok(())
+}
+
+async fn authenticate_completed_parents<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    journal: &ImportJournal,
+    empty: wheat_core::ViewId,
+    oid: &[u8],
+    receipts: &mut ProofReceipts,
+    verified: &mut HashSet<Vec<u8>>,
+    tree_work: &mut Vec<(wheat_core::TreeId, bool)>,
+) -> Result<(), StagedImportError> {
+    for parent in journal.parents(oid)? {
+        if verified.contains(&parent) {
+            continue;
+        }
+        let Some(native) = journal.result(&parent)? else {
+            if journal.mapping(&parent)?.is_some() {
+                continue;
+            }
+            return Err(StagedImportError::InvalidMapping(
+                hex(&parent),
+                "missing completed or prepared parent".into(),
+            ));
+        };
+        verify_mapping(
+            objects, content, journal, empty, &parent, native, receipts, false, tree_work,
+        )
+        .await?;
+        verified.insert(parent);
     }
     Ok(())
 }
@@ -435,6 +548,7 @@ fn push(out: &mut Vec<u8>, bytes: &[u8]) {
 struct ProofReceipts {
     max: usize,
     successful: HashSet<(u8, ObjectId)>,
+    skip_structural_walks: bool,
 }
 
 impl ProofReceipts {
@@ -442,6 +556,7 @@ impl ProofReceipts {
         Self {
             max,
             successful: HashSet::new(),
+            skip_structural_walks: false,
         }
     }
 
@@ -467,6 +582,7 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     n: NativeResult,
     receipts: &mut ProofReceipts,
     allow_prepared_parent: bool,
+    tree_work: &mut Vec<(wheat_core::TreeId, bool)>,
 ) -> Result<(), StagedImportError> {
     let bad = |why: &str| StagedImportError::InvalidMapping(hex(oid), why.to_owned());
     if n.change_id != ChangeId::from_import_identity(NAMESPACE, oid) {
@@ -531,32 +647,35 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     if tree != revision.resulting_tree || view.tree != tree {
         return Err(bad("resulting tree"));
     }
-    // Authenticate all roots carried by the claimed view. In particular, walk untouched tree
-    // structure instead of treating a root ID as proof that every referenced node exists.
-    collect_tree_content(&MerkleTreeStore::new(objects), tree, &mut BTreeSet::new())
-        .await
-        .map_err(|error| bad(&error.to_string()))?;
+    // Authenticate every tree node, but only once per invocation. Persistent
+    // path-copying shares unchanged subtrees across views; postorder receipts make
+    // verification proportional to the union of nodes rather than snapshots × tree.
     let required_content = reader
         .manifest(view.required_content)
         .await
         .map_err(|e| bad(&e.to_string()))?
         .content;
-    authenticate_set_once(
-        &ContentSetStore::new(objects),
-        required_content,
-        receipts,
-        1,
-    )
-    .await
-    .map_err(|error| bad(&error.to_string()))?;
-    authenticate_set_once(
-        &ConflictSetStore::new(objects),
-        view.unresolved_conflicts,
-        receipts,
-        2,
-    )
-    .await
-    .map_err(|error| bad(&error.to_string()))?;
+    if !receipts.skip_structural_walks {
+        authenticate_tree_once(&MerkleTreeStore::new(objects), tree, receipts, tree_work)
+            .await
+            .map_err(|error| bad(&error.to_string()))?;
+        authenticate_set_once(
+            &ContentSetStore::new(objects),
+            required_content,
+            receipts,
+            1,
+        )
+        .await
+        .map_err(|error| bad(&error.to_string()))?;
+        authenticate_set_once(
+            &ConflictSetStore::new(objects),
+            view.unresolved_conflicts,
+            receipts,
+            2,
+        )
+        .await
+        .map_err(|error| bad(&error.to_string()))?;
+    }
 
     // Neither the journal nor the claimed trees are authoritative. Authenticate every selected
     // definition and replay it against the authenticated parent before accepting this mapping.

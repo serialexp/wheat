@@ -12,6 +12,8 @@ use wheat_store::{
     RepositoryReader, RetainedSetStore, StoredObject,
 };
 
+const RESUME_READ_BUDGET: usize = 192;
+
 #[derive(Clone, Copy)]
 enum BatchFault {
     None,
@@ -28,6 +30,11 @@ struct ObservedStore {
 struct BlockedGetStore {
     inner: LooseObjectStore,
     blocked: ObjectId,
+}
+
+struct CountingGetStore {
+    inner: LooseObjectStore,
+    gets: AtomicUsize,
 }
 
 impl ObservedStore {
@@ -74,6 +81,34 @@ impl ImmutableObjectStore for ObservedStore {
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.inner.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.inner.exists_many(ids).await
+    }
+}
+
+#[async_trait]
+impl ImmutableObjectStore for CountingGetStore {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         self.inner.get(id).await
     }
 
@@ -423,35 +458,30 @@ async fn failed_batch_flush_completes_nothing_and_resume_is_idempotent() {
 }
 
 #[tokio::test]
-async fn invalid_completed_ancestry_prevents_prepared_descendant_promotion() {
-    let git = linear_fixture(2);
+async fn invalid_completed_frontier_prevents_prepared_descendant_promotion() {
+    let git = linear_fixture(3);
     let dir = tempfile::tempdir().unwrap();
     let journal_path = dir.path().join("import.sqlite");
     let object_path = dir.path().join("objects");
     let objects = LooseObjectStore::new(&object_path);
     let content = ContentStore::new(dir.path().join("content"));
-    stage_import(git.path(), &journal_path, &objects, &content, Some(2))
+    let staged = stage_import(git.path(), &journal_path, &objects, &content, Some(2))
         .await
         .unwrap();
+    assert_eq!(staged.completed_commits, 2);
+    assert_eq!(staged.pending_commits, 1);
 
-    let mut connection = rusqlite::Connection::open(&journal_path).unwrap();
+    let connection = rusqlite::Connection::open(&journal_path).unwrap();
     let blocked: Vec<u8> = connection
         .query_row(
-            "SELECT revision_id FROM work ORDER BY sequence LIMIT 1",
+            "SELECT parent.revision_id FROM work child \
+             JOIN work_parent edge ON edge.oid = child.oid AND edge.position = 0 \
+             JOIN work parent ON parent.oid = edge.parent_oid \
+             WHERE child.status = 0 AND parent.status = 1",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    let transaction = connection.transaction().unwrap();
-    transaction
-        .execute_batch(
-            "INSERT INTO prepared_work(oid, change_id, revision_id, view_id, application_id) \
-             SELECT oid, change_id, revision_id, view_id, application_id FROM work ORDER BY sequence DESC LIMIT 1; \
-             UPDATE work SET status = 0, change_id = NULL, revision_id = NULL, view_id = NULL, application_id = NULL \
-             WHERE sequence = (SELECT MAX(sequence) FROM work);",
-        )
-        .unwrap();
-    transaction.commit().unwrap();
     drop(connection);
 
     let objects = BlockedGetStore {
@@ -459,23 +489,21 @@ async fn invalid_completed_ancestry_prevents_prepared_descendant_promotion() {
         blocked: ObjectId::from_digest(blocked.try_into().unwrap()),
     };
     assert!(
-        stage_import(git.path(), &journal_path, &objects, &content, Some(0))
+        stage_import(git.path(), &journal_path, &objects, &content, Some(1))
             .await
             .is_err()
     );
     let connection = rusqlite::Connection::open(&journal_path).unwrap();
-    let child_status: i64 = connection
-        .query_row(
-            "SELECT status FROM work ORDER BY sequence DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
+    let pending: i64 = connection
+        .query_row("SELECT COUNT(*) FROM work WHERE status = 0", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     let prepared: i64 = connection
         .query_row("SELECT COUNT(*) FROM prepared_work", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(child_status, 0);
-    assert_eq!(prepared, 1);
+    assert_eq!(pending, 1);
+    assert_eq!(prepared, 0);
 }
 
 #[tokio::test]
@@ -631,6 +659,35 @@ async fn default_stage_budget_leaves_large_history_incomplete_then_resumes() {
             .unwrap();
     }
     assert_eq!(result.completed_commits, DEFAULT_STAGE_COMMITS + 1);
+}
+
+#[tokio::test]
+async fn bounded_resume_does_not_reauthenticate_the_completed_prefix() {
+    let git = linear_fixture(DEFAULT_STAGE_COMMITS + 1);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("import.sqlite");
+    let objects = CountingGetStore {
+        inner: LooseObjectStore::new(dir.path().join("objects")),
+        gets: AtomicUsize::new(0),
+    };
+    let content = ContentStore::new(dir.path().join("content"));
+
+    let first = stage_import(git.path(), &journal, &objects, &content, None)
+        .await
+        .unwrap();
+    assert_eq!(first.completed_commits, DEFAULT_STAGE_COMMITS);
+    assert!(!first.complete);
+
+    objects.gets.store(0, Ordering::SeqCst);
+    let resumed = stage_import(git.path(), &journal, &objects, &content, None)
+        .await
+        .unwrap();
+    assert!(resumed.complete);
+    let resume_gets = objects.gets.load(Ordering::SeqCst);
+    assert!(
+        resume_gets <= RESUME_READ_BUDGET,
+        "one-commit resume read {resume_gets} objects, exceeding the {RESUME_READ_BUDGET}-read budget for a {DEFAULT_STAGE_COMMITS}-commit prefix"
+    );
 }
 
 #[tokio::test]

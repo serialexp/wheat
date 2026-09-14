@@ -8,7 +8,9 @@ jobs:
     name: Wheat Gothab workflow
     # Keep profile comparisons on the pinned c8id.xlarge performance pool.
     runs-on: pt-heavy
-    timeout-minutes: 45
+    # A cold release build plus the 20-minute profile contract needs headroom for
+    # checkout, toolchain installation, and report upload on a fresh runner.
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: "true"

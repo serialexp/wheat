@@ -272,11 +272,22 @@ fn main() -> Result<()> {
     )?;
     git(&remote, &["fsck", "--strict"])?;
     let remote_tip = git(&remote, &["rev-parse", "refs/heads/main"])?;
-    git(
+    // Wheat re-encodes imported Git metadata, so projected commit IDs are not the
+    // source IDs. The exact pinned source tree remains the compatibility anchor.
+    let corpus_tree = git(&source, &["rev-parse", &format!("{corpus_sha}^{{tree}}")])?;
+    let projected_commits = git(
         &remote,
-        &["merge-base", "--is-ancestor", &corpus_sha, &remote_tip],
+        &["log", "--reverse", "--format=%H %T", &remote_tip],
     )?;
-    let changed_paths = git(&remote, &["diff", "--name-only", &corpus_sha, &remote_tip])?;
+    let projected_base = projected_commits
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find_map(|(commit, tree)| (tree == corpus_tree).then_some(commit))
+        .context("projected Git history does not contain the pinned corpus tree")?;
+    let changed_paths = git(
+        &remote,
+        &["diff", "--name-only", projected_base, &remote_tip],
+    )?;
     let mut actual_changed = changed_paths.lines().collect::<Vec<_>>();
     actual_changed.sort_unstable();
     let mut expected_changed = vec![

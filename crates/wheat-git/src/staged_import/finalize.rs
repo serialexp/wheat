@@ -20,7 +20,10 @@ use wheat_store::{
 use crate::{
     journal::{ImportJournal, JournalError},
     metadata,
-    staged_import::{StagedImportError, pinned_branches, snapshot_bytes, stage_import},
+    staged_import::{
+        StagedImportError, authenticate_completed_mappings, pinned_branches, snapshot_bytes,
+        stage_import,
+    },
 };
 
 const PAGE: usize = 256;
@@ -216,6 +219,11 @@ where
     let objects = &batch;
     let writer = wheat_store::PersistedCommitWriter::new(objects, content);
     let empty = writer.empty_view().await?;
+    // Ordinary bounded staging authenticates only crash-left work and the frontier
+    // it is about to consume. Publication performs one fresh exhaustive mapping
+    // authentication against the pinned Git snapshot before building authority.
+    observer(FinalizePhase::JournalAuthenticationAccumulation);
+    authenticate_completed_mappings(objects, content, &journal, empty).await?;
     let reader = RepositoryReader::new(objects, content);
     let retained = RetainedSetStore::new(objects);
     let content_sets = ContentSetStore::new(objects);
@@ -228,7 +236,6 @@ where
             .map_err(ContentAccumulatorError::from)?;
     }
 
-    observer(FinalizePhase::JournalAuthenticationAccumulation);
     let mut change_objects = Vec::new();
     let mut view_edges = Vec::new();
     let mut after = None::<Vec<u8>>;

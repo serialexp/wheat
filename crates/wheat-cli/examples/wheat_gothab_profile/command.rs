@@ -84,7 +84,9 @@ impl ProfileRun {
         let timing_file = tempfile::NamedTempFile::new_in(scratch)?;
         let stdout_file = tempfile::tempfile_in(scratch)?;
         let stderr_file = tempfile::tempfile_in(scratch)?;
-        let status = Command::new("/usr/bin/time")
+        eprintln!("profile phase {name}: starting");
+        let mut command = Command::new("/usr/bin/time");
+        command
             .args(["-f", "%e %M", "-o"])
             .arg(timing_file.path())
             .arg(&self.wheat)
@@ -93,8 +95,13 @@ impl ProfileRun {
             .env("WHEAT_STORE_HOME", &self.store_home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .stdout(Stdio::from(stdout_file.try_clone()?))
-            .stderr(Stdio::from(stderr_file.try_clone()?))
+            .stdout(Stdio::from(stdout_file.try_clone()?));
+        if name == "import.initial_materialize" {
+            command.stderr(Stdio::inherit());
+        } else {
+            command.stderr(Stdio::from(stderr_file.try_clone()?));
+        }
+        let status = command
             .status()
             .with_context(|| format!("run timed Wheat phase {name}"))?;
         let stdout = read_bounded(stdout_file, MAX_CAPTURE_BYTES)
@@ -111,8 +118,13 @@ impl ProfileRun {
             .with_context(|| format!("read {name} GNU time output"))?;
         let timing_text = std::str::from_utf8(&timing_bytes)
             .with_context(|| format!("decode {name} GNU time output"))?;
-        self.timings
-            .push((name.to_owned(), parse_time_output(timing_text)?));
+        let timing = parse_time_output(timing_text)?;
+        eprintln!(
+            "profile phase {name}: completed in {:.2}s, peak RSS {:.1} MiB",
+            timing.wall_seconds,
+            timing.peak_rss_bytes / (1024.0 * 1024.0)
+        );
+        self.timings.push((name.to_owned(), timing));
         Ok(if retain_output {
             BoundedOutput { stdout, stderr }
         } else {
