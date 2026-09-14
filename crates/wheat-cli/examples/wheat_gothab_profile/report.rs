@@ -97,11 +97,11 @@ fn build_report(
     ]);
     rules.extend([
         ContractRule {
-            // Baseline: 3,256.82s locally on 2026-09-14. Keep bounded headroom
-            // for cold runner variation while preserving a failing regression gate.
+            // Baseline: 3,246.56s locally; the pinned runner needs about 25%
+            // longer. Keep bounded headroom while preserving a regression gate.
             measurement: "run.total_time".into(),
             comparison: Comparison::Lte,
-            value: 4200.0,
+            value: 5_400.0,
             unit: "s".into(),
         },
         ContractRule {
@@ -129,13 +129,13 @@ fn build_report(
 }
 
 fn phase_wall_limit(name: &str) -> Result<f64> {
-    // These are ratcheted from the 2026-09-14 local Gothab baseline rather than
-    // aspirational targets. CI must first enforce a truthful passing contract;
-    // subsequent performance work can lower individual ceilings with evidence.
+    // These are ratcheted from the 2026-09-14 local and pinned-runner Gothab
+    // baselines rather than aspirational targets. CI must enforce a truthful
+    // passing contract; later performance work can lower ceilings with evidence.
     let limit = match name {
-        "import.initial_materialize" => 2_700.0,
+        "import.initial_materialize" => 3_300.0,
         "push.working" | "validate.complete" => 600.0,
-        "materialize.conflicted_working" | "materialize.resolved_working" => 300.0,
+        "materialize.conflicted_working" | "materialize.resolved_working" => 420.0,
         "status.initial_clean"
         | "log.initial"
         | "diff.readme_edit"

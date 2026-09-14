@@ -8,9 +8,9 @@ jobs:
     name: Wheat Gothab workflow
     # Keep profile comparisons on the pinned c8id.xlarge performance pool.
     runs-on: pt-heavy
-    # A cold release build plus the 20-minute profile contract needs headroom for
-    # checkout, toolchain installation, and report upload on a fresh runner.
-    timeout-minutes: 60
+    # The measured Gothab corpus takes about 55 minutes on the pinned runner;
+    # leave explicit headroom for a cold release build, setup, and artifact upload.
+    timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: "true"
