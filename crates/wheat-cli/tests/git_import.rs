@@ -214,6 +214,16 @@ fn import_trace_is_bounded_jsonl_and_keeps_command_output_separate() {
             "head_initialize",
         ]
     );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| {
+                record["event"] == "phase_started"
+                    && record["data"]["phase"] == "resolve_frontier"
+            })
+            .count(),
+        1
+    );
     let trace_text = std::fs::read_to_string(&trace).unwrap();
     assert!(!trace_text.contains(source.to_str().unwrap()));
     assert!(!trace_text.contains(workspace.to_str().unwrap()));

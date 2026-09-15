@@ -1166,10 +1166,10 @@ fn import(
         trace.phase_started("resolve_frontier");
     }
     let repository = open(&store_root)?;
-    let resolved = runtime.block_on(frontier_service::resolve(
+    let resolved = runtime.block_on(frontier_service::resolve_freshly_validated_import(
         &repository,
+        head,
         &selected_label,
-        None,
     ))?;
     if let Some(trace) = &mut trace {
         trace.phase_finished("resolve_frontier", phase_started.elapsed());
