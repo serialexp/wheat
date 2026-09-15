@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::memory::InMemory;
-use wheat_core::{ContentId, DirectoryEntry, FileKind, FileValue, ObjectId};
+use wheat_core::{ContentId, DirectoryEntry, DirectoryNode, FileKind, FileValue, ObjectId};
 use wheat_store::{
     ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectKind,
     ObjectStoreAdapter, ObjectStoreError, StoredObject, TreeDiff, TreeDiffLimits, TreeEdit,
@@ -1176,6 +1176,39 @@ async fn diff_prunes_shared_subtrees_and_obeys_all_limits() {
             "expected {expected}, got {error:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn content_cursor_streams_values_without_path_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path());
+    let trees = MerkleTreeStore::new(&objects);
+    let value = FileValue {
+        content: ContentId::from_digest([7; 32]),
+        kind: FileKind::Regular,
+    };
+    let leaf = trees
+        .write_node(
+            &DirectoryNode::new([(String::from("file"), DirectoryEntry::File(value))]).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut root = leaf;
+    for _ in 0..129 {
+        root = trees
+            .write_node(
+                &DirectoryNode::new([(String::from("dir"), DirectoryEntry::Directory(root))])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let mut cursor = trees
+        .content_cursor(root, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(cursor.next().await.unwrap(), Some(value));
+    assert_eq!(cursor.next().await.unwrap(), None);
 }
 
 #[tokio::test]

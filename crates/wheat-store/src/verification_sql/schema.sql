@@ -46,6 +46,15 @@ CREATE TABLE tree_content_counts (
     content_id BLOB PRIMARY KEY NOT NULL,
     count INTEGER NOT NULL CHECK (count > 0)
 ) WITHOUT ROWID;
+
+-- Before-images for one unresolved branch. Unlike SQLite savepoints, this
+-- journal restores only count state and never rolls back authenticated receipts.
+CREATE TABLE tree_content_undo (
+    mark_id INTEGER NOT NULL,
+    content_id BLOB NOT NULL,
+    prior_count INTEGER NOT NULL CHECK (prior_count >= 0),
+    PRIMARY KEY (mark_id, content_id)
+) WITHOUT ROWID;
 -- A radix node can be reused under different incoming prefixes. Receipts must
 -- name that reconstructed prefix as well as the external validation context.
 CREATE TABLE verified_radix_nodes (

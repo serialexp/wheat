@@ -15,7 +15,9 @@ use crate::{
     radix::{ContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
     sets::{ContentCollection, ContentSetDelta},
-    verification_scratch::{RadixReceiptKind, VerificationScratch, VerificationScratchError},
+    verification_scratch::{
+        RadixReceiptKind, TreeCountMark, VerificationScratch, VerificationScratchError,
+    },
 };
 use wheat_core::*;
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
@@ -184,7 +186,7 @@ enum ViewTreeFrame {
         next_child: usize,
     },
     Exit {
-        depth: usize,
+        rollback: Option<TreeCountMark>,
     },
 }
 
@@ -329,14 +331,12 @@ where
     }
 
     async fn seed_tree_content_counts(&self, root: TreeId) -> Result<()> {
-        self.scratch.clear_tree_content_counts()?;
-        for file in MerkleTreeStore::new(self.reader.objects)
-            .walk_files(root, Default::default())
-            .await?
-        {
-            self.required(file.value.content)?;
-            self.scratch
-                .adjust_tree_content_count(file.value.content, 1)?;
+        self.scratch.replace_tree_content_counts()?;
+        let trees = MerkleTreeStore::new(self.reader.objects);
+        let mut contents = trees.content_cursor(root, Default::default()).await?;
+        while let Some(file) = contents.next().await? {
+            self.required(file.content)?;
+            self.scratch.adjust_tree_content_count(file.content, 1)?;
         }
         Ok(())
     }
@@ -364,8 +364,10 @@ where
         }];
         while let Some(frame) = stack.pop() {
             match frame {
-                ViewTreeFrame::Exit { depth } => {
-                    self.scratch.rollback_tree_content_savepoint(depth)?;
+                ViewTreeFrame::Exit { rollback } => {
+                    if let Some(mark) = rollback {
+                        self.scratch.restore_tree_content_mark(mark)?;
+                    }
                 }
                 ViewTreeFrame::Children {
                     view_id,
@@ -398,7 +400,9 @@ where
                     let child_depth = depth.checked_add(1).ok_or_else(|| {
                         invalid("view lineage traversal depth exceeds verification limit")
                     })?;
-                    self.scratch.begin_tree_content_savepoint(child_depth)?;
+                    let mut rollback = (next_child + 1 < children.len())
+                        .then(|| self.scratch.begin_tree_content_mark())
+                        .transpose()?;
 
                     let mut diff =
                         trees.diff_cursor(view.tree, child.tree, TreeDiffLimits::default());
@@ -416,13 +420,17 @@ where
                         let Some(change) = change else {
                             break;
                         };
-                        if let Some(old) = change.old
-                            && let Err(VerificationScratchError::TreeContentCountUnderflow {
-                                ..
-                            }) = self.scratch.adjust_tree_content_count(old.content, -1)
-                        {
-                            fallback = true;
-                            break;
+                        if let Some(old) = change.old {
+                            match self.scratch.adjust_tree_content_count(old.content, -1) {
+                                Ok(()) => {}
+                                Err(VerificationScratchError::TreeContentCountUnderflow {
+                                    ..
+                                }) => {
+                                    fallback = true;
+                                    break;
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
                         }
                         if let Some(new) = change.new {
                             self.required(new.content)?;
@@ -434,8 +442,12 @@ where
                         // A counter inconsistency cannot weaken the proof. Restore the
                         // parent state and use the complete existing semantic walk for
                         // this edge, then seed its exact child state for descendants.
-                        self.scratch.rollback_tree_content_savepoint(child_depth)?;
-                        self.scratch.begin_tree_content_savepoint(child_depth)?;
+                        if let Some(mark) = rollback.take() {
+                            self.scratch.restore_tree_content_mark(mark)?;
+                            rollback = Some(self.scratch.begin_tree_content_mark()?);
+                        } else {
+                            self.seed_tree_content_counts(view.tree).await?;
+                        }
                         self.tree(child.tree, aggregate, Some(child_visible))
                             .await?;
                         self.seed_tree_content_counts(child.tree).await?;
@@ -463,8 +475,12 @@ where
                                 }
                             }
                             Err(error) if content_delta_limit(&error) => {
-                                self.scratch.rollback_tree_content_savepoint(child_depth)?;
-                                self.scratch.begin_tree_content_savepoint(child_depth)?;
+                                if let Some(mark) = rollback.take() {
+                                    self.scratch.restore_tree_content_mark(mark)?;
+                                    rollback = Some(self.scratch.begin_tree_content_mark()?);
+                                } else {
+                                    self.seed_tree_content_counts(view.tree).await?;
+                                }
                                 self.tree(child.tree, aggregate, Some(child_visible))
                                     .await?;
                                 self.seed_tree_content_counts(child.tree).await?;
@@ -472,7 +488,7 @@ where
                             Err(error) => return Err(error.into()),
                         }
                     }
-                    stack.push(ViewTreeFrame::Exit { depth: child_depth });
+                    stack.push(ViewTreeFrame::Exit { rollback });
                     stack.push(ViewTreeFrame::Children {
                         view_id: child_id,
                         view: child,

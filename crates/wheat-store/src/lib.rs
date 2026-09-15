@@ -55,8 +55,9 @@ pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };
 pub use merkle_tree::{
-    MerkleTreeError, MerkleTreeStore, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
-    TreePathLimits, TreePathSelection, TreeSelectionLimits, TreeWalkLimits,
+    MerkleTreeError, MerkleTreeStore, TreeContentCursor, TreeContentWalkLimits, TreeDiff,
+    TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile, TreePathLimits, TreePathSelection,
+    TreeSelectionLimits, TreeWalkLimits,
 };
 pub use mutation_publication::{
     PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,

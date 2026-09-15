@@ -34,6 +34,16 @@ const UPDATE_TREE_CONTENT_COUNT: &str =
     include_str!("verification_sql/update_tree_content_count.sql");
 const DELETE_TREE_CONTENT_COUNT: &str =
     include_str!("verification_sql/delete_tree_content_count.sql");
+const INSERT_TREE_CONTENT_UNDO: &str =
+    include_str!("verification_sql/insert_tree_content_undo.sql");
+const DELETE_ZERO_PRIOR_TREE_CONTENT: &str =
+    include_str!("verification_sql/delete_zero_prior_tree_content.sql");
+const RESTORE_TREE_CONTENT_COUNTS: &str =
+    include_str!("verification_sql/restore_tree_content_counts.sql");
+const DELETE_TREE_CONTENT_UNDO: &str =
+    include_str!("verification_sql/delete_tree_content_undo.sql");
+const INSERT_TREE_CONTENT_UNDO_SNAPSHOT: &str =
+    include_str!("verification_sql/insert_tree_content_undo_snapshot.sql");
 
 #[derive(Debug, Error)]
 pub enum VerificationScratchError {
@@ -48,8 +58,19 @@ pub enum VerificationScratchError {
 }
 
 /// A fresh, bounded-cache, automatically deleted index for one verification run.
+#[derive(Clone, Copy)]
+pub(crate) struct TreeCountMark(u64);
+
+impl TreeCountMark {
+    pub(crate) const fn id(self) -> u64 {
+        self.0
+    }
+}
+
 pub(crate) struct VerificationScratch {
     connection: Connection,
+    next_tree_count_mark: std::cell::Cell<u64>,
+    active_tree_count_marks: std::cell::RefCell<Vec<TreeCountMark>>,
     _file: NamedTempFile,
 }
 
@@ -60,6 +81,8 @@ impl VerificationScratch {
         connection.execute_batch(SCHEMA)?;
         Ok(Self {
             connection,
+            next_tree_count_mark: std::cell::Cell::new(0),
+            active_tree_count_marks: std::cell::RefCell::new(Vec::new()),
             _file: file,
         })
     }
@@ -193,6 +216,17 @@ impl VerificationScratch {
         Ok(())
     }
 
+    /// Replace count state while retaining enough before-images to restore all
+    /// unresolved branch parents.
+    pub(crate) fn replace_tree_content_counts(&self) -> Result<(), VerificationScratchError> {
+        if let Some(mark) = self.active_tree_count_marks.borrow().last().copied() {
+            self.connection
+                .prepare_cached(INSERT_TREE_CONTENT_UNDO_SNAPSHOT)?
+                .execute([mark.id()])?;
+        }
+        self.clear_tree_content_counts()
+    }
+
     pub(crate) fn adjust_tree_content_count(
         &self,
         content: ContentId,
@@ -204,6 +238,14 @@ impl VerificationScratch {
             .ok_or(VerificationScratchError::TreeContentCountOverflow { content })?;
         if next < 0 {
             return Err(VerificationScratchError::TreeContentCountUnderflow { content });
+        }
+        // The nearest mark always restores before an ancestor mark is reached,
+        // so its subtree mutations never become part of the ancestor's state.
+        // This keeps linear suffixes below a fork at one journal write each.
+        if let Some(mark) = self.active_tree_count_marks.borrow().last().copied() {
+            self.connection
+                .prepare_cached(INSERT_TREE_CONTENT_UNDO)?
+                .execute(params![mark.0, content.as_bytes().as_slice(), count])?;
         }
         if next == 0 {
             self.connection
@@ -236,22 +278,38 @@ impl VerificationScratch {
         }
     }
 
-    pub(crate) fn begin_tree_content_savepoint(
+    /// Begin a branch-local count checkpoint. This journals only count rows;
+    /// verification receipts remain valid globally for the entire run.
+    pub(crate) fn begin_tree_content_mark(
         &self,
-        depth: usize,
-    ) -> Result<(), VerificationScratchError> {
-        self.connection
-            .execute_batch(&format!("SAVEPOINT tree_content_{depth}"))?;
-        Ok(())
+    ) -> Result<TreeCountMark, VerificationScratchError> {
+        let mark = TreeCountMark(
+            self.next_tree_count_mark
+                .get()
+                .checked_add(1)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?,
+        );
+        self.next_tree_count_mark.set(mark.0);
+        self.active_tree_count_marks.borrow_mut().push(mark);
+        Ok(mark)
     }
 
-    pub(crate) fn rollback_tree_content_savepoint(
+    /// Restore exactly the before-images captured for one completed branch.
+    pub(crate) fn restore_tree_content_mark(
         &self,
-        depth: usize,
+        mark: TreeCountMark,
     ) -> Result<(), VerificationScratchError> {
-        self.connection.execute_batch(&format!(
-            "ROLLBACK TO tree_content_{depth}; RELEASE tree_content_{depth}"
-        ))?;
+        let active = self.active_tree_count_marks.borrow_mut().pop();
+        assert_eq!(active.map(|active| active.0), Some(mark.0));
+        self.connection
+            .prepare_cached(DELETE_ZERO_PRIOR_TREE_CONTENT)?
+            .execute([mark.0])?;
+        self.connection
+            .prepare_cached(RESTORE_TREE_CONTENT_COUNTS)?
+            .execute([mark.0])?;
+        self.connection
+            .prepare_cached(DELETE_TREE_CONTENT_UNDO)?
+            .execute([mark.0])?;
         Ok(())
     }
 
@@ -329,5 +387,22 @@ impl VerificationScratch {
                 conflicts.as_bytes().as_slice()
             ])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_count_mark_restores_only_count_state() {
+        let scratch = VerificationScratch::new().unwrap();
+        let content = ContentId::from_digest([7; 32]);
+        scratch.adjust_tree_content_count(content, 1).unwrap();
+        let mark = scratch.begin_tree_content_mark().unwrap();
+        scratch.adjust_tree_content_count(content, -1).unwrap();
+        assert_eq!(scratch.tree_content_count(content).unwrap(), 0);
+        scratch.restore_tree_content_mark(mark).unwrap();
+        assert_eq!(scratch.tree_content_count(content).unwrap(), 1);
     }
 }

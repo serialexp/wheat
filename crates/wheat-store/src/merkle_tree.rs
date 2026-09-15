@@ -262,6 +262,44 @@ enum DiffWork {
 }
 
 /// Incremental, lexically ordered Merkle diff. An error permanently exhausts it.
+/// Bounds for a streaming tree-content traversal without path allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TreeContentWalkLimits {
+    pub max_files: usize,
+    pub max_nodes: usize,
+    pub max_entries: usize,
+    pub max_depth: usize,
+    pub max_node_bytes: usize,
+    pub max_buffered_entries: usize,
+}
+
+impl Default for TreeContentWalkLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 1_000_000,
+            max_nodes: 1_000_000,
+            max_entries: 4_000_000,
+            max_depth: 1_023,
+            max_node_bytes: 16 * 1024 * 1024,
+            max_buffered_entries: 1_000_000,
+        }
+    }
+}
+
+pub struct TreeContentCursor<'a, S> {
+    store: &'a MerkleTreeStore<'a, S>,
+    limits: TreeContentWalkLimits,
+    stack: Vec<(
+        std::collections::btree_map::IntoValues<String, DirectoryEntry>,
+        usize,
+    )>,
+    nodes: usize,
+    entries: usize,
+    buffered_entries: usize,
+    files: usize,
+    exhausted: bool,
+}
+
 pub struct TreeDiffCursor<'a, S> {
     objects: &'a S,
     limits: TreeDiffLimits,
@@ -1000,6 +1038,27 @@ where
         self.write_node(&root_node).await
     }
 
+    /// Stream file values without allocating or retaining full path strings.
+    pub async fn content_cursor(
+        &'a self,
+        root: TreeId,
+        limits: TreeContentWalkLimits,
+    ) -> Result<TreeContentCursor<'a, S>, MerkleTreeError> {
+        let mut cursor = TreeContentCursor {
+            store: self,
+            limits,
+            stack: Vec::with_capacity(32),
+            nodes: 0,
+            entries: 0,
+            buffered_entries: 0,
+            files: 0,
+            exhausted: false,
+        };
+        let node = cursor.read_node(root).await?;
+        cursor.stack.push((node.entries.into_values(), 0));
+        Ok(cursor)
+    }
+
     /// Create an incremental lexical diff from `old` to `new`.
     ///
     /// Equal roots are pruned without reading storage. Other equal directory IDs
@@ -1035,6 +1094,100 @@ where
 
     pub async fn contains_node(&self, id: TreeId) -> Result<bool, MerkleTreeError> {
         Ok(self.objects.exists_many(&[ObjectId::from(id)]).await?[0])
+    }
+}
+
+impl<S: ImmutableObjectStore> TreeContentCursor<'_, S> {
+    async fn read_node(&mut self, id: TreeId) -> Result<DirectoryNode, MerkleTreeError> {
+        if self.nodes == self.limits.max_nodes {
+            return Err(MerkleTreeError::NodeLimitExceeded {
+                limit: self.limits.max_nodes,
+            });
+        }
+        self.nodes += 1;
+        let object = self.store.objects.get(id.into()).await?;
+        if object.kind != ObjectKind::Tree {
+            return Err(ObjectStoreError::WrongKind {
+                id: id.into(),
+                expected: ObjectKind::Tree,
+                actual: object.kind,
+            }
+            .into());
+        }
+        if object.canonical_bytes.len() > self.limits.max_node_bytes {
+            return Err(MerkleTreeError::NodeBytesExceeded {
+                size: object.canonical_bytes.len(),
+                limit: self.limits.max_node_bytes,
+            });
+        }
+        let node = decode_directory_node(&object.canonical_bytes)?;
+        let entries = self.entries.saturating_add(node.entries.len());
+        if entries > self.limits.max_entries {
+            return Err(MerkleTreeError::EntryLimitExceeded {
+                limit: self.limits.max_entries,
+            });
+        }
+        let buffered = self.buffered_entries.saturating_add(node.entries.len());
+        if buffered > self.limits.max_buffered_entries {
+            return Err(MerkleTreeError::BufferedEntriesExceeded {
+                limit: self.limits.max_buffered_entries,
+            });
+        }
+        self.entries = entries;
+        self.buffered_entries = buffered;
+        Ok(node)
+    }
+
+    /// Return the next file value. Errors permanently exhaust the cursor.
+    pub async fn next(&mut self) -> Result<Option<FileValue>, MerkleTreeError> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        let result = self.next_inner().await;
+        if result.is_err() || matches!(result, Ok(None)) {
+            self.exhausted = true;
+            self.stack.clear();
+        }
+        result
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<FileValue>, MerkleTreeError> {
+        loop {
+            let Some((entries, depth)) = self.stack.last_mut() else {
+                return Ok(None);
+            };
+            let Some(entry) = entries.next() else {
+                self.stack.pop();
+                continue;
+            };
+            self.buffered_entries -= 1;
+            match entry {
+                DirectoryEntry::File(value) => {
+                    if self.files == self.limits.max_files {
+                        return Err(MerkleTreeError::FileLimitExceeded {
+                            limit: self.limits.max_files,
+                        });
+                    }
+                    self.files += 1;
+                    return Ok(Some(value));
+                }
+                DirectoryEntry::Directory(child) => {
+                    let child_depth =
+                        depth.checked_add(1).ok_or(MerkleTreeError::DepthExceeded {
+                            depth: usize::MAX,
+                            limit: self.limits.max_depth,
+                        })?;
+                    if child_depth > self.limits.max_depth {
+                        return Err(MerkleTreeError::DepthExceeded {
+                            depth: child_depth,
+                            limit: self.limits.max_depth,
+                        });
+                    }
+                    let node = self.read_node(child).await?;
+                    self.stack.push((node.entries.into_values(), child_depth));
+                }
+            }
+        }
     }
 }
 
