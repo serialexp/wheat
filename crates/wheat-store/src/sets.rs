@@ -7,6 +7,32 @@ use wheat_core::{
 
 use crate::{ImmutableObjectStore, ObjectKind, ObjectStoreError, radix};
 
+/// One authenticated membership difference between two content manifests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentSetDelta {
+    Added(ContentId),
+    Removed(ContentId),
+}
+
+/// Bounds for a read-only content-manifest comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentSetDeltaLimits {
+    pub max_changes: usize,
+    pub max_nodes: usize,
+    pub max_pending: usize,
+}
+
+impl Default for ContentSetDeltaLimits {
+    fn default() -> Self {
+        let limits = radix::DiffLimits::default();
+        Self {
+            max_changes: limits.max_changes,
+            max_nodes: limits.max_nodes,
+            max_pending: limits.max_pending,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CollectionError {
     #[error("immutable collection storage failed")]
@@ -19,6 +45,12 @@ pub enum CollectionError {
     InvalidChildDepth,
     #[error("collection values are permitted only at terminal depth")]
     InvalidTerminalNode,
+    #[error("content-set delta contains more than {limit} entries")]
+    DeltaChangeLimitExceeded { limit: usize },
+    #[error("content-set delta reads more than {limit} nodes")]
+    DeltaNodeLimitExceeded { limit: usize },
+    #[error("content-set delta queues more than {limit} pending subtrees")]
+    DeltaPendingLimitExceeded { limit: usize },
 }
 impl From<radix::Error> for CollectionError {
     fn from(e: radix::Error) -> Self {
@@ -28,6 +60,20 @@ impl From<radix::Error> for CollectionError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+        }
+    }
+}
+impl From<radix::DiffError> for CollectionError {
+    fn from(error: radix::DiffError) -> Self {
+        match error {
+            radix::DiffError::Radix(error) => error.into(),
+            radix::DiffError::ChangeLimitExceeded { limit } => {
+                Self::DeltaChangeLimitExceeded { limit }
+            }
+            radix::DiffError::NodeLimitExceeded { limit } => Self::DeltaNodeLimitExceeded { limit },
+            radix::DiffError::PendingLimitExceeded { limit } => {
+                Self::DeltaPendingLimitExceeded { limit }
+            }
         }
     }
 }
@@ -240,6 +286,41 @@ set_api!(
     ContentId,
     ContentSetNode
 );
+
+impl<S: ImmutableObjectStore> ContentSetStore<'_, S> {
+    /// Compare two manifests without writing derived collection nodes.
+    ///
+    /// Equal immutable subtrees are authenticated by the preceding manifest
+    /// verification pass and are pruned by identity; divergent nodes are read
+    /// and structurally validated at their contextual radix positions.
+    pub async fn delta(
+        &self,
+        old: ContentSetId,
+        new: ContentSetId,
+        limits: ContentSetDeltaLimits,
+    ) -> Result<Vec<ContentSetDelta>, CollectionError> {
+        Ok(self
+            .inner
+            .paired_diff(
+                old,
+                new,
+                radix::DiffLimits {
+                    max_changes: limits.max_changes,
+                    max_nodes: limits.max_nodes,
+                    max_pending: limits.max_pending,
+                },
+            )
+            .await?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                radix::DiffEntry::Added(content, ()) => Some(ContentSetDelta::Added(content)),
+                radix::DiffEntry::Removed(content, ()) => Some(ContentSetDelta::Removed(content)),
+                radix::DiffEntry::Changed(_, (), ()) => None,
+            })
+            .collect())
+    }
+}
+
 set_api!(
     RetainedSetStore,
     RetainedSetCursor,

@@ -39,6 +39,13 @@ CREATE TABLE verified_tree_semantics (
     visible_id BLOB NOT NULL,
     PRIMARY KEY (tree_id, aggregate_id, visible_id)
 ) WITHOUT ROWID;
+
+-- Current DFS path's file-content multiplicities. This keeps branch state
+-- disk-backed and bounded without cloning whole trees for sibling views.
+CREATE TABLE tree_content_counts (
+    content_id BLOB PRIMARY KEY NOT NULL,
+    count INTEGER NOT NULL CHECK (count > 0)
+) WITHOUT ROWID;
 -- A radix node can be reused under different incoming prefixes. Receipts must
 -- name that reconstructed prefix as well as the external validation context.
 CREATE TABLE verified_radix_nodes (

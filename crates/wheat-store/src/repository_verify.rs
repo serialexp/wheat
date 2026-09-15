@@ -11,11 +11,11 @@ use lru::LruCache;
 use crate::{
     ApplicationMapStore, ConflictSetStore, ContentSetStore, ContentStoreError,
     ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryPublicationError,
-    RepositoryReader, RetainedSetStore, RevisionMapStore, StoredObject,
+    RepositoryReader, RetainedSetStore, RevisionMapStore, StoredObject, TreeDiffLimits,
     radix::{ContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
-    sets::ContentCollection,
-    verification_scratch::{RadixReceiptKind, VerificationScratch},
+    sets::{ContentCollection, ContentSetDelta},
+    verification_scratch::{RadixReceiptKind, VerificationScratch, VerificationScratchError},
 };
 use wheat_core::*;
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
@@ -60,6 +60,28 @@ impl RepositoryValidationPhase {
 
 fn invalid(message: &'static str) -> RepositoryPublicationError {
     RepositoryPublicationError::InvalidReferences(message)
+}
+
+fn tree_delta_limit(error: &crate::MerkleTreeError) -> bool {
+    matches!(
+        error,
+        crate::MerkleTreeError::ChangeLimitExceeded { .. }
+            | crate::MerkleTreeError::NodeLimitExceeded { .. }
+            | crate::MerkleTreeError::EntryLimitExceeded { .. }
+            | crate::MerkleTreeError::PathBytesExceeded { .. }
+            | crate::MerkleTreeError::DepthExceeded { .. }
+            | crate::MerkleTreeError::NodeBytesExceeded { .. }
+            | crate::MerkleTreeError::BufferedEntriesExceeded { .. }
+    )
+}
+
+fn content_delta_limit(error: &crate::CollectionError) -> bool {
+    matches!(
+        error,
+        crate::CollectionError::DeltaChangeLimitExceeded { .. }
+            | crate::CollectionError::DeltaNodeLimitExceeded { .. }
+            | crate::CollectionError::DeltaPendingLimitExceeded { .. }
+    )
 }
 
 /// Whether a touched leaf occurs strictly below `path`. The ordered range avoids
@@ -145,6 +167,25 @@ struct Verifier<'a, 'r, O, F> {
     reader: &'r RepositoryReader<'a, O>,
     scratch: VerificationScratch,
     observer: F,
+}
+
+struct LineageGraph {
+    retained: BTreeSet<ViewId>,
+    children_by_parent: BTreeMap<ViewId, Vec<ViewId>>,
+}
+
+#[allow(clippy::large_enum_variant)] // DFS frames carry the current decoded view; no per-frame allocation.
+enum ViewTreeFrame {
+    Children {
+        view_id: ViewId,
+        view: ViewRecord,
+        visible: ContentSetId,
+        depth: usize,
+        next_child: usize,
+    },
+    Exit {
+        depth: usize,
+    },
 }
 
 impl<O, F> Verifier<'_, '_, O, F>
@@ -283,6 +324,167 @@ where
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn seed_tree_content_counts(&self, root: TreeId) -> Result<()> {
+        self.scratch.clear_tree_content_counts()?;
+        for file in MerkleTreeStore::new(self.reader.objects)
+            .walk_files(root, Default::default())
+            .await?
+        {
+            self.required(file.value.content)?;
+            self.scratch
+                .adjust_tree_content_count(file.value.content, 1)?;
+        }
+        Ok(())
+    }
+
+    async fn verify_view_trees_by_lineage_delta(
+        &self,
+        state: &RepositoryStateRecord,
+        aggregate: ContentSetId,
+        graph: &LineageGraph,
+    ) -> Result<()> {
+        let base = self.reader.view(state.base_view).await?;
+        let base_visible = self.reader.manifest(base.required_content).await?.content;
+        self.tree(base.tree, aggregate, Some(base_visible)).await?;
+        self.seed_tree_content_counts(base.tree).await?;
+
+        let trees = MerkleTreeStore::new(self.reader.objects);
+        let contents = ContentSetStore::new(self.reader.objects);
+        let mut completed = BTreeSet::from([state.base_view]);
+        let mut stack = vec![ViewTreeFrame::Children {
+            view_id: state.base_view,
+            view: base,
+            visible: base_visible,
+            depth: 0,
+            next_child: 0,
+        }];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                ViewTreeFrame::Exit { depth } => {
+                    self.scratch.rollback_tree_content_savepoint(depth)?;
+                }
+                ViewTreeFrame::Children {
+                    view_id,
+                    view,
+                    visible,
+                    depth,
+                    next_child,
+                } => {
+                    let children = graph
+                        .children_by_parent
+                        .get(&view_id)
+                        .map_or(&[][..], Vec::as_slice);
+                    if next_child == children.len() {
+                        continue;
+                    }
+                    stack.push(ViewTreeFrame::Children {
+                        view_id,
+                        view,
+                        visible,
+                        depth,
+                        next_child: next_child + 1,
+                    });
+                    let child_id = children[next_child];
+                    if !completed.insert(child_id) {
+                        continue;
+                    }
+                    let child = self.reader.view(child_id).await?;
+                    let child_visible = self.reader.manifest(child.required_content).await?.content;
+                    self.authenticate_tree(child.tree).await?;
+                    let child_depth = depth.checked_add(1).ok_or_else(|| {
+                        invalid("view lineage traversal depth exceeds verification limit")
+                    })?;
+                    self.scratch.begin_tree_content_savepoint(child_depth)?;
+
+                    let mut diff =
+                        trees.diff_cursor(view.tree, child.tree, TreeDiffLimits::default());
+                    let mut added = BTreeSet::new();
+                    let mut fallback = false;
+                    loop {
+                        let change = match diff.next().await {
+                            Ok(change) => change,
+                            Err(error) if tree_delta_limit(&error) => {
+                                fallback = true;
+                                break;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        let Some(change) = change else {
+                            break;
+                        };
+                        if let Some(old) = change.old
+                            && let Err(VerificationScratchError::TreeContentCountUnderflow {
+                                ..
+                            }) = self.scratch.adjust_tree_content_count(old.content, -1)
+                        {
+                            fallback = true;
+                            break;
+                        }
+                        if let Some(new) = change.new {
+                            self.required(new.content)?;
+                            self.scratch.adjust_tree_content_count(new.content, 1)?;
+                            added.insert(new.content);
+                        }
+                    }
+                    if fallback {
+                        // A counter inconsistency cannot weaken the proof. Restore the
+                        // parent state and use the complete existing semantic walk for
+                        // this edge, then seed its exact child state for descendants.
+                        self.scratch.rollback_tree_content_savepoint(child_depth)?;
+                        self.scratch.begin_tree_content_savepoint(child_depth)?;
+                        self.tree(child.tree, aggregate, Some(child_visible))
+                            .await?;
+                        self.seed_tree_content_counts(child.tree).await?;
+                    } else {
+                        let manifest_delta = contents
+                            .delta(visible, child_visible, Default::default())
+                            .await;
+                        match manifest_delta {
+                            Ok(changes) => {
+                                for change in changes {
+                                    if let ContentSetDelta::Removed(content) = change
+                                        && self.scratch.tree_content_count(content)? != 0
+                                    {
+                                        return Err(invalid(
+                                            "visible file absent from view manifest",
+                                        ));
+                                    }
+                                }
+                                for content in added {
+                                    if !contents.contains(child_visible, content).await? {
+                                        return Err(invalid(
+                                            "visible file absent from view manifest",
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(error) if content_delta_limit(&error) => {
+                                self.scratch.rollback_tree_content_savepoint(child_depth)?;
+                                self.scratch.begin_tree_content_savepoint(child_depth)?;
+                                self.tree(child.tree, aggregate, Some(child_visible))
+                                    .await?;
+                                self.seed_tree_content_counts(child.tree).await?;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    stack.push(ViewTreeFrame::Exit { depth: child_depth });
+                    stack.push(ViewTreeFrame::Children {
+                        view_id: child_id,
+                        view: child,
+                        visible: child_visible,
+                        depth: child_depth,
+                        next_child: 0,
+                    });
+                }
+            }
+        }
+        if completed != graph.retained {
+            return Err(invalid("retained view is unreachable from base lineage"));
         }
         Ok(())
     }
@@ -567,7 +769,10 @@ where
         Ok(replay)
     }
 
-    async fn verify_lineage_semantics(&self, state: &RepositoryStateRecord) -> Result<()> {
+    async fn verify_lineage_semantics(
+        &self,
+        state: &RepositoryStateRecord,
+    ) -> Result<LineageGraph> {
         let retained = RetainedSetStore::new(self.reader.objects);
         let lineage = crate::ViewLineageMapStore::new(self.reader.objects);
         let mut retained_views = BTreeSet::new();
@@ -639,7 +844,10 @@ where
                 ));
             }
         }
-        Ok(())
+        Ok(LineageGraph {
+            retained: retained_views,
+            children_by_parent,
+        })
     }
 
     async fn verify_conflict(&self, id: ConflictId, _state: &RepositoryStateRecord) -> Result<()> {
@@ -738,7 +946,7 @@ where
             )
             .await
             .map_err(|_| invalid("invalid view lineage"))?;
-        self.verify_lineage_semantics(&state).await?;
+        let lineage = self.verify_lineage_semantics(&state).await?;
         (self.observer)(RepositoryValidationPhase::VerifyViewContentSets);
         let mut cursor = retained.cursor(state.retained_views).await?;
         while let Some(id) = cursor.next().await? {
@@ -750,15 +958,8 @@ where
             self.visible_set(visible, aggregate).await?;
         }
         (self.observer)(RepositoryValidationPhase::VerifyViewTrees);
-        let mut cursor = retained.cursor(state.retained_views).await?;
-        while let Some(id) = cursor.next().await? {
-            let view = self
-                .reader
-                .view(ViewId::from_digest(*id.as_bytes()))
-                .await?;
-            let visible = self.reader.manifest(view.required_content).await?.content;
-            self.tree(view.tree, aggregate, Some(visible)).await?;
-        }
+        self.verify_view_trees_by_lineage_delta(&state, aggregate, &lineage)
+            .await?;
         (self.observer)(RepositoryValidationPhase::VerifyViewRevisionMaps);
         let mut cursor = retained.cursor(state.retained_views).await?;
         while let Some(id) = cursor.next().await? {

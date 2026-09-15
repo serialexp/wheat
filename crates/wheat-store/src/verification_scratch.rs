@@ -27,6 +27,13 @@ const INSERT_RADIX_NODE: &str = include_str!("verification_sql/insert_radix_node
 const CONTAINS_RADIX_NODE: &str = include_str!("verification_sql/contains_radix_node.sql");
 const INSERT_MAP_PAIR: &str = include_str!("verification_sql/insert_map_pair.sql");
 const CONTAINS_MAP_PAIR: &str = include_str!("verification_sql/contains_map_pair.sql");
+const INSERT_TREE_CONTENT_COUNT: &str =
+    include_str!("verification_sql/insert_tree_content_count.sql");
+const CONTENT_COUNT: &str = include_str!("verification_sql/content_count.sql");
+const UPDATE_TREE_CONTENT_COUNT: &str =
+    include_str!("verification_sql/update_tree_content_count.sql");
+const DELETE_TREE_CONTENT_COUNT: &str =
+    include_str!("verification_sql/delete_tree_content_count.sql");
 
 #[derive(Debug, Error)]
 pub enum VerificationScratchError {
@@ -34,6 +41,10 @@ pub enum VerificationScratchError {
     File(#[from] std::io::Error),
     #[error("verification scratch database failed")]
     Database(#[from] rusqlite::Error),
+    #[error("tree content count underflow for {content}")]
+    TreeContentCountUnderflow { content: ContentId },
+    #[error("tree content count overflow for {content}")]
+    TreeContentCountOverflow { content: ContentId },
 }
 
 /// A fresh, bounded-cache, automatically deleted index for one verification run.
@@ -173,6 +184,74 @@ impl VerificationScratch {
                 aggregate.as_bytes().as_slice(),
                 Self::visible_bytes(visible)
             ])?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_tree_content_counts(&self) -> Result<(), VerificationScratchError> {
+        self.connection
+            .execute("DELETE FROM tree_content_counts", [])?;
+        Ok(())
+    }
+
+    pub(crate) fn adjust_tree_content_count(
+        &self,
+        content: ContentId,
+        delta: i64,
+    ) -> Result<(), VerificationScratchError> {
+        let count = self.tree_content_count(content)? as i64;
+        let next = count
+            .checked_add(delta)
+            .ok_or(VerificationScratchError::TreeContentCountOverflow { content })?;
+        if next < 0 {
+            return Err(VerificationScratchError::TreeContentCountUnderflow { content });
+        }
+        if next == 0 {
+            self.connection
+                .prepare_cached(DELETE_TREE_CONTENT_COUNT)?
+                .execute([content.as_bytes().as_slice()])?;
+        } else if count == 0 {
+            self.connection
+                .prepare_cached(INSERT_TREE_CONTENT_COUNT)?
+                .execute(params![content.as_bytes().as_slice(), next])?;
+        } else {
+            self.connection
+                .prepare_cached(UPDATE_TREE_CONTENT_COUNT)?
+                .execute(params![content.as_bytes().as_slice(), delta])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn tree_content_count(
+        &self,
+        content: ContentId,
+    ) -> Result<u64, VerificationScratchError> {
+        match self
+            .connection
+            .prepare_cached(CONTENT_COUNT)?
+            .query_row([content.as_bytes().as_slice()], |row| row.get(0))
+        {
+            Ok(count) => Ok(count),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn begin_tree_content_savepoint(
+        &self,
+        depth: usize,
+    ) -> Result<(), VerificationScratchError> {
+        self.connection
+            .execute_batch(&format!("SAVEPOINT tree_content_{depth}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_tree_content_savepoint(
+        &self,
+        depth: usize,
+    ) -> Result<(), VerificationScratchError> {
+        self.connection.execute_batch(&format!(
+            "ROLLBACK TO tree_content_{depth}; RELEASE tree_content_{depth}"
+        ))?;
         Ok(())
     }
 

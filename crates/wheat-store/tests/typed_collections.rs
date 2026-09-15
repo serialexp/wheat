@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, sync::Arc};
 use object_store::memory::InMemory;
 use wheat_core::{ApplicationId, ApplicationMapId, ChangeId, ConflictId, ContentId, ObjectId};
 use wheat_store::{
-    ApplicationMapStore, ConflictSetStore, ContentSetStore, ImmutableObjectStore, LooseObjectStore,
-    ObjectStoreAdapter, RetainedSetStore, RevisionMapStore,
+    ApplicationMapStore, ConflictSetStore, ContentSetDelta, ContentSetStore, ImmutableObjectStore,
+    LooseObjectStore, ObjectStoreAdapter, RetainedSetStore, RevisionMapStore,
 };
 
 async fn application_conformance<S: ImmutableObjectStore>(objects: &S) {
@@ -143,6 +143,36 @@ macro_rules! set_conformance {
 set_conformance!(conflict_conformance, ConflictSetStore, ConflictId);
 set_conformance!(content_conformance, ContentSetStore, ContentId);
 set_conformance!(retained_conformance, RetainedSetStore, ObjectId);
+
+#[tokio::test]
+async fn content_set_delta_is_sorted_and_prunes_equal_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path());
+    let contents = ContentSetStore::new(&objects);
+    let empty = contents.empty_root().await.unwrap();
+    let a = ContentId::from_digest([1; 32]);
+    let b = ContentId::from_digest([2; 32]);
+    let c = ContentId::from_digest([3; 32]);
+    let old = contents
+        .update_batch(empty, [(a, true), (b, true)])
+        .await
+        .unwrap();
+    let new = contents
+        .update_batch(old, [(a, false), (c, true)])
+        .await
+        .unwrap();
+    assert_eq!(
+        contents.delta(old, new, Default::default()).await.unwrap(),
+        vec![ContentSetDelta::Removed(a), ContentSetDelta::Added(c)]
+    );
+    assert!(
+        contents
+            .delta(new, new, Default::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
 
 #[tokio::test]
 async fn memory_backend_supports_all_typed_collections() {

@@ -74,8 +74,8 @@ pub use revision_map::{
     RevisionMapCursor, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore,
 };
 pub use sets::{
-    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetStore,
-    RetainedSetCursor, RetainedSetStore,
+    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetDelta,
+    ContentSetDeltaLimits, ContentSetStore, RetainedSetCursor, RetainedSetStore,
 };
 pub use view_lineage::{
     ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,

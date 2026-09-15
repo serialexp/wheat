@@ -723,7 +723,7 @@ where
                             .ok();
                         let mut divergent = Some(right);
                         for (index, &(child_edge, id)) in left.children.iter().enumerate().rev() {
-                            if matching.is_none() && child_edge < edge {
+                            if matching.is_none() && child_edge < edge && divergent.is_some() {
                                 pending.push(DiffTask::One(
                                     DiffSide::Loaded(
                                         divergent.take().expect("divergent side is queued once"),
@@ -765,7 +765,7 @@ where
                             .ok();
                         let mut divergent = Some(left);
                         for (index, &(child_edge, id)) in right.children.iter().enumerate().rev() {
-                            if matching.is_none() && child_edge < edge {
+                            if matching.is_none() && child_edge < edge && divergent.is_some() {
                                 pending.push(DiffTask::One(
                                     DiffSide::Loaded(
                                         divergent.take().expect("divergent side is queued once"),
