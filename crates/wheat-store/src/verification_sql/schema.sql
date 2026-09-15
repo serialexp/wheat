@@ -49,3 +49,8 @@ CREATE TABLE verified_map_pairs (
     conflict_root BLOB NOT NULL,
     PRIMARY KEY (application_node, revision_node, retained_root, conflict_root)
 ) WITHOUT ROWID;
+
+-- Verification scratch has no durability value and is deleted with the run. Keep
+-- its millions of membership and receipt operations in one transaction instead
+-- of paying SQLite's per-statement autocommit machinery.
+BEGIN IMMEDIATE;

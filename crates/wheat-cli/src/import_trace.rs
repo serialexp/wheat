@@ -106,6 +106,22 @@ impl ImportTrace {
                     "storage": storage_json(&storage),
                 }),
             ),
+            AtomicImportEvent::ValidationPhaseStarted { phase } => self.emit(
+                "validation_phase_started",
+                json!({ "phase": phase.as_str() }),
+            ),
+            AtomicImportEvent::ValidationPhaseFinished {
+                phase,
+                elapsed,
+                storage,
+            } => self.emit(
+                "validation_phase_finished",
+                json!({
+                    "phase": phase.as_str(),
+                    "duration_us": micros(elapsed),
+                    "storage": storage_json(&storage),
+                }),
+            ),
             AtomicImportEvent::StorageClosed { storage } => {
                 self.emit(
                     "storage_closed",

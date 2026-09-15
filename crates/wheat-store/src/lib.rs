@@ -33,6 +33,7 @@ mod repository_publication;
 mod repository_reader;
 mod repository_transition;
 mod repository_verify;
+pub use repository_verify::RepositoryValidationPhase;
 mod verification_scratch;
 pub use repository_reader::RepositoryReader;
 mod revision_map;

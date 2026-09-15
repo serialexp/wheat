@@ -12,8 +12,20 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         &self,
         id: RepositoryEnvelopeId,
     ) -> Result<RepositoryEnvelopeRecord> {
+        self.validate_envelope_with_observer(id, |_| {}).await
+    }
+
+    pub async fn validate_envelope_with_observer<F>(
+        &self,
+        id: RepositoryEnvelopeId,
+        observer: F,
+    ) -> Result<RepositoryEnvelopeRecord>
+    where
+        F: FnMut(crate::RepositoryValidationPhase),
+    {
         let envelope = self.envelope(id).await?;
-        self.validate_complete(envelope.state).await?;
+        self.validate_complete_with_observer(envelope.state, observer)
+            .await?;
         let state = self.state(envelope.state).await?;
         let labels = self.view_label_manifest(envelope.labels).await?;
         let retained = RetainedSetStore::new(self.objects);
@@ -37,12 +49,25 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
         state: RepositoryStateId,
         labels: &ViewLabelManifestRecord,
     ) -> Result<RepositoryEnvelopeId> {
+        self.prepare_envelope_with_validation_observer(state, labels, |_| {})
+            .await
+    }
+
+    pub async fn prepare_envelope_with_validation_observer<F>(
+        &self,
+        state: RepositoryStateId,
+        labels: &ViewLabelManifestRecord,
+        observer: F,
+    ) -> Result<RepositoryEnvelopeId>
+    where
+        F: FnMut(crate::RepositoryValidationPhase),
+    {
         self.objects
             .put_if_absent(labels.id().into(), &labels.canonical_bytes())
             .await?;
         let id = self.prepare_envelope_unchecked(state, labels.id()).await?;
         RepositoryReader::new(self.objects, self.content)
-            .validate_envelope(id)
+            .validate_envelope_with_observer(id, observer)
             .await?;
         Ok(id)
     }

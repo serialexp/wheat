@@ -138,12 +138,13 @@ where
         publications,
         working_branch,
         observer,
+        |_| {},
         true,
     )
     .await
 }
 
-pub(crate) async fn finalize_import_deferred_with_observer<O, P, F>(
+pub(crate) async fn finalize_import_deferred_with_observer<O, P, F, V>(
     git_path: &Path,
     journal_path: &Path,
     objects: &O,
@@ -151,11 +152,13 @@ pub(crate) async fn finalize_import_deferred_with_observer<O, P, F>(
     publications: &P,
     working_branch: &str,
     observer: F,
+    validation_observer: V,
 ) -> Result<RepositoryHead, FinalizeImportError>
 where
     O: ImmutableObjectStore,
     P: PublicationStore,
     F: FnMut(FinalizePhase),
+    V: FnMut(wheat_store::RepositoryValidationPhase),
 {
     finalize_import_inner(
         git_path,
@@ -165,12 +168,13 @@ where
         publications,
         working_branch,
         observer,
+        validation_observer,
         false,
     )
     .await
 }
 
-async fn finalize_import_inner<O, P, F>(
+async fn finalize_import_inner<O, P, F, V>(
     git_path: &Path,
     journal_path: &Path,
     objects: &O,
@@ -178,12 +182,14 @@ async fn finalize_import_inner<O, P, F>(
     publications: &P,
     working_branch: &str,
     mut observer: F,
+    validation_observer: V,
     durable_journal: bool,
 ) -> Result<RepositoryHead, FinalizeImportError>
 where
     O: ImmutableObjectStore,
     P: PublicationStore,
     F: FnMut(FinalizePhase),
+    V: FnMut(wheat_store::RepositoryValidationPhase),
 {
     observer(FinalizePhase::Preflight);
     let staged = if durable_journal {
@@ -409,7 +415,9 @@ where
     batch.flush().await?;
     let publisher = RepositoryPublisher::new(backing, content, publications);
     observer(FinalizePhase::PrepareEnvelopeValidation);
-    let envelope = publisher.prepare_envelope(state.id(), &labels).await?;
+    let envelope = publisher
+        .prepare_envelope_with_validation_observer(state.id(), &labels, validation_observer)
+        .await?;
     observer(FinalizePhase::HeadInitialize);
     Ok(publisher.initialize_prepared_envelope(envelope).await?)
 }

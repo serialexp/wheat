@@ -21,6 +21,40 @@ const RETAINED_VIEWS: u8 = 2;
 const RETAINED_REVISIONS: u8 = 3;
 const RETAINED_APPLICATIONS: u8 = 4;
 
+/// Stable coarse boundaries within a complete repository validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryValidationPhase {
+    LoadState,
+    IndexRetained,
+    VerifyContent,
+    VerifyChanges,
+    VerifyLineage,
+    VerifyViewContentSets,
+    VerifyViewTrees,
+    VerifyViewRevisionMaps,
+    VerifyViewApplicationMaps,
+    VerifyRevisions,
+    VerifyApplications,
+}
+
+impl RepositoryValidationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadState => "load_state",
+            Self::IndexRetained => "index_retained",
+            Self::VerifyContent => "verify_content",
+            Self::VerifyChanges => "verify_changes",
+            Self::VerifyLineage => "verify_lineage",
+            Self::VerifyViewContentSets => "verify_view_content_sets",
+            Self::VerifyViewTrees => "verify_view_trees",
+            Self::VerifyViewRevisionMaps => "verify_view_revision_maps",
+            Self::VerifyViewApplicationMaps => "verify_view_application_maps",
+            Self::VerifyRevisions => "verify_revisions",
+            Self::VerifyApplications => "verify_applications",
+        }
+    }
+}
+
 fn invalid(message: &'static str) -> RepositoryPublicationError {
     RepositoryPublicationError::InvalidReferences(message)
 }
@@ -104,12 +138,17 @@ impl<O: ImmutableObjectStore> ImmutableObjectStore for CachedObjects<'_, O> {
     }
 }
 
-struct Verifier<'a, 'r, O> {
+struct Verifier<'a, 'r, O, F> {
     reader: &'r RepositoryReader<'a, O>,
     scratch: VerificationScratch,
+    observer: F,
 }
 
-impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
+impl<O, F> Verifier<'_, '_, O, F>
+where
+    O: ImmutableObjectStore,
+    F: FnMut(RepositoryValidationPhase),
+{
     fn retained(&self, family: u8, id: ObjectId) -> Result<()> {
         if !self.scratch.contains_retained(family, id)? {
             return Err(invalid("reference not retained"));
@@ -258,40 +297,6 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
             )?;
         }
         Ok(produced)
-    }
-
-    async fn verify_view(
-        &self,
-        id: ViewId,
-        state: &RepositoryStateRecord,
-        aggregate: ContentSetId,
-    ) -> Result<()> {
-        let view = self.reader.view(id).await?;
-        let visible = self.reader.manifest(view.required_content).await?.content;
-        self.visible_set(visible, aggregate).await?;
-        self.tree(view.tree, aggregate, Some(visible)).await?;
-        self.revision_map(view.revisions, state.retained_revisions)
-            .await?;
-        let produced = self
-            .application_map(
-                view.applications,
-                view.revisions,
-                state.retained_applications,
-                view.unresolved_conflicts,
-            )
-            .await?;
-        let mut conflicts = ConflictSetStore::new(self.reader.objects)
-            .cursor(view.unresolved_conflicts)
-            .await?;
-        while let Some(id) = conflicts.next().await? {
-            self.verify_conflict(id, state).await?;
-            if !produced.contains(&id) {
-                return Err(invalid(
-                    "view conflict not produced by selected applications",
-                ));
-            }
-        }
-        Ok(())
     }
 
     async fn verify_untouched(
@@ -554,11 +559,13 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
         Ok(())
     }
 
-    async fn validate(&self, id: RepositoryStateId) -> Result<()> {
+    async fn validate(&mut self, id: RepositoryStateId) -> Result<()> {
+        (self.observer)(RepositoryValidationPhase::LoadState);
         let state = self.reader.state(id).await?;
         let aggregate = self.reader.manifest(state.required_content).await?.content;
 
         // Authenticate each retained inventory once and use exact disk-backed
+        (self.observer)(RepositoryValidationPhase::IndexRetained);
         // membership thereafter. Repeated radix descents dominated historical verification.
         self.index_retained(RETAINED_CHANGES, state.retained_changes)
             .await?;
@@ -571,6 +578,7 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
 
         // Verify and index the aggregate once. Subsequent checks are SQL membership only,
         // and raw content is read exactly once for this run.
+        (self.observer)(RepositoryValidationPhase::VerifyContent);
         let mut contents = ContentSetStore::new(self.reader.objects)
             .cursor(aggregate)
             .await?;
@@ -587,6 +595,7 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
 
         // Change objects are addressed by content. Build the logical index exactly once,
         // before checking references, and reject every duplicate logical identity.
+        (self.observer)(RepositoryValidationPhase::VerifyChanges);
         let retained = RetainedSetStore::new(self.reader.objects);
         let mut cursor = retained.cursor(state.retained_changes).await?;
         let mut retained_change_count = 0usize;
@@ -617,6 +626,7 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
             return Err(invalid("change map omits a retained logical change"));
         }
 
+        (self.observer)(RepositoryValidationPhase::VerifyLineage);
         self.retained(RETAINED_VIEWS, state.base_view.into())?;
         crate::ViewLineageMapStore::new(self.reader.objects)
             .validate(
@@ -627,11 +637,64 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
             .await
             .map_err(|_| invalid("invalid view lineage"))?;
         self.verify_lineage_semantics(&state).await?;
+        (self.observer)(RepositoryValidationPhase::VerifyViewContentSets);
         let mut cursor = retained.cursor(state.retained_views).await?;
         while let Some(id) = cursor.next().await? {
-            self.verify_view(ViewId::from_digest(*id.as_bytes()), &state, aggregate)
+            let view = self
+                .reader
+                .view(ViewId::from_digest(*id.as_bytes()))
+                .await?;
+            let visible = self.reader.manifest(view.required_content).await?.content;
+            self.visible_set(visible, aggregate).await?;
+        }
+        (self.observer)(RepositoryValidationPhase::VerifyViewTrees);
+        let mut cursor = retained.cursor(state.retained_views).await?;
+        while let Some(id) = cursor.next().await? {
+            let view = self
+                .reader
+                .view(ViewId::from_digest(*id.as_bytes()))
+                .await?;
+            let visible = self.reader.manifest(view.required_content).await?.content;
+            self.tree(view.tree, aggregate, Some(visible)).await?;
+        }
+        (self.observer)(RepositoryValidationPhase::VerifyViewRevisionMaps);
+        let mut cursor = retained.cursor(state.retained_views).await?;
+        while let Some(id) = cursor.next().await? {
+            let view = self
+                .reader
+                .view(ViewId::from_digest(*id.as_bytes()))
+                .await?;
+            self.revision_map(view.revisions, state.retained_revisions)
                 .await?;
         }
+        (self.observer)(RepositoryValidationPhase::VerifyViewApplicationMaps);
+        let mut cursor = retained.cursor(state.retained_views).await?;
+        while let Some(id) = cursor.next().await? {
+            let view = self
+                .reader
+                .view(ViewId::from_digest(*id.as_bytes()))
+                .await?;
+            let produced = self
+                .application_map(
+                    view.applications,
+                    view.revisions,
+                    state.retained_applications,
+                    view.unresolved_conflicts,
+                )
+                .await?;
+            let mut conflicts = ConflictSetStore::new(self.reader.objects)
+                .cursor(view.unresolved_conflicts)
+                .await?;
+            while let Some(id) = conflicts.next().await? {
+                self.verify_conflict(id, &state).await?;
+                if !produced.contains(&id) {
+                    return Err(invalid(
+                        "view conflict not produced by selected applications",
+                    ));
+                }
+            }
+        }
+        (self.observer)(RepositoryValidationPhase::VerifyRevisions);
         let mut cursor = retained.cursor(state.retained_revisions).await?;
         while let Some(id) = cursor.next().await? {
             let revision = self
@@ -741,6 +804,7 @@ impl<O: ImmutableObjectStore> Verifier<'_, '_, O> {
                 return Err(invalid("authored revision does not apply cleanly"));
             }
         }
+        (self.observer)(RepositoryValidationPhase::VerifyApplications);
         let mut cursor = retained.cursor(state.retained_applications).await?;
         while let Some(id) = cursor.next().await? {
             let app = self
@@ -894,6 +958,7 @@ mod untouched_tests {
         let verifier = Verifier {
             reader: &reader,
             scratch: VerificationScratch::new().unwrap(),
+            observer: |_| {},
         };
         verifier
             .verify_untouched(
@@ -978,6 +1043,18 @@ mod untouched_tests {
 impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
     /// Verify all retained inventories with verified reads and fresh, disk-backed scratch indexes.
     pub async fn validate_complete(&self, id: RepositoryStateId) -> Result<()> {
+        self.validate_complete_with_observer(id, |_| {}).await
+    }
+
+    /// Verify completely while reporting stable coarse phase boundaries.
+    pub async fn validate_complete_with_observer<F>(
+        &self,
+        id: RepositoryStateId,
+        observer: F,
+    ) -> Result<()>
+    where
+        F: FnMut(RepositoryValidationPhase),
+    {
         // Cache authenticated immutable objects only for this verification run.
         // This removes repeated radix-node decoding without carrying trust across calls.
         // Fixed entry bound keeps memory independent of repository size while
@@ -988,6 +1065,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         Verifier {
             reader: &reader,
             scratch: VerificationScratch::new()?,
+            observer,
         }
         .validate(id)
         .await

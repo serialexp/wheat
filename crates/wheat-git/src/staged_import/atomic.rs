@@ -54,6 +54,14 @@ pub enum AtomicImportEvent {
         elapsed: Duration,
         storage: PackedStoreTraceSnapshot,
     },
+    ValidationPhaseStarted {
+        phase: wheat_store::RepositoryValidationPhase,
+    },
+    ValidationPhaseFinished {
+        phase: wheat_store::RepositoryValidationPhase,
+        elapsed: Duration,
+        storage: PackedStoreTraceSnapshot,
+    },
     StorageClosed {
         storage: PackedStoreTraceSnapshot,
     },
@@ -243,36 +251,67 @@ where
             phase: AtomicImportPhase::Finalize,
         });
         let phase_started = Instant::now();
-        let mut previous_finalize = None::<(FinalizePhase, Instant)>;
-        let head = finalize_import_deferred_with_observer(
-            git_path,
-            &journal,
-            &objects,
-            &content,
-            &publications,
-            working_branch,
-            |phase| {
-                if let (Some((previous, started)), Some(trace)) =
-                    (previous_finalize, trace.as_ref())
-                {
-                    observer(AtomicImportEvent::FinalizePhaseFinished {
-                        phase: previous,
-                        elapsed: started.elapsed(),
-                        storage: trace.snapshot().expect("store remains open"),
+        let previous_finalize = std::cell::Cell::new(None::<(FinalizePhase, Instant)>);
+        let previous_validation =
+            std::cell::Cell::new(None::<(wheat_store::RepositoryValidationPhase, Instant)>);
+        let head = {
+            let shared_observer = std::cell::RefCell::new(&mut observer);
+            let head = finalize_import_deferred_with_observer(
+                git_path,
+                &journal,
+                &objects,
+                &content,
+                &publications,
+                working_branch,
+                |phase| {
+                    if let (Some((previous, started)), Some(trace)) =
+                        (previous_finalize.get(), trace.as_ref())
+                    {
+                        shared_observer.borrow_mut()(AtomicImportEvent::FinalizePhaseFinished {
+                            phase: previous,
+                            elapsed: started.elapsed(),
+                            storage: trace.snapshot().expect("store remains open"),
+                        });
+                    }
+                    shared_observer.borrow_mut()(AtomicImportEvent::FinalizePhaseStarted { phase });
+                    previous_finalize.set(Some((phase, Instant::now())));
+                },
+                |phase| {
+                    if let (Some((previous, started)), Some(trace)) =
+                        (previous_validation.get(), trace.as_ref())
+                    {
+                        shared_observer.borrow_mut()(AtomicImportEvent::ValidationPhaseFinished {
+                            phase: previous,
+                            elapsed: started.elapsed(),
+                            storage: trace.snapshot().expect("store remains open"),
+                        });
+                    }
+                    shared_observer.borrow_mut()(AtomicImportEvent::ValidationPhaseStarted {
+                        phase,
                     });
-                }
-                observer(AtomicImportEvent::FinalizePhaseStarted { phase });
-                previous_finalize = Some((phase, Instant::now()));
-            },
-        )
-        .await?;
-        if let (Some((phase, started)), Some(trace)) = (previous_finalize, trace.as_ref()) {
-            observer(AtomicImportEvent::FinalizePhaseFinished {
-                phase,
-                elapsed: started.elapsed(),
-                storage: trace.snapshot().expect("store remains open"),
-            });
-        }
+                    previous_validation.set(Some((phase, Instant::now())));
+                },
+            )
+            .await?;
+            if let (Some((phase, started)), Some(trace)) =
+                (previous_validation.get(), trace.as_ref())
+            {
+                shared_observer.borrow_mut()(AtomicImportEvent::ValidationPhaseFinished {
+                    phase,
+                    elapsed: started.elapsed(),
+                    storage: trace.snapshot().expect("store remains open"),
+                });
+            }
+            if let (Some((phase, started)), Some(trace)) = (previous_finalize.get(), trace.as_ref())
+            {
+                shared_observer.borrow_mut()(AtomicImportEvent::FinalizePhaseFinished {
+                    phase,
+                    elapsed: started.elapsed(),
+                    storage: trace.snapshot().expect("store remains open"),
+                });
+            }
+            head
+        };
         observer(AtomicImportEvent::PhaseFinished {
             phase: AtomicImportPhase::Finalize,
             elapsed: phase_started.elapsed(),

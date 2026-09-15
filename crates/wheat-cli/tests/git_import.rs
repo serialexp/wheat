@@ -174,7 +174,7 @@ fn import_trace_is_bounded_jsonl_and_keeps_command_output_separate() {
     assert_eq!(stdout["command"], "import");
 
     let records = trace_records(&trace);
-    assert!(records.len() < 50, "small imports emit only coarse events");
+    assert!(records.len() < 80, "small imports emit only coarse events");
     assert_eq!(records.first().unwrap()["event"], "import_started");
     assert_eq!(records.last().unwrap()["event"], "import_complete");
     for (index, record) in records.iter().enumerate() {
@@ -202,6 +202,26 @@ fn import_trace_is_bounded_jsonl_and_keeps_command_output_separate() {
     assert_eq!(
         records
             .iter()
+            .filter(|record| record["event"] == "validation_phase_started")
+            .map(|record| record["data"]["phase"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "load_state",
+            "index_retained",
+            "verify_content",
+            "verify_changes",
+            "verify_lineage",
+            "verify_view_content_sets",
+            "verify_view_trees",
+            "verify_view_revision_maps",
+            "verify_view_application_maps",
+            "verify_revisions",
+            "verify_applications",
+        ]
+    );
+    assert_eq!(
+        records
+            .iter()
             .filter(|record| record["event"] == "finalize_phase_started")
             .map(|record| record["data"]["phase"].as_str().unwrap())
             .collect::<Vec<_>>(),
@@ -218,8 +238,7 @@ fn import_trace_is_bounded_jsonl_and_keeps_command_output_separate() {
         records
             .iter()
             .filter(|record| {
-                record["event"] == "phase_started"
-                    && record["data"]["phase"] == "resolve_frontier"
+                record["event"] == "phase_started" && record["data"]["phase"] == "resolve_frontier"
             })
             .count(),
         1
