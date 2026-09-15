@@ -210,6 +210,54 @@ async fn resumable_packed_import_reopens_before_authenticated_publication() {
 }
 
 #[tokio::test]
+async fn traced_atomic_import_reports_bounded_progress_and_ordered_phases() {
+    let git = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("atomic");
+    let mut events = Vec::new();
+
+    wheat_git::atomic_import_with_observer(git.path(), &destination, "refs/heads/main", |event| {
+        events.push(event)
+    })
+    .await
+    .unwrap();
+
+    let progress = events
+        .iter()
+        .filter_map(|event| match event {
+            wheat_git::AtomicImportEvent::StageProgress { complete, .. } => Some(*complete),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(progress.last(), Some(&true));
+    assert!(progress.len() <= 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                wheat_git::AtomicImportEvent::FinalizePhaseStarted { phase } => Some(*phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [
+            wheat_git::FinalizePhase::Preflight,
+            wheat_git::FinalizePhase::JournalAuthenticationAccumulation,
+            wheat_git::FinalizePhase::AggregateSetConstruction,
+            wheat_git::FinalizePhase::BatchFlush,
+            wheat_git::FinalizePhase::PrepareEnvelopeValidation,
+            wheat_git::FinalizePhase::HeadInitialize,
+        ]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(wheat_git::AtomicImportEvent::PhaseFinished {
+            phase: wheat_git::AtomicImportPhase::ParentSync,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn atomic_import_retains_binary_content_above_the_guarded_text_limit() {
     let (git, expected) = large_binary_fixture();
     let root = tempfile::tempdir().unwrap();

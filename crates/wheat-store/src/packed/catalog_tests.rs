@@ -67,11 +67,13 @@ fn deferred_many_tiny_batches_read_through_and_finalize_one_tail_on_close() {
         1024 * 1024,
     )
     .unwrap();
-    for value in values {
+    for (index, value) in values.into_iter().enumerate() {
         store.put_records(&[value]).unwrap();
+        assert_eq!(store.test_locator_rows(), (index + 1) as u64);
         assert_value(&mut store, value);
     }
     store.put_records(&values).unwrap();
+    assert_eq!(store.test_locator_rows(), 3);
     assert_eq!(store.test_counts().unwrap(), (3, 2, 0));
     assert_eq!(
         fs::read_dir(root.path().join("catalog")).unwrap().count(),
@@ -88,6 +90,8 @@ fn deferred_many_tiny_batches_read_through_and_finalize_one_tail_on_close() {
     );
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
+    assert_eq!(reopened.test_locator_rows(), 3);
+    assert_eq!(reopened.test_checkpoint_locator_rows().unwrap(), 3);
     for value in values {
         assert_value(&mut reopened, value);
     }

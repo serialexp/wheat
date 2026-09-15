@@ -10,6 +10,8 @@ use std::{
     io::{self, Read, Write},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -27,6 +29,7 @@ use super::{
         MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, SegmentError, SegmentReader,
         SegmentRecord, verify_logical,
     },
+    trace::PackedStoreTraceCounters,
 };
 use crate::Durability;
 
@@ -109,6 +112,7 @@ pub(crate) struct PackedCatalog {
     max_segment_payload_bytes: u64,
     locator_rows: u64,
     poisoned: bool,
+    trace: Option<Arc<PackedStoreTraceCounters>>,
     #[cfg(test)]
     sealed_authentications: usize,
     #[cfg(test)]
@@ -154,13 +158,22 @@ impl PackedCatalog {
         root: impl AsRef<Path>,
         durability: Durability,
     ) -> Result<Self, CatalogError> {
-        Self::open_with_target(root, durability, DEFAULT_ACTIVE_TARGET_BYTES)
+        Self::open_with_target(root, durability, DEFAULT_ACTIVE_TARGET_BYTES, None)
+    }
+
+    pub(crate) fn open_with_trace(
+        root: impl AsRef<Path>,
+        durability: Durability,
+        trace: Arc<PackedStoreTraceCounters>,
+    ) -> Result<Self, CatalogError> {
+        Self::open_with_target(root, durability, DEFAULT_ACTIVE_TARGET_BYTES, Some(trace))
     }
 
     fn open_with_target(
         root: impl AsRef<Path>,
         durability: Durability,
         active_target_bytes: u64,
+        trace: Option<Arc<PackedStoreTraceCounters>>,
     ) -> Result<Self, CatalogError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
@@ -238,6 +251,7 @@ impl PackedCatalog {
             max_segment_payload_bytes: MAX_SEGMENT_PAYLOAD_BYTES,
             locator_rows: 0,
             poisoned: false,
+            trace,
             #[cfg(test)]
             sealed_authentications: 0,
             #[cfg(test)]
@@ -258,7 +272,7 @@ impl PackedCatalog {
             catalog.rebuild_index()?;
         } else {
             catalog.locator_rows = checkpoint.expect("validated checkpoint").2;
-            if catalog.locator_count()? != catalog.locator_rows {
+            if catalog.recount_locator_rows()? != catalog.locator_rows {
                 catalog.rebuild_index()?;
             }
         }
@@ -271,7 +285,7 @@ impl PackedCatalog {
         durability: Durability,
         active_target_bytes: u64,
     ) -> Result<Self, CatalogError> {
-        Self::open_with_target(root, durability, active_target_bytes)
+        Self::open_with_target(root, durability, active_target_bytes, None)
     }
 
     #[cfg(test)]
@@ -282,7 +296,7 @@ impl PackedCatalog {
         max_segment_entries: usize,
         max_segment_payload_bytes: u64,
     ) -> Result<Self, CatalogError> {
-        let mut catalog = Self::open_with_target(root, durability, active_target_bytes)?;
+        let mut catalog = Self::open_with_target(root, durability, active_target_bytes, None)?;
         assert!(max_segment_entries <= super::segment::MAX_SEGMENT_ENTRIES);
         assert!(max_segment_payload_bytes <= MAX_SEGMENT_PAYLOAD_BYTES);
         catalog.max_segment_entries = max_segment_entries;
@@ -326,6 +340,16 @@ impl PackedCatalog {
     #[cfg(test)]
     pub(crate) fn test_set_close_failpoint(&mut self, failpoint: CloseFailpoint) {
         self.close_failpoint = Some(failpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_locator_rows(&self) -> u64 {
+        self.locator_rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_checkpoint_locator_rows(&self) -> Result<u64, CatalogError> {
+        Ok(self.read_checkpoint()?.2)
     }
 
     #[cfg(test)]
@@ -535,8 +559,14 @@ impl PackedCatalog {
         if self.poisoned {
             return Err(CatalogError::Poisoned);
         }
+        if let Some(trace) = &self.trace {
+            trace.deferred_put(records.len());
+        }
         for record in records {
             if let Some((kind, bytes)) = self.get(record.namespace, record.digest)? {
+                if let Some(trace) = &self.trace {
+                    trace.deferred_duplicate();
+                }
                 if kind != record.kind || bytes != record.bytes {
                     return Err(CatalogError::Corrupt(
                         "existing key differs from proposed bytes",
@@ -558,6 +588,9 @@ impl PackedCatalog {
                     }
             };
             if must_roll {
+                if let Some(trace) = &self.trace {
+                    trace.bulk_roll();
+                }
                 self.finalize_bulk()?;
                 self.create_bulk()?;
             }
@@ -566,7 +599,13 @@ impl PackedCatalog {
             // permit this handle to finalize or publish that file unless its row
             // transaction also commits.
             self.poisoned = true;
+            let append_started = Instant::now();
             let entry = bulk.segment.append_one(*record)?;
+            if let Some(trace) = &self.trace {
+                trace.deferred_append();
+                trace.deferred_append_duration(append_started.elapsed());
+            }
+            let transaction_started = Instant::now();
             let transaction = self.index.transaction()?;
             insert_source_entries(&transaction, &bulk.source, std::slice::from_ref(&entry))?;
             #[cfg(test)]
@@ -576,7 +615,14 @@ impl PackedCatalog {
                 ));
             }
             transaction.commit()?;
-            self.locator_rows = self.locator_count()?;
+            if let Some(trace) = &self.trace {
+                trace.deferred_index_transaction();
+                trace.deferred_index_transaction_duration(transaction_started.elapsed());
+            }
+            self.locator_rows = self
+                .locator_rows
+                .checked_add(1)
+                .ok_or(CatalogError::Corrupt("locator count overflow"))?;
             self.poisoned = false;
         }
         Ok(())
@@ -606,8 +652,14 @@ impl PackedCatalog {
             return Ok(());
         }
         self.poisoned = true;
+        let started = Instant::now();
         let finalized = bulk.segment.finalize()?;
-        self.publish_finalized_bulk(finalized, &bulk.source)
+        let result = self.publish_finalized_bulk(finalized, &bulk.source);
+        if let Some(trace) = &self.trace {
+            trace.bulk_finalization();
+            trace.bulk_finalization_duration(started.elapsed());
+        }
+        result
     }
 
     fn publish_finalized_bulk(
@@ -651,9 +703,9 @@ impl PackedCatalog {
             &transaction,
             Some((generation, digest)),
             self.active.state(),
+            self.locator_rows,
         )?;
         transaction.commit()?;
-        self.locator_rows = self.locator_count()?;
         self.generation = Some(generation);
         self.head = Some(digest);
         self.sealed_sources.push(SealedSource {
@@ -679,6 +731,23 @@ impl PackedCatalog {
         digest: [u8; 32],
         max: usize,
     ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+        let started = Instant::now();
+        if let Some(trace) = &self.trace {
+            trace.catalog_get();
+        }
+        let result = self.get_bounded_inner(namespace, digest, max);
+        if let Some(trace) = &self.trace {
+            trace.catalog_lookup_duration(started.elapsed());
+        }
+        result
+    }
+
+    fn get_bounded_inner(
+        &mut self,
+        namespace: u8,
+        digest: [u8; 32],
+        max: usize,
+    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
         if let Some(value) = self
             .bulk
             .as_mut()
@@ -686,6 +755,9 @@ impl PackedCatalog {
             .transpose()?
             .flatten()
         {
+            if let Some(trace) = &self.trace {
+                trace.catalog_bulk_hit();
+            }
             return Ok(Some(value));
         }
         for attempt in 0..2 {
@@ -710,7 +782,14 @@ impl PackedCatalog {
                     return Err(CatalogError::Corrupt("locator misses authoritative object"));
                 }
                 match self.read_authoritative_location(namespace, digest, location.as_ref(), max) {
-                    Ok(value) => return Ok(value),
+                    Ok(value) => {
+                        if value.is_some()
+                            && let Some(trace) = &self.trace
+                        {
+                            trace.catalog_locator_hit();
+                        }
+                        return Ok(value);
+                    }
                     Err(CatalogError::Corrupt(_)) | Err(CatalogError::Database(_))
                         if attempt == 0 => {}
                     Err(error) => return Err(error),
@@ -935,9 +1014,15 @@ impl PackedCatalog {
             insert_source_entries(&transaction, &relative, reader.authenticated_entries())?;
         }
         insert_source_entries(&transaction, ACTIVE_FILE, self.active.entries())?;
-        write_checkpoint(&transaction, catalog_head, self.active.state())?;
+        let locator_rows = locator_count(&transaction)?;
+        write_checkpoint(
+            &transaction,
+            catalog_head,
+            self.active.state(),
+            locator_rows,
+        )?;
         transaction.commit()?;
-        self.locator_rows = self.locator_count()?;
+        self.locator_rows = locator_rows;
         Ok(())
     }
 
@@ -949,9 +1034,9 @@ impl PackedCatalog {
             &transaction,
             self.generation.zip(self.head),
             self.active.state(),
+            self.locator_rows,
         )?;
         transaction.commit()?;
-        self.locator_rows = self.locator_count()?;
         Ok(())
     }
 
@@ -959,15 +1044,22 @@ impl PackedCatalog {
         &mut self,
         entries: &[SegmentIndexEntry],
     ) -> Result<(), CatalogError> {
+        let added = u64::try_from(entries.len())
+            .map_err(|_| CatalogError::Corrupt("locator count overflow"))?;
+        let locator_rows = self
+            .locator_rows
+            .checked_add(added)
+            .ok_or(CatalogError::Corrupt("locator count overflow"))?;
         let transaction = self.index.transaction()?;
         insert_source_entries(&transaction, ACTIVE_FILE, entries)?;
         write_checkpoint(
             &transaction,
             self.generation.zip(self.head),
             self.active.state(),
+            locator_rows,
         )?;
         transaction.commit()?;
-        self.locator_rows = self.locator_count()?;
+        self.locator_rows = locator_rows;
         Ok(())
     }
 
@@ -1001,6 +1093,7 @@ impl PackedCatalog {
             max_segment_payload_bytes: _,
             locator_rows: _,
             poisoned: _,
+            trace: _,
             #[cfg(test)]
                 sealed_authentications: _,
             #[cfg(test)]
@@ -1029,11 +1122,16 @@ impl PackedCatalog {
         }
     }
 
-    fn locator_count(&self) -> Result<u64, CatalogError> {
-        let count: i64 = self
-            .index
-            .query_row("SELECT count(*) FROM locator", [], |row| row.get(0))?;
-        u64_value(count)
+    fn recount_locator_rows(&self) -> Result<u64, CatalogError> {
+        if let Some(trace) = &self.trace {
+            trace.locator_recount();
+        }
+        let started = Instant::now();
+        let count = locator_count(&self.index);
+        if let Some(trace) = &self.trace {
+            trace.locator_recount_duration(started.elapsed());
+        }
+        count
     }
 
     fn load_sealed_readers(&mut self) -> Result<(), CatalogError> {
@@ -1434,17 +1532,22 @@ fn insert_source_entries(
     Ok(())
 }
 
+fn locator_count(connection: &Connection) -> Result<u64, CatalogError> {
+    let count: i64 = connection.query_row("SELECT count(*) FROM locator", [], |row| row.get(0))?;
+    u64_value(count)
+}
+
 fn write_checkpoint(
     transaction: &Transaction<'_>,
     catalog: Option<(u64, [u8; 32])>,
     active: ActivePublishedState,
+    locator_rows: u64,
 ) -> Result<(), CatalogError> {
     let (generation, digest) = match catalog {
         Some((generation, digest)) => (Some(i64_value(generation)?), Some(digest)),
         None => (None, None),
     };
-    let locator_count: i64 =
-        transaction.query_row("SELECT count(*) FROM locator", [], |row| row.get(0))?;
+    let locator_count = i64_value(locator_rows)?;
     transaction.execute(
         "UPDATE checkpoint SET catalog_generation=?1,catalog_digest=?2,active_generation=?3,\
          active_id=?4,active_object_count=?5,active_payload_bytes=?6,active_total_length=?7,\

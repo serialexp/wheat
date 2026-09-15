@@ -5,5 +5,7 @@ pub(crate) mod catalog;
 mod catalog_tests;
 pub(crate) mod segment;
 mod store;
+mod trace;
 
 pub use store::PackedObjectStore;
+pub use trace::{PackedStoreTrace, PackedStoreTraceSnapshot};

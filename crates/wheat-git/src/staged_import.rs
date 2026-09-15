@@ -27,7 +27,10 @@ use crate::{
 mod atomic;
 mod cache;
 mod finalize;
-pub use atomic::{AtomicImportError, atomic_import};
+pub use atomic::{
+    AtomicImportError, AtomicImportEvent, AtomicImportPhase, atomic_import,
+    atomic_import_with_observer,
+};
 pub use finalize::{
     FinalizeImportError, FinalizePhase, finalize_import, finalize_import_with_observer,
 };

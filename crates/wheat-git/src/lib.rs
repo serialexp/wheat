@@ -10,9 +10,10 @@ pub mod journal;
 pub mod push;
 mod staged_import;
 pub use staged_import::{
-    AtomicImportError, DEFAULT_STAGE_COMMITS, FinalizeImportError, FinalizePhase, StagedBranch,
-    StagedImportError, StagedImportResult, atomic_import, finalize_import,
-    finalize_import_with_observer, stage_import,
+    AtomicImportError, AtomicImportEvent, AtomicImportPhase, DEFAULT_STAGE_COMMITS,
+    FinalizeImportError, FinalizePhase, StagedBranch, StagedImportError, StagedImportResult,
+    atomic_import, atomic_import_with_observer, finalize_import, finalize_import_with_observer,
+    stage_import,
 };
 
 use std::{

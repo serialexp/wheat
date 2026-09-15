@@ -143,17 +143,19 @@ where
     .await
 }
 
-pub(crate) async fn finalize_import_deferred<O, P>(
+pub(crate) async fn finalize_import_deferred_with_observer<O, P, F>(
     git_path: &Path,
     journal_path: &Path,
     objects: &O,
     content: &ContentStore,
     publications: &P,
     working_branch: &str,
+    observer: F,
 ) -> Result<RepositoryHead, FinalizeImportError>
 where
     O: ImmutableObjectStore,
     P: PublicationStore,
+    F: FnMut(FinalizePhase),
 {
     finalize_import_inner(
         git_path,
@@ -162,7 +164,7 @@ where
         content,
         publications,
         working_branch,
-        |_| {},
+        observer,
         false,
     )
     .await

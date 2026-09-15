@@ -25,6 +25,7 @@ mod conflict_inspection;
 mod diff_render;
 mod discovery;
 mod frontier_service;
+mod import_trace;
 mod inspection;
 mod label_service;
 mod local;
@@ -379,6 +380,9 @@ struct ImportArgs {
     /// Full Git branch ref to import and select as a native label.
     #[arg(long, default_value = "refs/heads/main")]
     branch: String,
+    /// Write bounded internal import diagnostics as JSON Lines.
+    #[arg(long, value_name = "PATH")]
+    trace: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -1094,33 +1098,82 @@ fn import(
             store_root.display()
         )));
     }
+    let mut trace = arguments
+        .trace
+        .as_deref()
+        .map(import_trace::ImportTrace::create)
+        .transpose()?;
     let local_source = Path::new(&arguments.source);
     let clone;
-    let source = if local_source.exists() {
+    let remote_clone = !local_source.exists();
+    if let Some(trace) = &mut trace {
+        trace.started(remote_clone);
+    }
+    let source = if !remote_clone {
         local_source
     } else {
+        let started = std::time::Instant::now();
+        if let Some(trace) = &mut trace {
+            trace.phase_started("remote_clone");
+        }
         clone = clone_remote_for_import(&arguments.source)?;
+        if let Some(trace) = &mut trace {
+            trace.phase_finished("remote_clone", started.elapsed());
+        }
         clone.path()
     };
     let runtime = runtime()?;
-    let head = runtime.block_on(wheat_git::atomic_import(
-        source,
-        &store_root,
-        &arguments.branch,
-    ))?;
+    let head_result = if let Some(trace) = &mut trace {
+        runtime.block_on(wheat_git::atomic_import_with_observer(
+            source,
+            &store_root,
+            &arguments.branch,
+            |event| trace.atomic_event(event),
+        ))
+    } else {
+        runtime.block_on(wheat_git::atomic_import(
+            source,
+            &store_root,
+            &arguments.branch,
+        ))
+    };
+    let head = match head_result {
+        Ok(head) => head,
+        Err(error) => {
+            if let Some(mut trace) = trace {
+                trace.error("atomic_import");
+                let _ = trace.finish();
+            }
+            return Err(error.into());
+        }
+    };
+    let phase_started = std::time::Instant::now();
+    if let Some(trace) = &mut trace {
+        trace.phase_started("store_metadata");
+    }
     let store = StoreMetadata::create(&store_root)?;
     let canonical_store = canonical_store_path(&store_root)?;
+    if let Some(trace) = &mut trace {
+        trace.phase_finished("store_metadata", phase_started.elapsed());
+    }
     let selected_label = arguments
         .branch
         .strip_prefix("refs/heads/")
         .unwrap_or(&arguments.branch)
         .to_owned();
+    let phase_started = std::time::Instant::now();
+    if let Some(trace) = &mut trace {
+        trace.phase_started("resolve_frontier");
+    }
     let repository = open(&store_root)?;
     let resolved = runtime.block_on(frontier_service::resolve(
         &repository,
         &selected_label,
         None,
     ))?;
+    if let Some(trace) = &mut trace {
+        trace.phase_finished("resolve_frontier", phase_started.elapsed());
+    }
     let workspace = WorkspaceMetadata::new(
         canonical_store,
         store.store_id,
@@ -1128,10 +1181,28 @@ fn import(
         resolved.basis,
     );
     drop(repository);
+    let phase_started = std::time::Instant::now();
+    if let Some(trace) = &mut trace {
+        trace.phase_started("workspace_metadata");
+    }
     initialize_workspace_directory(workspace_root)?;
     workspace.initialize(workspace_root)?;
+    if let Some(trace) = &mut trace {
+        trace.phase_finished("workspace_metadata", phase_started.elapsed());
+    }
+    let phase_started = std::time::Instant::now();
+    if let Some(trace) = &mut trace {
+        trace.phase_started("materialize");
+    }
     let (view, materialized_root) =
         materialize_resolved(workspace_root, Some(&store_root), selected_label, resolved)?;
+    if let Some(trace) = &mut trace {
+        trace.phase_finished("materialize", phase_started.elapsed());
+    }
+    if let Some(mut trace) = trace {
+        trace.complete(head.generation);
+        trace.finish()?;
+    }
     let human = format!(
         "materialized view {view} in {}\nimported {} at generation {}\nenvelope {}\n",
         materialized_root.display(),

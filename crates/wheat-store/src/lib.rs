@@ -23,7 +23,7 @@ pub use ownership::{
     prove_union_liveness_with,
 };
 mod packed;
-pub use packed::PackedObjectStore;
+pub use packed::{PackedObjectStore, PackedStoreTrace, PackedStoreTraceSnapshot};
 mod publication;
 mod radix;
 mod repository_envelope;
