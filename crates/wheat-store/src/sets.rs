@@ -51,7 +51,7 @@ digest_key!(ObjectId);
 
 macro_rules! set_collection {
     ($collection:ident,$id:ty,$key:ty,$node:ty,$child:ident,$kind:ident,$decode:ident) => {
-        struct $collection;
+        pub(crate) struct $collection;
         impl radix::Collection for $collection {
             type Id = $id;
             type Key = $key;

@@ -24,21 +24,29 @@ CREATE TABLE application_records (
     revision_id BLOB NOT NULL,
     conflict_id BLOB
 ) WITHOUT ROWID;
-CREATE TABLE verified_trees (
+-- Structural tree receipts are context-free but retain subtree height so a
+-- node authenticated shallowly cannot evade the directory-depth limit later.
+CREATE TABLE verified_tree_auth (
+    tree_id BLOB PRIMARY KEY NOT NULL,
+    height INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- Semantic receipts remain context-specific: aggregate membership and a view's
+-- visible manifest are independent of structural tree authentication.
+CREATE TABLE verified_tree_semantics (
     tree_id BLOB NOT NULL,
     aggregate_id BLOB NOT NULL,
     visible_id BLOB NOT NULL,
     PRIMARY KEY (tree_id, aggregate_id, visible_id)
 ) WITHOUT ROWID;
-CREATE TABLE verified_visible_sets (
+-- A radix node can be reused under different incoming prefixes. Receipts must
+-- name that reconstructed prefix as well as the external validation context.
+CREATE TABLE verified_radix_nodes (
+    kind INTEGER NOT NULL,
+    context_id BLOB NOT NULL,
     node_id BLOB NOT NULL,
-    aggregate_id BLOB NOT NULL,
-    PRIMARY KEY (node_id, aggregate_id)
-) WITHOUT ROWID;
-CREATE TABLE verified_revision_maps (
-    node_id BLOB NOT NULL,
-    retained_root BLOB NOT NULL,
-    PRIMARY KEY (node_id, retained_root)
+    prefix BLOB NOT NULL,
+    PRIMARY KEY (kind, context_id, node_id, prefix)
 ) WITHOUT ROWID;
 -- A pair receipt is deliberately written only for subtrees containing no conflicts.
 -- Thus pruning one can never hide a conflict needed by reverse conflict validation.

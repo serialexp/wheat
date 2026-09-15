@@ -129,6 +129,33 @@ pub(crate) struct Cursor<'a, S, C: Collection> {
     key: Vec<u8>,
 }
 
+/// A post-order, context-aware radix traversal used by repository verification.
+///
+/// Every node is read through [`Store::read_at`], so its structural constraints are
+/// checked at its actual key position. Callers can prune a subtree only after a
+/// receipt for this exact reconstructed prefix and external validation context.
+pub(crate) struct ContextWalk<'a, S, C: Collection> {
+    store: Store<'a, S, C>,
+    stack: Vec<ContextFrame<C>>,
+    key: Vec<u8>,
+    prefix_len: usize,
+}
+
+struct ContextFrame<C: Collection> {
+    id: C::Id,
+    node: Node<C::Id, C::Value>,
+    position: usize,
+    child_index: usize,
+    yielded_value: bool,
+    announced: bool,
+}
+
+pub(crate) enum ContextWalkStep<C: Collection> {
+    Node { id: C::Id },
+    Entry { key: C::Key, value: C::Value },
+    Complete { id: C::Id },
+}
+
 impl<'a, S, C> Store<'a, S, C>
 where
     S: ImmutableObjectStore,
@@ -247,6 +274,23 @@ where
             store: Self::new(self.objects),
             stack: vec![(node, 0, 0, false)],
             key: vec![0; C::Key::LEN],
+        })
+    }
+
+    pub(crate) async fn context_walk(&self, root: C::Id) -> Result<ContextWalk<'a, S, C>, Error> {
+        let node = self.root(root).await?;
+        Ok(ContextWalk {
+            store: Self::new(self.objects),
+            stack: vec![ContextFrame {
+                id: root,
+                node,
+                position: 0,
+                child_index: 0,
+                yielded_value: false,
+                announced: false,
+            }],
+            key: vec![0; C::Key::LEN],
+            prefix_len: 0,
         })
     }
 
@@ -874,6 +918,78 @@ where
 
     pub(crate) async fn contains_node(&self, id: C::Id) -> Result<bool, Error> {
         Ok(self.objects.exists_many(&[id.into()]).await?[0])
+    }
+}
+
+impl<S: ImmutableObjectStore, C: Collection> ContextWalk<'_, S, C> {
+    pub(crate) fn prefix(&self) -> &[u8] {
+        &self.key[..self.prefix_len]
+    }
+
+    /// Skip the subtree announced by the immediately preceding [`ContextWalkStep::Node`].
+    pub(crate) fn prune(&mut self) {
+        let frame = self
+            .stack
+            .last()
+            .expect("context walk prune follows a node announcement");
+        assert!(
+            frame.announced,
+            "context walk prune requires a node announcement"
+        );
+        self.stack.pop();
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<ContextWalkStep<C>>, Error> {
+        let result = self.next_inner().await;
+        if result.is_err() {
+            self.stack.clear();
+        }
+        result
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<ContextWalkStep<C>>, Error> {
+        loop {
+            let Some(frame) = self.stack.last_mut() else {
+                return Ok(None);
+            };
+            let end = frame.position + frame.node.prefix.len();
+            self.key[frame.position..end].copy_from_slice(&frame.node.prefix);
+            self.prefix_len = end;
+
+            if !frame.announced {
+                frame.announced = true;
+                return Ok(Some(ContextWalkStep::Node { id: frame.id }));
+            }
+            if !frame.yielded_value {
+                frame.yielded_value = true;
+                if let Some(value) = frame.node.value {
+                    return Ok(Some(ContextWalkStep::Entry {
+                        key: C::Key::from_bytes(&self.key),
+                        value,
+                    }));
+                }
+            }
+            if let Some(&(edge, id)) = frame.node.children.get(frame.child_index) {
+                frame.child_index += 1;
+                self.key[end] = edge;
+                let position = end + 1;
+                let node = self.store.read_at(id, position).await?;
+                self.stack.push(ContextFrame {
+                    id,
+                    node,
+                    position,
+                    child_index: 0,
+                    yielded_value: false,
+                    announced: false,
+                });
+                continue;
+            }
+
+            let id = frame.id;
+            self.stack.pop();
+            self.prefix_len = end;
+            return Ok(Some(ContextWalkStep::Complete { id }));
+        }
     }
 }
 

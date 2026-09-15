@@ -53,7 +53,7 @@ impl From<radix::DiffError> for RevisionMapError {
     }
 }
 
-struct RevisionCollection;
+pub(crate) struct RevisionCollection;
 impl radix::Key for ChangeId {
     const LEN: usize = 16;
     fn bytes(&self) -> &[u8] {

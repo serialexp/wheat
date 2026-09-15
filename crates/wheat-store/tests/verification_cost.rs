@@ -12,6 +12,8 @@ struct Counting {
     gets: AtomicUsize,
     changes: AtomicUsize,
     trees: AtomicUsize,
+    content_set_nodes: AtomicUsize,
+    revision_map_nodes: AtomicUsize,
 }
 #[async_trait]
 impl ImmutableObjectStore for Counting {
@@ -27,6 +29,12 @@ impl ImmutableObjectStore for Counting {
             }
             ObjectKind::Tree => {
                 self.trees.fetch_add(1, Ordering::SeqCst);
+            }
+            ObjectKind::ContentSetNode => {
+                self.content_set_nodes.fetch_add(1, Ordering::SeqCst);
+            }
+            ObjectKind::RevisionMapNode => {
+                self.revision_map_nodes.fetch_add(1, Ordering::SeqCst);
             }
             _ => {}
         }
@@ -46,6 +54,8 @@ async fn verification_indexes_changes_once_and_reuses_identical_tree_contexts() 
         gets: AtomicUsize::new(0),
         changes: AtomicUsize::new(0),
         trees: AtomicUsize::new(0),
+        content_set_nodes: AtomicUsize::new(0),
+        revision_map_nodes: AtomicUsize::new(0),
     };
     let mut repo = Repository::new(Tree::new());
     let basis = repo.base_view().id;
@@ -97,6 +107,8 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
         gets: AtomicUsize::new(0),
         changes: AtomicUsize::new(0),
         trees: AtomicUsize::new(0),
+        content_set_nodes: AtomicUsize::new(0),
+        revision_map_nodes: AtomicUsize::new(0),
     };
     let mut repo = Repository::new(Tree::new());
     let basis = repo.base_view().id;
@@ -130,7 +142,17 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
         .await
         .unwrap();
     let gets = objects.gets.load(Ordering::SeqCst);
+    let content_set_nodes = objects.content_set_nodes.load(Ordering::SeqCst);
+    let revision_map_nodes = objects.revision_map_nodes.load(Ordering::SeqCst);
     assert!(gets < 40_000, "shared history required {gets} object reads");
+    assert!(
+        content_set_nodes < 200,
+        "contextual visible-set receipts reread {content_set_nodes} nodes"
+    );
+    assert!(
+        revision_map_nodes < 200,
+        "contextual revision-map receipts reread {revision_map_nodes} nodes"
+    );
 }
 
 #[tokio::test]

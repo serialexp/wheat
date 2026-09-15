@@ -12,7 +12,10 @@ use crate::{
     ApplicationMapStore, ConflictSetStore, ContentSetStore, ContentStoreError,
     ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryPublicationError,
     RepositoryReader, RetainedSetStore, RevisionMapStore, StoredObject,
-    verification_scratch::VerificationScratch,
+    radix::{ContextWalkStep, Store as RadixStore},
+    revision_map::RevisionCollection,
+    sets::ContentCollection,
+    verification_scratch::{RadixReceiptKind, VerificationScratch},
 };
 use wheat_core::*;
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
@@ -180,13 +183,74 @@ where
         Ok(())
     }
 
+    /// Authenticate each distinct tree node once per validation run. The receipt
+    /// carries height so reuse beneath a deeper directory cannot bypass the
+    /// verification depth limit.
+    async fn authenticate_tree(&self, root: TreeId) -> Result<()> {
+        const MAX_DIRECTORY_DEPTH: usize = 1023;
+        if let Some(height) = self.scratch.tree_height(root)? {
+            if height > MAX_DIRECTORY_DEPTH {
+                return Err(invalid("directory depth exceeds verification limit"));
+            }
+            return Ok(());
+        }
+
+        let trees = MerkleTreeStore::new(self.reader.objects);
+        let mut stack = vec![(
+            root,
+            trees.read_node(root).await?.entries.into_values(),
+            0usize,
+        )];
+        while !stack.is_empty() {
+            let child_depth = stack.len();
+            let (node, frame, height) = stack.last_mut().expect("checked non-empty stack");
+            match frame.next() {
+                Some(DirectoryEntry::File(_)) => {}
+                Some(DirectoryEntry::Directory(child)) => {
+                    if let Some(child_height) = self.scratch.tree_height(child)? {
+                        if child_depth
+                            .checked_add(child_height)
+                            .is_none_or(|depth| depth > MAX_DIRECTORY_DEPTH)
+                        {
+                            return Err(invalid("directory depth exceeds verification limit"));
+                        }
+                        *height = (*height).max(child_height + 1);
+                    } else {
+                        stack.push((
+                            child,
+                            trees.read_node(child).await?.entries.into_values(),
+                            0,
+                        ));
+                    }
+                }
+                None => {
+                    let node = *node;
+                    let height = *height;
+                    if stack.len() - 1 + height > MAX_DIRECTORY_DEPTH {
+                        return Err(invalid("directory depth exceeds verification limit"));
+                    }
+                    self.scratch.record_tree_height(node, height)?;
+                    stack.pop();
+                    if let Some((_, _, parent_height)) = stack.last_mut() {
+                        *parent_height = (*parent_height).max(height + 1);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn tree(
         &self,
         root: TreeId,
         aggregate: ContentSetId,
         visible: Option<ContentSetId>,
     ) -> Result<()> {
-        if self.scratch.tree_verified(root, aggregate, visible)? {
+        self.authenticate_tree(root).await?;
+        if self
+            .scratch
+            .tree_semantics_verified(root, aggregate, visible)?
+        {
             return Ok(());
         }
         let trees = MerkleTreeStore::new(self.reader.objects);
@@ -196,7 +260,8 @@ where
                 None => {
                     // Only memoize a subtree after every descendant passed in
                     // this exact aggregate/visible-manifest context.
-                    self.scratch.record_tree(*node, aggregate, visible)?;
+                    self.scratch
+                        .record_tree_semantics(*node, aggregate, visible)?;
                     stack.pop();
                 }
                 Some(DirectoryEntry::File(value)) => {
@@ -210,46 +275,83 @@ where
                     }
                 }
                 Some(DirectoryEntry::Directory(id)) => {
-                    if stack.len() >= 1024 {
-                        return Err(invalid("directory depth exceeds verification limit"));
-                    }
-                    if !self.scratch.tree_verified(id, aggregate, visible)? {
+                    if !self
+                        .scratch
+                        .tree_semantics_verified(id, aggregate, visible)?
+                    {
                         stack.push((id, trees.read_node(id).await?.entries.into_values()));
                     }
                 }
             }
         }
-        // Failed traversals never produce receipts.
-        self.scratch.record_tree(root, aggregate, visible)?;
         Ok(())
     }
 
     async fn visible_set(&self, root: ContentSetId, aggregate: ContentSetId) -> Result<()> {
-        let store = ContentSetStore::new(self.reader.objects);
-        if self.scratch.visible_set_verified(root, aggregate)? {
-            return Ok(());
+        let store = RadixStore::<_, ContentCollection>::new(self.reader.objects);
+        let mut walk = store
+            .context_walk(root)
+            .await
+            .map_err(crate::CollectionError::from)?;
+        while let Some(step) = walk.next().await.map_err(crate::CollectionError::from)? {
+            match step {
+                ContextWalkStep::Node { id } => {
+                    if self.scratch.radix_node_verified(
+                        RadixReceiptKind::VisibleContent,
+                        aggregate.as_bytes(),
+                        id.into(),
+                        walk.prefix(),
+                    )? {
+                        walk.prune();
+                    }
+                }
+                ContextWalkStep::Entry { key: content, .. } => self.required(content)?,
+                ContextWalkStep::Complete { id } => self.scratch.record_radix_node(
+                    RadixReceiptKind::VisibleContent,
+                    aggregate.as_bytes(),
+                    id.into(),
+                    walk.prefix(),
+                )?,
+            }
         }
-        let mut cursor = store.cursor(root).await?;
-        while let Some(content) = cursor.next().await? {
-            self.required(content)?;
-        }
-        self.scratch.record_visible_set(root, aggregate)?;
         Ok(())
     }
 
     async fn revision_map(&self, root: RevisionMapId, retained: RetainedSetId) -> Result<()> {
-        let store = RevisionMapStore::new(self.reader.objects);
-        if self.scratch.revision_map_verified(root, retained)? {
-            return Ok(());
-        }
-        let mut cursor = store.cursor(root).await?;
-        while let Some((change_id, revision_id)) = cursor.next().await? {
-            self.retained(RETAINED_REVISIONS, revision_id.into())?;
-            if self.reader.revision(revision_id).await?.change_id != change_id {
-                return Err(invalid("selected revision change mismatch"));
+        let store = RadixStore::<_, RevisionCollection>::new(self.reader.objects);
+        let mut walk = store
+            .context_walk(root)
+            .await
+            .map_err(crate::RevisionMapError::from)?;
+        while let Some(step) = walk.next().await.map_err(crate::RevisionMapError::from)? {
+            match step {
+                ContextWalkStep::Node { id } => {
+                    if self.scratch.radix_node_verified(
+                        RadixReceiptKind::RevisionMap,
+                        retained.as_bytes(),
+                        id.into(),
+                        walk.prefix(),
+                    )? {
+                        walk.prune();
+                    }
+                }
+                ContextWalkStep::Entry {
+                    key: change_id,
+                    value: revision_id,
+                } => {
+                    self.retained(RETAINED_REVISIONS, revision_id.into())?;
+                    if self.reader.revision(revision_id).await?.change_id != change_id {
+                        return Err(invalid("selected revision change mismatch"));
+                    }
+                }
+                ContextWalkStep::Complete { id } => self.scratch.record_radix_node(
+                    RadixReceiptKind::RevisionMap,
+                    retained.as_bytes(),
+                    id.into(),
+                    walk.prefix(),
+                )?,
             }
         }
-        self.scratch.record_revision_map(root, retained)?;
         Ok(())
     }
 
@@ -967,6 +1069,34 @@ mod untouched_tests {
                 &touched.iter().map(|path| (*path).to_owned()).collect(),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn structural_tree_receipt_charges_cached_subtree_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::new(dir.path());
+        let trees = MerkleTreeStore::new(&objects);
+        let leaf = node(&trees, []).await;
+        let shared = node(&trees, [("child", DirectoryEntry::Directory(leaf))]).await;
+        let shallow = node(&trees, [("a", DirectoryEntry::Directory(shared))]).await;
+        let mut deep = shared;
+        for depth in 0..1024 {
+            deep = node(&trees, [("z", DirectoryEntry::Directory(deep))]).await;
+            if depth == 1023 {
+                break;
+            }
+        }
+
+        let content_dir = tempfile::tempdir().unwrap();
+        let content = crate::ContentStore::new(content_dir.path());
+        let reader = RepositoryReader::new(&objects, &content);
+        let verifier = Verifier {
+            reader: &reader,
+            scratch: VerificationScratch::new().unwrap(),
+            observer: |_| {},
+        };
+        verifier.authenticate_tree(shallow).await.unwrap();
+        assert!(verifier.authenticate_tree(deep).await.is_err());
     }
 
     #[tokio::test]
