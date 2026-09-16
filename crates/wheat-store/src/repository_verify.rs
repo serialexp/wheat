@@ -1,6 +1,6 @@
 //! Inventory-driven verification with a per-run disk-backed membership and memo index.
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
     sync::Mutex,
 };
@@ -11,8 +11,9 @@ use lru::LruCache;
 use crate::{
     ApplicationMapStore, ConflictSetStore, ContentSetStore, ContentStoreError,
     ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryPublicationError,
-    RepositoryReader, RetainedSetStore, RevisionMapStore, StoredObject, TreeDiffLimits,
-    radix::{ContextWalkStep, Store as RadixStore},
+    RepositoryReader, RetainedSetStore, StoredObject, TreeDiffLimits,
+    application_map::ApplicationCollection,
+    radix::{ContextWalkStep, DiffLimits, PairedContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
     sets::{ContentCollection, ContentSetDelta},
     verification_scratch::{
@@ -579,44 +580,80 @@ where
         revision_root: RevisionMapId,
         retained: RetainedSetId,
         conflict_root: ConflictSetId,
-    ) -> Result<HashSet<ConflictId>> {
-        let applications = ApplicationMapStore::new(self.reader.objects);
-        let revisions = RevisionMapStore::new(self.reader.objects);
-        if self.scratch.map_pair_verified(
-            application_root,
-            revision_root,
-            retained,
-            conflict_root,
-        )? {
-            return Ok(HashSet::new());
-        }
-        let mut produced = HashSet::new();
-        let mut cursor = applications.cursor(application_root).await?;
-        while let Some((change_id, application_id)) = cursor.next().await? {
-            self.retained(RETAINED_APPLICATIONS, application_id.into())?;
-            let record = self.reader.application(application_id).await?;
-            if revisions.get(revision_root, change_id).await? != Some(record.revision_id) {
-                return Err(invalid("selected application revision mismatch"));
-            }
-            if let ApplicationResultRecord::Conflicted { conflict, .. } = record.result {
-                if !ConflictSetStore::new(self.reader.objects)
-                    .contains(conflict_root, conflict)
-                    .await?
-                {
-                    return Err(invalid("selected conflict missing from view"));
-                }
-                produced.insert(conflict);
-            }
-        }
-        if produced.is_empty() {
-            self.scratch.record_map_pair(
+    ) -> Result<()> {
+        self.scratch.clear_produced_conflicts()?;
+        let applications = RadixStore::<_, ApplicationCollection>::new(self.reader.objects);
+        let revisions = RadixStore::<_, RevisionCollection>::new(self.reader.objects);
+        let mut walk = applications
+            .paired_context_walk(
                 application_root,
+                revisions,
                 revision_root,
-                retained,
-                conflict_root,
-            )?;
+                DiffLimits::default(),
+            )
+            .await
+            .map_err(|_| invalid("application and revision maps differ structurally"))?;
+        while let Some(step) = walk.next().await.map_err(|_| {
+            invalid("application/revision map verification limit or structure failure")
+        })? {
+            match step {
+                PairedContextWalkStep::Node {
+                    left,
+                    right: Some(right),
+                    right_skip,
+                } => {
+                    if self.scratch.map_pair_verified(
+                        left,
+                        right,
+                        walk.prefix(),
+                        0,
+                        right_skip,
+                        retained,
+                        conflict_root,
+                    )? {
+                        walk.prune();
+                    }
+                }
+                PairedContextWalkStep::Node { right: None, .. } => {}
+                PairedContextWalkStep::Entry {
+                    left: application_id,
+                    right: revision_id,
+                } => {
+                    self.retained(RETAINED_APPLICATIONS, application_id.into())?;
+                    let record = self.reader.application(application_id).await?;
+                    if revision_id != Some(record.revision_id) {
+                        return Err(invalid("selected application revision mismatch"));
+                    }
+                    if let ApplicationResultRecord::Conflicted { conflict, .. } = record.result {
+                        if !ConflictSetStore::new(self.reader.objects)
+                            .contains(conflict_root, conflict)
+                            .await?
+                        {
+                            return Err(invalid("selected conflict missing from view"));
+                        }
+                        self.scratch
+                            .insert_produced_conflict(conflict_root, conflict)?;
+                        walk.mark_conflict();
+                    }
+                }
+                PairedContextWalkStep::Complete {
+                    left,
+                    right: Some(right),
+                    right_skip,
+                    conflict_free: true,
+                } => self.scratch.record_map_pair(
+                    left,
+                    right,
+                    walk.prefix(),
+                    0,
+                    right_skip,
+                    retained,
+                    conflict_root,
+                )?,
+                PairedContextWalkStep::Complete { .. } => {}
+            }
         }
-        Ok(produced)
+        Ok(())
     }
 
     async fn verify_untouched(
@@ -993,20 +1030,22 @@ where
                 .reader
                 .view(ViewId::from_digest(*id.as_bytes()))
                 .await?;
-            let produced = self
-                .application_map(
-                    view.applications,
-                    view.revisions,
-                    state.retained_applications,
-                    view.unresolved_conflicts,
-                )
-                .await?;
+            self.application_map(
+                view.applications,
+                view.revisions,
+                state.retained_applications,
+                view.unresolved_conflicts,
+            )
+            .await?;
             let mut conflicts = ConflictSetStore::new(self.reader.objects)
                 .cursor(view.unresolved_conflicts)
                 .await?;
             while let Some(id) = conflicts.next().await? {
                 self.verify_conflict(id, &state).await?;
-                if !produced.contains(&id) {
+                if !self
+                    .scratch
+                    .contains_produced_conflict(view.unresolved_conflicts, id)?
+                {
                     return Err(invalid(
                         "view conflict not produced by selected applications",
                     ));

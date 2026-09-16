@@ -2,8 +2,8 @@ use rusqlite::{Connection, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{
-    ApplicationMapId, ChangeId, ChangeObjectId, ConflictSetId, ContentId, ContentSetId, ObjectId,
-    RetainedSetId, RevisionMapId, TreeId,
+    ApplicationMapId, ChangeId, ChangeObjectId, ConflictId, ConflictSetId, ContentId, ContentSetId,
+    ObjectId, RetainedSetId, RevisionMapId, TreeId,
 };
 
 #[derive(Clone, Copy)]
@@ -27,6 +27,12 @@ const INSERT_RADIX_NODE: &str = include_str!("verification_sql/insert_radix_node
 const CONTAINS_RADIX_NODE: &str = include_str!("verification_sql/contains_radix_node.sql");
 const INSERT_MAP_PAIR: &str = include_str!("verification_sql/insert_map_pair.sql");
 const CONTAINS_MAP_PAIR: &str = include_str!("verification_sql/contains_map_pair.sql");
+const INSERT_PRODUCED_CONFLICT: &str =
+    include_str!("verification_sql/insert_produced_conflict.sql");
+const CONTAINS_PRODUCED_CONFLICT: &str =
+    include_str!("verification_sql/contains_produced_conflict.sql");
+const DELETE_PRODUCED_CONFLICTS: &str =
+    include_str!("verification_sql/delete_produced_conflicts.sql");
 const INSERT_TREE_CONTENT_COUNT: &str =
     include_str!("verification_sql/insert_tree_content_count.sql");
 const CONTENT_COUNT: &str = include_str!("verification_sql/content_count.sql");
@@ -354,6 +360,9 @@ impl VerificationScratch {
         &self,
         application: ApplicationMapId,
         revision: RevisionMapId,
+        prefix: &[u8],
+        application_skip: usize,
+        revision_skip: usize,
         retained: RetainedSetId,
         conflicts: ConflictSetId,
     ) -> Result<bool, VerificationScratchError> {
@@ -364,6 +373,9 @@ impl VerificationScratch {
                 params![
                     application.as_bytes().as_slice(),
                     revision.as_bytes().as_slice(),
+                    prefix,
+                    application_skip,
+                    revision_skip,
                     retained.as_bytes().as_slice(),
                     conflicts.as_bytes().as_slice()
                 ],
@@ -375,6 +387,9 @@ impl VerificationScratch {
         &self,
         application: ApplicationMapId,
         revision: RevisionMapId,
+        prefix: &[u8],
+        application_skip: usize,
+        revision_skip: usize,
         retained: RetainedSetId,
         conflicts: ConflictSetId,
     ) -> Result<(), VerificationScratchError> {
@@ -383,10 +398,48 @@ impl VerificationScratch {
             .execute(params![
                 application.as_bytes().as_slice(),
                 revision.as_bytes().as_slice(),
+                prefix,
+                application_skip,
+                revision_skip,
                 retained.as_bytes().as_slice(),
                 conflicts.as_bytes().as_slice()
             ])?;
         Ok(())
+    }
+
+    /// Start collecting conflict-production evidence for one view. Evidence must
+    /// never flow between views that happen to share the same conflict-set root.
+    pub(crate) fn clear_produced_conflicts(&self) -> Result<(), VerificationScratchError> {
+        self.connection.execute(DELETE_PRODUCED_CONFLICTS, [])?;
+        Ok(())
+    }
+
+    pub(crate) fn insert_produced_conflict(
+        &self,
+        root: ConflictSetId,
+        conflict: ConflictId,
+    ) -> Result<(), VerificationScratchError> {
+        self.connection
+            .prepare_cached(INSERT_PRODUCED_CONFLICT)?
+            .execute(params![
+                root.as_bytes().as_slice(),
+                conflict.as_bytes().as_slice()
+            ])?;
+        Ok(())
+    }
+
+    pub(crate) fn contains_produced_conflict(
+        &self,
+        root: ConflictSetId,
+        conflict: ConflictId,
+    ) -> Result<bool, VerificationScratchError> {
+        Ok(self
+            .connection
+            .prepare_cached(CONTAINS_PRODUCED_CONFLICT)?
+            .query_row(
+                params![root.as_bytes().as_slice(), conflict.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?)
     }
 }
 

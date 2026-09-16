@@ -156,6 +156,63 @@ pub(crate) enum ContextWalkStep<C: Collection> {
     Complete { id: C::Id },
 }
 
+/// One post-order step for two collections with the same fixed-width key.
+///
+/// Nodes are authenticated at their physical key positions before being exposed.
+/// A caller may prune only the pair announced by the preceding `Node` step.
+pub(crate) enum PairedContextWalkStep<L: Collection, R: Collection<Key = L::Key>> {
+    Node {
+        left: L::Id,
+        right: Option<R::Id>,
+        right_skip: usize,
+    },
+    Entry {
+        left: L::Value,
+        right: Option<R::Value>,
+    },
+    Complete {
+        left: L::Id,
+        right: Option<R::Id>,
+        right_skip: usize,
+        conflict_free: bool,
+    },
+}
+
+pub(crate) struct PairedContextWalk<'a, S, L: Collection, R: Collection<Key = L::Key>> {
+    left: Store<'a, S, L>,
+    right: Store<'a, S, R>,
+    stack: Vec<PairedContextFrame<L, R>>,
+    key: Vec<u8>,
+    prefix_len: usize,
+    max_changes: usize,
+    max_nodes: usize,
+    max_pending: usize,
+    nodes_read: usize,
+    entries_emitted: usize,
+}
+
+enum PairedRight<R: Collection> {
+    Present {
+        id: R::Id,
+        node: Node<R::Id, R::Value>,
+        skip: usize,
+    },
+    Absent,
+}
+
+struct PairedContextFrame<L: Collection, R: Collection<Key = L::Key>> {
+    left_id: L::Id,
+    left: Node<L::Id, L::Value>,
+    right: PairedRight<R>,
+    position: usize,
+    child_index: usize,
+    yielded_value: bool,
+    announced: bool,
+    prunable: bool,
+    aligned: bool,
+    conflict_free: bool,
+}
+
 impl<'a, S, C> Store<'a, S, C>
 where
     S: ImmutableObjectStore,
@@ -291,6 +348,52 @@ where
             }],
             key: vec![0; C::Key::LEN],
             prefix_len: 0,
+        })
+    }
+
+    pub(crate) async fn paired_context_walk<R>(
+        &self,
+        left_root: C::Id,
+        right: Store<'a, S, R>,
+        right_root: R::Id,
+        limits: DiffLimits,
+    ) -> Result<PairedContextWalk<'a, S, C, R>, DiffError>
+    where
+        R: Collection<Key = C::Key>,
+    {
+        if limits.max_nodes < 2 {
+            return Err(DiffError::NodeLimitExceeded {
+                limit: limits.max_nodes,
+            });
+        }
+        let left = self.root(left_root).await.map_err(DiffError::from)?;
+        let right_node = right.root(right_root).await.map_err(DiffError::from)?;
+        Ok(PairedContextWalk {
+            left: Self::new(self.objects),
+            right,
+            stack: vec![PairedContextFrame {
+                left_id: left_root,
+                left,
+                right: PairedRight::Present {
+                    id: right_root,
+                    node: right_node,
+                    skip: 0,
+                },
+                position: 0,
+                child_index: 0,
+                yielded_value: false,
+                announced: false,
+                prunable: false,
+                aligned: false,
+                conflict_free: true,
+            }],
+            key: vec![0; C::Key::LEN],
+            prefix_len: 0,
+            max_changes: limits.max_changes,
+            max_nodes: limits.max_nodes,
+            max_pending: limits.max_pending,
+            nodes_read: 2,
+            entries_emitted: 0,
         })
     }
 
@@ -989,6 +1092,233 @@ impl<S: ImmutableObjectStore, C: Collection> ContextWalk<'_, S, C> {
             self.stack.pop();
             self.prefix_len = end;
             return Ok(Some(ContextWalkStep::Complete { id }));
+        }
+    }
+}
+
+impl<'a, S, L, R> PairedContextWalk<'a, S, L, R>
+where
+    S: ImmutableObjectStore,
+    L: Collection,
+    R: Collection<Key = L::Key>,
+{
+    pub(crate) fn prefix(&self) -> &[u8] {
+        &self.key[..self.prefix_len]
+    }
+
+    pub(crate) fn prune(&mut self) {
+        let frame = self
+            .stack
+            .last()
+            .expect("paired context walk prune follows a node announcement");
+        assert!(
+            frame.prunable,
+            "paired context walk prune must immediately follow a node announcement"
+        );
+        self.stack.pop();
+    }
+
+    pub(crate) fn mark_conflict(&mut self) {
+        self.stack
+            .last_mut()
+            .expect("paired context walk conflict follows an entry")
+            .conflict_free = false;
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<PairedContextWalkStep<L, R>>, DiffError> {
+        let result = self.next_inner().await;
+        if result.is_err() {
+            self.stack.clear();
+        }
+        result
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<PairedContextWalkStep<L, R>>, DiffError> {
+        loop {
+            let stack_depth = self.stack.len();
+            let Some(frame) = self.stack.last_mut() else {
+                return Ok(None);
+            };
+            let end = frame.position + frame.left.prefix.len();
+            self.key[frame.position..end].copy_from_slice(&frame.left.prefix);
+            self.prefix_len = end;
+            if !frame.aligned {
+                // Align the right cursor to this left node's complete compressed prefix.
+                // A right-only branch is ignored; a missing right path is carried as
+                // `Absent` until the left terminal reports the semantic mismatch.
+                let mut right = std::mem::replace(&mut frame.right, PairedRight::Absent);
+                let mut position = frame.position;
+                let mut left_offset = 0usize;
+                while left_offset < frame.left.prefix.len() {
+                    let byte = frame.left.prefix[left_offset];
+                    match right {
+                        PairedRight::Absent => break,
+                        PairedRight::Present { id, node, skip } if skip < node.prefix.len() => {
+                            if node.prefix[skip] != byte {
+                                right = PairedRight::Absent;
+                                break;
+                            }
+                            right = PairedRight::Present {
+                                id,
+                                node,
+                                skip: skip + 1,
+                            };
+                        }
+                        PairedRight::Present { node, .. } => {
+                            let Ok(index) =
+                                node.children.binary_search_by_key(&byte, |(edge, _)| *edge)
+                            else {
+                                right = PairedRight::Absent;
+                                break;
+                            };
+                            let child = node.children[index].1;
+                            if self.nodes_read == self.max_nodes {
+                                return Err(DiffError::NodeLimitExceeded {
+                                    limit: self.max_nodes,
+                                });
+                            }
+                            let child_node = self
+                                .right
+                                .read_at(child, position + 1)
+                                .await
+                                .map_err(DiffError::from)?;
+                            self.nodes_read += 1;
+                            right = PairedRight::Present {
+                                id: child,
+                                node: child_node,
+                                skip: 0,
+                            };
+                        }
+                    }
+                    left_offset += 1;
+                    position += 1;
+                }
+                frame.right = right;
+                frame.aligned = true;
+            }
+            if !frame.announced {
+                frame.announced = true;
+                frame.prunable = true;
+                let (right, right_skip) = match &frame.right {
+                    PairedRight::Present { id, skip, .. } => (Some(*id), *skip),
+                    PairedRight::Absent => (None, 0),
+                };
+                return Ok(Some(PairedContextWalkStep::Node {
+                    left: frame.left_id,
+                    right,
+                    right_skip,
+                }));
+            }
+            frame.prunable = false;
+
+            if !frame.yielded_value {
+                frame.yielded_value = true;
+                if let Some(left) = frame.left.value {
+                    if self.entries_emitted == self.max_changes {
+                        return Err(DiffError::ChangeLimitExceeded {
+                            limit: self.max_changes,
+                        });
+                    }
+                    self.entries_emitted += 1;
+                    let right = match &frame.right {
+                        PairedRight::Present { node, skip, .. }
+                            if *skip == node.prefix.len() && node.children.is_empty() =>
+                        {
+                            node.value
+                        }
+                        _ => None,
+                    };
+                    return Ok(Some(PairedContextWalkStep::Entry { left, right }));
+                }
+            }
+            let Some(&(edge, left_id)) = frame.left.children.get(frame.child_index) else {
+                let left = frame.left_id;
+                let (right, right_skip) = match &frame.right {
+                    PairedRight::Present { id, skip, .. } => (Some(*id), *skip),
+                    PairedRight::Absent => (None, 0),
+                };
+                let conflict_free = frame.conflict_free;
+                self.stack.pop();
+                if !conflict_free && let Some(parent) = self.stack.last_mut() {
+                    parent.conflict_free = false;
+                }
+                return Ok(Some(PairedContextWalkStep::Complete {
+                    left,
+                    right,
+                    right_skip,
+                    conflict_free,
+                }));
+            };
+            frame.child_index += 1;
+            if stack_depth >= self.max_pending {
+                return Err(DiffError::PendingLimitExceeded {
+                    limit: self.max_pending,
+                });
+            }
+            if self.nodes_read == self.max_nodes {
+                return Err(DiffError::NodeLimitExceeded {
+                    limit: self.max_nodes,
+                });
+            }
+            let child_position = end + 1;
+            let left = self
+                .left
+                .read_at(left_id, child_position)
+                .await
+                .map_err(DiffError::from)?;
+            self.nodes_read += 1;
+            let right = match &frame.right {
+                PairedRight::Absent => PairedRight::Absent,
+                PairedRight::Present { id, node, skip } if *skip < node.prefix.len() => {
+                    if node.prefix[*skip] == edge {
+                        PairedRight::Present {
+                            id: *id,
+                            node: node.clone(),
+                            skip: *skip + 1,
+                        }
+                    } else {
+                        PairedRight::Absent
+                    }
+                }
+                PairedRight::Present { node, .. } => match node
+                    .children
+                    .binary_search_by_key(&edge, |(child_edge, _)| *child_edge)
+                {
+                    Ok(index) => {
+                        let right_id = node.children[index].1;
+                        if self.nodes_read == self.max_nodes {
+                            return Err(DiffError::NodeLimitExceeded {
+                                limit: self.max_nodes,
+                            });
+                        }
+                        let right = self
+                            .right
+                            .read_at(right_id, child_position)
+                            .await
+                            .map_err(DiffError::from)?;
+                        self.nodes_read += 1;
+                        PairedRight::Present {
+                            id: right_id,
+                            node: right,
+                            skip: 0,
+                        }
+                    }
+                    Err(_) => PairedRight::Absent,
+                },
+            };
+            self.key[end] = edge;
+            self.stack.push(PairedContextFrame {
+                left_id,
+                left,
+                right,
+                position: child_position,
+                child_index: 0,
+                yielded_value: false,
+                announced: false,
+                prunable: false,
+                aligned: false,
+                conflict_free: true,
+            });
         }
     }
 }

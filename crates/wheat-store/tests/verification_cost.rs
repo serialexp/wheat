@@ -14,6 +14,8 @@ struct Counting {
     trees: AtomicUsize,
     content_set_nodes: AtomicUsize,
     revision_map_nodes: AtomicUsize,
+    application_map_nodes: AtomicUsize,
+    applications: AtomicUsize,
 }
 #[async_trait]
 impl ImmutableObjectStore for Counting {
@@ -36,6 +38,12 @@ impl ImmutableObjectStore for Counting {
             ObjectKind::RevisionMapNode => {
                 self.revision_map_nodes.fetch_add(1, Ordering::SeqCst);
             }
+            ObjectKind::ApplicationMapNode => {
+                self.application_map_nodes.fetch_add(1, Ordering::SeqCst);
+            }
+            ObjectKind::Application => {
+                self.applications.fetch_add(1, Ordering::SeqCst);
+            }
             _ => {}
         }
         Ok(object)
@@ -56,6 +64,8 @@ async fn verification_indexes_changes_once_and_reuses_identical_tree_contexts() 
         trees: AtomicUsize::new(0),
         content_set_nodes: AtomicUsize::new(0),
         revision_map_nodes: AtomicUsize::new(0),
+        application_map_nodes: AtomicUsize::new(0),
+        applications: AtomicUsize::new(0),
     };
     let mut repo = Repository::new(Tree::new());
     let basis = repo.base_view().id;
@@ -109,6 +119,8 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
         trees: AtomicUsize::new(0),
         content_set_nodes: AtomicUsize::new(0),
         revision_map_nodes: AtomicUsize::new(0),
+        application_map_nodes: AtomicUsize::new(0),
+        applications: AtomicUsize::new(0),
     };
     let mut repo = Repository::new(Tree::new());
     let basis = repo.base_view().id;
@@ -144,6 +156,8 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
     let gets = objects.gets.load(Ordering::SeqCst);
     let content_set_nodes = objects.content_set_nodes.load(Ordering::SeqCst);
     let revision_map_nodes = objects.revision_map_nodes.load(Ordering::SeqCst);
+    let application_map_nodes = objects.application_map_nodes.load(Ordering::SeqCst);
+    let applications = objects.applications.load(Ordering::SeqCst);
     assert!(gets < 40_000, "shared history required {gets} object reads");
     assert!(
         content_set_nodes < 200,
@@ -152,6 +166,14 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
     assert!(
         revision_map_nodes < 200,
         "contextual revision-map receipts reread {revision_map_nodes} nodes"
+    );
+    assert!(
+        application_map_nodes < 200,
+        "contextual application/revision receipts reread {application_map_nodes} nodes"
+    );
+    assert!(
+        applications < 200,
+        "contextual application/revision receipts reread {applications} application records"
     );
 }
 

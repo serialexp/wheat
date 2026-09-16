@@ -64,14 +64,29 @@ CREATE TABLE verified_radix_nodes (
     prefix BLOB NOT NULL,
     PRIMARY KEY (kind, context_id, node_id, prefix)
 ) WITHOUT ROWID;
--- A pair receipt is deliberately written only for subtrees containing no conflicts.
--- Thus pruning one can never hide a conflict needed by reverse conflict validation.
+-- Pair receipts are contextual: compressed nodes can be reached at multiple prefixes.
+-- A receipt is written only after the whole subtree has been checked and contributes
+-- no conflict evidence, so pruning it cannot hide reverse-conflict validation.
 CREATE TABLE verified_map_pairs (
     application_node BLOB NOT NULL,
     revision_node BLOB NOT NULL,
+    prefix BLOB NOT NULL,
+    application_skip INTEGER NOT NULL,
+    revision_skip INTEGER NOT NULL,
     retained_root BLOB NOT NULL,
     conflict_root BLOB NOT NULL,
-    PRIMARY KEY (application_node, revision_node, retained_root, conflict_root)
+    PRIMARY KEY (
+        application_node, revision_node, prefix, application_skip, revision_skip,
+        retained_root, conflict_root
+    )
+) WITHOUT ROWID;
+
+-- Conflict evidence is stream-produced during paired map verification. Keeping it
+-- disk-backed avoids an unbounded verifier HashSet and makes reverse checks exact.
+CREATE TABLE produced_conflicts (
+    conflict_root BLOB NOT NULL,
+    conflict_id BLOB NOT NULL,
+    PRIMARY KEY (conflict_root, conflict_id)
 ) WITHOUT ROWID;
 
 -- Verification scratch has no durability value and is deleted with the run. Keep
