@@ -16,6 +16,7 @@ pub(crate) enum Error {
     InvalidTerminalNode,
 }
 
+#[derive(Debug)]
 pub(crate) enum DiffError {
     Radix(Error),
     ChangeLimitExceeded { limit: usize },
@@ -1353,5 +1354,111 @@ impl<S: ImmutableObjectStore, C: Collection> Cursor<'_, S, C> {
             self.stack.push((child, child_position, 0, false));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod paired_context_tests {
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+    use wheat_core::{ApplicationId, ChangeId, RevisionId};
+
+    use super::*;
+    use crate::{
+        ObjectStoreAdapter, application_map::ApplicationCollection,
+        revision_map::RevisionCollection,
+    };
+
+    fn change(first: u8, last: u8) -> ChangeId {
+        let mut bytes = [0; 16];
+        bytes[0] = first;
+        bytes[15] = last;
+        ChangeId::from_bytes(bytes)
+    }
+
+    #[tokio::test]
+    async fn paired_context_walk_allows_extra_right_branches_and_compressed_prefixes() {
+        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "paired-subset");
+        let applications = Store::<_, ApplicationCollection>::new(&objects);
+        let revisions = Store::<_, RevisionCollection>::new(&objects);
+        let app_a = ApplicationId::from_digest([1; 32]);
+        let app_b = ApplicationId::from_digest([2; 32]);
+        let revision_a = RevisionId::from_digest([11; 32]);
+        let revision_b = RevisionId::from_digest([12; 32]);
+        let extra = RevisionId::from_digest([13; 32]);
+        let a = change(7, 1);
+        let b = change(7, 254);
+        let extra_key = change(3, 9);
+        let left = applications
+            .update_batch(
+                applications.empty_root().await.unwrap(),
+                [(a, Some(app_a)), (b, Some(app_b))],
+            )
+            .await
+            .unwrap();
+        let right = revisions
+            .update_batch(
+                revisions.empty_root().await.unwrap(),
+                [
+                    (a, Some(revision_a)),
+                    (b, Some(revision_b)),
+                    (extra_key, Some(extra)),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut walk = applications
+            .paired_context_walk(left, revisions, right, DiffLimits::default())
+            .await
+            .unwrap();
+        let mut entries = Vec::new();
+        while let Some(step) = walk.next().await.unwrap() {
+            if let PairedContextWalkStep::Entry { left, right } = step {
+                entries.push((left, right));
+            }
+        }
+        assert_eq!(
+            entries,
+            [(app_a, Some(revision_a)), (app_b, Some(revision_b))]
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_context_walk_enforces_entry_limit() {
+        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "paired-limit");
+        let applications = Store::<_, ApplicationCollection>::new(&objects);
+        let revisions = Store::<_, RevisionCollection>::new(&objects);
+        let key = change(7, 1);
+        let left = applications
+            .update_batch(
+                applications.empty_root().await.unwrap(),
+                [(key, Some(ApplicationId::from_digest([1; 32])))],
+            )
+            .await
+            .unwrap();
+        let right = revisions
+            .update_batch(
+                revisions.empty_root().await.unwrap(),
+                [(key, Some(RevisionId::from_digest([1; 32])))],
+            )
+            .await
+            .unwrap();
+        let mut walk = applications
+            .paired_context_walk(
+                left,
+                revisions,
+                right,
+                DiffLimits {
+                    max_changes: 0,
+                    ..DiffLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        while !matches!(
+            walk.next().await,
+            Err(DiffError::ChangeLimitExceeded { limit: 0 })
+        ) {}
     }
 }
