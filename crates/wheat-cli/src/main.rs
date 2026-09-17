@@ -271,8 +271,12 @@ struct AddArgs {
     /// Advanced stale-state assertion retained for low-level automation.
     #[arg(long, hide = true)]
     predecessor: Option<String>,
-    /// Explicit repository-relative workspace paths. No other files are read or written.
-    #[arg(required = true)]
+    /// Capture all non-ignored modified and deleted tracked paths instead of
+    /// naming them explicitly. New untracked files are excluded; use explicit
+    /// path arguments to include them.
+    #[arg(long)]
+    all: bool,
+    /// Explicit repository-relative workspace paths. Required unless --all is used.
     paths: Vec<String>,
     #[command(flatten)]
     metadata: RevisionMetadataArgs,
@@ -807,6 +811,16 @@ fn execute(cli: Cli) -> Result<Success> {
             )
         }
         Command::Add(arguments) => {
+            if arguments.all && !arguments.paths.is_empty() {
+                return Err(CliFailure::invalid(
+                    "--all and explicit paths are mutually exclusive",
+                ));
+            }
+            if !arguments.all && arguments.paths.is_empty() {
+                return Err(CliFailure::invalid(
+                    "at least one workspace path is required; use --all to capture all modified tracked paths",
+                ));
+            }
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
             // Recovery, capture, and publication are one workspace operation:
@@ -820,6 +834,30 @@ fn execute(cli: Cli) -> Result<Success> {
                 &mut context.workspace,
             ))?;
             selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
+
+            // Resolve paths: --all discovers modified/deleted tracked paths via scan.
+            let paths = if arguments.all {
+                let scan = workspace_scan::scan_locked(
+                    &context.root,
+                    &local,
+                    &context.workspace,
+                    0,
+                )?;
+                let resolved: Vec<String> = scan
+                    .changes
+                    .iter()
+                    .map(|c| c.path.clone())
+                    .collect();
+                if resolved.is_empty() {
+                    return Err(CliFailure::invalid(
+                        "no modified or deleted tracked paths; workspace is clean",
+                    ));
+                }
+                resolved
+            } else {
+                arguments.paths
+            };
+
             let expected = local.heads.read()?;
             let basis = context.workspace.basis;
             let active = runtime.block_on(active_changes::inspect(
@@ -868,7 +906,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 context.workspace.effective_view(),
                 change,
                 predecessor,
-                &arguments.paths,
+                &paths,
                 &guards,
             ))?;
             let (_, revision_metadata) = authoring_metadata::metadata(
@@ -921,11 +959,11 @@ fn execute(cli: Cli) -> Result<Success> {
                 .replace_prepared(&context.root)?
                 .publish()
                 .map_err(|error| anyhow::anyhow!(error))?;
+            let path_count = paths.len();
             let mut output = String::new();
             writeln!(
                 output,
-                "added {} path(s) to change {change} — {title}",
-                arguments.paths.len()
+                "added {path_count} path(s) to change {change} — {title}",
             )?;
             writeln!(output, "revision {}", outcome.revision_id)?;
             if arguments.change.is_some()
@@ -940,7 +978,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 json!({
                     "change": change.to_string(),
                     "revision": outcome.revision_id.to_string(),
-                    "paths": arguments.paths.len(),
+                    "paths": path_count,
                     "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 }),
                 output,
