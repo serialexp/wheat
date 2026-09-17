@@ -77,8 +77,8 @@ impl Harness {
         String::from_utf8_lossy(&output.stderr).to_string()
     }
 
-    /// Set up a minimal Git repository, import it, materialize, and configure
-    /// the actor identity.
+    /// Set up a minimal Git repository, import it (which materializes
+    /// automatically), and configure the actor identity.
     fn init_from_git(&self, files: &[(&str, &str)]) {
         let git_dir = self.root.path().join("source.git");
         fs::create_dir_all(&git_dir).unwrap();
@@ -97,6 +97,7 @@ impl Harness {
         git(Some(&work), &["commit", "-m", "initial"]);
         git(Some(&work), &["push", "origin", "HEAD:refs/heads/main"]);
 
+        // Import materializes the workspace as part of its flow.
         self.ok(
             self.root.path(),
             &[
@@ -105,7 +106,6 @@ impl Harness {
                 self.workspace.to_str().unwrap(),
             ],
         );
-        self.ok(&self.workspace, &["materialize"]);
 
         // Configure actor identity.
         let config_dir = self.config.join("wheat");

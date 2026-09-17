@@ -79,6 +79,7 @@ impl Harness {
         git(Some(&work), &["commit", "-m", "initial"]);
         git(Some(&work), &["push", "origin", "HEAD:refs/heads/main"]);
 
+        // Import materializes the workspace as part of its flow.
         self.ok(
             self.root.path(),
             &[
@@ -87,7 +88,6 @@ impl Harness {
                 self.workspace.to_str().unwrap(),
             ],
         );
-        self.ok(&self.workspace, &["materialize"]);
 
         let config_dir = self.config.join("wheat");
         fs::create_dir_all(&config_dir).unwrap();
