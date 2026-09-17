@@ -1,8 +1,8 @@
 # Wheat Local CLI — Design
 
-Status: partial — the Phase 1 local workflow is implemented and accepted; the Phase 2 label/workspace model is settled, while its CLI and Phases 2–3 remain outstanding
+Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, ignore rules, and extended configuration are landed; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-09-14
+Last updated: 2026-09-17
 
 ## Implementation status
 
@@ -88,27 +88,55 @@ both lists.
   settled short repository-local labels bound to immutable views, imported Git-ref
   provenance, per-workspace basis and selected frontier, and the zero/one/many
   selection rule. Label advancement and frontier consolidation remain deferred.
+- [x] **Phase 2 — label and frontier workflow.** Short repository-local labels
+  (list, create, rename, delete) are bound to immutable views via CAS-guarded
+  envelope mutations. Switching activates a label as workspace basis and selects
+  a retained descendant frontier by the zero/one/many rule. Refresh re-resolves
+  the active label binding. Frontier inspection lists bounded descendant views.
+  Deleting or renaming the workspace's active label is rejected.
+- [x] **Phase 2 — imported-label provenance.** Every imported label retains its
+  original Git ref without making the ref or its branch semantics native authority.
+  Rename preserves provenance. The ref is exposed in structured label output.
+- [x] **Phase 2 — ignore rules and workspace-wide status.** The `wheat-ignore`
+  crate implements complete `.gitignore`-compatible pattern matching in
+  `.wheatignore` files with hierarchical directory-scoped stacking, negation,
+  directory-only patterns, `**` matching, and bracket expressions. `.gitignore`
+  files are read as a fallback (with a per-scan diagnostic) when no sibling
+  `.wheatignore` exists. `wheat status` now reports untracked and ignored paths
+  via a bounded recursive workspace traversal that prunes ignored directories.
+  Built-in rules always ignore `.wheat`, `.wheat-git`, and packed-store authority
+  paths. User-global ignore lives at `$XDG_CONFIG_HOME/wheat/ignore`.
+  Workspace-wide capture (Phase 2 of `wheat-local-tooling.md`) depends on this
+  and remains outstanding.
+- [x] **Phase 2 — extended configuration model.** The config schema is bumped to
+  version 2 (backward-compatible with version 1). New keys: `core.editor`,
+  `core.pager`, `core.default_label`, `core.default_format`. `deny_unknown_fields`
+  is removed for forward compatibility. Hook and remote configuration sub-objects
+  are designed but not yet implemented.
+- [x] **Open question — lifecycle tooling shape.** Settled: Git-style executable
+  hooks with structured JSON context on stdin and optional structured JSON
+  diagnostics on stdout. Timeout and output bounds enforced. Content-hash trust
+  with re-consent on change. `wheat hook add/list/enable/disable/remove` commands.
+  See `wheat-local-tooling.md` for the full design.
 
 ### Outstanding
-- [ ] **Phase 2 — label and frontier workflow.** List, create, rename, delete, and
-  switch short repository-local labels bound to immutable views. Use the active
-  label's view as workspace basis; select retained descendant frontiers by the
-  settled zero/one/many rule, and require an explicit choice when several exist.
-- [ ] **Phase 2 — imported-label provenance.** Preserve the original Git ref on
-  every imported label without making the ref or its branch semantics native
-  authority.
 - [ ] **Phase 2 — dependency and integration workflow.** Expose stack revision,
   dependency movement, joins, deterministic descendant reapplication, and durable
   conflict outcomes as Wheat operations rather than Git-shaped rebase state.
-- [ ] **Phase 2 — ignore rules.** Define repository and user ignore configuration
-  before workspace-wide status/capture can include untracked files safely.
+- [ ] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
+  capture all non-ignored modified and deleted tracked paths. Untracked files
+  require `--include-untracked` or explicit path arguments. Depends on the
+  completed ignore rules.
 - [ ] **Phase 2 — lifecycle tooling.** Choose and implement the contract for
   formatters, linters, policy checks, and notifications around capture, revision,
-  materialization, and publication.
-- [ ] **Phase 2 — repository discovery and local configuration.** Discover a
-  repository from descendants and define configuration for identity, editor,
-  pager, defaults, aliases, and compatibility remotes without making Git config
-  authoritative.
+  materialization, and publication. The design is settled in
+  `wheat-local-tooling.md`: Git-style executable hooks with structured JSON
+  context on stdin, optional structured output, timeout/bounds, content-hash
+  trust, and `wheat hook` management commands.
+- [ ] **Phase 2 — repository discovery and local configuration.** Discovery walks
+  ancestors to `.wheat` and is already implemented. Remaining: editor/pager
+  integration, aliases, compatibility remotes, and `wheat ignore import`
+  convenience command.
 - [ ] **Phase 3 — client/protocol boundary.** Introduce `wheat-client` and
   `wheat-protocol`, move local workspace operations behind the client contract,
   and remove the CLI's direct dependence on production store capabilities before
@@ -119,9 +147,6 @@ both lists.
 - [ ] **Phase 3 — multiple workspaces.** Define workspace identity, concurrent
   local workspaces, cleanliness checks, and content pins without copying Git's
   index/worktree coupling by default.
-- [ ] **Open question — lifecycle tooling shape.** Choose Git-compatible
-  executables, declarative repository tasks, a structured versioned hook
-  protocol, or a deliberate combination.
 - [ ] **Open question — workspace metadata location.** Decide whether the settled
   workspace record (basis plus selected frontier) points at a separate store or is
   a named object within a local client database.
