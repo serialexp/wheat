@@ -38,6 +38,7 @@ mod workspace_diff;
 mod workspace_files;
 mod workspace_metadata;
 mod workspace_scan;
+mod workspace_walk;
 mod workspace_status;
 use command_output::{
     CliFailure, OutputFormat, Success, clap_error, emit_error, emit_success, requested_format,
@@ -542,13 +543,34 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Status => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
-            let status = workspace_status::WorkspaceStatus::from(workspace_scan::scan(
+            let scan = workspace_scan::scan(
                 &context.root,
                 &local,
                 &context.workspace,
                 0,
-            )?);
+            )?;
+
+            // Discover untracked files via workspace walk with ignore rules.
+            let global = wheat_ignore::loader::read_global_ignore();
+            let global_ref = global
+                .as_ref()
+                .map(|(content, path)| (content.as_str(), path.clone()));
+            let mut ignore_stack = wheat_ignore::stack::IgnoreStack::new(global_ref, &[]);
+            let walk_result = workspace_walk::walk_workspace(
+                &context.root,
+                &scan.tracked_paths,
+                &mut ignore_stack,
+                workspace_walk::WalkLimits::default(),
+            )?;
+
+            let status =
+                workspace_status::WorkspaceStatus::from_scan(scan, Some(walk_result));
+
             let mut output = String::new();
+            // Print diagnostics to stderr (they're informational, not command output).
+            for diagnostic in &status.diagnostics {
+                eprintln!("note: {diagnostic}");
+            }
             writeln!(output, "active label: {}", status.active_label)?;
             writeln!(output, "basis view: {}", status.basis)?;
             writeln!(output, "effective view: {}", status.effective_view)?;
@@ -570,6 +592,20 @@ fn execute(cli: Cli) -> Result<Success> {
                     "kind"
                 };
                 writeln!(output, "{kind} {}", change.path)?;
+            }
+            let untracked_count = status
+                .untracked
+                .iter()
+                .filter(|u| !u.ignored)
+                .count();
+            if untracked_count > 0 {
+                writeln!(output, "untracked files: {untracked_count}")?;
+                for entry in &status.untracked {
+                    if !entry.ignored {
+                        let suffix = if entry.is_directory { "/" } else { "" };
+                        writeln!(output, "untracked {}{suffix}", entry.path)?;
+                    }
+                }
             }
             Success::new("status", &status, output)
         }
@@ -745,6 +781,10 @@ fn execute(cli: Cli) -> Result<Success> {
             let key_name = match key {
                 authoring_metadata::ConfigKey::ActorName => "actor.name",
                 authoring_metadata::ConfigKey::ActorEmail => "actor.email",
+                authoring_metadata::ConfigKey::CoreEditor => "core.editor",
+                authoring_metadata::ConfigKey::CorePager => "core.pager",
+                authoring_metadata::ConfigKey::CoreDefaultLabel => "core.default_label",
+                authoring_metadata::ConfigKey::CoreDefaultFormat => "core.default_format",
             };
             authoring_metadata::set(store_root.as_deref(), global, key, &value)?;
             Success::new(

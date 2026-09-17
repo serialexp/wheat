@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use wheat_core::{Actor, ChangeMetadata, RevisionMetadata, Timestamp};
 
 const CONFIG_FORMAT: &str = "wheat-config";
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_ACTOR_NAME_BYTES: usize = 1_024;
 const MAX_ACTOR_EMAIL_BYTES: usize = 3_200;
@@ -22,19 +22,32 @@ const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_DESCRIPTION_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Config {
     format: String,
     version: u32,
     #[serde(default)]
     actor: ActorConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    core: Option<CoreConfig>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ActorConfig {
     name: Option<String>,
     email: Option<String>,
+}
+
+/// Extended configuration keys introduced in version 2.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CoreConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pager: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_format: Option<String>,
 }
 
 impl Default for Config {
@@ -43,6 +56,7 @@ impl Default for Config {
             format: CONFIG_FORMAT.to_owned(),
             version: CONFIG_VERSION,
             actor: ActorConfig::default(),
+            core: None,
         }
     }
 }
@@ -51,6 +65,10 @@ impl Default for Config {
 pub(crate) enum ConfigKey {
     ActorName,
     ActorEmail,
+    CoreEditor,
+    CorePager,
+    CoreDefaultLabel,
+    CoreDefaultFormat,
 }
 
 impl std::str::FromStr for ConfigKey {
@@ -60,7 +78,15 @@ impl std::str::FromStr for ConfigKey {
         match value {
             "actor.name" => Ok(Self::ActorName),
             "actor.email" => Ok(Self::ActorEmail),
-            _ => Err("configuration key must be actor.name or actor.email".to_owned()),
+            "core.editor" => Ok(Self::CoreEditor),
+            "core.pager" => Ok(Self::CorePager),
+            "core.default_label" => Ok(Self::CoreDefaultLabel),
+            "core.default_format" => Ok(Self::CoreDefaultFormat),
+            _ => Err(format!(
+                "unknown configuration key '{value}'; valid keys: \
+                 actor.name, actor.email, core.editor, core.pager, \
+                 core.default_label, core.default_format"
+            )),
         }
     }
 }
@@ -103,6 +129,19 @@ pub(crate) fn set(
     match key {
         ConfigKey::ActorName => config.actor.name = Some(value.to_owned()),
         ConfigKey::ActorEmail => config.actor.email = Some(value.to_owned()),
+        ConfigKey::CoreEditor
+        | ConfigKey::CorePager
+        | ConfigKey::CoreDefaultLabel
+        | ConfigKey::CoreDefaultFormat => {
+            let core = config.core.get_or_insert_with(CoreConfig::default);
+            match key {
+                ConfigKey::CoreEditor => core.editor = Some(value.to_owned()),
+                ConfigKey::CorePager => core.pager = Some(value.to_owned()),
+                ConfigKey::CoreDefaultLabel => core.default_label = Some(value.to_owned()),
+                ConfigKey::CoreDefaultFormat => core.default_format = Some(value.to_owned()),
+                _ => unreachable!(),
+            }
+        }
     }
     let result = write_config(&path, &config);
     let unlock = unlock(&lock);
@@ -202,10 +241,16 @@ fn validate_actor(name: &str, email: &str) -> Result<()> {
     validate_value(ConfigKey::ActorEmail, email)
 }
 
+const MAX_CORE_VALUE_BYTES: usize = 4_096;
+
 fn validate_value(key: ConfigKey, value: &str) -> Result<()> {
     let (field, limit) = match key {
         ConfigKey::ActorName => ("actor.name", MAX_ACTOR_NAME_BYTES),
         ConfigKey::ActorEmail => ("actor.email", MAX_ACTOR_EMAIL_BYTES),
+        ConfigKey::CoreEditor => ("core.editor", MAX_CORE_VALUE_BYTES),
+        ConfigKey::CorePager => ("core.pager", MAX_CORE_VALUE_BYTES),
+        ConfigKey::CoreDefaultLabel => ("core.default_label", MAX_CORE_VALUE_BYTES),
+        ConfigKey::CoreDefaultFormat => ("core.default_format", MAX_CORE_VALUE_BYTES),
     };
     ensure_text(field, value, limit)?;
     ensure!(
@@ -216,6 +261,12 @@ fn validate_value(key: ConfigKey, value: &str) -> Result<()> {
         ensure!(
             value.contains('@') && !value.starts_with('@') && !value.ends_with('@'),
             "actor.email must contain a nonempty local part and domain"
+        );
+    }
+    if key == ConfigKey::CoreDefaultFormat {
+        ensure!(
+            value == "human" || value == "json",
+            "core.default_format must be 'human' or 'json'"
         );
     }
     Ok(())
@@ -283,9 +334,13 @@ fn read_optional(path: &Path) -> Result<Option<Config>> {
     let config: Config =
         serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
     ensure!(
-        config.format == CONFIG_FORMAT && config.version == CONFIG_VERSION,
-        "unsupported Wheat config at {}",
-        path.display()
+        config.format == CONFIG_FORMAT
+            && config.version >= 1
+            && config.version <= CONFIG_VERSION,
+        "unsupported Wheat config at {} (format={:?}, version={})",
+        path.display(),
+        config.format,
+        config.version
     );
     if let Some(name) = &config.actor.name {
         validate_value(ConfigKey::ActorName, name)?;

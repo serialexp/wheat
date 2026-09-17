@@ -1,0 +1,13 @@
+[package]
+name = "wheat-ignore"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+globset = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

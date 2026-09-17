@@ -88,7 +88,7 @@ fn global_json_envelopes_read_and_mutation_results() {
     assert!(status.status.success());
     let status = document(&status);
     assert_eq!(status["command"], "status");
-    assert_eq!(status["result"]["schema_version"], 1);
+    assert_eq!(status["result"]["schema_version"], 2);
 
     let changes = command(root.path(), config.path(), &["changes", "--format=json"]);
     assert!(changes.status.success());

@@ -338,7 +338,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         ],
     );
     let status_after_materialize = harness.json_ok(&harness.workspace, &["status"]);
-    assert_eq!(status_after_materialize["result"]["schema_version"], 1);
+    assert_eq!(status_after_materialize["result"]["schema_version"], 2);
     assert_eq!(
         status_after_materialize["result"]["authority_advanced"],
         false
@@ -423,7 +423,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     let metadata_before_reads = fs::read(harness.workspace.join(".wheat/workspace.json")).unwrap();
     let status = harness.json_ok(&harness.workspace, &["status"]);
     assert_eq!(status["command"], "status");
-    assert_eq!(status["result"]["schema_version"], 1);
+    assert_eq!(status["result"]["schema_version"], 2);
     assert_eq!(status["result"]["authority_advanced"], true);
     assert!(
         status["result"]["current_head_generation"]
@@ -860,7 +860,29 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     let nested = harness.workspace.join("nested/reopen/here");
     fs::create_dir_all(&nested).unwrap();
     let reopened = harness.json_ok(&nested, &["status"]);
-    assert_eq!(reopened, expected_reopened);
+    // Compare core status fields; untracked entries may differ because the test
+    // creates nested/reopen/here directories that appear in the reopened scan.
+    for key in [
+        "schema_version",
+        "materialized_view",
+        "materialized_head_generation",
+        "current_head_generation",
+        "authority_advanced",
+        "active_label",
+        "basis",
+        "observed_label_binding",
+        "current_label_binding",
+        "label_binding_drifted",
+        "selected_frontier",
+        "effective_view",
+        "changes",
+    ] {
+        assert_eq!(
+            reopened["result"][key],
+            expected_reopened["result"][key],
+            "reopened status field '{key}' mismatch"
+        );
+    }
     assert_eq!(
         reopened["result"]["materialized_view"],
         reopened["result"]["effective_view"]

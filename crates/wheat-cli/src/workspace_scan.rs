@@ -32,6 +32,8 @@ pub(crate) struct WorkspaceScan {
     pub selected_frontier: Option<ViewId>,
     pub effective_view: ViewId,
     pub changes: Vec<ScannedChange>,
+    /// Complete set of tracked paths from the materialized tree.
+    pub tracked_paths: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -120,7 +122,9 @@ pub(crate) fn scan_locked(
 
     let mut read_budget = ScanReadBudget::new(MAX_TOTAL_READ_BYTES);
     let mut changes = Vec::new();
+    let mut tracked_paths = std::collections::BTreeSet::new();
     for file in files {
+        tracked_paths.insert(file.path.clone());
         let baseline_limit = read_budget.next_limit(MAX_BASELINE_INSPECTION_BYTES)?;
         // Retained content is collected only when it fits the text-diff eligibility bound.
         // Larger retained leaves are described from their authenticated identity and known size
@@ -204,6 +208,7 @@ pub(crate) fn scan_locked(
         selected_frontier: workspace.selected_frontier,
         effective_view: workspace.effective_view(),
         changes,
+        tracked_paths,
     })
 }
 
