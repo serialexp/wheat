@@ -212,18 +212,20 @@ pub async fn handle_publish(
         }
     }
 
-    if !missing_content.is_empty() {
-        let batch_size = missing_content.len().min(MAX_WANT_IDS);
-        send(
-            ws,
-            &WheatProtocolMessage::ContentNeeded(ContentNeededOutput {
-                message_type: 0x43,
-                op_id,
-                content_ids: missing_content[..batch_size].to_vec(),
-            }),
-        )
-        .await?;
+    // Always send ContentNeeded — even with an empty list — so the client
+    // doesn't hang waiting for it. An empty list means no content upload needed.
+    let batch_size = missing_content.len().min(MAX_WANT_IDS);
+    send(
+        ws,
+        &WheatProtocolMessage::ContentNeeded(ContentNeededOutput {
+            message_type: 0x43,
+            op_id,
+            content_ids: missing_content[..batch_size].to_vec(),
+        }),
+    )
+    .await?;
 
+    if !missing_content.is_empty() {
         // Receive content uploads (single-message and chunked).
         loop {
             let msg = recv(ws).await?;
@@ -429,13 +431,18 @@ pub async fn handle_publish(
 /// Discover which objects are missing from the store for the proposed
 /// envelope's structural closure. Iteratively walks every object the
 /// server has, decodes it, discovers child references, and reports any
-/// that are absent. Returns an empty vec when the full closure is present.
+/// that are absent.
+///
+/// After the BFS exhausts explicit references, walks the retained sets
+/// (views, revisions, applications, changes) to discover objects whose
+/// IDs are encoded as radix-trie keys. These are not extractable from
+/// individual nodes by `extract_object_references`.
 ///
 /// Bounded per call to MAX_WANT_IDS results so the client receives
 /// bounded batches. The caller re-invokes after each round of uploads.
 async fn discover_missing_objects(
     entry: &RepositoryEntry,
-    _envelope_id: RepositoryEnvelopeId,
+    envelope_id: RepositoryEnvelopeId,
     envelope_oid: ObjectId,
 ) -> Vec<Digest256> {
     use std::collections::HashSet;
@@ -474,5 +481,84 @@ async fn discover_missing_objects(
         }
     }
 
+    // Walk retained sets to discover objects whose IDs are radix-trie keys.
+    // Add discovered objects to the FRONTIER so the BFS also walks their children
+    // (revision map nodes, trees, etc. that are only reachable through retained views).
+    if missing.len() < MAX_WANT_IDS
+        && let Ok(retained_ids) =
+            walk_retained_sets(&entry.objects, &entry.content, envelope_id).await
+    {
+        for oid in retained_ids {
+            if !visited.contains(&oid) {
+                frontier.push(oid);
+            }
+        }
+
+        // Continue BFS with retained objects on the frontier.
+        while let Some(oid) = frontier.pop() {
+            if !visited.insert(oid) {
+                continue;
+            }
+            if missing.len() >= MAX_WANT_IDS {
+                break;
+            }
+
+            match entry.objects.get(oid).await {
+                Ok(obj) => {
+                    if let Ok(children) =
+                        wheat_core::extract_object_references(&obj.canonical_bytes)
+                    {
+                        for child_id in children {
+                            if !visited.contains(&child_id) {
+                                frontier.push(child_id);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    missing.push(Digest256 {
+                        bytes: oid.as_bytes().to_vec(),
+                    });
+                }
+            }
+        }
+    }
+
     missing
+}
+
+/// Walk all retained sets and return the ObjectIds they contain as keys.
+async fn walk_retained_sets(
+    objects: &impl ImmutableObjectStore,
+    content: &wheat_store::ContentStore,
+    envelope_id: RepositoryEnvelopeId,
+) -> Result<Vec<ObjectId>, ConnectionError> {
+    let reader = RepositoryReader::new(objects, content);
+    let envelope = reader.envelope(envelope_id).await.map_err(|e| {
+        ConnectionError::Internal(format!("failed to read envelope for retained walk: {e}"))
+    })?;
+    let state = reader.state(envelope.state).await.map_err(|e| {
+        ConnectionError::Internal(format!("failed to read state for retained walk: {e}"))
+    })?;
+
+    let mut retained = Vec::new();
+    let store = wheat_store::RetainedSetStore::new(objects);
+
+    for root in [
+        state.retained_views,
+        state.retained_revisions,
+        state.retained_applications,
+        state.retained_changes,
+    ] {
+        let mut cursor = store.cursor(root).await.map_err(|e| {
+            ConnectionError::Internal(format!("retained set walk error: {e}"))
+        })?;
+        while let Some(oid) = cursor.next().await.map_err(|e| {
+            ConnectionError::Internal(format!("retained set cursor error: {e}"))
+        })? {
+            retained.push(oid);
+        }
+    }
+
+    Ok(retained)
 }

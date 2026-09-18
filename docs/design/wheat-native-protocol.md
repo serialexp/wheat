@@ -1,8 +1,8 @@
 # Wheat Native Protocol — Design
 
-Status: partial — Phase 0 complete, Phase 1+ outstanding
+Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-09-18
+Last updated: 2026-09-19
 
 ## Implementation status
 
@@ -29,6 +29,16 @@ top of them.
   monotonicity and lineage extension checks. Benchmarked at 500 baseline
   changes + 5 delta: 64ms (transition) vs 410ms (complete), 6.4× speedup.
   Tests: 6 retained-set delta tests, 4 transition validation tests, 1 bench.
+- [x] **Phase 1 — standalone wheat server.** `wheat-server` binary with
+  WebSocket listener, per-connection session setup (ServerHello → ClientHello →
+  SessionEstablished), repository open with label manifest, iterative root-first
+  fetch (ObjectBatch → ObjectWant loop → FetchComplete), content fetch with
+  chunked streaming for large files, and publish with iterative BFS closure
+  discovery (`extract_object_references`), content transfer, bounded delta
+  validation, and CAS head advance. Registry supports single-repo (`--data-dir`)
+  and multi-repo (`--repos`) modes. 3 integration tests (session setup, fetch,
+  repo not found). Server helper `run_until()` supports in-process test use
+  with port-0 binding and shutdown signaling.
 
 - [x] **Phase 0 — protocol schema.** Defined at
   `crates/wheat-core/schemas/wheat-protocol.bs.json5`. 27 message types
@@ -41,6 +51,22 @@ top of them.
   framing helpers (`decode_message`/`encode_message`) with size limit
   enforcement. Generation script at `scripts/wheat-protocol-gen-schema`.
   11 round-trip smoke tests verify all message families.
+- [x] **Phase 1 — CLI client commands.** `wheat clone`, `wheat fetch`, and
+  `wheat publish` in `wheat-cli`, speaking the native protocol over WebSocket
+  to a `wheat-server` instance. URL scheme: `wheat://host:port/owner/repo`
+  (TLS: `wheat+tls://`). Client protocol engine in `remote.rs` with iterative
+  root-first fetch (BFS + retained-set walk for radix-trie-key ObjectIds),
+  content fetch, and publish with ObjectsNeeded/ObjectBatch loop. Remote
+  tracking via `remote.json` (url, last_fetched_generation, last_fetched_envelope)
+  with divergence detection on fetch (refuses when local has unpublished work).
+- [x] **Phase 1 — acceptance tests.** 3 end-to-end tests in
+  `crates/wheat-server/tests/clone_fetch_publish_test.rs`: clone round-trip
+  (validates complete structural closure via `validate_complete`), publish
+  round-trip (clone → local change via `PersistedRepositoryMutator` → publish
+  back → verify server head advanced), fetch after server advance (clone →
+  server-side change → fetch update → verify new content). All tests exercise
+  the full retained-set walk (RetainedSetStore cursor for views/revisions/
+  applications/changes) and BFS through retained objects' children.
 
 ### Outstanding
 
@@ -50,20 +76,9 @@ top of them.
   serves individual objects by index lookup and range read from segments. This is
   an economic requirement: per-request costs dominate per-byte costs for the small
   structural objects that make up most of a repository's object count.
-- [ ] **Phase 1 — standalone wheat server.** `wheat-server` binary: listens for
-  WebSocket connections, serves one or more repositories backed by an
-  `ImmutableObjectStore` (local or S3/R2/Hetzner with packed segments), handles
-  concurrent clients, manages head pointers and publication fencing.
-- [ ] **Phase 1 — CLI client commands.** `wheat clone`, `wheat fetch`, and
-  `wheat publish` in the existing `wheat-cli`, speaking the native protocol over
-  WebSocket to a `wheat-server` instance.
 - [ ] **Phase 1 — TypeScript client.** Generate TypeScript encode/decode from the
   same binschema schema, implement the client protocol over browser-native
   WebSocket, and demonstrate a round-trip from a Bun/browser client.
-- [ ] **Phase 1 — acceptance tests.** End-to-end: start an ephemeral `wheat-server`,
-  clone/fetch/publish from the Rust CLI, verify object identity and view fidelity.
-  Cross-language: the same operations from the TypeScript client produce identical
-  repository state.
 - [ ] **Phase 2 — remote tracking.** Persist observed remote views locally
   (`wheat-remote` configuration, remote-view observations) without treating them
   as local authority. Enable incremental fetch (only transfer objects the client

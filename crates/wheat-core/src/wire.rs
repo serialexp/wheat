@@ -1757,3 +1757,68 @@ fn encode(object: wire::WheatObject) -> Vec<u8> {
     debug_assert!(validate_canonical_object(&bytes).is_ok());
     bytes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_refs_from_view_label_manifest() {
+        let view_id_bytes = [42u8; 32];
+        let view = crate::ViewId::from_digest(view_id_bytes);
+        let label = crate::ViewLabel {
+            view,
+            original_git_ref: None,
+        };
+        let record =
+            crate::ViewLabelManifestRecord::new([("main", label)]).unwrap();
+        let bytes = record.canonical_bytes();
+
+        // Verify decode_view_label_manifest_record works (the known-good path).
+        let decoded = decode_view_label_manifest_record(&bytes).unwrap();
+        assert_eq!(decoded.labels.len(), 1, "decoded record should have 1 label");
+        assert_eq!(decoded.labels["main"].view, view);
+
+        // Now test extract_object_references.
+        let refs = extract_object_references(&bytes).unwrap();
+        assert!(
+            !refs.is_empty(),
+            "extract_object_references should find the view ID reference"
+        );
+        let expected_oid = crate::ObjectId::from_digest(view_id_bytes);
+        assert!(
+            refs.contains(&expected_oid),
+            "should contain the view ObjectId; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_refs_from_revision_map_node() {
+        // Build a revision map node with one leaf value.
+        let rev_id_bytes = [7u8; 32];
+        let node = wire::WheatObject::RevisionMapNodeV1(
+            wire::RevisionMapNodeV1Input {
+                prefix: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                value: vec![wire::RevisionId {
+                    digest: wire::Digest256 {
+                        bytes: rev_id_bytes.to_vec(),
+                    },
+                }],
+                children: vec![],
+            }
+            .into(),
+        );
+        let bytes = node.encode().unwrap();
+
+        let refs = extract_object_references(&bytes).unwrap();
+        assert!(
+            !refs.is_empty(),
+            "revision map node with a leaf value should have references"
+        );
+        let expected_oid = crate::ObjectId::from_digest(rev_id_bytes);
+        assert!(
+            refs.contains(&expected_oid),
+            "should contain the revision ObjectId; got {refs:?}"
+        );
+    }
+}

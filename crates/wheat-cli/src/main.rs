@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
@@ -38,8 +38,10 @@ mod workspace_diff;
 mod workspace_files;
 mod workspace_metadata;
 mod workspace_scan;
-mod workspace_walk;
 mod workspace_status;
+mod remote;
+mod remote_config;
+mod workspace_walk;
 use command_output::{
     CliFailure, OutputFormat, Success, clap_error, emit_error, emit_success, requested_format,
     require_supported_platform,
@@ -117,6 +119,12 @@ enum Command {
     Import(ImportArgs),
     /// Project Wheat revision history and push it to a Git branch.
     Push(PushArgs),
+    /// Clone a repository from a wheat-server via the native protocol.
+    Clone(NativeCloneArgs),
+    /// Fetch updates from a wheat-server via the native protocol.
+    Fetch(NativeFetchArgs),
+    /// Publish local state to a wheat-server via the native protocol.
+    Publish(NativePublishArgs),
 }
 
 #[derive(Debug, Args)]
@@ -428,6 +436,34 @@ struct PushArgs {
 }
 
 #[derive(Debug, Args)]
+struct NativeCloneArgs {
+    /// Wheat server URL: wheat://host:port/owner/repo.
+    url: String,
+    /// Workspace directory. Defaults to a directory named after the repository.
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct NativeFetchArgs {
+    /// Override the remote URL (wheat://host:port/owner/repo).
+    #[arg(long)]
+    remote: Option<String>,
+    /// Force fetch even if local has diverged from last-fetched state.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct NativePublishArgs {
+    /// Override the remote URL (wheat://host:port/owner/repo).
+    #[arg(long)]
+    remote: Option<String>,
+    /// Force publish (skip monotonicity checks on the server).
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
 struct ResolveArgs {
     /// Conflicted immutable revision (advanced disambiguation; inferred from --path when omitted).
     revision: Option<String>,
@@ -490,6 +526,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::Resolve(_) => "resolve",
         Command::Import(_) => "import",
         Command::Push(_) => "push",
+        Command::Clone(_) => "clone",
+        Command::Fetch(_) => "fetch",
+        Command::Publish(_) => "publish",
     }
 }
 
@@ -547,12 +586,7 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Status => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
-            let scan = workspace_scan::scan(
-                &context.root,
-                &local,
-                &context.workspace,
-                0,
-            )?;
+            let scan = workspace_scan::scan(&context.root, &local, &context.workspace, 0)?;
 
             // Discover untracked files via workspace walk with ignore rules.
             let global = wheat_ignore::loader::read_global_ignore();
@@ -567,8 +601,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 workspace_walk::WalkLimits::default(),
             )?;
 
-            let status =
-                workspace_status::WorkspaceStatus::from_scan(scan, Some(walk_result));
+            let status = workspace_status::WorkspaceStatus::from_scan(scan, Some(walk_result));
 
             let mut output = String::new();
             // Print diagnostics to stderr (they're informational, not command output).
@@ -597,11 +630,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 };
                 writeln!(output, "{kind} {}", change.path)?;
             }
-            let untracked_count = status
-                .untracked
-                .iter()
-                .filter(|u| !u.ignored)
-                .count();
+            let untracked_count = status.untracked.iter().filter(|u| !u.ignored).count();
             if untracked_count > 0 {
                 writeln!(output, "untracked files: {untracked_count}")?;
                 for entry in &status.untracked {
@@ -837,17 +866,9 @@ fn execute(cli: Cli) -> Result<Success> {
 
             // Resolve paths: --all discovers modified/deleted tracked paths via scan.
             let paths = if arguments.all {
-                let scan = workspace_scan::scan_locked(
-                    &context.root,
-                    &local,
-                    &context.workspace,
-                    0,
-                )?;
-                let resolved: Vec<String> = scan
-                    .changes
-                    .iter()
-                    .map(|c| c.path.clone())
-                    .collect();
+                let scan =
+                    workspace_scan::scan_locked(&context.root, &local, &context.workspace, 0)?;
+                let resolved: Vec<String> = scan.changes.iter().map(|c| c.path.clone()).collect();
                 if resolved.is_empty() {
                     return Err(CliFailure::invalid(
                         "no modified or deleted tracked paths; workspace is clean",
@@ -1141,6 +1162,13 @@ fn execute(cli: Cli) -> Result<Success> {
             resolve(&context.root, &context.store_root, arguments)
         }
         Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
+        Command::Clone(arguments) => native_clone(arguments, cli.store.as_deref()),
+        Command::Fetch(arguments) => {
+            native_fetch(&requested_workspace, cli.store.as_deref(), arguments)
+        }
+        Command::Publish(arguments) => {
+            native_publish(&requested_workspace, cli.store.as_deref(), arguments)
+        }
         Command::Push(mut arguments) => {
             let store_root = if arguments.source.is_none() {
                 let context = resolve_context(&requested_workspace, cli.store.as_deref()).map_err(
@@ -1822,6 +1850,354 @@ fn put_captured_value(
         wheat_core::text_capture::CapturedBytes::Binary(value) => value.as_ref(),
     };
     Ok(store.put(bytes)?)
+}
+
+// ---------------------------------------------------------------------------
+// Native protocol commands: clone, fetch, publish
+// ---------------------------------------------------------------------------
+
+fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Result<Success> {
+    let parsed = remote::parse_wheat_url(&arguments.url)?;
+
+    // Derive workspace directory from repo name if not provided.
+    let workspace_root = arguments.workspace.unwrap_or_else(|| {
+        let name = parsed
+            .repo_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(&parsed.repo_name);
+        PathBuf::from(name)
+    });
+
+    ensure_fresh_workspace(&workspace_root)?;
+
+    let store_root = explicit_store
+        .map(Path::to_path_buf)
+        .unwrap_or(allocate_store_root()?);
+    if store_root.exists() {
+        return Err(CliFailure::invalid(format!(
+            "Wheat store destination already exists: {}",
+            store_root.display()
+        )));
+    }
+    std::fs::create_dir(&store_root)?;
+
+    let objects = wheat_store::LooseObjectStore::new(store_root.join("objects"));
+    let content = wheat_store::ContentStore::new(store_root.join("content"));
+    let heads = wheat_store::LocalPublicationStore::new(store_root.join("repository.head"));
+
+    let rt = runtime()?;
+    let (remote_state, label_name) = rt.block_on(async {
+        let mut session = remote::connect(&parsed.ws_url).await?;
+        let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
+
+        // Fetch all structural objects.
+        let obj_count = remote::fetch_objects(
+            &mut session,
+            1,
+            &objects,
+            &content,
+            state.envelope,
+            0,
+            &[0u8; 32],
+        )
+        .await?;
+
+        // Fetch all content.
+        let content_count =
+            remote::fetch_content(&mut session, 2, &objects, &content, state.envelope).await?;
+
+        eprintln!(
+            "fetched {obj_count} objects, {content_count} content blobs"
+        );
+
+        remote::close(&mut session).await?;
+        // Pick the first label as the active label, or "main" as default.
+        let label = state
+            .labels
+            .first()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| "main".to_string());
+        Ok::<_, anyhow::Error>((state, label))
+    })?;
+
+    // Write the head.
+    let head = wheat_store::RepositoryHead {
+        generation: remote_state.generation,
+        envelope: remote_state.envelope,
+    };
+    heads.initialize(head)?;
+
+    // Write store metadata.
+    let store = workspace_metadata::StoreMetadata::create(&store_root)?;
+    let canonical_store = canonical_store_path(&store_root)?;
+
+    // Write remote config.
+    let remote_cfg = remote_config::RemoteConfig::new(&arguments.url, &head);
+    remote_cfg.write(&store_root)?;
+
+    // Initialize workspace and materialize.
+    initialize_workspace_directory(&workspace_root)?;
+    let repository = open(&store_root)?;
+    let resolved =
+        rt.block_on(frontier_service::resolve(&repository, &label_name, None))?;
+    drop(repository);
+    let workspace = workspace_metadata::WorkspaceMetadata::new(
+        canonical_store,
+        store.store_id,
+        label_name.clone(),
+        resolved.basis,
+    );
+    workspace.initialize(&workspace_root)?;
+    let (view, materialized_root) =
+        materialize_resolved(&workspace_root, Some(&store_root), label_name, resolved)?;
+
+    let human = format!(
+        "cloned {} into {}\nmaterialized view {view}\ngeneration {}, envelope {}\n",
+        arguments.url,
+        materialized_root.display(),
+        head.generation,
+        head.envelope,
+    );
+    Success::new(
+        "clone",
+        json!({
+            "url": arguments.url,
+            "generation": head.generation,
+            "envelope": head.envelope.to_string(),
+        }),
+        human,
+    )
+}
+
+fn native_fetch(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    arguments: NativeFetchArgs,
+) -> Result<Success> {
+    let context = resolve_context(workspace, explicit_store)?;
+    let local = open(&context.store_root)?;
+    let local_head = local.heads.read()?;
+
+    // Resolve remote URL.
+    let (parsed, remote_cfg) = resolve_remote(&context.store_root, arguments.remote.as_deref())?;
+
+    let last_fetched = remote_cfg.last_fetched_head()?;
+
+    // Divergence check: if local head has advanced past last-fetched, the user
+    // has unpublished local work. Refuse unless --force.
+    if !arguments.force && local_head.generation > last_fetched.generation {
+        return Err(CliFailure::stale(
+            "local repository has unpublished changes; run `wheat publish` first, or use `wheat fetch --force` to discard local divergence",
+        ));
+    }
+
+    let rt = runtime()?;
+    let (remote_state, obj_count, content_count) = rt.block_on(async {
+        let mut session = remote::connect(&parsed.ws_url).await?;
+        let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
+
+        if state.generation == last_fetched.generation && state.envelope == last_fetched.envelope {
+            remote::close(&mut session).await?;
+            return Ok((state, 0, 0));
+        }
+
+        let obj_count = remote::fetch_objects(
+            &mut session,
+            1,
+            &local.objects,
+            &local.content,
+            state.envelope,
+            0,
+            &[0u8; 32],
+        )
+        .await?;
+
+        let content_count = remote::fetch_content(
+            &mut session,
+            2,
+            &local.objects,
+            &local.content,
+            state.envelope,
+        )
+        .await?;
+
+        remote::close(&mut session).await?;
+        Ok::<_, anyhow::Error>((state, obj_count, content_count))
+    })?;
+
+    if obj_count == 0 && content_count == 0 && remote_state.generation == last_fetched.generation {
+        return Success::new(
+            "fetch",
+            json!({ "up_to_date": true, "generation": local_head.generation }),
+            "already up to date\n".to_string(),
+        );
+    }
+
+    // Update local head to match remote.
+    let new_head = wheat_store::RepositoryHead {
+        generation: remote_state.generation,
+        envelope: remote_state.envelope,
+    };
+    // CAS the local head: expected = current local head, proposed = remote head.
+    local
+        .heads
+        .compare_and_advance(local_head, new_head)
+        .map_err(|e| anyhow::anyhow!("failed to update local head: {e}"))?;
+
+    // Update remote config.
+    let mut updated_cfg = remote_cfg;
+    updated_cfg.set_last_fetched(&new_head);
+    updated_cfg.write(&context.store_root)?;
+
+    let human = format!(
+        "fetched {obj_count} objects, {content_count} content blobs\nupdated to generation {}, envelope {}\n",
+        new_head.generation,
+        new_head.envelope,
+    );
+    Success::new(
+        "fetch",
+        json!({
+            "up_to_date": false,
+            "generation": new_head.generation,
+            "envelope": new_head.envelope.to_string(),
+            "objects": obj_count,
+            "content": content_count,
+        }),
+        human,
+    )
+}
+
+fn native_publish(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    arguments: NativePublishArgs,
+) -> Result<Success> {
+    let context = resolve_context(workspace, explicit_store)?;
+    let local = open(&context.store_root)?;
+    let local_head = local.heads.read()?;
+
+    // Resolve remote URL.
+    let (parsed, mut remote_cfg) = if let Some(url) = arguments.remote.as_deref() {
+        let parsed = remote::parse_wheat_url(url)?;
+        // If no remote.json exists, create one (first publish of a locally-initialized repo).
+        let cfg = remote_config::RemoteConfig::read(&context.store_root)?
+            .unwrap_or_else(|| remote_config::RemoteConfig::new(url, &wheat_store::RepositoryHead {
+                generation: 0,
+                envelope: wheat_core::RepositoryEnvelopeId::from_digest([0u8; 32]),
+            }));
+        (parsed, cfg)
+    } else {
+        resolve_remote(&context.store_root, None)?
+    };
+
+    let last_fetched = remote_cfg.last_fetched_head()?;
+
+    let rt = runtime()?;
+    let outcome = rt.block_on(async {
+        let mut session = remote::connect(&parsed.ws_url).await?;
+        let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
+
+        // Check that the remote hasn't advanced past what we last fetched.
+        if state.generation != last_fetched.generation
+            || state.envelope != last_fetched.envelope
+        {
+            // Special case: if this is a first publish (last_fetched is all zeros),
+            // we use the remote's current state as the expected head.
+            let is_first_publish = last_fetched.generation == 0
+                && *last_fetched.envelope.as_bytes() == [0u8; 32];
+            if !is_first_publish {
+                remote::close(&mut session).await?;
+                bail!(
+                    "remote has advanced (generation {} → {}); run `wheat fetch` first",
+                    last_fetched.generation,
+                    state.generation,
+                );
+            }
+        }
+
+        let expected = wheat_store::RepositoryHead {
+            generation: state.generation,
+            envelope: state.envelope,
+        };
+
+        let result = remote::publish(
+            &mut session,
+            1,
+            &local.objects,
+            &local.content,
+            local_head.envelope,
+            &expected,
+            arguments.force,
+        )
+        .await?;
+
+        remote::close(&mut session).await?;
+        Ok::<_, anyhow::Error>(result)
+    })?;
+
+    match outcome {
+        remote::PublishOutcome::Ok {
+            new_generation,
+            new_envelope,
+        } => {
+            // Update remote config to track the new remote head.
+            let new_remote_head = wheat_store::RepositoryHead {
+                generation: new_generation,
+                envelope: new_envelope,
+            };
+            remote_cfg.set_last_fetched(&new_remote_head);
+            if let Some(url) = arguments.remote {
+                // First publish — also set the URL.
+                remote_cfg.url = url;
+            }
+            remote_cfg.write(&context.store_root)?;
+
+            let human = format!(
+                "published to generation {new_generation}, envelope {new_envelope}\n"
+            );
+            Success::new(
+                "publish",
+                json!({
+                    "status": "ok",
+                    "generation": new_generation,
+                    "envelope": new_envelope.to_string(),
+                }),
+                human,
+            )
+        }
+        remote::PublishOutcome::Stale {
+            remote_generation,
+            remote_envelope,
+            message,
+        } => Err(CliFailure::stale(format!(
+            "publish rejected: remote is at generation {remote_generation} (envelope {remote_envelope}); {message}"
+        ))),
+        remote::PublishOutcome::Rejected { message } => {
+            Err(CliFailure::invalid(format!("publish rejected: {message}")))
+        }
+        remote::PublishOutcome::Error { message } => {
+            Err(CliFailure::transport(format!("publish error: {message}")))
+        }
+    }
+}
+
+/// Resolve the remote URL from --remote flag or remote.json.
+fn resolve_remote(
+    store_root: &Path,
+    explicit_url: Option<&str>,
+) -> Result<(remote::WheatUrl, remote_config::RemoteConfig)> {
+    if let Some(url) = explicit_url {
+        let parsed = remote::parse_wheat_url(url)?;
+        let cfg = remote_config::RemoteConfig::read(store_root)?
+            .with_context(|| "no remote.json found; use wheat clone or pass --remote")?;
+        Ok((parsed, cfg))
+    } else {
+        let cfg = remote_config::RemoteConfig::read(store_root)?
+            .with_context(|| "no remote configured; use wheat clone or pass --remote")?;
+        let parsed = remote::parse_wheat_url(&cfg.url)?;
+        Ok((parsed, cfg))
+    }
 }
 
 fn print_reapplied(output: &mut String, changes: &[ChangeId]) -> Result<()> {
