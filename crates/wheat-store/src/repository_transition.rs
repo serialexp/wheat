@@ -140,7 +140,8 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         }
 
         // 4. Verify view lineage extension (existing bounded method).
-        if baseline.view_lineage != proposed.view_lineage {
+        //    Force-publish may legitimately rewrite lineage (history removal).
+        if baseline.view_lineage != proposed.view_lineage && !options.allow_non_monotonic {
             crate::ViewLineageMapStore::new(self.objects)
                 .validate_extension(
                     baseline.view_lineage,
