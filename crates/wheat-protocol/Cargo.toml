@@ -1,0 +1,10 @@
+[package]
+name = "wheat-protocol"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+wheat-protocol-generated = { package = "wheat-protocol-binschema-generated", path = "generated" }
+
+[lints]
+workspace = true

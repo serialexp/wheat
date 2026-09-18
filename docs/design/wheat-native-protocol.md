@@ -1,6 +1,6 @@
 # Wheat Native Protocol — Design
 
-Status: draft, not yet implemented
+Status: partial — Phase 0 complete, Phase 1+ outstanding
 Owner: bart
 Last updated: 2026-09-18
 
@@ -21,34 +21,29 @@ top of them.
 - [x] **Existing binschema object schema.** The wheat object wire format is already
   defined via binschema and generates Rust code (`wheat-core/generated/`). The
   protocol message schema is a second, separate schema.
+- [x] **Phase 0 — bounded delta validation in wheat-store.** O(delta)
+  `validate_transition` replaces the O(repository) full walk for publication.
+  Delta methods added for `RetainedSetStore`, `ChangeMapStore`, and
+  `ApplicationMapStore`; the existing `RevisionMapStore::delta` now has a
+  production call site. Force-publish (`allow_non_monotonic`) bypasses
+  monotonicity and lineage extension checks. Benchmarked at 500 baseline
+  changes + 5 delta: 64ms (transition) vs 410ms (complete), 6.4× speedup.
+  Tests: 6 retained-set delta tests, 4 transition validation tests, 1 bench.
+
+- [x] **Phase 0 — protocol schema.** Defined at
+  `crates/wheat-core/schemas/wheat-protocol.bs.json5`. 27 message types
+  covering session setup, repository state, fetch (iterative root-first
+  discovery), content transfer (batch + chunked + redirect), publication
+  (request/objects/content/commit/progress/result), credit-based flow
+  control, and errors with scope+retryable semantics.
+- [x] **Phase 0 — Rust protocol crate.** `wheat-protocol` crate with
+  binschema-generated encode/decode from the protocol schema, plus
+  framing helpers (`decode_message`/`encode_message`) with size limit
+  enforcement. Generation script at `scripts/wheat-protocol-gen-schema`.
+  11 round-trip smoke tests verify all message families.
 
 ### Outstanding
 
-- [ ] **Phase 0 — bounded delta validation in wheat-store.** A new validation
-  mode that verifies only the transition delta in O(delta) time. Concretely
-  this requires:
-  - Delta methods for `RetainedSetStore` (currently has only `cursor`,
-    `union`, `difference` — no `delta`).
-  - Delta methods for `ChangeMapStore` and `ApplicationMapStore` (neither
-    has one).
-  - Wiring the existing `RevisionMapStore::delta` (implemented and tested
-    but has zero call sites outside its test file).
-  - A new baseline-taking entry point in `repository_verify.rs` — current
-    `validate_complete` takes only a target `RepositoryStateId` with no
-    baseline parameter.
-  - The `radix::Store::paired_diff` primitive (short-circuits on equal
-    subtrees) already exists and is proven in production via
-    `verify_view_trees_by_lineage_delta`, so the hard part is de-risked.
-  - Full `validate_complete` takes minutes on representative repos and
-    cannot run synchronously during publication; it remains available as
-    a background audit.
-- [ ] **Phase 0 — protocol schema.** Define the wheat wire protocol in a binschema
-  `.schema.json`: handshake/version negotiation, repository advertisement,
-  object-have/want exchange, bounded object transfer, publication request/response,
-  and error frames.
-- [ ] **Phase 0 — Rust protocol crate.** `wheat-protocol` crate with generated
-  Rust encode/decode from the protocol schema, plus framing over WebSocket binary
-  messages. No transport or server logic — pure message types and serialization.
 - [ ] **Phase 1 — packed segments on the object store.** Extend the object store
   backend to write and read packed segments as S3 keys rather than one key per
   object. The server builds segments from incoming objects during publication and
@@ -497,8 +492,9 @@ truncates with a flag indicating more are available, and a separate
 
 ## Wire protocol schema (sketch)
 
-The full schema will be a binschema `.schema.json`. This sketch shows the
-message shapes. All arrays have explicit maximum item counts and byte limits;
+The actual schema is at `crates/wheat-core/schemas/wheat-protocol.bs.json5`.
+The sketch below records the original design intent; refer to the `.bs.json5`
+file as the source of truth. This sketch shows the message shapes. All arrays have explicit maximum item counts and byte limits;
 strings have maximum byte lengths. Binschema generates the encode/decode
 logic; the **framing layer** (handwritten, wrapping the generated code)
 enforces aggregate message-size bounds and per-field maximums before
