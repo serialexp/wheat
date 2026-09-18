@@ -1,0 +1,27 @@
+[package]
+name = "wheat-server"
+version.workspace = true
+edition = "2024"
+
+[[bin]]
+name = "wheat-server"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "io-util"] }
+tokio-tungstenite = "0.28"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wheat-core = { path = "../wheat-core" }
+wheat-protocol = { path = "../wheat-protocol" }
+wheat-store = { path = "../wheat-store" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

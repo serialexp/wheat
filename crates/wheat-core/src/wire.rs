@@ -1610,6 +1610,146 @@ fn digest(bytes: &[u8; 32]) -> wire::Digest256 {
     }
 }
 
+/// Extract all ObjectId references from a canonical wheat object.
+///
+/// Decodes the object and collects every digest-typed ID it references
+/// (children of radix nodes, structural references from state/view/revision
+/// objects, etc.). Does NOT include ContentIds (those are content-tier, not
+/// structural objects). Returns an empty vec for objects with no structural
+/// children (e.g. edits, changes with only metadata).
+///
+/// Used by the wheat-server to iteratively discover which objects a
+/// proposed publication closure is missing.
+pub fn extract_object_references(
+    bytes: &[u8],
+) -> Result<Vec<crate::ObjectId>, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let mut refs = Vec::new();
+
+    match object {
+        // --- Structural records ---
+        wire::WheatObject::RepositoryEnvelopeV1(env) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(&env.state.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&env.labels.digest)?));
+        }
+        wire::WheatObject::RepositoryStateV3(state) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.base_view.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.changes.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.view_lineage.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.required_content.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.retained_changes.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.retained_views.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.retained_revisions.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&state.retained_applications.digest)?));
+        }
+        wire::WheatObject::ViewV1(view) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(&view.tree.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&view.revisions.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&view.applications.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&view.unresolved_conflicts.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&view.required_content.digest)?));
+        }
+        wire::WheatObject::ContentManifestV1(manifest) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(&manifest.content.digest)?));
+        }
+        wire::WheatObject::RevisionV1(rev) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(&rev.authored_against.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&rev.resulting_tree.digest)?));
+            for edit_id in &rev.edits {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&edit_id.digest)?));
+            }
+        }
+        wire::WheatObject::ApplicationV1(app) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(&app.revision_id.digest)?));
+            refs.push(crate::ObjectId::from_digest(digest_domain(&app.target_view.digest)?));
+            match &app.result {
+                wire::ApplicationResultV1::CleanApplicationV1(clean) => {
+                    refs.push(crate::ObjectId::from_digest(digest_domain(&clean.resulting_tree.digest)?));
+                }
+                wire::ApplicationResultV1::ConflictedApplicationV1(conflicted) => {
+                    refs.push(crate::ObjectId::from_digest(digest_domain(&conflicted.partial_tree.digest)?));
+                    refs.push(crate::ObjectId::from_digest(digest_domain(&conflicted.conflict.digest)?));
+                }
+            }
+        }
+        wire::WheatObject::ConflictV1(conflict) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(&conflict.target_view.digest)?));
+        }
+        wire::WheatObject::TreeV1(tree) => {
+            for entry in &tree.entries {
+                match &entry.value {
+                    wire::DirectoryEntryValueV1::DirectoryEntryRefV1(dir) => {
+                        refs.push(crate::ObjectId::from_digest(digest_domain(&dir.directory.digest)?));
+                    }
+                    wire::DirectoryEntryValueV1::FileEntryV1(_) => {
+                        // File entries reference ContentIds, not ObjectIds.
+                    }
+                }
+            }
+        }
+        wire::WheatObject::ViewLabelManifestV1(manifest) => {
+            for entry in &manifest.labels {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&entry.view.digest)?));
+            }
+        }
+
+        // --- Radix tree nodes (children are structural object references) ---
+        wire::WheatObject::RevisionMapNodeV1(node) => {
+            for child in &node.children {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&child.child.digest)?));
+            }
+            // Leaf values are RevisionIds — those objects should be in retained_revisions.
+            for value in &node.value {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
+            }
+        }
+        wire::WheatObject::ChangeMapNodeV1(node) => {
+            for child in &node.children {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&child.child.digest)?));
+            }
+            for value in &node.value {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
+            }
+        }
+        wire::WheatObject::ApplicationMapNodeV1(node) => {
+            for child in &node.children {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&child.child.digest)?));
+            }
+            for value in &node.value {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
+            }
+        }
+        wire::WheatObject::ViewLineageMapNodeV1(node) => {
+            for child in &node.children {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&child.child.digest)?));
+            }
+            for value in &node.value {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
+            }
+        }
+        wire::WheatObject::ConflictSetNodeV1(node) => {
+            for child in &node.children {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&child.child.digest)?));
+            }
+        }
+        wire::WheatObject::ContentSetNodeV1(node) => {
+            for child in &node.children {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&child.child.digest)?));
+            }
+        }
+        wire::WheatObject::RetainedSetNodeV1(node) => {
+            for child in &node.children {
+                refs.push(crate::ObjectId::from_digest(digest_domain(&child.child.digest)?));
+            }
+        }
+
+        // --- Leaf objects with no structural children ---
+        wire::WheatObject::ChangeV1(_) | wire::WheatObject::EditV1(_) => {}
+    }
+
+    Ok(refs)
+}
+
 fn encode(object: wire::WheatObject) -> Vec<u8> {
     let bytes = object
         .encode()
