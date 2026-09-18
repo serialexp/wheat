@@ -17,6 +17,12 @@ pub enum ChangeMapError {
     InvalidChildDepth,
     #[error("change-map node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("change-map delta contains more than {limit} entries")]
+    DeltaChangeLimitExceeded { limit: usize },
+    #[error("change-map delta reads more than {limit} nodes")]
+    DeltaNodeLimitExceeded { limit: usize },
+    #[error("change-map delta queues more than {limit} pending subtrees")]
+    DeltaPendingLimitExceeded { limit: usize },
 }
 
 impl From<radix::Error> for ChangeMapError {
@@ -27,6 +33,58 @@ impl From<radix::Error> for ChangeMapError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+        }
+    }
+}
+
+impl From<radix::DiffError> for ChangeMapError {
+    fn from(error: radix::DiffError) -> Self {
+        match error {
+            radix::DiffError::Radix(error) => error.into(),
+            radix::DiffError::ChangeLimitExceeded { limit } => {
+                Self::DeltaChangeLimitExceeded { limit }
+            }
+            radix::DiffError::NodeLimitExceeded { limit } => Self::DeltaNodeLimitExceeded { limit },
+            radix::DiffError::PendingLimitExceeded { limit } => {
+                Self::DeltaPendingLimitExceeded { limit }
+            }
+        }
+    }
+}
+
+/// One deterministic difference from an old change map to a new one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangeMapDelta {
+    Added {
+        change: ChangeId,
+        object: ChangeObjectId,
+    },
+    Changed {
+        change: ChangeId,
+        old_object: ChangeObjectId,
+        new_object: ChangeObjectId,
+    },
+    Removed {
+        change: ChangeId,
+        object: ChangeObjectId,
+    },
+}
+
+/// Bounds for a read-only change-map comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChangeMapDeltaLimits {
+    pub max_changes: usize,
+    pub max_nodes: usize,
+    pub max_pending: usize,
+}
+
+impl Default for ChangeMapDeltaLimits {
+    fn default() -> Self {
+        let limits = radix::DiffLimits::default();
+        Self {
+            max_changes: limits.max_changes,
+            max_nodes: limits.max_nodes,
+            max_pending: limits.max_pending,
         }
     }
 }
@@ -125,5 +183,44 @@ impl<'a, S: ImmutableObjectStore> ChangeMapStore<'a, S> {
     }
     pub async fn contains_node(&self, id: ChangeMapId) -> Result<bool, ChangeMapError> {
         Ok(self.inner.contains_node(id).await?)
+    }
+
+    /// Return lexicographically ordered entry changes from `old` to `new`.
+    pub async fn delta(
+        &self,
+        old: ChangeMapId,
+        new: ChangeMapId,
+        limits: ChangeMapDeltaLimits,
+    ) -> Result<Vec<ChangeMapDelta>, ChangeMapError> {
+        let entries = self
+            .inner
+            .paired_diff(
+                old,
+                new,
+                radix::DiffLimits {
+                    max_changes: limits.max_changes,
+                    max_nodes: limits.max_nodes,
+                    max_pending: limits.max_pending,
+                },
+            )
+            .await?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| match entry {
+                radix::DiffEntry::Added(change, object) => {
+                    ChangeMapDelta::Added { change, object }
+                }
+                radix::DiffEntry::Changed(change, old_object, new_object) => {
+                    ChangeMapDelta::Changed {
+                        change,
+                        old_object,
+                        new_object,
+                    }
+                }
+                radix::DiffEntry::Removed(change, object) => {
+                    ChangeMapDelta::Removed { change, object }
+                }
+            })
+            .collect())
     }
 }

@@ -14,6 +14,13 @@ pub enum ContentSetDelta {
     Removed(ContentId),
 }
 
+/// One authenticated membership difference between two retained-object sets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedSetDelta {
+    Added(ObjectId),
+    Removed(ObjectId),
+}
+
 /// Bounds for a read-only content-manifest comparison.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContentSetDeltaLimits {
@@ -23,6 +30,25 @@ pub struct ContentSetDeltaLimits {
 }
 
 impl Default for ContentSetDeltaLimits {
+    fn default() -> Self {
+        let limits = radix::DiffLimits::default();
+        Self {
+            max_changes: limits.max_changes,
+            max_nodes: limits.max_nodes,
+            max_pending: limits.max_pending,
+        }
+    }
+}
+
+/// Bounds for a read-only retained-set comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedSetDeltaLimits {
+    pub max_changes: usize,
+    pub max_nodes: usize,
+    pub max_pending: usize,
+}
+
+impl Default for RetainedSetDeltaLimits {
     fn default() -> Self {
         let limits = radix::DiffLimits::default();
         Self {
@@ -45,11 +71,11 @@ pub enum CollectionError {
     InvalidChildDepth,
     #[error("collection values are permitted only at terminal depth")]
     InvalidTerminalNode,
-    #[error("content-set delta contains more than {limit} entries")]
+    #[error("set delta contains more than {limit} entries")]
     DeltaChangeLimitExceeded { limit: usize },
-    #[error("content-set delta reads more than {limit} nodes")]
+    #[error("set delta reads more than {limit} nodes")]
     DeltaNodeLimitExceeded { limit: usize },
-    #[error("content-set delta queues more than {limit} pending subtrees")]
+    #[error("set delta queues more than {limit} pending subtrees")]
     DeltaPendingLimitExceeded { limit: usize },
 }
 impl From<radix::Error> for CollectionError {
@@ -329,3 +355,36 @@ set_api!(
     ObjectId,
     RetainedSetNode
 );
+
+impl<S: ImmutableObjectStore> RetainedSetStore<'_, S> {
+    /// Compare two retained-object sets without writing derived collection nodes.
+    ///
+    /// Equal immutable subtrees are pruned by identity; divergent nodes are read
+    /// and structurally validated at their contextual radix positions.
+    pub async fn delta(
+        &self,
+        old: RetainedSetId,
+        new: RetainedSetId,
+        limits: RetainedSetDeltaLimits,
+    ) -> Result<Vec<RetainedSetDelta>, CollectionError> {
+        Ok(self
+            .inner
+            .paired_diff(
+                old,
+                new,
+                radix::DiffLimits {
+                    max_changes: limits.max_changes,
+                    max_nodes: limits.max_nodes,
+                    max_pending: limits.max_pending,
+                },
+            )
+            .await?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                radix::DiffEntry::Added(id, ()) => Some(RetainedSetDelta::Added(id)),
+                radix::DiffEntry::Removed(id, ()) => Some(RetainedSetDelta::Removed(id)),
+                radix::DiffEntry::Changed(_, (), ()) => None,
+            })
+            .collect())
+    }
+}

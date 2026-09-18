@@ -1426,6 +1426,14 @@ mod untouched_tests {
     }
 }
 
+/// Options governing which transition invariants to enforce.
+#[derive(Clone, Debug, Default)]
+pub struct TransitionValidationOptions {
+    /// When true, allow removal of retained entries (non-monotonic transition).
+    /// When false (default), any `Removed` delta entry is rejected.
+    pub allow_non_monotonic: bool,
+}
+
 impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
     /// Verify all retained inventories with verified reads and fresh, disk-backed scratch indexes.
     pub async fn validate_complete(&self, id: RepositoryStateId) -> Result<()> {

@@ -33,7 +33,7 @@ mod repository_publication;
 mod repository_reader;
 mod repository_transition;
 mod repository_verify;
-pub use repository_verify::RepositoryValidationPhase;
+pub use repository_verify::{RepositoryValidationPhase, TransitionValidationOptions};
 mod verification_scratch;
 pub use repository_reader::RepositoryReader;
 mod revision_map;
@@ -46,9 +46,14 @@ pub use snapshot::{
 };
 mod view_lineage;
 
-pub use application_map::{ApplicationMapCursor, ApplicationMapError, ApplicationMapStore};
+pub use application_map::{
+    ApplicationMapCursor, ApplicationMapDelta, ApplicationMapDeltaLimits, ApplicationMapError,
+    ApplicationMapStore,
+};
 pub use batch::BatchObjectStore;
-pub use change_map::{ChangeMapCursor, ChangeMapError, ChangeMapStore};
+pub use change_map::{
+    ChangeMapCursor, ChangeMapDelta, ChangeMapDeltaLimits, ChangeMapError, ChangeMapStore,
+};
 pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
 pub use durability::{Durability, sync_directory, sync_filesystem};
 pub use loose::{
@@ -76,7 +81,8 @@ pub use revision_map::{
 };
 pub use sets::{
     CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetDelta,
-    ContentSetDeltaLimits, ContentSetStore, RetainedSetCursor, RetainedSetStore,
+    ContentSetDeltaLimits, ContentSetStore, RetainedSetCursor, RetainedSetDelta,
+    RetainedSetDeltaLimits, RetainedSetStore,
 };
 pub use view_lineage::{
     ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,
