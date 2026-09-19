@@ -1936,11 +1936,34 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
     let remote_cfg = remote_config::RemoteConfig::new(&arguments.url, &head);
     remote_cfg.write(&store_root)?;
 
-    // Initialize workspace and materialize.
+    // Initialize workspace and materialize. If multiple descendant
+    // frontiers exist, resolve at the label basis (the user can select
+    // a specific frontier later with `wheat switch --frontier`).
     initialize_workspace_directory(&workspace_root)?;
     let repository = open(&store_root)?;
-    let resolved =
-        rt.block_on(frontier_service::resolve(&repository, &label_name, None))?;
+    let resolved = match rt.block_on(frontier_service::resolve(&repository, &label_name, None)) {
+        Ok(r) => r,
+        Err(_) => {
+            // Multiple frontiers — resolve at the label's basis view.
+            let basis_view = rt.block_on(async {
+                let reader =
+                    wheat_store::RepositoryReader::new(&repository.objects, &repository.content);
+                let head = repository.heads.read()?;
+                let envelope = reader.envelope(head.envelope).await?;
+                let labels = reader.view_label_manifest(envelope.labels).await?;
+                let label_entry = labels
+                    .labels
+                    .get(&label_name)
+                    .ok_or_else(|| anyhow::anyhow!("unknown label {label_name}"))?;
+                Ok::<_, anyhow::Error>(label_entry.view)
+            })?;
+            rt.block_on(frontier_service::resolve(
+                &repository,
+                &label_name,
+                Some(basis_view),
+            ))?
+        }
+    };
     drop(repository);
     let workspace = workspace_metadata::WorkspaceMetadata::new(
         canonical_store,

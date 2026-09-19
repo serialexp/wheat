@@ -202,7 +202,6 @@ async fn client_fetch_objects(
     let mut total = 0;
     let mut want_list: Vec<ObjectId> = Vec::new();
     let mut known = HashSet::new();
-    let mut retained_walk_done = false;
 
     loop {
         let msg = recv_msg(ws).await;
@@ -244,56 +243,67 @@ async fn client_fetch_objects(
                 let mut seen = HashSet::new();
                 want_list.retain(|id| seen.insert(*id));
 
-                // After BFS exhausts explicit refs, walk retained sets and
-                // BFS through any retained objects already present.
-                if want_list.is_empty() && !retained_walk_done {
-                    retained_walk_done = true;
-                    let reader = RepositoryReader::new(objects, content);
-                    let env = reader.envelope(envelope_id).await.unwrap();
-                    let state = reader.state(env.state).await.unwrap();
+                // Walk retained sets until convergence. Each round may
+                // fetch objects whose children include new trie nodes;
+                // those nodes may encode additional trie-key ObjectIds.
+                if want_list.is_empty() {
+                    loop {
+                        let reader = RepositoryReader::new(objects, content);
+                        let env = reader.envelope(envelope_id).await.unwrap();
+                        let state = reader.state(env.state).await.unwrap();
 
-                    let retained_store = wheat_store::RetainedSetStore::new(objects);
-                    let mut bfs_frontier: Vec<ObjectId> = Vec::new();
-                    for root in [
-                        state.retained_views,
-                        state.retained_revisions,
-                        state.retained_applications,
-                        state.retained_changes,
-                    ] {
-                        let mut cursor = retained_store.cursor(root).await.unwrap();
-                        while let Some(oid) = cursor.next().await.unwrap() {
-                            if !known.contains(&oid) {
-                                match objects.get(oid).await {
-                                    Ok(obj) => {
-                                        known.insert(oid);
-                                        if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
-                                            for c in children {
-                                                if !known.contains(&c) { bfs_frontier.push(c); }
+                        let retained_store = wheat_store::RetainedSetStore::new(objects);
+                        let mut bfs_frontier: Vec<ObjectId> = Vec::new();
+                        let mut found_new = false;
+                        for root in [
+                            state.retained_views,
+                            state.retained_revisions,
+                            state.retained_applications,
+                            state.retained_changes,
+                        ] {
+                            let mut cursor = retained_store.cursor(root).await.unwrap();
+                            while let Some(oid) = cursor.next().await.unwrap() {
+                                if !known.contains(&oid) {
+                                    found_new = true;
+                                    match objects.get(oid).await {
+                                        Ok(obj) => {
+                                            known.insert(oid);
+                                            if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
+                                                for c in children {
+                                                    if !known.contains(&c) { bfs_frontier.push(c); }
+                                                }
                                             }
                                         }
-                                    }
-                                    Err(_) => { want_list.push(oid); }
-                                }
-                            }
-                        }
-                    }
-                    while let Some(oid) = bfs_frontier.pop() {
-                        if known.contains(&oid) { continue; }
-                        match objects.get(oid).await {
-                            Ok(obj) => {
-                                known.insert(oid);
-                                if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
-                                    for c in children {
-                                        if !known.contains(&c) { bfs_frontier.push(c); }
+                                        Err(_) => { want_list.push(oid); }
                                     }
                                 }
                             }
-                            Err(_) => { want_list.push(oid); }
+                        }
+                        while let Some(oid) = bfs_frontier.pop() {
+                            if known.contains(&oid) { continue; }
+                            match objects.get(oid).await {
+                                Ok(obj) => {
+                                    known.insert(oid);
+                                    if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
+                                        for c in children {
+                                            if !known.contains(&c) { bfs_frontier.push(c); }
+                                        }
+                                    }
+                                }
+                                Err(_) => { want_list.push(oid); }
+                            }
+                        }
+                        want_list.retain(|id| !known.contains(id));
+                        let mut seen2 = HashSet::new();
+                        want_list.retain(|id| seen2.insert(*id));
+
+                        if !found_new && want_list.is_empty() {
+                            break;
+                        }
+                        if !want_list.is_empty() {
+                            break;
                         }
                     }
-                    want_list.retain(|id| !known.contains(id));
-                    let mut seen2 = HashSet::new();
-                    want_list.retain(|id| seen2.insert(*id));
                 }
 
                 if want_list.is_empty() {

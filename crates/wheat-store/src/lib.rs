@@ -6,6 +6,7 @@
 mod application_map;
 mod batch;
 mod change_map;
+mod closure;
 mod commit_content;
 mod commit_writer;
 mod content_batch;
@@ -51,6 +52,7 @@ pub use application_map::{
     ApplicationMapStore,
 };
 pub use batch::BatchObjectStore;
+pub use closure::collect_structural_closure;
 pub use change_map::{
     ChangeMapCursor, ChangeMapDelta, ChangeMapDeltaLimits, ChangeMapError, ChangeMapStore,
 };

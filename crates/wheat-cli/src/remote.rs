@@ -324,7 +324,6 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
     let mut total_received = 0usize;
     let mut want_list: Vec<ObjectId> = Vec::new();
     let mut known = HashSet::new();
-    let mut retained_walk_done = false;
 
     loop {
         let msg = recv_msg(&mut session.ws).await?;
@@ -376,20 +375,49 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
                 // When the BFS exhausts explicit references, walk the
                 // retained sets to discover objects whose IDs are encoded
                 // as radix-trie keys (not extractable from individual nodes).
-                // Add discovered objects to the want list AND BFS-expand
-                // any that are already present (their children may be missing).
-                if want_list.is_empty() && !retained_walk_done {
-                    retained_walk_done = true;
-                    let retained = discover_retained_objects(objects, content, envelope_id).await?;
-                    // BFS through retained objects that are already present
-                    // to discover their children (revision maps, trees, etc.).
-                    let mut bfs_frontier: Vec<ObjectId> = Vec::new();
-                    for oid in retained {
-                        if !known.contains(&oid) {
+                //
+                // Loop until convergence: each round may fetch objects whose
+                // children include new retained-set trie nodes. Once those
+                // nodes arrive, the next retained-set walk discovers additional
+                // trie-key ObjectIds. Repeat until no new objects are found.
+                if want_list.is_empty() {
+                    loop {
+                        let retained = discover_retained_objects(objects, content, envelope_id).await?;
+                        let mut found_new = false;
+
+                        // BFS through retained objects that are already present
+                        // to discover their children (revision maps, trees, etc.).
+                        let mut bfs_frontier: Vec<ObjectId> = Vec::new();
+                        for oid in retained {
+                            if !known.contains(&oid) {
+                                found_new = true;
+                                match objects.get(oid).await {
+                                    Ok(obj) => {
+                                        known.insert(oid);
+                                        if let Ok(children) =
+                                            wheat_core::extract_object_references(&obj.canonical_bytes)
+                                        {
+                                            for child_id in children {
+                                                if !known.contains(&child_id) {
+                                                    bfs_frontier.push(child_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        want_list.push(oid);
+                                    }
+                                }
+                            }
+                        }
+                        // Continue BFS with children of retained objects.
+                        while let Some(oid) = bfs_frontier.pop() {
+                            if known.contains(&oid) {
+                                continue;
+                            }
                             match objects.get(oid).await {
                                 Ok(obj) => {
                                     known.insert(oid);
-                                    // BFS-expand this object's children.
                                     if let Ok(children) =
                                         wheat_core::extract_object_references(&obj.canonical_bytes)
                                     {
@@ -405,34 +433,21 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
                                 }
                             }
                         }
-                    }
-                    // Continue BFS with children of retained objects.
-                    while let Some(oid) = bfs_frontier.pop() {
-                        if known.contains(&oid) {
-                            continue;
+                        // Dedup.
+                        want_list.retain(|id| !known.contains(id));
+                        let mut seen2 = HashSet::new();
+                        want_list.retain(|id| seen2.insert(*id));
+
+                        // If no new retained objects were found AND no new
+                        // wants were generated, convergence is reached.
+                        if !found_new && want_list.is_empty() {
+                            break;
                         }
-                        match objects.get(oid).await {
-                            Ok(obj) => {
-                                known.insert(oid);
-                                if let Ok(children) =
-                                    wheat_core::extract_object_references(&obj.canonical_bytes)
-                                {
-                                    for child_id in children {
-                                        if !known.contains(&child_id) {
-                                            bfs_frontier.push(child_id);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                want_list.push(oid);
-                            }
+                        // If we have new wants, break out to fetch them.
+                        if !want_list.is_empty() {
+                            break;
                         }
                     }
-                    // Dedup.
-                    want_list.retain(|id| !known.contains(id));
-                    let mut seen2 = HashSet::new();
-                    want_list.retain(|id| seen2.insert(*id));
                 }
 
                 if want_list.is_empty() {
@@ -488,35 +503,52 @@ async fn discover_retained_objects<O: ImmutableObjectStore>(
 
     let mut retained = Vec::new();
 
-    // Walk retained_views — keys are ViewIds (== ObjectIds).
-    let views_store = wheat_store::RetainedSetStore::new(objects);
-    let mut cursor = views_store.cursor(state.retained_views).await?;
-    while let Some(oid) = cursor.next().await? {
-        retained.push(oid);
+    // Walk all four top-level retained sets. Best-effort: some trie nodes
+    // may not be locally present yet during incremental fetch. The
+    // convergence loop retries after more objects arrive.
+    let retained_store = wheat_store::RetainedSetStore::new(objects);
+    for root in [
+        state.retained_views,
+        state.retained_revisions,
+        state.retained_applications,
+        state.retained_changes,
+    ] {
+        if let Ok(mut cursor) = retained_store.cursor(root).await {
+            while let Ok(Some(oid)) = cursor.next().await {
+                retained.push(oid);
+            }
+        }
     }
 
-    // Walk retained_revisions — keys are RevisionIds (== ObjectIds).
-    let mut cursor = views_store.cursor(state.retained_revisions).await?;
-    while let Some(oid) = cursor.next().await? {
-        retained.push(oid);
+    // Walk per-view lineage retained sets. The view lineage map stores,
+    // for each retained parent view, a RetainedSetId root listing that
+    // view's child views. These per-view retained sets also encode their
+    // member ViewIds as radix-trie keys, so they need the same cursor walk.
+    //
+    // Best-effort: some view lineage map nodes or per-view retained-set
+    // nodes may not have been fetched yet. Skip those — the convergence
+    // loop will retry after more objects arrive.
+    let lineage = wheat_store::ViewLineageMapStore::new(objects);
+    // Collect the retained view IDs first (they're already in `retained`).
+    let retained_view_ids: Vec<wheat_core::ViewId> = {
+        let mut ids = Vec::new();
+        // Re-walk; the cursor is consumed.
+        if let Ok(mut cursor) = retained_store.cursor(state.retained_views).await {
+            while let Ok(Some(oid)) = cursor.next().await {
+                ids.push(wheat_core::ViewId::from_digest(*oid.as_bytes()));
+            }
+        }
+        ids
+    };
+    for view_id in &retained_view_ids {
+        if let Ok(Some(children_root)) = lineage.get(state.view_lineage, *view_id).await
+            && let Ok(mut cursor) = retained_store.cursor(children_root).await
+        {
+            while let Ok(Some(oid)) = cursor.next().await {
+                retained.push(oid);
+            }
+        }
     }
-
-    // Walk retained_applications — keys are ApplicationIds (== ObjectIds).
-    let mut cursor = views_store.cursor(state.retained_applications).await?;
-    while let Some(oid) = cursor.next().await? {
-        retained.push(oid);
-    }
-
-    // Walk retained_changes — keys are ChangeObjectIds (== ObjectIds).
-    let mut cursor = views_store.cursor(state.retained_changes).await?;
-    while let Some(oid) = cursor.next().await? {
-        retained.push(oid);
-    }
-
-    // Also walk the view lineage map — values are ViewIds.
-    // And the change map — values are ChangeObjectIds.
-    // These ARE extractable from nodes, but the retained sets above
-    // are the critical gap.
 
     Ok(retained)
 }

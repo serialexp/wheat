@@ -481,17 +481,26 @@ async fn discover_missing_objects(
         }
     }
 
-    // Walk retained sets to discover objects whose IDs are radix-trie keys.
-    // Add discovered objects to the FRONTIER so the BFS also walks their children
-    // (revision map nodes, trees, etc. that are only reachable through retained views).
-    if missing.len() < MAX_WANT_IDS
-        && let Ok(retained_ids) =
+    // Walk retained sets until convergence: each round may discover new
+    // trie-key ObjectIds that were missing in the previous round (because
+    // their trie nodes hadn't been uploaded yet).
+    while missing.len() < MAX_WANT_IDS {
+        let Ok(retained_ids) =
             walk_retained_sets(&entry.objects, &entry.content, envelope_id).await
-    {
+        else {
+            break;
+        };
+
+        let mut found_new = false;
         for oid in retained_ids {
             if !visited.contains(&oid) {
+                found_new = true;
                 frontier.push(oid);
             }
+        }
+
+        if !found_new {
+            break;
         }
 
         // Continue BFS with retained objects on the frontier.

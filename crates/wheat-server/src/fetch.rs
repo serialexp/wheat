@@ -1,19 +1,24 @@
-//! Fetch protocol handler — iterative root-first discovery.
+//! Fetch protocol handler — server-driven closure send + client ObjectWant fallback.
 
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
-use wheat_core::ObjectId;
 use wheat_protocol::*;
-use wheat_store::{ImmutableObjectStore, RepositoryHead, RepositoryReader};
+use wheat_store::{ImmutableObjectStore, RepositoryHead};
 
 use crate::connection::ConnectionError;
 use crate::registry::RepositoryEntry;
 use crate::wire::{digest_to_object_id, recv, send};
 
-/// Handle a fetch request: send the envelope and top-level objects, then
-/// respond to ObjectWant rounds until the client sends FetchComplete.
+/// Handle a fetch request: compute the full structural closure and send
+/// all objects proactively, then respond to any ObjectWant rounds until
+/// the client sends FetchComplete.
+///
+/// The server uses [`wheat_store::collect_structural_closure`] to determine
+/// the complete set of objects the client needs. This is domain-aware:
+/// it discovers retained-set trie-key ObjectIds and per-view lineage
+/// retained sets that `extract_object_references` alone cannot find.
 pub async fn handle_fetch(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &RepositoryEntry,
@@ -23,68 +28,66 @@ pub async fn handle_fetch(
     let op_id = req.op_id;
     debug!(op_id, "fetch: starting");
 
-    // Send the envelope object as the first batch.
-    let envelope_oid: ObjectId = head.envelope.into();
-    let envelope_obj = entry
-        .objects
-        .get(envelope_oid)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("missing envelope object: {e}")))?;
+    // Compute the full structural closure — every ObjectId the client needs.
+    let closure = wheat_store::collect_structural_closure(
+        &entry.objects,
+        &entry.content,
+        head.envelope,
+    )
+    .await;
+    debug!(op_id, count = closure.len(), "fetch: closure computed");
 
-    // Also read the state object so we send two in the first batch.
-    let reader = RepositoryReader::new(&entry.objects, &entry.content);
-    let envelope_record = reader
-        .envelope(head.envelope)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read envelope: {e}")))?;
+    // Send all objects in the closure as a series of ObjectBatch messages.
+    let mut batch_objects = Vec::new();
+    let mut batch_size = 0usize;
+    let mut sequence = 0u32;
 
-    let state_oid: ObjectId = envelope_record.state.into();
-    let state_obj = entry
-        .objects
-        .get(state_oid)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("missing state object: {e}")))?;
-
-    // Send initial batch with envelope + state.
-    let mut objects = vec![
-        ObjectEntry {
+    for oid in &closure {
+        let Ok(obj) = entry.objects.get(*oid).await else {
+            continue;
+        };
+        batch_size += obj.canonical_bytes.len();
+        batch_objects.push(ObjectEntry {
             id: Digest256 {
-                bytes: envelope_oid.as_bytes().to_vec(),
+                bytes: oid.as_bytes().to_vec(),
             },
-            data: envelope_obj.canonical_bytes.to_vec(),
-        },
-        ObjectEntry {
-            id: Digest256 {
-                bytes: state_oid.as_bytes().to_vec(),
-            },
-            data: state_obj.canonical_bytes.to_vec(),
-        },
-    ];
-
-    // Also send the labels manifest.
-    let labels_oid: ObjectId = envelope_record.labels.into();
-    if let Ok(labels_obj) = entry.objects.get(labels_oid).await {
-        objects.push(ObjectEntry {
-            id: Digest256 {
-                bytes: labels_oid.as_bytes().to_vec(),
-            },
-            data: labels_obj.canonical_bytes.to_vec(),
+            data: obj.canonical_bytes.to_vec(),
         });
+
+        if batch_size >= MAX_OBJECT_BATCH_SIZE || batch_objects.len() >= MAX_OBJECT_BATCH_ITEMS {
+            send(
+                ws,
+                &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
+                    message_type: 0x21,
+                    op_id,
+                    sequence,
+                    objects: batch_objects,
+                }),
+            )
+            .await?;
+            batch_objects = Vec::new();
+            batch_size = 0;
+            sequence += 1;
+        }
     }
 
-    send(
-        ws,
-        &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
-            message_type: 0x21,
-            op_id,
-            sequence: 0,
-            objects,
-        }),
-    )
-    .await?;
+    // Send any remaining objects.
+    if !batch_objects.is_empty() {
+        send(
+            ws,
+            &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
+                message_type: 0x21,
+                op_id,
+                sequence,
+                objects: batch_objects,
+            }),
+        )
+        .await?;
+        sequence += 1;
+    }
 
-    // Enter the want/batch loop.
-    let mut sequence = 1;
+    // Enter the want/batch loop — the client may still request objects
+    // it discovered via its own BFS that the server didn't include.
     loop {
         let msg = recv(ws).await?;
         match msg {

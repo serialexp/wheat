@@ -230,26 +230,36 @@ async fn fetch_objects() {
     )
     .await;
 
-    // Should get an ObjectBatch back with the envelope and state objects.
-    let batch = recv_msg(&mut ws).await;
-    let objects = match &batch {
-        WheatProtocolMessage::ObjectBatch(ob) => {
-            assert_eq!(ob.op_id, 1);
-            assert_eq!(ob.sequence, 0);
-            &ob.objects
+    // Receive all ObjectBatch messages (the server sends the full closure).
+    // Collect all objects and verify the envelope is among them.
+    let mut all_objects = Vec::new();
+    loop {
+        let msg = recv_msg(&mut ws).await;
+        match msg {
+            WheatProtocolMessage::ObjectBatch(ob) => {
+                assert_eq!(ob.op_id, 1);
+                all_objects.extend(ob.objects);
+                // The server sends in batches of MAX_OBJECT_BATCH_ITEMS.
+                // Keep receiving until a batch with fewer items (the last one).
+                if all_objects.len() < 256 {
+                    break;
+                }
+            }
+            other => panic!("expected ObjectBatch, got {other:?}"),
         }
-        other => panic!("expected ObjectBatch, got {other:?}"),
-    };
+    }
 
     assert!(
-        objects.len() >= 2,
-        "first batch should contain at least envelope + state (got {})",
-        objects.len()
+        all_objects.len() >= 2,
+        "should receive at least envelope + state (got {})",
+        all_objects.len()
     );
 
-    // Verify the envelope object's identity matches the head.
-    let envelope_obj = &objects[0];
-    assert_eq!(envelope_obj.id.bytes, head_envelope.bytes);
+    // Verify the envelope object is in the batch (not necessarily first).
+    let envelope_obj = all_objects
+        .iter()
+        .find(|o| o.id.bytes == head_envelope.bytes)
+        .expect("envelope object must be in the batch");
     let actual_id = ObjectId::of_canonical_bytes(&envelope_obj.data);
     let claimed_id = ObjectId::from_digest(
         envelope_obj.id.bytes.as_slice().try_into().unwrap(),

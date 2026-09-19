@@ -1089,3 +1089,21 @@ All initial open questions have been settled:
 - `crates/wheat-store/src/loose.rs` — `ImmutableObjectStore` trait definition.
 - `crates/wheat-store/src/object_store_adapter.rs` — S3-compatible object store
   implementation.
+- [objgit: Running Git on Object Storage with Custom Packfiles](https://www.tigrisdata.com/blog/objgit-packfiles/)
+  — Tigris Data's `.bin/.cue` columnar packfile format for storing git objects on
+  S3-compatible object storage. Directly relevant to the packed-segments design:
+  their fixed-width index records (hash + kind + offset + compressed\_length +
+  decompressed\_length, 58 bytes each) enable O(1) arithmetic lookups and precise
+  HTTP Range request construction (git's `.idx` omits compressed size, making Range
+  reads impossible). Key results: 99.7% reduction in S3 API calls (9,236 → 30)
+  and 14.6× wall-time improvement on push by batching objects into 128 MiB
+  segments instead of one key per object. Their "racing the beam" read strategy
+  (background full-segment download + concurrent Range reads for urgent objects)
+  is applicable to wheat-server's fetch path. Lessons wheat should absorb: (1)
+  always store both compressed and decompressed sizes in the segment index — this
+  is the single design decision that enables Range reads; (2) minimizing API call
+  count dominates all other object-store performance levers; (3) zstd over zlib
+  for segment compression; (4) compaction of many small segments into fewer large
+  ones is needed eventually but can be deferred for v1. Not applicable to wheat:
+  git-specific delta encoding (OFS\_DELTA/REF\_DELTA), the write-then-read problem
+  (wheat objects are immutable and validated before commit), FoundationDB for refs.
