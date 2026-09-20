@@ -80,8 +80,12 @@ pub async fn handle_publish(
     // (e.g. retried publish with same envelope), skip straight to complete.
     let envelope_oid: ObjectId = proposed_envelope_id.into();
 
+    // Use a persistent discovery tracker that remembers visited objects
+    // across rounds, so we only re-check previously-missing objects and
+    // their newly-discoverable children instead of re-walking from root.
+    let mut tracker = MissingObjectTracker::new(envelope_oid);
     let mut objects_complete = false;
-    let missing = discover_missing_objects(entry, proposed_envelope_id, envelope_oid).await;
+    let missing = tracker.discover_missing(entry, proposed_envelope_id).await;
     if missing.is_empty() {
         // Server already has the full closure (retry of a prior attempt).
         send(
@@ -121,7 +125,9 @@ pub async fn handle_publish(
                     "publish: received ObjectBatch"
                 );
 
-                // Store each object, validating identity.
+                // Store each object, validating identity. Track which
+                // objects arrived so the tracker can re-check only those.
+                let mut received_ids = Vec::with_capacity(batch.objects.len());
                 for obj_entry in &batch.objects {
                     let claimed_id = digest_to_object_id(&obj_entry.id)?;
                     let actual_id = ObjectId::of_canonical_bytes(&obj_entry.data);
@@ -146,11 +152,13 @@ pub async fn handle_publish(
                         .map_err(|e| {
                             ConnectionError::Internal(format!("failed to store object: {e}"))
                         })?;
+                    received_ids.push(claimed_id);
                 }
 
-                // Re-check what's still missing.
-                let missing =
-                    discover_missing_objects(entry, proposed_envelope_id, envelope_oid).await;
+                // Re-check: only the previously-missing objects that were
+                // just uploaded and any new children they reference.
+                tracker.mark_received(&received_ids);
+                let missing = tracker.discover_missing(entry, proposed_envelope_id).await;
                 if missing.is_empty() {
                     send(
                         ws,
@@ -182,30 +190,33 @@ pub async fn handle_publish(
 
     // --- Content transfer phase ---
     let reader = RepositoryReader::new(&entry.objects, &entry.content);
-    let envelope_record = reader.envelope(proposed_envelope_id).await.map_err(|e| {
-        ConnectionError::Internal(format!("failed to read proposed envelope: {e}"))
-    })?;
-    let state = reader.state(envelope_record.state).await.map_err(|e| {
-        ConnectionError::Internal(format!("failed to read proposed state: {e}"))
-    })?;
+    let envelope_record = reader
+        .envelope(proposed_envelope_id)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed envelope: {e}")))?;
+    let state = reader
+        .state(envelope_record.state)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed state: {e}")))?;
     let manifest = reader
         .manifest(state.required_content)
         .await
-        .map_err(|e| {
-            ConnectionError::Internal(format!("failed to read content manifest: {e}"))
-        })?;
+        .map_err(|e| ConnectionError::Internal(format!("failed to read content manifest: {e}")))?;
 
     // Walk the content set to collect all content IDs, then bulk-check
     // which ones already exist. For S3 backends this does one LIST call
     // instead of one GET per item.
     let content_set = wheat_store::ContentSetStore::new(&entry.objects);
-    let mut cursor = content_set.cursor(manifest.content).await.map_err(|e| {
-        ConnectionError::Internal(format!("failed to walk content set: {e}"))
-    })?;
+    let mut cursor = content_set
+        .cursor(manifest.content)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to walk content set: {e}")))?;
     let mut all_content_ids = Vec::new();
-    while let Some(content_id) = cursor.next().await.map_err(|e| {
-        ConnectionError::Internal(format!("content set walk error: {e}"))
-    })? {
+    while let Some(content_id) = cursor
+        .next()
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("content set walk error: {e}")))?
+    {
         all_content_ids.push(content_id);
     }
 
@@ -449,84 +460,109 @@ pub async fn handle_publish(
     }
 }
 
-/// Discover which objects are missing from the store for the proposed
-/// envelope's structural closure. Iteratively walks every object the
-/// server has, decodes it, discovers child references, and reports any
-/// that are absent.
-///
-/// After the BFS exhausts explicit references, walks the retained sets
-/// (views, revisions, applications, changes) to discover objects whose
-/// IDs are encoded as radix-trie keys. These are not extractable from
-/// individual nodes by `extract_object_references`.
-///
-/// Bounded per call to MAX_WANT_IDS results so the client receives
-/// bounded batches. The caller re-invokes after each round of uploads.
-async fn discover_missing_objects(
-    entry: &RepositoryEntry,
-    envelope_id: RepositoryEnvelopeId,
-    envelope_oid: ObjectId,
-) -> Vec<Digest256> {
-    use std::collections::HashSet;
+/// Stateful tracker for the iterative missing-object discovery during
+/// publish. Remembers which objects have been visited and which were
+/// reported missing, so each round only needs to re-check the
+/// previously-missing objects (now received) and any new children they
+/// reference — not the entire BFS from root.
+struct MissingObjectTracker {
+    /// All ObjectIds that have been visited (present OR reported missing).
+    visited: std::collections::HashSet<ObjectId>,
+    /// ObjectIds reported as missing in the most recent round. These
+    /// become the starting frontier for the next round after the client
+    /// sends them.
+    last_missing: Vec<ObjectId>,
+    /// Whether this is the first call (must start from root).
+    initial: bool,
+    /// Root envelope ObjectId.
+    root: ObjectId,
+}
 
-    let mut visited = HashSet::new();
-    let mut frontier = vec![envelope_oid];
-    let mut missing = Vec::new();
-
-    while let Some(oid) = frontier.pop() {
-        if !visited.insert(oid) {
-            continue;
-        }
-        if missing.len() >= MAX_WANT_IDS {
-            break;
-        }
-
-        match entry.objects.get(oid).await {
-            Ok(obj) => {
-                // Object is present — decode it and enqueue its children.
-                if let Ok(children) =
-                    wheat_core::extract_object_references(&obj.canonical_bytes)
-                {
-                    for child_id in children {
-                        if !visited.contains(&child_id) {
-                            frontier.push(child_id);
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                // Object is missing — report it.
-                missing.push(Digest256 {
-                    bytes: oid.as_bytes().to_vec(),
-                });
-            }
+impl MissingObjectTracker {
+    fn new(root: ObjectId) -> Self {
+        Self {
+            visited: std::collections::HashSet::new(),
+            last_missing: Vec::new(),
+            initial: true,
+            root,
         }
     }
 
-    // Walk retained sets until convergence: each round may discover new
-    // trie-key ObjectIds that were missing in the previous round (because
-    // their trie nodes hadn't been uploaded yet).
-    while missing.len() < MAX_WANT_IDS {
-        let Ok(retained_ids) =
-            walk_retained_sets(&entry.objects, &entry.content, envelope_id).await
-        else {
-            break;
+    /// Mark received ObjectIds so they move from "missing" to "pending
+    /// re-check" — their children need to be discovered.
+    fn mark_received(&mut self, ids: &[ObjectId]) {
+        // Remove these from visited so the next discover_missing call
+        // re-visits them and discovers their children.
+        for id in ids {
+            self.visited.remove(id);
+        }
+    }
+
+    /// Discover missing objects. On first call, walks from root. On
+    /// subsequent calls, only re-checks previously-missing objects
+    /// (which should now be present after the client sent them) and
+    /// discovers their children.
+    async fn discover_missing(
+        &mut self,
+        entry: &RepositoryEntry,
+        envelope_id: RepositoryEnvelopeId,
+    ) -> Vec<Digest256> {
+        let frontier = if self.initial {
+            self.initial = false;
+            vec![self.root]
+        } else {
+            // Start from the objects that were missing last round —
+            // they should now be present and we need to discover their
+            // children.
+            std::mem::take(&mut self.last_missing)
         };
 
-        let mut found_new = false;
-        for oid in retained_ids {
-            if !visited.contains(&oid) {
-                found_new = true;
-                frontier.push(oid);
+        let mut missing = Vec::new();
+        self.bfs_round(entry, frontier, &mut missing).await;
+
+        // Walk retained sets until convergence: each round may discover
+        // new trie-key ObjectIds that were missing in the previous round
+        // (because their trie nodes hadn't been uploaded yet).
+        while missing.len() < MAX_WANT_IDS {
+            let Ok(retained_ids) =
+                walk_retained_sets(&entry.objects, &entry.content, envelope_id).await
+            else {
+                break;
+            };
+
+            let mut new_frontier = Vec::new();
+            for oid in retained_ids {
+                if !self.visited.contains(&oid) {
+                    new_frontier.push(oid);
+                }
             }
+
+            if new_frontier.is_empty() {
+                break;
+            }
+
+            self.bfs_round(entry, new_frontier, &mut missing).await;
         }
 
-        if !found_new {
-            break;
-        }
+        // Remember which objects are missing for the next round.
+        self.last_missing = missing
+            .iter()
+            .map(|d| ObjectId::from_digest(d.bytes.as_slice().try_into().unwrap()))
+            .collect();
 
-        // Continue BFS with retained objects on the frontier.
+        missing
+    }
+
+    /// Run one BFS pass from the given frontier, appending missing
+    /// ObjectIds to `missing`. Updates `self.visited`.
+    async fn bfs_round(
+        &mut self,
+        entry: &RepositoryEntry,
+        mut frontier: Vec<ObjectId>,
+        missing: &mut Vec<Digest256>,
+    ) {
         while let Some(oid) = frontier.pop() {
-            if !visited.insert(oid) {
+            if !self.visited.insert(oid) {
                 continue;
             }
             if missing.len() >= MAX_WANT_IDS {
@@ -539,7 +575,7 @@ async fn discover_missing_objects(
                         wheat_core::extract_object_references(&obj.canonical_bytes)
                     {
                         for child_id in children {
-                            if !visited.contains(&child_id) {
+                            if !self.visited.contains(&child_id) {
                                 frontier.push(child_id);
                             }
                         }
@@ -553,8 +589,6 @@ async fn discover_missing_objects(
             }
         }
     }
-
-    missing
 }
 
 /// Walk all retained sets and return the ObjectIds they contain as keys.
@@ -580,12 +614,15 @@ async fn walk_retained_sets(
         state.retained_applications,
         state.retained_changes,
     ] {
-        let mut cursor = store.cursor(root).await.map_err(|e| {
-            ConnectionError::Internal(format!("retained set walk error: {e}"))
-        })?;
-        while let Some(oid) = cursor.next().await.map_err(|e| {
-            ConnectionError::Internal(format!("retained set cursor error: {e}"))
-        })? {
+        let mut cursor = store
+            .cursor(root)
+            .await
+            .map_err(|e| ConnectionError::Internal(format!("retained set walk error: {e}")))?;
+        while let Some(oid) = cursor
+            .next()
+            .await
+            .map_err(|e| ConnectionError::Internal(format!("retained set cursor error: {e}")))?
+        {
             retained.push(oid);
         }
     }
