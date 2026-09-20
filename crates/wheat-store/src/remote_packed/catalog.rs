@@ -32,6 +32,9 @@ pub(super) struct RemoteCatalog {
     pub head_generation: u64,
     /// Blake3 digest of the current head catalog record (None if empty).
     pub head_digest: Option<[u8; 32]>,
+    /// Segment bytes downloaded during `load()`, available for pre-warming
+    /// the segment cache so the first `get()` doesn't re-download them.
+    pub preloaded_segments: Vec<(SegmentId, Vec<u8>)>,
 }
 
 /// The JSON format for the catalog head pointer stored at `{prefix}/catalog/head`.
@@ -49,6 +52,7 @@ impl RemoteCatalog {
             segments: Vec::new(),
             head_generation: 0,
             head_digest: None,
+            preloaded_segments: Vec::new(),
         }
     }
 
@@ -104,9 +108,10 @@ impl RemoteCatalog {
         // Reverse so chain is oldest-first.
         chain.reverse();
 
-        // Download each segment's index.
+        // Download each segment's index and keep the raw bytes for cache pre-warming.
         let mut index = HashMap::new();
         let mut segments = Vec::new();
+        let mut preloaded_segments = Vec::new();
         for record in &chain {
             let segment_id = SegmentId(record.segment);
             segments.push(segment_id);
@@ -138,6 +143,9 @@ impl RemoteCatalog {
                     },
                 );
             }
+
+            // Keep the raw bytes so we can pre-warm the segment cache.
+            preloaded_segments.push((segment_id, seg_bytes.to_vec()));
         }
 
         Ok(Self {
@@ -145,6 +153,7 @@ impl RemoteCatalog {
             segments,
             head_generation: head.generation,
             head_digest: Some(head_digest),
+            preloaded_segments,
         })
     }
 

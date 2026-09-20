@@ -37,6 +37,30 @@ pub enum ContentStoreError {
 pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
     fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError>;
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError>;
+
+    /// List all content IDs stored in this backend.
+    ///
+    /// Returns `None` if the backend does not support listing (the caller
+    /// should fall back to per-item `get_bounded` existence checks).
+    /// Remote backends override this to use a single LIST/scan call
+    /// instead of one GET per item.
+    fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
+        None
+    }
+
+    /// Fetch multiple content blobs concurrently.
+    ///
+    /// Returns `None` if the backend does not support concurrent reads
+    /// (the caller should fall back to sequential `get_bounded` calls).
+    /// Remote backends override this to issue concurrent S3 GETs.
+    #[allow(clippy::type_complexity)]
+    fn get_many_bounded(
+        &self,
+        _ids: &[ContentId],
+        _max: usize,
+    ) -> Option<Result<Vec<(ContentId, Vec<u8>)>, ContentStoreError>> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +274,50 @@ impl ContentStore {
             return backend.get_bounded(id, usize::MAX).is_ok();
         }
         self.path(id).is_file()
+    }
+
+    /// Fetch multiple content blobs, using concurrent reads when the
+    /// backend supports it (S3). Falls back to sequential `get_bounded`
+    /// for local filesystem backends.
+    pub fn get_many_bounded(
+        &self,
+        ids: &[ContentId],
+        max: usize,
+    ) -> Result<Vec<(ContentId, Vec<u8>)>, ContentStoreError> {
+        if let Some(backend) = &self.backend
+            && let Some(result) = backend.get_many_bounded(ids, max)
+        {
+            return result;
+        }
+        // Fallback: sequential reads (fast for local filesystem).
+        let mut results = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let bytes = self.get_bounded(id, max)?;
+            results.push((id, bytes));
+        }
+        Ok(results)
+    }
+
+    /// Return the set of content IDs that already exist in this store,
+    /// filtered to only those in `candidates`.
+    ///
+    /// When the backend supports listing (remote/S3), this does one
+    /// LIST call and filters in memory — O(1) network round trips
+    /// instead of O(n) per-item existence checks. Falls back to
+    /// per-item `contains()` for local filesystem backends.
+    pub fn existing_ids(
+        &self,
+        candidates: &[ContentId],
+    ) -> Result<std::collections::HashSet<ContentId>, ContentStoreError> {
+        if let Some(backend) = &self.backend
+            && let Some(result) = backend.list_ids()
+        {
+            let all: std::collections::HashSet<ContentId> =
+                result?.into_iter().collect();
+            return Ok(candidates.iter().copied().filter(|id| all.contains(id)).collect());
+        }
+        // Fallback: per-item check (fast for local filesystem).
+        Ok(candidates.iter().copied().filter(|id| self.contains(*id)).collect())
     }
 
     /// Loose fallback path, not a locator for packed content.

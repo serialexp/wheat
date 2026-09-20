@@ -29,6 +29,8 @@ pub async fn handle_fetch(
     debug!(op_id, "fetch: starting");
 
     // Compute the full structural closure — every ObjectId the client needs.
+    // The closure returns both IDs and object bytes, so we don't need to
+    // re-read them for serialization.
     let closure = wheat_store::collect_structural_closure(
         &entry.objects,
         &entry.content,
@@ -42,10 +44,7 @@ pub async fn handle_fetch(
     let mut batch_size = 0usize;
     let mut sequence = 0u32;
 
-    for oid in &closure {
-        let Ok(obj) = entry.objects.get(*oid).await else {
-            continue;
-        };
+    for (oid, obj) in &closure {
         batch_size += obj.canonical_bytes.len();
         batch_objects.push(ObjectEntry {
             id: Digest256 {
@@ -163,6 +162,11 @@ pub async fn handle_fetch(
 }
 
 /// Handle a content fetch request.
+///
+/// Fetches all requested content blobs concurrently (when the backend
+/// supports it, e.g. S3) and then streams them as batched responses.
+/// Large content that exceeds MAX_CONTENT_CHUNK_SIZE is still handled
+/// individually via the chunked protocol.
 pub async fn handle_content_fetch(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &RepositoryEntry,
@@ -171,10 +175,9 @@ pub async fn handle_content_fetch(
     let op_id = req.op_id;
     debug!(op_id, count = req.content_ids.len(), "content fetch");
 
-    let mut batch_contents = Vec::new();
-    let mut batch_size = 0usize;
-    let mut sequence = 0u32;
-
+    // Parse all content IDs up front.
+    let mut normal_ids = Vec::new();
+    let mut digest_map = Vec::new(); // parallel with normal_ids: original Digest256
     for digest in &req.content_ids {
         let content_id = wheat_core::ContentId::from_digest(
             digest
@@ -183,14 +186,29 @@ pub async fn handle_content_fetch(
                 .try_into()
                 .map_err(|_| ConnectionError::Protocol("invalid ContentId length"))?,
         );
+        normal_ids.push(content_id);
+        digest_map.push(digest.clone());
+    }
 
-        // Try to read with a bounded size first.
-        match entry.content.get_bounded(content_id, MAX_CONTENT_CHUNK_SIZE) {
-            Ok(data) => {
-                // Fits in one batch item.
+    // Fetch all content concurrently (one round-trip for S3 backends).
+    let fetched = entry
+        .content
+        .get_many_bounded(&normal_ids, MAX_CONTENT_CHUNK_SIZE);
+
+    let mut batch_contents = Vec::new();
+    let mut batch_size = 0usize;
+    let mut sequence = 0u32;
+
+    match fetched {
+        Ok(items) => {
+            // All items fit within MAX_CONTENT_CHUNK_SIZE. Batch them for sending.
+            for (content_id, data) in items {
+                let digest = Digest256 {
+                    bytes: content_id.as_bytes().to_vec(),
+                };
                 batch_size += data.len();
                 batch_contents.push(ContentEntry {
-                    id: digest.clone(),
+                    id: digest,
                     data,
                 });
 
@@ -212,55 +230,125 @@ pub async fn handle_content_fetch(
                     sequence += 1;
                 }
             }
-            Err(wheat_store::ContentStoreError::TooLarge { .. }) => {
-                // Flush any pending batch first.
-                if !batch_contents.is_empty() {
-                    send(
-                        ws,
-                        &WheatProtocolMessage::ContentBatch(ContentBatchOutput {
-                            message_type: 0x31,
-                            op_id,
-                            sequence,
-                            contents: batch_contents,
-                        }),
-                    )
-                    .await?;
-                    batch_contents = Vec::new();
-                    batch_size = 0;
-                    sequence += 1;
-                }
-
-                // Large content: read fully and send as chunks.
-                match entry.content.get(content_id) {
+        }
+        Err(wheat_store::ContentStoreError::TooLarge { id, .. }) => {
+            // At least one item is too large for bounded read. Fall back to
+            // per-item processing so we can chunk oversized content.
+            debug!(op_id, content_id = %id, "content fetch: oversized item, falling back to per-item");
+            for (idx, content_id) in normal_ids.iter().enumerate() {
+                match entry.content.get_bounded(*content_id, MAX_CONTENT_CHUNK_SIZE) {
                     Ok(data) => {
-                        let data_len = data.len();
-                        let mut offset = 0usize;
-                        while offset < data_len {
-                            let end = (offset + MAX_CONTENT_CHUNK_SIZE).min(data_len);
-                            let chunk = data[offset..end].to_vec();
-                            let is_final = end == data_len;
+                        batch_size += data.len();
+                        batch_contents.push(ContentEntry {
+                            id: digest_map[idx].clone(),
+                            data,
+                        });
+
+                        if batch_size >= MAX_CONTENT_BATCH_SIZE
+                            || batch_contents.len() >= MAX_CONTENT_BATCH_ITEMS
+                        {
                             send(
                                 ws,
-                                &WheatProtocolMessage::ContentChunk(ContentChunkOutput {
-                                    message_type: 0x32,
+                                &WheatProtocolMessage::ContentBatch(ContentBatchOutput {
+                                    message_type: 0x31,
                                     op_id,
-                                    content_id: digest.clone(),
-                                    offset: offset as u64,
-                                    data: chunk,
-                                    is_final,
+                                    sequence,
+                                    contents: batch_contents,
                                 }),
                             )
                             .await?;
-                            offset = end;
+                            batch_contents = Vec::new();
+                            batch_size = 0;
+                            sequence += 1;
+                        }
+                    }
+                    Err(wheat_store::ContentStoreError::TooLarge { .. }) => {
+                        // Flush any pending batch first.
+                        if !batch_contents.is_empty() {
+                            send(
+                                ws,
+                                &WheatProtocolMessage::ContentBatch(ContentBatchOutput {
+                                    message_type: 0x31,
+                                    op_id,
+                                    sequence,
+                                    contents: batch_contents,
+                                }),
+                            )
+                            .await?;
+                            batch_contents = Vec::new();
+                            batch_size = 0;
+                            sequence += 1;
+                        }
+
+                        // Large content: read fully and send as chunks.
+                        match entry.content.get(*content_id) {
+                            Ok(data) => {
+                                let data_len = data.len();
+                                let mut offset = 0usize;
+                                while offset < data_len {
+                                    let end = (offset + MAX_CONTENT_CHUNK_SIZE).min(data_len);
+                                    let chunk = data[offset..end].to_vec();
+                                    let is_final = end == data_len;
+                                    send(
+                                        ws,
+                                        &WheatProtocolMessage::ContentChunk(ContentChunkOutput {
+                                            message_type: 0x32,
+                                            op_id,
+                                            content_id: digest_map[idx].clone(),
+                                            offset: offset as u64,
+                                            data: chunk,
+                                            is_final,
+                                        }),
+                                    )
+                                    .await?;
+                                    offset = end;
+                                }
+                            }
+                            Err(e) => {
+                                debug!(op_id, content_id = %content_id, error = %e, "content fetch: large file read failed");
+                            }
                         }
                     }
                     Err(e) => {
-                        debug!(op_id, content_id = %content_id, error = %e, "content fetch: large file read failed");
+                        debug!(op_id, content_id = %content_id, error = %e, "content fetch: missing");
                     }
                 }
             }
-            Err(e) => {
-                debug!(op_id, content_id = %content_id, error = %e, "content fetch: missing");
+        }
+        Err(e) => {
+            // Other error (missing, IO, etc.) — fall back to per-item.
+            debug!(op_id, error = %e, "content fetch: bulk read failed, falling back to per-item");
+            for (idx, content_id) in normal_ids.iter().enumerate() {
+                match entry.content.get_bounded(*content_id, MAX_CONTENT_CHUNK_SIZE) {
+                    Ok(data) => {
+                        batch_size += data.len();
+                        batch_contents.push(ContentEntry {
+                            id: digest_map[idx].clone(),
+                            data,
+                        });
+
+                        if batch_size >= MAX_CONTENT_BATCH_SIZE
+                            || batch_contents.len() >= MAX_CONTENT_BATCH_ITEMS
+                        {
+                            send(
+                                ws,
+                                &WheatProtocolMessage::ContentBatch(ContentBatchOutput {
+                                    message_type: 0x31,
+                                    op_id,
+                                    sequence,
+                                    contents: batch_contents,
+                                }),
+                            )
+                            .await?;
+                            batch_contents = Vec::new();
+                            batch_size = 0;
+                            sequence += 1;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(op_id, content_id = %content_id, error = %e, "content fetch: missing");
+                    }
+                }
             }
         }
     }

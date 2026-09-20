@@ -8,53 +8,56 @@
 //! without the validation logic or the SQLite scratch space (which is
 //! `!Send` and incompatible with `tokio::spawn`).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use wheat_core::{ObjectId, RepositoryEnvelopeId, ViewId};
 
 use crate::{
     ChangeMapStore, ContentStore, ImmutableObjectStore, RepositoryReader, RetainedSetStore,
-    ViewLineageMapStore,
+    StoredObject, ViewLineageMapStore,
 };
 
-/// Collect all structural ObjectIds in the closure of an envelope.
+/// Collect all structural ObjectIds in the closure of an envelope,
+/// returning each object's data alongside its ID.
 ///
 /// Walks every retained view's revision map, application map, change map,
 /// view lineage map, trees, revisions, applications, edits, and changes —
 /// plus all retained-set trie nodes and the trie-key-encoded ObjectIds.
 ///
 /// Requires all objects to be present in the store (server-side use).
-/// Returns the complete set of ObjectIds a client needs.
+/// Returns a map from ObjectId to StoredObject so callers (e.g.
+/// handle_fetch) can serialize objects without re-reading them from
+/// the store.
 pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
     envelope_id: RepositoryEnvelopeId,
-) -> HashSet<ObjectId> {
-    let mut closure = HashSet::new();
+) -> HashMap<ObjectId, StoredObject> {
+    let mut closure = HashMap::new();
     let envelope_oid: ObjectId = envelope_id.into();
-    closure.insert(envelope_oid);
+    insert_oid(objects, envelope_oid, &mut closure).await;
 
     // --- Read envelope and state ---
     let reader = RepositoryReader::new(objects, content);
     let Ok(envelope) = reader.envelope(envelope_id).await else {
         return closure;
     };
-    closure.insert(envelope.state.into());
-    closure.insert(envelope.labels.into());
+    insert_oid(objects, envelope.state.into(), &mut closure).await;
+    insert_oid(objects, envelope.labels.into(), &mut closure).await;
 
     let Ok(state) = reader.state(envelope.state).await else {
         return closure;
     };
 
     // State's explicit references.
-    closure.insert(state.base_view.into());
-    closure.insert(state.changes.into());
-    closure.insert(state.view_lineage.into());
-    closure.insert(state.required_content.into());
-    closure.insert(state.retained_views.into());
-    closure.insert(state.retained_revisions.into());
-    closure.insert(state.retained_applications.into());
-    closure.insert(state.retained_changes.into());
+    insert_oid(objects, state.base_view.into(), &mut closure).await;
+    insert_oid(objects, state.changes.into(), &mut closure).await;
+    insert_oid(objects, state.view_lineage.into(), &mut closure).await;
+    insert_oid(objects, state.required_content.into(), &mut closure).await;
+    insert_oid(objects, state.retained_views.into(), &mut closure).await;
+    insert_oid(objects, state.retained_revisions.into(), &mut closure).await;
+    insert_oid(objects, state.retained_applications.into(), &mut closure).await;
+    insert_oid(objects, state.retained_changes.into(), &mut closure).await;
 
     // --- Walk retained sets (trie keys) ---
     let retained_store = RetainedSetStore::new(objects);
@@ -67,28 +70,28 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     if let Ok(mut cursor) = retained_store.cursor(state.retained_views).await {
         while let Ok(Some(oid)) = cursor.next().await {
             retained_view_ids.push(ViewId::from_digest(*oid.as_bytes()));
-            closure.insert(oid);
+            insert_oid(objects, oid, &mut closure).await;
         }
     }
     // Retained revisions.
     if let Ok(mut cursor) = retained_store.cursor(state.retained_revisions).await {
         while let Ok(Some(oid)) = cursor.next().await {
             retained_revision_ids.push(oid);
-            closure.insert(oid);
+            insert_oid(objects, oid, &mut closure).await;
         }
     }
     // Retained applications.
     if let Ok(mut cursor) = retained_store.cursor(state.retained_applications).await {
         while let Ok(Some(oid)) = cursor.next().await {
             retained_application_ids.push(oid);
-            closure.insert(oid);
+            insert_oid(objects, oid, &mut closure).await;
         }
     }
     // Retained changes.
     if let Ok(mut cursor) = retained_store.cursor(state.retained_changes).await {
         while let Ok(Some(oid)) = cursor.next().await {
             retained_change_ids.push(oid);
-            closure.insert(oid);
+            insert_oid(objects, oid, &mut closure).await;
         }
     }
 
@@ -97,10 +100,10 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     for view_id in &retained_view_ids {
         if let Ok(Some(children_root)) = lineage.get(state.view_lineage, *view_id).await {
             // The children_root itself is a RetainedSetId — an object.
-            closure.insert(children_root.into());
+            insert_oid(objects, children_root.into(), &mut closure).await;
             if let Ok(mut cursor) = retained_store.cursor(children_root).await {
                 while let Ok(Some(oid)) = cursor.next().await {
-                    closure.insert(oid);
+                    insert_oid(objects, oid, &mut closure).await;
                 }
             }
         }
@@ -144,7 +147,7 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
         bfs_trie_nodes(objects, view.unresolved_conflicts.into(), &mut closure).await;
 
         // Content manifest.
-        closure.insert(view.required_content.into());
+        insert_oid(objects, view.required_content.into(), &mut closure).await;
         if let Ok(manifest) = reader.manifest(view.required_content).await {
             bfs_trie_nodes(objects, manifest.content.into(), &mut closure).await;
         }
@@ -156,7 +159,7 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     // --- Walk labels manifest ---
     if let Ok(labels) = reader.view_label_manifest(envelope.labels).await {
         for label in labels.labels.values() {
-            closure.insert(label.view.into());
+            insert_oid(objects, label.view.into(), &mut closure).await;
         }
     }
 
@@ -164,10 +167,10 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     for oid in &retained_revision_ids {
         let revision_id = wheat_core::RevisionId::from_digest(*oid.as_bytes());
         if let Ok(rev) = reader.revision(revision_id).await {
-            closure.insert(rev.authored_against.into());
-            closure.insert(rev.resulting_tree.into());
+            insert_oid(objects, rev.authored_against.into(), &mut closure).await;
+            insert_oid(objects, rev.resulting_tree.into(), &mut closure).await;
             for edit_id in &rev.edits {
-                closure.insert((*edit_id).into());
+                insert_oid(objects, (*edit_id).into(), &mut closure).await;
                 // Read the edit to include it.
                 let _ = reader.edit(*edit_id).await;
             }
@@ -180,19 +183,19 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     for oid in &retained_application_ids {
         let app_id = wheat_core::ApplicationId::from_digest(*oid.as_bytes());
         if let Ok(app) = reader.application(app_id).await {
-            closure.insert(app.revision_id.into());
-            closure.insert(app.target_view.into());
+            insert_oid(objects, app.revision_id.into(), &mut closure).await;
+            insert_oid(objects, app.target_view.into(), &mut closure).await;
             match &app.result {
                 wheat_core::ApplicationResultRecord::Clean { tree } => {
-                    closure.insert((*tree).into());
+                    insert_oid(objects, (*tree).into(), &mut closure).await;
                     walk_tree(objects, (*tree).into(), &mut closure).await;
                 }
                 wheat_core::ApplicationResultRecord::Conflicted {
                     partial_tree,
                     conflict,
                 } => {
-                    closure.insert((*partial_tree).into());
-                    closure.insert((*conflict).into());
+                    insert_oid(objects, (*partial_tree).into(), &mut closure).await;
+                    insert_oid(objects, (*conflict).into(), &mut closure).await;
                     walk_tree(objects, (*partial_tree).into(), &mut closure).await;
                 }
             }
@@ -203,7 +206,7 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     let change_store = ChangeMapStore::new(objects);
     if let Ok(mut cursor) = change_store.cursor(state.changes).await {
         while let Ok(Some((_, change_oid))) = cursor.next().await {
-            closure.insert(change_oid.into());
+            insert_oid(objects, change_oid.into(), &mut closure).await;
         }
     }
 
@@ -211,22 +214,21 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
     // This handles objects like edits, trees, content-set nodes, etc.
     // that may have been missed if the targeted walks above didn't
     // cover every code path that validate_complete touches.
-    let snapshot: Vec<ObjectId> = closure.iter().copied().collect();
+    let snapshot: Vec<ObjectId> = closure.keys().copied().collect();
     let mut frontier = Vec::new();
     for oid in snapshot {
-        let Ok(obj) = objects.get(oid).await else {
-            continue;
-        };
-        if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
+        if let Some(obj) = closure.get(&oid)
+            && let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes)
+        {
             for child in children {
-                if !closure.contains(&child) {
+                if !closure.contains_key(&child) {
                     frontier.push(child);
                 }
             }
         }
     }
     while let Some(oid) = frontier.pop() {
-        if !closure.insert(oid) {
+        if closure.contains_key(&oid) {
             continue;
         }
         let Ok(obj) = objects.get(oid).await else {
@@ -234,26 +236,43 @@ pub async fn collect_structural_closure<O: ImmutableObjectStore>(
         };
         if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
             for child in children {
-                if !closure.contains(&child) {
+                if !closure.contains_key(&child) {
                     frontier.push(child);
                 }
             }
         }
+        closure.insert(oid, obj);
     }
 
     closure
 }
 
-/// BFS through a trie's structural nodes. Adds every node ObjectId to the
-/// closure. Does NOT walk trie keys — use `RetainedSetStore::cursor` for that.
+/// Insert an ObjectId into the closure map, fetching its StoredObject from
+/// the store if not already present. Skips if already in the map.
+async fn insert_oid<O: ImmutableObjectStore>(
+    objects: &O,
+    oid: ObjectId,
+    closure: &mut HashMap<ObjectId, StoredObject>,
+) {
+    if closure.contains_key(&oid) {
+        return;
+    }
+    if let Ok(obj) = objects.get(oid).await {
+        closure.insert(oid, obj);
+    }
+}
+
+/// BFS through a trie's structural nodes. Adds every node ObjectId and its
+/// StoredObject to the closure. Does NOT walk trie keys — use
+/// `RetainedSetStore::cursor` for that.
 async fn bfs_trie_nodes<O: ImmutableObjectStore>(
     objects: &O,
     root: ObjectId,
-    closure: &mut HashSet<ObjectId>,
+    closure: &mut HashMap<ObjectId, StoredObject>,
 ) {
     let mut frontier = vec![root];
     while let Some(oid) = frontier.pop() {
-        if !closure.insert(oid) {
+        if closure.contains_key(&oid) {
             continue;
         }
         let Ok(obj) = objects.get(oid).await else {
@@ -261,11 +280,12 @@ async fn bfs_trie_nodes<O: ImmutableObjectStore>(
         };
         if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
             for child in children {
-                if !closure.contains(&child) {
+                if !closure.contains_key(&child) {
                     frontier.push(child);
                 }
             }
         }
+        closure.insert(oid, obj);
     }
 }
 
@@ -273,7 +293,7 @@ async fn bfs_trie_nodes<O: ImmutableObjectStore>(
 async fn walk_tree<O: ImmutableObjectStore>(
     objects: &O,
     root: ObjectId,
-    closure: &mut HashSet<ObjectId>,
+    closure: &mut HashMap<ObjectId, StoredObject>,
 ) {
     // Trees are just another node type — BFS through child references works.
     bfs_trie_nodes(objects, root, closure).await;

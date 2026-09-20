@@ -87,13 +87,23 @@ impl RemotePackedStore {
         );
 
         let prefix = s3.prefix.trim_matches('/').to_owned();
-        let catalog = RemoteCatalog::load(&backend, &prefix)
+        let mut catalog = RemoteCatalog::load(&backend, &prefix)
             .await
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?;
 
         let cache_bytes = config
             .segment_cache_bytes
             .unwrap_or(DEFAULT_SEGMENT_CACHE_BYTES);
+
+        // Pre-warm the segment cache with segments already downloaded
+        // during catalog load, avoiding redundant S3 GETs on first access.
+        let preloaded = std::mem::take(&mut catalog.preloaded_segments);
+        let mut cache = SegmentCache::new(cache_bytes);
+        for (segment_id, segment_bytes) in &preloaded {
+            cache
+                .insert(*segment_id, segment_bytes)
+                .map_err(|e| ObjectStoreError::Backend(e.to_string()))?;
+        }
 
         let content_prefix = prefix.clone();
 
@@ -102,7 +112,7 @@ impl RemotePackedStore {
             prefix,
             state: Mutex::new(StoreState {
                 catalog,
-                cache: SegmentCache::new(cache_bytes),
+                cache,
                 pending: Vec::new(),
                 pending_ids: std::collections::HashSet::new(),
             }),

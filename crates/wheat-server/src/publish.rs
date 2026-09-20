@@ -195,22 +195,32 @@ pub async fn handle_publish(
             ConnectionError::Internal(format!("failed to read content manifest: {e}"))
         })?;
 
-    // Walk the content set to find missing content using contains() —
-    // NOT get_bounded(id, 0), which would return TooLarge for every non-empty file.
+    // Walk the content set to collect all content IDs, then bulk-check
+    // which ones already exist. For S3 backends this does one LIST call
+    // instead of one GET per item.
     let content_set = wheat_store::ContentSetStore::new(&entry.objects);
     let mut cursor = content_set.cursor(manifest.content).await.map_err(|e| {
         ConnectionError::Internal(format!("failed to walk content set: {e}"))
     })?;
-    let mut missing_content = Vec::new();
+    let mut all_content_ids = Vec::new();
     while let Some(content_id) = cursor.next().await.map_err(|e| {
         ConnectionError::Internal(format!("content set walk error: {e}"))
     })? {
-        if !entry.content.contains(content_id) {
-            missing_content.push(Digest256 {
-                bytes: content_id.as_bytes().to_vec(),
-            });
-        }
+        all_content_ids.push(content_id);
     }
+
+    let existing = entry
+        .content
+        .existing_ids(&all_content_ids)
+        .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
+
+    let missing_content: Vec<Digest256> = all_content_ids
+        .iter()
+        .filter(|id| !existing.contains(id))
+        .map(|id| Digest256 {
+            bytes: id.as_bytes().to_vec(),
+        })
+        .collect();
 
     // Always send ContentNeeded — even with an empty list — so the client
     // doesn't hang waiting for it. An empty list means no content upload needed.
@@ -226,7 +236,9 @@ pub async fn handle_publish(
     .await?;
 
     if !missing_content.is_empty() {
-        // Receive content uploads (single-message and chunked).
+        // Collect all content uploads first, then store them in a single
+        // batch (concurrent S3 PUTs for remote backends).
+        let mut content_batch: Vec<(ContentId, Vec<u8>)> = Vec::new();
         loop {
             let msg = recv(ws).await?;
             match msg {
@@ -250,9 +262,7 @@ pub async fn handle_publish(
                         .await?;
                         return Ok(None);
                     }
-                    entry.content.put(&upload.data).map_err(|e| {
-                        ConnectionError::Internal(format!("failed to store content: {e}"))
-                    })?;
+                    content_batch.push((content_id, upload.data));
                 }
                 WheatProtocolMessage::ContentUploadChunk(chunk) => {
                     if chunk.op_id != op_id {
@@ -280,11 +290,7 @@ pub async fn handle_publish(
                             .await?;
                             return Ok(None);
                         }
-                        entry.content.put(&chunk.data).map_err(|e| {
-                            ConnectionError::Internal(format!(
-                                "failed to store chunked content: {e}"
-                            ))
-                        })?;
+                        content_batch.push((content_id, chunk.data));
                     } else {
                         // Multi-chunk reassembly: not yet implemented.
                         // For v1 this is acceptable — the client can always
@@ -307,6 +313,14 @@ pub async fn handle_publish(
                     warn!(op_id, "publish: unexpected message during content upload");
                 }
             }
+        }
+
+        // Store all content in one batch — concurrent S3 PUTs for remote
+        // backends, parallel local writes for filesystem backends.
+        if !content_batch.is_empty() {
+            entry.content.put_many(content_batch, 8).map_err(|e| {
+                ConnectionError::Internal(format!("failed to store content batch: {e}"))
+            })?;
         }
     }
 
