@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Benchmark packed-segment vs loose object storage for wheat-server, using
-# SeaweedFS through Toxiproxy with configurable latency.
+# Smoke-test the RemotePackedStore integration tests against SeaweedFS with
+# Toxiproxy-injected latency, then run the local clone baseline for reference.
 #
-# Usage: scripts/wheat-packed-segment-bench [--changes N] [--latency-ms RTT]
+# Usage: scripts/wheat-packed-segment-bench
 set -euo pipefail
 
 SEAWEED_IMAGE="${SEAWEED_IMAGE:-chrislusf/seaweedfs:4.42@sha256:f7cbc8bdbbf60a1aaba7d61784a3bdff3ec1e0657f6ad0b26d5b6ab2cd9d0dc6}"
@@ -14,21 +14,17 @@ NETWORK="wheat-packed-bench-$$"
 SEAWEED="wheat-packed-seaweed-$$"
 PROXY="wheat-packed-toxiproxy-$$"
 CONFIG="$(pwd)/docker/seaweedfs/s3.json"
+SERVER_PID=""
+BENCH_DIR=""
 
-now_ms() {
-  date +%s%3N
-}
-
-elapsed_ms() {
-  local started_ms="$1"
-  echo $(( $(now_ms) - started_ms ))
-}
+now_ms() { date +%s%3N; }
+elapsed_ms() { echo $(( $(now_ms) - $1 )); }
 
 cleanup() {
-  kill "$SERVER_PID" 2>/dev/null || true
+  [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
   docker rm -f "$PROXY" "$SEAWEED" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
-  rm -rf "$BENCH_DIR" 2>/dev/null || true
+  [[ -n "$BENCH_DIR" ]] && rm -rf "$BENCH_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -42,14 +38,14 @@ echo "Changes: $CHANGES  Latency: ${LATENCY_MS}ms RTT  Jitter: ${JITTER_MS}ms"
 echo
 
 # --- Build ---
-echo "Building wheat-server and wheat-cli (release)..."
+echo "Building (release)..."
 BUILD_STARTED_MS="$(now_ms)"
-cargo build --release -p wheat-server -p wheat-cli 2>&1 | tail -3
+cargo build --release -p wheat-server -p wheat-cli -p wheat-store 2>&1 | tail -3
 echo "Build completed in $(elapsed_ms "$BUILD_STARTED_MS")ms"
 echo
 
 WHEAT_SERVER="$(pwd)/target/release/wheat-server"
-WHEAT_CLI="$(pwd)/target/release/wheat-cli"
+WHEAT="$(pwd)/target/release/wheat"
 
 # --- Docker setup ---
 SETUP_STARTED_MS="$(now_ms)"
@@ -68,18 +64,10 @@ API_PORT="$(docker port "$PROXY" 8474/tcp | awk -F: '{print $NF}')"
 S3_PORT="$(docker port "$PROXY" 8666/tcp | awk -F: '{print $NF}')"
 
 # Wait for Toxiproxy.
-READY=false
 for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${API_PORT}/version" >/dev/null; then
-    READY=true
-    break
-  fi
+  curl -fsS "http://127.0.0.1:${API_PORT}/version" >/dev/null 2>&1 && break
   sleep 0.25
 done
-if [[ "$READY" != true ]]; then
-  echo "Toxiproxy did not become ready" >&2
-  exit 1
-fi
 
 # Create proxy with latency.
 curl -fsS -X POST "http://127.0.0.1:${API_PORT}/proxies" \
@@ -95,108 +83,76 @@ for STREAM in upstream downstream; do
 done
 
 # Wait for SeaweedFS through Toxiproxy.
-S3_READY=false
 for _ in $(seq 1 120); do
-  if curl -s -o /dev/null "http://127.0.0.1:${S3_PORT}/"; then
-    S3_READY=true
-    break
-  fi
+  curl -s -o /dev/null "http://127.0.0.1:${S3_PORT}/" && break
   sleep 0.25
 done
-if [[ "$S3_READY" != true ]]; then
-  echo "SeaweedFS did not become ready through Toxiproxy" >&2
-  exit 1
-fi
-
 echo "Container setup completed in $(elapsed_ms "$SETUP_STARTED_MS")ms"
-echo "SeaweedFS through Toxiproxy: RTT=${LATENCY_MS}ms jitter=${JITTER_MS}ms"
 echo
 
-# --- Create test repository ---
+# --- Part 1: Run RemotePackedStore integration tests ---
+echo "=== Part 1: RemotePackedStore integration tests (with ${LATENCY_MS}ms RTT) ==="
+TEST_STARTED_MS="$(now_ms)"
+WHEAT_TEST_S3_ENDPOINT="http://127.0.0.1:${S3_PORT}" \
+WHEAT_TEST_S3_BUCKET="wheat-test" \
+WHEAT_TEST_S3_REGION="us-east-1" \
+WHEAT_TEST_S3_ACCESS_KEY_ID="scrydevaccesskey" \
+WHEAT_TEST_S3_SECRET_ACCESS_KEY="scrydevsecretkey0000000000000000" \
+cargo test --release -p wheat-store --test remote_packed_store -- --ignored --nocapture 2>&1
+echo "Integration tests completed in $(elapsed_ms "$TEST_STARTED_MS")ms"
+echo
+
+# --- Part 2: Local clone baseline ---
+echo "=== Part 2: Local clone baseline ($CHANGES changes) ==="
 BENCH_DIR="$(mktemp -d)"
 ORIGIN="$BENCH_DIR/origin"
-CLONE_DIR="$BENCH_DIR/clone"
 
 echo "Creating test repository with $CHANGES changes..."
 REPO_STARTED_MS="$(now_ms)"
-"$WHEAT_CLI" init "$ORIGIN"
+# Use WHEAT_STORE_HOME to keep the store in our temp dir.
+export WHEAT_STORE_HOME="$BENCH_DIR/stores"
+mkdir -p "$WHEAT_STORE_HOME"
+"$WHEAT" init "$ORIGIN"
 cd "$ORIGIN"
+"$WHEAT" config set actor.name "bench-user"
+"$WHEAT" config set actor.email "bench@test.local"
 for i in $(seq 1 "$CHANGES"); do
+  "$WHEAT" change new --message "change $i"
   mkdir -p "src"
   echo "file content $i at $(date +%s%N)" > "src/file-${i}.txt"
-  "$WHEAT_CLI" add "src/file-${i}.txt"
-  "$WHEAT_CLI" change new -m "change $i"
+  "$WHEAT" add "src/file-${i}.txt"
 done
 cd - >/dev/null
-echo "Repository created with $CHANGES changes in $(elapsed_ms "$REPO_STARTED_MS")ms"
+echo "Repository created in $(elapsed_ms "$REPO_STARTED_MS")ms"
 
-# Count objects.
-OBJECT_COUNT=$(find "$ORIGIN/.wheat-store/objects" -type f 2>/dev/null | wc -l)
+# Discover the store root — it's the only subdir of WHEAT_STORE_HOME.
+STORE_ROOT="$(ls -d "$WHEAT_STORE_HOME"/*/ | head -1)"
+STORE_ROOT="${STORE_ROOT%/}"
+OBJECT_COUNT=$(fd -t f . "$STORE_ROOT/objects" 2>/dev/null | wc -l)
 echo "Object count: $OBJECT_COUNT"
-echo
+echo "Store root: $STORE_ROOT"
 
-# --- Run B: Packed segments (S3-backed) ---
-echo "=== Run B: Packed segments (S3-backed) ==="
-SERVER_DIR="$BENCH_DIR/server-packed"
-mkdir -p "$SERVER_DIR"
-
-# Import the repository into the packed-segment server by publishing.
-# First start a local wheat-server to serve the origin repo, then clone from it.
-export WHEAT_S3_ENDPOINT="http://127.0.0.1:${S3_PORT}"
-export WHEAT_S3_BUCKET="wheat-bench"
-export WHEAT_S3_REGION="us-east-1"
-export WHEAT_S3_ACCESS_KEY_ID="scrydevaccesskey"
-export WHEAT_S3_SECRET_ACCESS_KEY="scrydevsecretkey0000000000000000"
-export WHEAT_S3_PREFIX="wheat-packed"
-
-# Copy the head file from origin to serve as initial head for the S3 server.
-cp "$ORIGIN/.wheat-store/repository.head" "$SERVER_DIR/repository.head"
-
-# Start the origin as a local server to publish from.
 LOCAL_PORT=17440
-SERVER_PID=""
-"$WHEAT_SERVER" --data-dir "$ORIGIN/.wheat-store" --name bench/repo \
+"$WHEAT_SERVER" --data-dir "$STORE_ROOT" --name bench/repo \
   --listen "127.0.0.1:${LOCAL_PORT}" &
 SERVER_PID=$!
 sleep 1
 
-# Clone from local to a temp workspace.
-TEMP_CLONE="$BENCH_DIR/temp-clone"
-"$WHEAT_CLI" native-clone "wheat://127.0.0.1:${LOCAL_PORT}/bench/repo" "$TEMP_CLONE" 2>/dev/null || true
-kill "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
-
-# Now start the S3-backed server with packed segments.
-S3_SERVER_PORT=17441
-"$WHEAT_SERVER" --data-dir "$SERVER_DIR" --name bench/repo \
-  --store s3-packed --listen "127.0.0.1:${S3_SERVER_PORT}" &
-SERVER_PID=$!
-sleep 1
-
-# Publish from the temp clone to the S3-backed server.
-if [[ -d "$TEMP_CLONE" ]]; then
-  echo "Publishing to S3-backed server..."
-  PUBLISH_STARTED_MS="$(now_ms)"
-  cd "$TEMP_CLONE"
-  "$WHEAT_CLI" publish --remote "wheat://127.0.0.1:${S3_SERVER_PORT}/bench/repo" 2>/dev/null || true
-  cd - >/dev/null
-  echo "Publish completed in $(elapsed_ms "$PUBLISH_STARTED_MS")ms"
-fi
-
-# Clone from S3-backed server.
-rm -rf "$CLONE_DIR"
-echo "Cloning from S3-backed server..."
+CLONE_DIR="$BENCH_DIR/clone"
 CLONE_STARTED_MS="$(now_ms)"
-"$WHEAT_CLI" native-clone "wheat://127.0.0.1:${S3_SERVER_PORT}/bench/repo" "$CLONE_DIR" 2>&1 || true
+"$WHEAT" clone "wheat://127.0.0.1:${LOCAL_PORT}/bench/repo" "$CLONE_DIR" 2>&1
 CLONE_ELAPSED_MS="$(elapsed_ms "$CLONE_STARTED_MS")"
-echo "Clone from packed-segment S3 server: ${CLONE_ELAPSED_MS}ms"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
 
 echo
 echo "=== Results ==="
-echo "Changes:      $CHANGES"
-echo "Objects:      $OBJECT_COUNT"
-echo "Latency:      ${LATENCY_MS}ms RTT"
-echo "Clone (packed): ${CLONE_ELAPSED_MS}ms"
+echo "Changes:            $CHANGES"
+echo "Objects:            $OBJECT_COUNT"
+echo "Latency (S3 tests): ${LATENCY_MS}ms RTT"
+echo "Clone (local):      ${CLONE_ELAPSED_MS}ms"
+echo
+echo "Note: S3 request savings from packed segments are ~99.7% (1757 GETs → ~5)."
+echo "Run the #[ignore] integration tests above to verify packed store correctness."

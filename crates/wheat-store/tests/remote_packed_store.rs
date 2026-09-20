@@ -47,7 +47,7 @@ fn make_objects() -> Vec<(ObjectId, Vec<u8>)> {
     objects
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires WHEAT_TEST_S3_* env vars (e.g. via scripts/wheat-seaweedfs-test)"]
 async fn put_seal_get_round_trip() {
     let Some(config) = s3_config() else {
@@ -82,7 +82,7 @@ async fn put_seal_get_round_trip() {
     eprintln!("put_seal_get_round_trip: {} objects stored and retrieved", objects.len());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires WHEAT_TEST_S3_* env vars (e.g. via scripts/wheat-seaweedfs-test)"]
 async fn catalog_chain_survives_reopen() {
     let Some(config) = s3_config() else {
@@ -114,7 +114,7 @@ async fn catalog_chain_survives_reopen() {
     eprintln!("catalog_chain_survives_reopen: {} objects survived re-open", objects.len());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires WHEAT_TEST_S3_* env vars (e.g. via scripts/wheat-seaweedfs-test)"]
 async fn content_round_trip() {
     let Some(config) = s3_config() else {
