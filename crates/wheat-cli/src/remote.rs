@@ -226,10 +226,7 @@ pub async fn connect(ws_url: &str) -> Result<WheatSession> {
         WheatProtocolMessage::SessionEstablished(se) => match &se.status {
             SessionEstablishedStatus::SessionStatusOk(_) => {}
             SessionEstablishedStatus::SessionStatusVersionMismatch(_) => {
-                bail!(
-                    "server rejected protocol version: {}",
-                    se.message
-                );
+                bail!("server rejected protocol version: {}", se.message);
             }
             SessionEstablishedStatus::SessionStatusAuthFailed(_) => {
                 bail!("authentication failed: {}", se.message);
@@ -246,10 +243,7 @@ pub async fn connect(ws_url: &str) -> Result<WheatSession> {
 // ---------------------------------------------------------------------------
 
 /// Open a repository on the server, returning its current state.
-pub async fn open_repository(
-    session: &mut WheatSession,
-    name: &str,
-) -> Result<RemoteRepoState> {
+pub async fn open_repository(session: &mut WheatSession, name: &str) -> Result<RemoteRepoState> {
     send_msg(
         &mut session.ws,
         &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
@@ -338,9 +332,7 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
                     let claimed_id = digest_to_object_id(&entry.id)?;
                     let actual_id = ObjectId::of_canonical_bytes(&entry.data);
                     if actual_id != claimed_id {
-                        bail!(
-                            "object identity mismatch: claimed {claimed_id}, actual {actual_id}"
-                        );
+                        bail!("object identity mismatch: claimed {claimed_id}, actual {actual_id}");
                     }
 
                     objects.put_if_absent(claimed_id, &entry.data).await?;
@@ -348,9 +340,7 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
                     total_received += 1;
 
                     // Discover child references.
-                    if let Ok(children) =
-                        wheat_core::extract_object_references(&entry.data)
-                    {
+                    if let Ok(children) = wheat_core::extract_object_references(&entry.data) {
                         for child_id in children {
                             if !known.contains(&child_id) {
                                 // Check if we already have it locally.
@@ -382,7 +372,8 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
                 // trie-key ObjectIds. Repeat until no new objects are found.
                 if want_list.is_empty() {
                     loop {
-                        let retained = discover_retained_objects(objects, content, envelope_id).await?;
+                        let retained =
+                            discover_retained_objects(objects, content, envelope_id).await?;
                         let mut found_new = false;
 
                         // BFS through retained objects that are already present
@@ -394,9 +385,9 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
                                 match objects.get(oid).await {
                                     Ok(obj) => {
                                         known.insert(oid);
-                                        if let Ok(children) =
-                                            wheat_core::extract_object_references(&obj.canonical_bytes)
-                                        {
+                                        if let Ok(children) = wheat_core::extract_object_references(
+                                            &obj.canonical_bytes,
+                                        ) {
                                             for child_id in children {
                                                 if !known.contains(&child_id) {
                                                     bfs_frontier.push(child_id);
@@ -587,7 +578,8 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
 
     // Request content in batches.
     for batch in missing.chunks(MAX_WANT_IDS) {
-        let content_ids: Vec<Digest256> = batch.iter().map(|id| content_id_to_digest(*id)).collect();
+        let content_ids: Vec<Digest256> =
+            batch.iter().map(|id| content_id_to_digest(*id)).collect();
 
         send_msg(
             &mut session.ws,
@@ -618,9 +610,7 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                         let id = digest_to_content_id(&entry.id)?;
                         let actual = ContentId::of(&entry.data);
                         if actual != id {
-                            bail!(
-                                "content identity mismatch: claimed {id}, actual {actual}"
-                            );
+                            bail!("content identity mismatch: claimed {id}, actual {actual}");
                         }
                         content.put(&entry.data)?;
                         received_this_batch += 1;
@@ -638,9 +628,7 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                             buf.extend_from_slice(&chunk.data);
                         }
                         Some((old_id, _)) => {
-                            bail!(
-                                "interleaved content chunks: expected {old_id}, got {chunk_id}"
-                            );
+                            bail!("interleaved content chunks: expected {old_id}, got {chunk_id}");
                         }
                         None => {
                             chunk_buffer = Some((chunk_id, chunk.data.clone()));
@@ -780,7 +768,6 @@ pub async fn publish<O: ImmutableObjectStore>(
         let msg = recv_msg(&mut session.ws).await?;
         match msg {
             WheatProtocolMessage::ContentNeeded(cn) if cn.op_id == op_id => {
-
                 for digest in &cn.content_ids {
                     let id = digest_to_content_id(digest)?;
                     let data = content.get(id)?;
@@ -799,12 +786,10 @@ pub async fn publish<O: ImmutableObjectStore>(
                 // Signal that all content has been uploaded.
                 send_msg(
                     &mut session.ws,
-                    &WheatProtocolMessage::ContentUploadComplete(
-                        ContentUploadCompleteOutput {
-                            message_type: 0x46,
-                            op_id,
-                        },
-                    ),
+                    &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
+                        message_type: 0x46,
+                        op_id,
+                    }),
                 )
                 .await?;
 

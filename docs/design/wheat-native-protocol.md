@@ -78,7 +78,13 @@ top of them.
   `--store s3-packed` mode reads S3 config from `WHEAT_S3_*` env vars. LRU
   segment cache (256 MiB default) downloads full segments on first access.
   Benchmark script (`scripts/wheat-packed-segment-bench`) with SeaweedFS +
-  Toxiproxy (20ms RTT). 3 `#[ignore]` integration tests.
+  Toxiproxy (20ms RTT). 3 `#[ignore]` integration tests. End-to-end
+  publish→clone through S3-backed wheat-server verified: genesis
+  initialization on `RemotePackedStore`, full publish protocol driving all
+  objects/content to S3, clone back with `validate_complete` assertion.
+  Benchmark test (`s3_packed_test::publish_clone_s3_benchmark`) measures
+  publish and clone timing separately against the latency-injected S3
+  backend.
 
 ### Outstanding
 

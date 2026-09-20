@@ -59,16 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let repo_name = cli
-        .name
-        .clone()
-        .unwrap_or_else(|| {
-            cli.data_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("default")
-                .to_string()
-        });
+    let repo_name = cli.name.clone().unwrap_or_else(|| {
+        cli.data_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default")
+            .to_string()
+    });
 
     let registry = match cli.store {
         StoreMode::Local => Registry::single_named(repo_name, &cli.data_dir),
@@ -76,15 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = s3_config_from_env()?;
             let store = wheat_store::RemotePackedStore::open(&config).await?;
             let content = store.content_store();
-            let heads = wheat_store::LocalPublicationStore::new(
-                cli.data_dir.join("repository.head"),
-            );
-            Registry::single_with_stores(
-                repo_name,
-                Box::new(store),
-                content,
-                heads,
-            )
+            let heads =
+                wheat_store::LocalPublicationStore::new(cli.data_dir.join("repository.head"));
+            Registry::single_with_stores(repo_name, Box::new(store), content, heads)
         }
     };
 
@@ -92,7 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn s3_config_from_env() -> Result<wheat_store::RemotePackedStoreConfig, Box<dyn std::error::Error>> {
+fn s3_config_from_env() -> Result<wheat_store::RemotePackedStoreConfig, Box<dyn std::error::Error>>
+{
     let endpoint = std::env::var("WHEAT_S3_ENDPOINT")
         .map_err(|_| "WHEAT_S3_ENDPOINT must be set for --store s3-packed")?;
     let bucket = std::env::var("WHEAT_S3_BUCKET")

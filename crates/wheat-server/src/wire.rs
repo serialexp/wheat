@@ -4,8 +4,8 @@
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 
 use wheat_core::{ContentId, ObjectId};
 use wheat_protocol::*;

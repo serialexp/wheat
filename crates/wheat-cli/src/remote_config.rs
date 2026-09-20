@@ -63,8 +63,8 @@ impl RemoteConfig {
         }
         let data =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let config: Self = serde_json::from_str(&data)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let config: Self =
+            serde_json::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
         Ok(Some(config))
     }
 
@@ -72,8 +72,7 @@ impl RemoteConfig {
     pub fn write(&self, store_root: &Path) -> Result<()> {
         let path = remote_config_path(store_root);
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
 }

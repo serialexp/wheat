@@ -128,9 +128,7 @@ async fn reverse_transition_rejected_without_force() {
     let (first_state, second_state) = two_state_repository(&objects, &content, &heads).await;
 
     let reader = RepositoryReader::new(&objects, &content);
-    let result = reader
-        .validate_transition(second_state, first_state)
-        .await;
+    let result = reader.validate_transition(second_state, first_state).await;
     assert!(
         result.is_err(),
         "reverse transition should fail without force"

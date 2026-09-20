@@ -139,6 +139,47 @@ fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
 }
 
 #[test]
+fn compressed_records_use_stored_bytes_for_rollover_and_logical_read_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let first_bytes = vec![b'a'; 8 * 1024];
+    let second_bytes = vec![b'b'; 8 * 1024];
+    let values = [
+        SegmentRecord {
+            namespace: CONTENT_NAMESPACE,
+            kind: 0,
+            digest: *wheat_core::ContentId::of(&first_bytes).as_bytes(),
+            bytes: &first_bytes,
+        },
+        SegmentRecord {
+            namespace: CONTENT_NAMESPACE,
+            kind: 0,
+            digest: *wheat_core::ContentId::of(&second_bytes).as_bytes(),
+            bytes: &second_bytes,
+        },
+    ];
+    let stored = crate::codec::prepare(&first_bytes).unwrap().bytes.len() as u64;
+    assert!(stored < first_bytes.len() as u64);
+
+    let mut store = PackedCatalog::open_with_test_limits(
+        root.path(),
+        crate::Durability::Durable,
+        u64::MAX,
+        100,
+        stored * 2,
+    )
+    .unwrap();
+    store.put_records(&values).unwrap();
+    assert_eq!(store.test_counts().unwrap().0, 2);
+    assert!(matches!(
+        store.get_bounded(CONTENT_NAMESPACE, values[0].digest, first_bytes.len() - 1),
+        Err(CatalogError::Segment(SegmentError::ReadLimit { minimum }))
+            if minimum == first_bytes.len()
+    ));
+    assert_value(&mut store, values[0]);
+    assert_value(&mut store, values[1]);
+}
+
+#[test]
 fn deferred_duplicate_is_idempotent_and_conflict_is_rejected() {
     let root = tempfile::tempdir().unwrap();
     let original = record(b"same digest authority");
@@ -475,7 +516,7 @@ fn empty_active_without_head_recovers_but_nonempty_legacy_window_is_rejected() {
 
 #[test]
 fn valid_sqlite_semantic_corruption_is_rebuilt_before_read_allocation() {
-    for column in ["kind", "offset", "length", "path"] {
+    for column in ["kind", "offset", "stored_length", "logical_length", "path"] {
         let root = tempfile::tempdir().unwrap();
         let value = record(b"authoritative payload");
         {
@@ -493,8 +534,11 @@ fn valid_sqlite_semantic_corruption_is_rebuilt_before_read_allocation() {
             "offset" => connection
                 .execute("UPDATE locator SET offset=999999", [])
                 .unwrap(),
-            "length" => connection
-                .execute("UPDATE locator SET length=9223372036854775807", [])
+            "stored_length" => connection
+                .execute("UPDATE locator SET stored_length=9223372036854775807", [])
+                .unwrap(),
+            "logical_length" => connection
+                .execute("UPDATE locator SET logical_length=9223372036854775807", [])
                 .unwrap(),
             "path" => connection
                 .execute("UPDATE physical_source SET path='../arbitrary'", [])

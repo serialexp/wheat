@@ -85,7 +85,10 @@ impl Harness {
         git(Some(&git_dir), &["init", "--bare"]);
 
         let work = self.root.path().join("source-work");
-        git(None, &["clone", git_dir.to_str().unwrap(), work.to_str().unwrap()]);
+        git(
+            None,
+            &["clone", git_dir.to_str().unwrap(), work.to_str().unwrap()],
+        );
         for (path, content) in files {
             let full_path = work.join(path);
             if let Some(parent) = full_path.parent() {

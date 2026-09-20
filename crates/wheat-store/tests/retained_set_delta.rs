@@ -3,8 +3,7 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 use wheat_core::ObjectId;
 use wheat_store::{
-    CollectionError, ObjectStoreAdapter, RetainedSetDelta, RetainedSetDeltaLimits,
-    RetainedSetStore,
+    CollectionError, ObjectStoreAdapter, RetainedSetDelta, RetainedSetDeltaLimits, RetainedSetStore,
 };
 
 fn memory_store(prefix: &str) -> ObjectStoreAdapter {
@@ -128,7 +127,10 @@ async fn large_set_one_element_delta_reads_few_nodes() {
     for i in 0_u16..1000 {
         let mut bytes = [0u8; 32];
         bytes[30..].copy_from_slice(&i.to_be_bytes());
-        root = sets.insert(root, ObjectId::from_digest(bytes)).await.unwrap();
+        root = sets
+            .insert(root, ObjectId::from_digest(bytes))
+            .await
+            .unwrap();
     }
 
     // Add one more entry to create a minimal delta.

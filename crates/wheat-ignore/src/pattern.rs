@@ -153,7 +153,11 @@ mod tests {
 
     fn matches(pattern_line: &str, path: &str, is_dir: bool) -> bool {
         let patterns = parse_ignore_file(pattern_line, 0);
-        assert_eq!(patterns.len(), 1, "expected exactly one pattern from '{pattern_line}'");
+        assert_eq!(
+            patterns.len(),
+            1,
+            "expected exactly one pattern from '{pattern_line}'"
+        );
         patterns[0].matches(path, is_dir)
     }
 

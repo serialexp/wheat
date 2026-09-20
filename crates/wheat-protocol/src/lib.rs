@@ -65,7 +65,9 @@ pub fn decode_message(bytes: &[u8]) -> Result<WheatProtocolMessage, DecodeError>
 /// Encode a protocol message into raw bytes suitable for a WebSocket
 /// binary message.
 pub fn encode_message(message: &WheatProtocolMessage) -> Result<Vec<u8>, EncodeError> {
-    let bytes = message.encode().map_err(|e| EncodeError::Schema(e.to_string()))?;
+    let bytes = message
+        .encode()
+        .map_err(|e| EncodeError::Schema(e.to_string()))?;
     if bytes.len() > MAX_MESSAGE_SIZE {
         return Err(EncodeError::TooLarge(bytes.len()));
     }

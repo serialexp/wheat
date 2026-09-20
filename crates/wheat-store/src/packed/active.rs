@@ -16,6 +16,8 @@ use wheat_core::{
     SEGMENT_PREFIX_ENCODED_SIZE, SegmentId, SegmentIndexEntry, encode_segment_prefix,
 };
 
+#[cfg(test)]
+use super::segment::prepare_record;
 use super::segment::{
     MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, SegmentError,
     SegmentMetadata, SegmentReader, SegmentRecord, emit_cumulative_tail,
@@ -78,7 +80,7 @@ pub(crate) enum ActiveError {
 pub(crate) struct PreparedAppend<'a> {
     old: ActivePublishedState,
     intended_generation: u64,
-    records: Vec<SegmentRecord<'a>>,
+    records: Vec<(SegmentRecord<'a>, crate::codec::PhysicalPayload)>,
     journal: ActiveRecoveryJournal,
 }
 
@@ -200,9 +202,23 @@ impl ActiveSegment {
 
     /// Validates/deduplicates a bounded batch and captures the exact old tail.
     /// No segment bytes are changed by this method.
+    #[cfg(test)]
     pub(crate) fn prepare_append<'a>(
         &mut self,
         records: &[SegmentRecord<'a>],
+        intended_generation: u64,
+    ) -> Result<PreparedAppend<'a>, ActiveError> {
+        let prepared = records
+            .iter()
+            .copied()
+            .map(prepare_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.prepare_prepared_append(prepared, intended_generation)
+    }
+
+    pub(crate) fn prepare_prepared_append<'a>(
+        &mut self,
+        records: Vec<super::segment::PreparedSegmentRecord<'a>>,
         intended_generation: u64,
     ) -> Result<PreparedAppend<'a>, ActiveError> {
         if self.poisoned {
@@ -216,10 +232,12 @@ impl ActiveSegment {
         let mut accepted = Vec::with_capacity(records.len());
         let mut accepted_by_key = HashMap::with_capacity(records.len());
         let mut projected_payload = self.state.metadata.payload_bytes;
-        for record in records {
-            super::segment::validate_record(*record)?;
-            if let Some((kind, offset, length)) = self.find_entry(record.namespace, record.digest) {
-                if kind != record.kind || !self.payload_equals(offset, length, record.bytes)? {
+        for prepared in records {
+            let record = prepared.logical;
+            if let Some(index) = self.find_entry(record.namespace, record.digest) {
+                if self.entries[index].kind != record.kind
+                    || !self.payload_equals(index, record.bytes)?
+                {
                     return Err(ActiveError::ConflictingKey);
                 }
                 continue;
@@ -229,8 +247,9 @@ impl ActiveSegment {
             }
             let record_key = (record.namespace, record.digest);
             if let Some(&index) = accepted_by_key.get(&record_key) {
-                let existing: &SegmentRecord<'_> = &accepted[index];
-                if existing.kind != record.kind || existing.bytes != record.bytes {
+                let existing: &(SegmentRecord<'_>, crate::codec::PhysicalPayload) =
+                    &accepted[index];
+                if existing.0.kind != record.kind || existing.0.bytes != record.bytes {
                     return Err(ActiveError::ConflictingKey);
                 }
                 continue;
@@ -241,13 +260,12 @@ impl ActiveSegment {
                 .checked_add(accepted.len())
                 .and_then(|count| count.checked_add(1))
                 .ok_or(SegmentError::TooManyEntries)?;
-            let length = u64::try_from(record.bytes.len()).map_err(|_| SegmentError::TooLarge)?;
             projected_payload = projected_payload
-                .checked_add(length)
+                .checked_add(prepared.stored_length())
                 .ok_or(SegmentError::TooLarge)?;
             validate_projected(projected_count, projected_payload)?;
             accepted_by_key.insert(record_key, accepted.len());
-            accepted.push(*record);
+            accepted.push((record, prepared.physical));
         }
         if !retry && accepted.is_empty() {
             return Err(ActiveError::NoChanges);
@@ -310,7 +328,7 @@ impl ActiveSegment {
         let added_keys: Vec<_> = prepared
             .records
             .iter()
-            .map(|record| (record.namespace, record.digest))
+            .map(|(record, _)| (record.namespace, record.digest))
             .collect();
         self.poisoned = true;
         let append_result = (|| -> Result<_, ActiveError> {
@@ -318,23 +336,23 @@ impl ActiveSegment {
             self.file
                 .seek(SeekFrom::Start(self.state.metadata.index_start))?;
             let mut payload_bytes = self.state.metadata.payload_bytes;
-            for record in &prepared.records {
-                let record = *record;
-                let length =
-                    u64::try_from(record.bytes.len()).map_err(|_| SegmentError::TooLarge)?;
+            for (record, physical) in &prepared.records {
+                let stored_length = physical.bytes.len() as u64;
                 let offset = PREFIX_LEN
                     .checked_add(payload_bytes)
                     .ok_or(SegmentError::TooLarge)?;
-                self.file.write_all(record.bytes)?;
+                self.file.write_all(&physical.bytes)?;
                 payload_bytes = payload_bytes
-                    .checked_add(length)
+                    .checked_add(stored_length)
                     .ok_or(SegmentError::TooLarge)?;
                 self.entries.push(SegmentIndexEntry {
                     namespace: record.namespace,
                     kind: record.kind,
                     digest: record.digest,
                     offset,
-                    length,
+                    codec: physical.codec.to_byte(),
+                    stored_length,
+                    logical_length: physical.logical_length,
                 });
             }
             #[cfg(test)]
@@ -464,15 +482,24 @@ impl ActiveSegment {
             return Ok(None);
         };
         let entry = self.entries[index].clone();
-        let length = usize::try_from(entry.length).map_err(|_| SegmentError::ReadLimit {
-            minimum: usize::MAX,
-        })?;
-        if length > max {
-            return Err(SegmentError::ReadLimit { minimum: length }.into());
+        let logical_length =
+            usize::try_from(entry.logical_length).map_err(|_| SegmentError::ReadLimit {
+                minimum: usize::MAX,
+            })?;
+        if logical_length > max {
+            return Err(SegmentError::ReadLimit {
+                minimum: logical_length,
+            }
+            .into());
         }
-        let mut bytes = vec![0; length];
+        let stored_length = usize::try_from(entry.stored_length)
+            .map_err(|_| SegmentError::Format("stored length"))?;
+        let mut stored = vec![0; stored_length];
         self.file.seek(SeekFrom::Start(entry.offset))?;
-        self.file.read_exact(&mut bytes)?;
+        self.file.read_exact(&mut stored)?;
+        let codec = crate::codec::Codec::from_byte(entry.codec).map_err(SegmentError::from)?;
+        let bytes = crate::codec::decode(codec, stored, entry.logical_length, max)
+            .map_err(SegmentError::from)?;
         super::segment::verify_logical(&entry, &bytes)?;
         Ok(Some((entry, bytes)))
     }
@@ -491,37 +518,23 @@ impl ActiveSegment {
             || self.entries.len() >= MAX_SEGMENT_ENTRIES
     }
 
-    fn find_entry(&self, namespace: u8, digest: [u8; 32]) -> Option<(u16, u64, u64)> {
-        let wanted = (namespace, digest);
+    fn find_entry(&self, namespace: u8, digest: [u8; 32]) -> Option<usize> {
         self.entries
-            .binary_search_by_key(&wanted, super::segment::key)
+            .binary_search_by_key(&(namespace, digest), super::segment::key)
             .ok()
-            .map(|index| {
-                let entry = &self.entries[index];
-                (entry.kind, entry.offset, entry.length)
-            })
     }
 
-    fn payload_equals(
-        &mut self,
-        offset: u64,
-        length: u64,
-        proposed: &[u8],
-    ) -> Result<bool, ActiveError> {
-        if length != proposed.len() as u64 {
+    fn payload_equals(&mut self, index: usize, proposed: &[u8]) -> Result<bool, ActiveError> {
+        let entry = self.entries[index].clone();
+        if entry.logical_length != proposed.len() as u64 {
             return Ok(false);
         }
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut consumed = 0;
-        while consumed < proposed.len() {
-            let amount = (proposed.len() - consumed).min(self.io_buffer.len());
-            self.file.read_exact(&mut self.io_buffer[..amount])?;
-            if self.io_buffer[..amount] != proposed[consumed..consumed + amount] {
-                return Ok(false);
-            }
-            consumed += amount;
-        }
-        Ok(true)
+        let Some((_, actual)) =
+            self.lookup_entry_bounded(entry.namespace, entry.digest, proposed.len())?
+        else {
+            return Ok(false);
+        };
+        Ok(actual == proposed)
     }
 }
 
@@ -586,7 +599,8 @@ mod tests {
             .find(|entry| entry.digest == *ContentId::of(second).as_bytes())
             .unwrap();
         assert_eq!(retained.offset, first_entry.offset);
-        assert_eq!(retained.length, first_entry.length);
+        assert_eq!(retained.stored_length, first_entry.stored_length);
+        assert_eq!(retained.logical_length, first_entry.logical_length);
         assert_eq!(added.offset, first_state.metadata.index_start);
 
         let bytes = fs::read(path).unwrap();
@@ -595,7 +609,7 @@ mod tests {
             first_payload
         );
         assert_eq!(
-            &bytes[added.offset as usize..(added.offset + added.length) as usize],
+            &bytes[added.offset as usize..(added.offset + added.stored_length) as usize],
             second
         );
     }

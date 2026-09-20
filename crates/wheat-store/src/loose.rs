@@ -11,7 +11,7 @@ use futures::{StreamExt, stream};
 use thiserror::Error;
 use wheat_core::{CanonicalObjectError, CanonicalObjectKind, ObjectId, validate_canonical_object};
 
-use crate::Durability;
+use crate::{Durability, codec};
 
 const MAX_BATCH_WORKERS: usize = 16;
 
@@ -116,6 +116,12 @@ pub enum ObjectStoreError {
     },
     #[error("invalid Wheat object: {0}")]
     InvalidFormat(#[from] CanonicalObjectError),
+    #[error("object {id} has an invalid physical envelope: {reason}")]
+    InvalidEnvelope { id: ObjectId, reason: String },
+    #[error("object {id} changed while it was being read")]
+    Changed { id: ObjectId },
+    #[error("immutable object storage integrity failure: {0}")]
+    Integrity(String),
     #[error("immutable object backend failed: {0}")]
     Backend(String),
     #[error("immutable object store I/O failed")]
@@ -264,15 +270,28 @@ impl LooseObjectStore {
         })
     }
 
-    fn verify_existing(&self, id: ObjectId, expected: &[u8]) -> Result<(), ObjectStoreError> {
-        let bytes = match fs::read(self.path(id)) {
-            Ok(bytes) => bytes,
+    fn read_existing(&self, id: ObjectId) -> Result<Vec<u8>, ObjectStoreError> {
+        let mut file = match fs::File::open(self.path(id)) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(ObjectStoreError::Missing(id));
             }
             Err(error) => return Err(ObjectStoreError::Io(error)),
         };
-        let stored = Self::verify_bytes(id, bytes)?;
+        let physical_length = file.metadata()?.len();
+        codec::read_envelope_file(&mut file, physical_length, codec::HARD_LOGICAL_RECORD_BYTES)
+            .map_err(|error| match error {
+                codec::EnvelopeFileError::Codec(error) => ObjectStoreError::InvalidEnvelope {
+                    id,
+                    reason: error.to_string(),
+                },
+                codec::EnvelopeFileError::Changed => ObjectStoreError::Changed { id },
+                codec::EnvelopeFileError::Io(error) => ObjectStoreError::Io(error),
+            })
+    }
+
+    fn verify_existing(&self, id: ObjectId, expected: &[u8]) -> Result<(), ObjectStoreError> {
+        let stored = Self::verify_bytes(id, self.read_existing(id)?)?;
         if stored.canonical_bytes != expected {
             return Err(ObjectStoreError::Corrupt {
                 expected: id,
@@ -312,11 +331,13 @@ impl ImmutableObjectStore for LooseObjectStore {
         }
         let temporary = temporary_path(parent, id);
         let result = (|| {
+            let encoded = codec::encode_envelope(canonical_bytes)
+                .map_err(|error| ObjectStoreError::Backend(error.to_string()))?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            file.write_all(canonical_bytes)?;
+            file.write_all(&encoded)?;
             self.durability.sync_file(&file)?;
 
             match fs::hard_link(&temporary, &path) {
@@ -388,14 +409,7 @@ impl ImmutableObjectStore for LooseObjectStore {
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
-        let bytes = match fs::read(self.path(id)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ObjectStoreError::Missing(id));
-            }
-            Err(error) => return Err(ObjectStoreError::Io(error)),
-        };
-        Self::verify_bytes(id, bytes)
+        Self::verify_bytes(id, self.read_existing(id)?)
     }
 
     async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {

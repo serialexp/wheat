@@ -11,7 +11,9 @@ mod commit_content;
 mod commit_writer;
 mod content_batch;
 pub use content_batch::ContentWriteBatch;
+mod codec;
 mod content_io;
+mod delta;
 mod durability;
 mod loose;
 mod merkle_tree;
@@ -54,10 +56,10 @@ pub use application_map::{
     ApplicationMapStore,
 };
 pub use batch::BatchObjectStore;
-pub use closure::collect_structural_closure;
 pub use change_map::{
     ChangeMapCursor, ChangeMapDelta, ChangeMapDeltaLimits, ChangeMapError, ChangeMapStore,
 };
+pub use closure::collect_structural_closure;
 pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
 pub use durability::{Durability, sync_directory, sync_filesystem};
 pub use loose::{

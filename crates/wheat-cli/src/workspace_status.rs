@@ -66,9 +66,8 @@ impl WorkspaceStatus {
                     );
                 }
                 if walk_result.truncated {
-                    diagnostics.push(
-                        "workspace scan truncated: traversal limits exceeded".to_owned(),
-                    );
+                    diagnostics
+                        .push("workspace scan truncated: traversal limits exceeded".to_owned());
                 }
                 (untracked_files, diagnostics)
             }

@@ -207,9 +207,7 @@ impl<'a, S: ImmutableObjectStore> ChangeMapStore<'a, S> {
         Ok(entries
             .into_iter()
             .map(|entry| match entry {
-                radix::DiffEntry::Added(change, object) => {
-                    ChangeMapDelta::Added { change, object }
-                }
+                radix::DiffEntry::Added(change, object) => ChangeMapDelta::Added { change, object },
                 radix::DiffEntry::Changed(change, old_object, new_object) => {
                     ChangeMapDelta::Changed {
                         change,

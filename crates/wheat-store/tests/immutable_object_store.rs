@@ -104,7 +104,7 @@ async fn distinguishes_missing_corrupt_and_invalid_objects() {
     fs::write(store.path(stored), [3, 1]).unwrap();
     assert!(matches!(
         store.get(stored).await,
-        Err(ObjectStoreError::Corrupt { expected, .. }) if expected == stored
+        Err(ObjectStoreError::InvalidEnvelope { id, .. }) if id == stored
     ));
 
     assert!(matches!(

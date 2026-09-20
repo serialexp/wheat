@@ -14,9 +14,7 @@ use wheat_store::{PublicationStore, RepositoryReader};
 
 use crate::registry::Registry;
 use crate::server::ServerConfig;
-use crate::wire::{
-    connection_error_scope, operation_error_scope, recv, send, send_error,
-};
+use crate::wire::{connection_error_scope, operation_error_scope, recv, send, send_error};
 
 /// Run one client connection to completion.
 pub async fn handle_connection(
@@ -136,8 +134,10 @@ async fn run_session(
                     let envelope = reader.envelope(head.envelope).await.map_err(|e| {
                         ConnectionError::Internal(format!("failed to read envelope: {e}"))
                     })?;
-                    let labels_manifest =
-                        reader.view_label_manifest(envelope.labels).await.map_err(|e| {
+                    let labels_manifest = reader
+                        .view_label_manifest(envelope.labels)
+                        .await
+                        .map_err(|e| {
                             ConnectionError::Internal(format!("failed to read labels: {e}"))
                         })?;
 
@@ -213,9 +213,10 @@ async fn run_session(
         match msg {
             WheatProtocolMessage::FetchRequest(req) => {
                 // Read head fresh for each fetch.
-                let head = entry.heads.read().map_err(|e| {
-                    ConnectionError::Internal(format!("failed to read head: {e}"))
-                })?;
+                let head = entry
+                    .heads
+                    .read()
+                    .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
                 crate::fetch::handle_fetch(&mut ws, &entry, &head, req).await?;
             }
             WheatProtocolMessage::ContentFetchRequest(req) => {
@@ -223,9 +224,10 @@ async fn run_session(
             }
             WheatProtocolMessage::PublishRequest(req) => {
                 // Read head fresh for each publish attempt.
-                let head = entry.heads.read().map_err(|e| {
-                    ConnectionError::Internal(format!("failed to read head: {e}"))
-                })?;
+                let head = entry
+                    .heads
+                    .read()
+                    .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
                 crate::publish::handle_publish(&mut ws, &entry, &head, req).await?;
             }
             _ => {

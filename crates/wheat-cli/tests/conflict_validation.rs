@@ -106,5 +106,9 @@ fn conflict_inspection_rejects_a_corrupt_selected_working_view() {
 
     let output = wheat(&workspace, &["conflicts"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("integrity verification"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid physical envelope"),
+        "unexpected diagnostic: {stderr}"
+    );
 }

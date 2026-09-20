@@ -8,7 +8,9 @@ fn physical_records_round_trip_and_footer_is_fixed() {
             kind: 0,
             digest: [3; 32],
             offset: 6,
-            length: 9,
+            codec: 1,
+            stored_length: 9,
+            logical_length: 90,
         }],
     };
     let bytes = encode_segment_index_page(&page).unwrap();
@@ -59,7 +61,9 @@ fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
         kind: SegmentIndexEntry::canonical_kind_code(CanonicalObjectKind::Edit),
         digest: [16; 32],
         offset: SEGMENT_PREFIX_ENCODED_SIZE as u64,
-        length: 42,
+        codec: 0,
+        stored_length: 42,
+        logical_length: 42,
     };
     assert_eq!(edit_entry.kind, 16);
     let page = SegmentIndexPage {
@@ -88,7 +92,9 @@ fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
                 kind,
                 digest: [0; 32],
                 offset: 0,
-                length: 0,
+                codec: 0,
+                stored_length: 0,
+                logical_length: 0,
             }],
         };
         assert!(matches!(
@@ -119,6 +125,34 @@ fn catalog_record_without_previous_round_trips_and_is_canonical() {
 }
 
 #[test]
+fn codec_identity_and_raw_lengths_are_validated() {
+    let entry = |codec, stored_length, logical_length| SegmentIndexPage {
+        entries: vec![SegmentIndexEntry {
+            namespace: SEGMENT_NAMESPACE_CONTENT,
+            kind: 0,
+            digest: [1; 32],
+            offset: SEGMENT_PREFIX_ENCODED_SIZE as u64,
+            codec,
+            stored_length,
+            logical_length,
+        }],
+    };
+    assert_eq!(
+        encode_segment_index_page(&entry(2, 1, 1)),
+        Err(SegmentRecordError::InvalidCodec(2))
+    );
+    assert_eq!(
+        encode_segment_index_page(&entry(0, 1, 2)),
+        Err(SegmentRecordError::InvalidRawLengths)
+    );
+    let zstd = entry(1, 10, 10_000);
+    assert_eq!(
+        decode_segment_index_page(&encode_segment_index_page(&zstd).unwrap()).unwrap(),
+        zstd
+    );
+}
+
+#[test]
 fn rejects_trailing_bytes_and_malicious_counts() {
     let mut prefix = encode_segment_prefix().unwrap();
     prefix.push(0);
@@ -137,7 +171,9 @@ fn rejects_trailing_bytes_and_malicious_counts() {
             kind: 1,
             digest: [0; 32],
             offset: 0,
-            length: 0,
+            codec: 0,
+            stored_length: 0,
+            logical_length: 0,
         }],
     };
     assert!(matches!(

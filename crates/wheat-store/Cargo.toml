@@ -19,6 +19,8 @@ tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 wheat-core = { path = "../wheat-core" }
+gunnar-delta = "1.1"
+zstd = "0.13"
 
 [dev-dependencies]
 hdrhistogram = { workspace = true }

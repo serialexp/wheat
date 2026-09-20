@@ -167,13 +167,18 @@ impl PackedObjectStore {
 fn object_catalog_error(error: CatalogError) -> ObjectStoreError {
     match error {
         CatalogError::Io(error) => ObjectStoreError::Io(error),
-        error => ObjectStoreError::Backend(error.to_string()),
+        CatalogError::Database(error) => ObjectStoreError::Backend(error.to_string()),
+        error => ObjectStoreError::Integrity(error.to_string()),
     }
 }
-fn content_catalog_error(error: CatalogError) -> ContentStoreError {
+fn content_catalog_error(id: ContentId, error: CatalogError) -> ContentStoreError {
     match error {
         CatalogError::Io(error) => ContentStoreError::Io(error),
-        error => ContentStoreError::Io(io::Error::other(error.to_string())),
+        CatalogError::Database(error) => ContentStoreError::Io(io::Error::other(error.to_string())),
+        error => ContentStoreError::InvalidFormat {
+            id,
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -261,7 +266,7 @@ impl ImmutableObjectStore for PackedObjectStore {
         // SegmentReader authenticated the immutable segment and verified this
         // payload against the requested object digest before returning it.
         let kind = ObjectKind::from_code(stored_kind).ok_or_else(|| {
-            ObjectStoreError::Backend("packed metadata has an unknown object kind".into())
+            ObjectStoreError::Integrity("packed metadata has an unknown object kind".into())
         })?;
         if let Some(trace) = &self.engine.trace {
             trace.object_get(kind as u8, bytes.len());
@@ -326,7 +331,7 @@ impl ContentBackend for PackedEngine {
                     ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned"))
                 })?
                 .put_records(&records)
-                .map_err(content_catalog_error)?;
+                .map_err(|error| content_catalog_error(packed[0].0, error))?;
         }
         Ok(())
     }
@@ -341,7 +346,7 @@ impl ContentBackend for PackedEngine {
                 CatalogError::Segment(super::segment::SegmentError::ReadLimit { minimum }) => {
                     ContentStoreError::TooLarge { id, max, minimum }
                 }
-                error => content_catalog_error(error),
+                error => content_catalog_error(id, error),
             })?;
         if let Some((_, bytes)) = value.as_ref().filter(|(_, bytes)| bytes.len() > max) {
             return Err(ContentStoreError::TooLarge {
@@ -365,6 +370,31 @@ impl ContentBackend for PackedEngine {
             trace.content_get(bytes.len());
         }
         Ok(bytes)
+    }
+
+    fn get_raw_envelope(
+        &self,
+        id: ContentId,
+    ) -> Result<(crate::codec::EnvelopeHeader, Vec<u8>), ContentStoreError> {
+        // Packed segments store raw content bytes, not envelopes. Check the
+        // segment catalog first — if content is there, synthesize a raw
+        // envelope header for the non-delta content.
+        let value = self
+            .catalog
+            .lock()
+            .map_err(|_| ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned")))?
+            .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), usize::MAX)
+            .map_err(|error| content_catalog_error(id, error))?;
+        if let Some((_kind, bytes)) = value {
+            let header = crate::codec::EnvelopeHeader {
+                codec: crate::codec::Codec::Raw,
+                stored_length: bytes.len() as u64,
+                logical_length: bytes.len() as u64,
+            };
+            return Ok((header, bytes));
+        }
+        // Fall back to loose content store (which uses envelope files).
+        self.content.read_local_raw_envelope(id)
     }
 }
 

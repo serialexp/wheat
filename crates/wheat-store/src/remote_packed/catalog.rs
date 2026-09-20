@@ -6,20 +6,24 @@ use std::sync::Arc;
 
 use object_store::{ObjectStore as BackendObjectStore, ObjectStoreExt, path::Path};
 use wheat_core::{
-    SegmentId, SegmentIndexEntry, decode_segment_catalog_record, encode_segment_catalog_record,
-    SegmentCatalogRecord,
+    SegmentCatalogRecord, SegmentId, SegmentIndexEntry, decode_segment_catalog_record,
+    encode_segment_catalog_record,
 };
 
 use crate::packed::segment::{SegmentError, SegmentReader};
 
-/// Entry in the in-memory locator index.
+/// Entry in the in-memory locator index. Physical codec and both lengths are
+/// retained so future reads can request exactly the stored range and allocate
+/// only after enforcing the logical bound.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // kind/offset/length reserved for future range-read optimization
+#[allow(dead_code)] // metadata reserved for future range-read optimization
 pub(super) struct LocatorEntry {
     pub segment_id: SegmentId,
     pub kind: u16,
     pub offset: u64,
-    pub length: u64,
+    pub codec: u8,
+    pub stored_length: u64,
+    pub logical_length: u64,
 }
 
 /// In-memory catalog state, reconstructed from the S3 catalog chain.
@@ -78,11 +82,12 @@ impl RemoteCatalog {
         // Walk the catalog chain from head to genesis, collecting records.
         let mut chain = Vec::new();
         let mut current_digest = Some(head_digest);
+        let mut current_generation = head.generation;
         while let Some(digest) = current_digest {
-            let gen_path =
-                Path::from(format!("{prefix}/catalog/{}-{}.catalog", chain.len(), hex::encode(digest)));
-            // Try the generation-based path first; fall back to scanning if
-            // the generation is unknown (we know the digest but not the gen).
+            let gen_path = Path::from(format!(
+                "{prefix}/catalog/{current_generation}-{}.catalog",
+                hex::encode(digest)
+            ));
             let catalog_bytes = match backend.get(&gen_path).await {
                 Ok(result) => result.bytes().await.map_err(CatalogError::Backend)?,
                 Err(object_store::Error::NotFound { .. }) => {
@@ -96,12 +101,15 @@ impl RemoteCatalog {
             let actual_digest = *blake3::hash(&catalog_bytes).as_bytes();
             if actual_digest != digest {
                 return Err(CatalogError::Corrupt(
-                    "catalog record digest does not match chain pointer",
+                    "catalog record digest does not match chain pointer".into(),
                 ));
             }
             let record = decode_segment_catalog_record(&catalog_bytes)
-                .map_err(|e| CatalogError::Corrupt(Box::leak(format!("decode catalog: {e}").into_boxed_str())))?;
+                .map_err(|error| CatalogError::Corrupt(format!("decode catalog: {error}")))?;
             current_digest = record.previous;
+            current_generation = current_generation
+                .checked_sub(1)
+                .ok_or_else(|| CatalogError::Corrupt("catalog generation underflow".into()))?;
             chain.push(record);
         }
 
@@ -116,8 +124,10 @@ impl RemoteCatalog {
             let segment_id = SegmentId(record.segment);
             segments.push(segment_id);
 
-            let seg_path =
-                Path::from(format!("{prefix}/segments/{}.segment", hex::encode(record.segment)));
+            let seg_path = Path::from(format!(
+                "{prefix}/segments/{}.segment",
+                hex::encode(record.segment)
+            ));
             let seg_bytes = backend
                 .get(&seg_path)
                 .await
@@ -139,7 +149,9 @@ impl RemoteCatalog {
                         segment_id,
                         kind: entry.kind,
                         offset: entry.offset,
-                        length: entry.length,
+                        codec: entry.codec,
+                        stored_length: entry.stored_length,
+                        logical_length: entry.logical_length,
                     },
                 );
             }
@@ -170,8 +182,10 @@ impl RemoteCatalog {
         let new_generation = self.head_generation + 1;
 
         // Upload the segment.
-        let seg_path =
-            Path::from(format!("{prefix}/segments/{}.segment", hex::encode(segment_id.0)));
+        let seg_path = Path::from(format!(
+            "{prefix}/segments/{}.segment",
+            hex::encode(segment_id.0)
+        ));
         backend
             .put(
                 &seg_path,
@@ -187,8 +201,8 @@ impl RemoteCatalog {
             segment: segment_id.0,
             stored_length: segment_bytes.len() as u64,
         };
-        let record_bytes =
-            encode_segment_catalog_record(&record).map_err(|e| CatalogError::Corrupt(Box::leak(format!("encode catalog: {e}").into_boxed_str())))?;
+        let record_bytes = encode_segment_catalog_record(&record)
+            .map_err(|error| CatalogError::Corrupt(format!("encode catalog: {error}")))?;
         let record_digest = *blake3::hash(&record_bytes).as_bytes();
         let cat_path = Path::from(format!(
             "{prefix}/catalog/{}-{}.catalog",
@@ -196,10 +210,7 @@ impl RemoteCatalog {
             hex::encode(record_digest)
         ));
         backend
-            .put(
-                &cat_path,
-                object_store::PutPayload::from(record_bytes),
-            )
+            .put(&cat_path, object_store::PutPayload::from(record_bytes))
             .await
             .map_err(CatalogError::Backend)?;
 
@@ -208,8 +219,7 @@ impl RemoteCatalog {
             generation: new_generation,
             digest: hex::encode(record_digest),
         };
-        let head_bytes =
-            serde_json::to_vec(&head_pointer).map_err(CatalogError::HeadFormat)?;
+        let head_bytes = serde_json::to_vec(&head_pointer).map_err(CatalogError::HeadFormat)?;
         let head_path = Path::from(format!("{prefix}/catalog/head"));
         backend
             .put(&head_path, object_store::PutPayload::from(head_bytes))
@@ -224,7 +234,9 @@ impl RemoteCatalog {
                     segment_id,
                     kind: entry.kind,
                     offset: entry.offset,
-                    length: entry.length,
+                    codec: entry.codec,
+                    stored_length: entry.stored_length,
+                    logical_length: entry.logical_length,
                 },
             );
         }
@@ -260,14 +272,17 @@ async fn find_catalog_record(
             return Ok(bytes);
         }
     }
-    Err(CatalogError::Corrupt("catalog record not found in chain"))
+    Err(CatalogError::Corrupt(
+        "catalog record not found in chain".into(),
+    ))
 }
 
 fn hex_to_digest(hex_str: &str) -> Result<[u8; 32], CatalogError> {
-    let bytes = hex::decode(hex_str).map_err(|_| CatalogError::Corrupt("invalid hex in head pointer"))?;
+    let bytes = hex::decode(hex_str)
+        .map_err(|_| CatalogError::Corrupt("invalid hex in head pointer".into()))?;
     bytes
         .try_into()
-        .map_err(|_| CatalogError::Corrupt("head pointer digest is not 32 bytes"))
+        .map_err(|_| CatalogError::Corrupt("head pointer digest is not 32 bytes".into()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -279,7 +294,7 @@ pub(super) enum CatalogError {
     #[error("segment error: {0}")]
     Segment(#[from] SegmentError),
     #[error("catalog corrupt: {0}")]
-    Corrupt(&'static str),
+    Corrupt(String),
     #[error("head pointer format error: {0}")]
     HeadFormat(#[from] serde_json::Error),
 }

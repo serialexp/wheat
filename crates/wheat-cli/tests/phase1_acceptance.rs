@@ -878,8 +878,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         "changes",
     ] {
         assert_eq!(
-            reopened["result"][key],
-            expected_reopened["result"][key],
+            reopened["result"][key], expected_reopened["result"][key],
             "reopened status field '{key}' mismatch"
         );
     }

@@ -4877,7 +4877,9 @@ pub struct SegmentIndexEntryV1 {
     pub kind: u16,
     pub digest: Digest256,
     pub offset: u64,
-    pub length: u64,
+    pub codec: u8,
+    pub stored_length: u64,
+    pub logical_length: u64,
 }
 
 impl SegmentIndexEntryV1 {
@@ -4892,7 +4894,9 @@ impl SegmentIndexEntryV1 {
         encoder.write_u16_be(self.kind);
         self.digest.encode_into(encoder)?;
         encoder.write_u64_be(self.offset);
-        encoder.write_u64_be(self.length);
+        encoder.write_byte(self.codec);
+        encoder.write_u64_be(self.stored_length);
+        encoder.write_u64_be(self.logical_length);
         Ok(())
     }
 
@@ -4906,13 +4910,17 @@ impl SegmentIndexEntryV1 {
         let kind = decoder.read_u16_be()?;
         let digest = Digest256::decode_with_decoder(decoder)?;
         let offset = decoder.read_u64_be()?;
-        let length = decoder.read_u64_be()?;
+        let codec = decoder.read_byte()?;
+        let stored_length = decoder.read_u64_be()?;
+        let logical_length = decoder.read_u64_be()?;
         Ok(Self {
             namespace,
             kind,
             digest,
             offset,
-            length,
+            codec,
+            stored_length,
+            logical_length,
         })
     }
 }

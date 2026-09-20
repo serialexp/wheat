@@ -11,11 +11,29 @@ use wheat_binschema::generated as wire;
 
 pub const SEGMENT_PREFIX_ENCODED_SIZE: usize = 6;
 pub const SEGMENT_FOOTER_ENCODED_SIZE: usize = 78;
-const INDEX_ENTRY_SIZE: usize = 51;
+const INDEX_ENTRY_SIZE: usize = 60;
 const DIRECTORY_ENTRY_SIZE: usize = 81;
 
 pub const SEGMENT_NAMESPACE_METADATA: u8 = 1;
 pub const SEGMENT_NAMESPACE_CONTENT: u8 = 2;
+
+/// Physical payload codec. Each zstd payload is exactly one independent frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(u8)]
+pub enum SegmentCodec {
+    Raw = 0,
+    Zstd = 1,
+}
+
+impl SegmentCodec {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Raw),
+            1 => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SegmentId(pub [u8; 32]);
@@ -27,8 +45,10 @@ pub struct SegmentIndexEntry {
     pub kind: u16,
     pub digest: [u8; 32],
     pub offset: u64,
-    /// Stored and logical lengths are identical until codecs are introduced.
-    pub length: u64,
+    /// [`SegmentCodec`] numeric identity (`Raw = 0`, `Zstd = 1`).
+    pub codec: u8,
+    pub stored_length: u64,
+    pub logical_length: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,6 +162,10 @@ pub enum SegmentRecordError {
     NonCanonicalEncoding,
     #[error("invalid segment index namespace/kind combination ({namespace}, {kind})")]
     InvalidNamespaceKind { namespace: u8, kind: u16 },
+    #[error("invalid segment payload codec {0}")]
+    InvalidCodec(u8),
+    #[error("raw segment payload has unequal stored and logical lengths")]
+    InvalidRawLengths,
     #[error("segment record count cannot fit in supplied bytes")]
     InvalidCount,
 }
@@ -178,6 +202,11 @@ fn valid_entry(e: &SegmentIndexEntry) -> Result<(), SegmentRecordError> {
             kind: e.kind,
         });
     }
+    let codec =
+        SegmentCodec::from_code(e.codec).ok_or(SegmentRecordError::InvalidCodec(e.codec))?;
+    if codec == SegmentCodec::Raw && e.stored_length != e.logical_length {
+        return Err(SegmentRecordError::InvalidRawLengths);
+    }
     Ok(())
 }
 
@@ -198,7 +227,9 @@ fn entry_wire(e: &SegmentIndexEntry) -> wire::SegmentIndexEntryV1 {
         kind: e.kind,
         digest: digest(e.digest),
         offset: e.offset,
-        length: e.length,
+        codec: e.codec,
+        stored_length: e.stored_length,
+        logical_length: e.logical_length,
     }
 }
 pub fn encode_segment_index_page(page: &SegmentIndexPage) -> Result<Vec<u8>, SegmentRecordError> {
@@ -223,7 +254,9 @@ pub fn decode_segment_index_page(bytes: &[u8]) -> Result<SegmentIndexPage, Segme
             kind: e.kind,
             digest: digest_array(e.digest)?,
             offset: e.offset,
-            length: e.length,
+            codec: e.codec,
+            stored_length: e.stored_length,
+            logical_length: e.logical_length,
         };
         valid_entry(&e)?;
         entries.push(e);

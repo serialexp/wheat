@@ -7,7 +7,9 @@ CREATE TABLE locator (
     digest BLOB NOT NULL CHECK(length(digest) = 32),
     kind INTEGER NOT NULL,
     offset INTEGER NOT NULL CHECK(offset >= 0),
-    length INTEGER NOT NULL CHECK(length >= 0),
+    codec INTEGER NOT NULL CHECK(codec IN (0, 1)),
+    stored_length INTEGER NOT NULL CHECK(stored_length >= 0),
+    logical_length INTEGER NOT NULL CHECK(logical_length >= 0),
     source_id INTEGER NOT NULL REFERENCES physical_source(id),
     PRIMARY KEY (namespace, digest)
 ) WITHOUT ROWID;
@@ -34,4 +36,4 @@ CREATE TABLE checkpoint (
     CHECK((active_id IS NULL) = (active_directory_length IS NULL))
 );
 INSERT INTO checkpoint(singleton) VALUES(1);
-PRAGMA user_version = 2;
+PRAGMA user_version = 4;

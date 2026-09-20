@@ -82,9 +82,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                     }
                     RetainedSetDelta::Removed(_) => {
                         if !options.allow_non_monotonic {
-                            return Err(invalid(
-                                "publication drops retained history",
-                            ));
+                            return Err(invalid("publication drops retained history"));
                         }
                     }
                 }
@@ -119,9 +117,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                     } => {
                         let oid = ObjectId::from_digest(*object.as_bytes());
                         if !added_objects.contains(&oid)
-                            && !retained
-                                .contains(baseline.retained_changes, oid)
-                                .await?
+                            && !retained.contains(baseline.retained_changes, oid).await?
                         {
                             return Err(invalid(
                                 "change map references object not in retained changes",
@@ -130,9 +126,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                     }
                     crate::change_map::ChangeMapDelta::Removed { .. } => {
                         if !options.allow_non_monotonic {
-                            return Err(invalid(
-                                "publication drops change-map entries",
-                            ));
+                            return Err(invalid("publication drops change-map entries"));
                         }
                     }
                 }
@@ -197,9 +191,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                     while let Some((_change_id, revision_id)) = cursor.next().await? {
                         let oid = ObjectId::from_digest(*revision_id.as_bytes());
                         if !added_objects.contains(&oid)
-                            && !retained
-                                .contains(baseline.retained_revisions, oid)
-                                .await?
+                            && !retained.contains(baseline.retained_revisions, oid).await?
                         {
                             return Err(invalid(
                                 "view revision map references non-retained revision",

@@ -102,13 +102,7 @@ pub(crate) fn walk_workspace(
     };
 
     ignore_stack.push_directory(workspace_root);
-    walk_directory(
-        workspace_root,
-        &String::new(),
-        0,
-        ignore_stack,
-        &mut state,
-    );
+    walk_directory(workspace_root, &String::new(), 0, ignore_stack, &mut state);
     ignore_stack.pop_directory();
 
     Ok(WorkspaceWalkResult {
@@ -257,16 +251,21 @@ fn walk_directory(
             break;
         }
         ignore_stack.push_directory(&subdir_path);
-        walk_directory(&subdir_path, &subdir_prefix, child_depth, ignore_stack, state);
+        walk_directory(
+            &subdir_path,
+            &subdir_prefix,
+            child_depth,
+            ignore_stack,
+            state,
+        );
         ignore_stack.pop_directory();
     }
 }
 
 /// Read a directory and return its entries sorted by name.
 fn read_dir_sorted(path: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
-    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(path)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(std::fs::DirEntry::file_name);
     Ok(entries)
 }

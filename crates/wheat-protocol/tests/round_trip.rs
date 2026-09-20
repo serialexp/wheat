@@ -2,10 +2,10 @@
 
 use wheat_protocol::{
     CreditOutput, Digest256, ErrorOutput, ErrorScope, ErrorScopeConnectionOutput,
-    FetchCompleteOutput, FetchRequestOutput, ObjectBatchOutput, ObjectEntry,
-    PublishRequestOutput, PublishResultOutput, PublishResultStatus, PublishStatusOkOutput,
-    RepositoryOpenOutput, ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus,
-    SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message, encode_message,
+    FetchCompleteOutput, FetchRequestOutput, ObjectBatchOutput, ObjectEntry, PublishRequestOutput,
+    PublishResultOutput, PublishResultStatus, PublishStatusOkOutput, RepositoryOpenOutput,
+    ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus, SessionStatusOkOutput,
+    Uuid128, WheatProtocolMessage, decode_message, encode_message,
 };
 
 fn zero_digest() -> Digest256 {
@@ -54,7 +54,9 @@ fn object_batch_round_trip() {
         op_id: 1,
         sequence: 0,
         objects: vec![ObjectEntry {
-            id: Digest256 { bytes: vec![0xff; 32] },
+            id: Digest256 {
+                bytes: vec![0xff; 32],
+            },
             data: vec![1, 2, 3, 4],
         }],
     });

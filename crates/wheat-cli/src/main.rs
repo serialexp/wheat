@@ -31,6 +31,8 @@ mod label_service;
 mod local;
 mod log_inspection;
 mod materialization;
+mod remote;
+mod remote_config;
 mod repository_diff;
 mod selection_recovery;
 mod workspace;
@@ -39,8 +41,6 @@ mod workspace_files;
 mod workspace_metadata;
 mod workspace_scan;
 mod workspace_status;
-mod remote;
-mod remote_config;
 mod workspace_walk;
 use command_output::{
     CliFailure, OutputFormat, Success, clap_error, emit_error, emit_success, requested_format,
@@ -1907,9 +1907,7 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
         let content_count =
             remote::fetch_content(&mut session, 2, &objects, &content, state.envelope).await?;
 
-        eprintln!(
-            "fetched {obj_count} objects, {content_count} content blobs"
-        );
+        eprintln!("fetched {obj_count} objects, {content_count} content blobs");
 
         remote::close(&mut session).await?;
         // Pick the first label as the active label, or "main" as default.
@@ -2075,8 +2073,7 @@ fn native_fetch(
 
     let human = format!(
         "fetched {obj_count} objects, {content_count} content blobs\nupdated to generation {}, envelope {}\n",
-        new_head.generation,
-        new_head.envelope,
+        new_head.generation, new_head.envelope,
     );
     Success::new(
         "fetch",
@@ -2104,11 +2101,15 @@ fn native_publish(
     let (parsed, mut remote_cfg) = if let Some(url) = arguments.remote.as_deref() {
         let parsed = remote::parse_wheat_url(url)?;
         // If no remote.json exists, create one (first publish of a locally-initialized repo).
-        let cfg = remote_config::RemoteConfig::read(&context.store_root)?
-            .unwrap_or_else(|| remote_config::RemoteConfig::new(url, &wheat_store::RepositoryHead {
-                generation: 0,
-                envelope: wheat_core::RepositoryEnvelopeId::from_digest([0u8; 32]),
-            }));
+        let cfg = remote_config::RemoteConfig::read(&context.store_root)?.unwrap_or_else(|| {
+            remote_config::RemoteConfig::new(
+                url,
+                &wheat_store::RepositoryHead {
+                    generation: 0,
+                    envelope: wheat_core::RepositoryEnvelopeId::from_digest([0u8; 32]),
+                },
+            )
+        });
         (parsed, cfg)
     } else {
         resolve_remote(&context.store_root, None)?
@@ -2122,13 +2123,11 @@ fn native_publish(
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         // Check that the remote hasn't advanced past what we last fetched.
-        if state.generation != last_fetched.generation
-            || state.envelope != last_fetched.envelope
-        {
+        if state.generation != last_fetched.generation || state.envelope != last_fetched.envelope {
             // Special case: if this is a first publish (last_fetched is all zeros),
             // we use the remote's current state as the expected head.
-            let is_first_publish = last_fetched.generation == 0
-                && *last_fetched.envelope.as_bytes() == [0u8; 32];
+            let is_first_publish =
+                last_fetched.generation == 0 && *last_fetched.envelope.as_bytes() == [0u8; 32];
             if !is_first_publish {
                 remote::close(&mut session).await?;
                 bail!(
@@ -2176,9 +2175,8 @@ fn native_publish(
             }
             remote_cfg.write(&context.store_root)?;
 
-            let human = format!(
-                "published to generation {new_generation}, envelope {new_envelope}\n"
-            );
+            let human =
+                format!("published to generation {new_generation}, envelope {new_envelope}\n");
             Success::new(
                 "publish",
                 json!({

@@ -4,11 +4,13 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
+use std::collections::HashMap;
+
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
-    ImmutableObjectStore, PublicationError, PublicationStore, RepositoryHead, RepositoryReader,
-    TransitionValidationOptions,
+    ImmutableObjectStore, MerkleTreeStore, PublicationError, PublicationStore, RepositoryHead,
+    RepositoryReader, TransitionValidationOptions, TreeDiffLimits,
 };
 
 use crate::connection::ConnectionError;
@@ -326,12 +328,28 @@ pub async fn handle_publish(
             }
         }
 
-        // Store all content in one batch — concurrent S3 PUTs for remote
-        // backends, parallel local writes for filesystem backends.
+        // Store all content, with delta compression when possible.
+        //
+        // Diff the old and new trees to find which files changed, then use
+        // the old ContentId as a delta base for each new ContentId. This
+        // produces much smaller stored objects for typical edits.
         if !content_batch.is_empty() {
-            entry.content.put_many(content_batch, 8).map_err(|e| {
-                ConnectionError::Internal(format!("failed to store content batch: {e}"))
-            })?;
+            let base_map =
+                compute_delta_base_map(&entry.objects, &reader, current_head, &envelope_record)
+                    .await;
+            let with_bases: Vec<(ContentId, Vec<u8>, Option<ContentId>)> = content_batch
+                .into_iter()
+                .map(|(id, bytes)| {
+                    let base = base_map.get(&id).copied();
+                    (id, bytes, base)
+                })
+                .collect();
+            entry
+                .content
+                .put_many_with_bases(with_bases, 8)
+                .map_err(|e| {
+                    ConnectionError::Internal(format!("failed to store content batch: {e}"))
+                })?;
         }
     }
 
@@ -628,4 +646,58 @@ async fn walk_retained_sets(
     }
 
     Ok(retained)
+}
+
+/// Diff old and new Merkle trees to find `new_content → old_content` base
+/// mappings for delta compression. Falls back to an empty map on any error
+/// (delta compression is an optimization, not a correctness requirement).
+#[expect(clippy::borrowed_box, reason = "MerkleTreeStore requires Sized, so &Box<dyn> is needed")]
+async fn compute_delta_base_map(
+    objects: &Box<dyn ImmutableObjectStore>,
+    reader: &RepositoryReader<'_, Box<dyn ImmutableObjectStore>>,
+    current_head: &RepositoryHead,
+    proposed_envelope: &wheat_core::RepositoryEnvelopeRecord,
+) -> HashMap<ContentId, ContentId> {
+    let mut base_map = HashMap::new();
+
+    // Read old tree.
+    let old_envelope = match reader.envelope(current_head.envelope).await {
+        Ok(e) => e,
+        Err(_) => return base_map,
+    };
+    let old_state = match reader.state(old_envelope.state).await {
+        Ok(s) => s,
+        Err(_) => return base_map,
+    };
+    let old_view = match reader.view(old_state.base_view).await {
+        Ok(v) => v,
+        Err(_) => return base_map,
+    };
+
+    // Read new tree.
+    let new_state = match reader.state(proposed_envelope.state).await {
+        Ok(s) => s,
+        Err(_) => return base_map,
+    };
+    let new_view = match reader.view(new_state.base_view).await {
+        Ok(v) => v,
+        Err(_) => return base_map,
+    };
+
+    if old_view.tree == new_view.tree {
+        return base_map; // No tree changes.
+    }
+
+    // Walk the diff — O(changed files), skips identical subtrees.
+    let trees = MerkleTreeStore::new(objects);
+    let mut diff_cursor = trees.diff_cursor(old_view.tree, new_view.tree, TreeDiffLimits::default());
+    while let Ok(Some(diff)) = diff_cursor.next().await {
+        if let (Some(old_value), Some(new_value)) = (&diff.old, &diff.new)
+            && old_value.content != new_value.content
+        {
+            base_map.insert(new_value.content, old_value.content);
+        }
+    }
+
+    base_map
 }

@@ -79,7 +79,10 @@ async fn put_seal_get_round_trip() {
         assert_eq!(&*stored.canonical_bytes, expected_bytes);
     }
 
-    eprintln!("put_seal_get_round_trip: {} objects stored and retrieved", objects.len());
+    eprintln!(
+        "put_seal_get_round_trip: {} objects stored and retrieved",
+        objects.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -111,7 +114,10 @@ async fn catalog_chain_survives_reopen() {
         }
     }
 
-    eprintln!("catalog_chain_survives_reopen: {} objects survived re-open", objects.len());
+    eprintln!(
+        "catalog_chain_survives_reopen: {} objects survived re-open",
+        objects.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

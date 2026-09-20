@@ -510,8 +510,14 @@ fn classify(error: &Error) -> Classification {
             return match content {
                 ContentStoreError::TooLarge { .. } => class("limit", "content_too_large", false, 5),
                 ContentStoreError::Missing(_) => class("integrity", "missing_content", false, 6),
-                ContentStoreError::Corrupt { .. } | ContentStoreError::Changed { .. } => {
+                ContentStoreError::Changed { .. } => class("state", "content_changed", true, 3),
+                ContentStoreError::Corrupt { .. }
+                | ContentStoreError::InvalidFormat { .. }
+                | ContentStoreError::DeltaResolution { .. } => {
                     class("integrity", "corrupt_content", false, 6)
+                }
+                ContentStoreError::DeltaChainTooDeep { .. } => {
+                    class("integrity", "delta_chain_too_deep", false, 6)
                 }
                 ContentStoreError::Io(_) => class("io", "io_failure", true, 8),
             };
@@ -519,11 +525,12 @@ fn classify(error: &Error) -> Classification {
         if let Some(object) = cause.downcast_ref::<ObjectStoreError>() {
             return match object {
                 ObjectStoreError::Missing(_) => class("integrity", "missing_object", false, 6),
+                ObjectStoreError::Changed { .. } => class("state", "object_changed", true, 3),
                 ObjectStoreError::WrongKind { .. }
                 | ObjectStoreError::Corrupt { .. }
-                | ObjectStoreError::InvalidFormat(_) => {
-                    class("integrity", "corrupt_object", false, 6)
-                }
+                | ObjectStoreError::InvalidFormat(_)
+                | ObjectStoreError::InvalidEnvelope { .. }
+                | ObjectStoreError::Integrity(_) => class("integrity", "corrupt_object", false, 6),
                 ObjectStoreError::Backend(_) => {
                     class("transport", "storage_backend_failure", true, 8)
                 }

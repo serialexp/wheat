@@ -531,7 +531,11 @@
         { name: "kind", type: "uint16" },
         { name: "digest", type: "Digest256" },
         { name: "offset", type: "uint64" },
-        { name: "length", type: "uint64" },
+        // Codec identity is part of every physical record. 0 = raw, 1 = one
+        // independent zstd frame. Identity remains over the logical bytes.
+        { name: "codec", type: "uint8" },
+        { name: "stored_length", type: "uint64" },
+        { name: "logical_length", type: "uint64" },
       ],
     },
     SegmentIndexPageV1: {

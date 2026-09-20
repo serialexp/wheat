@@ -73,10 +73,7 @@ impl IgnoreStack {
     /// `global_ignore` is the optional user-global ignore file content.
     /// `global_path` is its filesystem path (for diagnostics).
     /// `excludes` are command-line `--exclude` patterns.
-    pub fn new(
-        global_ignore: Option<(&str, PathBuf)>,
-        excludes: &[String],
-    ) -> Self {
+    pub fn new(global_ignore: Option<(&str, PathBuf)>, excludes: &[String]) -> Self {
         let mut layers = Vec::new();
 
         // User-global ignore (lowest precedence of the persistent layers).
@@ -151,8 +148,7 @@ impl IgnoreStack {
     pub fn pop_directory(&mut self) {
         assert!(self.current_depth > 0, "cannot pop below root depth");
         // Remove all layers at the current depth.
-        self.layers
-            .retain(|layer| layer.depth < self.current_depth);
+        self.layers.retain(|layer| layer.depth < self.current_depth);
         self.current_depth -= 1;
     }
 
@@ -231,7 +227,10 @@ mod tests {
     #[test]
     fn global_ignore() {
         let stack = IgnoreStack::new(
-            Some(("*.bak\n*.swp", PathBuf::from("/home/user/.config/wheat/ignore"))),
+            Some((
+                "*.bak\n*.swp",
+                PathBuf::from("/home/user/.config/wheat/ignore"),
+            )),
             &[],
         );
         assert!(stack.is_ignored("file.bak", false).is_ignored());

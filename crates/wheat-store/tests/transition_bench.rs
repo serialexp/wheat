@@ -139,7 +139,9 @@ async fn validate_transition_vs_validate_complete() {
     let delta_count = env_usize("WHEAT_BENCH_DELTA_CHANGES", 5);
     let samples = env_usize("WHEAT_BENCH_SAMPLES", 3).max(1);
 
-    println!("Building repository: {baseline_count} baseline changes + {delta_count} delta changes");
+    println!(
+        "Building repository: {baseline_count} baseline changes + {delta_count} delta changes"
+    );
     let dir = tempfile::tempdir().unwrap();
     let (objects, content, heads) = stores(dir.path());
 
@@ -192,7 +194,9 @@ async fn validate_transition_vs_validate_complete() {
 
     println!();
     println!("=== Transition Validation Benchmark ===");
-    println!("Baseline: {baseline_count} changes, Delta: {delta_count} changes, Samples: {samples}");
+    println!(
+        "Baseline: {baseline_count} changes, Delta: {delta_count} changes, Samples: {samples}"
+    );
     println!();
     println!(
         "validate_transition (O(delta)):      median {:.6}s  (all: {})",

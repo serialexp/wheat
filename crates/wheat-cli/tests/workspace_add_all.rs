@@ -67,7 +67,10 @@ impl Harness {
         git(Some(&git_dir), &["init", "--bare"]);
 
         let work = self.root.path().join("source-work");
-        git(None, &["clone", git_dir.to_str().unwrap(), work.to_str().unwrap()]);
+        git(
+            None,
+            &["clone", git_dir.to_str().unwrap(), work.to_str().unwrap()],
+        );
         for (path, content) in files {
             let full_path = work.join(path);
             if let Some(parent) = full_path.parent() {
@@ -129,7 +132,11 @@ fn add_all_captures_modified_tracked_paths() {
     h.ok(&h.workspace, &["change", "new", "-m", "update files"]);
 
     // Modify two tracked files, leave one unchanged.
-    fs::write(h.workspace.join("src/main.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+    fs::write(
+        h.workspace.join("src/main.rs"),
+        "fn main() { println!(\"hi\"); }\n",
+    )
+    .unwrap();
     fs::write(h.workspace.join("README.md"), "# Updated Project\n").unwrap();
 
     // Add --all should capture the two modified files.
@@ -213,10 +220,7 @@ fn add_all_excludes_untracked_files() {
 #[test]
 fn add_all_captures_deleted_tracked_paths() {
     let h = Harness::new();
-    h.init_from_git(&[
-        ("keep.txt", "keep\n"),
-        ("remove.txt", "will be deleted\n"),
-    ]);
+    h.init_from_git(&[("keep.txt", "keep\n"), ("remove.txt", "will be deleted\n")]);
     h.ok(&h.workspace, &["change", "new", "-m", "delete a file"]);
 
     // Delete a tracked file.

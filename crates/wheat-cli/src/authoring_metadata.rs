@@ -334,9 +334,7 @@ fn read_optional(path: &Path) -> Result<Option<Config>> {
     let config: Config =
         serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
     ensure!(
-        config.format == CONFIG_FORMAT
-            && config.version >= 1
-            && config.version <= CONFIG_VERSION,
+        config.format == CONFIG_FORMAT && config.version >= 1 && config.version <= CONFIG_VERSION,
         "unsupported Wheat config at {} (format={:?}, version={})",
         path.display(),
         config.format,

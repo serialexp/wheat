@@ -23,6 +23,8 @@ use wheat_core::{
     validate_canonical_object,
 };
 
+use crate::codec::{self, Codec, PhysicalPayload};
+
 /// Hard decode/allocation ceiling for a V1 segment. Active packs seal in this
 /// same format, so readers must accept the active-pack policy bounds.
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 1_000_000;
@@ -42,6 +44,18 @@ pub(crate) struct SegmentRecord<'a> {
     pub kind: u16,
     pub digest: [u8; 32],
     pub bytes: &'a [u8],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSegmentRecord<'a> {
+    pub logical: SegmentRecord<'a>,
+    pub physical: PhysicalPayload,
+}
+
+impl PreparedSegmentRecord<'_> {
+    pub(crate) fn stored_length(&self) -> u64 {
+        self.physical.bytes.len() as u64
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,10 +101,22 @@ pub(crate) enum SegmentError {
     WrongKind,
     #[error("canonical metadata object failed validation: {0}")]
     Canonical(#[from] CanonicalObjectError),
+    #[error("segment payload codec failed: {0}")]
+    Codec(#[from] codec::CodecError),
 }
 
 pub(super) fn key(entry: &SegmentIndexEntry) -> (u8, [u8; 32]) {
     (entry.namespace, entry.digest)
+}
+
+pub(crate) fn prepare_record(
+    record: SegmentRecord<'_>,
+) -> Result<PreparedSegmentRecord<'_>, SegmentError> {
+    validate_record(record)?;
+    Ok(PreparedSegmentRecord {
+        logical: record,
+        physical: codec::prepare(record.bytes)?,
+    })
 }
 
 fn directory_key(entry: &SegmentDirectoryEntry) -> (u8, [u8; 32]) {
@@ -135,7 +161,7 @@ pub(crate) fn projected_total_length(
     let pages = u64::try_from(entry_count.div_ceil(MAX_INDEX_PAGE_ENTRIES))
         .map_err(|_| SegmentError::TooManyEntries)?;
     // Both page and directory records have a four-byte count prefix.
-    let page_bytes = count.checked_mul(51).and_then(|n| n.checked_add(pages * 4));
+    let page_bytes = count.checked_mul(60).and_then(|n| n.checked_add(pages * 4));
     let directory_bytes = pages.checked_mul(81).and_then(|n| n.checked_add(4));
     let tail_bytes = page_bytes
         .and_then(|pages| directory_bytes.and_then(|directory| pages.checked_add(directory)))
@@ -172,29 +198,40 @@ impl SegmentBuilder {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn push(&mut self, record: SegmentRecord<'_>) -> Result<(), SegmentError> {
+        self.push_prepared(prepare_record(record)?)
+    }
+
+    pub(crate) fn push_prepared(
+        &mut self,
+        prepared: PreparedSegmentRecord<'_>,
+    ) -> Result<(), SegmentError> {
         if self.entries.len() == MAX_SEGMENT_ENTRIES {
             return Err(SegmentError::TooManyEntries);
         }
-        validate_record(record)?;
-        let length = u64::try_from(record.bytes.len()).map_err(|_| SegmentError::TooLarge)?;
+        let record = prepared.logical;
+        let physical = prepared.physical;
+        let stored_length = physical.bytes.len() as u64;
         if self
             .payload_bytes
-            .checked_add(length)
+            .checked_add(stored_length)
             .filter(|n| *n <= MAX_SEGMENT_PAYLOAD_BYTES)
             .is_none()
         {
             return Err(SegmentError::TooLarge);
         }
         let offset = PREFIX_LEN + self.payload_bytes;
-        self.file.write_all(record.bytes)?;
-        self.payload_bytes += length;
+        self.file.write_all(&physical.bytes)?;
+        self.payload_bytes += stored_length;
         self.entries.push(SegmentIndexEntry {
             namespace: record.namespace,
             kind: record.kind,
             digest: record.digest,
             offset,
-            length,
+            codec: physical.codec.to_byte(),
+            stored_length,
+            logical_length: physical.logical_length,
         });
         Ok(())
     }
@@ -416,18 +453,19 @@ impl SegmentReader {
         // Empty payloads can share an offset with the following non-empty payload;
         // order zero-length entries first so key sorting cannot make valid coverage
         // appear overlapping.
-        all_entries.sort_unstable_by_key(|entry| (entry.offset, entry.length));
+        all_entries.sort_unstable_by_key(|entry| (entry.offset, entry.stored_length));
         let mut next_payload_offset = PREFIX_LEN;
         for entry in &all_entries {
-            if entry.offset != next_payload_offset
+            if entry.logical_length > codec::HARD_LOGICAL_RECORD_BYTES as u64
+                || entry.offset != next_payload_offset
                 || entry
                     .offset
-                    .checked_add(entry.length)
+                    .checked_add(entry.stored_length)
                     .is_none_or(|end| end > footer.index_start)
             {
-                return Err(SegmentError::Format("payload offsets"));
+                return Err(SegmentError::Format("payload offsets or logical length"));
             }
-            next_payload_offset = entry.offset + entry.length;
+            next_payload_offset = entry.offset + entry.stored_length;
         }
         if next_payload_offset != footer.index_start {
             return Err(SegmentError::Format("payload coverage"));
@@ -475,13 +513,22 @@ impl SegmentReader {
             return Ok(None);
         };
         let entry = &self.entries_by_key[index];
-        let length = usize::try_from(entry.length).map_err(|_| SegmentError::ReadLimit {
-            minimum: usize::MAX,
-        })?;
-        if length > max {
-            return Err(SegmentError::ReadLimit { minimum: length });
+        let logical_length =
+            usize::try_from(entry.logical_length).map_err(|_| SegmentError::ReadLimit {
+                minimum: usize::MAX,
+            })?;
+        if logical_length > max {
+            return Err(SegmentError::ReadLimit {
+                minimum: logical_length,
+            });
         }
-        let bytes = read_range(&mut self.file, entry.offset, entry.length)?;
+        let stored = read_range(&mut self.file, entry.offset, entry.stored_length)?;
+        let bytes = codec::decode(
+            Codec::from_byte(entry.codec)?,
+            stored,
+            entry.logical_length,
+            max,
+        )?;
         verify_logical(entry, &bytes)?;
         Ok(Some((entry, bytes)))
     }
@@ -727,7 +774,9 @@ mod tests {
                     kind: wrong_known_kind,
                     digest,
                     offset: 0,
-                    length: canonical.len() as u64,
+                    codec: 0,
+                    stored_length: canonical.len() as u64,
+                    logical_length: canonical.len() as u64,
                 },
                 &canonical,
             ),
@@ -817,7 +866,7 @@ mod tests {
         replace_page(&mut raw, |page| page.entries[0].offset += 1);
         assert!(matches!(
             SegmentReader::open(file_with_bytes(&raw)),
-            Err(SegmentError::Format("payload offsets"))
+            Err(SegmentError::Format("payload offsets or logical length"))
         ));
     }
 }

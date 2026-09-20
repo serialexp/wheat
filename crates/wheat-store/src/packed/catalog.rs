@@ -26,8 +26,8 @@ use super::{
     active::{ActiveError, ActivePublishedState, ActiveRecoveryJournal, ActiveSegment},
     bulk::{BulkSegment, FinalizedBulk},
     segment::{
-        MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, SegmentError, SegmentReader,
-        SegmentRecord, verify_logical,
+        MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, PreparedSegmentRecord, SegmentError,
+        SegmentReader, SegmentRecord, prepare_record, verify_logical,
     },
     trace::PackedStoreTraceCounters,
 };
@@ -35,7 +35,7 @@ use crate::Durability;
 
 const SCHEMA: &str = include_str!("catalog_sql/schema.sql");
 const LOOKUP: &str = include_str!("catalog_sql/lookup.sql");
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SEGMENT_SUFFIX: &str = ".segment";
 const CATALOG_SUFFIX: &str = ".catalog";
 const CATALOG_HEAD_FILE: &str = "catalog.head";
@@ -92,6 +92,7 @@ struct DeferredBulk {
 
 type CatalogHead = Option<(u64, [u8; 32])>;
 type CatalogCheckpoint = (CatalogHead, ActivePublishedState, u64);
+type LocatorRow = (u16, u64, u8, u64, u64, String);
 
 /// A process-exclusive writer/read facade over a packed-store root.
 pub(crate) struct PackedCatalog {
@@ -434,25 +435,29 @@ impl PackedCatalog {
         if pending.is_empty() {
             return Ok(());
         }
+        // Prepare every new logical record exactly once. Partitioning and all
+        // downstream writers operate on these stored bytes, while duplicate and
+        // existing-key checks above deliberately compare the logical bytes.
+        let mut prepared = pending
+            .into_iter()
+            .map(prepare_record)
+            .collect::<Result<Vec<_>, _>>()?;
         // Reject any individually impossible record before sealing or appending
         // earlier records from this call. The target is advisory for one record,
-        // but the format's count and payload bounds are not.
-        for record in &pending {
-            let length = u64::try_from(record.bytes.len()).map_err(|_| SegmentError::TooLarge)?;
-            self.projected_physical_size(0, 0, 1, length)?;
+        // but the format's count and stored-payload bounds are not.
+        for record in &prepared {
+            self.projected_physical_size(0, 0, 1, record.stored_length())?;
         }
 
         // Partition at the catalog boundary. Adapters may submit arbitrarily
         // large batches; each active append remains bounded by the format and
         // target, while a record which cannot fit an empty segment still fails.
         let mut start = 0;
-        while start < pending.len() {
+        while start < prepared.len() {
             let mut end = start;
             let mut payload = 0_u64;
-            while end < pending.len() {
-                let length =
-                    u64::try_from(pending[end].bytes.len()).map_err(|_| SegmentError::TooLarge)?;
-                let Some(next_payload) = payload.checked_add(length) else {
+            while end < prepared.len() {
+                let Some(next_payload) = payload.checked_add(prepared[end].stored_length()) else {
                     break;
                 };
                 let projected = self.projected_physical_size(
@@ -482,9 +487,9 @@ impl PackedCatalog {
             if end == start {
                 return Err(SegmentError::TooLarge.into());
             }
-            self.append_active_batch(&pending[start..end])?;
-            start = end;
-            if start < pending.len()
+            self.append_active_batch(prepared.drain(start..end).collect())?;
+            start = 0;
+            if !prepared.is_empty()
                 || self.active.state().metadata.total_length >= self.active_target_bytes
                 || self.active.should_seal()
             {
@@ -516,14 +521,19 @@ impl PackedCatalog {
         Ok(super::segment::projected_total_length(count, payload)?)
     }
 
-    fn append_active_batch(&mut self, records: &[SegmentRecord<'_>]) -> Result<(), CatalogError> {
+    fn append_active_batch(
+        &mut self,
+        records: Vec<PreparedSegmentRecord<'_>>,
+    ) -> Result<(), CatalogError> {
         let intended_generation = self
             .active
             .state()
             .generation
             .checked_add(1)
             .ok_or(CatalogError::Corrupt("active generation overflow"))?;
-        let prepared = self.active.prepare_append(records, intended_generation)?;
+        let prepared = self
+            .active
+            .prepare_prepared_append(records, intended_generation)?;
         let journal = prepared.journal().clone();
         // Every operation from journal publication onward can leave observable
         // state behind even when it returns an error. Keep this instance closed
@@ -574,8 +584,8 @@ impl PackedCatalog {
                 }
                 continue;
             }
-            let record_length = u64::try_from(record.bytes.len())
-                .map_err(|_| CatalogError::Corrupt("bulk payload overflow"))?;
+            let prepared = prepare_record(*record)?;
+            let record_length = prepared.stored_length();
             if self.bulk.is_none() {
                 self.create_bulk()?;
             }
@@ -600,7 +610,7 @@ impl PackedCatalog {
             // transaction also commits.
             self.poisoned = true;
             let append_started = Instant::now();
-            let entry = bulk.segment.append_one(*record)?;
+            let entry = bulk.segment.append_prepared(prepared)?;
             if let Some(trace) = &self.trace {
                 trace.deferred_append();
                 trace.deferred_append_duration(append_started.elapsed());
@@ -761,11 +771,18 @@ impl PackedCatalog {
             return Ok(Some(value));
         }
         for attempt in 0..2 {
-            let location = (|| -> Result<Option<(u16, u64, u64, String)>, CatalogError> {
+            let location = (|| -> Result<Option<LocatorRow>, CatalogError> {
                 let mut lookup = self.index.prepare_cached(LOOKUP)?;
                 Ok(lookup
                     .query_row(params![namespace, digest.as_slice()], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
                     })
                     .optional()?)
             })();
@@ -806,10 +823,10 @@ impl PackedCatalog {
         &mut self,
         namespace: u8,
         digest: [u8; 32],
-        locator: Option<&(u16, u64, u64, String)>,
+        locator: Option<&LocatorRow>,
         max: usize,
     ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
-        let Some((kind, offset, length, source)) = locator else {
+        let Some((kind, offset, codec, stored_length, logical_length, source)) = locator else {
             // The locator checkpoint is advanced in the same SQLite transaction as
             // its rows. Once it matches the authenticated catalog and active heads,
             // a miss is authoritative derived state; scanning and reauthenticating
@@ -817,14 +834,14 @@ impl PackedCatalog {
             // first rollover.
             return Ok(None);
         };
-        if *length > MAX_SEGMENT_PAYLOAD_BYTES {
+        if *stored_length > MAX_SEGMENT_PAYLOAD_BYTES {
             return Err(CatalogError::Corrupt(
-                "locator length exceeds segment limit",
+                "locator stored length exceeds segment limit",
             ));
         }
-        if *length > max as u64 {
+        if *logical_length > max as u64 {
             return Err(CatalogError::Segment(SegmentError::ReadLimit {
-                minimum: usize::try_from(*length).unwrap_or(usize::MAX),
+                minimum: usize::try_from(*logical_length).unwrap_or(usize::MAX),
             }));
         }
         let Some((entry, bytes)) =
@@ -834,7 +851,12 @@ impl PackedCatalog {
                 "locator source or key is not authoritative",
             ));
         };
-        if entry.kind != *kind || entry.offset != *offset || entry.length != *length {
+        if entry.kind != *kind
+            || entry.offset != *offset
+            || entry.codec != *codec
+            || entry.stored_length != *stored_length
+            || entry.logical_length != *logical_length
+        {
             return Err(CatalogError::Corrupt(
                 "locator disagrees with authoritative index",
             ));
@@ -1515,9 +1537,11 @@ fn insert_source_entries(
         |row| row.get(0),
     )?;
     let mut insert = transaction.prepare_cached(
-        "INSERT INTO locator(namespace,digest,kind,offset,length,source_id) VALUES(?1,?2,?3,?4,?5,?6) \
-         ON CONFLICT(namespace,digest) DO UPDATE SET kind=excluded.kind,offset=excluded.offset,\
-         length=excluded.length,source_id=excluded.source_id",
+        "INSERT INTO locator(namespace,digest,kind,offset,codec,stored_length,logical_length,source_id) \
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(namespace,digest) DO UPDATE SET \
+         kind=excluded.kind,offset=excluded.offset,codec=excluded.codec,\
+         stored_length=excluded.stored_length,logical_length=excluded.logical_length,\
+         source_id=excluded.source_id",
     )?;
     for entry in entries {
         insert.execute(params![
@@ -1525,7 +1549,9 @@ fn insert_source_entries(
             entry.digest.as_slice(),
             entry.kind,
             entry.offset,
-            entry.length,
+            entry.codec,
+            entry.stored_length,
+            entry.logical_length,
             source_id
         ])?;
     }

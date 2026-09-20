@@ -14,8 +14,7 @@ use std::{
 use wheat_core::{SEGMENT_PREFIX_ENCODED_SIZE, SegmentIndexEntry, encode_segment_prefix};
 
 use super::segment::{
-    SegmentError, SegmentMetadata, SegmentRecord, emit_cumulative_tail, projected_total_length,
-    validate_record, verify_logical,
+    SegmentError, SegmentMetadata, emit_cumulative_tail, projected_total_length, verify_logical,
 };
 
 const PREFIX_LEN: u64 = SEGMENT_PREFIX_ENCODED_SIZE as u64;
@@ -76,23 +75,26 @@ impl BulkSegment {
         projected_total_length(count, payload)
     }
 
-    pub(crate) fn append_one(
+    pub(crate) fn append_prepared(
         &mut self,
-        record: SegmentRecord<'_>,
+        prepared: super::segment::PreparedSegmentRecord<'_>,
     ) -> Result<SegmentIndexEntry, SegmentError> {
-        validate_record(record)?;
-        let length = u64::try_from(record.bytes.len()).map_err(|_| SegmentError::TooLarge)?;
-        self.projected_physical_size(1, length)?;
+        let record = prepared.logical;
+        let physical = prepared.physical;
+        let stored_length = physical.bytes.len() as u64;
+        self.projected_physical_size(1, stored_length)?;
         let entry = SegmentIndexEntry {
             namespace: record.namespace,
             kind: record.kind,
             digest: record.digest,
             offset: PREFIX_LEN + self.payload_bytes,
-            length,
+            codec: physical.codec.to_byte(),
+            stored_length,
+            logical_length: physical.logical_length,
         };
         self.file.seek(SeekFrom::Start(entry.offset))?;
-        self.file.write_all(record.bytes)?;
-        self.payload_bytes += length;
+        self.file.write_all(&physical.bytes)?;
+        self.payload_bytes += stored_length;
         self.entries_by_key
             .insert((entry.namespace, entry.digest), self.entries.len());
         self.entries.push(entry.clone());
@@ -109,15 +111,22 @@ impl BulkSegment {
             return Ok(None);
         };
         let entry = self.entries[index].clone();
-        let length = usize::try_from(entry.length).map_err(|_| SegmentError::ReadLimit {
-            minimum: usize::MAX,
-        })?;
-        if length > max {
-            return Err(SegmentError::ReadLimit { minimum: length });
+        let logical_length =
+            usize::try_from(entry.logical_length).map_err(|_| SegmentError::ReadLimit {
+                minimum: usize::MAX,
+            })?;
+        if logical_length > max {
+            return Err(SegmentError::ReadLimit {
+                minimum: logical_length,
+            });
         }
-        let mut bytes = vec![0; length];
+        let stored_length = usize::try_from(entry.stored_length)
+            .map_err(|_| SegmentError::Format("stored length"))?;
+        let mut stored = vec![0; stored_length];
         self.file.seek(SeekFrom::Start(entry.offset))?;
-        self.file.read_exact(&mut bytes)?;
+        self.file.read_exact(&mut stored)?;
+        let codec = crate::codec::Codec::from_byte(entry.codec)?;
+        let bytes = crate::codec::decode(codec, stored, entry.logical_length, max)?;
         verify_logical(&entry, &bytes)?;
         Ok(Some((entry.kind, bytes)))
     }

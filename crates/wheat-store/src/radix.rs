@@ -1461,4 +1461,101 @@ mod paired_context_tests {
             Err(DiffError::ChangeLimitExceeded { limit: 0 })
         ) {}
     }
+
+    #[tokio::test]
+    async fn paired_context_walk_enforces_node_limit() {
+        // Two entries whose keys diverge at the first byte produce a root with
+        // two children. The constructor reads both roots (nodes_read = 2), so
+        // max_nodes = 2 means the first child read hits the limit.
+        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "paired-node-limit");
+        let applications = Store::<_, ApplicationCollection>::new(&objects);
+        let revisions = Store::<_, RevisionCollection>::new(&objects);
+        let a = change(1, 0);
+        let b = change(2, 0);
+        let left = applications
+            .update_batch(
+                applications.empty_root().await.unwrap(),
+                [
+                    (a, Some(ApplicationId::from_digest([1; 32]))),
+                    (b, Some(ApplicationId::from_digest([2; 32]))),
+                ],
+            )
+            .await
+            .unwrap();
+        let right = revisions
+            .update_batch(
+                revisions.empty_root().await.unwrap(),
+                [
+                    (a, Some(RevisionId::from_digest([1; 32]))),
+                    (b, Some(RevisionId::from_digest([2; 32]))),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut walk = applications
+            .paired_context_walk(
+                left,
+                revisions,
+                right,
+                DiffLimits {
+                    max_nodes: 2,
+                    ..DiffLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Drain until the node limit fires.
+        while !matches!(
+            walk.next().await,
+            Err(DiffError::NodeLimitExceeded { limit: 2 })
+        ) {}
+    }
+
+    #[tokio::test]
+    async fn paired_context_walk_enforces_pending_limit() {
+        // Two entries that diverge at the first byte require pushing a child
+        // frame. With max_pending = 1, the root frame (stack depth 1) already
+        // meets the limit so any child push is rejected.
+        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "paired-pending-limit");
+        let applications = Store::<_, ApplicationCollection>::new(&objects);
+        let revisions = Store::<_, RevisionCollection>::new(&objects);
+        let a = change(1, 0);
+        let b = change(2, 0);
+        let left = applications
+            .update_batch(
+                applications.empty_root().await.unwrap(),
+                [
+                    (a, Some(ApplicationId::from_digest([1; 32]))),
+                    (b, Some(ApplicationId::from_digest([2; 32]))),
+                ],
+            )
+            .await
+            .unwrap();
+        let right = revisions
+            .update_batch(
+                revisions.empty_root().await.unwrap(),
+                [
+                    (a, Some(RevisionId::from_digest([1; 32]))),
+                    (b, Some(RevisionId::from_digest([2; 32]))),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut walk = applications
+            .paired_context_walk(
+                left,
+                revisions,
+                right,
+                DiffLimits {
+                    max_pending: 1,
+                    ..DiffLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        while !matches!(
+            walk.next().await,
+            Err(DiffError::PendingLimitExceeded { limit: 1 })
+        ) {}
+    }
 }

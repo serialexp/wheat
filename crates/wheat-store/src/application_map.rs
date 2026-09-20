@@ -43,9 +43,7 @@ impl From<radix::DiffError> for ApplicationMapError {
             radix::DiffError::ChangeLimitExceeded { limit } => {
                 Self::DeltaChangeLimitExceeded { limit }
             }
-            radix::DiffError::NodeLimitExceeded { limit } => {
-                Self::DeltaNodeLimitExceeded { limit }
-            }
+            radix::DiffError::NodeLimitExceeded { limit } => Self::DeltaNodeLimitExceeded { limit },
             radix::DiffError::PendingLimitExceeded { limit } => {
                 Self::DeltaPendingLimitExceeded { limit }
             }
@@ -217,9 +215,10 @@ impl<'a, S: ImmutableObjectStore> ApplicationMapStore<'a, S> {
         Ok(entries
             .into_iter()
             .map(|entry| match entry {
-                radix::DiffEntry::Added(change, application) => {
-                    ApplicationMapDelta::Added { change, application }
-                }
+                radix::DiffEntry::Added(change, application) => ApplicationMapDelta::Added {
+                    change,
+                    application,
+                },
                 radix::DiffEntry::Changed(change, old_application, new_application) => {
                     ApplicationMapDelta::Changed {
                         change,
@@ -227,9 +226,10 @@ impl<'a, S: ImmutableObjectStore> ApplicationMapStore<'a, S> {
                         new_application,
                     }
                 }
-                radix::DiffEntry::Removed(change, application) => {
-                    ApplicationMapDelta::Removed { change, application }
-                }
+                radix::DiffEntry::Removed(change, application) => ApplicationMapDelta::Removed {
+                    change,
+                    application,
+                },
             })
             .collect())
     }

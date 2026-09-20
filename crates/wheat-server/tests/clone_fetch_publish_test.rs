@@ -104,17 +104,12 @@ async fn setup_repo(dir: &std::path::Path) -> Repository {
 // Client-side protocol helpers (thin wrappers for test use)
 // ---------------------------------------------------------------------------
 
-async fn send_msg(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    msg: &WheatProtocolMessage,
-) {
+async fn send_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, msg: &WheatProtocolMessage) {
     let bytes = encode_message(msg).unwrap();
     ws.send(Message::Binary(bytes.into())).await.unwrap();
 }
 
-async fn recv_msg(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-) -> WheatProtocolMessage {
+async fn recv_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> WheatProtocolMessage {
     loop {
         let msg = ws.next().await.unwrap().unwrap();
         match msg {
@@ -128,9 +123,7 @@ async fn recv_msg(
     }
 }
 
-async fn connect_and_handshake(
-    addr: SocketAddr,
-) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+async fn connect_and_handshake(addr: SocketAddr) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
     let url = format!("ws://{addr}");
     let (mut ws, _) = connect_async(&url).await.unwrap();
 
@@ -210,9 +203,8 @@ async fn client_fetch_objects(
                 assert_eq!(batch.op_id, op_id);
 
                 for entry in &batch.objects {
-                    let claimed_id = ObjectId::from_digest(
-                        entry.id.bytes.as_slice().try_into().unwrap(),
-                    );
+                    let claimed_id =
+                        ObjectId::from_digest(entry.id.bytes.as_slice().try_into().unwrap());
                     let actual_id = ObjectId::of_canonical_bytes(&entry.data);
                     assert_eq!(actual_id, claimed_id, "object identity mismatch");
 
@@ -268,29 +260,45 @@ async fn client_fetch_objects(
                                     match objects.get(oid).await {
                                         Ok(obj) => {
                                             known.insert(oid);
-                                            if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
+                                            if let Ok(children) =
+                                                wheat_core::extract_object_references(
+                                                    &obj.canonical_bytes,
+                                                )
+                                            {
                                                 for c in children {
-                                                    if !known.contains(&c) { bfs_frontier.push(c); }
+                                                    if !known.contains(&c) {
+                                                        bfs_frontier.push(c);
+                                                    }
                                                 }
                                             }
                                         }
-                                        Err(_) => { want_list.push(oid); }
+                                        Err(_) => {
+                                            want_list.push(oid);
+                                        }
                                     }
                                 }
                             }
                         }
                         while let Some(oid) = bfs_frontier.pop() {
-                            if known.contains(&oid) { continue; }
+                            if known.contains(&oid) {
+                                continue;
+                            }
                             match objects.get(oid).await {
                                 Ok(obj) => {
                                     known.insert(oid);
-                                    if let Ok(children) = wheat_core::extract_object_references(&obj.canonical_bytes) {
+                                    if let Ok(children) =
+                                        wheat_core::extract_object_references(&obj.canonical_bytes)
+                                    {
                                         for c in children {
-                                            if !known.contains(&c) { bfs_frontier.push(c); }
+                                            if !known.contains(&c) {
+                                                bfs_frontier.push(c);
+                                            }
                                         }
                                     }
                                 }
-                                Err(_) => { want_list.push(oid); }
+                                Err(_) => {
+                                    want_list.push(oid);
+                                }
                             }
                         }
                         want_list.retain(|id| !known.contains(id));
@@ -393,9 +401,7 @@ async fn client_fetch_content(
             WheatProtocolMessage::ContentBatch(cb) => {
                 assert_eq!(cb.op_id, op_id);
                 for entry in &cb.contents {
-                    let id = ContentId::from_digest(
-                        entry.id.bytes.as_slice().try_into().unwrap(),
-                    );
+                    let id = ContentId::from_digest(entry.id.bytes.as_slice().try_into().unwrap());
                     let actual = ContentId::of(&entry.data);
                     assert_eq!(actual, id, "content identity mismatch");
                     content.put(&entry.data).unwrap();
@@ -520,7 +526,10 @@ async fn publish_round_trip() {
         metadata: wheat_core::ChangeMetadata {
             title: "farewell".to_string(),
             description: String::new(),
-            created_at: wheat_core::Timestamp { seconds: 1000000, offset_minutes: 0 },
+            created_at: wheat_core::Timestamp {
+                seconds: 1000000,
+                offset_minutes: 0,
+            },
             creator: wheat_core::Actor {
                 name: "test".into(),
                 email: "test@test".into(),
@@ -530,8 +539,14 @@ async fn publish_round_trip() {
         dependencies: std::collections::BTreeSet::new(),
         revision_metadata: wheat_core::RevisionMetadata {
             message: "add farewell".to_string(),
-            authored_at: wheat_core::Timestamp { seconds: 1000000, offset_minutes: 0 },
-            committed_at: wheat_core::Timestamp { seconds: 1000000, offset_minutes: 0 },
+            authored_at: wheat_core::Timestamp {
+                seconds: 1000000,
+                offset_minutes: 0,
+            },
+            committed_at: wheat_core::Timestamp {
+                seconds: 1000000,
+                offset_minutes: 0,
+            },
             author: wheat_core::Actor {
                 name: "test".into(),
                 email: "test@test".into(),
@@ -546,22 +561,16 @@ async fn publish_round_trip() {
     };
 
     let objects_batch = BatchObjectStore::new(&clone_objects, 1024, 8 * 1024 * 1024);
-    let mutator =
-        PersistedRepositoryMutator::new(&objects_batch, &clone_content, &clone_heads);
+    let mutator = PersistedRepositoryMutator::new(&objects_batch, &clone_content, &clone_heads);
     let (prepared, _outcome) = mutator
         .create_on_frontier(head, basis_view, effective_view, proposal)
         .await
         .unwrap();
     let _resulting_view = prepared.resulting_view();
-    let publication = prepare_mutation_publication(
-        &objects_batch,
-        &clone_content,
-        &clone_heads,
-        head,
-        prepared,
-    )
-    .await
-    .unwrap();
+    let publication =
+        prepare_mutation_publication(&objects_batch, &clone_content, &clone_heads, head, prepared)
+            .await
+            .unwrap();
     objects_batch.flush().await.unwrap();
     finalize_mutation_publication(&clone_heads, publication).unwrap();
 
@@ -581,7 +590,10 @@ async fn publish_round_trip() {
     ws.close(None).await.ok();
     let mut ws = connect_and_handshake(addr).await;
     let (server_gen, server_env) = open_repo(&mut ws, "test/repo").await;
-    assert_eq!(server_gen, generation, "server should be at original generation");
+    assert_eq!(
+        server_gen, generation,
+        "server should be at original generation"
+    );
 
     // Send PublishRequest.
     let local_envelope = new_head.envelope;
@@ -590,9 +602,7 @@ async fn publish_round_trip() {
         &WheatProtocolMessage::PublishRequest(PublishRequestOutput {
             message_type: 0x40,
             op_id: 3,
-            publish_key: Uuid128 {
-                bytes: vec![1; 16],
-            },
+            publish_key: Uuid128 { bytes: vec![1; 16] },
             envelope_id: Digest256 {
                 bytes: local_envelope.as_bytes().to_vec(),
             },
@@ -611,9 +621,7 @@ async fn publish_round_trip() {
                 assert_eq!(on.op_id, 3);
                 let mut batch_objects = Vec::new();
                 for digest in &on.ids {
-                    let oid = ObjectId::from_digest(
-                        digest.bytes.as_slice().try_into().unwrap(),
-                    );
+                    let oid = ObjectId::from_digest(digest.bytes.as_slice().try_into().unwrap());
                     let obj = clone_objects.get(oid).await.unwrap();
                     batch_objects.push(ObjectEntry {
                         id: digest.clone(),
@@ -645,9 +653,7 @@ async fn publish_round_trip() {
         WheatProtocolMessage::ContentNeeded(cn) => {
             assert_eq!(cn.op_id, 3);
             for digest in &cn.content_ids {
-                let id = ContentId::from_digest(
-                    digest.bytes.as_slice().try_into().unwrap(),
-                );
+                let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
                 let data = clone_content.get(id).unwrap();
                 send_msg(
                     &mut ws,
@@ -662,12 +668,10 @@ async fn publish_round_trip() {
             }
             send_msg(
                 &mut ws,
-                &WheatProtocolMessage::ContentUploadComplete(
-                    ContentUploadCompleteOutput {
-                        message_type: 0x46,
-                        op_id: 3,
-                    },
-                ),
+                &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
+                    message_type: 0x46,
+                    op_id: 3,
+                }),
             )
             .await;
         }
@@ -697,10 +701,7 @@ async fn publish_round_trip() {
                     pr.status,
                     pr.message,
                 );
-                assert!(
-                    pr.new_generation > generation,
-                    "generation should advance"
-                );
+                assert!(pr.new_generation > generation, "generation should advance");
                 break;
             }
             other => panic!("expected PublishResult, got {other:?}"),
@@ -736,9 +737,8 @@ async fn fetch_after_server_advance() {
 
     let mut ws = connect_and_handshake(addr).await;
     let (gen1, env1) = open_repo(&mut ws, "test/repo").await;
-    let env1_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        env1.bytes.as_slice().try_into().unwrap(),
-    );
+    let env1_id =
+        wheat_core::RepositoryEnvelopeId::from_digest(env1.bytes.as_slice().try_into().unwrap());
     client_fetch_objects(&mut ws, 1, &clone_objects, &clone_content, env1_id).await;
     client_fetch_content(&mut ws, 2, &clone_objects, &clone_content, &env1).await;
     let head1 = RepositoryHead {
@@ -763,7 +763,10 @@ async fn fetch_after_server_advance() {
             metadata: wheat_core::ChangeMetadata {
                 title: "server update".to_string(),
                 description: String::new(),
-                created_at: wheat_core::Timestamp { seconds: 1000000, offset_minutes: 0 },
+                created_at: wheat_core::Timestamp {
+                    seconds: 1000000,
+                    offset_minutes: 0,
+                },
                 creator: wheat_core::Actor {
                     name: "server".into(),
                     email: "server@test".into(),
@@ -773,8 +776,14 @@ async fn fetch_after_server_advance() {
             dependencies: std::collections::BTreeSet::new(),
             revision_metadata: wheat_core::RevisionMetadata {
                 message: "add server.txt".to_string(),
-                authored_at: wheat_core::Timestamp { seconds: 1000000, offset_minutes: 0 },
-                committed_at: wheat_core::Timestamp { seconds: 1000000, offset_minutes: 0 },
+                authored_at: wheat_core::Timestamp {
+                    seconds: 1000000,
+                    offset_minutes: 0,
+                },
+                committed_at: wheat_core::Timestamp {
+                    seconds: 1000000,
+                    offset_minutes: 0,
+                },
                 author: wheat_core::Actor {
                     name: "server".into(),
                     email: "server@test".into(),
@@ -789,21 +798,15 @@ async fn fetch_after_server_advance() {
         };
 
         let srv_batch = BatchObjectStore::new(&srv_objects, 1024, 8 * 1024 * 1024);
-        let mutator =
-            PersistedRepositoryMutator::new(&srv_batch, &srv_content, &srv_heads);
+        let mutator = PersistedRepositoryMutator::new(&srv_batch, &srv_content, &srv_heads);
         let (prepared, _outcome) = mutator
             .create_on_frontier(srv_head, state.base_view, state.base_view, proposal)
             .await
             .unwrap();
-        let publication = prepare_mutation_publication(
-            &srv_batch,
-            &srv_content,
-            &srv_heads,
-            srv_head,
-            prepared,
-        )
-        .await
-        .unwrap();
+        let publication =
+            prepare_mutation_publication(&srv_batch, &srv_content, &srv_heads, srv_head, prepared)
+                .await
+                .unwrap();
         srv_batch.flush().await.unwrap();
         finalize_mutation_publication(&srv_heads, publication).unwrap();
     }
@@ -811,9 +814,8 @@ async fn fetch_after_server_advance() {
     // Now fetch the update.
     let mut ws = connect_and_handshake(addr).await;
     let (gen2, env2) = open_repo(&mut ws, "test/repo").await;
-    let env2_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        env2.bytes.as_slice().try_into().unwrap(),
-    );
+    let env2_id =
+        wheat_core::RepositoryEnvelopeId::from_digest(env2.bytes.as_slice().try_into().unwrap());
     assert!(gen2 > gen1, "server should have advanced");
 
     let obj_count = client_fetch_objects(&mut ws, 3, &clone_objects, &clone_content, env2_id).await;
@@ -824,16 +826,13 @@ async fn fetch_after_server_advance() {
     assert!(content_count > 0, "should fetch new content");
 
     // Update clone head.
-    let env2_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        env2.bytes.as_slice().try_into().unwrap(),
-    );
+    let env2_id =
+        wheat_core::RepositoryEnvelopeId::from_digest(env2.bytes.as_slice().try_into().unwrap());
     let head2 = RepositoryHead {
         generation: gen2,
         envelope: env2_id,
     };
-    clone_heads
-        .compare_and_advance(head1, head2)
-        .unwrap();
+    clone_heads.compare_and_advance(head1, head2).unwrap();
 
     // Verify the new content is available locally.
     let data = clone_content.get(ContentId::of(b"server change")).unwrap();

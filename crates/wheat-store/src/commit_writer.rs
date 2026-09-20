@@ -175,9 +175,32 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             return Err(CommitWriterError::FailedEdits(failed));
         }
 
+        // Build a map of new_content_id → old_content_id for delta compression.
+        // Each edit knows the old and new file value for its path.
+        let mut base_hints: BTreeMap<wheat_core::ContentId, wheat_core::ContentId> =
+            BTreeMap::new();
+        for (edit_id, outcome) in &output.outcomes {
+            if !matches!(outcome, ApplicationOutcome::Applied { .. }) {
+                continue;
+            }
+            let edit = &proposal.edits.edits[edit_id];
+            let old_value = target.get(&edit.path);
+            let new_value = output.tree.get(&edit.path);
+            if let (Some(old), Some(new)) = (old_value, new_value)
+                && old.content != new.content
+            {
+                base_hints.insert(new.content, old.content);
+            }
+        }
+
         // Generated blobs must be durable before any metadata can refer to them.
+        // Use delta compression when we know the old version of the same file.
         for (id, bytes) in &output.generated_content {
-            self.content.store_generated(*id, bytes)?;
+            if let Some(&base_id) = base_hints.get(id) {
+                self.content.put_with_base(*id, bytes, base_id)?;
+            } else {
+                self.content.store_generated(*id, bytes)?;
+            }
         }
 
         let mut applied = BTreeMap::new();

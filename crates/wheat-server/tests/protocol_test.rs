@@ -15,9 +15,7 @@ use wheat_core::{
 use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
-use wheat_store::{
-    ContentStore, LocalPublicationStore, LooseObjectStore, RepositoryPublisher,
-};
+use wheat_store::{ContentStore, LocalPublicationStore, LooseObjectStore, RepositoryPublisher};
 
 fn edit(path: &str, value: &[u8]) -> RevisionEdits {
     let record = EditRecord::new(
@@ -73,9 +71,7 @@ async fn start_server(
 
 /// Connect to the server and perform the handshake. Returns the WebSocket
 /// stream after SessionEstablished.
-async fn connect_and_handshake(
-    addr: SocketAddr,
-) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+async fn connect_and_handshake(addr: SocketAddr) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
     let url = format!("ws://{addr}");
     let (mut ws, _) = connect_async(&url).await.unwrap();
 
@@ -114,17 +110,12 @@ async fn connect_and_handshake(
     ws
 }
 
-async fn send_msg(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    msg: &WheatProtocolMessage,
-) {
+async fn send_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, msg: &WheatProtocolMessage) {
     let bytes = encode_message(msg).unwrap();
     ws.send(Message::Binary(bytes.into())).await.unwrap();
 }
 
-async fn recv_msg(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-) -> WheatProtocolMessage {
+async fn recv_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> WheatProtocolMessage {
     loop {
         let msg = ws.next().await.unwrap().unwrap();
         match msg {
@@ -261,9 +252,7 @@ async fn fetch_objects() {
         .find(|o| o.id.bytes == head_envelope.bytes)
         .expect("envelope object must be in the batch");
     let actual_id = ObjectId::of_canonical_bytes(&envelope_obj.data);
-    let claimed_id = ObjectId::from_digest(
-        envelope_obj.id.bytes.as_slice().try_into().unwrap(),
-    );
+    let claimed_id = ObjectId::from_digest(envelope_obj.id.bytes.as_slice().try_into().unwrap());
     assert_eq!(actual_id, claimed_id, "object identity must match");
 
     // Send FetchComplete.

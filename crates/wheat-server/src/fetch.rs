@@ -31,12 +31,9 @@ pub async fn handle_fetch(
     // Compute the full structural closure — every ObjectId the client needs.
     // The closure returns both IDs and object bytes, so we don't need to
     // re-read them for serialization.
-    let closure = wheat_store::collect_structural_closure(
-        &entry.objects,
-        &entry.content,
-        head.envelope,
-    )
-    .await;
+    let closure =
+        wheat_store::collect_structural_closure(&entry.objects, &entry.content, head.envelope)
+            .await;
     debug!(op_id, count = closure.len(), "fetch: closure computed");
 
     // Send all objects in the closure as a series of ObjectBatch messages.
@@ -207,10 +204,7 @@ pub async fn handle_content_fetch(
                     bytes: content_id.as_bytes().to_vec(),
                 };
                 batch_size += data.len();
-                batch_contents.push(ContentEntry {
-                    id: digest,
-                    data,
-                });
+                batch_contents.push(ContentEntry { id: digest, data });
 
                 if batch_size >= MAX_CONTENT_BATCH_SIZE
                     || batch_contents.len() >= MAX_CONTENT_BATCH_ITEMS
@@ -236,7 +230,10 @@ pub async fn handle_content_fetch(
             // per-item processing so we can chunk oversized content.
             debug!(op_id, content_id = %id, "content fetch: oversized item, falling back to per-item");
             for (idx, content_id) in normal_ids.iter().enumerate() {
-                match entry.content.get_bounded(*content_id, MAX_CONTENT_CHUNK_SIZE) {
+                match entry
+                    .content
+                    .get_bounded(*content_id, MAX_CONTENT_CHUNK_SIZE)
+                {
                     Ok(data) => {
                         batch_size += data.len();
                         batch_contents.push(ContentEntry {
@@ -319,7 +316,10 @@ pub async fn handle_content_fetch(
             // Other error (missing, IO, etc.) — fall back to per-item.
             debug!(op_id, error = %e, "content fetch: bulk read failed, falling back to per-item");
             for (idx, content_id) in normal_ids.iter().enumerate() {
-                match entry.content.get_bounded(*content_id, MAX_CONTENT_CHUNK_SIZE) {
+                match entry
+                    .content
+                    .get_bounded(*content_id, MAX_CONTENT_CHUNK_SIZE)
+                {
                     Ok(data) => {
                         batch_size += data.len();
                         batch_contents.push(ContentEntry {

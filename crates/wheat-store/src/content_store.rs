@@ -10,7 +10,32 @@ use std::{
 use thiserror::Error;
 use wheat_core::ContentId;
 
-use crate::Durability;
+use crate::{Durability, codec};
+
+fn codec_error(id: ContentId, max: usize, error: codec::CodecError) -> ContentStoreError {
+    match error {
+        codec::CodecError::ReadLimit { logical, .. } => ContentStoreError::TooLarge {
+            id,
+            max,
+            minimum: logical,
+        },
+        codec::CodecError::HardLimit => ContentStoreError::TooLarge {
+            id,
+            max,
+            minimum: codec::HARD_LOGICAL_RECORD_BYTES.saturating_add(1),
+        },
+        codec::CodecError::Format(_)
+        | codec::CodecError::Unknown(_)
+        | codec::CodecError::Zstd(_)
+        | codec::CodecError::Delta(_) => ContentStoreError::InvalidFormat {
+            id,
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Maximum number of delta links to follow before giving up.
+pub(crate) const MAX_DELTA_CHAIN_DEPTH: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum ContentStoreError {
@@ -23,6 +48,8 @@ pub enum ContentStoreError {
     },
     #[error("content {id} changed while it was being read")]
     Changed { id: ContentId },
+    #[error("content {id} has an invalid physical envelope: {reason}")]
+    InvalidFormat { id: ContentId, reason: String },
     #[error("content {id} is at least {minimum} bytes, exceeding the read limit of {max} bytes")]
     TooLarge {
         id: ContentId,
@@ -32,11 +59,36 @@ pub enum ContentStoreError {
     },
     #[error("content store I/O failed")]
     Io(#[from] io::Error),
+    #[error("content {id} exceeds delta chain depth limit of {MAX_DELTA_CHAIN_DEPTH}")]
+    DeltaChainTooDeep { id: ContentId },
+    #[error("content {id} delta resolution failed: {reason}")]
+    DeltaResolution { id: ContentId, reason: String },
 }
 
 pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
     fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError>;
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError>;
+
+    /// Read the raw envelope for a content ID: header + stored payload bytes.
+    ///
+    /// Used by `resolve_delta_chain` for iterative delta resolution.
+    fn get_raw_envelope(
+        &self,
+        id: ContentId,
+    ) -> Result<(crate::codec::EnvelopeHeader, Vec<u8>), ContentStoreError>;
+
+    /// Write pre-encoded envelope bytes directly to storage.
+    ///
+    /// Used for storing delta-encoded content where the envelope has already
+    /// been constructed by the caller. Each pair is `(ContentId, envelope_bytes)`.
+    fn put_raw_envelopes(
+        &self,
+        _envelopes: &[(ContentId, Vec<u8>)],
+    ) -> Result<(), ContentStoreError> {
+        Err(ContentStoreError::Io(io::Error::other(
+            "put_raw_envelopes not supported by this backend",
+        )))
+    }
 
     /// List all content IDs stored in this backend.
     ///
@@ -61,6 +113,88 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
     ) -> Option<Result<Vec<(ContentId, Vec<u8>)>, ContentStoreError>> {
         None
     }
+}
+
+/// Iteratively resolve a content delta chain and verify the final ContentId.
+///
+/// `fetch_raw` is a closure that reads the raw envelope for a given ContentId,
+/// returning `(EnvelopeHeader, raw_stored_payload)`. The delta chain is followed
+/// until a non-delta codec is found, then patches are applied in reverse
+/// (base → target) to reconstruct the requested content.
+///
+/// The `max` bound applies only to the final reconstructed output.
+pub(crate) fn resolve_delta_chain(
+    id: ContentId,
+    max: usize,
+    fetch_raw: impl Fn(ContentId) -> Result<(codec::EnvelopeHeader, Vec<u8>), ContentStoreError>,
+) -> Result<Vec<u8>, ContentStoreError> {
+    use crate::delta;
+
+    let mut chain: Vec<Vec<u8>> = Vec::new();
+    let mut current_id = id;
+
+    for _depth in 0..MAX_DELTA_CHAIN_DEPTH {
+        let (header, stored) = fetch_raw(current_id)?;
+
+        match codec::decode_payload(header.codec, stored, header.logical_length, usize::MAX)
+            .map_err(|e| codec_error(current_id, max, e))?
+        {
+            codec::DecodedPayload::Content(bytes) => {
+                // Non-delta codec — this is the base of the chain.
+                if chain.is_empty() {
+                    // No delta chain at all — direct content.
+                    if bytes.len() > max {
+                        return Err(ContentStoreError::TooLarge {
+                            id,
+                            max,
+                            minimum: bytes.len(),
+                        });
+                    }
+                    let actual = ContentId::of(&bytes);
+                    if actual != id {
+                        return Err(ContentStoreError::Corrupt {
+                            expected: id,
+                            actual,
+                        });
+                    }
+                    return Ok(bytes);
+                }
+                // Apply patches in reverse order (base → target).
+                let mut result = bytes;
+                for patch in chain.iter().rev() {
+                    result = delta::apply_delta(&result, patch).map_err(|e| {
+                        ContentStoreError::DeltaResolution {
+                            id,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                }
+                if result.len() > max {
+                    return Err(ContentStoreError::TooLarge {
+                        id,
+                        max,
+                        minimum: result.len(),
+                    });
+                }
+                let actual = ContentId::of(&result);
+                if actual != id {
+                    return Err(ContentStoreError::Corrupt {
+                        expected: id,
+                        actual,
+                    });
+                }
+                return Ok(result);
+            }
+            codec::DecodedPayload::Delta {
+                base_id, patch, ..
+            } => {
+                chain.push(patch);
+                current_id = base_id;
+            }
+        }
+    }
+
+    Err(ContentStoreError::DeltaChainTooDeep { id })
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +299,131 @@ impl ContentStore {
         })
     }
 
+    /// Store content with an optional delta base hint.
+    ///
+    /// If `base_id` refers to content already in this store, and a delta
+    /// against it is smaller than the raw content, stores the delta envelope
+    /// instead. Otherwise falls back to raw storage. The identity of `bytes`
+    /// must match `id`; this is always verified.
+    pub fn put_with_base(
+        &self,
+        id: ContentId,
+        bytes: &[u8],
+        base_id: ContentId,
+    ) -> Result<(), ContentStoreError> {
+        if ContentId::of(bytes) != id {
+            return Err(ContentStoreError::Corrupt {
+                expected: id,
+                actual: ContentId::of(bytes),
+            });
+        }
+        // Skip delta if the content already exists.
+        if self.contains(id) {
+            return Ok(());
+        }
+        // Try to compute a delta.
+        let base_bytes = match self.get(base_id) {
+            Ok(base) => base,
+            Err(ContentStoreError::Missing(_)) => {
+                // Base not available — store raw.
+                return self.put_with_id(id, bytes);
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(patch) = crate::delta::compute_delta(&base_bytes, bytes) {
+            let envelope = codec::encode_delta_envelope(bytes.len(), base_id, &patch)
+                .map_err(|e| codec_error(id, usize::MAX, e))?;
+            self.put_raw_envelope(id, envelope)
+        } else {
+            self.put_with_id(id, bytes)
+        }
+    }
+
+    /// Store content from a batch, with optional delta base hints.
+    ///
+    /// Each item is `(content_id, content_bytes, optional_base_id)`. Items
+    /// with a base hint attempt delta encoding; items without store raw.
+    pub fn put_many_with_bases(
+        &self,
+        contents: impl IntoIterator<Item = (ContentId, Vec<u8>, Option<ContentId>)>,
+        concurrency: usize,
+    ) -> Result<(), ContentStoreError> {
+        // Split into delta-eligible and raw items.
+        let mut raw_items = Vec::new();
+        for (id, bytes, base_id) in contents {
+            let actual = ContentId::of(&bytes);
+            if actual != id {
+                return Err(ContentStoreError::Corrupt {
+                    expected: id,
+                    actual,
+                });
+            }
+            if let Some(base) = base_id {
+                // Try delta — fall back to raw on failure.
+                if let Err(_e) = self.put_with_base(id, &bytes, base) {
+                    raw_items.push((id, bytes));
+                }
+            } else {
+                raw_items.push((id, bytes));
+            }
+        }
+        if !raw_items.is_empty() {
+            self.put_many(raw_items, concurrency)?;
+        }
+        Ok(())
+    }
+
+    /// Write a pre-encoded envelope directly to the store.
+    fn put_raw_envelope(
+        &self,
+        id: ContentId,
+        envelope: Vec<u8>,
+    ) -> Result<(), ContentStoreError> {
+        if let Some(backend) = &self.backend {
+            return backend.put_raw_envelopes(&[(id, envelope)]);
+        }
+        // Local filesystem: write the envelope bytes directly.
+        let path = self.path(id);
+        let parent = path.parent().expect("content path has parent");
+        fs::create_dir_all(parent)?;
+
+        let mut directory = Some(nonempty_path(&self.root));
+        while let Some(path) = directory {
+            self.durability.sync_directory(path)?;
+            directory = nonempty_parent(path);
+        }
+
+        if path.exists() {
+            // Already stored (possibly by a concurrent writer).
+            return Ok(());
+        }
+
+        let temporary = parent.join(format!(".{}.{}.tmp", id, std::process::id()));
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&envelope)?;
+            self.durability.sync_file(&file)?;
+            match fs::rename(&temporary, &path) {
+                Ok(()) => {
+                    self.durability.sync_directory(parent)?;
+                    Ok(())
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    self.durability.sync_directory(parent)?;
+                    Ok(())
+                }
+                Err(error) => Err(ContentStoreError::Io(error)),
+            }
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
     fn put_with_id(&self, id: ContentId, bytes: &[u8]) -> Result<(), ContentStoreError> {
         if ContentId::of(bytes) != id {
             return Err(ContentStoreError::Corrupt {
@@ -197,13 +456,15 @@ impl ContentStore {
             return Ok(());
         }
 
+        let encoded =
+            codec::encode_envelope(bytes).map_err(|error| codec_error(id, usize::MAX, error))?;
         let temporary = parent.join(format!(".{}.{}.tmp", id, std::process::id()));
         let result = (|| {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            file.write_all(bytes)?;
+            file.write_all(&encoded)?;
             self.durability.sync_file(&file)?;
             match fs::rename(&temporary, &path) {
                 Ok(()) => {
@@ -230,12 +491,27 @@ impl ContentStore {
 
     /// Reads and verifies content while refusing to allocate more than `max` bytes for it.
     ///
-    /// Loose files are sized before allocation and an additional byte is probed after the
-    /// declared length, so concurrent growth cannot turn the bound into an allocation hint.
+    /// Transparently resolves delta chains: if the envelope uses a delta codec,
+    /// follows the base reference chain (up to [`MAX_DELTA_CHAIN_DEPTH`] links)
+    /// and reconstructs the content by applying patches in reverse. The `max`
+    /// bound applies to the final reconstructed output, not to intermediate
+    /// base fetches.
     pub fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         if let Some(backend) = &self.backend {
-            return backend.get_bounded(id, max);
+            return resolve_delta_chain(id, max, |current_id| {
+                backend.get_raw_envelope(current_id)
+            });
         }
+        resolve_delta_chain(id, max, |current_id| {
+            self.read_local_raw_envelope(current_id)
+        })
+    }
+
+    /// Read a local envelope file and return (header, raw stored payload).
+    pub(crate) fn read_local_raw_envelope(
+        &self,
+        id: ContentId,
+    ) -> Result<(codec::EnvelopeHeader, Vec<u8>), ContentStoreError> {
         let path = self.path(id);
         let mut file = match fs::File::open(path) {
             Ok(file) => file,
@@ -244,28 +520,12 @@ impl ContentStore {
             }
             Err(error) => return Err(ContentStoreError::Io(error)),
         };
-        let size = file.metadata()?.len();
-        if size > max as u64 {
-            return Err(ContentStoreError::TooLarge {
-                id,
-                max,
-                minimum: usize::try_from(size).unwrap_or(usize::MAX),
-            });
-        }
-        let size = usize::try_from(size).map_err(|_| ContentStoreError::TooLarge {
-            id,
-            max,
-            minimum: usize::MAX,
-        })?;
-        let bytes = read_exact_content(&mut file, id, size)?;
-        let actual = ContentId::of(&bytes);
-        if actual != id {
-            return Err(ContentStoreError::Corrupt {
-                expected: id,
-                actual,
-            });
-        }
-        Ok(bytes)
+        let physical_length = file.metadata()?.len();
+        codec::read_envelope_file_raw(&mut file, physical_length).map_err(|error| match error {
+            codec::EnvelopeFileError::Codec(error) => codec_error(id, usize::MAX, error),
+            codec::EnvelopeFileError::Changed => ContentStoreError::Changed { id },
+            codec::EnvelopeFileError::Io(error) => ContentStoreError::Io(error),
+        })
     }
 
     #[must_use]
@@ -312,12 +572,19 @@ impl ContentStore {
         if let Some(backend) = &self.backend
             && let Some(result) = backend.list_ids()
         {
-            let all: std::collections::HashSet<ContentId> =
-                result?.into_iter().collect();
-            return Ok(candidates.iter().copied().filter(|id| all.contains(id)).collect());
+            let all: std::collections::HashSet<ContentId> = result?.into_iter().collect();
+            return Ok(candidates
+                .iter()
+                .copied()
+                .filter(|id| all.contains(id))
+                .collect());
         }
         // Fallback: per-item check (fast for local filesystem).
-        Ok(candidates.iter().copied().filter(|id| self.contains(*id)).collect())
+        Ok(candidates
+            .iter()
+            .copied()
+            .filter(|id| self.contains(*id))
+            .collect())
     }
 
     /// Loose fallback path, not a locator for packed content.
@@ -343,6 +610,7 @@ impl ContentStore {
     }
 }
 
+#[cfg(test)]
 fn read_exact_content(
     reader: &mut impl io::Read,
     id: ContentId,
