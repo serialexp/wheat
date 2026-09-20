@@ -382,6 +382,13 @@ pub async fn handle_publish(
         .compare_and_advance(*current_head, proposed_head)
     {
         Ok(()) => {
+            // Seal any buffered objects into a durable batch (e.g. a packed
+            // segment uploaded to S3). No-op for local stores.
+            entry.objects.seal().await.map_err(|e| {
+                ConnectionError::Protocol(Box::leak(
+                    format!("seal after commit failed: {e}").into_boxed_str(),
+                ))
+            })?;
             info!(op_id, generation = new_generation, "publish: committed");
             send(
                 ws,

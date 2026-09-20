@@ -1,8 +1,8 @@
 # Wheat Native Protocol — Design
 
-Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests complete, remaining Phase 1–2 outstanding
+Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-09-19
+Last updated: 2026-09-20
 
 ## Implementation status
 
@@ -68,14 +68,20 @@ top of them.
   the full retained-set walk (RetainedSetStore cursor for views/revisions/
   applications/changes) and BFS through retained objects' children.
 
+- [x] **Phase 1 — packed segments on the object store.** `RemotePackedStore`
+  in `wheat-store/src/remote_packed/` stores packed segments on S3-compatible
+  backends (SeaweedFS, R2, Hetzner). In-memory index rebuilt from S3 catalog
+  chain on startup. `SegmentBuilder` (ungated from `#[cfg(test)]`) builds
+  segments from buffered objects on `seal()`. `RemoteContentBackend` stores
+  content as individual S3 keys. `RepositoryEntry.objects` is now
+  `Box<dyn ImmutableObjectStore>` with a blanket delegation impl; wheat-server
+  `--store s3-packed` mode reads S3 config from `WHEAT_S3_*` env vars. LRU
+  segment cache (256 MiB default) downloads full segments on first access.
+  Benchmark script (`scripts/wheat-packed-segment-bench`) with SeaweedFS +
+  Toxiproxy (20ms RTT). 3 `#[ignore]` integration tests.
+
 ### Outstanding
 
-- [ ] **Phase 1 — packed segments on the object store.** Extend the object store
-  backend to write and read packed segments as S3 keys rather than one key per
-  object. The server builds segments from incoming objects during publication and
-  serves individual objects by index lookup and range read from segments. This is
-  an economic requirement: per-request costs dominate per-byte costs for the small
-  structural objects that make up most of a repository's object count.
 - [ ] **Phase 1 — TypeScript client.** Generate TypeScript encode/decode from the
   same binschema schema, implement the client protocol over browser-native
   WebSocket, and demonstrate a round-trip from a Bun/browser client.

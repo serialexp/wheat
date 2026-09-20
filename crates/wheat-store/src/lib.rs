@@ -25,6 +25,8 @@ pub use ownership::{
 };
 mod packed;
 pub use packed::{PackedObjectStore, PackedStoreTrace, PackedStoreTraceSnapshot};
+mod remote_packed;
+pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
 mod publication;
 mod radix;
 mod repository_envelope;

@@ -154,6 +154,46 @@ pub trait ImmutableObjectStore: Send + Sync {
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError>;
 
     async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError>;
+
+    /// Finalize any pending writes into a durable batch.
+    ///
+    /// Stores that buffer objects (e.g. into packed segments for upload to a
+    /// remote object store) override this to seal and persist the buffer.
+    /// The default implementation is a no-op.
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ImmutableObjectStore for Box<dyn ImmutableObjectStore> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        (**self).get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        (**self).exists_many(ids).await
+    }
+
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        (**self).seal().await
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -4,17 +4,14 @@
 //! `wheat_core`: prefix, payload bytes, sorted index pages, page directory, and
 //! footer. The footer's body digest covers every byte before the footer.
 
-#[cfg(test)]
 use std::path::Path;
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
 };
 
-#[cfg(test)]
 use tempfile::NamedTempFile;
 use thiserror::Error;
-#[cfg(test)]
 use wheat_core::encode_segment_prefix;
 use wheat_core::{
     CanonicalObjectError, ContentId, ObjectId, SEGMENT_FOOTER_ENCODED_SIZE,
@@ -57,7 +54,6 @@ pub(crate) struct SegmentMetadata {
     pub directory_length: u64,
 }
 
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct SealedSegment {
     pub file: NamedTempFile,
@@ -154,8 +150,7 @@ pub(crate) fn projected_total_length(
         .ok_or(SegmentError::TooLarge)
 }
 
-/// Streaming builder used to produce immutable V1 fixtures and sealed packs.
-#[cfg(test)]
+/// Streaming builder used to produce immutable V1 segments.
 pub(crate) struct SegmentBuilder {
     file: NamedTempFile,
     entries: Vec<SegmentIndexEntry>,
@@ -163,7 +158,6 @@ pub(crate) struct SegmentBuilder {
     io_buffer: Vec<u8>,
 }
 
-#[cfg(test)]
 impl SegmentBuilder {
     pub(crate) fn new(directory: impl AsRef<Path>) -> Result<Self, SegmentError> {
         let mut file = NamedTempFile::new_in(directory)?;

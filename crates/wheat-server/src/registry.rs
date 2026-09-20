@@ -1,14 +1,14 @@
-//! Repository registry — maps repository names to local stores.
+//! Repository registry — maps repository names to stores.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use wheat_store::{ContentStore, LocalPublicationStore, LooseObjectStore};
+use wheat_store::{ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore};
 
-/// A single repository's local stores.
+/// A single repository's stores.
 pub struct RepositoryEntry {
-    pub objects: LooseObjectStore,
+    pub objects: Box<dyn ImmutableObjectStore>,
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
 }
@@ -35,9 +35,26 @@ impl Registry {
     /// Create a registry serving a single repository with an explicit name.
     pub fn single_named(name: String, data_dir: &Path) -> Self {
         let entry = Arc::new(RepositoryEntry {
-            objects: LooseObjectStore::new(data_dir.join("objects")),
+            objects: Box::new(LooseObjectStore::new(data_dir.join("objects"))),
             content: ContentStore::new(data_dir.join("content")),
             heads: LocalPublicationStore::new(data_dir.join("repository.head")),
+        });
+        let mut repos = HashMap::new();
+        repos.insert(name, entry);
+        Self { repos }
+    }
+
+    /// Create a registry serving a single repository with pre-built stores.
+    pub fn single_with_stores(
+        name: String,
+        objects: Box<dyn ImmutableObjectStore>,
+        content: ContentStore,
+        heads: LocalPublicationStore,
+    ) -> Self {
+        let entry = Arc::new(RepositoryEntry {
+            objects,
+            content,
+            heads,
         });
         let mut repos = HashMap::new();
         repos.insert(name, entry);
@@ -70,7 +87,7 @@ impl Registry {
                 };
                 let name = format!("{owner_str}/{repo_str}");
                 let entry = Arc::new(RepositoryEntry {
-                    objects: LooseObjectStore::new(repo_path.join("objects")),
+                    objects: Box::new(LooseObjectStore::new(repo_path.join("objects"))),
                     content: ContentStore::new(repo_path.join("content")),
                     heads: LocalPublicationStore::new(repo_path.join("repository.head")),
                 });
