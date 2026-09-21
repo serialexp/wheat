@@ -133,7 +133,10 @@ impl ContentAccumulator {
             let mut node_path = path;
             node_path.extend_from_slice(&node.prefix);
             if node.present {
-                if node_path.len() != 32 || !node.children.is_empty() {
+                if node_path.len() != 32
+                    || !node.children.is_empty()
+                    || !node.entries.is_empty()
+                {
                     return Err(ContentAccumulatorError::NonterminalValue);
                 }
                 chunk.push(ContentId::from_digest(
@@ -145,6 +148,23 @@ impl ContentAccumulator {
                     self.flush_content_chunk(chunk)?;
                 }
                 continue;
+            }
+            // Inline entries: each suffix completes the key from this node's
+            // position.
+            for suffix in &node.entries {
+                let mut entry_key = node_path.clone();
+                entry_key.extend_from_slice(suffix);
+                if entry_key.len() != 32 {
+                    return Err(ContentAccumulatorError::NonterminalValue);
+                }
+                chunk.push(ContentId::from_digest(
+                    entry_key
+                        .try_into()
+                        .expect("entry path has the digest length"),
+                ));
+                if chunk.len() == CHUNK {
+                    self.flush_content_chunk(chunk)?;
+                }
             }
             for child in node.children.iter().rev() {
                 let mut child_path = node_path.clone();
@@ -179,22 +199,32 @@ impl ContentAccumulator {
     ) -> BuildFuture<'a, ContentSetId> {
         Box::pin(async move {
             if first == last {
-                let node = ContentSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![])
+                let node = ContentSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![], vec![])
                     .expect("sorted builder emits a canonical content leaf");
                 store.write_node(node).await.map_err(Into::into)
             } else {
                 let common = common_prefix(&first.as_bytes()[depth..], &last.as_bytes()[depth..]);
                 let end = depth + common;
                 let mut children = Vec::new();
+                let mut inline_entries = Vec::new();
                 for (edge, child_first, child_last) in self.content_groups(first, last, end)? {
-                    let child = self
-                        .build_content_range(store, child_first, child_last, end + 1)
-                        .await?;
-                    children.push(ContentSetChild { edge, child });
+                    if child_first == child_last {
+                        // Single-entry group: inline instead of creating a child.
+                        inline_entries.push(child_first.as_bytes()[end..].to_vec());
+                    } else {
+                        let child = self
+                            .build_content_range(store, child_first, child_last, end + 1)
+                            .await?;
+                        children.push(ContentSetChild { edge, child });
+                    }
                 }
-                let node =
-                    ContentSetNode::new(first.as_bytes()[depth..end].to_vec(), false, children)
-                        .expect("sorted builder emits a canonical content branch");
+                let node = ContentSetNode::new(
+                    first.as_bytes()[depth..end].to_vec(),
+                    false,
+                    children,
+                    inline_entries,
+                )
+                .expect("sorted builder emits a canonical content branch");
                 store.write_node(node).await.map_err(Into::into)
             }
         })
@@ -244,24 +274,34 @@ impl ContentAccumulator {
     ) -> BuildFuture<'a, RetainedSetId> {
         Box::pin(async move {
             if first == last {
-                let node = RetainedSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![])
+                let node = RetainedSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![], vec![])
                     .expect("sorted builder emits a canonical retained leaf");
                 store.write_node(node).await.map_err(Into::into)
             } else {
                 let common = common_prefix(&first.as_bytes()[depth..], &last.as_bytes()[depth..]);
                 let end = depth + common;
                 let mut children = Vec::new();
+                let mut inline_entries = Vec::new();
                 for (edge, child_first, child_last) in
                     self.retained_groups(table, first, last, end)?
                 {
-                    let child = self
-                        .build_retained_range(store, table, child_first, child_last, end + 1)
-                        .await?;
-                    children.push(RetainedSetChild { edge, child });
+                    if child_first == child_last {
+                        // Single-entry group: inline instead of creating a child.
+                        inline_entries.push(child_first.as_bytes()[end..].to_vec());
+                    } else {
+                        let child = self
+                            .build_retained_range(store, table, child_first, child_last, end + 1)
+                            .await?;
+                        children.push(RetainedSetChild { edge, child });
+                    }
                 }
-                let node =
-                    RetainedSetNode::new(first.as_bytes()[depth..end].to_vec(), false, children)
-                        .expect("sorted builder emits a canonical retained branch");
+                let node = RetainedSetNode::new(
+                    first.as_bytes()[depth..end].to_vec(),
+                    false,
+                    children,
+                    inline_entries,
+                )
+                .expect("sorted builder emits a canonical retained branch");
                 store.write_node(node).await.map_err(Into::into)
             }
         })

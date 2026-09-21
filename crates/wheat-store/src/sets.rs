@@ -138,6 +138,7 @@ macro_rules! set_collection {
                     prefix: n.prefix,
                     value: n.present.then_some(()),
                     children: n.children.into_iter().map(|c| (c.edge, c.child)).collect(),
+                    entries: n.entries.into_iter().map(|suffix| (suffix, ())).collect(),
                 }
             }
             fn build(
@@ -150,6 +151,7 @@ macro_rules! set_collection {
                         .into_iter()
                         .map(|(edge, child)| $child { edge, child })
                         .collect(),
+                    n.entries.into_iter().map(|(suffix, ())| suffix).collect(),
                 )
             }
             fn id(n: &Self::PublicNode) -> Self::Id {

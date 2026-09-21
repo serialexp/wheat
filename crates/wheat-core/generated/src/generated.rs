@@ -128,6 +128,10 @@ impl WheatObject {
                 for item in &v.children {
                     item.encode_into(encoder)?;
                 }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
             }
             WheatObject::ApplicationMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -143,6 +147,10 @@ impl WheatObject {
                 for item in &v.children {
                     item.encode_into(encoder)?;
                 }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
             }
             WheatObject::ConflictSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -153,6 +161,10 @@ impl WheatObject {
                 encoder.write_uint8(if v.present { 1 } else { 0 });
                 encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
                 for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
                     item.encode_into(encoder)?;
                 }
             }
@@ -167,6 +179,10 @@ impl WheatObject {
                 for item in &v.children {
                     item.encode_into(encoder)?;
                 }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
             }
             WheatObject::RetainedSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -177,6 +193,10 @@ impl WheatObject {
                 encoder.write_uint8(if v.present { 1 } else { 0 });
                 encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
                 for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
                     item.encode_into(encoder)?;
                 }
             }
@@ -215,6 +235,10 @@ impl WheatObject {
                 for item in &v.children {
                     item.encode_into(encoder)?;
                 }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
             }
             WheatObject::ViewLineageMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -228,6 +252,10 @@ impl WheatObject {
                 }
                 encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
                 for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
                     item.encode_into(encoder)?;
                 }
             }
@@ -3148,6 +3176,7 @@ pub struct RevisionMapNodeV1Input {
     pub prefix: Vec<u8>,
     pub value: Vec<RevisionId>,
     pub children: Vec<RevisionMapChildV1>,
+    pub entries: Vec<RevisionMapEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3156,6 +3185,7 @@ pub struct RevisionMapNodeV1Output {
     pub prefix: Vec<u8>,
     pub value: Vec<RevisionId>,
     pub children: Vec<RevisionMapChildV1>,
+    pub entries: Vec<RevisionMapEntryV1>,
 }
 
 pub type RevisionMapNodeV1 = RevisionMapNodeV1Output;
@@ -3179,6 +3209,10 @@ impl RevisionMapNodeV1Input {
         }
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -3217,11 +3251,18 @@ impl RevisionMapNodeV1Output {
             let item = RevisionMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = RevisionMapEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
         Ok(Self {
             wire_tag,
             prefix,
             value,
             children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -3238,6 +3279,7 @@ impl From<RevisionMapNodeV1Output> for RevisionMapNodeV1Input {
             prefix: o.prefix,
             value: o.value,
             children: o.children,
+            entries: o.entries,
         }
     }
 }
@@ -3249,6 +3291,7 @@ impl From<RevisionMapNodeV1Input> for RevisionMapNodeV1Output {
             prefix: i.prefix,
             value: i.value,
             children: i.children,
+            entries: i.entries,
         }
     }
 }
@@ -3285,10 +3328,50 @@ impl RevisionMapChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RevisionMapEntryV1 {
+    pub suffix: Vec<u8>,
+    pub value: RevisionId,
+}
+
+impl RevisionMapEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.suffix.len() as u32);
+        for item in &self.suffix {
+            encoder.write_byte(*item);
+        }
+        self.value.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut suffix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            suffix.push(item);
+        }
+        let value = RevisionId::decode_with_decoder(decoder)?;
+        Ok(Self { suffix, value })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChangeMapNodeV1Input {
     pub prefix: Vec<u8>,
     pub value: Vec<ChangeObjectId>,
     pub children: Vec<ChangeMapChildV1>,
+    pub entries: Vec<ChangeMapEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3297,6 +3380,7 @@ pub struct ChangeMapNodeV1Output {
     pub prefix: Vec<u8>,
     pub value: Vec<ChangeObjectId>,
     pub children: Vec<ChangeMapChildV1>,
+    pub entries: Vec<ChangeMapEntryV1>,
 }
 
 pub type ChangeMapNodeV1 = ChangeMapNodeV1Output;
@@ -3320,6 +3404,10 @@ impl ChangeMapNodeV1Input {
         }
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -3358,11 +3446,18 @@ impl ChangeMapNodeV1Output {
             let item = ChangeMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ChangeMapEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
         Ok(Self {
             wire_tag,
             prefix,
             value,
             children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -3379,6 +3474,7 @@ impl From<ChangeMapNodeV1Output> for ChangeMapNodeV1Input {
             prefix: o.prefix,
             value: o.value,
             children: o.children,
+            entries: o.entries,
         }
     }
 }
@@ -3390,6 +3486,7 @@ impl From<ChangeMapNodeV1Input> for ChangeMapNodeV1Output {
             prefix: i.prefix,
             value: i.value,
             children: i.children,
+            entries: i.entries,
         }
     }
 }
@@ -3426,10 +3523,50 @@ impl ChangeMapChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ChangeMapEntryV1 {
+    pub suffix: Vec<u8>,
+    pub value: ChangeObjectId,
+}
+
+impl ChangeMapEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.suffix.len() as u32);
+        for item in &self.suffix {
+            encoder.write_byte(*item);
+        }
+        self.value.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut suffix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            suffix.push(item);
+        }
+        let value = ChangeObjectId::decode_with_decoder(decoder)?;
+        Ok(Self { suffix, value })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApplicationMapNodeV1Input {
     pub prefix: Vec<u8>,
     pub value: Vec<ApplicationId>,
     pub children: Vec<ApplicationMapChildV1>,
+    pub entries: Vec<ApplicationMapEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3438,6 +3575,7 @@ pub struct ApplicationMapNodeV1Output {
     pub prefix: Vec<u8>,
     pub value: Vec<ApplicationId>,
     pub children: Vec<ApplicationMapChildV1>,
+    pub entries: Vec<ApplicationMapEntryV1>,
 }
 
 pub type ApplicationMapNodeV1 = ApplicationMapNodeV1Output;
@@ -3461,6 +3599,10 @@ impl ApplicationMapNodeV1Input {
         }
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -3499,11 +3641,18 @@ impl ApplicationMapNodeV1Output {
             let item = ApplicationMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ApplicationMapEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
         Ok(Self {
             wire_tag,
             prefix,
             value,
             children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -3520,6 +3669,7 @@ impl From<ApplicationMapNodeV1Output> for ApplicationMapNodeV1Input {
             prefix: o.prefix,
             value: o.value,
             children: o.children,
+            entries: o.entries,
         }
     }
 }
@@ -3531,6 +3681,7 @@ impl From<ApplicationMapNodeV1Input> for ApplicationMapNodeV1Output {
             prefix: i.prefix,
             value: i.value,
             children: i.children,
+            entries: i.entries,
         }
     }
 }
@@ -3567,10 +3718,50 @@ impl ApplicationMapChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ApplicationMapEntryV1 {
+    pub suffix: Vec<u8>,
+    pub value: ApplicationId,
+}
+
+impl ApplicationMapEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.suffix.len() as u32);
+        for item in &self.suffix {
+            encoder.write_byte(*item);
+        }
+        self.value.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut suffix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            suffix.push(item);
+        }
+        let value = ApplicationId::decode_with_decoder(decoder)?;
+        Ok(Self { suffix, value })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ViewLineageMapNodeV1Input {
     pub prefix: Vec<u8>,
     pub value: Vec<RetainedSetId>,
     pub children: Vec<ViewLineageMapChildV1>,
+    pub entries: Vec<ViewLineageMapEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3579,6 +3770,7 @@ pub struct ViewLineageMapNodeV1Output {
     pub prefix: Vec<u8>,
     pub value: Vec<RetainedSetId>,
     pub children: Vec<ViewLineageMapChildV1>,
+    pub entries: Vec<ViewLineageMapEntryV1>,
 }
 
 pub type ViewLineageMapNodeV1 = ViewLineageMapNodeV1Output;
@@ -3602,6 +3794,10 @@ impl ViewLineageMapNodeV1Input {
         }
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -3640,11 +3836,18 @@ impl ViewLineageMapNodeV1Output {
             let item = ViewLineageMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ViewLineageMapEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
         Ok(Self {
             wire_tag,
             prefix,
             value,
             children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -3661,6 +3864,7 @@ impl From<ViewLineageMapNodeV1Output> for ViewLineageMapNodeV1Input {
             prefix: o.prefix,
             value: o.value,
             children: o.children,
+            entries: o.entries,
         }
     }
 }
@@ -3672,6 +3876,7 @@ impl From<ViewLineageMapNodeV1Input> for ViewLineageMapNodeV1Output {
             prefix: i.prefix,
             value: i.value,
             children: i.children,
+            entries: i.entries,
         }
     }
 }
@@ -3708,10 +3913,50 @@ impl ViewLineageMapChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ViewLineageMapEntryV1 {
+    pub suffix: Vec<u8>,
+    pub value: RetainedSetId,
+}
+
+impl ViewLineageMapEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.suffix.len() as u32);
+        for item in &self.suffix {
+            encoder.write_byte(*item);
+        }
+        self.value.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut suffix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            suffix.push(item);
+        }
+        let value = RetainedSetId::decode_with_decoder(decoder)?;
+        Ok(Self { suffix, value })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConflictSetNodeV1Input {
     pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ConflictSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3720,6 +3965,7 @@ pub struct ConflictSetNodeV1Output {
     pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ConflictSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
 pub type ConflictSetNodeV1 = ConflictSetNodeV1Output;
@@ -3740,6 +3986,10 @@ impl ConflictSetNodeV1Input {
         encoder.write_byte(if self.present { 1 } else { 0 });
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -3773,11 +4023,18 @@ impl ConflictSetNodeV1Output {
             let item = ConflictSetChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = SetEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
         Ok(Self {
             wire_tag,
             prefix,
             present,
             children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -3794,6 +4051,7 @@ impl From<ConflictSetNodeV1Output> for ConflictSetNodeV1Input {
             prefix: o.prefix,
             present: o.present,
             children: o.children,
+            entries: o.entries,
         }
     }
 }
@@ -3805,6 +4063,7 @@ impl From<ConflictSetNodeV1Input> for ConflictSetNodeV1Output {
             prefix: i.prefix,
             present: i.present,
             children: i.children,
+            entries: i.entries,
         }
     }
 }
@@ -3845,6 +4104,7 @@ pub struct ContentSetNodeV1Input {
     pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ContentSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3853,6 +4113,7 @@ pub struct ContentSetNodeV1Output {
     pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<ContentSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
 pub type ContentSetNodeV1 = ContentSetNodeV1Output;
@@ -3873,6 +4134,10 @@ impl ContentSetNodeV1Input {
         encoder.write_byte(if self.present { 1 } else { 0 });
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -3906,11 +4171,18 @@ impl ContentSetNodeV1Output {
             let item = ContentSetChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = SetEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
         Ok(Self {
             wire_tag,
             prefix,
             present,
             children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -3927,6 +4199,7 @@ impl From<ContentSetNodeV1Output> for ContentSetNodeV1Input {
             prefix: o.prefix,
             present: o.present,
             children: o.children,
+            entries: o.entries,
         }
     }
 }
@@ -3938,6 +4211,7 @@ impl From<ContentSetNodeV1Input> for ContentSetNodeV1Output {
             prefix: i.prefix,
             present: i.present,
             children: i.children,
+            entries: i.entries,
         }
     }
 }
@@ -3978,6 +4252,7 @@ pub struct RetainedSetNodeV1Input {
     pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<RetainedSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3986,6 +4261,7 @@ pub struct RetainedSetNodeV1Output {
     pub prefix: Vec<u8>,
     pub present: bool,
     pub children: Vec<RetainedSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
 pub type RetainedSetNodeV1 = RetainedSetNodeV1Output;
@@ -4006,6 +4282,10 @@ impl RetainedSetNodeV1Input {
         encoder.write_byte(if self.present { 1 } else { 0 });
         encoder.write_u32_be(self.children.len() as u32);
         for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -4039,11 +4319,18 @@ impl RetainedSetNodeV1Output {
             let item = RetainedSetChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = SetEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
         Ok(Self {
             wire_tag,
             prefix,
             present,
             children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -4060,6 +4347,7 @@ impl From<RetainedSetNodeV1Output> for RetainedSetNodeV1Input {
             prefix: o.prefix,
             present: o.present,
             children: o.children,
+            entries: o.entries,
         }
     }
 }
@@ -4071,6 +4359,7 @@ impl From<RetainedSetNodeV1Input> for RetainedSetNodeV1Output {
             prefix: i.prefix,
             present: i.present,
             children: i.children,
+            entries: i.entries,
         }
     }
 }
@@ -4103,6 +4392,42 @@ impl RetainedSetChildV1 {
         let edge = decoder.read_byte()?;
         let child = RetainedSetId::decode_with_decoder(decoder)?;
         Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetEntryV1 {
+    pub suffix: Vec<u8>,
+}
+
+impl SetEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.suffix.len() as u32);
+        for item in &self.suffix {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut suffix = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            suffix.push(item);
+        }
+        Ok(Self { suffix })
     }
 }
 

@@ -271,12 +271,29 @@ pub fn decode_revision_map_node(bytes: &[u8]) -> Result<RevisionMapNode, Canonic
                 ),
             })
             .collect(),
+        entries: node
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.suffix.clone(),
+                    RevisionId::from_digest(
+                        digest_domain(&entry.value.digest).expect("validated digest"),
+                    ),
+                )
+            })
+            .collect(),
     })
 }
 
 pub(crate) fn validate_revision_map_node(
     node: &RevisionMapNode,
 ) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|(suffix, _)| suffix.first().copied())
+        .collect();
     validate_radix_node(
         &node.prefix,
         node.value.is_some(),
@@ -285,6 +302,7 @@ pub(crate) fn validate_revision_map_node(
             .iter()
             .map(|child| child.edge)
             .collect::<Vec<_>>(),
+        &entry_first_bytes,
         16,
         "revision map node",
     )
@@ -302,6 +320,14 @@ pub(crate) fn revision_map_node_bytes(node: &RevisionMapNode) -> Vec<u8> {
                 .map(|child| wire::RevisionMapChildV1 {
                     edge: child.edge,
                     child: revision_map_id(child.child),
+                })
+                .collect(),
+            entries: node
+                .entries
+                .iter()
+                .map(|(suffix, value)| wire::RevisionMapEntryV1 {
+                    suffix: suffix.clone(),
+                    value: revision_id(*value),
                 })
                 .collect(),
         }
@@ -334,10 +360,27 @@ pub fn decode_change_map_node(bytes: &[u8]) -> Result<ChangeMapNode, CanonicalOb
                 ),
             })
             .collect(),
+        entries: node
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.suffix.clone(),
+                    crate::ChangeObjectId::from_digest(
+                        digest_domain(&entry.value.digest).expect("validated digest"),
+                    ),
+                )
+            })
+            .collect(),
     })
 }
 
 pub(crate) fn validate_change_map_node(node: &ChangeMapNode) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|(suffix, _)| suffix.first().copied())
+        .collect();
     validate_radix_node(
         &node.prefix,
         node.value.is_some(),
@@ -346,6 +389,7 @@ pub(crate) fn validate_change_map_node(node: &ChangeMapNode) -> Result<(), Canon
             .iter()
             .map(|child| child.edge)
             .collect::<Vec<_>>(),
+        &entry_first_bytes,
         16,
         "change map node",
     )
@@ -363,6 +407,14 @@ pub(crate) fn change_map_node_bytes(node: &ChangeMapNode) -> Vec<u8> {
                 .map(|child| wire::ChangeMapChildV1 {
                     edge: child.edge,
                     child: change_map_id(child.child),
+                })
+                .collect(),
+            entries: node
+                .entries
+                .iter()
+                .map(|(suffix, value)| wire::ChangeMapEntryV1 {
+                    suffix: suffix.clone(),
+                    value: change_object_id(*value),
                 })
                 .collect(),
         }
@@ -392,6 +444,11 @@ macro_rules! decode_set_node {
                             digest_domain(&child.child.digest).expect("validated digest"),
                         ),
                     })
+                    .collect(),
+                entries: node
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.suffix)
                     .collect(),
             })
         }
@@ -450,6 +507,18 @@ pub fn decode_view_lineage_map_node(
                 ),
             })
             .collect(),
+        entries: node
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.suffix.clone(),
+                    crate::RetainedSetId::from_digest(
+                        digest_domain(&entry.value.digest).expect("validated digest"),
+                    ),
+                )
+            })
+            .collect(),
     })
 }
 
@@ -480,6 +549,18 @@ pub fn decode_application_map_node(
                 ),
             })
             .collect(),
+        entries: node
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.suffix.clone(),
+                    crate::ApplicationId::from_digest(
+                        digest_domain(&entry.value.digest).expect("validated digest"),
+                    ),
+                )
+            })
+            .collect(),
     })
 }
 
@@ -487,26 +568,58 @@ fn validate_radix_node(
     prefix: &[u8],
     terminal: bool,
     children: &[u8],
+    entry_first_bytes: &[u8],
     key_len: usize,
     name: &'static str,
 ) -> Result<(), CanonicalObjectError> {
-    if prefix.len() > key_len
-        || (terminal && !children.is_empty())
-        || (!terminal && children.len() == 1)
-        || (!terminal && children.is_empty() && !prefix.is_empty())
-    {
+    let total_branches = children.len() + entry_first_bytes.len();
+    if prefix.len() > key_len {
         return Err(CanonicalObjectError::InvalidCollection(name));
     }
-    validate_sorted_unique_by(children, |edge| edge, name)
+    // A terminal node (value at this position) must not have children or entries
+    // — it consumes the full key.
+    if terminal && total_branches != 0 {
+        return Err(CanonicalObjectError::InvalidCollection(name));
+    }
+    // Non-terminal, non-root: must have ≥2 branches (children + entries), or
+    // be a root empty node (empty prefix, no value, no branches).
+    if !terminal && total_branches == 1 {
+        return Err(CanonicalObjectError::InvalidCollection(name));
+    }
+    if !terminal && total_branches == 0 && !prefix.is_empty() {
+        return Err(CanonicalObjectError::InvalidCollection(name));
+    }
+    validate_sorted_unique_by(children, |edge| edge, name)?;
+    validate_sorted_unique_by(entry_first_bytes, |b| b, name)?;
+    // Children edges and entry first bytes must be disjoint.
+    let mut ci = 0;
+    let mut ei = 0;
+    while ci < children.len() && ei < entry_first_bytes.len() {
+        if children[ci] == entry_first_bytes[ei] {
+            return Err(CanonicalObjectError::InvalidCollection(name));
+        }
+        if children[ci] < entry_first_bytes[ei] {
+            ci += 1;
+        } else {
+            ei += 1;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_view_lineage_map_node(
     node: &ViewLineageMapNode,
 ) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|(suffix, _)| suffix.first().copied())
+        .collect();
     validate_radix_node(
         &node.prefix,
         node.value.is_some(),
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
         32,
         "view lineage map node",
     )
@@ -515,10 +628,16 @@ pub(crate) fn validate_view_lineage_map_node(
 pub(crate) fn validate_application_map_node(
     node: &ApplicationMapNode,
 ) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|(suffix, _)| suffix.first().copied())
+        .collect();
     validate_radix_node(
         &node.prefix,
         node.value.is_some(),
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
         16,
         "application map node",
     )
@@ -526,19 +645,31 @@ pub(crate) fn validate_application_map_node(
 pub(crate) fn validate_conflict_set_node(
     node: &ConflictSetNode,
 ) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|suffix| suffix.first().copied())
+        .collect();
     validate_radix_node(
         &node.prefix,
         node.present,
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
         32,
         "conflict set node",
     )
 }
 pub(crate) fn validate_content_set_node(node: &ContentSetNode) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|suffix| suffix.first().copied())
+        .collect();
     validate_radix_node(
         &node.prefix,
         node.present,
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
         32,
         "content set node",
     )
@@ -546,10 +677,16 @@ pub(crate) fn validate_content_set_node(node: &ContentSetNode) -> Result<(), Can
 pub(crate) fn validate_retained_set_node(
     node: &RetainedSetNode,
 ) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|suffix| suffix.first().copied())
+        .collect();
     validate_radix_node(
         &node.prefix,
         node.present,
         &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
         32,
         "retained set node",
     )
@@ -568,6 +705,14 @@ pub(crate) fn view_lineage_map_node_bytes(node: &ViewLineageMapNode) -> Vec<u8> 
                 .map(|c| wire::ViewLineageMapChildV1 {
                     edge: c.edge,
                     child: view_lineage_map_id(c.child),
+                })
+                .collect(),
+            entries: node
+                .entries
+                .iter()
+                .map(|(suffix, value)| wire::ViewLineageMapEntryV1 {
+                    suffix: suffix.clone(),
+                    value: retained_set_id(*value),
                 })
                 .collect(),
         }
@@ -590,6 +735,14 @@ pub(crate) fn application_map_node_bytes(node: &ApplicationMapNode) -> Vec<u8> {
                     child: application_map_id(c.child),
                 })
                 .collect(),
+            entries: node
+                .entries
+                .iter()
+                .map(|(suffix, value)| wire::ApplicationMapEntryV1 {
+                    suffix: suffix.clone(),
+                    value: application_id(*value),
+                })
+                .collect(),
         }
         .into(),
     ))
@@ -609,6 +762,13 @@ macro_rules! set_node_bytes {
                         .map(|c| wire::$wire_child {
                             edge: c.edge,
                             child: $id_fn(c.child),
+                        })
+                        .collect(),
+                    entries: node
+                        .entries
+                        .iter()
+                        .map(|suffix| wire::SetEntryV1 {
+                            suffix: suffix.clone(),
                         })
                         .collect(),
                 }
@@ -1165,10 +1325,16 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                     "revision map must have at most one value",
                 ));
             }
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
             validate_radix_node(
                 &node.prefix,
                 !node.value.is_empty(),
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
                 16,
                 "revision map node",
             )?;
@@ -1179,10 +1345,16 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                     "change map must have at most one value",
                 ));
             }
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
             validate_radix_node(
                 &node.prefix,
                 !node.value.is_empty(),
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
                 16,
                 "change map node",
             )?;
@@ -1193,37 +1365,61 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                     "application map value",
                 ));
             }
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
             validate_radix_node(
                 &node.prefix,
                 !node.value.is_empty(),
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
                 16,
                 "application map node",
             )?;
         }
         wire::WheatObject::ConflictSetNodeV1(node) => {
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
             validate_radix_node(
                 &node.prefix,
                 node.present,
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
                 32,
                 "conflict set node",
             )?;
         }
         wire::WheatObject::ContentSetNodeV1(node) => {
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
             validate_radix_node(
                 &node.prefix,
                 node.present,
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
                 32,
                 "content set node",
             )?;
         }
         wire::WheatObject::RetainedSetNodeV1(node) => {
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
             validate_radix_node(
                 &node.prefix,
                 node.present,
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
                 32,
                 "retained set node",
             )?;
@@ -1234,10 +1430,16 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                     "view lineage map value cardinality",
                 ));
             }
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
             validate_radix_node(
                 &node.prefix,
                 !node.value.is_empty(),
                 &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
                 32,
                 "view lineage map node",
             )?;
@@ -1758,6 +1960,12 @@ pub fn extract_object_references(
             for value in &node.value {
                 refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
             }
+            // Inline entry values are also RevisionId references.
+            for entry in &node.entries {
+                refs.push(crate::ObjectId::from_digest(digest_domain(
+                    &entry.value.digest,
+                )?));
+            }
         }
         wire::WheatObject::ChangeMapNodeV1(node) => {
             for child in &node.children {
@@ -1767,6 +1975,11 @@ pub fn extract_object_references(
             }
             for value in &node.value {
                 refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
+            }
+            for entry in &node.entries {
+                refs.push(crate::ObjectId::from_digest(digest_domain(
+                    &entry.value.digest,
+                )?));
             }
         }
         wire::WheatObject::ApplicationMapNodeV1(node) => {
@@ -1778,6 +1991,11 @@ pub fn extract_object_references(
             for value in &node.value {
                 refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
             }
+            for entry in &node.entries {
+                refs.push(crate::ObjectId::from_digest(digest_domain(
+                    &entry.value.digest,
+                )?));
+            }
         }
         wire::WheatObject::ViewLineageMapNodeV1(node) => {
             for child in &node.children {
@@ -1787,6 +2005,11 @@ pub fn extract_object_references(
             }
             for value in &node.value {
                 refs.push(crate::ObjectId::from_digest(digest_domain(&value.digest)?));
+            }
+            for entry in &node.entries {
+                refs.push(crate::ObjectId::from_digest(digest_domain(
+                    &entry.value.digest,
+                )?));
             }
         }
         wire::WheatObject::ConflictSetNodeV1(node) => {
@@ -1876,6 +2099,7 @@ mod tests {
                     },
                 }],
                 children: vec![],
+                entries: vec![],
             }
             .into(),
         );

@@ -124,6 +124,7 @@ impl radix::Collection for ViewLineageCollection {
                 .into_iter()
                 .map(|child| (child.edge, child.child))
                 .collect(),
+            entries: node.entries,
         }
     }
 
@@ -137,6 +138,7 @@ impl radix::Collection for ViewLineageCollection {
                 .into_iter()
                 .map(|(edge, child)| ViewLineageMapChild { edge, child })
                 .collect(),
+            node.entries,
         )
     }
 
@@ -522,6 +524,17 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
                     .collect();
                 result.insert(parent, children);
             }
+            // Yield inline entries.
+            for (suffix, children_root) in &node.entries {
+                key[end..end + suffix.len()].copy_from_slice(suffix);
+                let parent = ViewId::from_digest(key);
+                let children = self
+                    .child_set_bounded(*children_root, limits, budget, true)
+                    .await?
+                    .into_iter()
+                    .collect();
+                result.insert(parent, children);
+            }
             for child in node.children.into_iter().rev() {
                 pending.push((child.child, end + 1, Some(child.edge)));
             }
@@ -570,6 +583,14 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
             if position == 32 {
                 return Ok(node.value);
             }
+            // Check inline entries first.
+            let suffix = &bytes[position..];
+            if let Ok(idx) = node
+                .entries
+                .binary_search_by(|(s, _)| s.as_slice().cmp(suffix))
+            {
+                return Ok(Some(node.entries[idx].1));
+            }
             let edge = bytes[position];
             let Ok(index) = node
                 .children
@@ -606,6 +627,14 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
             let end = position + node.prefix.len();
             key[position..end].copy_from_slice(&node.prefix);
             if node.present {
+                if count_edges {
+                    budget.edge(limits)?;
+                }
+                result.push(ViewId::from_digest(key));
+            }
+            // Yield inline entries (set entries are just suffixes, no values).
+            for suffix in &node.entries {
+                key[end..end + suffix.len()].copy_from_slice(suffix);
                 if count_edges {
                     budget.edge(limits)?;
                 }

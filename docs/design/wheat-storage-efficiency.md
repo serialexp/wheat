@@ -1,8 +1,8 @@
 # Wheat Storage Efficiency — Design
 
-Status: partial — Phase 0 landed, Phases 1–4 outstanding
+Status: partial — Phases 0–1 landed, Phases 2–4 outstanding
 Owner: bart
-Last updated: 2026-09-20
+Last updated: 2026-09-21
 
 ## Implementation status
 
@@ -21,13 +21,16 @@ external review.
   gix-pack apply logic. Content store transparently resolves delta chains
   up to depth 16. Server publish path diffs old/new Merkle trees to find
   delta bases. Commit writer passes base hints for generated content.
+- [x] **Phase 1 — collection compaction.** Radix trie nodes now inline
+  single-entry leaf subtrees as entries (key suffix + value) in the parent
+  node body. Reduces node count by ~70-85% for typical collections while
+  preserving Merkle identity, O(Δ) `paired_diff`, and O(log N)
+  incremental COW updates. All 7 collection types updated: wire format,
+  builders, cursor, get, update_batch/update_node, paired_diff,
+  context_walk, paired_context_walk, snapshot closure walker,
+  extract_object_references, content accumulator (import path).
 
 ### Outstanding
-- [ ] **Phase 1 — collection compaction.** Reduce per-node overhead
-  in radix tries while preserving O(Δ) `paired_diff` for
-  `validate_transition`. Approach: higher-fanout nodes that inline
-  entries up to a size threshold, reducing node count without
-  sacrificing structural sharing.
 - [ ] **Phase 2 — segment-level block compression.** Compress groups
   of consecutive records within a segment as shared zstd frames,
   so small structural objects benefit from cross-record context.

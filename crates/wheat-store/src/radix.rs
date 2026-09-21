@@ -52,6 +52,9 @@ pub(crate) struct Node<I, V> {
     pub prefix: Vec<u8>,
     pub value: Option<V>,
     pub children: Vec<(u8, I)>,
+    /// Inline entries: key suffixes with values stored directly in this node
+    /// instead of as separate child objects.
+    pub entries: Vec<(Vec<u8>, V)>,
 }
 
 pub(crate) trait Collection: Send + Sync {
@@ -83,6 +86,7 @@ type BuildFuture<'a, I> = Pin<Box<dyn Future<Output = Result<I, Error>> + Send +
 type UpdateFuture<'a, I> = Pin<Box<dyn Future<Output = Result<Option<I>, Error>> + Send + 'a>>;
 type Frame<C> = (
     Node<<C as Collection>::Id, <C as Collection>::Value>,
+    usize,
     usize,
     usize,
     bool,
@@ -147,6 +151,7 @@ struct ContextFrame<C: Collection> {
     node: Node<C::Id, C::Value>,
     position: usize,
     child_index: usize,
+    entry_index: usize,
     yielded_value: bool,
     announced: bool,
 }
@@ -207,6 +212,7 @@ struct PairedContextFrame<L: Collection, R: Collection<Key = L::Key>> {
     right: PairedRight<R>,
     position: usize,
     child_index: usize,
+    entry_index: usize,
     yielded_value: bool,
     announced: bool,
     prunable: bool,
@@ -231,6 +237,7 @@ where
             prefix: Vec::new(),
             value: None,
             children: Vec::new(),
+            entries: Vec::new(),
         })
         .await
     }
@@ -297,12 +304,14 @@ where
         if end > C::Key::LEN {
             return Err(Error::InvalidChildDepth);
         }
+        let total_branches = node.children.len() + node.entries.len();
         if node.value.is_some() {
-            if end != C::Key::LEN || !node.children.is_empty() {
+            // Terminal: at full key depth, no children or entries.
+            if end != C::Key::LEN || total_branches != 0 {
                 return Err(Error::InvalidTerminalNode);
             }
-        } else if node.children.len() == 1
-            || (node.children.is_empty() && !(position == 0 && node.prefix.is_empty()))
+        } else if total_branches == 1
+            || (total_branches == 0 && !(position == 0 && node.prefix.is_empty()))
         {
             return Err(Error::InvalidTerminalNode);
         }
@@ -311,7 +320,10 @@ where
 
     async fn root(&self, id: C::Id) -> Result<Node<C::Id, C::Value>, Error> {
         let node = self.read_at(id, 0).await?;
-        if node.prefix.is_empty() && node.value.is_none() && node.children.len() == 1 {
+        if node.prefix.is_empty()
+            && node.value.is_none()
+            && node.children.len() + node.entries.len() == 1
+        {
             return Err(Error::InvalidRootDepth);
         }
         Ok(node)
@@ -330,7 +342,7 @@ where
         let node = self.root(root).await?;
         Ok(Cursor {
             store: Self::new(self.objects),
-            stack: vec![(node, 0, 0, false)],
+            stack: vec![(node, 0, 0, 0, false)],
             key: vec![0; C::Key::LEN],
         })
     }
@@ -344,6 +356,7 @@ where
                 node,
                 position: 0,
                 child_index: 0,
+                entry_index: 0,
                 yielded_value: false,
                 announced: false,
             }],
@@ -382,6 +395,7 @@ where
                 },
                 position: 0,
                 child_index: 0,
+                entry_index: 0,
                 yielded_value: false,
                 announced: false,
                 prunable: false,
@@ -409,6 +423,14 @@ where
             if end == C::Key::LEN {
                 return Ok(node.value);
             }
+            let suffix = &key.bytes()[end..];
+            // Check inline entries first — their suffix covers the remaining key bytes.
+            if let Ok(index) = node
+                .entries
+                .binary_search_by(|(s, _)| s.as_slice().cmp(suffix))
+            {
+                return Ok(Some(node.entries[index].1));
+            }
             let edge = key.bytes()[end];
             let Ok(index) = node.children.binary_search_by_key(&edge, |child| child.0) else {
                 return Ok(None);
@@ -434,8 +456,10 @@ where
             return Ok(root);
         }
         let initial = self.root(root).await?;
-        let initially_empty =
-            initial.prefix.is_empty() && initial.value.is_none() && initial.children.is_empty();
+        let initially_empty = initial.prefix.is_empty()
+            && initial.value.is_none()
+            && initial.children.is_empty()
+            && initial.entries.is_empty();
         if initially_empty {
             let present = edits
                 .iter()
@@ -453,8 +477,10 @@ where
                 continue;
             }
             let node = self.root(current).await?;
-            let was_empty =
-                node.prefix.is_empty() && node.value.is_none() && node.children.is_empty();
+            let was_empty = node.prefix.is_empty()
+                && node.value.is_none()
+                && node.children.is_empty()
+                && node.entries.is_empty();
             if was_empty {
                 let Some(value) = edit.1 else { continue };
                 current = self
@@ -462,6 +488,7 @@ where
                         prefix: edit.0.bytes().to_vec(),
                         value: Some(value),
                         children: Vec::new(),
+                        entries: Vec::new(),
                     })
                     .await?;
                 continue;
@@ -474,6 +501,9 @@ where
         Ok(current)
     }
 
+    /// Recursively update a node with a batch of edits, producing canonical
+    /// inline-entry structure.  Returns `None` when the node is pruned (all
+    /// entries removed from a non-root subtree).
     fn update_node<'b>(
         &'b self,
         original: Option<C::Id>,
@@ -496,21 +526,45 @@ where
                 })
                 .min()
                 .expect("edits are non-empty");
+
+            // ── Prefix diverges: split this node ──────────────────────────
             if common < node.prefix.len() {
                 if edits.iter().all(|(_, value)| value.is_none()) {
                     return Ok(original);
                 }
                 let split = position + common;
                 let old_edge = node.prefix[common];
-                let old_child = self
-                    .write(Node {
-                        prefix: node.prefix[common + 1..].to_vec(),
-                        value: node.value,
-                        children: node.children,
-                    })
-                    .await?;
-                let mut entries = BTreeMap::new();
-                entries.insert(old_edge, old_child);
+
+                // Determine whether the old node (after prefix split) is a
+                // bare terminal leaf that should be inlined.
+                let old_remainder = &node.prefix[common + 1..];
+                let old_is_terminal_leaf = node.value.is_some()
+                    && node.children.is_empty()
+                    && node.entries.is_empty()
+                    && position + node.prefix.len() == C::Key::LEN;
+
+                let mut new_children: Vec<(u8, C::Id)> = Vec::new();
+                let mut new_entries: Vec<(Vec<u8>, C::Value)> = Vec::new();
+
+                if old_is_terminal_leaf {
+                    // The old node becomes an inline entry (edge + remainder).
+                    let mut suffix = Vec::with_capacity(1 + old_remainder.len());
+                    suffix.push(old_edge);
+                    suffix.extend_from_slice(old_remainder);
+                    new_entries.push((suffix, node.value.unwrap()));
+                } else {
+                    let old_child = self
+                        .write(Node {
+                            prefix: old_remainder.to_vec(),
+                            value: node.value,
+                            children: node.children,
+                            entries: node.entries,
+                        })
+                        .await?;
+                    new_children.push((old_edge, old_child));
+                }
+
+                // Process edit groups by edge byte at the split position.
                 let mut start = 0;
                 while start < edits.len() {
                     let edge = edits[start].0.bytes()[split];
@@ -521,23 +575,41 @@ where
                         .filter_map(|(key, value)| value.map(|value| (*key, value)))
                         .collect();
                     if !present.is_empty() {
-                        entries.insert(edge, self.build_subtree(split + 1, &present).await?);
+                        if present.len() == 1 {
+                            // Single entry: inline it.
+                            let suffix = present[0].0.bytes()[split..].to_vec();
+                            new_entries.push((suffix, present[0].1));
+                        } else {
+                            let child = self.build_subtree(split + 1, &present).await?;
+                            new_children.push((edge, child));
+                        }
                     }
                     start = group_end;
                 }
-                if entries.len() == 1 {
-                    return Ok(original);
+
+                let total = new_children.len() + new_entries.len();
+                if total <= 1 && position > 0 {
+                    // After adding edits, if we still have only the old node
+                    // (all edits were deletions of non-existent keys), nothing
+                    // changed.
+                    if total == 1 && new_entries.is_empty() && new_children[0].0 == old_edge {
+                        return Ok(original);
+                    }
                 }
+                new_children.sort_by_key(|&(e, _)| e);
+                new_entries.sort_by(|a, b| a.0.cmp(&b.0));
                 return Ok(Some(
                     self.write(Node {
                         prefix: node.prefix[..common].to_vec(),
                         value: None,
-                        children: entries.into_iter().collect(),
+                        children: new_children,
+                        entries: new_entries,
                     })
                     .await?,
                 ));
             }
 
+            // ── Full prefix match, terminal depth ─────────────────────────
             let end = position + node.prefix.len();
             if end == C::Key::LEN {
                 let value = edits[edits.len() - 1].1;
@@ -550,6 +622,7 @@ where
                             prefix: node.prefix,
                             value: Some(value),
                             children: Vec::new(),
+                            entries: Vec::new(),
                         })
                         .await?,
                     )),
@@ -558,39 +631,148 @@ where
                 };
             }
 
+            // ── Full prefix match, non-terminal: update children & entries ─
             let mut children = node.children;
+            let mut entries = node.entries;
             let mut changed = false;
             let mut start = 0;
             while start < edits.len() {
                 let edge = edits[start].0.bytes()[end];
                 let group_end =
                     start + edits[start..].partition_point(|(key, _)| key.bytes()[end] == edge);
-                let location = children.binary_search_by_key(&edge, |child| child.0);
-                let old = location.ok().map(|index| children[index].1);
-                let replacement = if let Some(id) = old {
-                    let child = self.read_at(id, end + 1).await?;
-                    self.update_node(Some(id), child, end + 1, &edits[start..group_end])
-                        .await?
+                let child_location = children.binary_search_by_key(&edge, |child| child.0);
+
+                // Find an existing inline entry whose first suffix byte matches
+                // the edit's edge byte (not exact suffix match — entries under the
+                // same discriminating byte must interact).
+                let entry_idx = entries
+                    .iter()
+                    .position(|(s, _)| s.first().copied() == Some(edge));
+
+                if let Some(entry_idx) = entry_idx {
+                    // Edit group shares first byte with an existing inline entry.
+                    let edit_suffix = &edits[start].0.bytes()[end..];
+                    if group_end - start == 1 && entries[entry_idx].0 == edit_suffix {
+                        // Single edit targeting this exact entry — update in place.
+                        match edits[start].1 {
+                            Some(value) => {
+                                if entries[entry_idx].1 != value {
+                                    entries[entry_idx].1 = value;
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                entries.remove(entry_idx);
+                                changed = true;
+                            }
+                        }
+                    } else {
+                        // Edits interact with this entry's subtree. Pull the entry
+                        // out and merge with the edits to rebuild.
+                        let (old_suffix, old_value) = entries.remove(entry_idx);
+                        changed = true;
+                        // Reconstruct the full key for the old inline entry.
+                        let mut full_key = vec![0u8; C::Key::LEN];
+                        full_key[..end].copy_from_slice(&edits[start].0.bytes()[..end]);
+                        full_key[end..].copy_from_slice(&old_suffix);
+                        let mut combined = vec![(
+                            C::Key::from_bytes(&full_key),
+                            Some(old_value),
+                        )];
+                        combined.extend_from_slice(&edits[start..group_end]);
+                        // Dedup/apply: last value for each key wins.
+                        let present: Vec<_> = combined
+                            .iter()
+                            .filter_map(|(key, value)| value.map(|v| (*key, v)))
+                            .collect::<BTreeMap<_, _>>()
+                            .into_iter()
+                            .collect();
+                        if present.len() == 1 {
+                            // Still a single entry: re-inline.
+                            let suffix = present[0].0.bytes()[end..].to_vec();
+                            let ins_pos = entries
+                                .binary_search_by(|(s, _)| s.as_slice().cmp(&suffix))
+                                .unwrap_err();
+                            entries.insert(ins_pos, (suffix, present[0].1));
+                        } else if !present.is_empty() {
+                            // Multiple entries: create a child subtree.
+                            let child = self.build_subtree(end + 1, &present).await?;
+                            let ins_pos = children
+                                .binary_search_by_key(&edge, |c| c.0)
+                                .unwrap_err();
+                            children.insert(ins_pos, (edge, child));
+                        }
+                    }
+                } else if let Ok(child_idx) = child_location {
+                    // Edit targets an existing child — recurse.
+                    let old_id = children[child_idx].1;
+                    let child_node = self.read_at(old_id, end + 1).await?;
+                    let replacement = self
+                        .update_node(
+                            Some(old_id),
+                            child_node,
+                            end + 1,
+                            &edits[start..group_end],
+                        )
+                        .await?;
+                    if replacement != Some(old_id) {
+                        changed = true;
+                        match replacement {
+                            Some(new_id) => {
+                                // Check if the child is now a single bare leaf
+                                // that should be promoted to an inline entry.
+                                let updated = self.read_at(new_id, end + 1).await?;
+                                if let Some(leaf_value) = updated.value {
+                                    if updated.children.is_empty()
+                                        && updated.entries.is_empty()
+                                        && end + 1 + updated.prefix.len() == C::Key::LEN
+                                    {
+                                        // Promote to inline entry.
+                                        children.remove(child_idx);
+                                        let mut suffix =
+                                            Vec::with_capacity(1 + updated.prefix.len());
+                                        suffix.push(edge);
+                                        suffix.extend_from_slice(&updated.prefix);
+                                        let ins_pos = entries
+                                            .binary_search_by(|(s, _)| {
+                                                s.as_slice().cmp(&suffix)
+                                            })
+                                            .unwrap_err();
+                                        entries.insert(ins_pos, (suffix, leaf_value));
+                                    } else {
+                                        children[child_idx].1 = new_id;
+                                    }
+                                } else {
+                                    children[child_idx].1 = new_id;
+                                }
+                            }
+                            None => {
+                                children.remove(child_idx);
+                            }
+                        }
+                    }
                 } else {
+                    // No existing child or entry at this edge byte — create new.
                     let present: Vec<_> = edits[start..group_end]
                         .iter()
                         .filter_map(|(key, value)| value.map(|value| (*key, value)))
                         .collect();
-                    if present.is_empty() {
-                        None
-                    } else {
-                        Some(self.build_subtree(end + 1, &present).await?)
-                    }
-                };
-                if replacement != old {
-                    changed = true;
-                    match (location, replacement) {
-                        (Ok(index), Some(id)) => children[index].1 = id,
-                        (Ok(index), None) => {
-                            children.remove(index);
+                    if !present.is_empty() {
+                        changed = true;
+                        if present.len() == 1 {
+                            // Single entry: inline it.
+                            let suffix = present[0].0.bytes()[end..].to_vec();
+                            let ins_pos = entries
+                                .binary_search_by(|(s, _)| s.as_slice().cmp(&suffix))
+                                .unwrap_err();
+                            entries.insert(ins_pos, (suffix, present[0].1));
+                        } else {
+                            let child = self.build_subtree(end + 1, &present).await?;
+                            let ins_pos = children
+                                .binary_search_by_key(&edge, |c| c.0)
+                                .unwrap_err();
+                            children.insert(ins_pos, (edge, child));
                         }
-                        (Err(index), Some(id)) => children.insert(index, (edge, id)),
-                        (Err(_), None) => {}
                     }
                 }
                 start = group_end;
@@ -598,34 +780,53 @@ where
             if !changed {
                 return Ok(original);
             }
-            if children.is_empty() {
+            let total_branches = children.len() + entries.len();
+            if total_branches == 0 {
                 return if position == 0 {
                     Ok(Some(self.empty_root().await?))
                 } else {
                     Ok(None)
                 };
             }
-            if children.len() == 1 {
-                let (edge, child_id) = children[0];
-                let child = self.read_at(child_id, end + 1).await?;
-                let mut prefix = node.prefix;
-                prefix.reserve(1 + child.prefix.len());
-                prefix.push(edge);
-                prefix.extend_from_slice(&child.prefix);
-                return Ok(Some(
-                    self.write(Node {
-                        prefix,
-                        value: child.value,
-                        children: child.children,
-                    })
-                    .await?,
-                ));
+            if total_branches == 1 && node.value.is_none() {
+                // Collapse: merge the single remaining branch into this node.
+                if let Some((edge, child_id)) = children.first().copied() {
+                    let child = self.read_at(child_id, end + 1).await?;
+                    let mut prefix = node.prefix;
+                    prefix.reserve(1 + child.prefix.len());
+                    prefix.push(edge);
+                    prefix.extend_from_slice(&child.prefix);
+                    return Ok(Some(
+                        self.write(Node {
+                            prefix,
+                            value: child.value,
+                            children: child.children,
+                            entries: child.entries,
+                        })
+                        .await?,
+                    ));
+                } else {
+                    // Single remaining entry: collapse into a terminal node.
+                    let (suffix, value) = entries.into_iter().next().unwrap();
+                    let mut prefix = node.prefix;
+                    prefix.extend_from_slice(&suffix);
+                    return Ok(Some(
+                        self.write(Node {
+                            prefix,
+                            value: Some(value),
+                            children: Vec::new(),
+                            entries: Vec::new(),
+                        })
+                        .await?,
+                    ));
+                }
             }
             Ok(Some(
                 self.write(Node {
                     prefix: node.prefix,
-                    value: None,
+                    value: node.value,
                     children,
+                    entries,
                 })
                 .await?,
             ))
@@ -675,6 +876,19 @@ where
                                 DiffEntry::Added(C::Key::from_bytes(&key), value)
                             } else {
                                 DiffEntry::Removed(C::Key::from_bytes(&key), value)
+                            },
+                            limits,
+                        )?;
+                    }
+                    // Emit inline entries.
+                    for (suffix, value) in &node.entries {
+                        key[end..end + suffix.len()].copy_from_slice(suffix);
+                        Self::diff_emit(
+                            &mut changes,
+                            if added {
+                                DiffEntry::Added(C::Key::from_bytes(&key), *value)
+                            } else {
+                                DiffEntry::Removed(C::Key::from_bytes(&key), *value)
                             },
                             limits,
                         )?;
@@ -761,62 +975,310 @@ where
                             )?,
                             _ => {}
                         }
-                        let mut left_index = left.children.len();
-                        let mut right_index = right.children.len();
-                        while left_index != 0 || right_index != 0 {
-                            let left_child = left_index.checked_sub(1).map(|i| left.children[i]);
-                            let right_child = right_index.checked_sub(1).map(|i| right.children[i]);
-                            match (left_child, right_child) {
-                                (Some((le, li)), Some((re, ri))) if le == re => {
-                                    left_index -= 1;
-                                    right_index -= 1;
-                                    if li != ri {
-                                        pending.push(DiffTask::Pair(
-                                            DiffSide::Id(li),
-                                            DiffSide::Id(ri),
-                                            end + 1,
-                                            Some(le),
-                                        ));
+                        // Merge-diff all branches (children + entries) from both sides
+                        // by discriminating byte. A byte can be a child on one side
+                        // and an inline entry on the other (structural difference),
+                        // so we must cross-match.
+                        #[derive(Clone, Copy)]
+                        enum Branch<I, V: Copy> {
+                            Child(u8, I),
+                            Entry(u8, V), // first suffix byte + value
+                        }
+                        impl<I: Copy, V: Copy> Branch<I, V> {
+                            fn byte(&self) -> u8 {
+                                match self {
+                                    Branch::Child(b, _) | Branch::Entry(b, _) => *b,
+                                }
+                            }
+                        }
+                        // Collect and sort by discriminating byte (they're already
+                        // sorted within each list; merge is O(n)).
+                        let left_branches: Vec<Branch<C::Id, C::Value>> = {
+                            let mut v = Vec::with_capacity(
+                                left.children.len() + left.entries.len(),
+                            );
+                            let mut ci = 0;
+                            let mut ei = 0;
+                            loop {
+                                let cb = left.children.get(ci).map(|c| c.0);
+                                let eb = left
+                                    .entries
+                                    .get(ei)
+                                    .and_then(|(s, _)| s.first().copied());
+                                match (cb, eb) {
+                                    (Some(c), Some(e)) if c < e => {
+                                        v.push(Branch::Child(c, left.children[ci].1));
+                                        ci += 1;
+                                    }
+                                    (Some(_), Some(e)) => {
+                                        v.push(Branch::Entry(e, left.entries[ei].1));
+                                        ei += 1;
+                                    }
+                                    (Some(c), None) => {
+                                        v.push(Branch::Child(c, left.children[ci].1));
+                                        ci += 1;
+                                    }
+                                    (None, Some(e)) => {
+                                        v.push(Branch::Entry(e, left.entries[ei].1));
+                                        ei += 1;
+                                    }
+                                    (None, None) => break,
+                                }
+                            }
+                            v
+                        };
+                        let right_branches: Vec<Branch<C::Id, C::Value>> = {
+                            let mut v = Vec::with_capacity(
+                                right.children.len() + right.entries.len(),
+                            );
+                            let mut ci = 0;
+                            let mut ei = 0;
+                            loop {
+                                let cb = right.children.get(ci).map(|c| c.0);
+                                let eb = right
+                                    .entries
+                                    .get(ei)
+                                    .and_then(|(s, _)| s.first().copied());
+                                match (cb, eb) {
+                                    (Some(c), Some(e)) if c < e => {
+                                        v.push(Branch::Child(c, right.children[ci].1));
+                                        ci += 1;
+                                    }
+                                    (Some(_), Some(e)) => {
+                                        v.push(Branch::Entry(e, right.entries[ei].1));
+                                        ei += 1;
+                                    }
+                                    (Some(c), None) => {
+                                        v.push(Branch::Child(c, right.children[ci].1));
+                                        ci += 1;
+                                    }
+                                    (None, Some(e)) => {
+                                        v.push(Branch::Entry(e, right.entries[ei].1));
+                                        ei += 1;
+                                    }
+                                    (None, None) => break,
+                                }
+                            }
+                            v
+                        };
+                        // Now merge-diff the two branch lists by byte.
+                        // Entry diffs are collected here (loop is reverse, but
+                        // entries must be emitted in forward key order).
+                        let mut deferred_entry_diffs: Vec<DiffEntry<C::Key, C::Value>> =
+                            Vec::new();
+                        let mut lbi = left_branches.len();
+                        let mut rbi = right_branches.len();
+                        let left_entry_by_byte = |byte: u8| -> Option<usize> {
+                            left.entries
+                                .binary_search_by(|(s, _)| s[0].cmp(&byte))
+                                .ok()
+                        };
+                        let right_entry_by_byte = |byte: u8| -> Option<usize> {
+                            right.entries
+                                .binary_search_by(|(s, _)| s[0].cmp(&byte))
+                                .ok()
+                        };
+                        while lbi != 0 || rbi != 0 {
+                            let lb = lbi.checked_sub(1).map(|i| &left_branches[i]);
+                            let rb = rbi.checked_sub(1).map(|i| &right_branches[i]);
+                            match (lb, rb) {
+                                (Some(l), Some(r)) if l.byte() == r.byte() => {
+                                    let byte = l.byte();
+                                    lbi -= 1;
+                                    rbi -= 1;
+                                    match (l, r) {
+                                        (Branch::Child(_, li), Branch::Child(_, ri)) => {
+                                            if li != ri {
+                                                pending.push(DiffTask::Pair(
+                                                    DiffSide::Id(*li),
+                                                    DiffSide::Id(*ri),
+                                                    end + 1,
+                                                    Some(byte),
+                                                ));
+                                            }
+                                        }
+                                        (Branch::Entry(_, lv), Branch::Entry(_, rv)) => {
+                                            // Both are entries — compare full suffixes.
+                                            let lei = left_entry_by_byte(byte).unwrap();
+                                            let rei = right_entry_by_byte(byte).unwrap();
+                                            let (ls, _) = &left.entries[lei];
+                                            let (rs, _) = &right.entries[rei];
+                                            if ls == rs {
+                                                if lv != rv {
+                                                    key[end..end + ls.len()]
+                                                        .copy_from_slice(ls);
+                                                    deferred_entry_diffs.push(
+                                                        DiffEntry::Changed(
+                                                            C::Key::from_bytes(&key),
+                                                            *lv,
+                                                            *rv,
+                                                        ),
+                                                    );
+                                                }
+                                            } else {
+                                                // Same first byte, different suffixes.
+                                                key[end..end + ls.len()]
+                                                    .copy_from_slice(ls);
+                                                deferred_entry_diffs.push(
+                                                    DiffEntry::Removed(
+                                                        C::Key::from_bytes(&key),
+                                                        *lv,
+                                                    ),
+                                                );
+                                                key[end..end + rs.len()]
+                                                    .copy_from_slice(rs);
+                                                deferred_entry_diffs.push(
+                                                    DiffEntry::Added(
+                                                        C::Key::from_bytes(&key),
+                                                        *rv,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        (Branch::Child(_, id), Branch::Entry(_, rv)) => {
+                                            // Left has a child, right has an entry.
+                                            // Pair: make entry a synthetic node.
+                                            let rei = right_entry_by_byte(byte).unwrap();
+                                            let (rs, _) = &right.entries[rei];
+                                            let entry_node = Node {
+                                                prefix: rs[1..].to_vec(),
+                                                value: Some(*rv),
+                                                children: Vec::new(),
+                                                entries: Vec::new(),
+                                            };
+                                            pending.push(DiffTask::Pair(
+                                                DiffSide::Id(*id),
+                                                DiffSide::Loaded(entry_node, 0),
+                                                end + 1,
+                                                Some(byte),
+                                            ));
+                                        }
+                                        (Branch::Entry(_, lv), Branch::Child(_, id)) => {
+                                            // Left has an entry, right has a child.
+                                            let lei = left_entry_by_byte(byte).unwrap();
+                                            let (ls, _) = &left.entries[lei];
+                                            let entry_node = Node {
+                                                prefix: ls[1..].to_vec(),
+                                                value: Some(*lv),
+                                                children: Vec::new(),
+                                                entries: Vec::new(),
+                                            };
+                                            pending.push(DiffTask::Pair(
+                                                DiffSide::Loaded(entry_node, 0),
+                                                DiffSide::Id(*id),
+                                                end + 1,
+                                                Some(byte),
+                                            ));
+                                        }
                                     }
                                 }
-                                (Some((le, li)), Some((re, _))) if le > re => {
-                                    left_index -= 1;
-                                    pending.push(DiffTask::One(
-                                        DiffSide::Id(li),
-                                        end + 1,
-                                        Some(le),
-                                        false,
-                                    ));
+                                (Some(l), Some(r)) if l.byte() > r.byte() => {
+                                    lbi -= 1;
+                                    let byte = l.byte();
+                                    match l {
+                                        Branch::Child(_, id) => {
+                                            pending.push(DiffTask::One(
+                                                DiffSide::Id(*id),
+                                                end + 1,
+                                                Some(byte),
+                                                false,
+                                            ));
+                                        }
+                                        Branch::Entry(_, val) => {
+                                            let lei = left_entry_by_byte(byte).unwrap();
+                                            let (ls, _) = &left.entries[lei];
+                                            key[end..end + ls.len()].copy_from_slice(ls);
+                                            deferred_entry_diffs.push(
+                                                DiffEntry::Removed(
+                                                    C::Key::from_bytes(&key),
+                                                    *val,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
-                                (Some(_), Some((re, ri))) => {
-                                    right_index -= 1;
-                                    pending.push(DiffTask::One(
-                                        DiffSide::Id(ri),
-                                        end + 1,
-                                        Some(re),
-                                        true,
-                                    ));
+                                (Some(_), Some(r)) => {
+                                    rbi -= 1;
+                                    let byte = r.byte();
+                                    match r {
+                                        Branch::Child(_, id) => {
+                                            pending.push(DiffTask::One(
+                                                DiffSide::Id(*id),
+                                                end + 1,
+                                                Some(byte),
+                                                true,
+                                            ));
+                                        }
+                                        Branch::Entry(_, val) => {
+                                            let rei = right_entry_by_byte(byte).unwrap();
+                                            let (rs, _) = &right.entries[rei];
+                                            key[end..end + rs.len()].copy_from_slice(rs);
+                                            deferred_entry_diffs.push(
+                                                DiffEntry::Added(
+                                                    C::Key::from_bytes(&key),
+                                                    *val,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
-                                (Some((le, li)), None) => {
-                                    left_index -= 1;
-                                    pending.push(DiffTask::One(
-                                        DiffSide::Id(li),
-                                        end + 1,
-                                        Some(le),
-                                        false,
-                                    ));
+                                (Some(l), None) => {
+                                    lbi -= 1;
+                                    let byte = l.byte();
+                                    match l {
+                                        Branch::Child(_, id) => {
+                                            pending.push(DiffTask::One(
+                                                DiffSide::Id(*id),
+                                                end + 1,
+                                                Some(byte),
+                                                false,
+                                            ));
+                                        }
+                                        Branch::Entry(_, val) => {
+                                            let lei = left_entry_by_byte(byte).unwrap();
+                                            let (ls, _) = &left.entries[lei];
+                                            key[end..end + ls.len()].copy_from_slice(ls);
+                                            deferred_entry_diffs.push(
+                                                DiffEntry::Removed(
+                                                    C::Key::from_bytes(&key),
+                                                    *val,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
-                                (None, Some((re, ri))) => {
-                                    right_index -= 1;
-                                    pending.push(DiffTask::One(
-                                        DiffSide::Id(ri),
-                                        end + 1,
-                                        Some(re),
-                                        true,
-                                    ));
+                                (None, Some(r)) => {
+                                    rbi -= 1;
+                                    let byte = r.byte();
+                                    match r {
+                                        Branch::Child(_, id) => {
+                                            pending.push(DiffTask::One(
+                                                DiffSide::Id(*id),
+                                                end + 1,
+                                                Some(byte),
+                                                true,
+                                            ));
+                                        }
+                                        Branch::Entry(_, val) => {
+                                            let rei = right_entry_by_byte(byte).unwrap();
+                                            let (rs, _) = &right.entries[rei];
+                                            key[end..end + rs.len()].copy_from_slice(rs);
+                                            deferred_entry_diffs.push(
+                                                DiffEntry::Added(
+                                                    C::Key::from_bytes(&key),
+                                                    *val,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                                 (None, None) => break,
                             }
+                        }
+                        // Emit deferred entry diffs in forward (key-sorted) order.
+                        // The loop above ran high→low, so reverse.
+                        for entry_diff in deferred_entry_diffs.into_iter().rev() {
+                            Self::diff_emit(&mut changes, entry_diff, limits)?;
                         }
                     } else if common == left_prefix.len() {
                         let end = position + common;
@@ -825,9 +1287,18 @@ where
                             .children
                             .binary_search_by_key(&edge, |child| child.0)
                             .ok();
+                        // Check if any left entry has first byte matching the right's edge.
+                        let matching_entry = left
+                            .entries
+                            .binary_search_by(|(suffix, _)| suffix[0].cmp(&edge))
+                            .ok();
                         let mut divergent = Some(right);
                         for (index, &(child_edge, id)) in left.children.iter().enumerate().rev() {
-                            if matching.is_none() && child_edge < edge && divergent.is_some() {
+                            if matching.is_none()
+                                && matching_entry.is_none()
+                                && child_edge < edge
+                                && divergent.is_some()
+                            {
                                 pending.push(DiffTask::One(
                                     DiffSide::Loaded(
                                         divergent.take().expect("divergent side is queued once"),
@@ -852,6 +1323,46 @@ where
                                 DiffTask::One(DiffSide::Id(id), end + 1, Some(child_edge), false)
                             });
                         }
+                        // Emit only-left inline entries, except the one that
+                        // matches the right's edge — that gets paired with
+                        // the right subtree as a synthetic terminal node.
+                        for (i, (suffix, value)) in left.entries.iter().enumerate() {
+                            if Some(i) == matching_entry {
+                                // Convert the entry into a synthetic terminal node
+                                // and pair it with the right subtree.
+                                let entry_node = Node {
+                                    prefix: suffix[1..].to_vec(),
+                                    value: Some(*value),
+                                    children: Vec::new(),
+                                    entries: Vec::new(),
+                                };
+                                if let Some(right) = divergent.take() {
+                                    pending.push(DiffTask::Pair(
+                                        DiffSide::Loaded(entry_node, 0),
+                                        DiffSide::Loaded(right, right_skip + common + 1),
+                                        end + 1,
+                                        Some(edge),
+                                    ));
+                                } else {
+                                    // Right was already enqueued as a child match —
+                                    // shouldn't happen since entries and children are
+                                    // disjoint, but handle gracefully.
+                                    key[end..end + suffix.len()].copy_from_slice(suffix);
+                                    Self::diff_emit(
+                                        &mut changes,
+                                        DiffEntry::Removed(C::Key::from_bytes(&key), *value),
+                                        limits,
+                                    )?;
+                                }
+                            } else {
+                                key[end..end + suffix.len()].copy_from_slice(suffix);
+                                Self::diff_emit(
+                                    &mut changes,
+                                    DiffEntry::Removed(C::Key::from_bytes(&key), *value),
+                                    limits,
+                                )?;
+                            }
+                        }
                         if let Some(divergent) = divergent {
                             pending.push(DiffTask::One(
                                 DiffSide::Loaded(divergent, right_skip + common + 1),
@@ -867,9 +1378,17 @@ where
                             .children
                             .binary_search_by_key(&edge, |child| child.0)
                             .ok();
+                        let matching_entry = right
+                            .entries
+                            .binary_search_by(|(suffix, _)| suffix[0].cmp(&edge))
+                            .ok();
                         let mut divergent = Some(left);
                         for (index, &(child_edge, id)) in right.children.iter().enumerate().rev() {
-                            if matching.is_none() && child_edge < edge && divergent.is_some() {
+                            if matching.is_none()
+                                && matching_entry.is_none()
+                                && child_edge < edge
+                                && divergent.is_some()
+                            {
                                 pending.push(DiffTask::One(
                                     DiffSide::Loaded(
                                         divergent.take().expect("divergent side is queued once"),
@@ -893,6 +1412,40 @@ where
                             } else {
                                 DiffTask::One(DiffSide::Id(id), end + 1, Some(child_edge), true)
                             });
+                        }
+                        // Handle right inline entries — pair matching ones with the
+                        // left subtree, emit non-matching as Added.
+                        for (i, (suffix, value)) in right.entries.iter().enumerate() {
+                            if Some(i) == matching_entry {
+                                let entry_node = Node {
+                                    prefix: suffix[1..].to_vec(),
+                                    value: Some(*value),
+                                    children: Vec::new(),
+                                    entries: Vec::new(),
+                                };
+                                if let Some(left) = divergent.take() {
+                                    pending.push(DiffTask::Pair(
+                                        DiffSide::Loaded(left, left_skip + common + 1),
+                                        DiffSide::Loaded(entry_node, 0),
+                                        end + 1,
+                                        Some(edge),
+                                    ));
+                                } else {
+                                    key[end..end + suffix.len()].copy_from_slice(suffix);
+                                    Self::diff_emit(
+                                        &mut changes,
+                                        DiffEntry::Added(C::Key::from_bytes(&key), *value),
+                                        limits,
+                                    )?;
+                                }
+                            } else {
+                                key[end..end + suffix.len()].copy_from_slice(suffix);
+                                Self::diff_emit(
+                                    &mut changes,
+                                    DiffEntry::Added(C::Key::from_bytes(&key), *value),
+                                    limits,
+                                )?;
+                            }
                         }
                         if let Some(divergent) = divergent {
                             pending.push(DiffTask::One(
@@ -995,26 +1548,35 @@ where
                         prefix,
                         value: Some(entries[0].1),
                         children: Vec::new(),
+                        entries: Vec::new(),
                     })
                     .await;
             }
 
             let mut children = Vec::new();
+            let mut inline_entries = Vec::new();
             let mut start = 0;
             while start < entries.len() {
                 let edge = entries[start].0.bytes()[end];
                 let group_end =
                     start + entries[start..].partition_point(|(key, _)| key.bytes()[end] == edge);
-                let child = self
-                    .build_subtree(end + 1, &entries[start..group_end])
-                    .await?;
-                children.push((edge, child));
+                if group_end - start == 1 {
+                    // Single-entry group: inline it instead of creating a child node.
+                    let suffix = entries[start].0.bytes()[end..].to_vec();
+                    inline_entries.push((suffix, entries[start].1));
+                } else {
+                    let child = self
+                        .build_subtree(end + 1, &entries[start..group_end])
+                        .await?;
+                    children.push((edge, child));
+                }
                 start = group_end;
             }
             self.write(Node {
                 prefix,
                 value: None,
                 children,
+                entries: inline_entries,
             })
             .await
         })
@@ -1073,26 +1635,76 @@ impl<S: ImmutableObjectStore, C: Collection> ContextWalk<'_, S, C> {
                     }));
                 }
             }
-            if let Some(&(edge, id)) = frame.node.children.get(frame.child_index) {
-                frame.child_index += 1;
-                self.key[end] = edge;
-                let position = end + 1;
-                let node = self.store.read_at(id, position).await?;
-                self.stack.push(ContextFrame {
-                    id,
-                    node,
-                    position,
-                    child_index: 0,
-                    yielded_value: false,
-                    announced: false,
-                });
-                continue;
+            // Merge-iterate children and entries by discriminating byte.
+            let next_child = frame.node.children.get(frame.child_index).map(|&(e, _)| e);
+            let next_entry = frame
+                .node
+                .entries
+                .get(frame.entry_index)
+                .and_then(|(s, _)| s.first().copied());
+            match (next_child, next_entry) {
+                (Some(ce), Some(ee)) if ce < ee => {
+                    let id = frame.node.children[frame.child_index].1;
+                    frame.child_index += 1;
+                    self.key[end] = ce;
+                    let position = end + 1;
+                    let node = self.store.read_at(id, position).await?;
+                    self.stack.push(ContextFrame {
+                        id,
+                        node,
+                        position,
+                        child_index: 0,
+                        entry_index: 0,
+                        yielded_value: false,
+                        announced: false,
+                    });
+                    continue;
+                }
+                (Some(_), Some(_)) => {
+                    // Entry first — its discriminating byte < child edge.
+                    let (suffix, value) = &frame.node.entries[frame.entry_index];
+                    self.key[end..end + suffix.len()].copy_from_slice(suffix);
+                    let value = *value;
+                    frame.entry_index += 1;
+                    return Ok(Some(ContextWalkStep::Entry {
+                        key: C::Key::from_bytes(&self.key),
+                        value,
+                    }));
+                }
+                (Some(ce), None) => {
+                    let id = frame.node.children[frame.child_index].1;
+                    frame.child_index += 1;
+                    self.key[end] = ce;
+                    let position = end + 1;
+                    let node = self.store.read_at(id, position).await?;
+                    self.stack.push(ContextFrame {
+                        id,
+                        node,
+                        position,
+                        child_index: 0,
+                        entry_index: 0,
+                        yielded_value: false,
+                        announced: false,
+                    });
+                    continue;
+                }
+                (None, Some(_)) => {
+                    let (suffix, value) = &frame.node.entries[frame.entry_index];
+                    self.key[end..end + suffix.len()].copy_from_slice(suffix);
+                    let value = *value;
+                    frame.entry_index += 1;
+                    return Ok(Some(ContextWalkStep::Entry {
+                        key: C::Key::from_bytes(&self.key),
+                        value,
+                    }));
+                }
+                (None, None) => {
+                    let id = frame.id;
+                    self.stack.pop();
+                    self.prefix_len = end;
+                    return Ok(Some(ContextWalkStep::Complete { id }));
+                }
             }
-
-            let id = frame.id;
-            self.stack.pop();
-            self.prefix_len = end;
-            return Ok(Some(ContextWalkStep::Complete { id }));
         }
     }
 }
@@ -1223,7 +1835,9 @@ where
                     self.entries_emitted += 1;
                     let right = match &frame.right {
                         PairedRight::Present { node, skip, .. }
-                            if *skip == node.prefix.len() && node.children.is_empty() =>
+                            if *skip == node.prefix.len()
+                                && node.children.is_empty()
+                                && node.entries.is_empty() =>
                         {
                             node.value
                         }
@@ -1232,24 +1846,71 @@ where
                     return Ok(Some(PairedContextWalkStep::Entry { left, right }));
                 }
             }
-            let Some(&(edge, left_id)) = frame.left.children.get(frame.child_index) else {
-                let left = frame.left_id;
-                let (right, right_skip) = match &frame.right {
-                    PairedRight::Present { id, skip, .. } => (Some(*id), *skip),
-                    PairedRight::Absent => (None, 0),
-                };
-                let conflict_free = frame.conflict_free;
-                self.stack.pop();
-                if !conflict_free && let Some(parent) = self.stack.last_mut() {
-                    parent.conflict_free = false;
+            // Merge-iterate children and inline entries by discriminating byte.
+            let next_child = frame
+                .left
+                .children
+                .get(frame.child_index)
+                .map(|&(e, _)| e);
+            let next_entry = frame
+                .left
+                .entries
+                .get(frame.entry_index)
+                .and_then(|(s, _)| s.first().copied());
+            // Determine whether to yield an entry or descend into a child.
+            let yield_entry = match (next_child, next_entry) {
+                (Some(ce), Some(ee)) if ce < ee => false,
+                (Some(_), Some(_)) => true, // ee < ce
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (None, None) => {
+                    let left = frame.left_id;
+                    let (right, right_skip) = match &frame.right {
+                        PairedRight::Present { id, skip, .. } => (Some(*id), *skip),
+                        PairedRight::Absent => (None, 0),
+                    };
+                    let conflict_free = frame.conflict_free;
+                    self.stack.pop();
+                    if !conflict_free && let Some(parent) = self.stack.last_mut() {
+                        parent.conflict_free = false;
+                    }
+                    return Ok(Some(PairedContextWalkStep::Complete {
+                        left,
+                        right,
+                        right_skip,
+                        conflict_free,
+                    }));
                 }
-                return Ok(Some(PairedContextWalkStep::Complete {
-                    left,
-                    right,
-                    right_skip,
-                    conflict_free,
-                }));
             };
+            if yield_entry {
+                // Inline entry — yield it directly.
+                let (suffix, left_value) = &frame.left.entries[frame.entry_index];
+                self.key[end..end + suffix.len()].copy_from_slice(suffix);
+                let left_value = *left_value;
+                frame.entry_index += 1;
+                if self.entries_emitted == self.max_changes {
+                    return Err(DiffError::ChangeLimitExceeded {
+                        limit: self.max_changes,
+                    });
+                }
+                self.entries_emitted += 1;
+                // Try to find matching right entry.
+                let right_value = match &frame.right {
+                    PairedRight::Present { node, skip, .. } if *skip == node.prefix.len() => {
+                        // Right node fully aligned — check its entries.
+                        node.entries
+                            .binary_search_by(|(s, _)| s.as_slice().cmp(suffix.as_slice()))
+                            .ok()
+                            .map(|idx| node.entries[idx].1)
+                    }
+                    _ => None,
+                };
+                return Ok(Some(PairedContextWalkStep::Entry {
+                    left: left_value,
+                    right: right_value,
+                }));
+            }
+            let &(edge, left_id) = &frame.left.children[frame.child_index];
             frame.child_index += 1;
             if stack_depth >= self.max_pending {
                 return Err(DiffError::PendingLimitExceeded {
@@ -1314,6 +1975,7 @@ where
                 right,
                 position: child_position,
                 child_index: 0,
+                entry_index: 0,
                 yielded_value: false,
                 announced: false,
                 prunable: false,
@@ -1334,7 +1996,8 @@ impl<S: ImmutableObjectStore, C: Collection> Cursor<'_, S, C> {
     }
 
     async fn next_inner(&mut self) -> Result<Option<(C::Key, C::Value)>, Error> {
-        while let Some((node, position, child_index, yielded)) = self.stack.last_mut() {
+        while let Some((node, position, child_index, entry_index, yielded)) = self.stack.last_mut()
+        {
             let end = *position + node.prefix.len();
             self.key[*position..end].copy_from_slice(&node.prefix);
             if !*yielded {
@@ -1343,15 +2006,48 @@ impl<S: ImmutableObjectStore, C: Collection> Cursor<'_, S, C> {
                     return Ok(Some((C::Key::from_bytes(&self.key), value)));
                 }
             }
-            let Some(&(edge, id)) = node.children.get(*child_index) else {
-                self.stack.pop();
-                continue;
-            };
-            *child_index += 1;
-            self.key[end] = edge;
-            let child_position = end + 1;
-            let child = self.store.read_at(id, child_position).await?;
-            self.stack.push((child, child_position, 0, false));
+            // Merge-iterate children and entries in sorted order by discriminating byte.
+            let next_child = node.children.get(*child_index).map(|&(edge, _)| edge);
+            let next_entry = node
+                .entries
+                .get(*entry_index)
+                .and_then(|(suffix, _)| suffix.first().copied());
+            match (next_child, next_entry) {
+                (Some(ce), Some(ee)) if ce < ee => {
+                    let id = node.children[*child_index].1;
+                    *child_index += 1;
+                    self.key[end] = ce;
+                    let child_position = end + 1;
+                    let child = self.store.read_at(id, child_position).await?;
+                    self.stack.push((child, child_position, 0, 0, false));
+                }
+                (Some(_ce), Some(_ee)) => {
+                    // ee < ce (disjoint, and ce < ee was false above).
+                    let (suffix, value) = &node.entries[*entry_index];
+                    self.key[end..end + suffix.len()].copy_from_slice(suffix);
+                    let value = *value;
+                    *entry_index += 1;
+                    return Ok(Some((C::Key::from_bytes(&self.key), value)));
+                }
+                (Some(ce), None) => {
+                    let id = node.children[*child_index].1;
+                    *child_index += 1;
+                    self.key[end] = ce;
+                    let child_position = end + 1;
+                    let child = self.store.read_at(id, child_position).await?;
+                    self.stack.push((child, child_position, 0, 0, false));
+                }
+                (None, Some(_)) => {
+                    let (suffix, value) = &node.entries[*entry_index];
+                    self.key[end..end + suffix.len()].copy_from_slice(suffix);
+                    let value = *value;
+                    *entry_index += 1;
+                    return Ok(Some((C::Key::from_bytes(&self.key), value)));
+                }
+                (None, None) => {
+                    self.stack.pop();
+                }
+            }
         }
         Ok(None)
     }
@@ -1464,20 +2160,25 @@ mod paired_context_tests {
 
     #[tokio::test]
     async fn paired_context_walk_enforces_node_limit() {
-        // Two entries whose keys diverge at the first byte produce a root with
-        // two children. The constructor reads both roots (nodes_read = 2), so
-        // max_nodes = 2 means the first child read hits the limit.
+        // Four entries: two under byte 1 (multi-entry group → child node) and
+        // two under byte 2 (multi-entry group → child node). The constructor
+        // reads both roots (nodes_read = 2), so max_nodes = 2 means the first
+        // child read hits the limit.
         let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "paired-node-limit");
         let applications = Store::<_, ApplicationCollection>::new(&objects);
         let revisions = Store::<_, RevisionCollection>::new(&objects);
         let a = change(1, 0);
-        let b = change(2, 0);
+        let b = change(1, 1);
+        let c = change(2, 0);
+        let d = change(2, 1);
         let left = applications
             .update_batch(
                 applications.empty_root().await.unwrap(),
                 [
                     (a, Some(ApplicationId::from_digest([1; 32]))),
                     (b, Some(ApplicationId::from_digest([2; 32]))),
+                    (c, Some(ApplicationId::from_digest([3; 32]))),
+                    (d, Some(ApplicationId::from_digest([4; 32]))),
                 ],
             )
             .await
@@ -1488,6 +2189,8 @@ mod paired_context_tests {
                 [
                     (a, Some(RevisionId::from_digest([1; 32]))),
                     (b, Some(RevisionId::from_digest([2; 32]))),
+                    (c, Some(RevisionId::from_digest([3; 32]))),
+                    (d, Some(RevisionId::from_digest([4; 32]))),
                 ],
             )
             .await
@@ -1513,20 +2216,24 @@ mod paired_context_tests {
 
     #[tokio::test]
     async fn paired_context_walk_enforces_pending_limit() {
-        // Two entries that diverge at the first byte require pushing a child
-        // frame. With max_pending = 1, the root frame (stack depth 1) already
-        // meets the limit so any child push is rejected.
+        // Four entries that produce two child nodes. Pushing a child frame
+        // increases stack depth. With max_pending = 1, the root frame
+        // (stack depth 1) already meets the limit so any child push is rejected.
         let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "paired-pending-limit");
         let applications = Store::<_, ApplicationCollection>::new(&objects);
         let revisions = Store::<_, RevisionCollection>::new(&objects);
         let a = change(1, 0);
-        let b = change(2, 0);
+        let b = change(1, 1);
+        let c = change(2, 0);
+        let d = change(2, 1);
         let left = applications
             .update_batch(
                 applications.empty_root().await.unwrap(),
                 [
                     (a, Some(ApplicationId::from_digest([1; 32]))),
                     (b, Some(ApplicationId::from_digest([2; 32]))),
+                    (c, Some(ApplicationId::from_digest([3; 32]))),
+                    (d, Some(ApplicationId::from_digest([4; 32]))),
                 ],
             )
             .await
@@ -1537,6 +2244,8 @@ mod paired_context_tests {
                 [
                     (a, Some(RevisionId::from_digest([1; 32]))),
                     (b, Some(RevisionId::from_digest([2; 32]))),
+                    (c, Some(RevisionId::from_digest([3; 32]))),
+                    (d, Some(RevisionId::from_digest([4; 32]))),
                 ],
             )
             .await

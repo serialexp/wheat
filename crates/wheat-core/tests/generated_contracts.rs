@@ -114,7 +114,7 @@ proptest! {
             child: RevisionMapId::from_digest(digest(index as u8)),
         }).collect::<Vec<_>>();
         children.reverse();
-        let node = RevisionMapNode::new(prefix, None, children).unwrap();
+        let node = RevisionMapNode::new(prefix, None, children, vec![]).unwrap();
         let actual = node.children.iter().map(|child| child.edge).collect::<Vec<_>>();
         prop_assert_eq!(actual, edges.pop_first().into_iter().chain(edges).collect::<Vec<_>>());
         let bytes = node.canonical_bytes();

@@ -944,6 +944,10 @@ impl ClosureWalk {
                     false,
                     false,
                 )?;
+                // Inline entry values are object references.
+                for (_, value) in &node.entries {
+                    self.enqueue_object((*value).into())?;
+                }
             }
             ObjectKind::ApplicationMapNode => {
                 let node = wheat_core::decode_application_map_node(bytes)?;
@@ -957,6 +961,9 @@ impl ClosureWalk {
                     false,
                     false,
                 )?;
+                for (_, value) in &node.entries {
+                    self.enqueue_object((*value).into())?;
+                }
             }
             ObjectKind::ChangeMapNode => {
                 let node = wheat_core::decode_change_map_node(bytes)?;
@@ -970,6 +977,9 @@ impl ClosureWalk {
                     false,
                     false,
                 )?;
+                for (_, value) in &node.entries {
+                    self.enqueue_object((*value).into())?;
+                }
             }
             ObjectKind::ViewLineageMapNode => {
                 let node = wheat_core::decode_view_lineage_map_node(bytes)?;
@@ -987,45 +997,81 @@ impl ClosureWalk {
                 if let Some(id) = child_set {
                     self.enqueue_radix_root(id.into())?;
                 }
+                // Inline entry values are RetainedSetIds (radix roots).
+                for (_, value) in &node.entries {
+                    self.enqueue_radix_root((*value).into())?;
+                }
             }
             ObjectKind::ConflictSetNode => {
                 let node = wheat_core::decode_conflict_set_node(bytes)?;
-                self.follow_radix(
+                self.follow_radix_with_set_entries(
                     stored.id,
                     &node.prefix,
-                    None,
                     node.children
                         .into_iter()
                         .map(|child| (child.edge, child.child.into())),
                     false,
                     node.present,
+                    &node.entries,
                 )?;
             }
             ObjectKind::ContentSetNode => {
                 let node = wheat_core::decode_content_set_node(bytes)?;
-                self.follow_radix(
+                self.follow_radix_with_set_entries(
                     stored.id,
                     &node.prefix,
-                    None,
                     node.children
                         .into_iter()
                         .map(|child| (child.edge, child.child.into())),
                     node.present,
                     false,
+                    &node.entries,
                 )?;
             }
             ObjectKind::RetainedSetNode => {
                 let node = wheat_core::decode_retained_set_node(bytes)?;
-                self.follow_radix(
+                self.follow_radix_with_set_entries(
                     stored.id,
                     &node.prefix,
-                    None,
                     node.children
                         .into_iter()
                         .map(|child| (child.edge, child.child.into())),
                     false,
                     node.present,
+                    &node.entries,
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn follow_radix_with_set_entries(
+        &mut self,
+        id: ObjectId,
+        prefix: &[u8],
+        children: impl IntoIterator<Item = (u8, ObjectId)>,
+        content_terminal: bool,
+        object_terminal: bool,
+        entries: &[Vec<u8>],
+    ) -> Result<(), SnapshotError> {
+        self.follow_radix(id, prefix, None, children, content_terminal, object_terminal)?;
+        // Set inline entries are terminal keys. Their suffix appended to the
+        // radix path at this node gives the full key/digest.
+        if !entries.is_empty() && let Some(mut path) = self.radix_path(id)? {
+            path.extend_from_slice(prefix);
+            for suffix in entries {
+                let mut full = path.clone();
+                full.extend_from_slice(suffix);
+                let digest: [u8; 32] = full
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SnapshotError::InvalidManifest("invalid set entry terminal"))?;
+                if content_terminal {
+                    self.enqueue_content(ContentId::from_digest(digest))?;
+                }
+                if object_terminal {
+                    self.enqueue_object(ObjectId::from_digest(digest))?;
+                }
             }
         }
         Ok(())

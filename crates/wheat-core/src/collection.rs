@@ -27,6 +27,8 @@ pub struct ApplicationMapNode {
     pub prefix: Vec<u8>,
     pub value: Option<ApplicationId>,
     pub children: Vec<ApplicationMapChild>,
+    /// Inline entries: key suffixes with values inlined into this node.
+    pub entries: Vec<(Vec<u8>, ApplicationId)>,
 }
 
 impl ApplicationMapNode {
@@ -34,12 +36,15 @@ impl ApplicationMapNode {
         prefix: Vec<u8>,
         value: Option<ApplicationId>,
         mut children: Vec<ApplicationMapChild>,
+        mut entries: Vec<(Vec<u8>, ApplicationId)>,
     ) -> Result<Self, CanonicalObjectError> {
         children.sort_by_key(|child| child.edge);
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         let node = Self {
             prefix,
             value,
             children,
+            entries,
         };
         crate::wire::validate_application_map_node(&node)?;
         Ok(node)
@@ -61,6 +66,7 @@ pub struct ViewLineageMapNode {
     pub prefix: Vec<u8>,
     pub value: Option<RetainedSetId>,
     pub children: Vec<ViewLineageMapChild>,
+    pub entries: Vec<(Vec<u8>, RetainedSetId)>,
 }
 
 impl ViewLineageMapNode {
@@ -68,12 +74,15 @@ impl ViewLineageMapNode {
         prefix: Vec<u8>,
         value: Option<RetainedSetId>,
         mut children: Vec<ViewLineageMapChild>,
+        mut entries: Vec<(Vec<u8>, RetainedSetId)>,
     ) -> Result<Self, CanonicalObjectError> {
         children.sort_by_key(|child| child.edge);
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         let node = Self {
             prefix,
             value,
             children,
+            entries,
         };
         crate::wire::validate_view_lineage_map_node(&node)?;
         Ok(node)
@@ -95,6 +104,7 @@ pub struct ChangeMapNode {
     pub prefix: Vec<u8>,
     pub value: Option<ChangeObjectId>,
     pub children: Vec<ChangeMapChild>,
+    pub entries: Vec<(Vec<u8>, ChangeObjectId)>,
 }
 
 impl ChangeMapNode {
@@ -102,12 +112,15 @@ impl ChangeMapNode {
         prefix: Vec<u8>,
         value: Option<ChangeObjectId>,
         mut children: Vec<ChangeMapChild>,
+        mut entries: Vec<(Vec<u8>, ChangeObjectId)>,
     ) -> Result<Self, CanonicalObjectError> {
         children.sort_by_key(|child| child.edge);
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         let node = Self {
             prefix,
             value,
             children,
+            entries,
         };
         crate::wire::validate_change_map_node(&node)?;
         Ok(node)
@@ -131,6 +144,8 @@ macro_rules! set_node {
             pub prefix: Vec<u8>,
             pub present: bool,
             pub children: Vec<$child>,
+            /// Inline entries: key suffixes for members inlined into this node.
+            pub entries: Vec<Vec<u8>>,
         }
 
         impl $node {
@@ -138,12 +153,15 @@ macro_rules! set_node {
                 prefix: Vec<u8>,
                 present: bool,
                 mut children: Vec<$child>,
+                mut entries: Vec<Vec<u8>>,
             ) -> Result<Self, CanonicalObjectError> {
                 children.sort_by_key(|child| child.edge);
+                entries.sort();
                 let node = Self {
                     prefix,
                     present,
                     children,
+                    entries,
                 };
                 crate::wire::$validate(&node)?;
                 Ok(node)

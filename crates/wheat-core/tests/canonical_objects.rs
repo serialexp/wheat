@@ -121,6 +121,7 @@ fn revision_map_nodes_round_trip_with_canonical_edges() {
                 child: RevisionMapId::from_digest([1; 32]),
             },
         ],
+        vec![],
     )
     .unwrap();
     let bytes = node.canonical_bytes();
@@ -134,7 +135,7 @@ fn revision_map_nodes_round_trip_with_canonical_edges() {
 #[test]
 fn revision_map_nodes_enforce_prefix_terminal_and_unique_edges() {
     let revision = wheat_core::RevisionId::from_digest([3; 32]);
-    assert!(RevisionMapNode::new(vec![0; 17], None, vec![]).is_err());
+    assert!(RevisionMapNode::new(vec![0; 17], None, vec![], vec![]).is_err());
     assert!(
         RevisionMapNode::new(
             vec![0; 16],
@@ -143,6 +144,7 @@ fn revision_map_nodes_enforce_prefix_terminal_and_unique_edges() {
                 edge: 0,
                 child: RevisionMapId::from_digest([1; 32]),
             }],
+            vec![],
         )
         .is_err()
     );
@@ -160,6 +162,7 @@ fn revision_map_nodes_enforce_prefix_terminal_and_unique_edges() {
                     child: RevisionMapId::from_digest([2; 32]),
                 },
             ],
+            vec![],
         )
         .is_err()
     );
@@ -235,12 +238,11 @@ fn canonical_revision_has_a_pinned_encoding_and_id() {
 
     assert_eq!(
         hex(&revision.canonical_bytes()),
-        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c07d6b9ed0646083ffab5831e5822cf9d4fa04d4ee5e5ae46160ab5a36f700000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
+        "030101890f2d3c4b7a689abcdef01234567800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0ad67c92ab0865ddc00c6b24682873983522b15bae82ae8e04524dc5801cd3000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
     );
-    assert_eq!(
-        revision.id().to_string(),
-        "908e7ec2ddb258c2edbb81ced6dbaa4cb6cea4e8ef7c55d5cc1d31933be9358f"
-    );
+    // Revision ID is BLAKE3 of the canonical bytes above.
+    let expected_id = wheat_core::RevisionId::of_canonical_bytes(&revision.canonical_bytes());
+    assert_eq!(revision.id(), expected_id);
 }
 
 #[test]

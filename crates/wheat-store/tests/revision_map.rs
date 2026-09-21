@@ -178,8 +178,8 @@ async fn batch_groups_shared_paths_and_prunes_deletions() {
         .unwrap();
     assert_eq!(
         objects.take_writes(),
-        3,
-        "two leaves and their compressed branch are written once"
+        1,
+        "one root with two inline entries is written once"
     );
     assert_eq!(maps.get(two, first).await.unwrap(), Some(revision_a));
     assert_eq!(maps.get(two, second).await.unwrap(), Some(revision_b));
@@ -322,6 +322,7 @@ async fn cursor_reports_a_missing_child_during_iteration() {
                 child: missing,
             },
         ],
+        vec![],
     )
     .unwrap();
     objects
@@ -444,14 +445,28 @@ async fn delta_enforces_selection_node_and_pending_bounds() {
     let objects = memory_store("revision-map-delta-bounds");
     let maps = RevisionMapStore::new(&objects);
     let empty = maps.empty_root().await.unwrap();
-    let first = ChangeId::from_bytes([1; 16]);
-    let second = ChangeId::from_bytes([2; 16]);
+    // Use 4 entries with 2 per first-byte-group to force actual child nodes
+    // (single-entry groups get inlined and don't create pending child tasks).
+    let mut first_bytes = [1u8; 16];
+    first_bytes[15] = 0;
+    let first = ChangeId::from_bytes(first_bytes);
+    let mut second_bytes = [1u8; 16];
+    second_bytes[15] = 1;
+    let second = ChangeId::from_bytes(second_bytes);
+    let mut third_bytes = [2u8; 16];
+    third_bytes[15] = 0;
+    let third = ChangeId::from_bytes(third_bytes);
+    let mut fourth_bytes = [2u8; 16];
+    fourth_bytes[15] = 1;
+    let fourth = ChangeId::from_bytes(fourth_bytes);
     let root = maps
         .update_batch(
             empty,
             [
                 (first, Some(RevisionId::from_digest([1; 32]))),
                 (second, Some(RevisionId::from_digest([2; 32]))),
+                (third, Some(RevisionId::from_digest([3; 32]))),
+                (fourth, Some(RevisionId::from_digest([4; 32]))),
             ],
         )
         .await
@@ -474,24 +489,24 @@ async fn delta_enforces_selection_node_and_pending_bounds() {
             empty,
             root,
             RevisionMapDeltaLimits {
-                max_nodes: 1,
+                max_nodes: 2,
                 ..Default::default()
             },
         )
         .await,
-        Err(RevisionMapError::DeltaNodeLimitExceeded { limit: 1 })
+        Err(RevisionMapError::DeltaNodeLimitExceeded { limit: 2 })
     ));
     assert!(matches!(
         maps.delta(
             empty,
             root,
             RevisionMapDeltaLimits {
-                max_pending: 0,
+                max_pending: 1,
                 ..Default::default()
             },
         )
         .await,
-        Err(RevisionMapError::DeltaPendingLimitExceeded { limit: 0 })
+        Err(RevisionMapError::DeltaPendingLimitExceeded { limit: 1 })
     ));
 }
 

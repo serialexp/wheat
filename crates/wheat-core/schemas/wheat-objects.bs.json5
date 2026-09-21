@@ -342,12 +342,27 @@
           length_type: "uint32",
           items: { type: "RevisionMapChildV1" },
         },
+        {
+          // Inline entries: key suffixes with values inlined into this node
+          // instead of stored as separate leaf child objects.
+          name: "entries",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "RevisionMapEntryV1" },
+        },
       ],
     },
     RevisionMapChildV1: {
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "RevisionMapId" },
+      ],
+    },
+    RevisionMapEntryV1: {
+      sequence: [
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "value", type: "RevisionId" },
       ],
     },
 
@@ -357,12 +372,19 @@
         { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeObjectId" } },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeMapEntryV1" } },
       ],
     },
     ChangeMapChildV1: {
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "ChangeMapId" },
+      ],
+    },
+    ChangeMapEntryV1: {
+      sequence: [
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "value", type: "ChangeObjectId" },
       ],
     },
 
@@ -372,12 +394,19 @@
         { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationId" } },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationMapEntryV1" } },
       ],
     },
     ApplicationMapChildV1: {
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "ApplicationMapId" },
+      ],
+    },
+    ApplicationMapEntryV1: {
+      sequence: [
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "value", type: "ApplicationId" },
       ],
     },
 
@@ -387,12 +416,19 @@
         { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "RetainedSetId" } },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ViewLineageMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ViewLineageMapEntryV1" } },
       ],
     },
     ViewLineageMapChildV1: {
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "ViewLineageMapId" },
+      ],
+    },
+    ViewLineageMapEntryV1: {
+      sequence: [
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "value", type: "RetainedSetId" },
       ],
     },
 
@@ -402,6 +438,8 @@
         { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "present", type: "bool" },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ConflictSetChildV1" } },
+        // Inline entries: key suffixes for members inlined into this node.
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
       ],
     },
     ConflictSetChildV1: {
@@ -417,6 +455,7 @@
         { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "present", type: "bool" },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
       ],
     },
     ContentSetChildV1: {
@@ -432,12 +471,20 @@
         { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
         { name: "present", type: "bool" },
         { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "RetainedSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
       ],
     },
     RetainedSetChildV1: {
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "RetainedSetId" },
+      ],
+    },
+
+    // Shared inline entry type for set nodes (no value, just suffix).
+    SetEntryV1: {
+      sequence: [
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
       ],
     },
 

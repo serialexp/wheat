@@ -24,6 +24,7 @@ trait RadixShape {
         prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
     ) -> (Self::Id, Vec<u8>);
 }
 
@@ -50,38 +51,45 @@ where
         .count();
     let end_prefix = depth + common;
     let prefix = first[depth..end_prefix].to_vec();
-    let (value, children) = if end_prefix == key_len {
+    if end_prefix == key_len {
         debug_assert_eq!(entries.len(), 1);
-        (Some(entries[0].1), Vec::new())
-    } else {
-        let mut children = Vec::new();
-        let mut start = 0;
-        while start < entries.len() {
-            let edge = S::key_bytes(&entries[start].0)[end_prefix];
-            let end = start
-                + entries[start..]
-                    .partition_point(|(key, _)| S::key_bytes(key)[end_prefix] == edge);
+        return emit_node::<S, F>(prefix, Some(entries[0].1), Vec::new(), Vec::new(), emit);
+    }
+
+    let mut children = Vec::new();
+    let mut inline_entries = Vec::new();
+    let mut start = 0;
+    while start < entries.len() {
+        let edge = S::key_bytes(&entries[start].0)[end_prefix];
+        let end = start
+            + entries[start..]
+                .partition_point(|(key, _)| S::key_bytes(key)[end_prefix] == edge);
+        if end - start == 1 {
+            // Single-entry group: inline it instead of creating a child node.
+            let suffix = S::key_bytes(&entries[start].0)[end_prefix..].to_vec();
+            inline_entries.push((suffix, entries[start].1));
+        } else {
             let child = build_subtree::<S, F>(end_prefix + 1, &entries[start..end], emit);
             children.push((edge, child));
-            start = end;
         }
-        (None, children)
-    };
+        start = end;
+    }
 
-    emit_node::<S, F>(prefix, value, children, emit)
+    emit_node::<S, F>(prefix, None, children, inline_entries, emit)
 }
 
 fn emit_node<S, F>(
     prefix: Vec<u8>,
     value: Option<S::Value>,
     children: Vec<(u8, S::Id)>,
+    entries: Vec<(Vec<u8>, S::Value)>,
     emit: &mut F,
 ) -> S::Id
 where
     S: RadixShape,
     F: FnMut(CanonicalObject),
 {
-    let (canonical_id, bytes) = S::node(prefix, value, children);
+    let (canonical_id, bytes) = S::node(prefix, value, children, entries);
     emit(CanonicalObject {
         id: canonical_id.into(),
         bytes,
@@ -96,7 +104,7 @@ where
 {
     if entries.is_empty() {
         // The root is the sole empty node that is canonical collection output.
-        return emit_node::<S, F>(Vec::new(), None, Vec::new(), &mut emit);
+        return emit_node::<S, F>(Vec::new(), None, Vec::new(), Vec::new(), &mut emit);
     }
     build_subtree::<S, F>(0, &entries, &mut emit)
 }
@@ -115,6 +123,7 @@ impl RadixShape for RevisionShape {
         prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
     ) -> (Self::Id, Vec<u8>) {
         let node = RevisionMapNode::new(
             prefix,
@@ -123,6 +132,7 @@ impl RadixShape for RevisionShape {
                 .into_iter()
                 .map(|(edge, child)| RevisionMapChild { edge, child })
                 .collect(),
+            entries,
         )
         .expect("builder produces a valid revision-map node");
         let bytes = node.canonical_bytes();
@@ -144,6 +154,7 @@ impl RadixShape for ChangeShape {
         prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
     ) -> (Self::Id, Vec<u8>) {
         let node = ChangeMapNode::new(
             prefix,
@@ -152,6 +163,7 @@ impl RadixShape for ChangeShape {
                 .into_iter()
                 .map(|(edge, child)| ChangeMapChild { edge, child })
                 .collect(),
+            entries,
         )
         .expect("builder produces a valid change-map node");
         let bytes = node.canonical_bytes();
@@ -173,6 +185,7 @@ impl RadixShape for ApplicationShape {
         prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
     ) -> (Self::Id, Vec<u8>) {
         let node = ApplicationMapNode::new(
             prefix,
@@ -181,6 +194,7 @@ impl RadixShape for ApplicationShape {
                 .into_iter()
                 .map(|(edge, child)| ApplicationMapChild { edge, child })
                 .collect(),
+            entries,
         )
         .expect("builder produces a valid application-map node");
         let bytes = node.canonical_bytes();
@@ -202,6 +216,7 @@ impl RadixShape for ViewLineageShape {
         prefix: Vec<u8>,
         value: Option<Self::Value>,
         children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
     ) -> (Self::Id, Vec<u8>) {
         let node = ViewLineageMapNode::new(
             prefix,
@@ -210,6 +225,7 @@ impl RadixShape for ViewLineageShape {
                 .into_iter()
                 .map(|(edge, child)| ViewLineageMapChild { edge, child })
                 .collect(),
+            entries,
         )
         .expect("builder produces a valid view-lineage map node");
         let bytes = node.canonical_bytes();
@@ -233,7 +249,11 @@ macro_rules! set_shape {
                 prefix: Vec<u8>,
                 value: Option<Self::Value>,
                 children: Vec<(u8, Self::Id)>,
+                _entries: Vec<(Vec<u8>, Self::Value)>,
             ) -> (Self::Id, Vec<u8>) {
+                // Set entries: convert (suffix, ()) pairs to just suffixes.
+                let set_entries: Vec<Vec<u8>> =
+                    _entries.into_iter().map(|(suffix, ())| suffix).collect();
                 let node = <$node>::new(
                     prefix,
                     value.is_some(),
@@ -241,6 +261,7 @@ macro_rules! set_shape {
                         .into_iter()
                         .map(|(edge, child)| $child { edge, child })
                         .collect(),
+                    set_entries,
                 )
                 .expect("builder produces a valid set node");
                 let bytes = node.canonical_bytes();

@@ -109,6 +109,7 @@ impl radix::Collection for ChangeCollection {
                 .into_iter()
                 .map(|child| (child.edge, child.child))
                 .collect(),
+            entries: node.entries,
         }
     }
     fn build(
@@ -121,6 +122,7 @@ impl radix::Collection for ChangeCollection {
                 .into_iter()
                 .map(|(edge, child)| ChangeMapChild { edge, child })
                 .collect(),
+            node.entries,
         )
     }
     fn id(node: &Self::PublicNode) -> Self::Id {

@@ -103,6 +103,7 @@ impl radix::Collection for ApplicationCollection {
             prefix: n.prefix,
             value: n.value,
             children: n.children.into_iter().map(|c| (c.edge, c.child)).collect(),
+            entries: n.entries,
         }
     }
     fn build(
@@ -115,6 +116,7 @@ impl radix::Collection for ApplicationCollection {
                 .into_iter()
                 .map(|(edge, child)| ApplicationMapChild { edge, child })
                 .collect(),
+            n.entries,
         )
     }
     fn id(n: &Self::PublicNode) -> Self::Id {

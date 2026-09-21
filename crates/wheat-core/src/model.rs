@@ -260,6 +260,7 @@ pub struct RevisionMapNode {
     pub prefix: Vec<u8>,
     pub value: Option<RevisionId>,
     pub children: Vec<RevisionMapChild>,
+    pub entries: Vec<(Vec<u8>, RevisionId)>,
 }
 
 impl RevisionMapNode {
@@ -267,12 +268,15 @@ impl RevisionMapNode {
         prefix: Vec<u8>,
         value: Option<RevisionId>,
         mut children: Vec<RevisionMapChild>,
+        mut entries: Vec<(Vec<u8>, RevisionId)>,
     ) -> Result<Self, crate::CanonicalObjectError> {
         children.sort_by_key(|child| child.edge);
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         let node = Self {
             prefix,
             value,
             children,
+            entries,
         };
         crate::wire::validate_revision_map_node(&node)?;
         Ok(node)
