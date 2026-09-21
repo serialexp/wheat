@@ -54,6 +54,8 @@ pub enum CanonicalObjectKind {
     ApplicationMapNode,
     ConflictSetNode,
     ContentSetNode,
+    ContentSetSnapshot,
+    ContentSetDelta,
     RetainedSetNode,
     ViewLineageMapNode,
 }
@@ -908,9 +910,91 @@ pub(crate) fn content_manifest_record_bytes(record: &crate::ContentManifestRecor
     ))
 }
 
+/// Encode a flat sorted content set snapshot as canonical bytes.
+pub fn content_set_snapshot_bytes(members: &[ContentId]) -> Vec<u8> {
+    encode(wire::WheatObject::ContentSetSnapshotV1(
+        wire::ContentSetSnapshotV1Input {
+            members: members.iter().map(|id| content_id(*id)).collect(),
+        }
+        .into(),
+    ))
+}
+
+/// Encode a content set delta as canonical bytes.
+pub fn content_set_delta_bytes(
+    base: crate::ContentSetId,
+    added: &[ContentId],
+    removed: &[ContentId],
+) -> Vec<u8> {
+    encode(wire::WheatObject::ContentSetDeltaV1(
+        wire::ContentSetDeltaV1Input {
+            base: content_set_id(base),
+            added: added.iter().map(|id| content_id(*id)).collect(),
+            removed: removed.iter().map(|id| content_id(*id)).collect(),
+        }
+        .into(),
+    ))
+}
+
+/// The resolved members or delta chain step from a content set blob.
+pub enum ContentSetBlob {
+    /// Full snapshot — sorted array of content IDs.
+    Snapshot(Vec<ContentId>),
+    /// Delta referencing a base content set.
+    Delta {
+        base: crate::ContentSetId,
+        added: Vec<ContentId>,
+        removed: Vec<ContentId>,
+    },
+}
+
+/// Decode a content set blob (snapshot, delta, or legacy radix node).
+///
+/// Returns `Err` if the bytes don't decode as any content set type.
+pub fn decode_content_set_blob(bytes: &[u8]) -> Result<ContentSetBlob, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    match object {
+        wire::WheatObject::ContentSetSnapshotV1(snapshot) => {
+            let members = snapshot
+                .members
+                .iter()
+                .map(content_id_domain)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ContentSetBlob::Snapshot(members))
+        }
+        wire::WheatObject::ContentSetDeltaV1(delta) => {
+            let base = crate::ContentSetId::from_digest(digest_domain(&delta.base.digest)?);
+            let added = delta
+                .added
+                .iter()
+                .map(content_id_domain)
+                .collect::<Result<Vec<_>, _>>()?;
+            let removed = delta
+                .removed
+                .iter()
+                .map(content_id_domain)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ContentSetBlob::Delta {
+                base,
+                added,
+                removed,
+            })
+        }
+        _ => Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::ContentSetSnapshot,
+            actual: object_kind(&object),
+        }),
+    }
+}
+
 pub(crate) fn content_manifest_bytes(content: &BTreeSet<ContentId>) -> Vec<u8> {
-    let content = crate::build_content_set(content.iter().copied(), |_| {});
-    content_manifest_record_bytes(&crate::ContentManifestRecord { content })
+    // Build a flat snapshot instead of a radix trie for the content set.
+    let members: Vec<ContentId> = content.iter().copied().collect();
+    let snapshot_bytes = content_set_snapshot_bytes(&members);
+    let content_id = crate::ContentSetId::of_canonical_bytes(&snapshot_bytes);
+    content_manifest_record_bytes(&crate::ContentManifestRecord {
+        content: content_id,
+    })
 }
 
 pub(crate) fn content_manifest_id(content: &BTreeSet<ContentId>) -> ContentManifestId {
@@ -1409,6 +1493,35 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "content set node",
             )?;
         }
+        wire::WheatObject::ContentSetSnapshotV1(snapshot) => {
+            validate_sorted_unique_by(
+                &snapshot.members,
+                |id| id.digest.bytes.as_slice(),
+                "content set snapshot members",
+            )?;
+        }
+        wire::WheatObject::ContentSetDeltaV1(delta) => {
+            digest_domain(&delta.base.digest)?;
+            validate_sorted_unique_by(
+                &delta.added,
+                |id| id.digest.bytes.as_slice(),
+                "content set delta added",
+            )?;
+            validate_sorted_unique_by(
+                &delta.removed,
+                |id| id.digest.bytes.as_slice(),
+                "content set delta removed",
+            )?;
+            // added and removed must be disjoint
+            let added_set: std::collections::BTreeSet<_> = delta.added.iter().map(|id| id.digest.bytes.as_slice()).collect();
+            for id in &delta.removed {
+                if added_set.contains(id.digest.bytes.as_slice()) {
+                    return Err(CanonicalObjectError::InvalidCollection(
+                        "content set delta has overlapping added and removed entries",
+                    ));
+                }
+            }
+        }
         wire::WheatObject::RetainedSetNodeV1(node) => {
             let efb: Vec<u8> = node
                 .entries
@@ -1482,6 +1595,8 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ApplicationMapNodeV1(_) => CanonicalObjectKind::ApplicationMapNode,
         wire::WheatObject::ConflictSetNodeV1(_) => CanonicalObjectKind::ConflictSetNode,
         wire::WheatObject::ContentSetNodeV1(_) => CanonicalObjectKind::ContentSetNode,
+        wire::WheatObject::ContentSetSnapshotV1(_) => CanonicalObjectKind::ContentSetSnapshot,
+        wire::WheatObject::ContentSetDeltaV1(_) => CanonicalObjectKind::ContentSetDelta,
         wire::WheatObject::RetainedSetNodeV1(_) => CanonicalObjectKind::RetainedSetNode,
         wire::WheatObject::ViewLineageMapNodeV1(_) => CanonicalObjectKind::ViewLineageMapNode,
     }
@@ -2025,6 +2140,14 @@ pub fn extract_object_references(
                     &child.child.digest,
                 )?));
             }
+        }
+        // Snapshot has no object references — members are ContentIds, not ObjectIds.
+        wire::WheatObject::ContentSetSnapshotV1(_) => {}
+        // Delta references its base ContentSetId as a structural object.
+        wire::WheatObject::ContentSetDeltaV1(delta) => {
+            refs.push(crate::ObjectId::from_digest(digest_domain(
+                &delta.base.digest,
+            )?));
         }
         wire::WheatObject::RetainedSetNodeV1(node) => {
             for child in &node.children {

@@ -32,6 +32,8 @@
         { type: "ApplicationMapNodeV1", when: "value == 0x0a01" },
         { type: "ConflictSetNodeV1", when: "value == 0x0b01" },
         { type: "ContentSetNodeV1", when: "value == 0x0c01" },
+        { type: "ContentSetSnapshotV1", when: "value == 0x0c02" },
+        { type: "ContentSetDeltaV1", when: "value == 0x0c03" },
         { type: "RetainedSetNodeV1", when: "value == 0x0d01" },
         { type: "ViewLabelManifestV1", when: "value == 0x0e01" },
         { type: "RepositoryEnvelopeV1", when: "value == 0x0f01" },
@@ -462,6 +464,24 @@
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "ContentSetId" },
+      ],
+    },
+
+    // Flat sorted blob of ContentId members — a full snapshot of content set membership.
+    ContentSetSnapshotV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0c02 },
+        { name: "members", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentId" } },
+      ],
+    },
+
+    // Delta blob referencing a base ContentSetId, plus sorted arrays of added/removed members.
+    ContentSetDeltaV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x0c03 },
+        { name: "base", type: "ContentSetId" },
+        { name: "added", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentId" } },
+        { name: "removed", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentId" } },
       ],
     },
 

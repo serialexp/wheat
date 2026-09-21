@@ -791,7 +791,7 @@ mod tests {
             (0, 0),
             (CONTENT_NAMESPACE, 1),
             (METADATA_NAMESPACE, 0),
-            (METADATA_NAMESPACE, 19),
+            (METADATA_NAMESPACE, 21),
         ] {
             let mut builder = SegmentBuilder::new(directory.path()).unwrap();
             assert!(matches!(

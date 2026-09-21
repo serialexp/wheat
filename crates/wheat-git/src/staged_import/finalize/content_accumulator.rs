@@ -3,8 +3,7 @@ use std::{future::Future, pin::Pin};
 use rusqlite::{Connection, Transaction, params};
 use thiserror::Error;
 use wheat_core::{
-    ContentId, ContentSetChild, ContentSetId, ContentSetNode, ObjectId, RetainedSetChild,
-    RetainedSetId, RetainedSetNode,
+    ContentId, ContentSetId, ObjectId, RetainedSetChild, RetainedSetId, RetainedSetNode,
 };
 use wheat_store::{CollectionError, ContentSetStore, ImmutableObjectStore, RetainedSetStore};
 
@@ -37,11 +36,6 @@ impl ContentAccumulator {
             "PRAGMA temp_store = FILE;
              PRAGMA cache_size = -8192;
              CREATE TABLE content_manifest_roots (id BLOB PRIMARY KEY) WITHOUT ROWID;
-             CREATE TABLE content_nodes_seen (
-                 id BLOB NOT NULL,
-                 path BLOB NOT NULL,
-                 PRIMARY KEY (id, path)
-             ) WITHOUT ROWID;
              CREATE TABLE content_ids (id BLOB PRIMARY KEY) WITHOUT ROWID;
              CREATE TABLE retained_changes (id BLOB PRIMARY KEY) WITHOUT ROWID;
              CREATE TABLE retained_views (id BLOB PRIMARY KEY) WITHOUT ROWID;
@@ -108,10 +102,13 @@ impl ContentAccumulator {
             }
         }
 
-        let Some((first, last)) = self.content_bounds()? else {
+        // With flat sorted blobs, collect all unique ContentIds from SQLite
+        // and write one snapshot.
+        let members = self.collect_all_content_ids()?;
+        if members.is_empty() {
             return Ok(store.empty_root().await?);
-        };
-        self.build_content_range(store, first, last, 0).await
+        }
+        Ok(store.write_snapshot(&members).await?)
     }
 
     async fn collect_manifest<S: ImmutableObjectStore>(
@@ -120,56 +117,13 @@ impl ContentAccumulator {
         root: ContentSetId,
         chunk: &mut Vec<ContentId>,
     ) -> Result<(), ContentAccumulatorError> {
-        let mut stack = vec![(root, Vec::<u8>::new())];
-        while let Some((id, path)) = stack.pop() {
-            let inserted = self.connection.execute(
-                "INSERT OR IGNORE INTO content_nodes_seen (id, path) VALUES (?1, ?2)",
-                params![id.as_bytes().as_slice(), path.as_slice()],
-            )? == 1;
-            if !inserted {
-                continue;
-            }
-            let node = store.read_node_at(id, path.len()).await?;
-            let mut node_path = path;
-            node_path.extend_from_slice(&node.prefix);
-            if node.present {
-                if node_path.len() != 32
-                    || !node.children.is_empty()
-                    || !node.entries.is_empty()
-                {
-                    return Err(ContentAccumulatorError::NonterminalValue);
-                }
-                chunk.push(ContentId::from_digest(
-                    node_path
-                        .try_into()
-                        .expect("terminal path has the digest length"),
-                ));
-                if chunk.len() == CHUNK {
-                    self.flush_content_chunk(chunk)?;
-                }
-                continue;
-            }
-            // Inline entries: each suffix completes the key from this node's
-            // position.
-            for suffix in &node.entries {
-                let mut entry_key = node_path.clone();
-                entry_key.extend_from_slice(suffix);
-                if entry_key.len() != 32 {
-                    return Err(ContentAccumulatorError::NonterminalValue);
-                }
-                chunk.push(ContentId::from_digest(
-                    entry_key
-                        .try_into()
-                        .expect("entry path has the digest length"),
-                ));
-                if chunk.len() == CHUNK {
-                    self.flush_content_chunk(chunk)?;
-                }
-            }
-            for child in node.children.iter().rev() {
-                let mut child_path = node_path.clone();
-                child_path.push(child.edge);
-                stack.push((child.child, child_path));
+        // With flat sorted blobs, resolving the chain gives us the full sorted
+        // membership directly — no radix tree traversal needed.
+        let members = store.resolve(root).await?;
+        for id in members {
+            chunk.push(id);
+            if chunk.len() == CHUNK {
+                self.flush_content_chunk(chunk)?;
             }
         }
         if !chunk.is_empty() {
@@ -190,44 +144,23 @@ impl ContentAccumulator {
         Ok(())
     }
 
-    fn build_content_range<'a, S: ImmutableObjectStore>(
-        &'a self,
-        store: &'a ContentSetStore<'a, S>,
-        first: ContentId,
-        last: ContentId,
-        depth: usize,
-    ) -> BuildFuture<'a, ContentSetId> {
-        Box::pin(async move {
-            if first == last {
-                let node = ContentSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![], vec![])
-                    .expect("sorted builder emits a canonical content leaf");
-                store.write_node(node).await.map_err(Into::into)
-            } else {
-                let common = common_prefix(&first.as_bytes()[depth..], &last.as_bytes()[depth..]);
-                let end = depth + common;
-                let mut children = Vec::new();
-                let mut inline_entries = Vec::new();
-                for (edge, child_first, child_last) in self.content_groups(first, last, end)? {
-                    if child_first == child_last {
-                        // Single-entry group: inline instead of creating a child.
-                        inline_entries.push(child_first.as_bytes()[end..].to_vec());
-                    } else {
-                        let child = self
-                            .build_content_range(store, child_first, child_last, end + 1)
-                            .await?;
-                        children.push(ContentSetChild { edge, child });
-                    }
-                }
-                let node = ContentSetNode::new(
-                    first.as_bytes()[depth..end].to_vec(),
-                    false,
-                    children,
-                    inline_entries,
+    /// Collect all unique ContentIds from SQLite in sorted order.
+    fn collect_all_content_ids(&self) -> Result<Vec<ContentId>, ContentAccumulatorError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM content_ids ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            let digest: [u8; 32] = bytes.try_into().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    32,
+                    rusqlite::types::Type::Blob,
+                    "invalid digest length".into(),
                 )
-                .expect("sorted builder emits a canonical content branch");
-                store.write_node(node).await.map_err(Into::into)
-            }
-        })
+            })?;
+            Ok(ContentId::from_digest(digest))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn manifest_root_chunk(
@@ -305,64 +238,6 @@ impl ContentAccumulator {
                 store.write_node(node).await.map_err(Into::into)
             }
         })
-    }
-
-    fn content_bounds(&self) -> Result<Option<(ContentId, ContentId)>, ContentAccumulatorError> {
-        let mut statement = self.connection.prepare(
-            "SELECT (SELECT id FROM content_ids ORDER BY id LIMIT 1), \
-             (SELECT id FROM content_ids ORDER BY id DESC LIMIT 1)",
-        )?;
-        let (first, last) = statement.query_row([], |row| {
-            Ok((
-                row.get::<_, Option<Vec<u8>>>(0)?,
-                row.get::<_, Option<Vec<u8>>>(1)?,
-            ))
-        })?;
-        match (first, last) {
-            (Some(first), Some(last)) => Ok(Some((
-                ContentId::from_digest(decode_digest(first)?),
-                ContentId::from_digest(decode_digest(last)?),
-            ))),
-            (None, None) => Ok(None),
-            _ => unreachable!("both aggregate bounds come from the same table"),
-        }
-    }
-
-    fn content_groups(
-        &self,
-        first: ContentId,
-        last: ContentId,
-        byte: usize,
-    ) -> Result<Vec<(u8, ContentId, ContentId)>, ContentAccumulatorError> {
-        let mut statement = self.connection.prepare(
-            "SELECT substr(id, ?1, 1), MIN(id), MAX(id) FROM content_ids \
-             WHERE id >= ?2 AND id <= ?3 GROUP BY substr(id, ?1, 1) ORDER BY 1",
-        )?;
-        let rows = statement.query_map(
-            params![
-                byte as i64 + 1,
-                first.as_bytes().as_slice(),
-                last.as_bytes().as_slice()
-            ],
-            |row| {
-                let edge: Vec<u8> = row.get(0)?;
-                let first: Vec<u8> = row.get(1)?;
-                let last: Vec<u8> = row.get(2)?;
-                Ok((edge, first, last))
-            },
-        )?;
-        rows.map(|row| {
-            let (edge, first, last) = row?;
-            if edge.len() != 1 {
-                return Err(ContentAccumulatorError::NonterminalValue);
-            }
-            Ok((
-                edge[0],
-                ContentId::from_digest(decode_digest(first)?),
-                ContentId::from_digest(decode_digest(last)?),
-            ))
-        })
-        .collect()
     }
 
     fn retained_bounds(

@@ -1,6 +1,6 @@
 # Wheat Storage Efficiency — Design
 
-Status: partial — Phases 0–1 landed, Phases 2–4 outstanding
+Status: partial — Phases 0–1.5 landed, Phases 2–4 outstanding
 Owner: bart
 Last updated: 2026-09-21
 
@@ -29,6 +29,18 @@ external review.
   builders, cursor, get, update_batch/update_node, paired_diff,
   context_walk, paired_context_walk, snapshot closure walker,
   extract_object_references, content accumulator (import path).
+
+- [x] **Phase 1.5 — flat sorted blob content sets.** Replaced the radix
+  trie content set representation (ContentSetNodeV1 objects) with flat sorted
+  blob snapshots (ContentSetSnapshotV1) and delta chains
+  (ContentSetDeltaV1). Full snapshot every 16 views, compact deltas in
+  between. Reduces content set storage from 348 MiB to ~14 MiB on the
+  Gothab benchmark (96% reduction). ContentSetStore rewritten with
+  resolve/write_snapshot/write_delta operations backed by sorted Vec
+  operations instead of radix tree traversal. All consumers updated:
+  commit_content, commit_writer, repository_mutation, content_accumulator,
+  repository_verify (visible_set), repository_hydration,
+  repository_transition, canonical_closure, snapshot walker, staged_import.
 
 ### Outstanding
 - [ ] **Phase 2 — segment-level block compression.** Compress groups

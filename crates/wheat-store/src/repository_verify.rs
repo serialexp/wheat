@@ -15,7 +15,7 @@ use crate::{
     application_map::ApplicationCollection,
     radix::{ContextWalkStep, DiffLimits, PairedContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
-    sets::{ContentCollection, ContentSetDelta},
+    sets::ContentSetDelta,
     verification_scratch::{
         RadixReceiptKind, TreeCountMark, VerificationScratch, VerificationScratchError,
     },
@@ -506,32 +506,14 @@ where
         Ok(())
     }
 
-    async fn visible_set(&self, root: ContentSetId, aggregate: ContentSetId) -> Result<()> {
-        let store = RadixStore::<_, ContentCollection>::new(self.reader.objects);
-        let mut walk = store
-            .context_walk(root)
-            .await
-            .map_err(crate::CollectionError::from)?;
-        while let Some(step) = walk.next().await.map_err(crate::CollectionError::from)? {
-            match step {
-                ContextWalkStep::Node { id } => {
-                    if self.scratch.radix_node_verified(
-                        RadixReceiptKind::VisibleContent,
-                        aggregate.as_bytes(),
-                        id.into(),
-                        walk.prefix(),
-                    )? {
-                        walk.prune();
-                    }
-                }
-                ContextWalkStep::Entry { key: content, .. } => self.required(content)?,
-                ContextWalkStep::Complete { id } => self.scratch.record_radix_node(
-                    RadixReceiptKind::VisibleContent,
-                    aggregate.as_bytes(),
-                    id.into(),
-                    walk.prefix(),
-                )?,
-            }
+    async fn visible_set(&self, root: ContentSetId, _aggregate: ContentSetId) -> Result<()> {
+        // With flat sorted blobs, resolve the content set and verify each member
+        // exists in the aggregate content index.
+        let members = ContentSetStore::new(self.reader.objects)
+            .resolve(root)
+            .await?;
+        for content in members {
+            self.required(content)?;
         }
         Ok(())
     }

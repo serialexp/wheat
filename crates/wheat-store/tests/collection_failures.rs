@@ -5,7 +5,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use object_store::memory::InMemory;
-use wheat_core::{ContentId, ContentSetChild, ContentSetId, ContentSetNode, ObjectId};
+use wheat_core::{ContentId, ContentSetId, ObjectId};
 use wheat_store::{
     ContentSetStore, ImmutableObjectStore, ObjectStoreAdapter, ObjectStoreError, StoredObject,
 };
@@ -48,7 +48,7 @@ impl ImmutableObjectStore for InstrumentedStore {
 }
 
 #[tokio::test]
-async fn digest_set_batches_write_only_changed_prefixes() {
+async fn digest_set_batches_write_only_changed_snapshots() {
     let objects = InstrumentedStore::new();
     let sets = ContentSetStore::new(&objects);
     let empty = sets.empty_root().await.unwrap();
@@ -61,7 +61,9 @@ async fn digest_set_batches_write_only_changed_prefixes() {
         .update_batch(empty, [(a, true), (b, true)])
         .await
         .unwrap();
-    assert_eq!(objects.reset(), 1, "one root with two inline entries");
+    // With flat blobs: one snapshot object written.
+    assert_eq!(objects.reset(), 1, "one snapshot with two members");
+    // No-op edit produces the same root, no writes.
     assert_eq!(
         sets.update_batch(root, [(a, false), (a, true)])
             .await
@@ -69,17 +71,16 @@ async fn digest_set_batches_write_only_changed_prefixes() {
         root
     );
     assert_eq!(objects.reset(), 0);
+    // Removing both members produces the empty root.
     assert_eq!(
         sets.update_batch(root, [(a, false), (b, false)])
             .await
             .unwrap(),
         empty
     );
-    assert_eq!(
-        objects.reset(),
-        2,
-        "incremental removal: collapse to single leaf, then to empty root"
-    );
+    // With flat blobs: one put_if_absent call for the empty snapshot
+    // (the backing store may dedup, but the call still happens).
+    assert_eq!(objects.reset(), 1, "empty snapshot put_if_absent");
 }
 
 #[tokio::test]
@@ -105,51 +106,22 @@ async fn failed_batch_keeps_old_root_readable_and_retry_is_deterministic() {
 }
 
 #[tokio::test]
-async fn cursor_rejects_wrong_depth_and_missing_children_without_skipping_them() {
+async fn resolve_rejects_missing_base_in_delta_chain() {
     let objects = InstrumentedStore::new();
     let sets = ContentSetStore::new(&objects);
-    for missing in [false, true] {
-        let child = ContentSetNode::new(vec![2], true, vec![], vec![]).unwrap();
-        let child_id = if missing {
-            ContentSetId::from_digest([99; 32])
-        } else {
-            objects
-                .put_if_absent(child.id().into(), &child.canonical_bytes())
-                .await
-                .unwrap();
-            child.id()
-        };
-        let root = ContentSetNode::new(
-            vec![],
-            false,
-            vec![
-                ContentSetChild {
-                    edge: 0,
-                    child: child_id,
-                },
-                ContentSetChild {
-                    edge: 1,
-                    child: child_id,
-                },
-            ],
-            vec![],
-        )
+
+    // Write a delta blob referencing a non-existent base.
+    let fake_base = ContentSetId::from_digest([99; 32]);
+    let a = ContentId::from_digest([1; 32]);
+    let delta_bytes =
+        wheat_core::content_set_delta_bytes(fake_base, &[a], &[]);
+    let delta_id = ContentSetId::of_canonical_bytes(&delta_bytes);
+    objects
+        .put_if_absent(delta_id.into(), &delta_bytes)
+        .await
         .unwrap();
-        objects
-            .put_if_absent(root.id().into(), &root.canonical_bytes())
-            .await
-            .unwrap();
-        let mut cursor = sets.cursor(root.id()).await.unwrap();
-        assert!(cursor.next().await.is_err());
-        assert_eq!(
-            cursor.next().await.unwrap(),
-            None,
-            "failure exhausts cursor"
-        );
-        assert!(
-            sets.contains(root.id(), ContentId::from_digest([0; 32]))
-                .await
-                .is_err()
-        );
-    }
+
+    // Resolving the delta chain should fail because the base is missing.
+    assert!(sets.resolve(delta_id).await.is_err());
+    assert!(sets.contains(delta_id, a).await.is_err());
 }

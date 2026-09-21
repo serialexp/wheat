@@ -8,6 +8,9 @@ use wheat_core::{
 
 #[derive(Clone, Copy)]
 pub(crate) enum RadixReceiptKind {
+    // VisibleContent was used by the radix-trie content set walker. With flat sorted
+    // blobs, visible_set() resolves the blob directly. Kept for schema stability.
+    #[allow(dead_code)]
     VisibleContent = 1,
     RevisionMap = 2,
 }

@@ -24,6 +24,8 @@ pub enum WheatObject {
     ApplicationMapNodeV1(ApplicationMapNodeV1Output),
     ConflictSetNodeV1(ConflictSetNodeV1Output),
     ContentSetNodeV1(ContentSetNodeV1Output),
+    ContentSetSnapshotV1(ContentSetSnapshotV1Output),
+    ContentSetDeltaV1(ContentSetDeltaV1Output),
     RetainedSetNodeV1(RetainedSetNodeV1Output),
     ViewLabelManifestV1(ViewLabelManifestV1Output),
     RepositoryEnvelopeV1(RepositoryEnvelopeV1Output),
@@ -184,6 +186,25 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
             }
+            WheatObject::ContentSetSnapshotV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_uint32(v.members.len() as u32, Endianness::BigEndian);
+                for item in &v.members {
+                    item.encode_into(encoder)?;
+                }
+            }
+            WheatObject::ContentSetDeltaV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                v.base.encode_into(encoder)?;
+                encoder.write_uint32(v.added.len() as u32, Endianness::BigEndian);
+                for item in &v.added {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.removed.len() as u32, Endianness::BigEndian);
+                for item in &v.removed {
+                    item.encode_into(encoder)?;
+                }
+            }
             WheatObject::RetainedSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
@@ -318,6 +339,14 @@ impl WheatObject {
         } else if value == 0x0c01 {
             Ok(WheatObject::ContentSetNodeV1(
                 ContentSetNodeV1Output::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x0c02 {
+            Ok(WheatObject::ContentSetSnapshotV1(
+                ContentSetSnapshotV1Output::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x0c03 {
+            Ok(WheatObject::ContentSetDeltaV1(
+                ContentSetDeltaV1Output::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x0d01 {
             Ok(WheatObject::RetainedSetNodeV1(
@@ -4244,6 +4273,187 @@ impl ContentSetChildV1 {
         let edge = decoder.read_byte()?;
         let child = ContentSetId::decode_with_decoder(decoder)?;
         Ok(Self { edge, child })
+    }
+}
+
+// --- ContentSetSnapshotV1 ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentSetSnapshotV1Input {
+    pub members: Vec<ContentId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentSetSnapshotV1Output {
+    pub wire_tag: u16,
+    pub members: Vec<ContentId>,
+}
+
+pub type ContentSetSnapshotV1 = ContentSetSnapshotV1Output;
+
+impl ContentSetSnapshotV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(0x0c02);
+        encoder.write_u32_be(self.members.len() as u32);
+        for item in &self.members {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ContentSetSnapshotV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 0x0c02u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 0x0c02, got {}",
+                wire_tag
+            )));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut members = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ContentId::decode_with_decoder(decoder)?;
+            members.push(item);
+        }
+        Ok(Self { wire_tag, members })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentSetSnapshotV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentSetSnapshotV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentSetSnapshotV1Output> for ContentSetSnapshotV1Input {
+    fn from(o: ContentSetSnapshotV1Output) -> Self {
+        Self { members: o.members }
+    }
+}
+
+impl From<ContentSetSnapshotV1Input> for ContentSetSnapshotV1Output {
+    fn from(i: ContentSetSnapshotV1Input) -> Self {
+        Self {
+            wire_tag: 0x0c02u16,
+            members: i.members,
+        }
+    }
+}
+
+// --- ContentSetDeltaV1 ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentSetDeltaV1Input {
+    pub base: ContentSetId,
+    pub added: Vec<ContentId>,
+    pub removed: Vec<ContentId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentSetDeltaV1Output {
+    pub wire_tag: u16,
+    pub base: ContentSetId,
+    pub added: Vec<ContentId>,
+    pub removed: Vec<ContentId>,
+}
+
+pub type ContentSetDeltaV1 = ContentSetDeltaV1Output;
+
+impl ContentSetDeltaV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(0x0c03);
+        self.base.encode_into(encoder)?;
+        encoder.write_u32_be(self.added.len() as u32);
+        for item in &self.added {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.removed.len() as u32);
+        for item in &self.removed {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ContentSetDeltaV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 0x0c03u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 0x0c03, got {}",
+                wire_tag
+            )));
+        }
+        let base = ContentSetId::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut added = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ContentId::decode_with_decoder(decoder)?;
+            added.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut removed = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ContentId::decode_with_decoder(decoder)?;
+            removed.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            base,
+            added,
+            removed,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentSetDeltaV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentSetDeltaV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentSetDeltaV1Output> for ContentSetDeltaV1Input {
+    fn from(o: ContentSetDeltaV1Output) -> Self {
+        Self {
+            base: o.base,
+            added: o.added,
+            removed: o.removed,
+        }
+    }
+}
+
+impl From<ContentSetDeltaV1Input> for ContentSetDeltaV1Output {
+    fn from(i: ContentSetDeltaV1Input) -> Self {
+        Self {
+            wire_tag: 0x0c03u16,
+            base: i.base,
+            added: i.added,
+            removed: i.removed,
+        }
     }
 }
 

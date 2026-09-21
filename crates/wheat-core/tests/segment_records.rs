@@ -85,7 +85,16 @@ fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
         Some(CanonicalObjectKind::ViewLineageMapNode)
     );
 
-    for kind in [0, 19, u16::MAX] {
+    assert_eq!(
+        SegmentIndexEntry::canonical_kind(19),
+        Some(CanonicalObjectKind::ContentSetSnapshot)
+    );
+    assert_eq!(
+        SegmentIndexEntry::canonical_kind(20),
+        Some(CanonicalObjectKind::ContentSetDelta)
+    );
+
+    for kind in [0, 21, u16::MAX] {
         let invalid = SegmentIndexPage {
             entries: vec![SegmentIndexEntry {
                 namespace: SEGMENT_NAMESPACE_METADATA,

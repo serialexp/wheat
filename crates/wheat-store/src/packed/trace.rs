@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-const OBJECT_KIND_COUNT: usize = 18;
+const OBJECT_KIND_COUNT: usize = 20;
 
 /// Cumulative packed-store activity captured with bounded, constant-memory counters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

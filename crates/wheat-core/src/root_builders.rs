@@ -8,9 +8,15 @@ pub fn build_content_manifest_record(
     content: &BTreeSet<ContentId>,
     sink: &mut impl FnMut(CanonicalObject),
 ) -> ContentManifestRecord {
-    ContentManifestRecord {
-        content: crate::build_content_set(content.iter().copied(), sink),
-    }
+    // Build a flat sorted snapshot blob instead of a radix trie.
+    let members: Vec<ContentId> = content.iter().copied().collect();
+    let bytes = crate::content_set_snapshot_bytes(&members);
+    let id = crate::ContentSetId::of_canonical_bytes(&bytes);
+    sink(CanonicalObject {
+        id: id.into(),
+        bytes,
+    });
+    ContentManifestRecord { content: id }
 }
 
 pub fn build_view_record(
