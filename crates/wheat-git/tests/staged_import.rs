@@ -859,13 +859,11 @@ async fn finalization_retains_branches_without_journal_and_refuses_partial_impor
     let envelope = reader.envelope(head.envelope).await.unwrap();
     let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
     assert_eq!(labels.labels.len(), 2);
-    for (name, branch) in reference.branches {
-        let label = &labels.labels[&name];
+    for (full_ref, branch) in reference.branches {
+        let label_name = wheat_git::ref_to_label_name(&full_ref);
+        let label = &labels.labels[label_name];
         assert_eq!(label.view, branch.tip.resulting_view);
-        assert_eq!(
-            label.original_git_ref.as_deref(),
-            Some(format!("refs/heads/{name}").as_str())
-        );
+        assert_eq!(label.original_git_ref.as_deref(), Some(full_ref.as_str()));
     }
     let state = reader.state(envelope.state).await.unwrap();
     assert!(

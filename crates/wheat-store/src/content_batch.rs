@@ -42,6 +42,26 @@ impl<'a> ContentWriteBatch<'a> {
         Ok(id)
     }
 
+    /// Store content with an optional delta base hint.
+    ///
+    /// If `base_id` refers to content already in the store, and a delta
+    /// against it is smaller than the raw content, the delta envelope is
+    /// stored instead. Otherwise falls back to raw storage.
+    pub fn put_with_base(
+        &mut self,
+        bytes: &[u8],
+        base_id: ContentId,
+    ) -> Result<ContentId, ContentStoreError> {
+        let id = ContentId::of(bytes);
+        if self.pending.contains_key(&id) {
+            return Ok(id);
+        }
+        // Flush pending first so the base (if it's pending) is durable.
+        self.commit()?;
+        self.store.put_with_base(id, bytes, base_id)?;
+        Ok(id)
+    }
+
     /// Durably retains the pending tail. Failed batches remain available for retry.
     pub fn commit(&mut self) -> Result<(), ContentStoreError> {
         if self.pending.is_empty() {

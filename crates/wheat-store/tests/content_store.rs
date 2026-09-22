@@ -170,9 +170,7 @@ fn delta_base_larger_than_target() {
     // The max bound (target.len()) should work since we only apply
     // max to the final output, not to the base fetch.
     assert_eq!(
-        store
-            .get_bounded(target_id, target.len())
-            .unwrap(),
+        store.get_bounded(target_id, target.len()).unwrap(),
         target.as_bytes()
     );
 }

@@ -16,7 +16,10 @@ pub(crate) enum DeltaError {
     #[error("delta command byte 0 is reserved")]
     ReservedCommand,
     #[error("delta encoding failed: {0}")]
-    #[expect(dead_code, reason = "reserved for future delta encoding error propagation")]
+    #[expect(
+        dead_code,
+        reason = "reserved for future delta encoding error propagation"
+    )]
     Encode(#[source] gunnar_delta::Error),
 }
 
@@ -139,9 +142,9 @@ fn apply_instructions(base: &[u8], target: &mut [u8], data: &[u8]) -> Result<(),
                 }
                 let ofs = ofs as usize;
                 let size = size as usize;
-                let end = ofs.checked_add(size).ok_or(DeltaError::Corrupt(
-                    "delta copy range overflows",
-                ))?;
+                let end = ofs
+                    .checked_add(size)
+                    .ok_or(DeltaError::Corrupt("delta copy range overflows"))?;
                 let src = base
                     .get(ofs..end)
                     .ok_or(DeltaError::Corrupt("delta copy range exceeds base size"))?;
@@ -157,9 +160,9 @@ fn apply_instructions(base: &[u8], target: &mut [u8], data: &[u8]) -> Result<(),
             &size => {
                 // Insert literal bytes.
                 let size = size as usize;
-                let end = i.checked_add(size).ok_or(DeltaError::Corrupt(
-                    "delta insert range overflows",
-                ))?;
+                let end = i
+                    .checked_add(size)
+                    .ok_or(DeltaError::Corrupt("delta insert range overflows"))?;
                 let src = data
                     .get(i..end)
                     .ok_or(DeltaError::Corrupt("delta insert data is truncated"))?;

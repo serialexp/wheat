@@ -19,6 +19,12 @@ pub(crate) enum Codec {
     Zstd = 1,
     Delta = 2,
     DeltaZstd = 3,
+    /// Multiple records grouped into one zstd frame. Each entry's
+    /// `stored_length` is the compressed block size (shared by all entries in
+    /// the block); `logical_length` is this record's decompressed size. The
+    /// reader decompresses the block and extracts the record at its precomputed
+    /// within-block byte offset.
+    ZstdBlock = 4,
 }
 
 impl Codec {
@@ -28,6 +34,7 @@ impl Codec {
             1 => Ok(Self::Zstd),
             2 => Ok(Self::Delta),
             3 => Ok(Self::DeltaZstd),
+            4 => Ok(Self::ZstdBlock),
             other => Err(CodecError::Unknown(other)),
         }
     }
@@ -55,7 +62,10 @@ pub(crate) enum CodecError {
     #[error("zstd codec failed: {0}")]
     Zstd(#[source] io::Error),
     #[error("delta codec failed: {0}")]
-    #[expect(dead_code, reason = "reserved for future delta error propagation paths")]
+    #[expect(
+        dead_code,
+        reason = "reserved for future delta error propagation paths"
+    )]
     Delta(#[source] crate::delta::DeltaError),
 }
 
@@ -99,7 +109,9 @@ impl EnvelopeHeader {
             Codec::Delta | Codec::DeltaZstd => {
                 // Delta payloads must have at least the 32-byte base reference.
                 if self.stored_length < crate::delta::BASE_REFERENCE_SIZE as u64 {
-                    return Err(CodecError::Format("delta payload too short for base reference"));
+                    return Err(CodecError::Format(
+                        "delta payload too short for base reference",
+                    ));
                 }
                 Ok(())
             }
@@ -182,12 +194,23 @@ pub(crate) fn decode(
     logical_length: u64,
     max: usize,
 ) -> Result<Vec<u8>, CodecError> {
+    if codec == Codec::ZstdBlock {
+        return Err(CodecError::Format(
+            "ZstdBlock codec requires block-level decoding, not per-record decode",
+        ));
+    }
     match decode_payload(codec, stored, logical_length, max)? {
         DecodedPayload::Content(bytes) => Ok(bytes),
         DecodedPayload::Delta { .. } => Err(CodecError::Format(
             "delta codec in a context that does not support delta resolution",
         )),
     }
+}
+
+/// Decompresses a zstd block payload (codec 4). Returns the full decompressed
+/// block buffer from which individual record bytes are extracted by offset.
+pub(crate) fn decode_block(compressed: &[u8]) -> Result<Vec<u8>, CodecError> {
+    zstd::bulk::decompress(compressed, HARD_LOGICAL_RECORD_BYTES).map_err(CodecError::Zstd)
 }
 
 /// Decode a stored payload into either final content or a delta reference.
@@ -232,7 +255,9 @@ pub(crate) fn decode_payload(
         Codec::Delta => {
             let base_ref_size = crate::delta::BASE_REFERENCE_SIZE;
             if stored.len() < base_ref_size {
-                return Err(CodecError::Format("delta payload too short for base reference"));
+                return Err(CodecError::Format(
+                    "delta payload too short for base reference",
+                ));
             }
             let base_digest: [u8; 32] = stored[..base_ref_size].try_into().unwrap();
             let base_id = ContentId::from_digest(base_digest);
@@ -242,7 +267,9 @@ pub(crate) fn decode_payload(
         Codec::DeltaZstd => {
             let base_ref_size = crate::delta::BASE_REFERENCE_SIZE;
             if stored.len() < base_ref_size {
-                return Err(CodecError::Format("delta payload too short for base reference"));
+                return Err(CodecError::Format(
+                    "delta payload too short for base reference",
+                ));
             }
             let base_digest: [u8; 32] = stored[..base_ref_size].try_into().unwrap();
             let base_id = ContentId::from_digest(base_digest);
@@ -253,6 +280,9 @@ pub(crate) fn decode_payload(
                 .map_err(CodecError::Zstd)?;
             Ok(DecodedPayload::Delta { base_id, patch })
         }
+        Codec::ZstdBlock => Err(CodecError::Format(
+            "ZstdBlock codec requires block-level decoding, not per-record decode",
+        )),
     }
 }
 
@@ -289,7 +319,8 @@ pub(crate) fn encode_delta_envelope(
     };
 
     let stored_length = (base_ref_size + payload_after_base.len()) as u64;
-    let mut encoded = Vec::with_capacity(ENVELOPE_HEADER_LEN + base_ref_size + payload_after_base.len());
+    let mut encoded =
+        Vec::with_capacity(ENVELOPE_HEADER_LEN + base_ref_size + payload_after_base.len());
     encoded.extend_from_slice(ENVELOPE_MAGIC);
     encoded.push(ENVELOPE_VERSION);
     encoded.push(codec.to_byte());

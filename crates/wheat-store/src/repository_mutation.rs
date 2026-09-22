@@ -229,6 +229,12 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         active.rebuild_graph();
         let selected = active.revisions.keys().copied().collect();
         let resulting = self.compose(&active, &selected, &mut fresh).await?;
+        // Ensure the lineage records a continuation edge from the previous effective
+        // view to the new result.  `compose` rebuilds the composed view from the base
+        // and records only intra-compose edges (base → result), so when the effective
+        // view was already a descendant of the base (e.g. from a prior `change new`),
+        // its vertex becomes an orphaned leaf unless we connect it explicitly.
+        Self::ensure_continuation_edge(&active, &resulting, &mut fresh);
         let outcome = RevisionOutcome {
             revision_id,
             resulting_view: resulting.id(),
@@ -458,6 +464,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let descendants = descendants(change, &active.reverse_dependencies);
         let selected = active.revisions.keys().copied().collect();
         let resulting = self.compose(&active, &selected, &mut fresh).await?;
+        Self::ensure_continuation_edge(&active, &resulting, &mut fresh);
         let outcome = RevisionOutcome {
             revision_id,
             resulting_view: resulting.id(),
@@ -667,6 +674,24 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             }
         }
         Ok(view)
+    }
+
+    /// Record a lineage edge from the prior effective view to the new composed result so that the
+    /// prior effective view is no longer a leaf frontier.
+    ///
+    /// `compose` is a pure reconstructor: it rebuilds the view from `active.base` and only records
+    /// edges between consecutively-composed intermediate views within a single call.  When the
+    /// effective view was already a descendant of the base (from a prior mutation), `compose`
+    /// produces a new result branching from the base, leaving the old effective as an orphaned leaf.
+    /// This explicit continuation edge connects the two, maintaining a single-frontier chain.
+    fn ensure_continuation_edge(active: &Active, resulting: &ViewRecord, fresh: &mut Fresh) {
+        let effective_id = active.effective.id();
+        let resulting_id = resulting.id();
+        // Only needed when the effective view is a non-trivial descendant of the base (otherwise
+        // compose's own base→result edge is sufficient) and the result differs from the effective.
+        if effective_id != active.base.id() && effective_id != resulting_id {
+            fresh.view_edges.insert((effective_id, resulting_id));
+        }
     }
 
     async fn load_edits(&self, revision: &RevisionRecord) -> Result<BTreeMap<EditId, EditRecord>> {

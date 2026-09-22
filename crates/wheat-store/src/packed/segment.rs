@@ -176,12 +176,33 @@ pub(crate) fn projected_total_length(
         .ok_or(SegmentError::TooLarge)
 }
 
+/// Target logical bytes per compressed block. Small structural records are
+/// buffered until this threshold and then flushed as one zstd frame.
+pub(crate) const BLOCK_TARGET_BYTES: usize = 65_536;
+
+/// A pending block record: the validated logical bytes and metadata needed to
+/// emit a `SegmentIndexEntry` after the block is compressed.
+struct PendingBlockRecord {
+    namespace: u8,
+    kind: u16,
+    digest: [u8; 32],
+    logical_bytes: Vec<u8>,
+}
+
 /// Streaming builder used to produce immutable V1 segments.
+///
+/// Small metadata records (below [`codec::RAW_THRESHOLD`]) are buffered and
+/// flushed as compressed blocks (codec 4). Larger records are written
+/// individually with per-record compression (codec 0 or 1).
 pub(crate) struct SegmentBuilder {
     file: NamedTempFile,
     entries: Vec<SegmentIndexEntry>,
     payload_bytes: u64,
     io_buffer: Vec<u8>,
+    /// Small records waiting to be compressed into a block.
+    pending_block: Vec<PendingBlockRecord>,
+    /// Sum of `logical_bytes.len()` across `pending_block`.
+    pending_block_bytes: usize,
 }
 
 impl SegmentBuilder {
@@ -195,6 +216,8 @@ impl SegmentBuilder {
             entries: Vec::new(),
             payload_bytes: 0,
             io_buffer: vec![0; HASH_BUFFER_SIZE],
+            pending_block: Vec::new(),
+            pending_block_bytes: 0,
         })
     }
 
@@ -207,10 +230,29 @@ impl SegmentBuilder {
         &mut self,
         prepared: PreparedSegmentRecord<'_>,
     ) -> Result<(), SegmentError> {
+        let record = prepared.logical;
+
+        // Route small metadata records into the pending block buffer.
+        // Content namespace records are never block-compressed (they have their
+        // own delta/envelope compression).
+        if record.namespace == METADATA_NAMESPACE && record.bytes.len() < codec::RAW_THRESHOLD {
+            self.pending_block.push(PendingBlockRecord {
+                namespace: record.namespace,
+                kind: record.kind,
+                digest: record.digest,
+                logical_bytes: record.bytes.to_vec(),
+            });
+            self.pending_block_bytes += record.bytes.len();
+            if self.pending_block_bytes >= BLOCK_TARGET_BYTES {
+                self.flush_pending_block()?;
+            }
+            return Ok(());
+        }
+
+        // Large record: write individually with per-record compression.
         if self.entries.len() == MAX_SEGMENT_ENTRIES {
             return Err(SegmentError::TooManyEntries);
         }
-        let record = prepared.logical;
         let physical = prepared.physical;
         let stored_length = physical.bytes.len() as u64;
         if self
@@ -236,7 +278,69 @@ impl SegmentBuilder {
         Ok(())
     }
 
+    /// Compresses the pending block records into one zstd frame and writes it.
+    fn flush_pending_block(&mut self) -> Result<(), SegmentError> {
+        if self.pending_block.is_empty() {
+            return Ok(());
+        }
+
+        // Sort records by (namespace, digest) — the same deterministic order
+        // the reader uses to reconstruct within-block positions.
+        self.pending_block
+            .sort_unstable_by_key(|r| (r.namespace, r.digest));
+
+        // Concatenate logical bytes.
+        let total_logical: usize = self.pending_block_bytes;
+        let mut concatenated = Vec::with_capacity(total_logical);
+        for record in &self.pending_block {
+            concatenated.extend_from_slice(&record.logical_bytes);
+        }
+
+        // Compress as one zstd frame.
+        let compressed = zstd::bulk::compress(&concatenated, codec::ZSTD_LEVEL)
+            .map_err(codec::CodecError::Zstd)?;
+
+        // Check limits.
+        let entry_count = self.pending_block.len();
+        if self.entries.len() + entry_count > MAX_SEGMENT_ENTRIES {
+            return Err(SegmentError::TooManyEntries);
+        }
+        let stored_length = compressed.len() as u64;
+        if self
+            .payload_bytes
+            .checked_add(stored_length)
+            .filter(|n| *n <= MAX_SEGMENT_PAYLOAD_BYTES)
+            .is_none()
+        {
+            return Err(SegmentError::TooLarge);
+        }
+
+        // Write compressed block.
+        let block_offset = PREFIX_LEN + self.payload_bytes;
+        self.file.write_all(&compressed)?;
+        self.payload_bytes += stored_length;
+
+        // Emit one SegmentIndexEntry per record. All share the same
+        // (offset, stored_length); each has its own logical_length.
+        for record in self.pending_block.drain(..) {
+            self.entries.push(SegmentIndexEntry {
+                namespace: record.namespace,
+                kind: record.kind,
+                digest: record.digest,
+                offset: block_offset,
+                codec: Codec::ZstdBlock.to_byte(),
+                stored_length,
+                logical_length: record.logical_bytes.len() as u64,
+            });
+        }
+        self.pending_block_bytes = 0;
+        Ok(())
+    }
+
     pub(crate) fn seal(mut self) -> Result<SealedSegment, SegmentError> {
+        // Flush any remaining pending block records.
+        self.flush_pending_block()?;
+
         let index_start = PREFIX_LEN
             .checked_add(self.payload_bytes)
             .ok_or(SegmentError::TooLarge)?;
@@ -349,6 +453,13 @@ pub(crate) struct SegmentReader {
     id: SegmentId,
     metadata: SegmentMetadata,
     entries_by_key: Vec<SegmentIndexEntry>,
+    /// For codec=4 entries: byte offset of this record within the decompressed
+    /// block. Zero for non-block entries. Indexed in parallel with
+    /// `entries_by_key`.
+    block_logical_offsets: Vec<u64>,
+    /// Cache of decompressed block payloads, keyed by the block's physical
+    /// byte offset in the segment file.
+    block_cache: std::collections::HashMap<u64, Vec<u8>>,
 }
 
 impl SegmentReader {
@@ -449,34 +560,53 @@ impl SegmentReader {
             return Err(SegmentError::Format("object count or index coverage"));
         }
 
-        // Payload ranges must cover precisely the payload body, regardless of key order.
-        // Empty payloads can share an offset with the following non-empty payload;
-        // order zero-length entries first so key sorting cannot make valid coverage
-        // appear overlapping.
+        // Payload ranges must cover precisely the payload body. For codec=4
+        // (ZstdBlock) entries, multiple entries share the same (offset,
+        // stored_length) — they belong to the same compressed block.
+        // Deduplicate by (offset, stored_length) to get the unique payload
+        // regions, then check contiguous coverage.
         all_entries.sort_unstable_by_key(|entry| (entry.offset, entry.stored_length));
-        let mut next_payload_offset = PREFIX_LEN;
-        for entry in &all_entries {
-            if entry.logical_length > codec::HARD_LOGICAL_RECORD_BYTES as u64
-                || entry.offset != next_payload_offset
-                || entry
-                    .offset
-                    .checked_add(entry.stored_length)
-                    .is_none_or(|end| end > footer.index_start)
-            {
-                return Err(SegmentError::Format("payload offsets or logical length"));
+        {
+            let mut next_payload_offset = PREFIX_LEN;
+            let mut prev_region: Option<(u64, u64)> = None;
+            for entry in &all_entries {
+                if entry.logical_length > codec::HARD_LOGICAL_RECORD_BYTES as u64 {
+                    return Err(SegmentError::Format("payload offsets or logical length"));
+                }
+                let region = (entry.offset, entry.stored_length);
+                if prev_region == Some(region) {
+                    // Same block as the previous entry — already accounted for.
+                    continue;
+                }
+                if entry.offset != next_payload_offset
+                    || entry
+                        .offset
+                        .checked_add(entry.stored_length)
+                        .is_none_or(|end| end > footer.index_start)
+                {
+                    return Err(SegmentError::Format("payload offsets or logical length"));
+                }
+                next_payload_offset = entry.offset + entry.stored_length;
+                prev_region = Some(region);
             }
-            next_payload_offset = entry.offset + entry.stored_length;
-        }
-        if next_payload_offset != footer.index_start {
-            return Err(SegmentError::Format("payload coverage"));
+            if next_payload_offset != footer.index_start {
+                return Err(SegmentError::Format("payload coverage"));
+            }
         }
 
+        // Re-sort by key for binary-search lookup.
         all_entries.sort_unstable_by_key(key);
+
+        // Precompute within-block byte offsets for codec=4 entries.
+        let block_logical_offsets = compute_block_logical_offsets(&all_entries);
+
         Ok(Self {
             file,
             id: footer.segment_id(),
             metadata: metadata(&footer),
             entries_by_key: all_entries,
+            block_logical_offsets,
+            block_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -522,13 +652,36 @@ impl SegmentReader {
                 minimum: logical_length,
             });
         }
-        let stored = read_range(&mut self.file, entry.offset, entry.stored_length)?;
-        let bytes = codec::decode(
-            Codec::from_byte(entry.codec)?,
-            stored,
-            entry.logical_length,
-            max,
-        )?;
+        let codec = Codec::from_byte(entry.codec)?;
+        let bytes =
+            if codec == Codec::ZstdBlock {
+                let block_offset = entry.offset;
+                let block_stored_length = entry.stored_length;
+                let within_block_offset = usize::try_from(self.block_logical_offsets[index])
+                    .map_err(|_| SegmentError::ReadLimit {
+                        minimum: usize::MAX,
+                    })?;
+
+                // Decompress and cache the block.
+                if !self.block_cache.contains_key(&block_offset) {
+                    let compressed = read_range(&mut self.file, block_offset, block_stored_length)?;
+                    let decompressed = codec::decode_block(&compressed)?;
+                    self.block_cache.insert(block_offset, decompressed);
+                }
+                let block = &self.block_cache[&block_offset];
+                let end = within_block_offset
+                    .checked_add(logical_length)
+                    .ok_or(SegmentError::Format("block record overflows"))?;
+                if end > block.len() {
+                    return Err(SegmentError::Format(
+                        "block record exceeds decompressed block",
+                    ));
+                }
+                block[within_block_offset..end].to_vec()
+            } else {
+                let stored = read_range(&mut self.file, entry.offset, entry.stored_length)?;
+                codec::decode(codec, stored, entry.logical_length, max)?
+            };
         verify_logical(entry, &bytes)?;
         Ok(Some((entry, bytes)))
     }
@@ -554,6 +707,37 @@ pub(super) fn metadata(footer: &SegmentFooter) -> SegmentMetadata {
         directory_offset: footer.directory_offset,
         directory_length: footer.directory_length,
     }
+}
+
+/// Computes the logical byte offset of each record within its compressed block.
+///
+/// `entries` must already be sorted by key (namespace, digest). Records with
+/// codec=4 that share the same `offset` value belong to the same block. Their
+/// logical bytes are concatenated in key-sorted order within the decompressed
+/// block, so the offset of record i is the sum of `logical_length` of all
+/// preceding records in the same block.
+///
+/// Non-block entries get offset 0 (unused).
+fn compute_block_logical_offsets(entries: &[SegmentIndexEntry]) -> Vec<u64> {
+    use std::collections::HashMap;
+    let mut offsets = vec![0u64; entries.len()];
+    // Group block entries by block physical offset, preserving key-sorted order.
+    let mut blocks: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.codec == Codec::ZstdBlock.to_byte() {
+            blocks.entry(entry.offset).or_default().push(i);
+        }
+    }
+    for indices in blocks.values() {
+        // Indices are already in key order because entries is key-sorted and we
+        // iterate sequentially.
+        let mut cumulative = 0u64;
+        for &i in indices {
+            offsets[i] = cumulative;
+            cumulative += entries[i].logical_length;
+        }
+    }
+    offsets
 }
 
 pub(super) fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), SegmentError> {
@@ -868,5 +1052,182 @@ mod tests {
             SegmentReader::open(file_with_bytes(&raw)),
             Err(SegmentError::Format("payload offsets or logical length"))
         ));
+    }
+
+    /// Creates a small Edit metadata record (always <1024 bytes, so
+    /// SegmentBuilder will route it to block compression).
+    fn make_edit(path: &str) -> (u16, [u8; 32], Vec<u8>) {
+        let edit = wheat_core::EditRecord::new(
+            path,
+            wheat_core::EditOperation::ExactFile {
+                expected: None,
+                replacement: Some(wheat_core::FileValue {
+                    content: ContentId::of(path.as_bytes()),
+                    kind: wheat_core::FileKind::Regular,
+                }),
+            },
+        )
+        .unwrap();
+        let canonical = edit.canonical_bytes();
+        let digest = *ObjectId::of_canonical_bytes(&canonical).as_bytes();
+        let kind = SegmentIndexEntry::canonical_kind_code(wheat_core::CanonicalObjectKind::Edit);
+        (kind, digest, canonical)
+    }
+
+    #[test]
+    fn block_compressed_metadata_records_read_back_correctly() {
+        // Push enough small metadata records to trigger block compression.
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = SegmentBuilder::new(directory.path()).unwrap();
+        let mut expected: Vec<(u16, [u8; 32], Vec<u8>)> = Vec::new();
+        for i in 0..20 {
+            let (kind, digest, canonical) = make_edit(&format!("file_{i:03}.txt"));
+            builder
+                .push(SegmentRecord {
+                    namespace: METADATA_NAMESPACE,
+                    kind,
+                    digest,
+                    bytes: &canonical,
+                })
+                .unwrap();
+            expected.push((kind, digest, canonical));
+        }
+        let segment = builder.seal().unwrap();
+        let mut reader = SegmentReader::open(segment.file.reopen().unwrap()).unwrap();
+
+        // Verify every record reads back correctly.
+        for (kind, digest, canonical) in &expected {
+            let (got_kind, got_bytes) =
+                reader.lookup(METADATA_NAMESPACE, *digest).unwrap().unwrap();
+            assert_eq!(got_kind, *kind);
+            assert_eq!(got_bytes, *canonical);
+        }
+
+        // Verify that block compression was actually used: at least one entry
+        // has codec=4.
+        let has_block = reader
+            .authenticated_entries()
+            .iter()
+            .any(|e| e.codec == Codec::ZstdBlock.to_byte());
+        assert!(
+            has_block,
+            "expected at least one block-compressed entry, but all entries \
+             have codec {:?}",
+            reader
+                .authenticated_entries()
+                .iter()
+                .map(|e| e.codec)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mixed_block_and_standalone_records_in_same_segment() {
+        // Mix small metadata records (block-compressed) with content records
+        // (always standalone).
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = SegmentBuilder::new(directory.path()).unwrap();
+
+        // 10 small metadata records.
+        let mut edits = Vec::new();
+        for i in 0..10 {
+            let (kind, digest, canonical) = make_edit(&format!("mixed_{i}.rs"));
+            builder
+                .push(SegmentRecord {
+                    namespace: METADATA_NAMESPACE,
+                    kind,
+                    digest,
+                    bytes: &canonical,
+                })
+                .unwrap();
+            edits.push((digest, canonical));
+        }
+
+        // 3 content records (standalone, not block-compressed).
+        let contents: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("content-{i}").into_bytes())
+            .collect();
+        for content in &contents {
+            builder.push(content_record(content)).unwrap();
+        }
+
+        let segment = builder.seal().unwrap();
+        let mut reader = SegmentReader::open(segment.file.reopen().unwrap()).unwrap();
+
+        // Verify metadata records.
+        for (digest, canonical) in &edits {
+            let (_, got_bytes) = reader.lookup(METADATA_NAMESPACE, *digest).unwrap().unwrap();
+            assert_eq!(got_bytes, *canonical);
+        }
+
+        // Verify content records.
+        for content in &contents {
+            let (kind, got_bytes) = reader
+                .lookup(CONTENT_NAMESPACE, *ContentId::of(content).as_bytes())
+                .unwrap()
+                .unwrap();
+            assert_eq!(kind, 0);
+            assert_eq!(got_bytes, *content);
+        }
+
+        // Verify mix of codecs: metadata should be block-compressed, content raw.
+        let entries = reader.authenticated_entries();
+        let metadata_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.namespace == METADATA_NAMESPACE)
+            .collect();
+        let content_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.namespace == CONTENT_NAMESPACE)
+            .collect();
+        assert!(
+            metadata_entries
+                .iter()
+                .all(|e| e.codec == Codec::ZstdBlock.to_byte())
+        );
+        assert!(
+            content_entries
+                .iter()
+                .all(|e| e.codec == Codec::Raw.to_byte())
+        );
+    }
+
+    #[test]
+    fn block_compression_reduces_payload_bytes() {
+        // Build the same records with and without block compression by
+        // controlling the record size relative to RAW_THRESHOLD.
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = SegmentBuilder::new(directory.path()).unwrap();
+        for i in 0..20 {
+            let (kind, digest, canonical) = make_edit(&format!("compress_{i:03}.txt"));
+            builder
+                .push(SegmentRecord {
+                    namespace: METADATA_NAMESPACE,
+                    kind,
+                    digest,
+                    bytes: &canonical,
+                })
+                .unwrap();
+        }
+        let segment = builder.seal().unwrap();
+        let compressed_payload = segment.metadata.payload_bytes;
+        let raw_total: u64 = reader_payload_logical_total(segment.file.reopen().unwrap());
+
+        // Block compression should reduce payload bytes relative to the sum
+        // of all logical record sizes.
+        assert!(
+            compressed_payload < raw_total,
+            "block-compressed payload ({compressed_payload}) should be less \
+             than raw total ({raw_total})"
+        );
+    }
+
+    fn reader_payload_logical_total(file: File) -> u64 {
+        let reader = SegmentReader::open(file).unwrap();
+        reader
+            .authenticated_entries()
+            .iter()
+            .map(|e| e.logical_length)
+            .sum()
     }
 }

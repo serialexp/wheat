@@ -1063,10 +1063,19 @@ impl ClosureWalk {
         object_terminal: bool,
         entries: &[Vec<u8>],
     ) -> Result<(), SnapshotError> {
-        self.follow_radix(id, prefix, None, children, content_terminal, object_terminal)?;
+        self.follow_radix(
+            id,
+            prefix,
+            None,
+            children,
+            content_terminal,
+            object_terminal,
+        )?;
         // Set inline entries are terminal keys. Their suffix appended to the
         // radix path at this node gives the full key/digest.
-        if !entries.is_empty() && let Some(mut path) = self.radix_path(id)? {
+        if !entries.is_empty()
+            && let Some(mut path) = self.radix_path(id)?
+        {
             path.extend_from_slice(prefix);
             for suffix in entries {
                 let mut full = path.clone();

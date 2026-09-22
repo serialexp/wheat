@@ -20,7 +20,7 @@ use wheat_store::{
 use crate::{
     journal::{ImportJournal, JournalError},
     metadata,
-    staged_import::{StagedImportError, pinned_branches, snapshot_bytes, stage_import},
+    staged_import::{StagedImportError, pinned_refs, snapshot_bytes, stage_import},
 };
 
 const PAGE: usize = 256;
@@ -211,7 +211,7 @@ where
 
     // Re-pin and hold exclusive ownership from this point through head initialization.
     let git = gix::open(git_path).map_err(|e| FinalizeImportError::Git(e.to_string()))?;
-    let pinned = pinned_branches(&git)?;
+    let pinned = pinned_refs(&git)?;
     let snapshot = snapshot_bytes(&git, git_path, &pinned)?;
     let journal = if durable_journal {
         ImportJournal::open(journal_path, &snapshot)?
@@ -396,10 +396,7 @@ where
                 .native
                 .expect("complete import has every branch tip")
                 .view_id;
-            let name = original_ref
-                .strip_prefix("refs/heads/")
-                .expect("staged branches are local branch refs")
-                .to_owned();
+            let name = crate::ref_to_label_name(&original_ref).to_owned();
             (
                 name,
                 ViewLabel {

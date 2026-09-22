@@ -11,6 +11,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use url::{Host, Url};
 
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, ViewId};
 use wheat_protocol::*;
@@ -20,44 +21,223 @@ use wheat_store::{ContentStore, ImmutableObjectStore, RepositoryHead, Repository
 // URL parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed wheat remote URL.
+/// Parsed and canonicalized wheat remote URL.
 ///
 /// Format: `wheat://host:port/owner/repo` (WS) or
 ///         `wheat+tls://host:port/owner/repo` (WSS).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WheatUrl {
     /// WebSocket URL: `ws://host:port` or `wss://host:port`.
     pub ws_url: String,
     /// Repository name extracted from the URL path (e.g. `owner/repo`).
     pub repo_name: String,
+    /// Stable remote identity. This is the canonical wheat URL, not a display URL.
+    pub canonical_identity: String,
 }
 
-/// Parse a `wheat://` or `wheat+tls://` URL.
-pub fn parse_wheat_url(url: &str) -> Result<WheatUrl> {
-    let (scheme, rest) = if let Some(rest) = url.strip_prefix("wheat+tls://") {
-        ("wss", rest)
-    } else if let Some(rest) = url.strip_prefix("wheat://") {
-        ("ws", rest)
-    } else {
-        bail!("invalid wheat URL: expected wheat:// or wheat+tls:// scheme");
+impl WheatUrl {
+    /// Return the canonical identity used when comparing remote URLs.
+    pub fn canonical_identity(&self) -> &str {
+        &self.canonical_identity
+    }
+
+    #[cfg(test)]
+    fn has_same_identity(&self, other: &Self) -> bool {
+        self.canonical_identity == other.canonical_identity
+    }
+}
+
+/// Parse a `wheat://` or `wheat+tls://` URL into a strict canonical identity.
+///
+/// No default port is currently part of the Wheat protocol contract, so an
+/// omitted port remains omitted and every explicit port remains significant.
+pub fn parse_wheat_url(input: &str) -> Result<WheatUrl> {
+    // Keep the original escaped path: `url` correctly normalizes dot segments,
+    // but accepting that normalization would give invalid spellings an identity.
+    let after_scheme = input
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .with_context(|| "invalid wheat URL: missing authority")?;
+    let path_start = after_scheme
+        .find('/')
+        .with_context(|| "invalid wheat URL: no repository path")?;
+    let raw_authority = &after_scheme[..path_start];
+    if raw_authority.contains('@') {
+        bail!("invalid wheat URL: user information is not allowed");
+    }
+    let raw_path = &after_scheme[path_start..];
+    let raw_path = raw_path
+        .split_once(['?', '#'])
+        .map_or(raw_path, |(path, _)| path);
+
+    let parsed = Url::parse(input).with_context(|| format!("invalid wheat URL: {input}"))?;
+    let (wheat_scheme, ws_scheme) = match parsed.scheme() {
+        "wheat" => ("wheat", "ws"),
+        "wheat+tls" => ("wheat+tls", "wss"),
+        _ => bail!("invalid wheat URL: expected wheat:// or wheat+tls:// scheme"),
     };
 
-    // Split host:port from the repo path.
-    let (host_port, repo_path) = rest
-        .split_once('/')
-        .with_context(|| format!("invalid wheat URL: no repository path in {url}"))?;
-
-    if host_port.is_empty() {
-        bail!("invalid wheat URL: empty host");
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("invalid wheat URL: user information is not allowed");
     }
-    if repo_path.is_empty() {
+    if parsed.query().is_some() {
+        bail!("invalid wheat URL: query is not allowed");
+    }
+    if parsed.fragment().is_some() {
+        bail!("invalid wheat URL: fragment is not allowed");
+    }
+
+    let host = parsed
+        .host()
+        .with_context(|| "invalid wheat URL: empty host")?;
+    let canonical_host = match host {
+        Host::Domain(domain) => domain.to_ascii_lowercase(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[{address}]"),
+    };
+    let authority = match parsed.port() {
+        Some(port) => format!("{canonical_host}:{port}"),
+        None => canonical_host,
+    };
+
+    // Validate the original escaped path before `url` can normalize it.
+    // Encoded slashes and backslashes could otherwise change repository
+    // boundaries downstream.
+    if contains_forbidden_path_escape(raw_path) {
+        bail!("invalid wheat URL: encoded path separators or NUL are not allowed");
+    }
+    let raw_repo_path = raw_path
+        .strip_prefix('/')
+        .with_context(|| "invalid wheat URL: repository path is not absolute")?;
+    let mut repo_segments = Vec::new();
+    for segment in raw_repo_path.split('/') {
+        let decoded = percent_decode_segment(segment)?;
+        if decoded.is_empty() || decoded == "." || decoded == ".." {
+            bail!("invalid wheat URL: empty or dot repository path segment");
+        }
+        if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
+            bail!("invalid wheat URL: repository path contains a separator or NUL");
+        }
+        repo_segments.push(decoded);
+    }
+    if repo_segments.is_empty() {
         bail!("invalid wheat URL: empty repository name");
     }
+    let repo_name = repo_segments.join("/");
+    let canonical_path = repo_segments
+        .iter()
+        .map(|segment| encode_identity_segment(segment))
+        .collect::<Vec<_>>()
+        .join("/");
 
     Ok(WheatUrl {
-        ws_url: format!("{scheme}://{host_port}"),
-        repo_name: repo_path.to_string(),
+        ws_url: format!("{ws_scheme}://{authority}"),
+        repo_name,
+        canonical_identity: format!("{wheat_scheme}://{authority}/{canonical_path}"),
     })
+}
+
+fn contains_forbidden_path_escape(path: &str) -> bool {
+    path.as_bytes().windows(3).any(|bytes| {
+        bytes[0] == b'%'
+            && matches!(
+                (bytes[1].to_ascii_lowercase(), bytes[2].to_ascii_lowercase()),
+                (b'2', b'f') | (b'5', b'c') | (b'0', b'0')
+            )
+    })
+}
+
+fn percent_decode_segment(segment: &str) -> Result<String> {
+    let mut decoded = Vec::with_capacity(segment.len());
+    let bytes = segment.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                bail!("invalid wheat URL: malformed percent escape in repository path");
+            }
+            let high = hex_value(bytes[index + 1]).with_context(
+                || "invalid wheat URL: malformed percent escape in repository path",
+            )?;
+            let low = hex_value(bytes[index + 2]).with_context(
+                || "invalid wheat URL: malformed percent escape in repository path",
+            )?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).context("invalid wheat URL: repository path is not UTF-8")
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn encode_identity_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod url_tests {
+    use super::parse_wheat_url;
+
+    #[test]
+    fn canonicalizes_host_and_escapes_without_changing_repo_case() {
+        let parsed = parse_wheat_url("wheat+tls://EXAMPLE.COM:443/Owner/R%C3%A9po").unwrap();
+        assert_eq!(parsed.ws_url, "wss://example.com:443");
+        assert_eq!(parsed.repo_name, "Owner/Répo");
+        assert_eq!(
+            parsed.canonical_identity(),
+            "wheat+tls://example.com:443/Owner/R%C3%A9po"
+        );
+    }
+
+    #[test]
+    fn preserves_scheme_and_explicit_port_in_identity() {
+        let plain = parse_wheat_url("wheat://example.com/owner/repo").unwrap();
+        let explicit = parse_wheat_url("wheat://example.com:80/owner/repo").unwrap();
+        let tls = parse_wheat_url("wheat+tls://example.com/owner/repo").unwrap();
+        assert!(!plain.has_same_identity(&explicit));
+        assert!(!plain.has_same_identity(&tls));
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_non_repository_urls() {
+        for input in [
+            "wheat://user@example.com/owner/repo",
+            "wheat://user%40name@example.com/owner/repo",
+            "wheat://example.com/owner/repo?x=1",
+            "wheat://example.com/owner/repo#fragment",
+            "wheat://example.com/owner//repo",
+            "wheat://example.com/owner/./repo",
+            "wheat://example.com/owner/../repo",
+            "wheat://example.com/owner%2Frepo",
+            "wheat://example.com/owner%5Crepo",
+            "wheat://example.com/owner/%00repo",
+        ] {
+            assert!(parse_wheat_url(input).is_err(), "accepted {input}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

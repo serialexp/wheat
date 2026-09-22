@@ -675,10 +675,7 @@ where
                         let mut full_key = vec![0u8; C::Key::LEN];
                         full_key[..end].copy_from_slice(&edits[start].0.bytes()[..end]);
                         full_key[end..].copy_from_slice(&old_suffix);
-                        let mut combined = vec![(
-                            C::Key::from_bytes(&full_key),
-                            Some(old_value),
-                        )];
+                        let mut combined = vec![(C::Key::from_bytes(&full_key), Some(old_value))];
                         combined.extend_from_slice(&edits[start..group_end]);
                         // Dedup/apply: last value for each key wins.
                         let present: Vec<_> = combined
@@ -697,9 +694,8 @@ where
                         } else if !present.is_empty() {
                             // Multiple entries: create a child subtree.
                             let child = self.build_subtree(end + 1, &present).await?;
-                            let ins_pos = children
-                                .binary_search_by_key(&edge, |c| c.0)
-                                .unwrap_err();
+                            let ins_pos =
+                                children.binary_search_by_key(&edge, |c| c.0).unwrap_err();
                             children.insert(ins_pos, (edge, child));
                         }
                     }
@@ -708,12 +704,7 @@ where
                     let old_id = children[child_idx].1;
                     let child_node = self.read_at(old_id, end + 1).await?;
                     let replacement = self
-                        .update_node(
-                            Some(old_id),
-                            child_node,
-                            end + 1,
-                            &edits[start..group_end],
-                        )
+                        .update_node(Some(old_id), child_node, end + 1, &edits[start..group_end])
                         .await?;
                     if replacement != Some(old_id) {
                         changed = true;
@@ -734,9 +725,7 @@ where
                                         suffix.push(edge);
                                         suffix.extend_from_slice(&updated.prefix);
                                         let ins_pos = entries
-                                            .binary_search_by(|(s, _)| {
-                                                s.as_slice().cmp(&suffix)
-                                            })
+                                            .binary_search_by(|(s, _)| s.as_slice().cmp(&suffix))
                                             .unwrap_err();
                                         entries.insert(ins_pos, (suffix, leaf_value));
                                     } else {
@@ -768,9 +757,8 @@ where
                             entries.insert(ins_pos, (suffix, present[0].1));
                         } else {
                             let child = self.build_subtree(end + 1, &present).await?;
-                            let ins_pos = children
-                                .binary_search_by_key(&edge, |c| c.0)
-                                .unwrap_err();
+                            let ins_pos =
+                                children.binary_search_by_key(&edge, |c| c.0).unwrap_err();
                             children.insert(ins_pos, (edge, child));
                         }
                     }
@@ -994,17 +982,13 @@ where
                         // Collect and sort by discriminating byte (they're already
                         // sorted within each list; merge is O(n)).
                         let left_branches: Vec<Branch<C::Id, C::Value>> = {
-                            let mut v = Vec::with_capacity(
-                                left.children.len() + left.entries.len(),
-                            );
+                            let mut v =
+                                Vec::with_capacity(left.children.len() + left.entries.len());
                             let mut ci = 0;
                             let mut ei = 0;
                             loop {
                                 let cb = left.children.get(ci).map(|c| c.0);
-                                let eb = left
-                                    .entries
-                                    .get(ei)
-                                    .and_then(|(s, _)| s.first().copied());
+                                let eb = left.entries.get(ei).and_then(|(s, _)| s.first().copied());
                                 match (cb, eb) {
                                     (Some(c), Some(e)) if c < e => {
                                         v.push(Branch::Child(c, left.children[ci].1));
@@ -1028,17 +1012,14 @@ where
                             v
                         };
                         let right_branches: Vec<Branch<C::Id, C::Value>> = {
-                            let mut v = Vec::with_capacity(
-                                right.children.len() + right.entries.len(),
-                            );
+                            let mut v =
+                                Vec::with_capacity(right.children.len() + right.entries.len());
                             let mut ci = 0;
                             let mut ei = 0;
                             loop {
                                 let cb = right.children.get(ci).map(|c| c.0);
-                                let eb = right
-                                    .entries
-                                    .get(ei)
-                                    .and_then(|(s, _)| s.first().copied());
+                                let eb =
+                                    right.entries.get(ei).and_then(|(s, _)| s.first().copied());
                                 match (cb, eb) {
                                     (Some(c), Some(e)) if c < e => {
                                         v.push(Branch::Child(c, right.children[ci].1));
@@ -1064,17 +1045,15 @@ where
                         // Now merge-diff the two branch lists by byte.
                         // Entry diffs are collected here (loop is reverse, but
                         // entries must be emitted in forward key order).
-                        let mut deferred_entry_diffs: Vec<DiffEntry<C::Key, C::Value>> =
-                            Vec::new();
+                        let mut deferred_entry_diffs: Vec<DiffEntry<C::Key, C::Value>> = Vec::new();
                         let mut lbi = left_branches.len();
                         let mut rbi = right_branches.len();
                         let left_entry_by_byte = |byte: u8| -> Option<usize> {
-                            left.entries
-                                .binary_search_by(|(s, _)| s[0].cmp(&byte))
-                                .ok()
+                            left.entries.binary_search_by(|(s, _)| s[0].cmp(&byte)).ok()
                         };
                         let right_entry_by_byte = |byte: u8| -> Option<usize> {
-                            right.entries
+                            right
+                                .entries
                                 .binary_search_by(|(s, _)| s[0].cmp(&byte))
                                 .ok()
                         };
@@ -1105,34 +1084,25 @@ where
                                             let (rs, _) = &right.entries[rei];
                                             if ls == rs {
                                                 if lv != rv {
-                                                    key[end..end + ls.len()]
-                                                        .copy_from_slice(ls);
-                                                    deferred_entry_diffs.push(
-                                                        DiffEntry::Changed(
-                                                            C::Key::from_bytes(&key),
-                                                            *lv,
-                                                            *rv,
-                                                        ),
-                                                    );
+                                                    key[end..end + ls.len()].copy_from_slice(ls);
+                                                    deferred_entry_diffs.push(DiffEntry::Changed(
+                                                        C::Key::from_bytes(&key),
+                                                        *lv,
+                                                        *rv,
+                                                    ));
                                                 }
                                             } else {
                                                 // Same first byte, different suffixes.
-                                                key[end..end + ls.len()]
-                                                    .copy_from_slice(ls);
-                                                deferred_entry_diffs.push(
-                                                    DiffEntry::Removed(
-                                                        C::Key::from_bytes(&key),
-                                                        *lv,
-                                                    ),
-                                                );
-                                                key[end..end + rs.len()]
-                                                    .copy_from_slice(rs);
-                                                deferred_entry_diffs.push(
-                                                    DiffEntry::Added(
-                                                        C::Key::from_bytes(&key),
-                                                        *rv,
-                                                    ),
-                                                );
+                                                key[end..end + ls.len()].copy_from_slice(ls);
+                                                deferred_entry_diffs.push(DiffEntry::Removed(
+                                                    C::Key::from_bytes(&key),
+                                                    *lv,
+                                                ));
+                                                key[end..end + rs.len()].copy_from_slice(rs);
+                                                deferred_entry_diffs.push(DiffEntry::Added(
+                                                    C::Key::from_bytes(&key),
+                                                    *rv,
+                                                ));
                                             }
                                         }
                                         (Branch::Child(_, id), Branch::Entry(_, rv)) => {
@@ -1188,12 +1158,10 @@ where
                                             let lei = left_entry_by_byte(byte).unwrap();
                                             let (ls, _) = &left.entries[lei];
                                             key[end..end + ls.len()].copy_from_slice(ls);
-                                            deferred_entry_diffs.push(
-                                                DiffEntry::Removed(
-                                                    C::Key::from_bytes(&key),
-                                                    *val,
-                                                ),
-                                            );
+                                            deferred_entry_diffs.push(DiffEntry::Removed(
+                                                C::Key::from_bytes(&key),
+                                                *val,
+                                            ));
                                         }
                                     }
                                 }
@@ -1213,12 +1181,10 @@ where
                                             let rei = right_entry_by_byte(byte).unwrap();
                                             let (rs, _) = &right.entries[rei];
                                             key[end..end + rs.len()].copy_from_slice(rs);
-                                            deferred_entry_diffs.push(
-                                                DiffEntry::Added(
-                                                    C::Key::from_bytes(&key),
-                                                    *val,
-                                                ),
-                                            );
+                                            deferred_entry_diffs.push(DiffEntry::Added(
+                                                C::Key::from_bytes(&key),
+                                                *val,
+                                            ));
                                         }
                                     }
                                 }
@@ -1238,12 +1204,10 @@ where
                                             let lei = left_entry_by_byte(byte).unwrap();
                                             let (ls, _) = &left.entries[lei];
                                             key[end..end + ls.len()].copy_from_slice(ls);
-                                            deferred_entry_diffs.push(
-                                                DiffEntry::Removed(
-                                                    C::Key::from_bytes(&key),
-                                                    *val,
-                                                ),
-                                            );
+                                            deferred_entry_diffs.push(DiffEntry::Removed(
+                                                C::Key::from_bytes(&key),
+                                                *val,
+                                            ));
                                         }
                                     }
                                 }
@@ -1263,12 +1227,10 @@ where
                                             let rei = right_entry_by_byte(byte).unwrap();
                                             let (rs, _) = &right.entries[rei];
                                             key[end..end + rs.len()].copy_from_slice(rs);
-                                            deferred_entry_diffs.push(
-                                                DiffEntry::Added(
-                                                    C::Key::from_bytes(&key),
-                                                    *val,
-                                                ),
-                                            );
+                                            deferred_entry_diffs.push(DiffEntry::Added(
+                                                C::Key::from_bytes(&key),
+                                                *val,
+                                            ));
                                         }
                                     }
                                 }
@@ -1847,11 +1809,7 @@ where
                 }
             }
             // Merge-iterate children and inline entries by discriminating byte.
-            let next_child = frame
-                .left
-                .children
-                .get(frame.child_index)
-                .map(|&(e, _)| e);
+            let next_child = frame.left.children.get(frame.child_index).map(|&(e, _)| e);
             let next_entry = frame
                 .left
                 .entries

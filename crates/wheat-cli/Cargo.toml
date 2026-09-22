@@ -23,6 +23,7 @@ tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.28", features = ["connect"] }
+url = { workspace = true }
 uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-ignore = { path = "../wheat-ignore" }

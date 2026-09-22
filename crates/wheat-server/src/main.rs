@@ -29,9 +29,10 @@ enum StoreMode {
 #[command(name = "wheat-server", about = "Wheat native protocol server")]
 struct Cli {
     /// Directory containing a wheat repository. For `--store local`, this
-    /// must contain objects/, content/, and repository.head. For `--store
-    /// s3-packed`, the repository.head is read from this directory while
-    /// objects and content are stored on S3.
+    /// may be either a loose store (objects/, content/, repository.head) or
+    /// a packed store (storage/, repository.head) — auto-detected. For
+    /// `--store s3-packed`, the repository.head is read from this directory
+    /// while objects and content are stored on S3.
     #[arg(long)]
     data_dir: PathBuf,
 

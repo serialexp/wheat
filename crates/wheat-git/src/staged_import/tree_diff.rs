@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use gix::bstr::ByteSlice;
 use wheat_core::{
-    EditId, EditRecord, EditTransition, FileKind, RevisionEdits,
+    ContentId, EditId, EditRecord, EditTransition, FileKind, RevisionEdits,
     edit_capture::{CaptureLimits, FileSnapshot, capture_edit_with_limits},
     guarded,
 };
@@ -315,6 +315,14 @@ fn record_blob_edit(
     let after = new
         .map(|(oid, kind)| load_blob(git, oid).map(|bytes| (kind, bytes)))
         .transpose()?;
+
+    // When both old and new blobs exist (a modification), compute the old
+    // content's ContentId so we can delta-encode new content against it.
+    let base_content_id = match (&before, &after) {
+        (Some((old_kind, old_bytes)), Some(_)) => Some(canonical_content_id(old_bytes, *old_kind)),
+        _ => None,
+    };
+
     let captured = capture_edit_with_limits(
         path,
         before
@@ -339,7 +347,13 @@ fn record_blob_edit(
         source,
     })?;
     for (id, bytes) in captured.content {
-        let stored = content.put(&bytes)?;
+        let stored = if let Some(base_id) = base_content_id {
+            // Try delta encoding against the old version of this file.
+            // put_with_base falls back to raw if the delta isn't worthwhile.
+            content.put_with_base(&bytes, base_id)?
+        } else {
+            content.put(&bytes)?
+        };
         debug_assert_eq!(stored, id);
     }
     edits.extend(captured.edits);
@@ -353,4 +367,22 @@ fn load_blob(git: &gix::Repository, oid: gix::ObjectId) -> Result<Vec<u8>, Stage
         .try_into_blob()
         .map_err(git_error_local)?;
     Ok(blob.data.clone())
+}
+
+/// Compute the `ContentId` of a Git blob after applying the same text
+/// canonicalization that `capture_edit_with_limits` uses internally.
+/// Symlinks are stored raw; everything else goes through text capture
+/// (CR/CRLF → LF normalization, binary detection).
+fn canonical_content_id(bytes: &[u8], kind: FileKind) -> ContentId {
+    use std::borrow::Cow;
+    use wheat_core::text_capture::{CapturedBytes, capture};
+
+    if kind == FileKind::Symlink {
+        return ContentId::of(bytes);
+    }
+    match capture(bytes) {
+        CapturedBytes::Text(Cow::Borrowed(text)) => ContentId::of(text.as_bytes()),
+        CapturedBytes::Text(Cow::Owned(text)) => ContentId::of(text.as_bytes()),
+        CapturedBytes::Binary(blob) => ContentId::of(&blob),
+    }
 }

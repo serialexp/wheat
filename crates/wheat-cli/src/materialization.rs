@@ -329,7 +329,10 @@ fn insert_parent_paths<'a>(path: &'a str, directories: &mut HashSet<&'a str>) {
     }
 }
 
-pub(crate) struct WorkspaceLock(File);
+pub(crate) struct WorkspaceLock {
+    lock: File,
+    control: File,
+}
 
 impl WorkspaceLock {
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
@@ -358,14 +361,21 @@ impl WorkspaceLock {
                 }
                 return Err(error.into());
             }
-            Ok(Self(file))
+            Ok(Self {
+                lock: file,
+                control,
+            })
         }
+    }
+
+    pub(crate) fn control(&self) -> &File {
+        &self.control
     }
 }
 
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -478,10 +488,25 @@ pub(crate) async fn materialize_locked(
         "repository head changed while materialization was planned"
     );
     let journal_bytes = encode_journal(&journal)?;
-    let (tx, mut progress) = create_transaction(root, transaction_id)?;
+    crate::workspace_registry_service::transition_materialization(
+        root,
+        &metadata.store.path,
+        metadata,
+        head,
+        view,
+        tree,
+    )?;
+    let (tx, mut progress) = match create_transaction(root, transaction_id) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            crate::workspace_registry_service::reconcile(root, &metadata.store.path, metadata)?;
+            return Err(error);
+        }
+    };
     if let Err(error) = write_journal(root, &journal_bytes) {
         if !journal_exists(root)? {
             cleanup_abandoned_transaction(root, transaction_id, &tx)?;
+            crate::workspace_registry_service::reconcile(root, &metadata.store.path, metadata)?;
         }
         return Err(error);
     }
@@ -499,6 +524,7 @@ pub(crate) async fn materialize_locked(
         checkpoint("completion-persisted")?;
     }
     cleanup_committed(root, repository, &journal, &tx)?;
+    crate::workspace_registry_service::reconcile(root, &metadata.store.path, metadata)?;
     Ok(())
 }
 
@@ -751,6 +777,7 @@ pub(crate) async fn recover_locked(
 ) -> Result<()> {
     let Some(journal) = read_journal(root)? else {
         cleanup_orphan_transactions(root)?;
+        crate::workspace_registry_service::reconcile(root, &metadata.store.path, metadata)?;
         return Ok(());
     };
     authenticate_journal(repository, metadata, &journal).await?;
@@ -811,7 +838,8 @@ pub(crate) async fn recover_locked(
         )?;
         checkpoint("completion-persisted")?;
     }
-    cleanup_committed(root, repository, &journal, &tx)
+    cleanup_committed(root, repository, &journal, &tx)?;
+    crate::workspace_registry_service::reconcile(root, &metadata.store.path, metadata)
 }
 
 fn publish_target(root: &Path, metadata: &mut WorkspaceMetadata, journal: &Journal) -> Result<()> {
@@ -1050,7 +1078,7 @@ async fn authenticate_journal(
 }
 
 async fn authenticate_target(repository: &LocalRepository, journal: &Journal) -> Result<()> {
-    let head: RepositoryHead = journal.target.repository_head.clone().into();
+    let head: RepositoryHead = journal.target.repository_head.into();
     let reader = wheat_store::RepositoryReader::new(&repository.objects, &repository.content);
     let envelope = reader.validate_envelope(head.envelope).await?;
     let labels = reader.view_label_manifest(envelope.labels).await?;

@@ -17,12 +17,20 @@ const DIRECTORY_ENTRY_SIZE: usize = 81;
 pub const SEGMENT_NAMESPACE_METADATA: u8 = 1;
 pub const SEGMENT_NAMESPACE_CONTENT: u8 = 2;
 
-/// Physical payload codec. Each zstd payload is exactly one independent frame.
+/// Physical payload codec.
+///
+/// `Raw` and `Zstd` are per-record codecs (each record's payload is
+/// independently encoded). `ZstdBlock` groups multiple small records into one
+/// zstd frame: records within a block share the same `(offset, stored_length)`
+/// in their index entries. The reader decompresses the block and extracts each
+/// record at the logical position derived from co-block entries' `logical_length`
+/// values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(u8)]
 pub enum SegmentCodec {
     Raw = 0,
     Zstd = 1,
+    ZstdBlock = 4,
 }
 
 impl SegmentCodec {
@@ -30,6 +38,7 @@ impl SegmentCodec {
         match code {
             0 => Some(Self::Raw),
             1 => Some(Self::Zstd),
+            4 => Some(Self::ZstdBlock),
             _ => None,
         }
     }
@@ -45,7 +54,7 @@ pub struct SegmentIndexEntry {
     pub kind: u16,
     pub digest: [u8; 32],
     pub offset: u64,
-    /// [`SegmentCodec`] numeric identity (`Raw = 0`, `Zstd = 1`).
+    /// [`SegmentCodec`] numeric identity (`Raw = 0`, `Zstd = 1`, `ZstdBlock = 4`).
     pub codec: u8,
     pub stored_length: u64,
     pub logical_length: u64,
@@ -211,6 +220,9 @@ fn valid_entry(e: &SegmentIndexEntry) -> Result<(), SegmentRecordError> {
     if codec == SegmentCodec::Raw && e.stored_length != e.logical_length {
         return Err(SegmentRecordError::InvalidRawLengths);
     }
+    // ZstdBlock entries: stored_length is the compressed block size (shared by
+    // all entries in the block), logical_length is this record's decompressed
+    // size. No per-entry length invariant to check.
     Ok(())
 }
 

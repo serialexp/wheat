@@ -356,9 +356,13 @@ impl ContentBackend for PackedEngine {
             });
         }
         let Some((_kind, bytes)) = value else {
-            // Oversized content bypasses packed segments. As with metadata,
-            // avoid a failed loose-file probe for every ordinary packed read.
-            let bytes = self.content.get_bounded(id, max)?;
+            // Not in a packed segment — could be oversized raw content or a
+            // delta envelope in the loose content directory. Use
+            // resolve_delta_chain with our own get_raw_envelope so that a
+            // delta stored loose can reference a base in a packed segment.
+            let bytes = crate::content_store::resolve_delta_chain(id, max, |current_id| {
+                self.get_raw_envelope(current_id)
+            })?;
             if let Some(trace) = &self.trace {
                 trace.content_get(bytes.len());
             }
@@ -396,6 +400,24 @@ impl ContentBackend for PackedEngine {
         // Fall back to loose content store (which uses envelope files).
         self.content.read_local_raw_envelope(id)
     }
+
+    fn put_raw_envelopes(
+        &self,
+        envelopes: &[(ContentId, Vec<u8>)],
+    ) -> Result<(), ContentStoreError> {
+        // Delta envelopes are stored in the loose content directory. The read
+        // path (get_bounded) resolves delta chains via get_raw_envelope which
+        // checks both the packed catalog and loose files, so a delta whose base
+        // lives in a packed segment resolves correctly.
+        for (id, envelope) in envelopes {
+            self.content.put_raw_envelope(*id, envelope.clone())?;
+        }
+        Ok(())
+    }
+
+    fn supports_raw_envelopes(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -424,6 +446,40 @@ mod tests {
         assert_eq!(final_snapshot.bulk_finalizations, 1);
         assert_eq!(final_snapshot.locator_recounts, 0);
         assert!(trace.snapshot().is_none());
+    }
+
+    #[test]
+    fn delta_across_packed_and_loose_resolves_through_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PackedObjectStore::open_deferred(root.path()).unwrap();
+        let content = store.content_store();
+
+        // Base content stored raw → goes to packed segment via put_many backend.
+        let base = b"hello world this is the base content for delta testing purposes here";
+        let base_id = content.put(base).unwrap();
+        assert_eq!(content.get(base_id).unwrap(), base);
+
+        // Build a chain up to depth 14 (one below MAX_DELTA_CHAIN_DEPTH).
+        let mut prev_id = base_id;
+        let mut versions: Vec<(wheat_core::ContentId, Vec<u8>)> = Vec::new();
+        for i in 1..=14 {
+            let data = format!(
+                "hello world this is version {i:03} content for delta testing purposes here"
+            );
+            let data = data.into_bytes();
+            let id = wheat_core::ContentId::of(&data);
+            content.put_with_base(id, &data, prev_id).unwrap();
+            let read_back = content.get(id).unwrap();
+            assert_eq!(read_back, data, "depth-{i} delta read failed");
+            versions.push((id, data));
+            prev_id = id;
+        }
+
+        // Verify all versions are still readable.
+        for (i, (id, expected)) in versions.iter().enumerate() {
+            let read_back = content.get(*id).unwrap();
+            assert_eq!(&read_back, expected, "re-read of depth-{} failed", i + 1);
+        }
     }
 
     #[test]

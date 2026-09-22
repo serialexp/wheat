@@ -43,9 +43,9 @@ const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PROOF_RECEIPTS: usize = 65_536;
 
 const NAMESPACE: Uuid = Uuid::from_u128(0xc245_a89b_519f_5a4b_9b36_d62b_78f5_2901);
-const SNAPSHOT_VERSION: &[u8] = b"wheat-git-staged-import-v1\0";
+const SNAPSHOT_VERSION: &[u8] = b"wheat-git-staged-import-v2\0";
 const DISCOVERY_BATCH: usize = 256;
-const MAX_STAGE_BRANCHES: usize = 256;
+const MAX_STAGE_REFS: usize = 1024;
 /// The current import path materializes a complete blob and exact replacement
 /// sides in memory, so keep its whole-file ceiling explicit and conservative.
 /// Native streaming/chunked content storage will allow a larger repository policy
@@ -157,7 +157,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     durable_journal: bool,
 ) -> Result<StagedImportResult, StagedImportError> {
     let git = gix::open(git_path).map_err(git_error_local)?;
-    let branches = pinned_branches(&git)?;
+    let branches = pinned_refs(&git)?;
     let snapshot = snapshot_bytes(&git, git_path, &branches)?;
     let mut journal = if durable_journal {
         ImportJournal::open(journal_path, &snapshot)?
@@ -456,30 +456,55 @@ fn add_commit(
     Ok(())
 }
 
-pub(super) fn pinned_branches(
+/// Collect all importable refs: local branches, tags, and remote-tracking
+/// branches. Each ref is peeled to its target commit OID. Annotated tags
+/// (tag objects) are peeled through to the underlying commit; tags that
+/// point at non-commit objects (trees, blobs) are silently skipped.
+pub(super) fn pinned_refs(
     git: &gix::Repository,
 ) -> Result<BTreeMap<String, gix::ObjectId>, StagedImportError> {
     let mut out = BTreeMap::new();
     let platform = git.references().map_err(git_error_local)?;
-    let iter = platform.local_branches().map_err(git_error_local)?;
-    for reference in iter {
-        if out.len() >= MAX_STAGE_BRANCHES {
-            return Err(StagedImportError::Git(format!(
-                "Git import exceeded branch limit of {MAX_STAGE_BRANCHES}"
-            )));
+
+    // Helper: add refs from one iterator, peeling each to a commit.
+    let mut add_refs = |iter: gix::reference::iter::Iter<'_, '_>| -> Result<(), StagedImportError> {
+        for reference in iter {
+            if out.len() >= MAX_STAGE_REFS {
+                return Err(StagedImportError::Git(format!(
+                    "Git import exceeded ref limit of {MAX_STAGE_REFS}"
+                )));
+            }
+            let mut reference = reference.map_err(git_error_local)?;
+            let name = reference
+                .name()
+                .as_bstr()
+                .to_str()
+                .map_err(|_| StagedImportError::InvalidUtf8("ref name"))?
+                .to_owned();
+            // Peel the reference (follows symrefs) to get the target OID.
+            let oid = reference.peel_to_id().map_err(git_error_local)?.detach();
+            // For annotated tags the OID points at a tag object, not a
+            // commit. Try to peel through to the commit; skip if the
+            // target is a non-commit (e.g. a tag pointing at a tree).
+            let commit_oid = match git.find_object(oid) {
+                Ok(obj) => match obj.peel_to_kind(gix::object::Kind::Commit) {
+                    Ok(commit) => commit.id,
+                    Err(_) => continue, // skip non-commit targets
+                },
+                Err(_) => continue, // skip unresolvable refs
+            };
+            out.insert(name, commit_oid);
         }
-        let mut reference = reference.map_err(git_error_local)?;
-        let name = reference
-            .name()
-            .as_bstr()
-            .to_str()
-            .map_err(|_| StagedImportError::InvalidUtf8("branch name"))?
-            .to_owned();
-        out.insert(
-            name,
-            reference.peel_to_id().map_err(git_error_local)?.detach(),
-        );
-    }
+        Ok(())
+    };
+
+    add_refs(platform.local_branches().map_err(git_error_local)?)?;
+    // Re-acquire the platform for each iterator (gix consumes it).
+    let platform = git.references().map_err(git_error_local)?;
+    add_refs(platform.tags().map_err(git_error_local)?)?;
+    let platform = git.references().map_err(git_error_local)?;
+    add_refs(platform.remote_branches().map_err(git_error_local)?)?;
+
     Ok(out)
 }
 

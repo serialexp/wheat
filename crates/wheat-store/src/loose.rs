@@ -43,7 +43,7 @@ pub enum ObjectKind {
 }
 
 impl ObjectKind {
-    pub(crate) fn from_code(code: u16) -> Option<Self> {
+    pub fn from_code(code: u16) -> Option<Self> {
         Some(match code {
             1 => Self::Tree,
             2 => Self::Change,

@@ -35,10 +35,16 @@ mod remote;
 mod remote_config;
 mod repository_diff;
 mod selection_recovery;
+mod store_analyze;
+mod store_lookup;
 mod workspace;
+mod workspace_clone;
 mod workspace_diff;
 mod workspace_files;
+mod workspace_lifecycle;
 mod workspace_metadata;
+mod workspace_registry;
+mod workspace_registry_service;
 mod workspace_scan;
 mod workspace_status;
 mod workspace_walk;
@@ -46,7 +52,7 @@ use command_output::{
     CliFailure, OutputFormat, Success, clap_error, emit_error, emit_success, requested_format,
     require_supported_platform,
 };
-use discovery::{allocate_store_root, canonical_store_path, discover_workspace};
+use discovery::{allocate_store_root, canonical_store_path, discover_workspace, store_home};
 use local::{content_store, initialize, open, projection_path, revision_with_edits, runtime};
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
 
@@ -115,6 +121,12 @@ enum Command {
     Change(ChangeCommand),
     /// Resolve a durable conflict with an exact tree entry.
     Resolve(ResolveArgs),
+    /// Inspect or detach workspaces sharing one repository store.
+    #[command(subcommand)]
+    Workspace(WorkspaceCommand),
+    /// Storage analysis and maintenance.
+    #[command(subcommand)]
+    Store(StoreCommand),
     /// Import a local Git repository into a fresh Wheat repository.
     Import(ImportArgs),
     /// Project Wheat revision history and push it to a Git branch.
@@ -173,6 +185,20 @@ struct DiffArgs {
     from: Option<String>,
     #[arg(long, requires = "from", conflicts_with = "revision")]
     to: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    /// List workspaces registered against this repository store.
+    List,
+    /// Detach this workspace while preserving every materialized file.
+    Unregister,
+}
+
+#[derive(Debug, Subcommand)]
+enum StoreCommand {
+    /// Show a detailed breakdown of where bytes live in the store.
+    Analyze,
 }
 
 #[derive(Debug, Subcommand)]
@@ -390,7 +416,9 @@ struct ImportArgs {
     source: String,
     /// Fresh workspace to create. Defaults to the current directory.
     workspace: Option<PathBuf>,
-    /// Full Git branch ref to import and select as a native label.
+    /// Git ref to use as the workspace's active label.
+    /// All local branches, tags, and remote-tracking branches are imported
+    /// regardless; this only selects which one becomes the workspace default.
     #[arg(long, default_value = "refs/heads/main")]
     branch: String,
     /// Write bounded internal import diagnostics as JSON Lines.
@@ -524,6 +552,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::Change(ChangeCommand::New(_)) => "change.new",
         Command::Change(ChangeCommand::Select { .. }) => "change.select",
         Command::Resolve(_) => "resolve",
+        Command::Workspace(WorkspaceCommand::List) => "workspace.list",
+        Command::Workspace(WorkspaceCommand::Unregister) => "workspace.unregister",
+        Command::Store(StoreCommand::Analyze) => "store.analyze",
         Command::Import(_) => "import",
         Command::Push(_) => "push",
         Command::Clone(_) => "clone",
@@ -672,6 +703,11 @@ fn execute(cli: Cli) -> Result<Success> {
             let local = open(&context.store_root)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
+            runtime()?.block_on(materialization::recover_locked(
+                &context.root,
+                &local,
+                &mut context.workspace,
+            ))?;
             selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
             let basis = context.workspace.basis;
             let head = local.heads.read()?;
@@ -965,6 +1001,11 @@ fn execute(cli: Cli) -> Result<Success> {
                 resulting_frontier,
                 selected_change: context.workspace.selected_change,
             });
+            workspace_registry_service::reconcile(
+                &context.root,
+                &context.store_root,
+                &context.workspace,
+            )?;
             context
                 .workspace
                 .replace_prepared(&context.root)?
@@ -980,6 +1021,11 @@ fn execute(cli: Cli) -> Result<Success> {
                 .replace_prepared(&context.root)?
                 .publish()
                 .map_err(|error| anyhow::anyhow!(error))?;
+            workspace_registry_service::reconcile(
+                &context.root,
+                &context.store_root,
+                &context.workspace,
+            )?;
             let path_count = paths.len();
             let mut output = String::new();
             writeln!(
@@ -1093,6 +1139,11 @@ fn execute(cli: Cli) -> Result<Success> {
                 resulting_frontier,
                 selected_change: Some(change),
             });
+            workspace_registry_service::reconcile(
+                &context.root,
+                &context.store_root,
+                &context.workspace,
+            )?;
             context
                 .workspace
                 .replace_prepared(&context.root)?
@@ -1109,6 +1160,11 @@ fn execute(cli: Cli) -> Result<Success> {
                 .replace_prepared(&context.root)?
                 .publish()
                 .map_err(|error| anyhow::anyhow!(error))?;
+            workspace_registry_service::reconcile(
+                &context.root,
+                &context.store_root,
+                &context.workspace,
+            )?;
             let mut output = String::new();
             writeln!(output, "change {change}")?;
             writeln!(output, "revision {}", outcome.revision_id)?;
@@ -1130,6 +1186,11 @@ fn execute(cli: Cli) -> Result<Success> {
             let local = open(&context.store_root)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
+            runtime()?.block_on(materialization::recover_locked(
+                &context.root,
+                &local,
+                &mut context.workspace,
+            ))?;
             selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
             let basis = context.workspace.basis;
             let head = local.heads.read()?;
@@ -1151,6 +1212,11 @@ fn execute(cli: Cli) -> Result<Success> {
                 .replace_prepared(&context.root)?
                 .publish()
                 .map_err(|error| anyhow::anyhow!(error))?;
+            workspace_registry_service::reconcile(
+                &context.root,
+                &context.store_root,
+                &context.workspace,
+            )?;
             Success::new(
                 "change.select",
                 json!({ "change": change.to_string(), "title": selected.title }),
@@ -1160,6 +1226,16 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Resolve(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             resolve(&context.root, &context.store_root, arguments)
+        }
+        Command::Workspace(WorkspaceCommand::List) => {
+            list_workspaces(&requested_workspace, cli.store.as_deref())
+        }
+        Command::Workspace(WorkspaceCommand::Unregister) => {
+            unregister_workspace(&requested_workspace, cli.store.as_deref())
+        }
+        Command::Store(StoreCommand::Analyze) => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            store_analyze::analyze(&store_root)
         }
         Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
         Command::Clone(arguments) => native_clone(arguments, cli.store.as_deref()),
@@ -1262,11 +1338,7 @@ fn import(
     if let Some(trace) = &mut trace {
         trace.phase_finished("store_metadata", phase_started.elapsed());
     }
-    let selected_label = arguments
-        .branch
-        .strip_prefix("refs/heads/")
-        .unwrap_or(&arguments.branch)
-        .to_owned();
+    let selected_label = wheat_git::ref_to_label_name(&arguments.branch).to_owned();
     let phase_started = std::time::Instant::now();
     if let Some(trace) = &mut trace {
         trace.phase_started("resolve_frontier");
@@ -1292,6 +1364,7 @@ fn import(
         trace.phase_started("workspace_metadata");
     }
     initialize_workspace_directory(workspace_root)?;
+    workspace_registry_service::reconcile(workspace_root, &store_root, &workspace)?;
     workspace.initialize(workspace_root)?;
     if let Some(trace) = &mut trace {
         trace.phase_finished("workspace_metadata", phase_started.elapsed());
@@ -1339,13 +1412,14 @@ fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Resul
     let resolved = runtime()?.block_on(frontier_service::resolve(&repository, "main", None))?;
     drop(repository);
     initialize_workspace_directory(workspace_root)?;
-    WorkspaceMetadata::new(
+    let workspace = WorkspaceMetadata::new(
         canonical_store,
         store.store_id,
         "main".into(),
         resolved.basis,
-    )
-    .initialize(workspace_root)?;
+    );
+    workspace_registry_service::reconcile(workspace_root, &store_root, &workspace)?;
+    workspace.initialize(workspace_root)?;
     let (view, materialized_root) =
         materialize_resolved(workspace_root, Some(&store_root), "main".into(), resolved)?;
     Success::new(
@@ -1459,6 +1533,7 @@ fn switch_workspace(
         &repository,
         &mut context.workspace,
     ))?;
+    selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
     ensure_workspace_clean_locked(&context.root, &repository, &context.workspace)?;
     let resolved = runtime()?.block_on(frontier_service::resolve(
         &repository,
@@ -1765,6 +1840,7 @@ fn resolve(
         resulting_frontier,
         selected_change: metadata.selected_change,
     });
+    workspace_registry_service::reconcile(workspace_root, store_root, &metadata)?;
     metadata
         .replace_prepared(workspace_root)?
         .publish()
@@ -1778,6 +1854,7 @@ fn resolve(
         .replace_prepared(workspace_root)?
         .publish()
         .map_err(|error| anyhow::anyhow!(error))?;
+    workspace_registry_service::reconcile(workspace_root, store_root, &metadata)?;
     let mut output = String::new();
     writeln!(output, "revision {}", outcome.revision_id)?;
     print_reapplied(&mut output, &outcome.reapplied)?;
@@ -1857,6 +1934,26 @@ fn put_captured_value(
 // ---------------------------------------------------------------------------
 
 fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Result<Success> {
+    if let Some(source) = workspace_clone::local_source(&arguments.url) {
+        let workspace_root = arguments.workspace.unwrap_or_else(|| {
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace");
+            PathBuf::from(format!("{name}-workspace"))
+        });
+        if let Some(store) = explicit_store {
+            let source_store = discover_workspace(&source)
+                .map(|context| context.store_root)
+                .unwrap_or_else(|_| source.clone());
+            if canonical_store_path(store)? != canonical_store_path(&source_store)? {
+                return Err(CliFailure::invalid(
+                    "explicit Wheat store does not match the local clone source",
+                ));
+            }
+        }
+        return workspace_clone::clone_local(&source, &workspace_root);
+    }
     let parsed = remote::parse_wheat_url(&arguments.url)?;
 
     // Derive workspace directory from repo name if not provided.
@@ -1871,9 +1968,24 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
 
     ensure_fresh_workspace(&workspace_root)?;
 
-    let store_root = explicit_store
-        .map(Path::to_path_buf)
-        .unwrap_or(allocate_store_root()?);
+    let existing_store = if let Some(store) = explicit_store {
+        let store = canonical_store_path(store)?;
+        let config = remote_config::RemoteConfig::read(&store)?
+            .context("explicit Wheat store has no native remote configuration")?;
+        if !config.has_same_identity(&parsed) {
+            return Err(CliFailure::invalid(
+                "explicit Wheat store tracks a different native remote",
+            ));
+        }
+        Some(store)
+    } else {
+        store_lookup::find_remote_store(&store_home()?, &parsed)?
+    };
+    if let Some(store_root) = existing_store {
+        return workspace_clone::clone_local(&store_root, &workspace_root);
+    }
+
+    let store_root = allocate_store_root()?;
     if store_root.exists() {
         return Err(CliFailure::invalid(format!(
             "Wheat store destination already exists: {}",
@@ -1969,6 +2081,7 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
         label_name.clone(),
         resolved.basis,
     );
+    workspace_registry_service::reconcile(&workspace_root, &store_root, &workspace)?;
     workspace.initialize(&workspace_root)?;
     let (view, materialized_root) =
         materialize_resolved(&workspace_root, Some(&store_root), label_name, resolved)?;
@@ -2110,6 +2223,11 @@ fn native_publish(
                 },
             )
         });
+        if !cfg.has_same_identity(&parsed) {
+            return Err(CliFailure::invalid(
+                "explicit native remote does not match this store's tracked remote",
+            ));
+        }
         (parsed, cfg)
     } else {
         resolve_remote(&context.store_root, None)?
@@ -2170,8 +2288,7 @@ fn native_publish(
             };
             remote_cfg.set_last_fetched(&new_remote_head);
             if let Some(url) = arguments.remote {
-                // First publish — also set the URL.
-                remote_cfg.url = url;
+                remote_cfg.set_remote(&url, &parsed);
             }
             remote_cfg.write(&context.store_root)?;
 
@@ -2212,6 +2329,11 @@ fn resolve_remote(
         let parsed = remote::parse_wheat_url(url)?;
         let cfg = remote_config::RemoteConfig::read(store_root)?
             .with_context(|| "no remote.json found; use wheat clone or pass --remote")?;
+        if !cfg.has_same_identity(&parsed) {
+            return Err(CliFailure::invalid(
+                "explicit native remote does not match this store's tracked remote",
+            ));
+        }
         Ok((parsed, cfg))
     } else {
         let cfg = remote_config::RemoteConfig::read(store_root)?
@@ -2219,6 +2341,14 @@ fn resolve_remote(
         let parsed = remote::parse_wheat_url(&cfg.url)?;
         Ok((parsed, cfg))
     }
+}
+
+fn list_workspaces(workspace: &Path, explicit_store: Option<&Path>) -> Result<Success> {
+    workspace_lifecycle::list(workspace, explicit_store)
+}
+
+fn unregister_workspace(workspace: &Path, explicit_store: Option<&Path>) -> Result<Success> {
+    workspace_lifecycle::unregister(workspace, explicit_store)
 }
 
 fn print_reapplied(output: &mut String, changes: &[ChangeId]) -> Result<()> {

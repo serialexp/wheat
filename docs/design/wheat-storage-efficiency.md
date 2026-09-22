@@ -1,8 +1,8 @@
 # Wheat Storage Efficiency — Design
 
-Status: partial — Phases 0–1.5 landed, Phases 2–4 outstanding
+Status: partial — Phases 0–2 landed, Phases 3–4 outstanding
 Owner: bart
-Last updated: 2026-09-21
+Last updated: 2026-09-22
 
 ## Implementation status
 
@@ -42,17 +42,31 @@ external review.
   repository_verify (visible_set), repository_hydration,
   repository_transition, canonical_closure, snapshot walker, staged_import.
 
+- [x] **Phase 2 — segment-level block compression.** Small metadata
+  records (<1024 bytes) are grouped into ~64 KB blocks and compressed
+  as single zstd frames (codec=4 "ZstdBlock"). Multiple index entries
+  share the same `(offset, stored_length)` — the reader decompresses
+  the block and extracts records at precomputed within-block offsets.
+  No segment version bump (V1 format, new codec byte). SegmentBuilder
+  and BulkSegment buffer small records and flush blocks at the target
+  size or at seal time. seal_active() rebuilds with block compression
+  instead of raw-copying. SQLite locator schema updated for codec=4.
+  50-change benchmark: 205 KiB stored vs 288 KiB uncompressed (29%
+  savings).
+
 ### Outstanding
-- [ ] **Phase 2 — segment-level block compression.** Compress groups
-  of consecutive records within a segment as shared zstd frames,
-  so small structural objects benefit from cross-record context.
 - [ ] **Phase 3 — wire encoding compaction.** Switch binschema length
   prefixes from fixed `uint32` to varint, drop the always-1 ContentId
   algorithm byte, and shrink low-cardinality arrays to `uint8`/`uint16`
   counts. This is essentially free since the types are generated.
-- [ ] **Phase 4 — repack / gc.** Background compaction that rebuilds
-  delta chains (newest-as-base) and reclaims unreachable objects.
-  GC must mark delta base ContentIds as reachable.
+- [ ] **Phase 4a — nondestructive repack.** Rebuild physical structural
+  storage and content delta chains with newest content as the full base while
+  preserving the repository head, envelope, logical object identities, retained
+  history, and observable semantics.
+- [ ] **Phase 4b — destructive GC.** Reclaim only objects and content already
+  unreachable from every authority in the collection scope. GC must use exact,
+  fail-closed marking, include transitive delta-base `ContentId`s, and respect
+  writer fencing plus reader grace periods.
 - [ ] **Measurement prerequisite.** Before implementing, measure the
   actual benchmark repository: object count by kind, bytes by kind
   (canonical + stored), objects reachable from HEAD vs total ever
@@ -114,8 +128,11 @@ This document designs the fixes for all three layers.
 - Changing the hash algorithm. BLAKE3-256 is non-negotiable for the
   object identity model. The 12-byte-per-reference overhead relative to
   SHA-1 is a constant factor already paid in every other subsystem.
-- Garbage collection across repositories. Repack/GC operates on a
-  single repository's object closure.
+- Client-directed garbage collection across repositories. A local command may
+  operate directly only on an exclusively owned repository store. Shared remote
+  structural and content backends require server-authoritative fork-network and
+  global mark scopes; Phase 4 specifies that safety boundary rather than a client
+  cross-repository sweep.
 
 ## Phase 0 — Content delta compression
 
@@ -413,7 +430,35 @@ Across a 50-change repository with ~1337 objects, the total savings
 from Phase 3 alone are roughly **5–10 KB** (~5–8% of structural data).
 Modest, but free because the schema regeneration is mechanical.
 
-## Phase 4 — Repack / GC
+## Phase 4 — Repack and GC
+
+History retention is not a storage-engine decision. Immutable local revision
+checkpoints remain part of the authoritative repository closure until an explicit
+`wheat change squash`, `wheat stack squash`, or separately authorized history
+rewrite publishes a new state that no longer retains them. The collapse contract,
+including stable edit identities and exact publish behavior, lives in
+[`wheat-local-cli.md`](./wheat-local-cli.md#revision-checkpoints-and-explicit-collapse).
+Neither operation in this section rewrites logical change history.
+
+The two maintenance commands have deliberately different contracts:
+
+- **`wheat repack` is nondestructive and representation-preserving.** It may rewrite
+  packed segments, indexes, compression, and physical content-delta envelopes, but
+  it preserves the repository head and generation, envelope, canonical structural
+  objects, logical `ContentId`s, retained history, and all observable semantics.
+  Old physical generations are retired only after the replacement is durable and
+  authenticated and reader-safety rules permit retirement.
+- **`wheat gc` is destructive but policy-free.** It reclaims only physical objects
+  and content already unreachable from every authoritative owner in its collection
+  scope. It never decides that a revision, view, conflict, or application is too old
+  or uninteresting, never collapses lineage, and never squashes a change. A dry run
+  reports candidates; deletion requires an exact fail-closed proof.
+
+A user may therefore run squash without GC, repack without squash, GC without
+repack, or any ordered combination. Typical reclamation is semantic collapse first,
+then GC after the old objects are outside every root and grace period. Repack is not
+a prerequisite for determining semantic deadness, though GC may internally compact
+a partially live segment before retiring its old physical representation.
 
 ### Delta chain optimization
 
@@ -441,28 +486,43 @@ publishes, or as a background task.
 
 ### Dead object collection
 
-After repacking, objects that are no longer in any reachable closure
-can be garbage collected. This requires:
+GC uses the complete authority set for the backend's sharing scope:
 
-1. Walk the current envelope's full closure
-   (`collect_structural_closure`).
-2. Mark all reachable ObjectIds and ContentIds.
-3. **Walk all reachable content envelopes and mark delta base
-   ContentIds as reachable.** This is critical: a delta base
-   might not be referenced by any tree or manifest in the current
-   closure, but it's required to reconstruct a content blob that
-   *is* reachable. Without this step, GC would delete delta bases
-   and make dependent content unrecoverable.
-4. Repeat step 3 transitively until no new bases are discovered
-   (a base might itself be a delta referencing another base).
-5. Delete everything else from the segment and content stores.
+- an exclusively owned local repository store marks its authenticated current
+  envelope plus declared workspace, snapshot, archive, and other pins;
+- a shared remote structural store marks the union of every head in its fork
+  network;
+- a globally deduplicated content store marks the union of content manifests and
+  explicit content pins across every sharing domain.
 
-GC must fail closed on missing or unreadable references — if an
-object can't be read, assume it's reachable rather than deleting
-something that might depend on it.
+A client must not sweep a shared remote backend from one repository's closure.
+Remote collection is server-authoritative. Workspace roots must be durably
+registered and enumerable; discovering only the invoking `.wheat/workspace.json`
+is not a complete root set.
 
-For the remote packed store, this means building a new segment from
-only the live objects and uploading it, then deleting the old segments.
+Collection requires:
+
+1. Snapshot the complete authority set behind an appropriate generation barrier.
+2. Completely validate each authority. A best-effort fetch closure that skips
+   missing or undecodable references is not a deletion proof.
+3. Walk every structural closure with bounded, disk-backed visited state and mark
+   all reachable `ObjectId`s and semantic `ContentId`s.
+4. **Walk all reachable physical content envelopes and mark delta-base
+   `ContentId`s as reachable.** A delta base might not be referenced by a tree or
+   semantic manifest but is required to reconstruct reachable content.
+5. Repeat delta-base marking transitively to a fixed point.
+6. Compare the authenticated mark set with a backend inventory, recheck the
+   authority barrier, and retire only the proven complement.
+7. Delay physical removal for the configured reader grace period. Whole-dead
+   segments may be retired; partially live segments require replacement containing
+   the live records before the old segment is retired.
+
+GC fails closed on every missing, corrupt, unreadable, ambiguous, or unbounded
+reference. It treats recent loose objects, in-flight publications, staged uploads,
+and failed-publication debris according to their declared age/lease/TTL state; it
+does not infer deadness merely because one authority snapshot cannot yet reach
+them. Writers after a collection barrier belong to the next cycle and must not
+publish dependencies on storage being retired by the current cycle.
 
 ## Interaction with nimble-heron's codec work
 
@@ -523,16 +583,23 @@ Phase 3 (wire compaction)
   └── changes canonical encoding → changes all object IDs
   └── smallest absolute savings, but essentially free
 
-Phase 4 (repack / gc)
-  └── depends on Phase 0 (delta chains to rewrite)
-  └── GC must understand delta base references in content envelopes
-  └── can run incrementally against the current format
+Phase 4a (nondestructive repack)
+  └── depends on Phase 0 for content delta-chain reversal
+  └── preserves semantic authority and logical identities
+  └── needs atomic physical-generation publication and reader-safe retirement
+
+Phase 4b (destructive GC)
+  └── independent from semantic squash and optional repack scheduling
+  └── needs complete owner enumeration, exact fail-closed marking, inventory,
+      writer fencing, delta-base traversal, and reader grace periods
+  └── remote mode is server-authoritative at fork-network/global scope
 ```
 
 Phases 0 and 1 are independent and deliver the largest wins. Phase 2
 is a nice-to-have after the codec plumbing stabilises. Phase 3 can
-be done at any point but touches everything. Phase 4 is the ongoing
-maintenance tool.
+be done at any point but touches everything. Phase 4 contains two
+separate ongoing maintenance operations: representation-preserving repack and
+destructive reachability GC.
 
 ## References
 

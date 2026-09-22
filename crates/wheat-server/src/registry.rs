@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use wheat_store::{ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore};
+use wheat_store::{
+    ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, PackedObjectStore,
+};
 
 /// A single repository's stores.
 pub struct RepositoryEntry {
@@ -33,10 +35,27 @@ impl Registry {
     }
 
     /// Create a registry serving a single repository with an explicit name.
+    ///
+    /// Auto-detects packed stores (`storage/` directory) vs loose stores
+    /// (`objects/` directory).
     pub fn single_named(name: String, data_dir: &Path) -> Self {
+        let (objects, content): (Box<dyn ImmutableObjectStore>, ContentStore) =
+            if data_dir.join("storage").is_dir() {
+                // Packed store (produced by `wheat import`).
+                let packed = PackedObjectStore::open(data_dir.join("storage"))
+                    .expect("open packed object store");
+                let content = packed.content_store();
+                (Box::new(packed), content)
+            } else {
+                // Loose store (produced by `wheat init`).
+                (
+                    Box::new(LooseObjectStore::new(data_dir.join("objects"))),
+                    ContentStore::new(data_dir.join("content")),
+                )
+            };
         let entry = Arc::new(RepositoryEntry {
-            objects: Box::new(LooseObjectStore::new(data_dir.join("objects"))),
-            content: ContentStore::new(data_dir.join("content")),
+            objects,
+            content,
             heads: LocalPublicationStore::new(data_dir.join("repository.head")),
         });
         let mut repos = HashMap::new();

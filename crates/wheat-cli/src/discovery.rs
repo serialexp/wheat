@@ -10,7 +10,7 @@ pub(crate) struct ResolvedWorkspace {
     pub workspace: WorkspaceMetadata,
 }
 
-pub(crate) fn allocate_store_root() -> Result<PathBuf> {
+pub(crate) fn store_home() -> Result<PathBuf> {
     let home = if let Some(path) = std::env::var_os("WHEAT_STORE_HOME") {
         PathBuf::from(path)
     } else if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
@@ -24,7 +24,12 @@ pub(crate) fn allocate_store_root() -> Result<PathBuf> {
     };
     std::fs::create_dir_all(&home)
         .with_context(|| format!("create Wheat store home {}", home.display()))?;
-    Ok(home.join(uuid::Uuid::now_v7().to_string()))
+    home.canonicalize()
+        .with_context(|| format!("canonicalize Wheat store home {}", home.display()))
+}
+
+pub(crate) fn allocate_store_root() -> Result<PathBuf> {
+    Ok(store_home()?.join(uuid::Uuid::now_v7().to_string()))
 }
 
 pub(crate) fn canonical_store_path(path: &Path) -> Result<PathBuf> {

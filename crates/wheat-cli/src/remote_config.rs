@@ -1,82 +1,343 @@
-//! Remote configuration — persists the origin URL and last-fetched head
-//! for divergence tracking across fetch/publish operations.
+//! Durable remote configuration for divergence tracking across fetch/publish.
 //!
-//! Stored as `remote.json` in the wheat store root, alongside `store.json`
-//! and `repository.head`.
+//! `remote.json` lives in the wheat store root beside `store.json` and
+//! `repository.head`. Writes use a same-directory atomic replacement and sync
+//! both the replacement and containing directory before returning.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use wheat_core::RepositoryEnvelopeId;
 use wheat_store::RepositoryHead;
 
-/// On-disk remote configuration.
-#[derive(Debug, Serialize, Deserialize)]
+use crate::remote::{WheatUrl, parse_wheat_url};
+
+const REMOTE_CONFIG_VERSION: u32 = 1;
+const MAX_REMOTE_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// In-memory remote configuration.
+#[derive(Clone, Debug)]
 pub struct RemoteConfig {
-    /// The wheat:// URL of the origin server.
+    /// User-facing URL spelling retained for display.
     pub url: String,
-    /// Generation counter of the last-fetched (or cloned/published) remote head.
+    /// Stable, canonical URL identity used for comparisons.
+    pub canonical_identity: String,
+    /// Generation counter of the exact last-observed remote head.
     pub last_fetched_generation: u64,
-    /// Hex-encoded envelope ID of the last-fetched remote head.
+    /// Hex-encoded envelope ID of the exact last-observed remote head.
     pub last_fetched_envelope: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedRemoteConfig {
+    version: u32,
+    display_url: String,
+    canonical_identity: String,
+    head: StoredHead,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredHead {
+    generation: u64,
+    envelope: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRemoteConfig {
+    url: String,
+    last_fetched_generation: u64,
+    last_fetched_envelope: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredRemoteConfig {
+    Versioned(VersionedRemoteConfig),
+    Legacy(LegacyRemoteConfig),
+}
+
 impl RemoteConfig {
-    /// Build a new remote config from a URL and a head.
-    pub fn new(url: &str, head: &RepositoryHead) -> Self {
-        Self {
-            url: url.to_string(),
-            last_fetched_generation: head.generation,
-            last_fetched_envelope: head.envelope.to_string(),
-        }
+    /// Build a remote config from a URL and head.
+    ///
+    /// Callers already validate command-line remotes before reaching this
+    /// constructor. `parse` is available where validation must be fallible.
+    pub fn new(display_url: &str, head: &RepositoryHead) -> Self {
+        Self::parse(display_url, head).expect("RemoteConfig::new requires a valid wheat URL")
     }
 
-    /// The last-fetched head as a `RepositoryHead`.
-    pub fn last_fetched_head(&self) -> Result<RepositoryHead> {
-        let envelope = self
-            .last_fetched_envelope
-            .parse::<RepositoryEnvelopeId>()
-            .with_context(|| {
-                format!(
-                    "invalid envelope ID in remote.json: {}",
-                    self.last_fetched_envelope
-                )
-            })?;
-        Ok(RepositoryHead {
-            generation: self.last_fetched_generation,
-            envelope,
+    /// Parse a display URL and construct a validated remote config.
+    pub fn parse(display_url: &str, head: &RepositoryHead) -> Result<Self> {
+        let remote = parse_wheat_url(display_url)?;
+        Ok(Self {
+            url: display_url.to_owned(),
+            canonical_identity: remote.canonical_identity().to_owned(),
+            last_fetched_generation: head.generation,
+            last_fetched_envelope: head.envelope.to_string(),
         })
     }
 
-    /// Update the last-fetched head.
+    #[cfg(test)]
+    fn canonical_identity(&self) -> &str {
+        &self.canonical_identity
+    }
+
+    /// Compare this config to a parsed remote by canonical identity.
+    pub fn has_same_identity(&self, remote: &WheatUrl) -> bool {
+        self.canonical_identity == remote.canonical_identity()
+    }
+
+    #[cfg(test)]
+    fn matches_url(&self, url: &str) -> Result<bool> {
+        Ok(self.has_same_identity(&parse_wheat_url(url)?))
+    }
+
+    /// Replace the display URL and identity from an already validated remote.
+    pub fn set_remote(&mut self, display_url: &str, remote: &WheatUrl) {
+        self.url = display_url.to_owned();
+        self.canonical_identity = remote.canonical_identity().to_owned();
+    }
+
+    /// The exact last-fetched head as a `RepositoryHead`.
+    pub fn last_fetched_head(&self) -> Result<RepositoryHead> {
+        parse_head(self.last_fetched_generation, &self.last_fetched_envelope)
+    }
+
+    /// Update the exact last-fetched head.
     pub fn set_last_fetched(&mut self, head: &RepositoryHead) {
         self.last_fetched_generation = head.generation;
         self.last_fetched_envelope = head.envelope.to_string();
     }
 
-    /// Read remote.json from a store root. Returns None if the file doesn't exist.
+    /// Read and validate `remote.json`. Returns `None` when it does not exist.
+    ///
+    /// The previous unversioned shape is accepted only when its URL and head
+    /// validate. The next write migrates it to the current versioned shape.
     pub fn read(store_root: &Path) -> Result<Option<Self>> {
         let path = remote_config_path(store_root);
-        if !path.is_file() {
-            return Ok(None);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+        };
+        if !metadata.file_type().is_file() {
+            bail!("remote config is not a regular file: {}", path.display());
         }
-        let data =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let config: Self =
-            serde_json::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
+        if metadata.len() > MAX_REMOTE_CONFIG_BYTES {
+            bail!(
+                "remote config exceeds {} bytes: {}",
+                MAX_REMOTE_CONFIG_BYTES,
+                path.display()
+            );
+        }
+
+        let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let mut data = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_REMOTE_CONFIG_BYTES + 1)
+            .read_to_end(&mut data)
+            .with_context(|| format!("read {}", path.display()))?;
+        if data.len() as u64 > MAX_REMOTE_CONFIG_BYTES {
+            bail!(
+                "remote config exceeds {} bytes: {}",
+                MAX_REMOTE_CONFIG_BYTES,
+                path.display()
+            );
+        }
+        let stored: StoredRemoteConfig =
+            serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?;
+
+        let config = match stored {
+            StoredRemoteConfig::Versioned(stored) => {
+                if stored.version != REMOTE_CONFIG_VERSION {
+                    bail!(
+                        "unsupported remote config version {} in {}",
+                        stored.version,
+                        path.display()
+                    );
+                }
+                let parsed = parse_wheat_url(&stored.display_url)
+                    .with_context(|| format!("invalid display URL in {}", path.display()))?;
+                if parsed.canonical_identity() != stored.canonical_identity {
+                    bail!(
+                        "canonical remote identity does not match display URL in {}",
+                        path.display()
+                    );
+                }
+                parse_head(stored.head.generation, &stored.head.envelope)?;
+                Self {
+                    url: stored.display_url,
+                    canonical_identity: stored.canonical_identity,
+                    last_fetched_generation: stored.head.generation,
+                    last_fetched_envelope: stored.head.envelope,
+                }
+            }
+            StoredRemoteConfig::Legacy(legacy) => {
+                let parsed = parse_wheat_url(&legacy.url)
+                    .with_context(|| format!("invalid legacy URL in {}", path.display()))?;
+                let head = parse_head(
+                    legacy.last_fetched_generation,
+                    &legacy.last_fetched_envelope,
+                )?;
+                Self {
+                    url: legacy.url,
+                    canonical_identity: parsed.canonical_identity().to_owned(),
+                    last_fetched_generation: head.generation,
+                    last_fetched_envelope: head.envelope.to_string(),
+                }
+            }
+        };
+
         Ok(Some(config))
     }
 
-    /// Write remote.json to a store root. Overwrites any existing file.
+    /// Atomically and durably replace `remote.json`.
     pub fn write(&self, store_root: &Path) -> Result<()> {
+        let parsed = parse_wheat_url(&self.url).context("invalid remote display URL")?;
+        if !self.has_same_identity(&parsed) {
+            bail!("canonical remote identity does not match display URL");
+        }
+        self.last_fetched_head()?;
+
+        let stored = VersionedRemoteConfig {
+            version: REMOTE_CONFIG_VERSION,
+            display_url: self.url.clone(),
+            canonical_identity: self.canonical_identity.clone(),
+            head: StoredHead {
+                generation: self.last_fetched_generation,
+                envelope: self.last_fetched_envelope.clone(),
+            },
+        };
+        let mut data = serde_json::to_vec_pretty(&stored)?;
+        data.push(b'\n');
+        if data.len() as u64 > MAX_REMOTE_CONFIG_BYTES {
+            bail!("serialized remote config exceeds {MAX_REMOTE_CONFIG_BYTES} bytes");
+        }
+
         let path = remote_config_path(store_root);
-        let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(store_root)
+            .with_context(|| format!("create temporary file in {}", store_root.display()))?;
+        temporary
+            .write_all(&data)
+            .with_context(|| format!("write temporary remote config for {}", path.display()))?;
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .with_context(|| format!("sync temporary remote config for {}", path.display()))?;
+        temporary
+            .persist(&path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("replace {}", path.display()))?;
+        File::open(store_root)
+            .with_context(|| format!("open {} for sync", store_root.display()))?
+            .sync_all()
+            .with_context(|| format!("sync {}", store_root.display()))?;
         Ok(())
     }
 }
 
+fn parse_head(generation: u64, envelope: &str) -> Result<RepositoryHead> {
+    let envelope = envelope
+        .parse::<RepositoryEnvelopeId>()
+        .with_context(|| format!("invalid envelope ID in remote.json: {envelope}"))?;
+    Ok(RepositoryHead {
+        generation,
+        envelope,
+    })
+}
+
 fn remote_config_path(store_root: &Path) -> PathBuf {
     store_root.join("remote.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(generation: u64) -> RepositoryHead {
+        RepositoryHead {
+            generation,
+            envelope: RepositoryEnvelopeId::from_digest([generation as u8; 32]),
+        }
+    }
+
+    #[test]
+    fn writes_versioned_config_and_round_trips_exact_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let remote = parse_wheat_url("wheat+tls://EXAMPLE.com/Owner/Repo").unwrap();
+        let config = RemoteConfig::new("wheat+tls://EXAMPLE.com/Owner/Repo", &head(7));
+        assert!(config.has_same_identity(&remote));
+        config.write(directory.path()).unwrap();
+
+        let bytes = fs::read(directory.path().join("remote.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["display_url"], "wheat+tls://EXAMPLE.com/Owner/Repo");
+        assert_eq!(
+            value["canonical_identity"],
+            "wheat+tls://example.com/Owner/Repo"
+        );
+        assert_eq!(value["head"]["generation"], 7);
+
+        let loaded = RemoteConfig::read(directory.path()).unwrap().unwrap();
+        assert_eq!(loaded.last_fetched_head().unwrap(), head(7));
+        assert!(
+            loaded
+                .matches_url("wheat+tls://example.COM/Owner/Repo")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn safely_migrates_strict_legacy_shape_on_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = serde_json::json!({
+            "url": "wheat://EXAMPLE.com/Owner/Repo",
+            "last_fetched_generation": 3,
+            "last_fetched_envelope": head(3).envelope.to_string(),
+        });
+        fs::write(
+            directory.path().join("remote.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = RemoteConfig::read(directory.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.canonical_identity(),
+            "wheat://example.com/Owner/Repo"
+        );
+        loaded.write(directory.path()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("remote.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["version"], 1);
+        assert!(value.get("last_fetched_generation").is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_fields_identity_mismatch_and_oversized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("remote.json");
+        let invalid = serde_json::json!({
+            "version": 1,
+            "display_url": "wheat://example.com/Owner/Repo",
+            "canonical_identity": "wheat://other.example/Owner/Repo",
+            "head": {
+                "generation": 1,
+                "envelope": head(1).envelope.to_string(),
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(RemoteConfig::read(directory.path()).is_err());
+
+        fs::write(&path, vec![b' '; MAX_REMOTE_CONFIG_BYTES as usize + 1]).unwrap();
+        assert!(RemoteConfig::read(directory.path()).is_err());
+    }
 }

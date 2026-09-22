@@ -90,6 +90,15 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
         )))
     }
 
+    /// Whether this backend supports `put_raw_envelopes`.
+    ///
+    /// Backends that store content in their own packed format (e.g. segment
+    /// packs) cannot accept pre-encoded envelopes. Callers use this to skip
+    /// delta computation when it would be wasted work.
+    fn supports_raw_envelopes(&self) -> bool {
+        false
+    }
+
     /// List all content IDs stored in this backend.
     ///
     /// Returns `None` if the backend does not support listing (the caller
@@ -185,9 +194,7 @@ pub(crate) fn resolve_delta_chain(
                 }
                 return Ok(result);
             }
-            codec::DecodedPayload::Delta {
-                base_id, patch, ..
-            } => {
+            codec::DecodedPayload::Delta { base_id, patch, .. } => {
                 chain.push(patch);
                 current_id = base_id;
             }
@@ -321,11 +328,34 @@ impl ContentStore {
         if self.contains(id) {
             return Ok(());
         }
-        // Try to compute a delta.
+        // Backends that don't support raw envelope writes (e.g. packed stores)
+        // cannot store delta-encoded content — skip the delta attempt entirely.
+        if self
+            .backend
+            .as_ref()
+            .is_some_and(|b| !b.supports_raw_envelopes())
+        {
+            return self.put_with_id(id, bytes);
+        }
+        // Limit delta chain depth. The resolution limit is
+        // MAX_DELTA_CHAIN_DEPTH (16), but deeper chains during import
+        // cause content-resolution failures when the commit_writer reads
+        // back content through the packed engine's cross-store chain
+        // resolver. Cap at depth 1 during import for now; deeper chains
+        // are a repack optimization.
+        // TODO: investigate why chains > 1 fail during staged import
+        // (the unit test passes with depth 14, but the full gothab import
+        // fails at depth ~3-4 with "content is missing").
+        let base_depth = self
+            .delta_chain_depth(base_id)
+            .unwrap_or(MAX_DELTA_CHAIN_DEPTH);
+        if base_depth >= 1 {
+            return self.put_with_id(id, bytes);
+        }
+        // Try to compute a delta against the base content.
         let base_bytes = match self.get(base_id) {
             Ok(base) => base,
             Err(ContentStoreError::Missing(_)) => {
-                // Base not available — store raw.
                 return self.put_with_id(id, bytes);
             }
             Err(e) => return Err(e),
@@ -374,7 +404,7 @@ impl ContentStore {
     }
 
     /// Write a pre-encoded envelope directly to the store.
-    fn put_raw_envelope(
+    pub(crate) fn put_raw_envelope(
         &self,
         id: ContentId,
         envelope: Vec<u8>,
@@ -498,9 +528,7 @@ impl ContentStore {
     /// base fetches.
     pub fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         if let Some(backend) = &self.backend {
-            return resolve_delta_chain(id, max, |current_id| {
-                backend.get_raw_envelope(current_id)
-            });
+            return resolve_delta_chain(id, max, |current_id| backend.get_raw_envelope(current_id));
         }
         resolve_delta_chain(id, max, |current_id| {
             self.read_local_raw_envelope(current_id)
@@ -592,6 +620,34 @@ impl ContentStore {
     pub fn path(&self, id: ContentId) -> PathBuf {
         let encoded = id.to_string();
         self.root.join(&encoded[..2]).join(&encoded[2..])
+    }
+
+    /// Count the delta chain depth starting from `id`.
+    ///
+    /// Returns 0 if content is stored raw, 1 if it's a delta against raw
+    /// content, 2 if it's a delta against a delta against raw, etc.
+    /// Returns `None` if the content can't be inspected.
+    fn delta_chain_depth(&self, id: ContentId) -> Option<usize> {
+        let fetch_raw = |cid: ContentId| -> Option<(codec::EnvelopeHeader, Vec<u8>)> {
+            if let Some(backend) = &self.backend {
+                backend.get_raw_envelope(cid).ok()
+            } else {
+                self.read_local_raw_envelope(cid).ok()
+            }
+        };
+
+        let mut current = id;
+        for depth in 0..MAX_DELTA_CHAIN_DEPTH {
+            let (header, stored) = fetch_raw(current)?;
+            if !header.codec.is_delta() {
+                return Some(depth);
+            }
+            match codec::decode_payload(header.codec, stored, header.logical_length, usize::MAX) {
+                Ok(codec::DecodedPayload::Delta { base_id, .. }) => current = base_id,
+                _ => return Some(depth),
+            }
+        }
+        Some(MAX_DELTA_CHAIN_DEPTH)
     }
 
     fn verify_existing(

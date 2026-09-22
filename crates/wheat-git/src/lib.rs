@@ -16,6 +16,17 @@ pub use staged_import::{
     stage_import,
 };
 
+/// Derive a wheat label name from a full git ref.
+///
+/// - `refs/heads/foo` → `"foo"`
+/// - `refs/tags/v1.0` → `"tags/v1.0"`
+/// - `refs/remotes/origin/main` → `"remotes/origin/main"`
+pub fn ref_to_label_name(full_ref: &str) -> &str {
+    full_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or_else(|| full_ref.strip_prefix("refs/").unwrap_or(full_ref))
+}
+
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
@@ -240,7 +251,7 @@ pub fn import_open_repository_with_limits(
 ) -> Result<ImportResult, ImportError> {
     let profile = std::env::var_os("WHEAT_IMPORT_PROFILE").is_some();
     let started = Instant::now();
-    let branches = branch_tips(git, limits)?;
+    let branches = ref_tips(git, limits)?;
     let order = commit_order(git, branches.values().copied(), limits)?;
     if profile {
         eprintln!("graph_ms={:.3}", started.elapsed().as_secs_f64() * 1_000.0);
@@ -253,6 +264,7 @@ pub fn import_open_repository_with_limits(
     let mut tree_cache = BTreeMap::new();
     let mut blob_cache = BTreeMap::new();
     let mut pending_content = BTreeMap::new();
+    let mut base_hints: BTreeMap<ContentId, ContentId> = BTreeMap::new();
     let mut accounting = ImportAccounting::default();
     let mut proposals = Vec::with_capacity(order.len());
     let mut commit_changes = BTreeMap::new();
@@ -297,6 +309,17 @@ pub fn import_open_repository_with_limits(
             })
             .transpose()?
             .unwrap_or_default();
+        // Collect delta base hints: when a file at path P changes from
+        // ContentId A → B, content B can be delta-encoded against A.
+        for (path, new_value) in &tree {
+            if let Some(old_value) = parent_tree.get(path)
+                && old_value.content != new_value.content
+            {
+                base_hints
+                    .entry(new_value.content)
+                    .or_insert(old_value.content);
+            }
+        }
         let edits = edits_between(
             &parent_tree,
             &tree,
@@ -325,7 +348,12 @@ pub fn import_open_repository_with_limits(
         commit_changes.insert(oid_bytes, change_id);
     }
 
-    content.put_many(pending_content, 16)?;
+    content.put_many_with_bases(
+        pending_content
+            .into_iter()
+            .map(|(id, bytes)| (id, bytes, base_hints.get(&id).copied())),
+        16,
+    )?;
     if profile {
         eprintln!(
             "prepare_ms={:.3}",
@@ -372,40 +400,58 @@ pub fn import_open_repository_with_limits(
     })
 }
 
-fn branch_tips(
+/// Collect all importable ref tips: local branches, tags, and remote-tracking
+/// branches. Each ref is peeled to its target commit OID; annotated tags are
+/// peeled through to the underlying commit. Non-commit targets are skipped.
+fn ref_tips(
     git: &gix::Repository,
     limits: ImportLimits,
 ) -> Result<BTreeMap<String, gix::ObjectId>, ImportError> {
-    let platform = git.references().map_err(git_error)?;
-    let iter = platform.local_branches().map_err(git_error)?;
-    let mut branches = BTreeMap::new();
-    for reference in iter {
-        let actual = branches
-            .len()
-            .checked_add(1)
-            .ok_or(ImportError::LimitExceeded {
+    let mut out = BTreeMap::new();
+
+    let mut add_refs = |iter: gix::reference::iter::Iter<'_, '_>| -> Result<(), ImportError> {
+        for reference in iter {
+            let actual = out.len().checked_add(1).ok_or(ImportError::LimitExceeded {
                 limit: ImportLimit::Branches,
                 actual: usize::MAX,
                 maximum: limits.max_branches,
             })?;
-        if actual > limits.max_branches {
-            return Err(ImportError::LimitExceeded {
-                limit: ImportLimit::Branches,
-                actual,
-                maximum: limits.max_branches,
-            });
+            if actual > limits.max_branches {
+                return Err(ImportError::LimitExceeded {
+                    limit: ImportLimit::Branches,
+                    actual,
+                    maximum: limits.max_branches,
+                });
+            }
+            let mut reference = reference.map_err(git_error)?;
+            let name = reference
+                .name()
+                .as_bstr()
+                .to_str()
+                .map_err(|_| ImportError::InvalidUtf8("ref name"))?
+                .to_owned();
+            let oid = reference.peel_to_id().map_err(git_error)?.detach();
+            // Peel through annotated tags to the underlying commit.
+            let commit_oid = match git.find_object(oid) {
+                Ok(obj) => match obj.peel_to_kind(gix::object::Kind::Commit) {
+                    Ok(commit) => commit.id,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            out.insert(name, commit_oid);
         }
-        let mut reference = reference.map_err(git_error)?;
-        let name = reference
-            .name()
-            .shorten()
-            .to_str()
-            .map_err(|_| ImportError::InvalidUtf8("branch name"))?
-            .to_owned();
-        let oid = reference.peel_to_id().map_err(git_error)?.detach();
-        branches.insert(name, oid);
-    }
-    Ok(branches)
+        Ok(())
+    };
+
+    let platform = git.references().map_err(git_error)?;
+    add_refs(platform.local_branches().map_err(git_error)?)?;
+    let platform = git.references().map_err(git_error)?;
+    add_refs(platform.tags().map_err(git_error)?)?;
+    let platform = git.references().map_err(git_error)?;
+    add_refs(platform.remote_branches().map_err(git_error)?)?;
+
+    Ok(out)
 }
 
 fn commit_order(

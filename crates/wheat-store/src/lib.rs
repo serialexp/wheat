@@ -96,3 +96,101 @@ pub use view_lineage::{
 
 mod content_store;
 pub use content_store::{ContentStore, ContentStoreError};
+
+/// Read-only segment and loose-object access for analysis tools (e.g.
+/// `wheat store analyze`).
+#[doc(hidden)]
+pub mod packed_segment_reader {
+    use std::fs::File;
+    use std::path::Path;
+
+    use crate::codec;
+    use crate::packed::segment::SegmentReader;
+
+    /// Authenticated segment view returned by [`open_segment`].
+    pub struct AuthenticatedSegment {
+        reader: SegmentReader,
+    }
+
+    /// A single index entry exposed for measurement.
+    pub struct SegmentEntry {
+        pub namespace: u8,
+        pub kind: u16,
+        pub codec: u8,
+        pub offset: u64,
+        pub logical_length: u64,
+        pub stored_length: u64,
+    }
+
+    impl AuthenticatedSegment {
+        /// Returns all authenticated index entries.
+        pub fn entries(&self) -> Vec<SegmentEntry> {
+            self.reader
+                .authenticated_entries()
+                .iter()
+                .map(|e| SegmentEntry {
+                    namespace: e.namespace,
+                    kind: e.kind,
+                    codec: e.codec,
+                    offset: e.offset,
+                    logical_length: e.logical_length,
+                    stored_length: e.stored_length,
+                })
+                .collect()
+        }
+    }
+
+    /// Opens and authenticates a segment file.
+    pub fn open_segment(file: File) -> Result<AuthenticatedSegment, String> {
+        Ok(AuthenticatedSegment {
+            reader: SegmentReader::open(file).map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// Read a loose envelope file and return the decompressed canonical bytes.
+    ///
+    /// This is the synchronous counterpart of `LooseObjectStore::get` exposed
+    /// for analysis tools that need to identify object kinds without an async
+    /// runtime.
+    pub fn read_loose_envelope(path: &Path) -> Result<Vec<u8>, String> {
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let physical_length = file.metadata().map_err(|e| e.to_string())?.len();
+        codec::read_envelope_file(&mut file, physical_length, codec::HARD_LOGICAL_RECORD_BYTES)
+            .map_err(|e| format!("{e}"))
+    }
+}
+
+/// Test helpers for integration tests that need to build segments directly.
+#[doc(hidden)]
+pub mod packed_segment_test_helpers {
+    use wheat_core::{CanonicalObject, validate_canonical_object};
+
+    use crate::packed::segment::{
+        METADATA_NAMESPACE, SegmentBuilder, SegmentRecord, prepare_record,
+    };
+
+    /// Build a segment from canonical closure objects (with block compression)
+    /// and return its serialized bytes.
+    pub fn build_segment_bytes(objects: &[CanonicalObject]) -> Vec<u8> {
+        use std::io::Read;
+        let mut builder = SegmentBuilder::new(std::env::temp_dir()).unwrap();
+        for object in objects {
+            let kind = validate_canonical_object(&object.bytes).unwrap();
+            let kind_code = wheat_core::SegmentIndexEntry::canonical_kind_code(kind);
+            let record = SegmentRecord {
+                namespace: METADATA_NAMESPACE,
+                kind: kind_code,
+                digest: *object.id.as_bytes(),
+                bytes: &object.bytes,
+            };
+            builder
+                .push_prepared(prepare_record(record).unwrap())
+                .unwrap();
+        }
+        let sealed = builder.seal().unwrap();
+        let mut file = sealed.file.reopen().unwrap();
+        let mut result = Vec::new();
+        file.read_to_end(&mut result).unwrap();
+        result
+    }
+}

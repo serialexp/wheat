@@ -74,11 +74,11 @@ pub use semantic_records::{
     decode_change, decode_conflict, decode_revision_record,
 };
 pub use wire::{
-    CanonicalObjectError, CanonicalObjectKind, decode_application_map_node, decode_change_map_node,
-    ContentSetBlob, decode_conflict_set_node, decode_content_manifest_record,
-    decode_content_set_blob, decode_content_set_node, decode_directory_node,
-    decode_repository_envelope_record, decode_repository_state_record, decode_retained_set_node,
-    decode_revision_map_node, decode_view_label_manifest_record, decode_view_lineage_map_node,
-    decode_view_record, content_set_delta_bytes, content_set_snapshot_bytes,
+    CanonicalObjectError, CanonicalObjectKind, ContentSetBlob, content_set_delta_bytes,
+    content_set_snapshot_bytes, decode_application_map_node, decode_change_map_node,
+    decode_conflict_set_node, decode_content_manifest_record, decode_content_set_blob,
+    decode_content_set_node, decode_directory_node, decode_repository_envelope_record,
+    decode_repository_state_record, decode_retained_set_node, decode_revision_map_node,
+    decode_view_label_manifest_record, decode_view_lineage_map_node, decode_view_record,
     extract_object_references, validate_canonical_object, validate_directory_component,
 };

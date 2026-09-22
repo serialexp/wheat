@@ -831,7 +831,8 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     let pinned_metadata = fs::read(harness.workspace.join(".wheat/workspace.json")).unwrap();
     let metadata_document: Value = serde_json::from_slice(&pinned_metadata).unwrap();
     assert_eq!(metadata_document["format"], "wheat-workspace");
-    assert_eq!(metadata_document["version"], 3);
+    assert_eq!(metadata_document["version"], 4);
+    assert!(metadata_document["registration_token"].is_string());
     assert_eq!(metadata_document["active_label"], "main");
     assert_eq!(
         metadata_document["basis"],

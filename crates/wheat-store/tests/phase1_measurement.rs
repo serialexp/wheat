@@ -146,7 +146,7 @@ fn measure_50_change_repository_closure() {
         "-------------------------", "--------", "----------", "--------"
     );
     let mut kinds: Vec<_> = by_kind.iter().collect();
-    kinds.sort_by_key(|b| std::cmp::Reverse(b.1 .1));
+    kinds.sort_by_key(|b| std::cmp::Reverse(b.1.1));
     for (kind, (count, bytes)) in &kinds {
         println!(
             "  {:<25} {:>8} {:>10} {:>8}",
@@ -211,6 +211,29 @@ fn measure_50_change_repository_closure() {
         "  Canonical + index total: {} bytes ({:.1} KiB)",
         total_bytes + index_overhead,
         (total_bytes + index_overhead) as f64 / 1024.0
+    );
+
+    // --- Block compression measurement ---
+    // Build a segment from all closure objects and measure the actual physical
+    // size with block compression enabled (codec=4 for small metadata records).
+    use wheat_store::packed_segment_test_helpers::build_segment_bytes;
+    let segment_bytes = build_segment_bytes(&closure.objects);
+    let segment_len = segment_bytes.len();
+    println!();
+    println!("  --- Block compression measurement ---");
+    println!(
+        "  Segment total:   {segment_len} bytes ({:.1} KiB)",
+        segment_len as f64 / 1024.0
+    );
+    println!(
+        "  vs canonical:    {total_bytes} bytes ({:.1} KiB)",
+        total_bytes as f64 / 1024.0
+    );
+    let ratio = segment_len as f64 / total_bytes as f64;
+    println!("  Storage ratio:   {ratio:.2}x");
+    println!(
+        "  Savings from block compression: {:.1}%",
+        (1.0 - (segment_len as f64 / (total_bytes + index_overhead) as f64)) * 100.0
     );
     println!();
 }

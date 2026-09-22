@@ -1034,7 +1034,7 @@ impl Repository {
 
     fn add_revision<C: ContentIo + ?Sized>(
         &mut self,
-        _effective: ViewId,
+        effective: ViewId,
         mut selection: ActiveSelection,
         change: ChangeId,
         predecessor: Option<RevisionId>,
@@ -1085,6 +1085,13 @@ impl Repository {
         .collect::<Vec<_>>();
         let all = selection.revisions.keys().copied().collect::<BTreeSet<_>>();
         let resulting = self.compose(&selection, &all, context)?;
+        // Ensure the lineage records a continuation edge from the prior effective view
+        // to the new result.  compose rebuilds from base_view and only records intra-
+        // compose edges, so a prior effective that was already a descendant of the base
+        // would become an orphaned leaf without this edge.
+        if effective != self.base_view && effective != resulting.id {
+            self.view_lineage.insert((effective, resulting.id));
+        }
         Ok(RevisionOutcome {
             revision_id,
             resulting_view: resulting.id,

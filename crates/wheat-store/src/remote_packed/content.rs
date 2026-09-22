@@ -159,7 +159,9 @@ async fn fetch_raw_envelope(
                 // Validate physical length match but not logical limits (delta
                 // codecs may have logical_length != stored_length, and the max
                 // bound is checked after reconstruction).
-                if parsed.physical_length().map_err(|e| codec_error(id, usize::MAX, e))?
+                if parsed
+                    .physical_length()
+                    .map_err(|e| codec_error(id, usize::MAX, e))?
                     != physical_length
                 {
                     return Err(codec_error(
@@ -181,7 +183,11 @@ async fn fetch_raw_envelope(
         }
         if !chunk.is_empty() {
             let payload = stored.as_mut().ok_or_else(|| {
-                codec_error(id, usize::MAX, codec::CodecError::Format("bad envelope prefix"))
+                codec_error(
+                    id,
+                    usize::MAX,
+                    codec::CodecError::Format("bad envelope prefix"),
+                )
             })?;
             let expected = header
                 .expect("payload allocation follows parsed header")
@@ -196,8 +202,13 @@ async fn fetch_raw_envelope(
             payload.extend_from_slice(chunk);
         }
     }
-    let header = header
-        .ok_or_else(|| codec_error(id, usize::MAX, codec::CodecError::Format("bad envelope prefix")))?;
+    let header = header.ok_or_else(|| {
+        codec_error(
+            id,
+            usize::MAX,
+            codec::CodecError::Format("bad envelope prefix"),
+        )
+    })?;
     let payload = stored.expect("parsed header allocates payload");
     if payload.len() as u64 != header.stored_length {
         return Err(codec_error(
@@ -305,9 +316,12 @@ impl ContentBackend for RemoteContentBackend {
     ) -> Option<Result<Vec<(ContentId, Vec<u8>)>, ContentStoreError>> {
         // Use resolve_delta_chain for each item — this handles delta resolution
         // transparently. For non-delta content, it's equivalent to the old path.
-        Some(ids.iter().copied().map(|id| {
-            self.get_bounded(id, max).map(|bytes| (id, bytes))
-        }).collect())
+        Some(
+            ids.iter()
+                .copied()
+                .map(|id| self.get_bounded(id, max).map(|bytes| (id, bytes)))
+                .collect(),
+        )
     }
 
     fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
@@ -370,6 +384,10 @@ impl ContentBackend for RemoteContentBackend {
                 .map(|_| ())
             })
         })
+    }
+
+    fn supports_raw_envelopes(&self) -> bool {
+        true
     }
 }
 

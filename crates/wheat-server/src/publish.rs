@@ -651,7 +651,10 @@ async fn walk_retained_sets(
 /// Diff old and new Merkle trees to find `new_content → old_content` base
 /// mappings for delta compression. Falls back to an empty map on any error
 /// (delta compression is an optimization, not a correctness requirement).
-#[expect(clippy::borrowed_box, reason = "MerkleTreeStore requires Sized, so &Box<dyn> is needed")]
+#[expect(
+    clippy::borrowed_box,
+    reason = "MerkleTreeStore requires Sized, so &Box<dyn> is needed"
+)]
 async fn compute_delta_base_map(
     objects: &Box<dyn ImmutableObjectStore>,
     reader: &RepositoryReader<'_, Box<dyn ImmutableObjectStore>>,
@@ -690,7 +693,8 @@ async fn compute_delta_base_map(
 
     // Walk the diff — O(changed files), skips identical subtrees.
     let trees = MerkleTreeStore::new(objects);
-    let mut diff_cursor = trees.diff_cursor(old_view.tree, new_view.tree, TreeDiffLimits::default());
+    let mut diff_cursor =
+        trees.diff_cursor(old_view.tree, new_view.tree, TreeDiffLimits::default());
     while let Ok(Some(diff)) = diff_cursor.next().await {
         if let (Some(old_value), Some(new_value)) = (&diff.old, &diff.new)
             && old_value.content != new_value.content

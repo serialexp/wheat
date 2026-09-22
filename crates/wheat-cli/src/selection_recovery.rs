@@ -30,5 +30,6 @@ pub(crate) fn recover(
         .replace_prepared(root)
         .context("prepare recovered workspace operation")?
         .publish()
-        .map_err(|error| anyhow::anyhow!(error))
+        .map_err(|error| anyhow::anyhow!(error))?;
+    crate::workspace_registry_service::reconcile(root, &metadata.store.path, metadata)
 }

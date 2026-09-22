@@ -98,7 +98,7 @@ fn imports_root_linear_branch_and_merge_with_first_parent_semantics() {
     assert!(!root_tree.contains_key("feature.txt"));
     assert!(!root_tree.contains_key("main.txt"));
 
-    let feature_branch = &imported.branches["feature"].tip;
+    let feature_branch = &imported.branches["refs/heads/feature"].tip;
     let feature_tree = &imported
         .repository
         .view(feature_branch.resulting_view)

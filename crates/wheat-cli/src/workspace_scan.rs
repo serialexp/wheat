@@ -85,7 +85,7 @@ pub(crate) fn scan_locked(
         .materialized
         .as_ref()
         .context("Wheat workspace has not been materialized")?;
-    let materialized_head: RepositoryHead = materialized.repository_head.clone().into();
+    let materialized_head: RepositoryHead = materialized.repository_head.into();
     let current_head = repository.heads.read()?;
     let (current_label_binding, files) = runtime.block_on(async {
         let reader = RepositoryReader::new(&repository.objects, &repository.content);

@@ -26,8 +26,8 @@ use super::{
     active::{ActiveError, ActivePublishedState, ActiveRecoveryJournal, ActiveSegment},
     bulk::{BulkSegment, FinalizedBulk},
     segment::{
-        MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, PreparedSegmentRecord, SegmentError,
-        SegmentReader, SegmentRecord, prepare_record, verify_logical,
+        MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, PreparedSegmentRecord, SealedSegment,
+        SegmentBuilder, SegmentError, SegmentReader, SegmentRecord, prepare_record, verify_logical,
     },
     trace::PackedStoreTraceCounters,
 };
@@ -35,7 +35,7 @@ use crate::Durability;
 
 const SCHEMA: &str = include_str!("catalog_sql/schema.sql");
 const LOOKUP: &str = include_str!("catalog_sql/lookup.sql");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SEGMENT_SUFFIX: &str = ".segment";
 const CATALOG_SUFFIX: &str = ".catalog";
 const CATALOG_HEAD_FILE: &str = "catalog.head";
@@ -933,16 +933,21 @@ impl PackedCatalog {
             .generation
             .map_or(Some(0), |value| value.checked_add(1))
             .ok_or(CatalogError::Corrupt("generation overflow"))?;
-        let state = self.active.state();
-        let segment_name = format!("{}-{}{}", generation, hex(&state.id.0), SEGMENT_SUFFIX);
+
+        // Rebuild the segment with block compression via SegmentBuilder instead
+        // of raw-copying the active file. This ensures every sealed segment
+        // benefits from block compression of small structural records.
+        let sealed = self.rebuild_active_as_block_compressed()?;
+
+        let segment_name = format!("{}-{}{}", generation, hex(&sealed.id.0), SEGMENT_SUFFIX);
         let segment_path = self.segments.join(&segment_name);
         if !segment_path.exists() {
-            let mut source = File::open(self.root.join(ACTIVE_FILE))?;
             let mut temporary = NamedTempFile::new_in(&self.segments)?;
-            io::copy(
-                &mut Read::by_ref(&mut source).take(state.metadata.total_length),
-                &mut temporary,
-            )?;
+            let mut source = sealed
+                .file
+                .reopen()
+                .map_err(|e| CatalogError::Segment(SegmentError::Io(e)))?;
+            io::copy(&mut source, &mut temporary)?;
             self.durability.sync_file(temporary.as_file())?;
             if let Err(error) = temporary.persist_noclobber(&segment_path)
                 && error.error.kind() != io::ErrorKind::AlreadyExists
@@ -951,16 +956,13 @@ impl PackedCatalog {
             }
         }
         let reader = SegmentReader::open(File::open(&segment_path)?)?;
-        if reader.id() != state.id || reader.metadata() != state.metadata {
-            return Err(CatalogError::Corrupt("conflicting sealed segment"));
-        }
         self.durability.sync_directory(&self.segments)?;
 
         let record = SegmentCatalogRecord {
             generation,
             previous: self.head,
-            segment: state.id.0,
-            stored_length: state.metadata.total_length,
+            segment: sealed.id.0,
+            stored_length: sealed.metadata.total_length,
         };
         let digest = publish_catalog_record(&self.root, &self.catalogs, &record, self.durability)?;
         write_catalog_head(
@@ -974,10 +976,10 @@ impl PackedCatalog {
         let sealed_source = format!("segments/{segment_name}");
         self.sealed_sources.push(SealedSource {
             path: sealed_source.clone(),
-            segment: state.id.0,
-            stored_length: state.metadata.total_length,
+            segment: sealed.id.0,
+            stored_length: sealed.metadata.total_length,
         });
-        self.sealed_readers.insert(state.id.0, reader);
+        self.sealed_readers.insert(sealed.id.0, reader);
         #[cfg(test)]
         {
             self.sealed_authentications += 1;
@@ -992,10 +994,21 @@ impl PackedCatalog {
             ));
         }
         let transaction = self.index.transaction()?;
+        // The old locator rows pointed at ACTIVE_FILE; drop them and rebuild
+        // from the fresh sealed reader since the block-compressed segment has
+        // different offsets/codecs than the per-record active file.
         transaction.execute(
-            "UPDATE physical_source SET path=?1 WHERE path=?2",
-            params![format!("segments/{segment_name}"), ACTIVE_FILE],
+            "DELETE FROM locator WHERE source_id IN \
+             (SELECT id FROM physical_source WHERE path=?1)",
+            params![ACTIVE_FILE],
         )?;
+        transaction.execute(
+            "DELETE FROM physical_source WHERE path=?1",
+            params![ACTIVE_FILE],
+        )?;
+        if let Some(reader) = self.sealed_readers.get(&sealed.id.0) {
+            insert_source_entries(&transaction, &sealed_source, reader.authenticated_entries())?;
+        }
         transaction.commit()?;
         #[cfg(test)]
         let fail_during_retirement = self.seal_failpoint == Some(SealFailpoint::DuringRetirement);
@@ -1011,6 +1024,29 @@ impl PackedCatalog {
         self.index_active_and_checkpoint()?;
         self.poisoned = false;
         Ok(())
+    }
+
+    /// Reads all entries from the active segment and rebuilds them through
+    /// `SegmentBuilder`, which applies block compression to small records.
+    fn rebuild_active_as_block_compressed(&mut self) -> Result<SealedSegment, CatalogError> {
+        let entries = self.active.entries().to_vec();
+        let mut builder = SegmentBuilder::new(&self.segments)?;
+        for entry in &entries {
+            let (_, bytes) = self
+                .active
+                .lookup_entry_bounded(entry.namespace, entry.digest, usize::MAX)?
+                .ok_or(CatalogError::Corrupt(
+                    "active segment entry missing during seal rebuild",
+                ))?;
+            let record = SegmentRecord {
+                namespace: entry.namespace,
+                kind: entry.kind,
+                digest: entry.digest,
+                bytes: &bytes,
+            };
+            builder.push_prepared(prepare_record(record)?)?;
+        }
+        Ok(builder.seal()?)
     }
 
     fn rebuild_index(&mut self) -> Result<(), CatalogError> {

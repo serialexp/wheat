@@ -62,8 +62,7 @@ where
     while start < entries.len() {
         let edge = S::key_bytes(&entries[start].0)[end_prefix];
         let end = start
-            + entries[start..]
-                .partition_point(|(key, _)| S::key_bytes(key)[end_prefix] == edge);
+            + entries[start..].partition_point(|(key, _)| S::key_bytes(key)[end_prefix] == edge);
         if end - start == 1 {
             // Single-entry group: inline it instead of creating a child node.
             let suffix = S::key_bytes(&entries[start].0)[end_prefix..].to_vec();

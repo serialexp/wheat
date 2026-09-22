@@ -14,7 +14,8 @@ use wheat_store::RepositoryHead;
 const STORE_FORMAT: &str = "wheat-store";
 const WORKSPACE_FORMAT: &str = "wheat-workspace";
 const STORE_FORMAT_VERSION: u32 = 1;
-const WORKSPACE_FORMAT_VERSION: u32 = 3;
+const LEGACY_WORKSPACE_FORMAT_VERSION: u32 = 3;
+const WORKSPACE_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +31,7 @@ pub(crate) struct WorkspaceMetadata {
     format: String,
     version: u32,
     pub workspace_id: Uuid,
+    pub registration_token: Uuid,
     pub store: WorkspaceStore,
     pub active_label: String,
     pub basis: ViewId,
@@ -64,7 +66,7 @@ pub(crate) struct MaterializedState {
     pub tree: TreeId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SerializedHead {
     pub generation: u64,
@@ -134,6 +136,7 @@ impl WorkspaceMetadata {
             format: WORKSPACE_FORMAT.into(),
             version: WORKSPACE_FORMAT_VERSION,
             workspace_id: Uuid::now_v7(),
+            registration_token: Uuid::now_v7(),
             store: WorkspaceStore {
                 path: store_path,
                 store_id,
@@ -154,8 +157,39 @@ impl WorkspaceMetadata {
 
     pub(crate) fn read(root: &Path) -> Result<Self> {
         let path = root.join(".wheat/workspace.json");
-        let metadata: Self = read_json(&path)?;
-        if metadata.format != WORKSPACE_FORMAT || metadata.version != WORKSPACE_FORMAT_VERSION {
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .context("workspace metadata lacks a numeric version")?;
+        if version == u64::from(LEGACY_WORKSPACE_FORMAT_VERSION) {
+            let object = value
+                .as_object_mut()
+                .context("workspace metadata must be a JSON object")?;
+            object.insert(
+                "version".into(),
+                serde_json::Value::from(WORKSPACE_FORMAT_VERSION),
+            );
+            let workspace_id = object
+                .get("workspace_id")
+                .and_then(serde_json::Value::as_str)
+                .context("legacy workspace metadata lacks a workspace identity")?;
+            object.insert(
+                "registration_token".into(),
+                serde_json::Value::String(workspace_id.to_owned()),
+            );
+        } else if version != u64::from(WORKSPACE_FORMAT_VERSION) {
+            bail!("unsupported Wheat workspace metadata at {}", path.display());
+        }
+        let metadata: Self =
+            serde_json::from_value(value).with_context(|| format!("decode {}", path.display()))?;
+        if metadata.format != WORKSPACE_FORMAT
+            || metadata.version != WORKSPACE_FORMAT_VERSION
+            || metadata.workspace_id.is_nil()
+            || metadata.registration_token.is_nil()
+        {
             bail!("unsupported Wheat workspace metadata at {}", path.display());
         }
         Ok(metadata)
@@ -259,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_v3_round_trips_pinned_label_and_effective_view() {
+    fn workspace_v4_round_trips_pinned_label_and_effective_view() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join(".wheat")).unwrap();
         let basis = ViewId::from_digest([7; 32]);
@@ -279,7 +313,11 @@ mod tests {
             &std::fs::read(root.path().join(".wheat/workspace.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(document["version"], 3);
+        assert_eq!(document["version"], 4);
+        assert_eq!(
+            document["registration_token"],
+            metadata.registration_token.to_string()
+        );
         assert_eq!(document["active_label"], "main");
         assert!(document.get("selection").is_none());
     }

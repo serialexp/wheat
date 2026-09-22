@@ -447,11 +447,7 @@ macro_rules! decode_set_node {
                         ),
                     })
                     .collect(),
-                entries: node
-                    .entries
-                    .into_iter()
-                    .map(|entry| entry.suffix)
-                    .collect(),
+                entries: node.entries.into_iter().map(|entry| entry.suffix).collect(),
             })
         }
     };
@@ -1513,7 +1509,11 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "content set delta removed",
             )?;
             // added and removed must be disjoint
-            let added_set: std::collections::BTreeSet<_> = delta.added.iter().map(|id| id.digest.bytes.as_slice()).collect();
+            let added_set: std::collections::BTreeSet<_> = delta
+                .added
+                .iter()
+                .map(|id| id.digest.bytes.as_slice())
+                .collect();
             for id in &delta.removed {
                 if added_set.contains(id.digest.bytes.as_slice()) {
                     return Err(CanonicalObjectError::InvalidCollection(

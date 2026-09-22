@@ -207,8 +207,9 @@ impl ContentAccumulator {
     ) -> BuildFuture<'a, RetainedSetId> {
         Box::pin(async move {
             if first == last {
-                let node = RetainedSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![], vec![])
-                    .expect("sorted builder emits a canonical retained leaf");
+                let node =
+                    RetainedSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![], vec![])
+                        .expect("sorted builder emits a canonical retained leaf");
                 store.write_node(node).await.map_err(Into::into)
             } else {
                 let common = common_prefix(&first.as_bytes()[depth..], &last.as_bytes()[depth..]);

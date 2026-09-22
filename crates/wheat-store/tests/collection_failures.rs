@@ -113,8 +113,7 @@ async fn resolve_rejects_missing_base_in_delta_chain() {
     // Write a delta blob referencing a non-existent base.
     let fake_base = ContentSetId::from_digest([99; 32]);
     let a = ContentId::from_digest([1; 32]);
-    let delta_bytes =
-        wheat_core::content_set_delta_bytes(fake_base, &[a], &[]);
+    let delta_bytes = wheat_core::content_set_delta_bytes(fake_base, &[a], &[]);
     let delta_id = ContentSetId::of_canonical_bytes(&delta_bytes);
     objects
         .put_if_absent(delta_id.into(), &delta_bytes)

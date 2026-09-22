@@ -340,8 +340,9 @@ impl<'a, S: ImmutableObjectStore> ContentSetStore<'a, S> {
     pub fn resolve(
         &self,
         root: ContentSetId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ContentId>, CollectionError>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ContentId>, CollectionError>> + Send + '_>,
+    > {
         Box::pin(async move {
             let stored = self.objects.get(root.into()).await?;
             let blob = wheat_core::decode_content_set_blob(&stored.canonical_bytes)?;
@@ -471,10 +472,7 @@ impl<'a, S: ImmutableObjectStore> ContentSetStore<'a, S> {
     }
 
     /// Iterate all members in sorted order.
-    pub async fn cursor(
-        &self,
-        root: ContentSetId,
-    ) -> Result<ContentSetCursor, CollectionError> {
+    pub async fn cursor(&self, root: ContentSetId) -> Result<ContentSetCursor, CollectionError> {
         let members = self.resolve(root).await?;
         Ok(ContentSetCursor { members, index: 0 })
     }
@@ -555,8 +553,9 @@ impl<'a, S: ImmutableObjectStore> ContentSetStore<'a, S> {
     pub fn chain_depth(
         &self,
         root: ContentSetId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32, CollectionError>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<u32, CollectionError>> + Send + '_>,
+    > {
         Box::pin(async move {
             let stored = self.objects.get(root.into()).await?;
             let blob = wheat_core::decode_content_set_blob(&stored.canonical_bytes)?;
@@ -608,10 +607,7 @@ fn apply_delta(members: &mut Vec<ContentId>, added: &[ContentId], removed: &[Con
 ///
 /// Last-edit-wins: if the same key appears multiple times, the final operation
 /// in iteration order determines whether the key is present or absent.
-fn apply_edits(
-    members: &mut Vec<ContentId>,
-    edits: impl IntoIterator<Item = (ContentId, bool)>,
-) {
+fn apply_edits(members: &mut Vec<ContentId>, edits: impl IntoIterator<Item = (ContentId, bool)>) {
     // Collect last-wins state per key.
     let mut final_state = std::collections::BTreeMap::new();
     for (key, insert) in edits {

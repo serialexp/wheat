@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# Holistic wheat performance benchmark against a real git repository.
+#
+# Measures speed, peak memory (RSS), and final store size for:
+#   1. Import     (git → wheat packed store)
+#   2. Commit     (modify a tracked file, create change, add)
+#   3. Clone      (wheat → wheat via local wheat-server)
+#   4. Publish    (wheat → wheat-server, incremental after a commit)
+#   5. Store size (detailed breakdown via `wheat store analyze`)
+#
+# Usage:
+#   scripts/wheat-holistic-bench                  # defaults to gothab repo
+#   scripts/wheat-holistic-bench /path/to/repo    # custom git repo
+#   WHEAT_BENCH_OUTPUT=report.json scripts/wheat-holistic-bench
+#
+# Prerequisites:
+#   cargo build --release -p wheat-cli -p wheat-server
+set -euo pipefail
+
+REPO="${1:-/home/bart/Projects/gothab}"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WHEAT="$PROJECT_ROOT/target/release/wheat"
+WHEAT_SERVER="$PROJECT_ROOT/target/release/wheat-server"
+SERVER_PID=""
+BENCH_DIR=""
+SERVER_PORT=17441
+
+now_ms() { date +%s%3N; }
+
+cleanup() {
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  [[ -n "$BENCH_DIR" ]] && rm -rf "$BENCH_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+die() { echo "FATAL: $*" >&2; exit 1; }
+
+# --- Preflight ---
+[[ -x "$WHEAT" ]]        || die "wheat not found — run: cargo build --release -p wheat-cli"
+[[ -x "$WHEAT_SERVER" ]] || die "wheat-server not found — run: cargo build --release -p wheat-server"
+[[ -x /usr/bin/time ]]   || die "/usr/bin/time (GNU time) not found"
+[[ -d "$REPO/.git" ]]    || die "$REPO is not a git repository"
+
+BENCH_DIR="$(mktemp -d /tmp/wheat-holistic-bench-XXXXXX)"
+IMPORT_WS="$BENCH_DIR/import-ws"
+CLONE_WS="$BENCH_DIR/clone-ws"
+TIME_OUT="$BENCH_DIR/time.out"
+TRACE="$BENCH_DIR/import-trace.jsonl"
+
+# Keep all wheat stores inside the bench dir so cleanup is trivial.
+export WHEAT_STORE_HOME="$BENCH_DIR/stores"
+mkdir -p "$WHEAT_STORE_HOME"
+
+branch="refs/heads/main"
+git_commits=$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo "?")
+
+# Git reference sizes.
+# 1) Full repo repack — all reachable objects from all refs.
+git_tmp=$(mktemp -d)
+git -C "$REPO" pack-objects --all --stdout > "$git_tmp/all.pack" 2>/dev/null
+git_all_bytes=$(stat --printf='%s' "$git_tmp/all.pack" 2>/dev/null || echo 0)
+# 2) HEAD-only repack — just the imported branch for a fair per-branch comparison.
+git -C "$REPO" pack-objects --revs --stdout <<< "HEAD" > "$git_tmp/head.pack" 2>/dev/null
+git_head_bytes=$(stat --printf='%s' "$git_tmp/head.pack" 2>/dev/null || echo 0)
+rm -rf "$git_tmp"
+git_branch_count=$(git -C "$REPO" branch -a 2>/dev/null | wc -l)
+git_tag_count=$(git -C "$REPO" tag 2>/dev/null | wc -l)
+
+echo >&2
+echo "wheat holistic benchmark" >&2
+echo "════════════════════════════════════════════════════════════" >&2
+echo "  repo:         $REPO" >&2
+echo "  git commits:  $git_commits  branches: $git_branch_count  tags: $git_tag_count" >&2
+echo "  git pack (all refs):  $(numfmt --to=iec-i --suffix=B "$git_all_bytes" 2>/dev/null)" >&2
+echo "  git pack (HEAD only): $(numfmt --to=iec-i --suffix=B "$git_head_bytes" 2>/dev/null)" >&2
+echo "  temp:         $BENCH_DIR" >&2
+echo >&2
+
+# --- Helper: run a command, capture wall-clock ms + peak RSS KiB ---
+# Sets globals: LAST_MS  LAST_RSS
+timed_run() {
+  local label="$1"; shift
+  local t0; t0=$(now_ms)
+  /usr/bin/time -v "$@" 2>"$TIME_OUT" || {
+    local rc=$?
+    echo "  !! $label failed (exit $rc)" >&2
+    cat "$TIME_OUT" >&2
+    LAST_MS=-1; LAST_RSS=0
+    return $rc
+  }
+  LAST_MS=$(( $(now_ms) - t0 ))
+  LAST_RSS=$(awk '/Maximum resident set size/{print $NF}' "$TIME_OUT")
+  : "${LAST_RSS:=0}"
+  printf "  %-22s %7d ms   %7.1f MiB RSS\n" \
+    "$label" "$LAST_MS" "$(awk "BEGIN{printf \"%.1f\",$LAST_RSS/1024}")" >&2
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 1. Import
+# ═══════════════════════════════════════════════════════════════
+echo "1. Import" >&2
+echo "────────────────────────────────────────────────────────────" >&2
+
+timed_run "import" \
+  "$WHEAT" --workspace "$IMPORT_WS" import "$REPO" --branch "$branch" --trace "$TRACE"
+import_ms=$LAST_MS; import_rss=$LAST_RSS
+
+# Resolve the store root created by import.
+import_store=$(python3 -c "
+import json, pathlib
+ws = json.loads(pathlib.Path('$IMPORT_WS/.wheat/workspace.json').read_text())
+print(ws['store']['path'])
+")
+import_store_bytes=$(du -sb "$import_store" | awk '{print $1}')
+echo "  store on disk:       $(numfmt --to=iec-i --suffix=B "$import_store_bytes")" >&2
+echo >&2
+
+# ═══════════════════════════════════════════════════════════════
+# 2. Commit (modify → change new → add)
+# ═══════════════════════════════════════════════════════════════
+echo "2. Commit" >&2
+echo "────────────────────────────────────────────────────────────" >&2
+
+"$WHEAT" --workspace "$IMPORT_WS" config set actor.name "Wheat Bench" 2>/dev/null
+"$WHEAT" --workspace "$IMPORT_WS" config set actor.email "bench@test" 2>/dev/null
+
+# Pick a tracked file to modify.
+commit_file=$(find "$IMPORT_WS" -maxdepth 3 \( -name "*.toml" -o -name "*.rs" -o -name "*.ts" \) \
+  -not -path '*/.wheat/*' -print -quit)
+
+change_ms=-1; change_rss=0; add_ms=-1; add_rss=0
+if [[ -n "$commit_file" ]]; then
+  echo "# wheat bench $(date -Iseconds)" >> "$commit_file"
+
+  timed_run "change new" \
+    "$WHEAT" --workspace "$IMPORT_WS" change new --message "benchmark commit"
+  change_ms=$LAST_MS; change_rss=$LAST_RSS
+
+  # `wheat add` expects a path relative to the workspace root.
+  rel_path="${commit_file#"$IMPORT_WS/"}"
+  timed_run "add" \
+    "$WHEAT" --workspace "$IMPORT_WS" add "$rel_path"
+  add_ms=$LAST_MS; add_rss=$LAST_RSS
+else
+  echo "  (no tracked file found, skipping)" >&2
+fi
+echo >&2
+
+# ═══════════════════════════════════════════════════════════════
+# 3. Clone (via wheat-server serving the packed import store)
+# ═══════════════════════════════════════════════════════════════
+echo "3. Clone (via local wheat-server)" >&2
+echo "────────────────────────────────────────────────────────────" >&2
+
+# Start wheat-server against the import store (packed — auto-detected).
+"$WHEAT_SERVER" --data-dir "$import_store" --name bench/repo \
+  --listen "127.0.0.1:$SERVER_PORT" &
+SERVER_PID=$!
+
+# Wait for the server to start listening.
+sleep 1
+
+clone_ms=-1; clone_rss=0; clone_store_bytes=0
+if kill -0 "$SERVER_PID" 2>/dev/null; then
+  timed_run "clone" \
+    "$WHEAT" clone "wheat://127.0.0.1:$SERVER_PORT/bench/repo" "$CLONE_WS" \
+    || true
+  clone_ms=$LAST_MS; clone_rss=$LAST_RSS
+
+  if [[ -f "$CLONE_WS/.wheat/workspace.json" ]]; then
+    clone_store=$(python3 -c "
+import json, pathlib
+ws = json.loads(pathlib.Path('$CLONE_WS/.wheat/workspace.json').read_text())
+print(ws['store']['path'])
+")
+    clone_store_bytes=$(du -sb "$clone_store" | awk '{print $1}')
+    echo "  clone store:         $(numfmt --to=iec-i --suffix=B "$clone_store_bytes")" >&2
+  fi
+else
+  echo "  wheat-server failed to start" >&2
+fi
+echo >&2
+
+# ═══════════════════════════════════════════════════════════════
+# 4. Publish (clone workspace → server, should be a no-op on
+#    the original data, but exercises the full protocol path)
+# ═══════════════════════════════════════════════════════════════
+echo "4. Publish" >&2
+echo "────────────────────────────────────────────────────────────" >&2
+
+publish_ms=-1; publish_rss=0
+if kill -0 "$SERVER_PID" 2>/dev/null && [[ -d "$CLONE_WS/.wheat" ]]; then
+  timed_run "publish" \
+    "$WHEAT" --workspace "$CLONE_WS" publish "wheat://127.0.0.1:$SERVER_PORT/bench/repo" \
+    || true
+  publish_ms=$LAST_MS; publish_rss=$LAST_RSS
+else
+  echo "  (skipped — no server or no clone workspace)" >&2
+fi
+
+# Stop server.
+if [[ -n "$SERVER_PID" ]]; then
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
+fi
+echo >&2
+
+# ═══════════════════════════════════════════════════════════════
+# 5. Store analysis
+# ═══════════════════════════════════════════════════════════════
+echo "5. Store analysis" >&2
+echo "────────────────────────────────────────────────────────────" >&2
+
+# Run analyze on the import workspace (the real packed store).
+"$WHEAT" --workspace "$IMPORT_WS" store analyze >&2
+
+# Grab the JSON form for the report.
+store_json=$("$WHEAT" --workspace "$IMPORT_WS" --format json store analyze 2>/dev/null)
+store_result=$(echo "$store_json" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['result']))")
+
+# ═══════════════════════════════════════════════════════════════
+# 6. Import trace phases (from --trace JSONL)
+# ═══════════════════════════════════════════════════════════════
+trace_phases="{}"
+if [[ -f "$TRACE" ]]; then
+  echo >&2
+  echo "Import trace phases:" >&2
+  echo "────────────────────────────────────────────────────────────" >&2
+  trace_phases=$(python3 -c "
+import json, sys
+phases = {}
+with open('$TRACE') as f:
+    for line in f:
+        r = json.loads(line)
+        if r['event'] == 'phase_finished':
+            name = r['data']['phase']
+            dur_ms = r['data']['duration_us'] / 1000
+            phases[name] = round(dur_ms, 1)
+            print(f'  {name:<30s} {dur_ms:>8.0f} ms', file=sys.stderr)
+print(json.dumps(phases))
+")
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# JSON report
+# ═══════════════════════════════════════════════════════════════
+echo >&2
+echo "════════════════════════════════════════════════════════════" >&2
+
+report=$(python3 -c "
+import json
+r = {
+  'schema': 'wheat.holistic-bench.v1',
+  'repo': '$REPO',
+  'git_commits': $( [[ "$git_commits" == "?" ]] && echo null || echo "$git_commits" ),
+  'git_branches': $git_branch_count,
+  'git_tags': $git_tag_count,
+  'git_pack_all_bytes': $git_all_bytes,
+  'git_pack_head_bytes': $git_head_bytes,
+  'operations': {
+    'import':     {'wall_ms': $import_ms,  'peak_rss_kib': $import_rss,  'store_bytes': $import_store_bytes},
+    'change_new': {'wall_ms': $change_ms,  'peak_rss_kib': $change_rss},
+    'add':        {'wall_ms': $add_ms,     'peak_rss_kib': $add_rss},
+    'clone':      {'wall_ms': $clone_ms,   'peak_rss_kib': $clone_rss,   'store_bytes': $clone_store_bytes},
+    'publish':    {'wall_ms': $publish_ms, 'peak_rss_kib': $publish_rss},
+  },
+  'store_analysis': json.loads('$store_result'),
+  'import_trace_phases': json.loads('$(echo "$trace_phases" | sed "s/'/\\\\'/g")'),
+}
+# Drop operations that were skipped.
+r['operations'] = {k:v for k,v in r['operations'].items() if v.get('wall_ms',-1) >= 0}
+# Add ratio.
+total = r['store_analysis'].get('total_disk_bytes', 0)
+git = r['git_pack_all_bytes']
+r['store_analysis']['ratio_vs_git'] = round(total / max(1, git), 2)
+print(json.dumps(r, indent=2))
+")
+
+echo "$report"
+
+if [[ -n "${WHEAT_BENCH_OUTPUT:-}" ]]; then
+  echo "$report" > "$WHEAT_BENCH_OUTPUT"
+  echo "Report written to $WHEAT_BENCH_OUTPUT" >&2
+fi
