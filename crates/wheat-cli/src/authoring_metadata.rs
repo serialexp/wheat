@@ -167,11 +167,7 @@ pub(crate) fn metadata(
     arguments: MetadataArgs,
     include_change: bool,
 ) -> Result<(Option<ChangeMetadata>, RevisionMetadata)> {
-    if include_change {
-        ensure_text("revision message", &arguments.message, MAX_MESSAGE_BYTES)?;
-    } else {
-        ensure_bounded("revision message", &arguments.message, MAX_MESSAGE_BYTES)?;
-    }
+    validate_revision_message(&arguments.message, include_change)?;
     let actor = actor(store_root)?;
     let now = Local::now().fixed_offset();
     let authored_at = parse_timestamp(arguments.authored_at.as_deref(), now, "authored-at")?;
@@ -211,6 +207,18 @@ fn message_title(message: &str) -> Result<&str> {
         "revision message must have a nonempty first line"
     );
     Ok(title)
+}
+
+/// Validates revision-message bounds using the canonical CLI limit.
+///
+/// Squash callers retain an existing message, so they pass `false` to permit an
+/// empty message that was valid for a non-change revision.
+pub(crate) fn validate_revision_message(message: &str, require_text: bool) -> Result<()> {
+    if require_text {
+        ensure_text("revision message", message, MAX_MESSAGE_BYTES)
+    } else {
+        ensure_bounded("revision message", message, MAX_MESSAGE_BYTES)
+    }
 }
 
 fn parse_timestamp(

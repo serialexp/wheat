@@ -35,6 +35,8 @@ pub(crate) fn list(workspace: &Path, explicit_store: Option<&Path>) -> Result<Su
             .context("workspace list requires a discoverable workspace or --store")?
     };
     let store = StoreMetadata::read(&store_root)?;
+    let local = crate::local::open(&store_root)?;
+    let _operation = crate::rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
     let registry = WorkspaceRegistry::new(&store_root, store.store_id)?;
     let pins = registry.enumerate()?;
     let current_id = current.as_ref().and_then(|context| {
@@ -97,8 +99,10 @@ pub(crate) fn unregister(workspace: &Path, explicit_store: Option<&Path>) -> Res
             "explicit Wheat store does not match the discovered workspace link"
         );
     }
-    let lock = WorkspaceLock::acquire(&context.root)?;
     let local = crate::local::open(&context.store_root)?;
+    let _operation =
+        crate::rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+    let lock = WorkspaceLock::acquire(&context.root)?;
     let mut metadata = WorkspaceMetadata::read(&context.root)?;
     crate::runtime()?.block_on(crate::materialization::recover_locked(
         &context.root,

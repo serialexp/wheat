@@ -34,7 +34,10 @@ mod materialization;
 mod remote;
 mod remote_config;
 mod repository_diff;
+mod rewrite_transaction;
 mod selection_recovery;
+mod squash;
+mod squash_attribution;
 mod store_analyze;
 mod store_lookup;
 mod workspace;
@@ -121,6 +124,9 @@ enum Command {
     Change(ChangeCommand),
     /// Resolve a durable conflict with an exact tree entry.
     Resolve(ResolveArgs),
+    /// Squash every unpublished change in the selected stack.
+    #[command(subcommand)]
+    Stack(StackCommand),
     /// Inspect or detach workspaces sharing one repository store.
     #[command(subcommand)]
     Workspace(WorkspaceCommand),
@@ -220,6 +226,14 @@ enum ChangeCommand {
     New(Box<NewArgs>),
     /// Select an existing active change for subsequent `wheat add` commands.
     Select { change: String },
+    /// Collapse the unpublished checkpoint suffix of one logical change.
+    Squash { change: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum StackCommand {
+    /// Collapse unpublished checkpoint suffixes throughout the selected stack.
+    Squash,
 }
 
 #[derive(Debug, Subcommand)]
@@ -551,6 +565,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Cat { .. } => "cat",
         Command::Change(ChangeCommand::New(_)) => "change.new",
         Command::Change(ChangeCommand::Select { .. }) => "change.select",
+        Command::Change(ChangeCommand::Squash { .. }) => "change.squash",
+        Command::Stack(StackCommand::Squash) => "stack.squash",
         Command::Resolve(_) => "resolve",
         Command::Workspace(WorkspaceCommand::List) => "workspace.list",
         Command::Workspace(WorkspaceCommand::Unregister) => "workspace.unregister",
@@ -598,6 +614,8 @@ fn execute(cli: Cli) -> Result<Success> {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let label = label.unwrap_or(context.workspace.active_label);
             let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
             let document = runtime()?.block_on(frontier_service::list(&local, &label))?;
             let mut human = String::new();
             for frontier in &document.frontiers {
@@ -615,8 +633,11 @@ fn execute(cli: Cli) -> Result<Success> {
             )
         }
         Command::Status => {
-            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+            context.workspace = WorkspaceMetadata::read(&context.root)?;
             let scan = workspace_scan::scan(&context.root, &local, &context.workspace, 0)?;
 
             // Discover untracked files via workspace walk with ignore rules.
@@ -676,6 +697,8 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Validate => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let local = open(&store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
             let head = local.heads.read()?;
             let runtime = runtime()?;
             let state = runtime.block_on(async {
@@ -692,15 +715,20 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Log => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            log_inspection::inspect(
-                &context.store_root,
-                context.workspace.effective_view(),
-                format,
-            )
+            let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+            let workspace = WorkspaceMetadata::read(&context.root)?;
+            // Packed repositories hold their catalog lock for the handle lifetime; admission is
+            // retained independently while the inspector reopens the same store.
+            drop(local);
+            log_inspection::inspect(&context.store_root, workspace.effective_view(), format)
         }
         Command::Changes => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
             runtime()?.block_on(materialization::recover_locked(
@@ -723,7 +751,10 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Labels => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            label_service::list(&open(&store_root)?)
+            let local = open(&store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
+            label_service::list(&local)
         }
         Command::Label(arguments) => {
             let explicit_store = cli.store.as_deref().map(canonical_store_path).transpose()?;
@@ -738,6 +769,8 @@ fn execute(cli: Cli) -> Result<Success> {
                 .or_else(|| context.as_ref().map(|context| context.store_root.clone()))
                 .expect("workspace resolution is required without --store");
             let local = open(&store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
             match arguments {
                 LabelCommand::Create {
                     name,
@@ -777,17 +810,23 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Conflicts => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+            let workspace = WorkspaceMetadata::read(&context.root)?;
             let document = runtime()?.block_on(conflict_inspection::inspect(
                 &local,
-                context.workspace.effective_view(),
+                workspace.effective_view(),
             ))?;
             let mut human = Vec::new();
             conflict_inspection::human(&document, &mut human)?;
             Success::new("conflicts", &document, human)
         }
         Command::Diff(arguments) => {
-            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+            context.workspace = WorkspaceMetadata::read(&context.root)?;
             let limits = wheat_core::diff_model::DiffLimits::default();
             let deadline = std::time::Instant::now() + limits.deadline;
             let document = if let Some(revision) = arguments.revision {
@@ -888,10 +927,13 @@ fn execute(cli: Cli) -> Result<Success> {
             }
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
-            // Recovery, capture, and publication are one workspace operation:
-            // otherwise pending or concurrent materialization can rewrite a selected
-            // leaf between capture and the repository-head compare-and-swap.
+            // Store admission precedes the workspace lock. Holding both across planning and
+            // publication prevents either a staged rewrite or another head mutation from
+            // interleaving before the compare-and-swap.
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
+            context.workspace = WorkspaceMetadata::read(&context.root)?;
             let runtime = runtime()?;
             runtime.block_on(materialization::recover(
                 &context.root,
@@ -1068,7 +1110,10 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Change(ChangeCommand::New(arguments)) => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
+            context.workspace = WorkspaceMetadata::read(&context.root)?;
             let runtime = runtime()?;
             runtime.block_on(materialization::recover(
                 &context.root,
@@ -1184,6 +1229,8 @@ fn execute(cli: Cli) -> Result<Success> {
             let change = ChangeId::from_str(&change)
                 .map_err(|_| CliFailure::invalid("invalid change ID"))?;
             let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
             let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
             runtime()?.block_on(materialization::recover_locked(
@@ -1223,6 +1270,16 @@ fn execute(cli: Cli) -> Result<Success> {
                 format!("selected change {change} — {}\n", selected.title),
             )
         }
+        Command::Change(ChangeCommand::Squash { change }) => squash::execute(
+            &requested_workspace,
+            cli.store.as_deref(),
+            squash::Scope::Change(change.as_deref()),
+        ),
+        Command::Stack(StackCommand::Squash) => squash::execute(
+            &requested_workspace,
+            cli.store.as_deref(),
+            squash::Scope::Stack,
+        ),
         Command::Resolve(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             resolve(&context.root, &context.store_root, arguments)
@@ -1235,6 +1292,9 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Store(StoreCommand::Analyze) => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
             store_analyze::analyze(&store_root)
         }
         Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
@@ -1494,26 +1554,39 @@ fn materialize_active_workspace(
     explicit_store: Option<&Path>,
     command: &'static str,
 ) -> Result<Success> {
-    let context = resolve_context(workspace, explicit_store)?;
+    let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
+    let _operation =
+        rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
+    let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
+    context.workspace = WorkspaceMetadata::read(&context.root)?;
+    runtime()?.block_on(materialization::recover_locked(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+    ))?;
+    selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
     let resolved = runtime()?.block_on(frontier_service::resolve(
         &repository,
         &context.workspace.active_label,
         context.workspace.selected_frontier,
     ))?;
-    // Packed repositories hold an exclusive catalog lock for the lifetime of the
-    // handle. Release it before materialization reopens the same store.
-    drop(repository);
-    let (view, root) = materialize_resolved(
-        workspace,
-        explicit_store,
-        context.workspace.active_label,
-        resolved,
-    )?;
+    let view = resolved.effective_view();
+    let label = context.workspace.active_label.clone();
+    runtime()?.block_on(materialization::materialize_locked(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+        resolved.head,
+        label,
+        resolved.basis,
+        resolved.selected_frontier,
+        resolved.tree,
+    ))?;
     Success::new(
         command,
         json!({ "view": view.to_string() }),
-        format!("materialized view {view} in {}\n", root.display()),
+        format!("materialized view {view} in {}\n", context.root.display()),
     )
 }
 
@@ -1526,6 +1599,8 @@ fn switch_workspace(
 ) -> Result<Success> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
+    let _operation =
+        rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
     let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
     context.workspace = WorkspaceMetadata::read(&context.root)?;
     runtime()?.block_on(materialization::recover_locked(
@@ -1611,6 +1686,8 @@ fn restore_workspace(
 ) -> Result<usize> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
+    let _operation =
+        rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
     let restored = runtime()?.block_on(materialization::restore(
         &context.root,
         &repository,
@@ -1645,6 +1722,7 @@ fn clone_remote_for_import(remote: &str) -> Result<tempfile::TempDir> {
 
 fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
     let local = open(root)?;
+    let _operation = rewrite_transaction::StoreOperationGuard::acquire(root, &local)?;
     let expected = local.heads.read()?;
     let runtime = runtime()?;
     let (base, selected) = runtime.block_on(async {
@@ -1726,8 +1804,10 @@ fn resolve(
             "resolution path exceeds conflict inspection limit",
         ));
     }
-    let mut metadata = WorkspaceMetadata::read(workspace_root)?;
     let local = open(store_root)?;
+    let _operation = rewrite_transaction::StoreOperationGuard::acquire(store_root, &local)?;
+    let _workspace_lock = materialization::WorkspaceLock::acquire(workspace_root)?;
+    let mut metadata = WorkspaceMetadata::read(workspace_root)?;
     let runtime = runtime()?;
     let revision = if let Some(revision) = arguments.revision.as_deref() {
         RevisionId::from_str(revision).map_err(|_| CliFailure::invalid("invalid revision ID"))?
@@ -2111,6 +2191,8 @@ fn native_fetch(
 ) -> Result<Success> {
     let context = resolve_context(workspace, explicit_store)?;
     let local = open(&context.store_root)?;
+    let _operation =
+        rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
     let local_head = local.heads.read()?;
 
     // Resolve remote URL.
@@ -2208,6 +2290,8 @@ fn native_publish(
 ) -> Result<Success> {
     let context = resolve_context(workspace, explicit_store)?;
     let local = open(&context.store_root)?;
+    let _operation =
+        rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
     let local_head = local.heads.read()?;
 
     // Resolve remote URL.

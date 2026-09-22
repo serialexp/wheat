@@ -13,7 +13,7 @@ use wheat_git::{
 };
 use wheat_store::{
     ContentStoreError, ObjectStoreError, PublicationError, RepositoryMutationError,
-    RepositoryPublicationError,
+    RepositoryPublicationError, RepositoryRewriteError,
 };
 
 use crate::workspace_files::WorkspaceFileError;
@@ -493,6 +493,20 @@ fn classify(error: &Error) -> Classification {
             .is_some_and(|mutation| matches!(mutation, RepositoryMutationError::Stale { .. }))
         {
             return class("state", "repository_head_changed", true, 3);
+        }
+        if let Some(rewrite) = cause.downcast_ref::<RepositoryRewriteError>() {
+            return match rewrite {
+                RepositoryRewriteError::StaleSelection => {
+                    class("state", "stale_rewrite_selection", true, 3)
+                }
+                RepositoryRewriteError::InvalidBoundary
+                | RepositoryRewriteError::MissingMetadata
+                | RepositoryRewriteError::SemanticDrift
+                | RepositoryRewriteError::UnknownAuthorityRoot => {
+                    class("integrity", "invalid_repository_rewrite", false, 6)
+                }
+                _ => continue,
+            };
         }
         if let Some(repository) = cause.downcast_ref::<RepositoryError>() {
             return match repository {

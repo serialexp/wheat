@@ -31,6 +31,8 @@ pub(crate) fn clone_local(source: &Path, workspace_root: &Path) -> Result<Succes
     };
     let store = StoreMetadata::read(&store_root)?;
     let repository = open(&store_root)?;
+    let _operation =
+        crate::rewrite_transaction::StoreOperationGuard::acquire(&store_root, &repository)?;
     let head = repository.heads.read()?;
     let rt = runtime()?;
     let (label, resolved) = rt.block_on(async {

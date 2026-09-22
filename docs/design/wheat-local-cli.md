@@ -1,6 +1,6 @@
 # Wheat Local CLI — Design
 
-Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, and extended configuration are landed; dependency/integration workflow, explicit revision collapse, lifecycle tooling, and Phases 2–3 remain outstanding
+Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, extended configuration, and explicit revision collapse are landed; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
 Last updated: 2026-09-22
 
@@ -127,25 +127,33 @@ both lists.
   diagnostics on stdout. Timeout and output bounds enforced. Content-hash trust
   with re-consent on change. `wheat hook add/list/enable/disable/remove` commands.
   See `wheat-local-tooling.md` for the full design.
+- [x] **Open question — replacement revision attribution.** Settled: the squashing
+  actor is the replacement author and committer at squash time; the latest message
+  and provenance remain, with deterministic, deduplicated `Co-authored-by` trailers
+  for distinct superseded authors other than the squasher. Routine squash exposes no
+  metadata overrides.
+- [x] **Phase 2 — explicit revision collapse.** `wheat change squash [CHANGE]` and
+  `wheat stack squash` collapse only unpublished checkpoint suffixes, preserve stable
+  logical/edit identities and effective clean or conflicted semantics, remap labels
+  and attached workspaces, and publish one completely validated non-monotonic state.
+  Exact observed remote retained inventories form the immutable boundary; ordinary
+  native publish remains exact and never squashes implicitly.
+- [x] **Phase 2 — squash rewrite recovery atop workspace pins.** One bounded,
+  store-scoped transaction pins the complete old/new repository and workspace sides.
+  Store admission serializes every head-dependent command, recovers before another
+  CAS can create a third head, and finalizes all affected workspace references without
+  rewriting materialized bytes. Missing registrations are pruned; inaccessible,
+  mismatched, or locked workspaces fail closed.
 
 ### Outstanding
 - [ ] **Phase 2 — dependency and integration workflow.** Expose stack revision,
   dependency movement, joins, deterministic descendant reapplication, and durable
   conflict outcomes as Wheat operations rather than Git-shaped rebase state.
-- [ ] **Phase 2 — explicit revision collapse.** Add `wheat change squash` and
-  `wheat stack squash`. Collapse only unpublished checkpoint suffixes during routine
-  operation, preserve each logical change and its canonical edit identities, rebuild
-  graph-dependent evidence, and require semantic equivalence before publication.
-  Ordinary native publish remains exact and never squashes implicitly.
-- [ ] **Phase 2 — squash rewrite recovery atop workspace pins.** The registry now
-  makes every workspace frontier attached to a store enumerable and conservatively
-  pins materialization/repository-CAS transitions. Extend that protocol to publish
-  squash plus affected workspace selections recoverably; a rewrite must retain
-  history still selected by another workspace.
-- [ ] **Open question — replacement revision attribution.** Fix the author,
-  committer, message, and timestamp defaults for a squashed revision. The
-  replacement must have honest new metadata without losing useful attribution from
-  the latest retained checkpoint.
+- [ ] **Phase 2 — composed squash provenance.** The landed rewrite preserves
+  transition evidence that is exactly representable at the retained boundary and
+  fails closed with no publication otherwise. Define a canonical composed-evidence
+  representation for complex intermediate subsumption/resolution chains before
+  allowing those chains to collapse.
 - [ ] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
   capture all non-ignored modified and deleted tracked paths. Untracked files
   require `--include-untracked` or explicit path arguments. Depends on the
@@ -525,9 +533,11 @@ forced history-rewrite operation with remote authorization; it is not routine
 squash behavior.
 
 The unpublished boundary is resolved from the configured remote's exact
-last-observed head, not from generation ordering alone. With no configured remote,
-all history after the workspace basis is local draft history. The operation pins
-the repository head, remote observation, workspace selection, and expected latest
+last-observed head, not from generation ordering alone. Every revision in that
+remote state's retained-revision inventory is published and immutable to routine
+squash, even when no current label selects it. With no configured remote, all
+history after the workspace basis is local draft history. The operation pins the
+repository head, remote observation, workspace selection, and expected latest
 revision before planning, and publishes nothing if any becomes stale.
 
 ### Rewrite semantics
@@ -559,8 +569,11 @@ squash introduced an ordinary conflict.
 The replacement revision is a new authored object. It preserves logical change
 metadata and the latest complete edit set, records the retained predecessor
 boundary, and receives honest revision metadata rather than impersonating an old
-checkpoint. The exact author/message/timestamp defaults remain to be fixed before
-implementation because they affect canonical identity and audit meaning.
+checkpoint. The actor running squash becomes both author and committer at squash
+time. The latest checkpoint message and provenance remain; one canonical
+`Co-authored-by: Name <email>` trailer is appended for each distinct superseded
+author other than the squasher, deduplicated against existing equivalent trailers
+and sorted deterministically. Routine squash has no metadata override flags.
 
 ### Roots, transactions, and reporting
 
@@ -573,9 +586,15 @@ A store must be able to enumerate every attached workspace's effective-view pin
 before destructive history collapse is enabled. The invoking workspace is not the
 only possible root: old history remains retained while another workspace, label,
 base view, published boundary, snapshot, or other declared owner still selects it.
-Repository-head publication and affected workspace selections need a recoverable
-multi-resource protocol; a crash must resolve to the complete old or complete new
-selection, never an untracked dangling workspace.
+Repository-head publication and affected workspace selections use one store-scoped
+recoverable transaction; a crash resolves to the complete old or complete new
+selection, never an untracked dangling workspace. Every authenticated workspace
+whose basis, observed label binding, selected frontier, or materialized provenance
+maps exactly to an equivalent replacement view moves in that transaction. Its
+materialized bytes and tree do not change. An affected inaccessible,
+identity-mismatched, or locked workspace blocks squash. A registry entry whose
+recorded workspace path is genuinely absent is a broken attachment and is removed
+during preflight rather than retaining history indefinitely.
 
 Human and structured output report the replaced and replacement revisions/views,
 reapplied descendant changes, consolidated conflicts, retained roots that prevented

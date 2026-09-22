@@ -36,6 +36,7 @@ mod repository_hydration;
 mod repository_mutation;
 mod repository_publication;
 mod repository_reader;
+mod repository_rewrite;
 mod repository_transition;
 mod repository_verify;
 pub use repository_verify::{RepositoryValidationPhase, TransitionValidationOptions};
@@ -82,6 +83,10 @@ pub use repository_mutation::{
     RepositoryMutationError,
 };
 pub use repository_publication::{RepositoryPublicationError, RepositoryPublisher};
+pub use repository_rewrite::{
+    PreparedRepositoryRewrite, RepositoryRewriteError, RepositoryRewriter, RewriteMapping,
+    SquashRewriteRequest, finalize_repository_rewrite,
+};
 pub use revision_map::{
     RevisionMapCursor, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore,
 };

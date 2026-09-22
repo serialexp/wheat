@@ -338,6 +338,7 @@ impl WorkspaceRegistry {
         for pin in self.enumerate()? {
             roots.union_with(pin.roots());
         }
+        roots.union_with(crate::rewrite_transaction::pinned_roots(&self.store_root)?);
         Ok(roots)
     }
 

@@ -95,11 +95,11 @@ pub struct PersistedConflictResolution {
     pub resolved: BTreeMap<String, Option<FileValue>>,
 }
 
-struct Active {
-    state: RepositoryStateRecord,
-    base: ViewRecord,
-    effective: ViewRecord,
-    revisions: BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
+pub(crate) struct Active {
+    pub(crate) state: RepositoryStateRecord,
+    pub(crate) base: ViewRecord,
+    pub(crate) effective: ViewRecord,
+    pub(crate) revisions: BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
     /// The revision identities and canonical order represented by `effective` before this mutation.
     persisted_revisions: BTreeMap<ChangeId, RevisionId>,
     persisted_order: Vec<ChangeId>,
@@ -107,14 +107,14 @@ struct Active {
 }
 
 #[derive(Default)]
-struct Fresh {
-    changes: BTreeSet<ChangeObjectId>,
-    view_edges: BTreeSet<(ViewId, ViewId)>,
-    views: BTreeSet<ViewId>,
-    revisions: BTreeSet<RevisionId>,
-    applications: BTreeSet<ApplicationId>,
-    content: BTreeSet<ContentId>,
-    objects: usize,
+pub(crate) struct Fresh {
+    pub(crate) changes: BTreeSet<ChangeObjectId>,
+    pub(crate) view_edges: BTreeSet<(ViewId, ViewId)>,
+    pub(crate) views: BTreeSet<ViewId>,
+    pub(crate) revisions: BTreeSet<RevisionId>,
+    pub(crate) applications: BTreeSet<ApplicationId>,
+    pub(crate) content: BTreeSet<ContentId>,
+    pub(crate) objects: usize,
 }
 
 impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'a, O, P> {
@@ -505,7 +505,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(proposed)
     }
 
-    async fn open(
+    pub(crate) async fn open(
         &self,
         expected: RepositoryHead,
         basis_view: ViewId,
@@ -583,7 +583,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(active)
     }
 
-    async fn compose(
+    pub(crate) async fn compose(
         &self,
         active: &Active,
         selected: &BTreeSet<ChangeId>,
@@ -694,7 +694,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
     }
 
-    async fn load_edits(&self, revision: &RevisionRecord) -> Result<BTreeMap<EditId, EditRecord>> {
+    pub(crate) async fn load_edits(
+        &self,
+        revision: &RevisionRecord,
+    ) -> Result<BTreeMap<EditId, EditRecord>> {
         let reader = RepositoryReader::new(self.objects, self.content);
         let mut edits = BTreeMap::new();
         for id in &revision.edits {
@@ -703,7 +706,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(edits)
     }
 
-    async fn apply(
+    pub(crate) async fn apply(
         &self,
         revision: RevisionId,
         target: &ViewRecord,
@@ -872,7 +875,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         fresh.views.insert(view.id());
         Ok(())
     }
-    async fn put_revision(
+    pub(crate) async fn put_revision(
         &self,
         revision: &RevisionRecord,
         fresh: &mut Fresh,

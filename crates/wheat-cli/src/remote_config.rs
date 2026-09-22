@@ -21,7 +21,7 @@ const REMOTE_CONFIG_VERSION: u32 = 1;
 const MAX_REMOTE_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// In-memory remote configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteConfig {
     /// User-facing URL spelling retained for display.
     pub url: String,
