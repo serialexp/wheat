@@ -11,6 +11,13 @@ mod commit_content;
 mod commit_writer;
 mod content_batch;
 pub use content_batch::ContentWriteBatch;
+mod content_repack;
+pub use content_repack::{
+    ContentGenerationEntry, ContentGenerationManifest, ContentGenerationTarget,
+    ContentRepackAnalysis, ContentRepackError, ContentRepackInput, ContentRepackLimits,
+    ContentRepackPlan, GenerationQualifiedEnvelope, PreparedContentGeneration, plan_content_repack,
+    prepare_content_repack, publish_content_repack,
+};
 mod codec;
 mod content_io;
 mod delta;
@@ -26,7 +33,10 @@ pub use ownership::{
     prove_union_liveness_with,
 };
 mod packed;
-pub use packed::{PackedObjectStore, PackedStoreTrace, PackedStoreTraceSnapshot};
+pub use packed::{
+    PackedObjectStore, PackedStoreTrace, PackedStoreTraceSnapshot, RepackError, RepackOptions,
+    RepackPlan, RepackReport,
+};
 mod remote_packed;
 pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
 mod publication;

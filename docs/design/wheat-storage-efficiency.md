@@ -1,6 +1,6 @@
 # Wheat Storage Efficiency — Design
 
-Status: partial — Phases 0–2 landed, Phases 3–4 outstanding
+Status: partial — Phases 0–2 and local Phase 4a landed; Phase 3, remote maintenance, and Phase 4b outstanding
 Owner: bart
 Last updated: 2026-09-22
 
@@ -53,16 +53,21 @@ external review.
   instead of raw-copying. SQLite locator schema updated for codec=4.
   50-change benchmark: 205 KiB stored vs 288 KiB uncompressed (29%
   savings).
+- [x] **Phase 4a — nondestructive local repack.** `wheat repack` converts or
+  rewrites an existing local packed/hybrid store through one authenticated V2
+  physical-catalog generation. Structural records stream through bounded segment
+  builders; content uses one generation pack with reverse deltas, every retained
+  lineage tip full, and depth capped at 16. Planning is read-only, capacity is
+  confirmed before replacement bytes are produced, publication binds the exact
+  repository and physical authorities, recovery resolves to the complete old or
+  new generation, and a canonical second run is a true no-op. Loose stores and
+  shared remote backends are refused rather than silently migrated or swept.
 
 ### Outstanding
 - [ ] **Phase 3 — wire encoding compaction.** Switch binschema length
   prefixes from fixed `uint32` to varint, drop the always-1 ContentId
   algorithm byte, and shrink low-cardinality arrays to `uint8`/`uint16`
   counts. This is essentially free since the types are generated.
-- [ ] **Phase 4a — nondestructive repack.** Rebuild physical structural
-  storage and content delta chains with newest content as the full base while
-  preserving the repository head, envelope, logical object identities, retained
-  history, and observable semantics.
 - [ ] **Phase 4b — destructive GC.** Reclaim only objects and content already
   unreachable from every authority in the collection scope. GC must use exact,
   fail-closed marking, include transitive delta-base `ContentId`s, and respect

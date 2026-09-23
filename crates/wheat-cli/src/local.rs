@@ -70,6 +70,16 @@ enum RepositoryLayout {
     Packed,
 }
 
+pub(crate) fn require_packed_layout(root: &Path) -> Result<()> {
+    match repository_layout(root)? {
+        RepositoryLayout::Packed => Ok(()),
+        RepositoryLayout::Loose => bail!(
+            "repack requires a packed Wheat store; {} uses the loose store layout",
+            root.display()
+        ),
+    }
+}
+
 fn repository_layout(root: &Path) -> Result<RepositoryLayout> {
     if root.join(".wheat/repository.head").exists() || root.join(".wheat/repository.yaml").exists()
     {
@@ -187,4 +197,28 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_store(root: &Path) {
+        std::fs::write(root.join("store.json"), "{}").unwrap();
+        std::fs::write(root.join("repository.head"), "head").unwrap();
+    }
+
+    #[test]
+    fn repack_layout_check_accepts_only_packed_stores() {
+        let packed = tempfile::tempdir().unwrap();
+        base_store(packed.path());
+        std::fs::create_dir(packed.path().join("storage")).unwrap();
+        require_packed_layout(packed.path()).unwrap();
+
+        let loose = tempfile::tempdir().unwrap();
+        base_store(loose.path());
+        std::fs::create_dir(loose.path().join("objects")).unwrap();
+        let error = require_packed_layout(loose.path()).unwrap_err();
+        assert!(error.to_string().contains("requires a packed Wheat store"));
+    }
 }

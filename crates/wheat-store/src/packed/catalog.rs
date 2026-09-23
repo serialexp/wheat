@@ -18,8 +18,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{
+    PhysicalCatalogSnapshot, PhysicalContentGeneration, PhysicalSegmentDescriptor,
     SegmentCatalogRecord, SegmentId, SegmentIndexEntry, SegmentRecordError,
-    decode_segment_catalog_record, encode_segment_catalog_record,
+    decode_physical_catalog_snapshot, decode_segment_catalog_record,
+    encode_physical_catalog_snapshot, encode_segment_catalog_record,
 };
 
 use super::{
@@ -43,6 +45,8 @@ const ACTIVE_FILE: &str = "active.segment";
 const ACTIVE_HEAD_FILE: &str = "active.head";
 const ACTIVE_JOURNAL_FILE: &str = "active.append";
 const BULK_FILE_PREFIX: &str = "bulk-";
+const REPACK_INTENT_FILE: &str = "repack.intent";
+const REPACK_INTENT_MAGIC: &[u8; 8] = b"WHTRPK02";
 const CATALOG_HEAD_MAGIC: &[u8; 9] = b"WHEATPACK";
 const CATALOG_HEAD_VERSION: u8 = 1;
 const CATALOG_HEAD_LEN: usize = CATALOG_HEAD_MAGIC.len() + 1 + 8 + 32;
@@ -71,8 +75,15 @@ pub(crate) enum CatalogError {
     Corrupt(&'static str),
     #[error("catalog must be reopened after an interrupted seal")]
     Poisoned,
+    #[error("repack requires durable storage without pending deferred writes")]
+    RepackUnsupported,
+    #[error("repack inventory exceeds its {limit} record limit")]
+    RepackInventoryLimit { limit: usize },
+    #[error("repack plan no longer matches physical authority")]
+    RepackStaleAuthority,
 }
 
+#[derive(Clone, Debug)]
 struct CatalogItem {
     record: SegmentCatalogRecord,
     digest: [u8; 32],
@@ -81,8 +92,19 @@ struct CatalogItem {
 #[derive(Clone)]
 struct SealedSource {
     path: String,
+    generation: u64,
+    sequence: u64,
     segment: [u8; 32],
     stored_length: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RepackInventoryEntry {
+    source: [u8; 32],
+    namespace: u8,
+    kind: u16,
+    digest: [u8; 32],
+    logical_length: u64,
 }
 
 struct DeferredBulk {
@@ -91,8 +113,50 @@ struct DeferredBulk {
 }
 
 type CatalogHead = Option<(u64, [u8; 32])>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogPhysicalAuthority {
+    pub head: CatalogHead,
+    pub content: PhysicalContentGeneration,
+    pub active: ActivePublishedState,
+}
 type CatalogCheckpoint = (CatalogHead, ActivePublishedState, u64);
 type LocatorRow = (u16, u64, u8, u64, u64, String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RepackIntent {
+    old: CatalogHead,
+    new: (u64, [u8; 32]),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogRepackReport {
+    pub no_op: bool,
+    pub generation_before: u64,
+    pub generation_after: u64,
+    pub segments_before: usize,
+    pub segments_after: usize,
+    pub physical_bytes_before: u64,
+    pub physical_bytes_after: u64,
+    pub structural_records: u64,
+    /// Number of source-body reads performed by the streaming rewrite.
+    pub source_body_reads: u64,
+    /// Peak simultaneously resident record bodies (kept at one by design).
+    pub max_resident_bodies: u64,
+    pub bytes_written: u64,
+    pub bytes_retired: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CatalogRepackOptions {
+    pub max_records: usize,
+    pub target_segment_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+enum CatalogAuthority {
+    V1(Vec<CatalogItem>),
+    V2(PhysicalCatalogSnapshot),
+}
 
 /// A process-exclusive writer/read facade over a packed-store root.
 pub(crate) struct PackedCatalog {
@@ -103,6 +167,8 @@ pub(crate) struct PackedCatalog {
     index: Connection,
     generation: Option<u64>,
     head: Option<[u8; 32]>,
+    catalog_v2: bool,
+    content_generation: PhysicalContentGeneration,
     sealed_sources: Vec<SealedSource>,
     sealed_readers: HashMap<[u8; 32], SegmentReader>,
     active: ActiveSegment,
@@ -124,6 +190,8 @@ pub(crate) struct PackedCatalog {
     deferred_failpoint: Option<DeferredFailpoint>,
     #[cfg(test)]
     close_failpoint: Option<CloseFailpoint>,
+    #[cfg(test)]
+    repack_failpoint: Option<RepackFailpoint>,
 }
 
 #[cfg(test)]
@@ -152,6 +220,13 @@ pub(crate) enum SealFailpoint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloseFailpoint {
     BeforeFinalize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepackFailpoint {
+    AfterIntent,
+    AfterHead,
 }
 
 impl PackedCatalog {
@@ -204,12 +279,22 @@ impl PackedCatalog {
             }
             Err(error) => return Err(error),
         };
-        validate_catalog_head(&catalogs, durable_head)?;
-        let catalog_chain = read_chain(&catalogs, durable_head)?;
-        let committed_segment = catalog_chain.last().map(|item| item.record.segment);
+        recover_repack_intent(&root, durable_head, durability)?;
+        let authority = read_catalog_authority(&catalogs, durable_head)?;
+        remove_unreachable_content_generations(&root, &authority, durability)?;
+        let committed_segment = match &authority {
+            CatalogAuthority::V1(chain) => chain.last().map(|item| item.record.segment),
+            CatalogAuthority::V2(snapshot) => snapshot.segments.last().map(|item| item.segment),
+        };
         let (active, active_retired) = recover_active(&root, durability, committed_segment)?;
         remove_unpublished_bulk_files(&segments, durability)?;
-        remove_unreachable_publications(&segments, &catalogs, &catalog_chain, durability)?;
+        remove_unreachable_publications(
+            &segments,
+            &catalogs,
+            durable_head,
+            &authority,
+            durability,
+        )?;
 
         let index_path = root.join("catalog-locator.sqlite3");
         let index_was_missing = !index_path.exists();
@@ -222,18 +307,7 @@ impl PackedCatalog {
         if index_was_missing || index_recreated {
             durability.sync_directory(&root)?;
         }
-        let sealed_sources = catalog_chain
-            .into_iter()
-            .map(|item| SealedSource {
-                path: format!(
-                    "segments/{}-{}.segment",
-                    item.record.generation,
-                    hex(&item.record.segment)
-                ),
-                segment: item.record.segment,
-                stored_length: item.record.stored_length,
-            })
-            .collect();
+        let sealed_sources = authority_sources(&authority);
         let mut catalog = Self {
             root,
             segments,
@@ -242,6 +316,11 @@ impl PackedCatalog {
             index,
             generation: durable_head.map(|(generation, _)| generation),
             head: durable_head.map(|(_, digest)| digest),
+            catalog_v2: matches!(authority, CatalogAuthority::V2(_)),
+            content_generation: match &authority {
+                CatalogAuthority::V1(_) => legacy_content_generation(),
+                CatalogAuthority::V2(snapshot) => snapshot.content,
+            },
             sealed_sources,
             sealed_readers: HashMap::new(),
             active,
@@ -263,6 +342,8 @@ impl PackedCatalog {
             deferred_failpoint: None,
             #[cfg(test)]
             close_failpoint: None,
+            #[cfg(test)]
+            repack_failpoint: None,
         };
         let authority = (durable_head, catalog.active.state());
         let checkpoint = catalog.read_checkpoint();
@@ -344,6 +425,11 @@ impl PackedCatalog {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_set_repack_failpoint(&mut self, failpoint: RepackFailpoint) {
+        self.repack_failpoint = Some(failpoint);
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_locator_rows(&self) -> u64 {
         self.locator_rows
     }
@@ -368,6 +454,11 @@ impl PackedCatalog {
     #[cfg(test)]
     pub(crate) fn test_sealed_authentications(&self) -> usize {
         self.sealed_authentications
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_is_v2(&self) -> bool {
+        self.catalog_v2
     }
 
     #[cfg(test)]
@@ -681,16 +772,23 @@ impl PackedCatalog {
             .generation
             .map_or(Some(0), |value| value.checked_add(1))
             .ok_or(CatalogError::Corrupt("generation overflow"))?;
-        let segment_name = format!("{}-{}{}", generation, hex(&finalized.id.0), SEGMENT_SUFFIX);
+        let segment_name = if self.catalog_v2 {
+            format!(
+                "{}-0-{}{}",
+                generation,
+                hex(&finalized.id.0),
+                SEGMENT_SUFFIX
+            )
+        } else {
+            format!("{}-{}{}", generation, hex(&finalized.id.0), SEGMENT_SUFFIX)
+        };
         let segment_path = self.segments.join(&segment_name);
         fs::rename(&finalized.path, &segment_path)?;
-        let record = SegmentCatalogRecord {
+        let digest = self.publish_appended_authority(
             generation,
-            previous: self.head,
-            segment: finalized.id.0,
-            stored_length: finalized.metadata.total_length,
-        };
-        let digest = publish_catalog_record(&self.root, &self.catalogs, &record, self.durability)?;
+            finalized.id.0,
+            finalized.metadata.total_length,
+        )?;
         write_catalog_head(
             &self.root,
             &self.root.join(CATALOG_HEAD_FILE),
@@ -720,6 +818,8 @@ impl PackedCatalog {
         self.head = Some(digest);
         self.sealed_sources.push(SealedSource {
             path: new_source,
+            generation,
+            sequence: 0,
             segment: finalized.id.0,
             stored_length: finalized.metadata.total_length,
         });
@@ -939,7 +1039,11 @@ impl PackedCatalog {
         // benefits from block compression of small structural records.
         let sealed = self.rebuild_active_as_block_compressed()?;
 
-        let segment_name = format!("{}-{}{}", generation, hex(&sealed.id.0), SEGMENT_SUFFIX);
+        let segment_name = if self.catalog_v2 {
+            format!("{}-0-{}{}", generation, hex(&sealed.id.0), SEGMENT_SUFFIX)
+        } else {
+            format!("{}-{}{}", generation, hex(&sealed.id.0), SEGMENT_SUFFIX)
+        };
         let segment_path = self.segments.join(&segment_name);
         if !segment_path.exists() {
             let mut temporary = NamedTempFile::new_in(&self.segments)?;
@@ -964,7 +1068,8 @@ impl PackedCatalog {
             segment: sealed.id.0,
             stored_length: sealed.metadata.total_length,
         };
-        let digest = publish_catalog_record(&self.root, &self.catalogs, &record, self.durability)?;
+        let digest =
+            self.publish_appended_authority(generation, sealed.id.0, sealed.metadata.total_length)?;
         write_catalog_head(
             &self.root,
             &self.root.join(CATALOG_HEAD_FILE),
@@ -976,6 +1081,8 @@ impl PackedCatalog {
         let sealed_source = format!("segments/{segment_name}");
         self.sealed_sources.push(SealedSource {
             path: sealed_source.clone(),
+            generation,
+            sequence: 0,
             segment: sealed.id.0,
             stored_length: sealed.metadata.total_length,
         });
@@ -1049,27 +1156,419 @@ impl PackedCatalog {
         Ok(builder.seal()?)
     }
 
+    fn publish_appended_authority(
+        &self,
+        generation: u64,
+        segment: [u8; 32],
+        stored_length: u64,
+    ) -> Result<[u8; 32], CatalogError> {
+        if !self.catalog_v2 {
+            return publish_catalog_record(
+                &self.root,
+                &self.catalogs,
+                &SegmentCatalogRecord {
+                    generation,
+                    previous: self.head,
+                    segment,
+                    stored_length,
+                },
+                self.durability,
+            );
+        }
+        let mut segments = self
+            .sealed_sources
+            .iter()
+            .map(|source| PhysicalSegmentDescriptor {
+                generation: source.generation,
+                sequence: source.sequence,
+                segment: source.segment,
+                stored_length: source.stored_length,
+            })
+            .collect::<Vec<_>>();
+        segments.push(PhysicalSegmentDescriptor {
+            generation,
+            sequence: 0,
+            segment,
+            stored_length,
+        });
+        publish_physical_snapshot(
+            &self.root,
+            &self.catalogs,
+            &PhysicalCatalogSnapshot {
+                generation,
+                segments,
+                content: self.content_generation,
+            },
+            self.durability,
+        )
+    }
+
+    /// Returns the complete published physical authority without sealing or
+    /// otherwise publishing the active segment. Repack planning is a read-only
+    /// preflight; execution binds this exact active state before doing work.
+    pub(crate) fn physical_authority(&self) -> Result<CatalogPhysicalAuthority, CatalogError> {
+        if self.durability != Durability::Durable || self.bulk.is_some() || self.poisoned {
+            return Err(CatalogError::RepackUnsupported);
+        }
+        Ok(CatalogPhysicalAuthority {
+            head: self.generation.zip(self.head),
+            content: self.content_generation,
+            active: self.active.state(),
+        })
+    }
+
+    pub(crate) fn physical_stats(&mut self) -> Result<(usize, u64, u64), CatalogError> {
+        self.load_sealed_readers()?;
+        let sealed_bytes = self.sealed_sources.iter().try_fold(0_u64, |sum, source| {
+            sum.checked_add(source.stored_length)
+                .ok_or(CatalogError::Corrupt("physical byte count overflow"))
+        })?;
+        let bytes = sealed_bytes
+            .checked_add(self.active.state().metadata.total_length)
+            .ok_or(CatalogError::Corrupt("physical byte count overflow"))?;
+        let sealed_records = self
+            .sealed_readers
+            .values()
+            .try_fold(0_u64, |sum, reader| {
+                let count = u64::try_from(reader.authenticated_entries().len())
+                    .map_err(|_| CatalogError::Corrupt("record count overflow"))?;
+                sum.checked_add(count)
+                    .ok_or(CatalogError::Corrupt("record count overflow"))
+            })?;
+        let records = sealed_records
+            .checked_add(self.active.state().metadata.object_count)
+            .ok_or(CatalogError::Corrupt("record count overflow"))?;
+        let segments = self
+            .sealed_sources
+            .len()
+            .checked_add(usize::from(self.active.state().metadata.object_count != 0))
+            .ok_or(CatalogError::Corrupt("segment count overflow"))?;
+        Ok((segments, bytes, records))
+    }
+
+    pub(crate) fn content_generation(&self) -> PhysicalContentGeneration {
+        self.content_generation
+    }
+
+    pub(crate) fn packed_content_ids(
+        &mut self,
+    ) -> Result<Vec<wheat_core::ContentId>, CatalogError> {
+        self.load_sealed_readers()?;
+        let mut ids = Vec::new();
+        for source in &self.sealed_sources {
+            let reader = self
+                .sealed_readers
+                .get(&source.segment)
+                .ok_or(CatalogError::Corrupt(
+                    "sealed reader missing during inventory",
+                ))?;
+            ids.extend(
+                reader
+                    .authenticated_entries()
+                    .iter()
+                    .filter(|entry| entry.namespace == super::segment::CONTENT_NAMESPACE)
+                    .map(|entry| wheat_core::ContentId::from_digest(entry.digest)),
+            );
+        }
+        ids.extend(
+            self.active
+                .entries()
+                .iter()
+                .filter(|entry| entry.namespace == super::segment::CONTENT_NAMESPACE)
+                .map(|entry| wheat_core::ContentId::from_digest(entry.digest)),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    pub(crate) fn repack_structural(
+        &mut self,
+        options: CatalogRepackOptions,
+        replacement_content: PhysicalContentGeneration,
+        expected_authority: CatalogPhysicalAuthority,
+    ) -> Result<CatalogRepackReport, CatalogError> {
+        if self.durability != Durability::Durable || self.bulk.is_some() || self.poisoned {
+            return Err(CatalogError::RepackUnsupported);
+        }
+        if self.physical_authority()? != expected_authority {
+            return Err(CatalogError::RepackStaleAuthority);
+        }
+        // Capacity admission has happened. Seal now, as the first publication in
+        // execution, and continue only if it was the exact active state planned.
+        self.seal_active()?;
+        self.load_sealed_readers()?;
+
+        let generation_before = self.generation.unwrap_or(0);
+        let segments_before = self.sealed_sources.len();
+        let physical_bytes_before = self.sealed_sources.iter().try_fold(0_u64, |sum, source| {
+            sum.checked_add(source.stored_length)
+                .ok_or(CatalogError::Corrupt("physical byte count overflow"))
+        })?;
+        // Inventory only authenticated keys and source references. Record bodies
+        // are read and released one at a time below; a million-record repack must
+        // never retain a million Vec payloads.
+        let mut inventory = Vec::new();
+        for source in &self.sealed_sources {
+            let entries = self
+                .sealed_readers
+                .get(&source.segment)
+                .ok_or(CatalogError::Corrupt("sealed reader missing during repack"))?
+                .authenticated_entries();
+            let next_len = inventory
+                .len()
+                .checked_add(entries.len())
+                .ok_or(CatalogError::Corrupt("inventory count overflow"))?;
+            if next_len > options.max_records {
+                return Err(CatalogError::RepackInventoryLimit {
+                    limit: options.max_records,
+                });
+            }
+            inventory.extend(entries.iter().map(|entry| RepackInventoryEntry {
+                source: source.segment,
+                namespace: entry.namespace,
+                kind: entry.kind,
+                digest: entry.digest,
+                logical_length: entry.logical_length,
+            }));
+        }
+        inventory.sort_unstable_by_key(|record| (record.namespace, record.digest, record.source));
+        inventory.dedup_by(|right, left| {
+            if (left.namespace, left.digest) != (right.namespace, right.digest) {
+                return false;
+            }
+            if left.kind != right.kind || left.logical_length != right.logical_length {
+                return false;
+            }
+            true
+        });
+        if inventory
+            .windows(2)
+            .any(|pair| (pair[0].namespace, pair[0].digest) == (pair[1].namespace, pair[1].digest))
+        {
+            return Err(CatalogError::Corrupt(
+                "duplicate key has conflicting authenticated metadata",
+            ));
+        }
+        let structural_records = inventory.iter().try_fold(0_u64, |count, record| {
+            if record.namespace == super::segment::METADATA_NAMESPACE {
+                count
+                    .checked_add(1)
+                    .ok_or(CatalogError::Corrupt("record count overflow"))
+            } else {
+                Ok(count)
+            }
+        })?;
+
+        let next_generation = generation_before
+            .checked_add(1)
+            .ok_or(CatalogError::Corrupt("generation overflow"))?;
+        let target = options
+            .target_segment_bytes
+            .clamp(1, MAX_SEGMENT_PAYLOAD_BYTES);
+        let mut replacements = Vec::new();
+        let mut source_body_reads = 0u64;
+        let mut max_resident_bodies = 0u64;
+        let mut cursor = 0;
+        while cursor < inventory.len() {
+            let mut builder = SegmentBuilder::new(&self.segments)?;
+            let start = cursor;
+            let mut logical_bytes = 0_u64;
+            while cursor < inventory.len() {
+                let record = inventory[cursor];
+                let next_logical_bytes = logical_bytes
+                    .checked_add(record.logical_length)
+                    .ok_or(CatalogError::Corrupt("segment logical byte count overflow"))?;
+                if cursor > start && next_logical_bytes > target {
+                    break;
+                }
+                let reader = self
+                    .sealed_readers
+                    .get_mut(&record.source)
+                    .ok_or(CatalogError::Corrupt("repack source reader missing"))?;
+                let (_, bytes) = reader
+                    .lookup_entry_bounded(record.namespace, record.digest, usize::MAX)?
+                    .ok_or(CatalogError::Corrupt(
+                        "authenticated inventory entry missing",
+                    ))?;
+                source_body_reads = source_body_reads
+                    .checked_add(1)
+                    .ok_or(CatalogError::Corrupt("source body read count overflow"))?;
+                max_resident_bodies = 1;
+                builder.push_prepared(prepare_record(SegmentRecord {
+                    namespace: record.namespace,
+                    kind: record.kind,
+                    digest: record.digest,
+                    bytes: &bytes,
+                })?)?;
+                reader.clear_block_cache();
+                logical_bytes = next_logical_bytes;
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or(CatalogError::Corrupt("inventory cursor overflow"))?;
+            }
+            replacements.push(builder.seal()?);
+        }
+
+        let proposed_ids = replacements
+            .iter()
+            .map(|segment| segment.id.0)
+            .collect::<Vec<_>>();
+        let current_ids = self
+            .sealed_sources
+            .iter()
+            .map(|source| source.segment)
+            .collect::<Vec<_>>();
+        if self.catalog_v2
+            && proposed_ids == current_ids
+            && replacement_content == self.content_generation
+        {
+            return Ok(CatalogRepackReport {
+                no_op: true,
+                generation_before,
+                generation_after: generation_before,
+                segments_before,
+                segments_after: segments_before,
+                physical_bytes_before,
+                physical_bytes_after: physical_bytes_before,
+                structural_records,
+                source_body_reads: 0,
+                max_resident_bodies: 0,
+                bytes_written: 0,
+                bytes_retired: 0,
+            });
+        }
+
+        self.poisoned = true;
+        let mut descriptors = Vec::with_capacity(replacements.len());
+        let mut new_sources = Vec::with_capacity(replacements.len());
+        let mut new_readers = HashMap::with_capacity(replacements.len());
+        let mut physical_bytes_after = 0_u64;
+        for (sequence, replacement) in replacements.into_iter().enumerate() {
+            let sequence = u64::try_from(sequence)
+                .map_err(|_| CatalogError::Corrupt("segment sequence overflow"))?;
+            let name = format!(
+                "{next_generation}-{sequence}-{}{}",
+                hex(&replacement.id.0),
+                SEGMENT_SUFFIX
+            );
+            let path = self.segments.join(&name);
+            replacement
+                .file
+                .persist_noclobber(&path)
+                .map_err(|error| error.error)?;
+            let file = File::open(&path)?;
+            self.durability.sync_file(&file)?;
+            let reader = SegmentReader::open(file)?;
+            if reader.id() != replacement.id {
+                return Err(CatalogError::Corrupt("replacement segment identity"));
+            }
+            physical_bytes_after = physical_bytes_after
+                .checked_add(replacement.metadata.total_length)
+                .ok_or(CatalogError::Corrupt("physical byte count overflow"))?;
+            descriptors.push(PhysicalSegmentDescriptor {
+                generation: next_generation,
+                sequence,
+                segment: replacement.id.0,
+                stored_length: replacement.metadata.total_length,
+            });
+            new_sources.push(SealedSource {
+                path: format!("segments/{name}"),
+                generation: next_generation,
+                sequence,
+                segment: replacement.id.0,
+                stored_length: replacement.metadata.total_length,
+            });
+            new_readers.insert(replacement.id.0, reader);
+        }
+        self.durability.sync_directory(&self.segments)?;
+        let snapshot = PhysicalCatalogSnapshot {
+            generation: next_generation,
+            segments: descriptors,
+            content: replacement_content,
+        };
+        let digest =
+            publish_physical_snapshot(&self.root, &self.catalogs, &snapshot, self.durability)?;
+        write_repack_intent(
+            &self.root,
+            RepackIntent {
+                old: self.generation.zip(self.head),
+                new: (next_generation, digest),
+            },
+            self.durability,
+        )?;
+        #[cfg(test)]
+        if self.repack_failpoint == Some(RepackFailpoint::AfterIntent) {
+            return Err(CatalogError::Corrupt("test failure after repack intent"));
+        }
+        write_catalog_head(
+            &self.root,
+            &self.root.join(CATALOG_HEAD_FILE),
+            Some((next_generation, digest)),
+            self.durability,
+        )?;
+        #[cfg(test)]
+        if self.repack_failpoint == Some(RepackFailpoint::AfterHead) {
+            return Err(CatalogError::Corrupt("test failure after repack head"));
+        }
+
+        self.generation = Some(next_generation);
+        self.head = Some(digest);
+        self.catalog_v2 = true;
+        self.content_generation = replacement_content;
+        self.sealed_readers = new_readers;
+        let old_sources = std::mem::replace(&mut self.sealed_sources, new_sources);
+        self.rebuild_index()?;
+        for source in old_sources {
+            let path = self.root.join(source.path);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        self.durability.sync_directory(&self.segments)?;
+        remove_unreachable_publications(
+            &self.segments,
+            &self.catalogs,
+            self.generation.zip(self.head),
+            &CatalogAuthority::V2(snapshot),
+            self.durability,
+        )?;
+        remove_durable_file(
+            &self.root,
+            &self.root.join(REPACK_INTENT_FILE),
+            self.durability,
+        )?;
+        self.poisoned = false;
+        Ok(CatalogRepackReport {
+            no_op: false,
+            generation_before,
+            generation_after: next_generation,
+            segments_before,
+            segments_after: self.sealed_sources.len(),
+            physical_bytes_before,
+            physical_bytes_after,
+            structural_records,
+            source_body_reads,
+            max_resident_bodies,
+            bytes_written: physical_bytes_after,
+            bytes_retired: physical_bytes_before,
+        })
+    }
+
     fn rebuild_index(&mut self) -> Result<(), CatalogError> {
         self.load_sealed_readers()?;
         let catalog_head = self.generation.zip(self.head);
-        let items = read_chain(&self.catalogs, catalog_head)?;
         let transaction = self.index.transaction()?;
         transaction.execute("DELETE FROM locator", [])?;
         transaction.execute("DELETE FROM physical_source", [])?;
-        for item in &items {
-            let filename = format!(
-                "{}-{}.segment",
-                item.record.generation,
-                hex(&item.record.segment)
-            );
-            let relative = format!("segments/{filename}");
-            let reader =
-                self.sealed_readers
-                    .get(&item.record.segment)
-                    .ok_or(CatalogError::Corrupt(
-                        "sealed descriptor lacks cached reader",
-                    ))?;
-            insert_source_entries(&transaction, &relative, reader.authenticated_entries())?;
+        for source in &self.sealed_sources {
+            let reader = self
+                .sealed_readers
+                .get(&source.segment)
+                .ok_or(CatalogError::Corrupt(
+                    "sealed descriptor lacks cached reader",
+                ))?;
+            insert_source_entries(&transaction, &source.path, reader.authenticated_entries())?;
         }
         insert_source_entries(&transaction, ACTIVE_FILE, self.active.entries())?;
         let locator_rows = locator_count(&transaction)?;
@@ -1141,6 +1640,8 @@ impl PackedCatalog {
             index,
             generation: _,
             head: _,
+            catalog_v2: _,
+            content_generation: _,
             sealed_sources: _,
             sealed_readers: _,
             active,
@@ -1162,6 +1663,8 @@ impl PackedCatalog {
                 deferred_failpoint: _,
             #[cfg(test)]
                 close_failpoint: _,
+            #[cfg(test)]
+                repack_failpoint: _,
         } = self;
 
         let close_result = index.close();
@@ -1338,9 +1841,10 @@ fn retire_active(
     durability: Durability,
     fail_before_rename: bool,
 ) -> Result<(), CatalogError> {
-    if active.state().id.0 != record.segment {
-        return Err(CatalogError::Corrupt("retired active identity"));
-    }
+    // `record.segment` identifies the block-compressed replacement. It need not
+    // equal the active segment's byte identity; publication authenticated the
+    // replacement before this retirement step.
+    let _ = record;
     let next_generation = active
         .state()
         .generation
@@ -1412,36 +1916,99 @@ fn remove_unpublished_bulk_files(
     Ok(())
 }
 
+fn remove_unreachable_content_generations(
+    root: &Path,
+    authority: &CatalogAuthority,
+    durability: Durability,
+) -> Result<(), CatalogError> {
+    let retained = match authority {
+        CatalogAuthority::V1(_) => 0,
+        CatalogAuthority::V2(snapshot) => snapshot.content.generation,
+    };
+    let directory = root.join("content-generations");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut authenticated_generations = HashSet::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((generation, digest)) = parse_canonical_publication_name(&name, ".manifest")
+        else {
+            continue;
+        };
+        let encoded = fs::read(entry.path())?;
+        if blake3::hash(&encoded).as_bytes() == &digest {
+            authenticated_generations.insert(generation);
+        }
+    }
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(generation) = name.parse::<u64>() else {
+            continue;
+        };
+        if generation != retained
+            && authenticated_generations.contains(&generation)
+            && entry.path().join("content.pack").is_file()
+        {
+            fs::remove_dir_all(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        durability.sync_directory(&directory)?;
+    }
+    Ok(())
+}
+
 /// Removes only authenticated immutable publications whose canonical names are
 /// absent from the chain rooted at the already-validated authoritative head.
 /// Unknown, non-canonical, and malformed entries are deliberately preserved.
 fn remove_unreachable_publications(
     segments: &Path,
     catalogs: &Path,
-    chain: &[CatalogItem],
+    head: CatalogHead,
+    authority: &CatalogAuthority,
     durability: Durability,
 ) -> Result<(), CatalogError> {
-    let reachable_catalogs: HashSet<String> = chain
-        .iter()
-        .map(|item| {
-            format!(
-                "{}-{}{}",
-                item.record.generation,
-                hex(&item.digest),
-                CATALOG_SUFFIX
-            )
-        })
-        .collect();
-    let reachable_segments: HashSet<String> = chain
-        .iter()
-        .map(|item| {
-            format!(
-                "{}-{}{}",
-                item.record.generation,
-                hex(&item.record.segment),
-                SEGMENT_SUFFIX
-            )
-        })
+    let reachable_catalogs: HashSet<String> = match authority {
+        CatalogAuthority::V1(chain) => chain
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}-{}{}",
+                    item.record.generation,
+                    hex(&item.digest),
+                    CATALOG_SUFFIX
+                )
+            })
+            .collect(),
+        CatalogAuthority::V2(_) => head
+            .map(|(generation, digest)| {
+                [format!("{}-{}{}", generation, hex(&digest), CATALOG_SUFFIX)]
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let reachable_segments: HashSet<String> = authority_sources(authority)
+        .into_iter()
+        .map(|source| source.path.trim_start_matches("segments/").to_owned())
         .collect();
 
     let mut removed_catalog = false;
@@ -1464,10 +2031,12 @@ fn remove_unreachable_publications(
         if blake3::hash(&encoded).as_bytes() != &digest {
             continue;
         }
-        let Ok(record) = decode_segment_catalog_record(&encoded) else {
-            continue;
-        };
-        if record.generation != generation {
+        let valid_generation = decode_segment_catalog_record(&encoded)
+            .map(|record| record.generation)
+            .or_else(|_| {
+                decode_physical_catalog_snapshot(&encoded).map(|snapshot| snapshot.generation)
+            });
+        if valid_generation != Ok(generation) {
             continue;
         }
         fs::remove_file(entry.path())?;
@@ -1639,10 +2208,30 @@ fn publish_catalog_record(
     durability: Durability,
 ) -> Result<[u8; 32], CatalogError> {
     let encoded = encode_segment_catalog_record(record)?;
-    let digest = *blake3::hash(&encoded).as_bytes();
-    let path = catalogs.join(format!("{}-{}.catalog", record.generation, hex(&digest)));
+    publish_catalog_bytes(root, catalogs, record.generation, &encoded, durability)
+}
+
+fn publish_physical_snapshot(
+    root: &Path,
+    catalogs: &Path,
+    snapshot: &PhysicalCatalogSnapshot,
+    durability: Durability,
+) -> Result<[u8; 32], CatalogError> {
+    let encoded = encode_physical_catalog_snapshot(snapshot)?;
+    publish_catalog_bytes(root, catalogs, snapshot.generation, &encoded, durability)
+}
+
+fn publish_catalog_bytes(
+    root: &Path,
+    catalogs: &Path,
+    generation: u64,
+    encoded: &[u8],
+    durability: Durability,
+) -> Result<[u8; 32], CatalogError> {
+    let digest = *blake3::hash(encoded).as_bytes();
+    let path = catalogs.join(format!("{}-{}.catalog", generation, hex(&digest)));
     let mut temporary = NamedTempFile::new_in(root)?;
-    temporary.write_all(&encoded)?;
+    temporary.write_all(encoded)?;
     durability.sync_file(temporary.as_file())?;
     if let Err(error) = temporary.persist_noclobber(&path) {
         if error.error.kind() != io::ErrorKind::AlreadyExists {
@@ -1689,21 +2278,70 @@ fn write_catalog_head(
     atomic_write(root, path, &encoded, durability)
 }
 
-fn validate_catalog_head(
+fn read_catalog_authority(
     directory: &Path,
-    head: Option<(u64, [u8; 32])>,
-) -> Result<(), CatalogError> {
-    if let Some((generation, digest)) = head {
-        read_catalog_record(directory, generation, digest)?;
+    head: CatalogHead,
+) -> Result<CatalogAuthority, CatalogError> {
+    let Some((generation, digest)) = head else {
+        return Ok(CatalogAuthority::V1(Vec::new()));
+    };
+    let encoded = read_catalog_bytes(directory, generation, digest)?;
+    if let Ok(snapshot) = decode_physical_catalog_snapshot(&encoded) {
+        if snapshot.generation != generation {
+            return Err(CatalogError::Corrupt("catalog snapshot generation"));
+        }
+        return Ok(CatalogAuthority::V2(snapshot));
     }
-    Ok(())
+    Ok(CatalogAuthority::V1(read_chain(directory, head)?))
 }
 
-fn read_catalog_record(
+fn authority_sources(authority: &CatalogAuthority) -> Vec<SealedSource> {
+    match authority {
+        CatalogAuthority::V1(chain) => chain
+            .iter()
+            .map(|item| SealedSource {
+                path: format!(
+                    "segments/{}-{}.segment",
+                    item.record.generation,
+                    hex(&item.record.segment)
+                ),
+                generation: item.record.generation,
+                sequence: 0,
+                segment: item.record.segment,
+                stored_length: item.record.stored_length,
+            })
+            .collect(),
+        CatalogAuthority::V2(snapshot) => snapshot
+            .segments
+            .iter()
+            .map(|item| SealedSource {
+                path: format!(
+                    "segments/{}-{}-{}.segment",
+                    item.generation,
+                    item.sequence,
+                    hex(&item.segment)
+                ),
+                generation: item.generation,
+                sequence: item.sequence,
+                segment: item.segment,
+                stored_length: item.stored_length,
+            })
+            .collect(),
+    }
+}
+
+pub(super) fn legacy_content_generation() -> PhysicalContentGeneration {
+    PhysicalContentGeneration {
+        generation: 0,
+        manifest: [0; 32],
+    }
+}
+
+fn read_catalog_bytes(
     directory: &Path,
     generation: u64,
     digest: [u8; 32],
-) -> Result<SegmentCatalogRecord, CatalogError> {
+) -> Result<Vec<u8>, CatalogError> {
     let path = directory.join(format!("{}-{}{}", generation, hex(&digest), CATALOG_SUFFIX));
     let encoded = fs::read(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -1712,8 +2350,20 @@ fn read_catalog_record(
             CatalogError::Io(error)
         }
     })?;
+    if blake3::hash(&encoded).as_bytes() != &digest {
+        return Err(CatalogError::Corrupt("catalog record identity"));
+    }
+    Ok(encoded)
+}
+
+fn read_catalog_record(
+    directory: &Path,
+    generation: u64,
+    digest: [u8; 32],
+) -> Result<SegmentCatalogRecord, CatalogError> {
+    let encoded = read_catalog_bytes(directory, generation, digest)?;
     let record = decode_segment_catalog_record(&encoded)?;
-    if record.generation != generation || blake3::hash(&encoded).as_bytes() != &digest {
+    if record.generation != generation {
         return Err(CatalogError::Corrupt("catalog record identity"));
     }
     Ok(record)
@@ -1759,14 +2409,17 @@ fn latest_catalog_head(directory: &Path) -> Result<Option<(u64, [u8; 32])>, Cata
         if blake3::hash(&encoded).as_bytes() != &digest {
             continue;
         }
+        let head = (generation, digest);
+        if let Ok(snapshot) = decode_physical_catalog_snapshot(&encoded) {
+            if snapshot.generation == generation {
+                candidates.push(head);
+            }
+            continue;
+        }
         let Ok(record) = decode_segment_catalog_record(&encoded) else {
             continue;
         };
-        if record.generation != generation {
-            continue;
-        }
-        let head = (generation, digest);
-        if read_chain(directory, Some(head)).is_ok() {
+        if record.generation == generation && read_chain(directory, Some(head)).is_ok() {
             candidates.push(head);
         }
     }
@@ -1803,6 +2456,110 @@ fn read_chain(
     }
     reversed.reverse();
     Ok(reversed)
+}
+
+fn write_repack_intent(
+    root: &Path,
+    intent: RepackIntent,
+    durability: Durability,
+) -> Result<(), CatalogError> {
+    let mut encoded = Vec::with_capacity(8 + 1 + CATALOG_HEAD_LEN * 2 + CHECKSUM_LEN);
+    encoded.extend_from_slice(REPACK_INTENT_MAGIC);
+    encode_optional_head(intent.old, &mut encoded);
+    encode_optional_head(Some(intent.new), &mut encoded);
+    let checksum = blake3::hash(&encoded);
+    encoded.extend_from_slice(checksum.as_bytes());
+    atomic_write(root, &root.join(REPACK_INTENT_FILE), &encoded, durability)
+}
+
+fn encode_optional_head(head: CatalogHead, output: &mut Vec<u8>) {
+    match head {
+        Some((generation, digest)) => {
+            output.push(1);
+            output.extend_from_slice(&generation.to_be_bytes());
+            output.extend_from_slice(&digest);
+        }
+        None => output.push(0),
+    }
+}
+
+fn decode_optional_head(bytes: &[u8], offset: &mut usize) -> Result<CatalogHead, CatalogError> {
+    let present = *bytes
+        .get(*offset)
+        .ok_or(CatalogError::Corrupt("repack intent length"))?;
+    *offset += 1;
+    match present {
+        0 => Ok(None),
+        1 => {
+            let end = offset
+                .checked_add(40)
+                .ok_or(CatalogError::Corrupt("repack intent length"))?;
+            let value = bytes
+                .get(*offset..end)
+                .ok_or(CatalogError::Corrupt("repack intent length"))?;
+            *offset = end;
+            Ok(Some((
+                u64::from_be_bytes(value[..8].try_into().unwrap()),
+                value[8..].try_into().unwrap(),
+            )))
+        }
+        _ => Err(CatalogError::Corrupt("repack intent head flag")),
+    }
+}
+
+fn recover_repack_intent(
+    root: &Path,
+    current: CatalogHead,
+    durability: Durability,
+) -> Result<(), CatalogError> {
+    let path = root.join(REPACK_INTENT_FILE);
+    let encoded = match fs::read(&path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if encoded.len() < REPACK_INTENT_MAGIC.len() + 2 + CHECKSUM_LEN
+        || !encoded.starts_with(REPACK_INTENT_MAGIC)
+    {
+        return Err(CatalogError::Corrupt("repack intent format"));
+    }
+    let body_len = encoded.len() - CHECKSUM_LEN;
+    if blake3::hash(&encoded[..body_len]).as_bytes() != &encoded[body_len..] {
+        return Err(CatalogError::Corrupt("repack intent checksum"));
+    }
+    let mut offset = REPACK_INTENT_MAGIC.len();
+    let old = decode_optional_head(&encoded[..body_len], &mut offset)?;
+    let new = decode_optional_head(&encoded[..body_len], &mut offset)?
+        .ok_or(CatalogError::Corrupt("repack intent missing new head"))?;
+    if offset != body_len || (current != old && current != Some(new)) {
+        return Err(CatalogError::Corrupt("repack intent authority mismatch"));
+    }
+    if current == old {
+        let catalogs = root.join("catalog");
+        let encoded = read_catalog_bytes(&catalogs, new.0, new.1)?;
+        let snapshot = decode_physical_catalog_snapshot(&encoded)?;
+        if snapshot.generation != new.0 {
+            return Err(CatalogError::Corrupt("repack intent new generation"));
+        }
+        let segments = root.join("segments");
+        for source in authority_sources(&CatalogAuthority::V2(snapshot)) {
+            let segment_path = root.join(source.path);
+            let reader = SegmentReader::open(File::open(&segment_path)?)?;
+            if reader.id().0 != source.segment
+                || reader.metadata().total_length != source.stored_length
+            {
+                return Err(CatalogError::Corrupt("repack intent replacement segment"));
+            }
+            fs::remove_file(segment_path)?;
+        }
+        fs::remove_file(catalogs.join(format!("{}-{}.catalog", new.0, hex(&new.1))))?;
+        durability.sync_directory(&segments)?;
+        durability.sync_directory(&catalogs)?;
+    }
+    // When the new head is authoritative, normal opening authenticates it and
+    // then retires the old generation. The intent can be removed now because
+    // both branches have reached a self-describing authority.
+    remove_durable_file(root, &path, durability)
 }
 
 fn encode_state(state: ActivePublishedState, output: &mut Vec<u8>) {

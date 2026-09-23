@@ -1,6 +1,43 @@
 use wheat_core::*;
 
 #[test]
+fn physical_catalog_v2_round_trips_and_rejects_noncanonical_order() {
+    let snapshot = PhysicalCatalogSnapshot {
+        generation: 7,
+        segments: vec![
+            PhysicalSegmentDescriptor {
+                generation: 6,
+                sequence: 0,
+                segment: [1; 32],
+                stored_length: 100,
+            },
+            PhysicalSegmentDescriptor {
+                generation: 7,
+                sequence: 0,
+                segment: [2; 32],
+                stored_length: 200,
+            },
+        ],
+        content: PhysicalContentGeneration {
+            generation: 0,
+            manifest: [0; 32],
+        },
+    };
+    let encoded = encode_physical_catalog_snapshot(&snapshot).unwrap();
+    assert_eq!(
+        decode_physical_catalog_snapshot(&encoded).unwrap(),
+        snapshot
+    );
+
+    let mut invalid = snapshot;
+    invalid.segments.swap(0, 1);
+    assert_eq!(
+        encode_physical_catalog_snapshot(&invalid),
+        Err(SegmentRecordError::NonCanonicalEncoding)
+    );
+}
+
+#[test]
 fn physical_records_round_trip_and_footer_is_fixed() {
     let page = SegmentIndexPage {
         entries: vec![SegmentIndexEntry {

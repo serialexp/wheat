@@ -423,6 +423,16 @@ impl Repository {
         self.views.get(&view)
     }
 
+    /// Iterate the complete retained view authority in canonical ID order.
+    pub fn retained_views(&self) -> impl Iterator<Item = &RepositoryView> {
+        self.views.values()
+    }
+
+    /// Iterate authenticated parent-to-child view-lineage edges in canonical order.
+    pub fn view_lineage(&self) -> impl Iterator<Item = (ViewId, ViewId)> + '_ {
+        self.view_lineage.iter().copied()
+    }
+
     #[must_use]
     pub fn change(&self, change: ChangeId) -> Option<&Change> {
         self.changes.get(&change)

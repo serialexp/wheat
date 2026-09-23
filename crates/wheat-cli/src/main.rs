@@ -33,6 +33,7 @@ mod log_inspection;
 mod materialization;
 mod remote;
 mod remote_config;
+mod repack;
 mod repository_diff;
 mod rewrite_transaction;
 mod selection_recovery;
@@ -133,6 +134,8 @@ enum Command {
     /// Storage analysis and maintenance.
     #[command(subcommand)]
     Store(StoreCommand),
+    /// Repack a packed store without changing repository authority.
+    Repack(RepackArgs),
     /// Import a local Git repository into a fresh Wheat repository.
     Import(ImportArgs),
     /// Project Wheat revision history and push it to a Git branch.
@@ -205,6 +208,13 @@ enum WorkspaceCommand {
 enum StoreCommand {
     /// Show a detailed breakdown of where bytes live in the store.
     Analyze,
+}
+
+#[derive(Debug, Args)]
+struct RepackArgs {
+    /// Bypass the temporary-capacity preflight.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -571,6 +581,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Workspace(WorkspaceCommand::List) => "workspace.list",
         Command::Workspace(WorkspaceCommand::Unregister) => "workspace.unregister",
         Command::Store(StoreCommand::Analyze) => "store.analyze",
+        Command::Repack(_) => "repack",
         Command::Import(_) => "import",
         Command::Push(_) => "push",
         Command::Clone(_) => "clone",
@@ -1296,6 +1307,30 @@ fn execute(cli: Cli) -> Result<Success> {
             let _operation =
                 rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
             store_analyze::analyze(&store_root)
+        }
+        Command::Repack(arguments) => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            local::require_packed_layout(&store_root)?;
+            let local = open(&store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
+            let backend = repack::PackedRepackBackend::new(&store_root, &local)?;
+            let stdin = std::io::stdin();
+            let stderr = std::io::stderr();
+            let interactive = stdin.is_terminal() && stderr.is_terminal();
+            let mut input = stdin.lock();
+            let mut diagnostics = stderr.lock();
+            let mut io = repack::RepackIo {
+                input: &mut input,
+                diagnostics: &mut diagnostics,
+                interactive,
+            };
+            repack::run(
+                &backend,
+                arguments.force,
+                || repack::available_bytes(&store_root),
+                &mut io,
+            )
         }
         Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
         Command::Clone(arguments) => native_clone(arguments, cli.store.as_deref()),

@@ -23,6 +23,125 @@ fn assert_value(store: &mut PackedCatalog, value: SegmentRecord<'_>) {
     );
 }
 
+fn repack_options() -> CatalogRepackOptions {
+    CatalogRepackOptions {
+        max_records: 100,
+        target_segment_bytes: 32,
+    }
+}
+
+fn repack(store: &mut PackedCatalog) -> Result<CatalogRepackReport, CatalogError> {
+    let authority = store.physical_authority()?;
+    store.repack_structural(repack_options(), legacy_content_generation(), authority)
+}
+
+#[test]
+fn repack_converts_v1_to_v2_preserves_records_and_second_run_is_noop() {
+    let root = tempfile::tempdir().unwrap();
+    let values = [
+        record(b"one authenticated value"),
+        record(b"another authenticated value"),
+    ];
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+            .unwrap();
+    store.put_records(&values).unwrap();
+    let report = repack(&mut store).unwrap();
+    assert!(!report.no_op);
+    assert_eq!(report.source_body_reads, 2);
+    assert_eq!(report.max_resident_bodies, 1);
+    assert_eq!(report.generation_after, report.generation_before + 1);
+    assert!(store.test_is_v2());
+    for value in values {
+        assert_value(&mut store, value);
+    }
+    let publications = publication_names(root.path());
+    assert_eq!(publications.1.len(), 1);
+
+    let second = repack(&mut store).unwrap();
+    assert!(second.no_op);
+    assert_eq!(second.generation_before, second.generation_after);
+    drop(store);
+
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert!(reopened.test_is_v2());
+    for value in values {
+        assert_value(&mut reopened, value);
+    }
+}
+
+#[test]
+fn ordinary_publication_after_repack_remains_v2() {
+    let root = tempfile::tempdir().unwrap();
+    let first = record(b"first generation");
+    let second = record(b"later ordinary publication");
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+            .unwrap();
+    store.put_records(&[first]).unwrap();
+    repack(&mut store).unwrap();
+    store.put_records(&[second]).unwrap();
+    assert!(store.test_is_v2());
+    drop(store);
+
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert!(reopened.test_is_v2());
+    assert_value(&mut reopened, first);
+    assert_value(&mut reopened, second);
+}
+
+#[test]
+fn interrupted_repack_recovers_old_or_new_authority() {
+    for failpoint in [RepackFailpoint::AfterIntent, RepackFailpoint::AfterHead] {
+        let root = tempfile::tempdir().unwrap();
+        let values = [record(b"recover one"), record(b"recover two")];
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&values).unwrap();
+        store.test_set_repack_failpoint(failpoint);
+        assert!(repack(&mut store).is_err());
+        drop(store);
+
+        let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        for value in values {
+            assert_value(&mut reopened, value);
+        }
+        assert!(!root.path().join("repack.intent").exists());
+        assert_eq!(
+            reopened.test_is_v2(),
+            failpoint == RepackFailpoint::AfterHead
+        );
+    }
+}
+
+#[test]
+fn repack_inventory_limit_fails_before_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let values = [record(b"limit one"), record(b"limit two")];
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+            .unwrap();
+    store.put_records(&values).unwrap();
+    let head_before = fs::read(root.path().join("catalog.head")).unwrap();
+    let authority = store.physical_authority().unwrap();
+    assert!(matches!(
+        store.repack_structural(
+            CatalogRepackOptions {
+                max_records: 1,
+                target_segment_bytes: 32,
+            },
+            legacy_content_generation(),
+            authority,
+        ),
+        Err(CatalogError::RepackInventoryLimit { limit: 1 })
+    ));
+    assert_eq!(
+        fs::read(root.path().join("catalog.head")).unwrap(),
+        head_before
+    );
+}
+
 fn write_catalog_record(
     directory: &std::path::Path,
     record: &wheat_core::SegmentCatalogRecord,

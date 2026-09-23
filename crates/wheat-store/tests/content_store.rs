@@ -79,6 +79,34 @@ fn delta_chain_resolution() {
 }
 
 #[test]
+fn sixteen_link_delta_chain_resolves_and_seventeenth_falls_back_full() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let mut bytes = (0..8 * 1024)
+        .map(|offset| ((offset * 131 + offset / 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    let mut previous = store.put(&bytes).unwrap();
+    let mut ids = vec![previous];
+    for version in 1u64..=17 {
+        bytes[100..108].copy_from_slice(&version.to_be_bytes());
+        let id = ContentId::of(&bytes);
+        store.put_with_base(id, &bytes, previous).unwrap();
+        ids.push(id);
+        previous = id;
+    }
+    for id in ids {
+        assert!(store.get(id).is_ok());
+    }
+    let comparison_directory = tempfile::tempdir().unwrap();
+    let full_store = ContentStore::new(comparison_directory.path());
+    let full_id = full_store.put(&bytes).unwrap();
+    assert_eq!(
+        fs::metadata(store.path(previous)).unwrap().len(),
+        fs::metadata(full_store.path(full_id)).unwrap().len()
+    );
+}
+
+#[test]
 fn delta_falls_back_to_raw_for_unrelated_content() {
     let directory = tempfile::tempdir().unwrap();
     let store = ContentStore::new(directory.path());

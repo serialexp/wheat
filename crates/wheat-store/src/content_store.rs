@@ -142,7 +142,7 @@ pub(crate) fn resolve_delta_chain(
     let mut chain: Vec<Vec<u8>> = Vec::new();
     let mut current_id = id;
 
-    for _depth in 0..MAX_DELTA_CHAIN_DEPTH {
+    for depth in 0..=MAX_DELTA_CHAIN_DEPTH {
         let (header, stored) = fetch_raw(current_id)?;
 
         match codec::decode_payload(header.codec, stored, header.logical_length, usize::MAX)
@@ -195,13 +195,16 @@ pub(crate) fn resolve_delta_chain(
                 return Ok(result);
             }
             codec::DecodedPayload::Delta { base_id, patch, .. } => {
+                if depth == MAX_DELTA_CHAIN_DEPTH {
+                    return Err(ContentStoreError::DeltaChainTooDeep { id });
+                }
                 chain.push(patch);
                 current_id = base_id;
             }
         }
     }
 
-    Err(ContentStoreError::DeltaChainTooDeep { id })
+    unreachable!("bounded delta-chain loop always returns")
 }
 
 #[derive(Clone, Debug)]
@@ -337,19 +340,13 @@ impl ContentStore {
         {
             return self.put_with_id(id, bytes);
         }
-        // Limit delta chain depth. The resolution limit is
-        // MAX_DELTA_CHAIN_DEPTH (16), but deeper chains during import
-        // cause content-resolution failures when the commit_writer reads
-        // back content through the packed engine's cross-store chain
-        // resolver. Cap at depth 1 during import for now; deeper chains
-        // are a repack optimization.
-        // TODO: investigate why chains > 1 fail during staged import
-        // (the unit test passes with depth 14, but the full gothab import
-        // fails at depth ~3-4 with "content is missing").
+        // Keep the stored chain within the same 16-link bound enforced by
+        // resolution. A chain with 16 deltas still needs one final full-base
+        // read, so the resolver deliberately permits that terminal fetch.
         let base_depth = self
             .delta_chain_depth(base_id)
             .unwrap_or(MAX_DELTA_CHAIN_DEPTH);
-        if base_depth >= 1 {
+        if base_depth >= MAX_DELTA_CHAIN_DEPTH {
             return self.put_with_id(id, bytes);
         }
         // Try to compute a delta against the base content.

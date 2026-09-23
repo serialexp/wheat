@@ -629,6 +629,12 @@ impl SegmentReader {
         &self.entries_by_key
     }
 
+    /// Drop decompressed block scratch between streaming repack reads. This keeps
+    /// residency bounded by one block rather than by every block in a segment.
+    pub(crate) fn clear_block_cache(&mut self) {
+        self.block_cache.clear();
+    }
+
     /// Returns the authenticated index entry and its logically verified payload.
     /// The index is neither read nor decoded again, and the payload length is
     /// checked against `max` before allocating its output buffer.

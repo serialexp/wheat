@@ -61,11 +61,13 @@ pub use root_builders::{
     build_content_manifest_record, build_repository_state_record, build_view_record,
 };
 pub use segment_records::{
-    SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_NAMESPACE_CONTENT, SEGMENT_NAMESPACE_METADATA,
-    SEGMENT_PREFIX_ENCODED_SIZE, SegmentCatalogRecord, SegmentDirectory, SegmentDirectoryEntry,
-    SegmentFooter, SegmentId, SegmentIndexEntry, SegmentIndexKey, SegmentIndexPage,
-    SegmentRecordError, decode_segment_catalog_record, decode_segment_directory,
-    decode_segment_footer, decode_segment_index_page, decode_segment_prefix,
+    MAX_PHYSICAL_CATALOG_SEGMENTS, PhysicalCatalogSnapshot, PhysicalContentGeneration,
+    PhysicalSegmentDescriptor, SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_NAMESPACE_CONTENT,
+    SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE, SegmentCatalogRecord,
+    SegmentDirectory, SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry,
+    SegmentIndexKey, SegmentIndexPage, SegmentRecordError, decode_physical_catalog_snapshot,
+    decode_segment_catalog_record, decode_segment_directory, decode_segment_footer,
+    decode_segment_index_page, decode_segment_prefix, encode_physical_catalog_snapshot,
     encode_segment_catalog_record, encode_segment_directory, encode_segment_footer,
     encode_segment_index_page, encode_segment_prefix,
 };

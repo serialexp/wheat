@@ -164,6 +164,38 @@ impl LocalPublicationStore {
         RepositoryHead::decode(&bytes)
     }
 
+    /// Hold the repository publication lock while checking exact logical authority
+    /// and performing a physical-only commit.
+    pub(crate) fn with_repack_authority<T>(
+        &self,
+        expected: RepositoryHead,
+        operation: impl FnOnce() -> Result<T, crate::RepackError>,
+    ) -> Result<T, crate::RepackError> {
+        let parent = self
+            .head_path
+            .parent()
+            .ok_or_else(|| crate::RepackError::Authority("head path has no parent".into()))?;
+        fs::create_dir_all(parent)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock_path)?;
+        lock_exclusive(&lock)?;
+        let result = match self.read_unlocked() {
+            Ok(actual) if actual == expected => operation(),
+            Ok(_) => Err(crate::RepackError::StaleAuthority),
+            Err(error) => Err(crate::RepackError::Authority(error.to_string())),
+        };
+        let unlock_result = unlock(&lock);
+        match (result, unlock_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(crate::RepackError::Io(error)),
+        }
+    }
+
     fn write_unlocked(&self, head: RepositoryHead) -> Result<(), PublicationError> {
         let parent = self.head_path.parent().expect("validated head parent");
         let temporary = self.head_path.with_extension(format!(

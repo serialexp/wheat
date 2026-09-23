@@ -602,6 +602,23 @@ removal, and whether old objects merely became GC candidates. Squash does not
 physically delete bytes. That is the separate destructive `wheat gc` operation;
 physical representation changes belong to nondestructive `wheat repack`.
 
+`wheat repack [--force]` is implemented for existing local packed/hybrid stores. It
+holds store-wide mutation admission while a read-only plan authenticates the exact
+repository and physical authorities and estimates temporary capacity. Insufficient or
+unmeasurable capacity asks for confirmation only on an interactive terminal;
+non-interactive use must pass `--force`, which bypasses only this capacity gate. After
+admission, repack streams every authenticated structural record into bounded replacement
+segments and writes one authenticated content-generation pack. Every maximal retained
+file lineage tip is full, historical content reverse-deltas toward a deterministic newer
+version with depth at most 16, and ambiguous lineage falls back to full content. One V2
+physical-catalog head commit selects both representations; interruption recovers to all
+old or all new, and old local files retire immediately under the process-exclusive reader
+lock. Repository head bytes/generation/envelope, logical IDs, retained and unrelated
+physical inventory, workspace metadata, and materialized files remain unchanged. A
+canonical second invocation is a true no-op. Wholly loose stores and remote/shared
+backends are refused; loose migration and server-authoritative maintenance remain
+separate work.
+
 ## Identity, messages, and configuration
 
 Native authoring uses this Phase 1 identity precedence contract:

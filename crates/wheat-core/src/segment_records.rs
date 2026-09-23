@@ -106,6 +106,40 @@ pub struct SegmentCatalogRecord {
     pub stored_length: u64,
 }
 
+/// One immutable segment named by a V2 physical catalog snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalSegmentDescriptor {
+    /// Physical generation used in the canonical segment filename.
+    pub generation: u64,
+    /// Stable position among segments created in that generation.
+    pub sequence: u64,
+    pub segment: [u8; 32],
+    pub stored_length: u64,
+}
+
+/// Content-envelope authority selected alongside structural segments.
+///
+/// Generation zero with an all-zero manifest denotes the legacy content layout.
+/// Store-side structural repack deliberately preserves that layout unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalContentGeneration {
+    pub generation: u64,
+    pub manifest: [u8; 32],
+}
+
+/// Complete authenticated physical authority for a local packed store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalCatalogSnapshot {
+    pub generation: u64,
+    pub segments: Vec<PhysicalSegmentDescriptor>,
+    pub content: PhysicalContentGeneration,
+}
+
+/// Hard allocation bound for an authenticated V2 catalog snapshot.
+pub const MAX_PHYSICAL_CATALOG_SEGMENTS: usize = 1_000_000;
+const PHYSICAL_CATALOG_MAGIC: [u8; 4] = 0x5748_4354_u32.to_be_bytes();
+const PHYSICAL_CATALOG_V2: u16 = 2;
+
 impl SegmentFooter {
     pub fn segment_id(&self) -> SegmentId {
         SegmentId(self.body_digest)
@@ -396,4 +430,112 @@ pub fn decode_segment_catalog_record(
         stored_length: w.stored_length,
     };
     checked(bytes, record, encoded)
+}
+
+/// Canonically encodes a complete V2 physical catalog snapshot.
+///
+/// The small hand-written envelope intentionally shares the existing catalog
+/// magic while retaining the generated V1 decoder unchanged. Integer fields are
+/// big-endian and descriptors must be sorted by contiguous sequence number.
+pub fn encode_physical_catalog_snapshot(
+    snapshot: &PhysicalCatalogSnapshot,
+) -> Result<Vec<u8>, SegmentRecordError> {
+    validate_physical_catalog_snapshot(snapshot)?;
+    let count =
+        u32::try_from(snapshot.segments.len()).map_err(|_| SegmentRecordError::InvalidCount)?;
+    let capacity = 4 + 2 + 8 + 4 + snapshot.segments.len() * 56 + 8 + 32;
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.extend_from_slice(&PHYSICAL_CATALOG_MAGIC);
+    encoded.extend_from_slice(&PHYSICAL_CATALOG_V2.to_be_bytes());
+    encoded.extend_from_slice(&snapshot.generation.to_be_bytes());
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for descriptor in &snapshot.segments {
+        encoded.extend_from_slice(&descriptor.generation.to_be_bytes());
+        encoded.extend_from_slice(&descriptor.sequence.to_be_bytes());
+        encoded.extend_from_slice(&descriptor.segment);
+        encoded.extend_from_slice(&descriptor.stored_length.to_be_bytes());
+    }
+    encoded.extend_from_slice(&snapshot.content.generation.to_be_bytes());
+    encoded.extend_from_slice(&snapshot.content.manifest);
+    Ok(encoded)
+}
+
+/// Decodes and canonical-validates a complete V2 physical catalog snapshot.
+pub fn decode_physical_catalog_snapshot(
+    bytes: &[u8],
+) -> Result<PhysicalCatalogSnapshot, SegmentRecordError> {
+    const HEADER: usize = 4 + 2 + 8 + 4;
+    const DESCRIPTOR: usize = 8 + 8 + 32 + 8;
+    const CONTENT: usize = 8 + 32;
+    if bytes.len() < HEADER + CONTENT
+        || bytes[..4] != PHYSICAL_CATALOG_MAGIC
+        || u16::from_be_bytes(bytes[4..6].try_into().unwrap()) != PHYSICAL_CATALOG_V2
+    {
+        return Err(SegmentRecordError::Decode(
+            "not a V2 physical catalog snapshot".into(),
+        ));
+    }
+    let generation = u64::from_be_bytes(bytes[6..14].try_into().unwrap());
+    let count = u32::from_be_bytes(bytes[14..18].try_into().unwrap()) as usize;
+    if count > MAX_PHYSICAL_CATALOG_SEGMENTS
+        || HEADER
+            .checked_add(
+                count
+                    .checked_mul(DESCRIPTOR)
+                    .ok_or(SegmentRecordError::InvalidCount)?,
+            )
+            .and_then(|length| length.checked_add(CONTENT))
+            != Some(bytes.len())
+    {
+        return Err(SegmentRecordError::InvalidCount);
+    }
+    let mut segments = Vec::with_capacity(count);
+    let mut offset = HEADER;
+    for _ in 0..count {
+        segments.push(PhysicalSegmentDescriptor {
+            generation: u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+            sequence: u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()),
+            segment: bytes[offset + 16..offset + 48].try_into().unwrap(),
+            stored_length: u64::from_be_bytes(bytes[offset + 48..offset + 56].try_into().unwrap()),
+        });
+        offset += DESCRIPTOR;
+    }
+    let snapshot = PhysicalCatalogSnapshot {
+        generation,
+        segments,
+        content: PhysicalContentGeneration {
+            generation: u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+            manifest: bytes[offset + 8..offset + 40].try_into().unwrap(),
+        },
+    };
+    validate_physical_catalog_snapshot(&snapshot)?;
+    if encode_physical_catalog_snapshot(&snapshot)? != bytes {
+        return Err(SegmentRecordError::NonCanonicalEncoding);
+    }
+    Ok(snapshot)
+}
+
+fn validate_physical_catalog_snapshot(
+    snapshot: &PhysicalCatalogSnapshot,
+) -> Result<(), SegmentRecordError> {
+    if snapshot.segments.len() > MAX_PHYSICAL_CATALOG_SEGMENTS {
+        return Err(SegmentRecordError::InvalidCount);
+    }
+    if snapshot.segments.windows(2).any(|pair| {
+        (pair[0].generation, pair[0].sequence) >= (pair[1].generation, pair[1].sequence)
+    }) || snapshot
+        .segments
+        .iter()
+        .any(|descriptor| descriptor.stored_length == 0)
+    {
+        return Err(SegmentRecordError::NonCanonicalEncoding);
+    }
+    if snapshot
+        .segments
+        .windows(2)
+        .any(|pair| pair[0].segment == pair[1].segment)
+    {
+        return Err(SegmentRecordError::NonCanonicalEncoding);
+    }
+    Ok(())
 }
