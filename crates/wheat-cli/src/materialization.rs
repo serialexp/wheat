@@ -25,7 +25,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{FileKind, FileValue, TreeId, ViewId};
 use wheat_store::{
-    MerkleTreeStore, PublicationStore, RepositoryHead, TreeDiffLimits, TreeFile, TreeWalkLimits,
+    ContentStore, MerkleTreeStore, PublicationStore, RepositoryHead, TreeDiffLimits, TreeFile,
+    TreeWalkLimits,
 };
 
 use crate::{
@@ -48,7 +49,7 @@ const PROGRESS_OPCODE_INSTALL_INTENT: u16 = 1;
 const PROGRESS_OPCODE_COMPLETE: u16 = 2;
 const PROGRESS_OPCODE_ABORTED: u16 = 3;
 const MAX_JOURNAL_BYTES: usize = 192 * 1024 * 1024;
-const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 // ContentStore currently returns owned Vecs. A replacement needs old and new
 // bytes concurrently to authenticate both sides of an exchange; workspace,
 // staged, and displaced regular files are streamed through a fixed 64 KiB
@@ -98,7 +99,42 @@ fn invalidated_install(install: &Install, message: String) -> anyhow::Error {
     }
 }
 
-fn path_is_absent(root: &Path, path: &str) -> Result<bool> {
+/// Report whether the workspace leaf at `path` is exactly `value`: the same kind and raw
+/// bytes that materializing `value` would write, or an absent path when `value` is `None`.
+///
+/// Obstructions that materialization would refuse (an intermediate symlink, an unsupported
+/// file type, or an oversized leaf) are reported as a mismatch rather than an error.
+pub(crate) fn workspace_holds(
+    root: &Path,
+    content: &ContentStore,
+    path: &str,
+    value: Option<FileValue>,
+) -> Result<bool> {
+    let Some(value) = value else {
+        return path_is_absent(root, path);
+    };
+    let bytes = content.get(value.content)?;
+    ensure!(
+        bytes.len() <= MAX_FILE_BYTES,
+        "materialized file exceeds byte limit"
+    );
+    match authenticate_workspace_file(
+        root,
+        Path::new(path),
+        Some((value.kind, &bytes)),
+        MAX_FILE_BYTES,
+    ) {
+        Ok(matches) => Ok(matches),
+        Err(
+            WorkspaceFileError::IntermediateSymlink
+            | WorkspaceFileError::UnsupportedFileType
+            | WorkspaceFileError::TooLarge { .. },
+        ) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn path_is_absent(root: &Path, path: &str) -> Result<bool> {
     match observe_workspace_file(root, Path::new(path), 0) {
         Ok(None) => Ok(true),
         Ok(Some(_))
@@ -465,6 +501,7 @@ pub(crate) async fn materialize_locked(
             })
             .collect()
     };
+    let installs = preflight_materialization(root, repository, installs)?;
     let journal = Journal {
         version: VERSION,
         operation: Operation::Materialize,
@@ -481,7 +518,6 @@ pub(crate) async fn materialize_locked(
         installs,
     };
     let planner = PlannerContext::new(&journal.installs);
-    authenticate_preflight(root, repository, &journal.installs, &planner)?;
     checkpoint("preflight-complete")?;
     ensure!(
         repository.heads.read()? == head,
@@ -1213,13 +1249,75 @@ fn authenticate_install_preimage(
     )?)
 }
 
+/// Authenticate a materialization plan and drop the leaf operations the workspace
+/// already satisfies.
+///
+/// A leaf that no longer holds its pinned value but already holds the exact target
+/// value, or is already absent when the target deletes it, needs no installation.
+/// Dropping it lets `materialize` proceed over paths that were written by other
+/// means, such as captured workspace bytes, without overwriting anything. Every
+/// other mismatch is refused exactly as before.
+fn preflight_materialization(
+    root: &Path,
+    repository: &LocalRepository,
+    installs: Vec<Install>,
+) -> Result<Vec<Install>> {
+    let satisfied = authenticate_preflight_with(
+        root,
+        repository,
+        &installs,
+        &PlannerContext::new(&installs),
+        SatisfiedLeaves::Accept,
+    )?;
+    if satisfied.is_empty() {
+        return Ok(installs);
+    }
+    let remaining = installs
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !satisfied.contains(index))
+        .map(|(_, install)| install)
+        .collect::<Vec<_>>();
+    // Dropping operations can change the directory-replacement plan, so authenticate
+    // the remaining plan exactly as it will be journaled.
+    authenticate_preflight(
+        root,
+        repository,
+        &remaining,
+        &PlannerContext::new(&remaining),
+    )?;
+    Ok(remaining)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SatisfiedLeaves {
+    Refuse,
+    Accept,
+}
+
 fn authenticate_preflight(
     root: &Path,
     repository: &LocalRepository,
     installs: &[Install],
     planner: &PlannerContext,
 ) -> Result<()> {
-    for install in installs {
+    let satisfied =
+        authenticate_preflight_with(root, repository, installs, planner, SatisfiedLeaves::Refuse)?;
+    debug_assert!(satisfied.is_empty());
+    Ok(())
+}
+
+/// Returns the indexes of plain leaf operations whose target the workspace already
+/// holds. The set is always empty under [`SatisfiedLeaves::Refuse`].
+fn authenticate_preflight_with(
+    root: &Path,
+    repository: &LocalRepository,
+    installs: &[Install],
+    planner: &PlannerContext,
+    satisfied_leaves: SatisfiedLeaves,
+) -> Result<BTreeSet<usize>> {
+    let mut satisfied = BTreeSet::new();
+    for (index, install) in installs.iter().enumerate() {
         if planner.is_shadowed_by_removed_leaf(&install.path) {
             continue;
         }
@@ -1259,13 +1357,21 @@ fn authenticate_preflight(
                 install.path
             )));
         }
+        if !matches
+            && satisfied_leaves == SatisfiedLeaves::Accept
+            && workspace_holds(root, &repository.content, &install.path, install.new)
+                .with_context(|| format!("preflight workspace path {:?}", install.path))?
+        {
+            satisfied.insert(index);
+            continue;
+        }
         ensure!(
             matches,
             "workspace path {:?} changed from its exact observed value",
             install.path
         );
     }
-    Ok(())
+    Ok(satisfied)
 }
 
 fn roll_forward(

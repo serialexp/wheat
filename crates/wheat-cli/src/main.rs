@@ -20,6 +20,7 @@ use wheat_store::{
 };
 mod active_changes;
 mod authoring_metadata;
+mod capture_settlement;
 mod command_output;
 mod conflict_inspection;
 mod diff_render;
@@ -1048,17 +1049,50 @@ fn execute(cli: Cli) -> Result<Success> {
                 expected,
                 prepared,
             ))?;
+            // Settle the materialized pin before anything is published, so a settlement
+            // failure leaves the repository and workspace metadata unchanged. Its tree
+            // nodes join the batch flushed below.
+            let settlement = context
+                .workspace
+                .materialized
+                .as_ref()
+                .map(|pinned| {
+                    runtime.block_on(capture_settlement::settle(
+                        &context.root,
+                        &objects,
+                        &local.content,
+                        pinned,
+                        publication.proposed(),
+                        resulting_frontier,
+                        change,
+                        &paths,
+                    ))
+                })
+                .transpose()?;
             context.workspace.pending_repository_operation = Some(PendingRepositoryOperation {
                 expected_head: publication.expected().into(),
                 proposed_head: publication.proposed().into(),
                 resulting_frontier,
                 selected_change: context.workspace.selected_change,
             });
-            workspace_registry_service::reconcile(
-                &context.root,
-                &context.store_root,
-                &context.workspace,
-            )?;
+            match &settlement {
+                // Root the settled pin before metadata can reference it. If the
+                // publication is interrupted, recovery keeps the previous pin and the
+                // next reconciliation releases this root.
+                Some(settlement) => workspace_registry_service::transition_materialization(
+                    &context.root,
+                    &context.store_root,
+                    &context.workspace,
+                    settlement.materialized.repository_head.into(),
+                    settlement.materialized.view,
+                    settlement.materialized.tree,
+                )?,
+                None => workspace_registry_service::reconcile(
+                    &context.root,
+                    &context.store_root,
+                    &context.workspace,
+                )?,
+            }
             context
                 .workspace
                 .replace_prepared(&context.root)?
@@ -1069,6 +1103,9 @@ fn execute(cli: Cli) -> Result<Success> {
             context.workspace.selected_frontier =
                 (resulting_frontier != context.workspace.basis).then_some(resulting_frontier);
             context.workspace.pending_repository_operation = None;
+            if let Some(settlement) = &settlement {
+                context.workspace.materialized = Some(settlement.materialized.clone());
+            }
             context
                 .workspace
                 .replace_prepared(&context.root)?
@@ -1093,6 +1130,21 @@ fn execute(cli: Cli) -> Result<Success> {
                 writeln!(output, "selected change remains {selected}")?;
             }
             print_reapplied(&mut output, &outcome.reapplied)?;
+            let materialize_required = settlement
+                .as_ref()
+                .is_none_or(|settlement| !settlement.complete);
+            let diverged = settlement
+                .as_ref()
+                .map_or(&[][..], |settlement| settlement.diverged.as_slice());
+            for path in diverged {
+                writeln!(output, "diverged {path}")?;
+            }
+            if materialize_required {
+                writeln!(
+                    output,
+                    "lineage changed: the working view includes changes this workspace has not materialized; run `wheat materialize` to update it",
+                )?;
+            }
             Success::new(
                 "add",
                 json!({
@@ -1100,6 +1152,8 @@ fn execute(cli: Cli) -> Result<Success> {
                     "revision": outcome.revision_id.to_string(),
                     "paths": path_count,
                     "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "materialize_required": materialize_required,
+                    "diverged": diverged,
                 }),
                 output,
             )

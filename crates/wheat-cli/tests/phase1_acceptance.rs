@@ -697,18 +697,12 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     let conflicts_reopened = harness.ok(&harness.workspace, &["conflicts", "--format=json"]);
     assert_eq!(conflicts_reopened.stdout, conflicts_first.stdout);
 
-    // Restore the exact pinned imported view before moving the workspace pin. Materialization
-    // refuses to discard local edits, including the ancestor bytes used for revision capture.
-    fs::write(harness.workspace.join("shared.txt"), b"imported\n").unwrap();
-    fs::write(
-        harness.workspace.join("tool.sh"),
-        b"#!/bin/sh\necho imported\n",
-    )
-    .unwrap();
-    set_executable(&harness.workspace.join("tool.sh"));
-    fs::remove_file(harness.workspace.join("current")).unwrap();
-    symlink("shared.txt", harness.workspace.join("current")).unwrap();
-    fs::remove_file(harness.workspace.join("nested/created.txt")).unwrap();
+    // Every capture was authored from this workspace and the reapplied descendant's
+    // surviving paths are already on disk, so each add settled the pin in place.
+    assert!(!revised_text.contains("lineage changed"));
+    let settled_status = harness.json_ok(&harness.workspace, &["status"]);
+    assert_eq!(settled_status["result"]["authority_advanced"], false);
+    assert_eq!(settled_status["result"]["changes"], serde_json::json!([]));
 
     // Conflicted working state remains materializable and includes successful descendant paths.
     harness.ok(&harness.workspace, &["materialize"]);
