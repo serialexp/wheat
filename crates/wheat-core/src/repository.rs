@@ -7,7 +7,7 @@ use crate::{
     Application, ApplicationContext, ApplicationId, ApplicationRecord, ApplicationResult,
     AppliedEditEvidence, ByteRange, CanonicalObject, Change, ChangeId, ChangeMetadata,
     ChangeRevision, Conflict, ConflictId, ConflictResolution, ContentIo, DependencyGraph,
-    EditFailure, EditId, EditRecord, FailedEditEvidence, ObjectId, RepositoryClosure,
+    EditFailure, EditId, EditRecord, FailedEditEvidence, ObjectId, RejectedEdit, RepositoryClosure,
     RepositoryState, RepositoryStateId, RepositoryStateRecord, RepositoryView, RevisionEdits,
     RevisionId, RevisionMetadata, RevisionRecord, Tree, ViewId,
 };
@@ -63,8 +63,8 @@ pub enum RepositoryError {
     StaleRevision(ChangeId),
     #[error("dependency {0} does not exist")]
     UnknownDependency(ChangeId),
-    #[error("authored edits do not apply cleanly")]
-    InvalidEdits,
+    #[error("authored edits do not apply cleanly: {}", describe_rejected(.0))]
+    InvalidEdits(Vec<RejectedEdit>),
     #[error("revision edit transition is invalid: {0}")]
     InvalidEditTransition(&'static str),
     #[error("edit application failed: {0}")]
@@ -77,6 +77,26 @@ pub enum RepositoryError {
     InvalidConflictResolution,
     #[error("repository state violates an identity invariant: {0}")]
     InvalidRepositoryState(&'static str),
+}
+
+/// Rejected edits shown in an error message; a large import can reject many, so
+/// only the first few are listed.
+const SHOWN_REJECTED_EDITS: usize = 5;
+
+fn describe_rejected(rejected: &[RejectedEdit]) -> String {
+    let mut description = rejected
+        .iter()
+        .take(SHOWN_REJECTED_EDITS)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if rejected.len() > SHOWN_REJECTED_EDITS {
+        description.push_str(&format!(
+            "; and {} more",
+            rejected.len() - SHOWN_REJECTED_EDITS
+        ));
+    }
+    description
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -981,8 +1001,14 @@ impl Repository {
             let pending_id = RevisionId::from_digest([0; 32]);
             let preliminary =
                 application::execute(pending_id, &target, &proposal.edits.edits, context, false)?;
-            let ApplicationResult::Clean { tree } = &preliminary.result else {
-                return Err(RepositoryError::InvalidEdits);
+            let tree = match &preliminary.result {
+                ApplicationResult::Clean { tree } => tree,
+                ApplicationResult::Conflicted { conflict, .. } => {
+                    return Err(RepositoryError::InvalidEdits(RejectedEdit::collect(
+                        &proposal.edits.edits,
+                        &conflict.edits,
+                    )));
+                }
             };
             let mut revision = ChangeRevision {
                 id: RevisionId::from_digest([0; 32]),
@@ -1065,11 +1091,14 @@ impl Repository {
             context,
             false,
         )?;
-        let ApplicationResult::Clean {
-            tree: authored_tree,
-        } = &preliminary.result
-        else {
-            return Err(RepositoryError::InvalidEdits);
+        let authored_tree = match &preliminary.result {
+            ApplicationResult::Clean { tree } => tree,
+            ApplicationResult::Conflicted { conflict, .. } => {
+                return Err(RepositoryError::InvalidEdits(RejectedEdit::collect(
+                    &edits.edits,
+                    &conflict.edits,
+                )));
+            }
         };
         let mut revision = ChangeRevision {
             id: RevisionId::from_digest([0; 32]),

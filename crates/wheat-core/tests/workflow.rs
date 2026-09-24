@@ -773,7 +773,11 @@ fn failed_creation_does_not_leave_a_descendant_that_panics_on_reapplication() {
             exact(&io, "missing", Some("nope"), Some("value")),
             ctx
         ),
-        Err(RepositoryError::InvalidEdits)
+        Err(RepositoryError::InvalidEdits(vec![RejectedEdit {
+            path: "missing".into(),
+            target: None,
+            reason: EditFailure::ExpectedFileMismatch,
+        }]))
     );
     let old = current_edits(&repository, effective, a);
     repository
@@ -905,4 +909,39 @@ fn mutations_return_retained_views_without_changing_the_base_selection() {
             .tree
             .contains_key("a")
     );
+}
+
+/// The rejected-edits message names each failed path and its reason, and lists only
+/// the first few when an import rejects many.
+#[test]
+fn rejected_edits_message_names_paths_and_bounds_the_list() {
+    let rejected = |path: &str, target: Option<FileValue>, reason: EditFailure| RejectedEdit {
+        path: path.into(),
+        target,
+        reason,
+    };
+    let existing = Some(FileValue {
+        content: ContentId::of(b"x"),
+        kind: FileKind::Regular,
+    });
+    let error = RepositoryError::InvalidEdits(vec![
+        rejected("a", existing, EditFailure::ExpectedFileMismatch),
+        rejected("b", None, EditFailure::KindMismatch),
+        rejected("c", existing, EditFailure::NoMatch),
+    ]);
+    assert_eq!(
+        error.to_string(),
+        "authored edits do not apply cleanly: \
+         a: the current file differs from the edit's expected file (the path exists); \
+         b: the edit expects a file, but the path does not exist; \
+         c: the guarded text is not found"
+    );
+
+    let many = (0..8)
+        .map(|index| rejected(&format!("p{index}"), None, EditFailure::NoMatch))
+        .collect();
+    let message = RepositoryError::InvalidEdits(many).to_string();
+    assert!(message.contains("p4: "), "{message}");
+    assert!(!message.contains("p5: "), "{message}");
+    assert!(message.ends_with("; and 3 more"), "{message}");
 }

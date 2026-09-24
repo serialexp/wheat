@@ -106,6 +106,27 @@ pub(crate) struct Active {
     reverse_dependencies: BTreeMap<ChangeId, BTreeSet<ChangeId>>,
 }
 
+/// An application of a revision's edits, with the evidence for each edit that failed
+/// (the recorded conflict's edits; empty when the application is clean).
+pub(crate) struct AppliedEdits {
+    pub(crate) application: ApplicationRecord,
+    pub(crate) failed: BTreeMap<EditId, FailedEditEvidence>,
+}
+
+impl AppliedEdits {
+    /// The clean resulting tree, or [`RepositoryError::InvalidEdits`] naming each edit
+    /// that failed and why.
+    fn clean_tree(&self, edits: &BTreeMap<EditId, EditRecord>) -> Result<TreeId> {
+        match self.application.result {
+            ApplicationResultRecord::Clean { tree } => Ok(tree),
+            ApplicationResultRecord::Conflicted { .. } => Err(RepositoryError::InvalidEdits(
+                RejectedEdit::collect(edits, &self.failed),
+            )
+            .into()),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Fresh {
     pub(crate) changes: BTreeSet<ChangeObjectId>,
@@ -194,9 +215,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 false,
             )
             .await?;
-        let ApplicationResultRecord::Clean { tree } = preliminary.result else {
-            return Err(RepositoryError::InvalidEdits.into());
-        };
+        let tree = preliminary.clean_tree(&proposal.edits.edits)?;
         let revision = RevisionRecord {
             change_id: proposal.id,
             metadata: proposal.revision_metadata,
@@ -453,9 +472,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 false,
             )
             .await?;
-        let ApplicationResultRecord::Clean { tree } = preliminary.result else {
-            return Err(RepositoryError::InvalidEdits.into());
-        };
+        let tree = preliminary.clean_tree(&edits.edits)?;
         let revision = RevisionRecord {
             change_id: change,
             metadata,
@@ -646,7 +663,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         for change in order.into_iter().skip(prefix) {
             let (revision_id, revision) = &active.revisions[&change];
             let edits = self.load_edits(revision).await?;
-            let application = self.apply(*revision_id, &view, &edits, fresh, true).await?;
+            let application = self
+                .apply(*revision_id, &view, &edits, fresh, true)
+                .await?
+                .application;
             let application_id = application.id();
             let tree = match application.result {
                 ApplicationResultRecord::Clean { tree } => tree,
@@ -722,7 +742,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         edits: &BTreeMap<EditId, EditRecord>,
         fresh: &mut Fresh,
         persist: bool,
-    ) -> Result<ApplicationRecord> {
+    ) -> Result<AppliedEdits> {
         let trees = MerkleTreeStore::new(self.objects);
         let paths = edit_paths(edits);
         let mut flat = Tree::new();
@@ -824,8 +844,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 }
             }
         }
-        let result = if failed.is_empty() {
-            ApplicationResultRecord::Clean { tree }
+        let (result, failed) = if failed.is_empty() {
+            (ApplicationResultRecord::Clean { tree }, failed)
         } else {
             let conflict = Conflict::new(target.id(), failed);
             if persist {
@@ -834,10 +854,13 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                     .await?;
                 fresh.objects += 1;
             }
-            ApplicationResultRecord::Conflicted {
-                partial_tree: tree,
-                conflict: conflict.id,
-            }
+            (
+                ApplicationResultRecord::Conflicted {
+                    partial_tree: tree,
+                    conflict: conflict.id,
+                },
+                conflict.edits,
+            )
         };
         let application = ApplicationRecord {
             revision_id: revision,
@@ -852,7 +875,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             fresh.objects += 1;
             fresh.applications.insert(application.id());
         }
-        Ok(application)
+        Ok(AppliedEdits {
+            application,
+            failed,
+        })
     }
 
     async fn update_visible_manifest(

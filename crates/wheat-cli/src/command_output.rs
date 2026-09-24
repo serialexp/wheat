@@ -360,8 +360,43 @@ fn bounded_text(message: String) -> String {
     bounded
 }
 
+/// The error a transparent [`RepositoryMutationError`] wraps, or `cause` itself.
+///
+/// A transparent variant forwards `source()` to its inner error's source, so the
+/// inner error never appears in an [`Error::chain`] on its own.
+fn unwrap_mutation<'a>(
+    cause: &'a (dyn std::error::Error + 'static),
+) -> &'a (dyn std::error::Error + 'static) {
+    let Some(mutation) = cause.downcast_ref::<RepositoryMutationError>() else {
+        return cause;
+    };
+    match mutation {
+        RepositoryMutationError::Publication(inner) => inner,
+        RepositoryMutationError::Model(inner) => inner,
+        RepositoryMutationError::Revisions(inner) => inner,
+        RepositoryMutationError::Changes(inner) => inner,
+        RepositoryMutationError::Applications(inner) => inner,
+        RepositoryMutationError::Collections(inner) => inner,
+        RepositoryMutationError::ViewLineage(inner) => inner,
+        RepositoryMutationError::Trees(inner) => inner,
+        RepositoryMutationError::Objects(inner) => inner,
+        RepositoryMutationError::Commit(inner) => inner,
+        RepositoryMutationError::Stale { .. } | RepositoryMutationError::FrontierDependencies => {
+            cause
+        }
+    }
+}
+
+/// The [`RepositoryError`] behind `error`, including one a mutation wraps.
+pub(crate) fn repository_error(error: &Error) -> Option<&RepositoryError> {
+    error
+        .chain()
+        .find_map(|cause| unwrap_mutation(cause).downcast_ref::<RepositoryError>())
+}
+
 fn classify(error: &Error) -> Classification {
     for cause in error.chain() {
+        let cause = unwrap_mutation(cause);
         if let Some(failure) = cause.downcast_ref::<CliFailure>() {
             return match failure {
                 CliFailure::UnsupportedPlatform => {
@@ -517,6 +552,7 @@ fn classify(error: &Error) -> Classification {
                 RepositoryError::InvalidRepositoryState(_) => {
                     class("integrity", "corrupt_repository", false, 6)
                 }
+                RepositoryError::InvalidEdits(_) => class("input", "edits_do_not_apply", false, 2),
                 _ => class("input", "invalid_repository_operation", false, 2),
             };
         }
@@ -625,6 +661,32 @@ mod tests {
         assert_eq!(classified.code, "stale_state");
         assert!(classified.retryable);
         assert_eq!(classified.exit, 3);
+    }
+
+    /// A mutation wraps model errors transparently, which hides them from the error
+    /// chain; they still classify by the model error.
+    #[test]
+    fn model_errors_inside_a_mutation_keep_their_class() {
+        let stale: Error = RepositoryMutationError::Model(RepositoryError::StaleRevision(
+            wheat_core::ChangeId::new(),
+        ))
+        .into();
+        let classified = classify(&stale);
+        assert_eq!((classified.code, classified.exit), ("stale_revision", 3));
+
+        let rejected: Error =
+            RepositoryMutationError::Model(RepositoryError::InvalidEdits(Vec::new())).into();
+        let classified = classify(&rejected.context("hint"));
+        assert_eq!(
+            (classified.code, classified.exit),
+            ("edits_do_not_apply", 2)
+        );
+
+        let missing: Error = RepositoryMutationError::Objects(ObjectStoreError::Missing(
+            wheat_core::ObjectId::of_canonical_bytes(b"x"),
+        ))
+        .into();
+        assert_eq!(classify(&missing).code, "missing_object");
     }
 
     #[test]

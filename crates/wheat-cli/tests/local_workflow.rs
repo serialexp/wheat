@@ -692,6 +692,79 @@ fn failed_mutation_keeps_head_and_emits_no_success() {
     assert!(wheat(dir.path(), &["status"]).status.success());
 }
 
+/// An initial edit whose `--expected` file does not match says which path failed,
+/// why, and how to fix it, and classifies as an input error.
+#[test]
+fn initial_edit_that_does_not_apply_explains_expected() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(wheat(dir.path(), &["init"]).status.success());
+    let created = wheat(
+        dir.path(),
+        &["change", "new", "--path", "file", "--value", "one"],
+    );
+    assert!(created.status.success());
+    let change = field(&created, "change");
+
+    let cases: [(&[&str], &str); 3] = [
+        (
+            &["--path", "file", "--value", "two"],
+            "file already exists; pass --expected with its current content to change it",
+        ),
+        (
+            &["--path", "absent", "--expected", "one", "--value", "two"],
+            "absent does not exist; omit --expected to create it",
+        ),
+        (
+            &["--path", "file", "--expected", "wrong", "--value", "two"],
+            "file does not match --expected",
+        ),
+    ];
+    for (edit, hint) in cases {
+        let mut arguments = vec!["change", "new", "--depends-on", &change];
+        arguments.extend_from_slice(edit);
+        let failed = wheat(dir.path(), &arguments);
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert_eq!(failed.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains(hint), "{stderr}");
+        assert!(
+            stderr.contains("authored edits do not apply cleanly: "),
+            "{stderr}"
+        );
+    }
+    // Without --depends-on the change is created on the frontier.
+    let failed = wheat(
+        dir.path(),
+        &["change", "new", "--path", "file", "--value", "two"],
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert_eq!(failed.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("file already exists"), "{stderr}");
+
+    let failed = wheat(
+        dir.path(),
+        &[
+            "--format",
+            "json",
+            "change",
+            "new",
+            "--message",
+            "test revision",
+            "--depends-on",
+            &change,
+            "--path",
+            "file",
+            "--value",
+            "two",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(2));
+    let envelope: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "edits_do_not_apply");
+    assert!(envelope["error"]["message"].as_str().unwrap().contains(
+        "file: the current file differs from the edit's expected file (the path exists)"
+    ));
+}
+
 #[test]
 fn corrupted_canonical_state_is_not_replaced() {
     use wheat_store::{LocalPublicationStore, PublicationStore};

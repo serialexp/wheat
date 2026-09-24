@@ -10,8 +10,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
-    ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditTransition, FileKind,
-    FileValue, RevisionEdits, RevisionId, ViewId, guarded::Limits,
+    ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditFailure, EditTransition,
+    FileKind, FileValue, RepositoryError, RevisionEdits, RevisionId, ViewId, guarded::Limits,
 };
 use wheat_store::{
     ApplicationMapStore, BatchObjectStore, MerkleTreeStore, PersistedConflictResolution,
@@ -1212,6 +1212,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 || edit.value.is_some()
                 || edit.replacement_kind.is_some()
                 || edit.delete;
+            let expected_given = edit.expected.is_some();
             let edits = if has_edit {
                 capture_initial_edit(&local.content, edit)?
             } else {
@@ -1229,12 +1230,13 @@ fn execute(cli: Cli) -> Result<Success> {
             let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
             let basis = context.workspace.basis;
             let effective = context.workspace.effective_view();
-            let (prepared, outcome) = if use_frontier {
-                runtime
-                    .block_on(mutator.create_on_frontier(expected, basis, effective, proposal))?
+            let created = if use_frontier {
+                runtime.block_on(mutator.create_on_frontier(expected, basis, effective, proposal))
             } else {
-                runtime.block_on(mutator.create(expected, basis, effective, proposal))?
+                runtime.block_on(mutator.create(expected, basis, effective, proposal))
             };
+            let (prepared, outcome) =
+                created.map_err(|error| explain_initial_edit(error.into(), expected_given))?;
             let resulting_frontier = prepared.resulting_view();
             let publication = runtime.block_on(prepare_mutation_publication(
                 &objects,
@@ -2031,6 +2033,42 @@ fn resolve(
         }),
         output,
     )
+}
+
+/// Adds how to fix a `change new` initial edit whose `--expected` does not match the
+/// path, which is the usual way it fails to apply. A whole-file edit fails with
+/// `ExpectedFileMismatch`; a text edit against a missing or different file fails with
+/// `KindMismatch` or `NoMatch`.
+fn explain_initial_edit(error: anyhow::Error, expected_given: bool) -> anyhow::Error {
+    let Some(RepositoryError::InvalidEdits(rejected)) = command_output::repository_error(&error)
+    else {
+        return error;
+    };
+    let hint = rejected.iter().find_map(|edit| {
+        let path = &edit.path;
+        match (&edit.reason, edit.target.is_some(), expected_given) {
+            (EditFailure::ExpectedFileMismatch, true, false) => Some(format!(
+                "{path} already exists; pass --expected with its current content to change it"
+            )),
+            (EditFailure::ExpectedFileMismatch | EditFailure::KindMismatch, false, true) => Some(
+                format!("{path} does not exist; omit --expected to create it"),
+            ),
+            (
+                EditFailure::ExpectedFileMismatch
+                | EditFailure::KindMismatch
+                | EditFailure::NoMatch,
+                true,
+                true,
+            ) => Some(format!(
+                "{path} does not match --expected; check its current content and --expected-kind"
+            )),
+            _ => None,
+        }
+    });
+    match hint {
+        Some(hint) => error.context(hint),
+        None => error,
+    }
 }
 
 /// Captures the initial whole-file edit for `change new`.

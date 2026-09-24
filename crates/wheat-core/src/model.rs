@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -339,10 +342,77 @@ pub enum EditFailure {
     ExpectedFileMismatch,
 }
 
+impl fmt::Display for EditFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMatch => formatter.write_str("the guarded text is not found"),
+            Self::Ambiguous => formatter.write_str("the guarded text matches more than once"),
+            Self::Interference { with } => {
+                write!(formatter, "the edit overlaps {} other edit(s)", with.len())
+            }
+            Self::KindMismatch => formatter.write_str("the file kind differs from the edit's"),
+            Self::ExpectedFileMismatch => {
+                formatter.write_str("the current file differs from the edit's expected file")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FailedEditEvidence {
     pub target: Option<FileValue>,
     pub reason: EditFailure,
+}
+
+/// An authored edit that does not apply to the view it is authored against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectedEdit {
+    pub path: String,
+    /// The file the edit found at `path`, if any.
+    pub target: Option<FileValue>,
+    pub reason: EditFailure,
+}
+
+impl RejectedEdit {
+    /// The edits of `failed` with their paths from `edits`, ordered by path.
+    ///
+    /// # Panics
+    ///
+    /// When `failed` names an edit missing from `edits`; the failures come from
+    /// applying those edits.
+    #[must_use]
+    pub fn collect(
+        edits: &BTreeMap<EditId, EditRecord>,
+        failed: &BTreeMap<EditId, FailedEditEvidence>,
+    ) -> Vec<Self> {
+        let mut rejected = failed
+            .iter()
+            .map(|(id, evidence)| Self {
+                path: edits[id].path.clone(),
+                target: evidence.target,
+                reason: evidence.reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        rejected.sort_by(|left, right| left.path.cmp(&right.path));
+        rejected
+    }
+}
+
+impl fmt::Display for RejectedEdit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = &self.path;
+        match (&self.reason, self.target) {
+            (EditFailure::KindMismatch | EditFailure::ExpectedFileMismatch, None) => write!(
+                formatter,
+                "{path}: the edit expects a file, but the path does not exist"
+            ),
+            (EditFailure::ExpectedFileMismatch, Some(_)) => write!(
+                formatter,
+                "{path}: the current file differs from the edit's expected file (the path exists)"
+            ),
+            (reason, _) => write!(formatter, "{path}: {reason}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -279,7 +279,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
                         false,
                     )
                     .await?;
-            let ApplicationResultRecord::Clean { tree } = preliminary.result else {
+            let ApplicationResultRecord::Clean { tree } = preliminary.application.result else {
                 return Err(RepositoryRewriteError::SemanticDrift);
             };
             let edit_ids = old.edits.clone();
