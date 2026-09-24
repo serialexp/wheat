@@ -13,7 +13,8 @@ use wheat_core::{ContentId, DirectoryEntry, DirectoryNode, FileKind, FileValue, 
 use wheat_store::{
     ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectKind,
     ObjectStoreAdapter, ObjectStoreError, StoredObject, TreeDiff, TreeDiffLimits, TreeEdit,
-    TreeFile, TreePathLimits, TreePathSelection, TreeSelectionLimits, TreeWalkLimits,
+    TreeFile, TreePathFilter, TreePathLimits, TreePathSelection, TreeSelectionLimits,
+    TreeWalkLimits,
 };
 
 struct CountingStore<S> {
@@ -1023,6 +1024,118 @@ async fn lookup_many_matches_lookup_and_reads_each_directory_once() {
     assert!(matches!(
         trees.lookup_many(root, &[""]).await,
         Err(MerkleTreeError::EmptyPath)
+    ));
+}
+
+#[test]
+fn path_filter_matches_roots_and_below_and_reaches_their_ancestors() {
+    // "a-b" sorts between "a" and "a/…", which a nearest-root search would get wrong.
+    let filter = TreePathFilter::new(["a/x".to_owned(), "a-b".to_owned(), "a-b".to_owned()]);
+    for path in ["a/x", "a/x/y", "a-b", "a-b/c"] {
+        assert!(filter.matches(path), "{path}");
+        assert!(filter.reaches(path), "{path}");
+    }
+    for path in ["a", "a/xy", "a/w", "a-", "b", "a-bc"] {
+        assert!(!filter.matches(path), "{path}");
+    }
+    assert!(filter.reaches("a"));
+    for path in ["a/w", "a/xy", "b", "a-bc", "a-"] {
+        assert!(!filter.reaches(path), "{path}");
+    }
+    let everything = TreePathFilter::default();
+    assert!(everything.is_everything());
+    assert!(everything.matches("any/path") && everything.reaches("any"));
+}
+
+/// A restricted diff reports only selected paths and never reads a directory that
+/// cannot hold one; its change limit counts only reported changes.
+#[tokio::test]
+async fn restricted_diff_reports_selected_paths_and_skips_other_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::new(directory.path()));
+    let trees = MerkleTreeStore::new(&objects);
+    let empty = trees.empty_root().await.unwrap();
+    let old = trees
+        .apply_edits(
+            empty,
+            &[
+                edit(&["a", "x"], Some("x1")),
+                edit(&["a-b"], Some("ab1")),
+                edit(&["b", "deep", "f"], Some("f1")),
+                edit(&["c"], Some("c1")),
+            ],
+        )
+        .await
+        .unwrap();
+    let mut changes = vec![
+        edit(&["a", "x"], Some("x2")),
+        edit(&["a-b"], Some("ab2")),
+        edit(&["b", "deep", "f"], Some("f2")),
+        edit(&["c"], None),
+    ];
+    for index in 0..50 {
+        changes.push(edit(&["b", &format!("n{index:02}")], Some("new")));
+    }
+    let without_c = trees.apply_edits(old, &changes).await.unwrap();
+    // `c` becomes a directory.
+    let new = trees
+        .apply_edits(without_c, &[edit(&["c", "d"], Some("d"))])
+        .await
+        .unwrap();
+
+    let diff = |roots: &[&str], limits: TreeDiffLimits| {
+        let filter = TreePathFilter::new(roots.iter().map(|root| (*root).to_owned()));
+        let trees = &trees;
+        async move {
+            let mut cursor = trees.diff_cursor(old, new, limits).restricted_to(filter);
+            let mut paths = Vec::new();
+            while let Some(change) = cursor.next().await? {
+                paths.push(change.path);
+            }
+            Ok::<_, MerkleTreeError>(paths)
+        }
+    };
+
+    let before = objects.reads();
+    assert_eq!(
+        diff(&["a"], TreeDiffLimits::default()).await.unwrap(),
+        ["a/x"]
+    );
+    // Both roots and both versions of `a`; nothing under `b`.
+    assert_eq!(objects.reads() - before, 4);
+
+    assert_eq!(
+        diff(&["b/deep/f"], TreeDiffLimits::default())
+            .await
+            .unwrap(),
+        ["b/deep/f"]
+    );
+    // A file replaced by a directory: each side is selected on its own.
+    assert_eq!(
+        diff(&["c/d"], TreeDiffLimits::default()).await.unwrap(),
+        ["c/d"]
+    );
+    assert_eq!(
+        diff(&["c", "a-b"], TreeDiffLimits::default())
+            .await
+            .unwrap(),
+        ["a-b", "c", "c/d"]
+    );
+    assert!(
+        diff(&["missing"], TreeDiffLimits::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // 54 changes in total, but only one is selected.
+    let one = TreeDiffLimits {
+        max_changes: 1,
+        ..TreeDiffLimits::default()
+    };
+    assert_eq!(diff(&["a"], one).await.unwrap(), ["a/x"]);
+    assert!(matches!(
+        diff(&[], one).await,
+        Err(MerkleTreeError::ChangeLimitExceeded { .. })
     ));
 }
 

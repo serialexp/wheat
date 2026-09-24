@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use wheat_core::{ContentId, FileKind, ViewId, diff_model::DiffDescriptor, text_capture};
 use wheat_store::{
     ContentStoreError, MerkleTreeStore, PublicationStore, RepositoryHead, RepositoryReader,
-    TreeWalkLimits,
+    TreePathFilter, TreeWalkLimits,
 };
 
 use crate::{
@@ -53,6 +53,7 @@ pub(crate) fn scan(
     repository: &LocalRepository,
     workspace: &WorkspaceMetadata,
     max_inline_text_bytes: usize,
+    filter: &TreePathFilter,
 ) -> Result<WorkspaceScan> {
     let _lock = crate::materialization::WorkspaceLock::acquire(workspace_root)?;
     let runtime = crate::local::runtime()?;
@@ -67,14 +68,18 @@ pub(crate) fn scan(
         repository,
         &workspace,
         max_inline_text_bytes,
+        filter,
     )
 }
 
+/// Compares the tracked files `filter` selects with the workspace. Unselected files are
+/// neither read nor reported, though they stay in `tracked_paths`.
 pub(crate) fn scan_locked(
     workspace_root: &Path,
     repository: &LocalRepository,
     workspace: &WorkspaceMetadata,
     max_inline_text_bytes: usize,
+    filter: &TreePathFilter,
 ) -> Result<WorkspaceScan> {
     let runtime = crate::local::runtime()?;
     anyhow::ensure!(
@@ -125,6 +130,9 @@ pub(crate) fn scan_locked(
     let mut tracked_paths = std::collections::BTreeSet::new();
     for file in files {
         tracked_paths.insert(file.path.clone());
+        if !filter.matches(&file.path) {
+            continue;
+        }
         let baseline_limit = read_budget.next_limit(MAX_BASELINE_INSPECTION_BYTES)?;
         // Retained content is collected only when it fits the text-diff eligibility bound.
         // Larger retained leaves are described from their authenticated identity and known size

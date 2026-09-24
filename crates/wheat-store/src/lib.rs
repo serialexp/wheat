@@ -88,7 +88,8 @@ pub use loose::{
 pub use merkle_tree::{
     FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, TreeContentCursor,
     TreeContentWalkLimits, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
-    TreePathLimits, TreePathSelection, TreePathShape, TreeSelectionLimits, TreeWalkLimits,
+    TreePathFilter, TreePathLimits, TreePathSelection, TreePathShape, TreeSelectionLimits,
+    TreeWalkLimits,
 };
 pub use mutation_publication::{
     PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,

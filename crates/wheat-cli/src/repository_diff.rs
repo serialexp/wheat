@@ -10,7 +10,7 @@ use anyhow::Result;
 use wheat_core::{FileValue, ObjectId, RevisionId, TreeId, ViewId};
 use wheat_store::{
     ContentStoreError, MerkleTreeError, MerkleTreeStore, PublicationStore, RepositoryReader,
-    RetainedSetStore, TreeDiffLimits,
+    RetainedSetStore, TreeDiffLimits, TreePathFilter,
 };
 
 use crate::{command_output::CliFailure, local::LocalRepository};
@@ -60,6 +60,7 @@ pub(crate) struct RepositoryDiffInput {
 pub(crate) async fn revision(
     repository: &LocalRepository,
     revision_id: RevisionId,
+    filter: &TreePathFilter,
     deadline: std::time::Instant,
 ) -> Result<RepositoryDiffInput> {
     let snapshot = Snapshot::read(repository).await?;
@@ -115,6 +116,7 @@ pub(crate) async fn revision(
         },
         from,
         revision.resulting_tree,
+        filter,
         deadline,
     )
     .await
@@ -124,6 +126,7 @@ pub(crate) async fn views(
     repository: &LocalRepository,
     from: &str,
     to: &str,
+    filter: &TreePathFilter,
     deadline: std::time::Instant,
 ) -> Result<RepositoryDiffInput> {
     let snapshot = Snapshot::read(repository).await?;
@@ -140,29 +143,35 @@ pub(crate) async fn views(
         },
         from_record.tree,
         to_record.tree,
+        filter,
         deadline,
     )
     .await
 }
 
+/// Diffs `from` against `to`, reporting and reading content only for the paths
+/// `filter` selects.
 async fn finish(
     repository: &LocalRepository,
     head_generation: u64,
     comparison: ComparisonInput,
     from: TreeId,
     to: TreeId,
+    filter: &TreePathFilter,
     _deadline: std::time::Instant,
 ) -> Result<RepositoryDiffInput> {
     let trees = MerkleTreeStore::new(&repository.objects);
-    let mut cursor = trees.diff_cursor(
-        from,
-        to,
-        TreeDiffLimits {
-            max_changes: MAX_DIFF_CHANGES,
-            max_path_bytes: MAX_DIFF_PATH_BYTES,
-            ..TreeDiffLimits::default()
-        },
-    );
+    let mut cursor = trees
+        .diff_cursor(
+            from,
+            to,
+            TreeDiffLimits {
+                max_changes: MAX_DIFF_CHANGES,
+                max_path_bytes: MAX_DIFF_PATH_BYTES,
+                ..TreeDiffLimits::default()
+            },
+        )
+        .restricted_to(filter.clone());
     let mut changes = Vec::new();
     let mut remaining_inline_bytes = MAX_TOTAL_INLINE_CONTENT_BYTES;
     while let Some(change) = cursor.next().await.map_err(classify_diff_error)? {

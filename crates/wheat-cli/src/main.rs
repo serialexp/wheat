@@ -195,6 +195,21 @@ struct DiffArgs {
     from: Option<String>,
     #[arg(long, requires = "from", conflicts_with = "revision")]
     to: Option<String>,
+    /// Show only changes at or below these repository-relative paths.
+    paths: Vec<String>,
+}
+
+/// The filter for `wheat diff PATH…`: each path is repository-relative, and one
+/// trailing slash (as shell completion adds to directories) is accepted.
+fn diff_path_filter(paths: Vec<String>) -> Result<wheat_store::TreePathFilter> {
+    let mut roots = Vec::with_capacity(paths.len());
+    for path in paths {
+        let root = path.strip_suffix('/').unwrap_or(&path);
+        materialization::validate_path(root)
+            .map_err(|error| CliFailure::invalid(format!("invalid diff path {path:?}: {error}")))?;
+        roots.push(root.to_owned());
+    }
+    Ok(wheat_store::TreePathFilter::new(roots))
 }
 
 #[derive(Debug, Subcommand)]
@@ -650,7 +665,13 @@ fn execute(cli: Cli) -> Result<Success> {
             let _operation =
                 rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
-            let scan = workspace_scan::scan(&context.root, &local, &context.workspace, 0)?;
+            let scan = workspace_scan::scan(
+                &context.root,
+                &local,
+                &context.workspace,
+                0,
+                &wheat_store::TreePathFilter::default(),
+            )?;
 
             // Discover untracked files via workspace walk with ignore rules.
             let global = wheat_ignore::loader::read_global_ignore();
@@ -839,13 +860,15 @@ fn execute(cli: Cli) -> Result<Success> {
             let _operation =
                 rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
             context.workspace = WorkspaceMetadata::read(&context.root)?;
+            let filter = diff_path_filter(arguments.paths)?;
             let limits = wheat_core::diff_model::DiffLimits::default();
             let deadline = std::time::Instant::now() + limits.deadline;
             let document = if let Some(revision) = arguments.revision {
                 let revision = RevisionId::from_str(&revision)
                     .map_err(|_| CliFailure::invalid("invalid revision ID"))?;
-                let input =
-                    runtime()?.block_on(repository_diff::revision(&local, revision, deadline))?;
+                let input = runtime()?.block_on(repository_diff::revision(
+                    &local, revision, &filter, deadline,
+                ))?;
                 let comparison = match input.comparison {
                     repository_diff::ComparisonInput::Revision { revision, from, to } => {
                         wheat_core::diff_model::DiffComparison::Revision {
@@ -859,8 +882,9 @@ fn execute(cli: Cli) -> Result<Success> {
                 };
                 workspace_diff::build_repository(comparison, input.changes, limits, deadline)?
             } else if let (Some(from), Some(to)) = (arguments.from, arguments.to) {
-                let input =
-                    runtime()?.block_on(repository_diff::views(&local, &from, &to, deadline))?;
+                let input = runtime()?.block_on(repository_diff::views(
+                    &local, &from, &to, &filter, deadline,
+                ))?;
                 let comparison = match input.comparison {
                     repository_diff::ComparisonInput::Views {
                         from_view,
@@ -883,6 +907,7 @@ fn execute(cli: Cli) -> Result<Success> {
                     &local,
                     &context.workspace,
                     limits.max_inline_bytes_per_side,
+                    &filter,
                 )?;
                 workspace_diff::build(scan, limits, deadline)?
             };
@@ -956,8 +981,13 @@ fn execute(cli: Cli) -> Result<Success> {
 
             // Resolve paths: --all discovers modified/deleted tracked paths via scan.
             let paths = if arguments.all {
-                let scan =
-                    workspace_scan::scan_locked(&context.root, &local, &context.workspace, 0)?;
+                let scan = workspace_scan::scan_locked(
+                    &context.root,
+                    &local,
+                    &context.workspace,
+                    0,
+                    &wheat_store::TreePathFilter::default(),
+                )?;
                 let resolved: Vec<String> = scan.changes.iter().map(|c| c.path.clone()).collect();
                 if resolved.is_empty() {
                     return Err(CliFailure::invalid(
@@ -1751,7 +1781,13 @@ fn ensure_workspace_clean_locked(
     repository: &local::LocalRepository,
     workspace: &WorkspaceMetadata,
 ) -> Result<()> {
-    let scan = workspace_scan::scan_locked(root, repository, workspace, 0)?;
+    let scan = workspace_scan::scan_locked(
+        root,
+        repository,
+        workspace,
+        0,
+        &wheat_store::TreePathFilter::default(),
+    )?;
     if !scan.changes.is_empty() {
         return Err(CliFailure::invalid(
             "uncaptured tracked workspace edits block switch or refresh",

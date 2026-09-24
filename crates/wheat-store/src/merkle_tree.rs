@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, btree_map},
     iter::Peekable,
 };
@@ -181,6 +182,66 @@ pub enum TreePathSelection {
     Directory(Vec<TreeFile>),
 }
 
+/// The paths at or below any of a set of repository paths, like the paths in
+/// `git diff -- PATH…`. An empty set selects every path.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TreePathFilter {
+    /// Sorted and deduplicated canonical paths.
+    roots: Vec<String>,
+}
+
+impl TreePathFilter {
+    /// Selects the paths at or below each of `roots`, which are canonical slash-separated
+    /// repository-relative paths. No roots selects everything.
+    #[must_use]
+    pub fn new(roots: impl IntoIterator<Item = String>) -> Self {
+        let mut roots = roots.into_iter().collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots.dedup();
+        Self { roots }
+    }
+
+    /// Whether every path is selected.
+    #[must_use]
+    pub fn is_everything(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// Whether `path` is one of the roots or lies below one. Costs one search per
+    /// component of `path`.
+    #[must_use]
+    pub fn matches(&self, path: &str) -> bool {
+        if self.is_everything() {
+            return true;
+        }
+        let contains = |candidate: &str| {
+            self.roots
+                .binary_search_by(|root| root.as_str().cmp(candidate))
+                .is_ok()
+        };
+        path.match_indices('/')
+            .map(|(index, _)| &path[..index])
+            .chain(std::iter::once(path))
+            .any(contains)
+    }
+
+    /// Whether a directory at `path` can hold a selected path: it is selected itself,
+    /// or it is an ancestor of a root.
+    #[must_use]
+    pub fn reaches(&self, path: &str) -> bool {
+        if self.matches(path) {
+            return true;
+        }
+        // Roots below `path` sort together, from the first one not less than `path/`.
+        let below = self.roots.partition_point(|root| {
+            root.bytes().cmp(path.bytes().chain(std::iter::once(b'/'))) == Ordering::Less
+        });
+        self.roots.get(below).is_some_and(|root| {
+            root.len() > path.len() && root.starts_with(path) && root.as_bytes()[path.len()] == b'/'
+        })
+    }
+}
+
 /// One changed file leaf between two Merkle roots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeDiff {
@@ -360,6 +421,7 @@ pub struct TreeDiffCursor<'a, S> {
     changes: usize,
     buffered_entries: usize,
     exhausted: bool,
+    filter: TreePathFilter,
 }
 
 impl<'a, S> MerkleTreeStore<'a, S>
@@ -1249,6 +1311,7 @@ where
             changes: 0,
             buffered_entries: 0,
             exhausted: false,
+            filter: TreePathFilter::default(),
         }
     }
 
@@ -1352,6 +1415,14 @@ impl<S: ImmutableObjectStore> TreeContentCursor<'_, S> {
 }
 
 impl<S: ImmutableObjectStore> TreeDiffCursor<'_, S> {
+    /// Reports only changes to paths `filter` matches. Directories that cannot hold a
+    /// selected path are not read, and the change limit counts only reported changes.
+    #[must_use]
+    pub fn restricted_to(mut self, filter: TreePathFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
     async fn read_node(&mut self, id: TreeId) -> Result<DirectoryNode, MerkleTreeError> {
         if self.nodes == self.limits.max_nodes {
             return Err(MerkleTreeError::NodeLimitExceeded {
@@ -1435,12 +1506,15 @@ impl<S: ImmutableObjectStore> TreeDiffCursor<'_, S> {
         while let Some(work) = self.work.pop() {
             match work {
                 DiffWork::Emit { path_len, old, new } => {
+                    self.path.truncate(path_len);
+                    if !self.filter.matches(&self.path) {
+                        continue;
+                    }
                     if self.changes == self.limits.max_changes {
                         return Err(MerkleTreeError::ChangeLimitExceeded {
                             limit: self.limits.max_changes,
                         });
                     }
-                    self.path.truncate(path_len);
                     self.changes += 1;
                     return Ok(Some(TreeDiff {
                         path: self.path.clone(),
@@ -1524,6 +1598,11 @@ impl<S: ImmutableObjectStore> TreeDiffCursor<'_, S> {
                     new,
                 } => {
                     self.path.truncate(path_len);
+                    // A file here is reported only if selected (checked on emit); a
+                    // directory is entered only if it can hold a selected path.
+                    if !self.filter.reaches(&self.path) {
+                        continue;
+                    }
                     match (old, new) {
                         (Some(DirectoryEntry::File(old)), Some(DirectoryEntry::File(new))) => {
                             if old != new {

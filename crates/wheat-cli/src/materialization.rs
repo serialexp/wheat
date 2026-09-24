@@ -1134,7 +1134,7 @@ async fn authenticate_target(repository: &LocalRepository, journal: &Journal) ->
     Ok(())
 }
 
-fn validate_path(path: &str) -> Result<()> {
+pub(crate) fn validate_path(path: &str) -> Result<()> {
     ensure!(
         !path.is_empty()
             && path.len() <= MAX_PATH_BYTES
