@@ -59,6 +59,8 @@ async fn whole_repository_repack_preserves_content_reopens_and_then_is_true_noop
         second.physical_generation_before,
         second.physical_generation_after
     );
+    // A no-op writes and retires nothing, including content packs.
+    assert_eq!((second.bytes_written, second.bytes_retired), (0, 0));
 }
 
 #[tokio::test]

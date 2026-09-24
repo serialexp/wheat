@@ -20,7 +20,7 @@ use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
-    BatchObjectStore, ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
+    BatchObjectStore, ContentStore, ImmutableObjectStore, LocalPublicationStore, PackedObjectStore,
     PersistedRepositoryMutator, PublicationStore, RepositoryHead, RepositoryPublisher,
     RepositoryReader, finalize_mutation_publication, prepare_mutation_publication,
 };
@@ -51,10 +51,12 @@ fn edit(path: &str, value: &[u8]) -> RevisionEdits {
     }
 }
 
-fn stores(root: &std::path::Path) -> (LooseObjectStore, ContentStore, LocalPublicationStore) {
+fn stores(root: &std::path::Path) -> (PackedObjectStore, ContentStore, LocalPublicationStore) {
+    let objects = PackedObjectStore::open(root.join("storage")).unwrap();
+    let content = objects.content_store();
     (
-        LooseObjectStore::new(root.join("objects")),
-        ContentStore::new(root.join("content")),
+        objects,
+        content,
         LocalPublicationStore::new(root.join("repository.head")),
     )
 }
@@ -63,7 +65,31 @@ async fn start_server(
     data_dir: &std::path::Path,
     repo_name: &str,
 ) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
-    let registry = Registry::single_named(repo_name.to_string(), data_dir);
+    serve(Registry::single_named(repo_name.to_string(), data_dir).unwrap()).await
+}
+
+/// Serves the repository through handles the caller keeps, so the test can write to the
+/// server's store while it runs; the packed store admits one opener per process.
+async fn start_server_sharing(
+    data_dir: &std::path::Path,
+    repo_name: &str,
+) -> (
+    SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    (PackedObjectStore, ContentStore, LocalPublicationStore),
+) {
+    let (objects, content, heads) = stores(data_dir);
+    let registry = Registry::single_with_stores(
+        repo_name.to_string(),
+        Box::new(objects.clone()),
+        content.clone(),
+        heads.clone(),
+    );
+    let (addr, shutdown) = serve(registry).await;
+    (addr, shutdown, (objects, content, heads))
+}
+
+async fn serve(registry: Registry) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -175,7 +201,7 @@ async fn open_repo(
 async fn client_fetch_objects(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     op_id: u32,
-    objects: &LooseObjectStore,
+    objects: &PackedObjectStore,
     content: &ContentStore,
     envelope_id: wheat_core::RepositoryEnvelopeId,
 ) -> usize {
@@ -355,7 +381,7 @@ async fn client_fetch_objects(
 async fn client_fetch_content(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     op_id: u32,
-    objects: &LooseObjectStore,
+    objects: &PackedObjectStore,
     content: &ContentStore,
     envelope_id: &Digest256,
 ) -> usize {
@@ -727,7 +753,8 @@ async fn fetch_after_server_advance() {
     let server_dir = tempfile::tempdir().unwrap();
     let _repo = setup_repo(server_dir.path()).await;
 
-    let (addr, shutdown) = start_server(server_dir.path(), "test/repo").await;
+    let (addr, shutdown, server_stores) =
+        start_server_sharing(server_dir.path(), "test/repo").await;
 
     // Clone.
     let clone_dir = tempfile::tempdir().unwrap();
@@ -750,7 +777,7 @@ async fn fetch_after_server_advance() {
 
     // Advance the server by publishing a second change directly to the server's store.
     {
-        let (srv_objects, srv_content, srv_heads) = stores(server_dir.path());
+        let (srv_objects, srv_content, srv_heads) = server_stores;
         srv_content.put(b"server change").unwrap();
 
         let srv_head = srv_heads.read().unwrap();

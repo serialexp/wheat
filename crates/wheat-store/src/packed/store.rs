@@ -24,11 +24,11 @@ use crate::content_store::ContentBackend;
 use crate::{
     ContentGenerationIndex, ContentGenerationManifest, ContentRepackLimits, ContentRepackPlan,
     ContentStore, ContentStoreError, Durability, ImmutableObjectStore, LocalPublicationStore,
-    LooseObjectStore, ObjectKind, ObjectStoreError, PublicationStore, RepositoryHead,
-    RepositoryReader, StoredObject, content_generation_index_path,
+    LooseObjectStore, ObjectKind, ObjectStoreError, PreparedContentGeneration, PublicationStore,
+    RepositoryHead, RepositoryReader, StoredObject, content_generation_index_path,
     content_generation_shard_manifest_path, content_generation_shard_pack_path,
-    content_repack::{plan_content_repack, prepare_content_repack, retained_lineages},
-    metadata_repack::{MetadataDeltaPlan, plan_metadata_deltas},
+    content_repack::{plan_content_repack, prepare_content_repack},
+    metadata_repack::{HistoryPlan, HistoryPlanLimits, MetadataDeltaPlan, plan_history_deltas},
     read_content_generation,
 };
 
@@ -81,7 +81,7 @@ pub struct RepackPlan {
     repository_head: RepositoryHead,
     options: RepackOptions,
     prepared_content: ContentRepackPlan,
-    content_before: Option<ContentGenerationManifest>,
+    content_before: ContentGenerationStats,
     metadata_deltas: MetadataDeltaPlan,
     loose_metadata: Vec<LooseMetadataRecord>,
     pub estimated_replacement_structural_bytes: u64,
@@ -199,12 +199,13 @@ impl PackedObjectStore {
         }
         .map_err(object_catalog_error)?;
         let content_generation = catalog.content_generation();
-        validate_content_generation(root, content_generation)
+        let content_manifest = validate_content_generation(root, content_generation)
             .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
         // The catalog's process lock remains held by `catalog`. Cleanup follows
         // recovery and validation, but never mutates catalog authority.
-        retire_repacked_content(root, content_generation)
+        retire_repacked_content(root, content_generation, content_manifest.as_ref())
             .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
+        drop(content_manifest);
         Ok(Self {
             engine: Arc::new(PackedEngine {
                 catalog: Arc::new(Mutex::new(catalog)),
@@ -285,10 +286,6 @@ impl PackedObjectStore {
             .validate_envelope(repository_head.envelope)
             .await
             .map_err(|error| RepackError::Authority(error.to_string()))?;
-        let repository = reader
-            .hydrate(envelope.state)
-            .await
-            .map_err(|error| RepackError::Authority(error.to_string()))?;
         let (physical_authority, segments, physical_bytes, records, mut inventory) = {
             let mut catalog = self
                 .catalog()
@@ -324,29 +321,39 @@ impl PackedObjectStore {
         }
         inventory.sort_unstable();
         inventory.dedup();
-        let metadata_deltas = plan_metadata_deltas(self, &repository, options.max_records)
-            .await
-            .map_err(|error| RepackError::Corrupt(error.to_string()))?;
+        // `validate_envelope` verified the whole state, so history planning
+        // can read its records directly instead of hydrating every view.
+        let HistoryPlan {
+            metadata: metadata_deltas,
+            content: content_history,
+        } = plan_history_deltas(
+            self,
+            envelope.state,
+            HistoryPlanLimits {
+                metadata_proposals: options.max_records,
+                content_pairs: options.content_limits.max_history_pairs,
+                content_tips: options.content_limits.max_content_ids,
+            },
+        )
+        .await
+        .map_err(|error| RepackError::Corrupt(error.to_string()))?;
         let loose_metadata = self.loose_metadata_inventory()?;
-        let lineages = retained_lineages(&repository);
         let prepared_content = plan_content_repack(
             &self.content_store(),
             current_manifest.as_ref(),
             crate::ContentRepackInput {
                 content_ids: inventory,
-                lineages_newest_first: lineages,
+                tips: content_history.tips.into_iter().collect(),
+                history: content_history.pairs.into_iter().collect(),
             },
             options.content_limits,
         )
         .map_err(|error| RepackError::Corrupt(error.to_string()))?;
+        let content_before = ContentGenerationStats::of(current_manifest.as_ref())?;
+        drop(current_manifest);
         let content_bytes = match &prepared_content {
             ContentRepackPlan::NoOp { .. } => 0,
             ContentRepackPlan::Replace(analysis) => analysis.estimated_bytes(),
-            ContentRepackPlan::ReplacePrepared(_) => {
-                return Err(RepackError::Corrupt(
-                    "prepared content appeared during planning".into(),
-                ));
-            }
         };
         let structural_bytes = loose_metadata
             .iter()
@@ -367,7 +374,7 @@ impl PackedObjectStore {
             repository_head,
             options,
             prepared_content,
-            content_before: current_manifest,
+            content_before,
             metadata_deltas,
             loose_metadata,
             estimated_replacement_structural_bytes: structural_bytes,
@@ -385,7 +392,7 @@ impl PackedObjectStore {
         publications.with_repack_authority(plan.repository_head, || self.execute_bound_repack(plan))
     }
 
-    fn execute_bound_repack(&self, mut plan: RepackPlan) -> Result<RepackReport, RepackError> {
+    fn execute_bound_repack(&self, plan: RepackPlan) -> Result<RepackReport, RepackError> {
         // Bind authority before expensive generation, then generate/stage only
         // after the caller's capacity gate has admitted execution.
         {
@@ -398,21 +405,45 @@ impl PackedObjectStore {
                 return Err(RepackError::StaleAuthority);
             }
         }
-        if let ContentRepackPlan::Replace(analysis) = &plan.prepared_content {
-            let prepared = prepare_content_repack(&self.content_store(), analysis)
-                .map_err(|error| RepackError::Corrupt(error.to_string()))?;
-            plan.prepared_content = ContentRepackPlan::ReplacePrepared(prepared);
-        }
-        let (replacement_content, content_after) =
-            stage_content_generation(&self.engine.root, &plan)?;
+        let RepackPlan {
+            physical_authority,
+            repository_head,
+            options,
+            prepared_content,
+            content_before,
+            metadata_deltas,
+            loose_metadata,
+            estimated_replacement_content_bytes,
+            estimated_temporary_bytes,
+            ..
+        } = plan;
+        // Each manifest copy is dropped as soon as the next step owns one: the
+        // prepared generation is staged, then released before the staged
+        // generation is read back and authenticated.
+        let replacement_content = match prepared_content {
+            ContentRepackPlan::NoOp { .. } => {
+                if physical_authority.content == super::catalog::no_content_generation() {
+                    return Err(RepackError::Corrupt(
+                        "content without a selected generation cannot produce a no-op content plan"
+                            .into(),
+                    ));
+                }
+                physical_authority.content
+            }
+            ContentRepackPlan::Replace(analysis) => {
+                let prepared = prepare_content_repack(&self.content_store(), analysis)
+                    .map_err(|error| RepackError::Corrupt(error.to_string()))?;
+                stage_content_generation(&self.engine.root, &prepared)?
+            }
+        };
         let mut catalog = self
             .catalog()
             .map_err(|error| RepackError::Corrupt(error.to_string()))?;
         // Authenticate the staged replacement before the catalog may omit segment
         // content records. The manifest passed below is capability data derived
         // from this full pack scan, never a caller-supplied generation token.
-        validate_content_generation(&self.engine.root, replacement_content)?;
-        let validated_content = read_content_manifest(&self.engine.root, replacement_content)?;
+        let validated_content =
+            validate_content_generation(&self.engine.root, replacement_content)?;
         let loose_objects = &self.engine.objects;
         let mut read_loose = |digest: [u8; 32]| {
             loose_objects
@@ -422,8 +453,8 @@ impl PackedObjectStore {
         };
         let report = match catalog.repack_structural(
             super::catalog::CatalogRepackOptions {
-                max_records: plan.options.max_records,
-                target_segment_bytes: plan.options.target_segment_bytes,
+                max_records: options.max_records,
+                target_segment_bytes: options.target_segment_bytes,
             },
             replacement_content,
             validated_content.as_ref().map(|manifest| {
@@ -432,10 +463,10 @@ impl PackedObjectStore {
                     manifest,
                 )
             }),
-            plan.physical_authority,
+            physical_authority,
             MetadataRepackInput {
-                bases: &plan.metadata_deltas.bases,
-                loose: &plan.loose_metadata,
+                bases: &metadata_deltas.bases,
+                loose: &loose_metadata,
                 read_loose: &mut read_loose,
             },
         ) {
@@ -454,7 +485,13 @@ impl PackedObjectStore {
         // This runs while `catalog` still holds the process-exclusive catalog
         // lock. It intentionally does not alter catalog authority; failures are
         // returned after the new head is durable and retried by `open`.
-        retire_repacked_content(&self.engine.root, replacement_content)?;
+        retire_repacked_content(
+            &self.engine.root,
+            replacement_content,
+            validated_content.as_ref(),
+        )?;
+        let content_after = ContentGenerationStats::of(validated_content.as_ref())?;
+        drop(validated_content);
         // Same lock and timing: every absorbed object is in the durable head's
         // segments, so its loose file is only a redundant copy now.
         let absorbed = report
@@ -466,13 +503,12 @@ impl PackedObjectStore {
             .objects
             .retire(&absorbed)
             .map_err(|error| RepackError::Corrupt(error.to_string()))?;
-        let empty_before = ContentGenerationManifest::new(0, Vec::new())
-            .map_err(|error| RepackError::Corrupt(error.to_string()))?;
-        let before = plan.content_before.as_ref().unwrap_or(&empty_before);
-        let (full_before, delta_before, depth_before) = content_stats(before)?;
-        let (full_after, delta_after, depth_after) = content_stats(&content_after)?;
-        let content_bytes_before = sum_content_bytes(before)?;
-        let content_bytes_after = sum_content_bytes(&content_after)?;
+        // The old generation's packs are retired only when a new one replaced it.
+        let content_bytes_retired = if replacement_content == physical_authority.content {
+            0
+        } else {
+            content_before.bytes
+        };
         Ok(RepackReport {
             no_op: report.no_op,
             physical_generation_before: report.generation_before,
@@ -481,35 +517,37 @@ impl PackedObjectStore {
             segments_after: report.segments_after,
             physical_bytes_before: report
                 .physical_bytes_before
-                .checked_add(content_bytes_before)
+                .checked_add(content_before.bytes)
                 .ok_or_else(|| RepackError::Corrupt("report byte count overflow".into()))?,
             physical_bytes_after: report
                 .physical_bytes_after
-                .checked_add(content_bytes_after)
+                .checked_add(content_after.bytes)
                 .ok_or_else(|| RepackError::Corrupt("report byte count overflow".into()))?,
-            repository_generation: plan.repository_head.generation,
-            envelope_before: plan.repository_head.envelope,
-            envelope_after: plan.repository_head.envelope,
+            repository_generation: repository_head.generation,
+            envelope_before: repository_head.envelope,
+            envelope_after: repository_head.envelope,
             structural_record_count: report.structural_records,
-            content_record_count: u64::try_from(content_after.entries.len())
-                .map_err(|_| RepackError::Corrupt("report record count overflow".into()))?,
-            full_content_before: full_before,
-            full_content_after: full_after,
-            delta_content_before: delta_before,
-            delta_content_after: delta_after,
-            max_delta_depth_before: depth_before,
-            max_delta_depth_after: depth_after,
+            content_record_count: content_after
+                .full
+                .checked_add(content_after.delta)
+                .ok_or_else(|| RepackError::Corrupt("report record count overflow".into()))?,
+            full_content_before: content_before.full,
+            full_content_after: content_after.full,
+            delta_content_before: content_before.delta,
+            delta_content_after: content_after.delta,
+            max_delta_depth_before: content_before.max_depth,
+            max_delta_depth_after: content_after.max_depth,
             metadata_delta_records: report.delta_records,
             max_metadata_delta_depth: report.max_delta_depth,
             loose_metadata_absorbed: absorbed.len() as u64,
-            estimated_temporary_bytes: plan.estimated_temporary_bytes,
+            estimated_temporary_bytes,
             bytes_written: report
                 .bytes_written
-                .checked_add(plan.estimated_replacement_content_bytes)
+                .checked_add(estimated_replacement_content_bytes)
                 .ok_or_else(|| RepackError::Corrupt("report written byte count overflow".into()))?,
             bytes_retired: report
                 .bytes_retired
-                .checked_add(content_bytes_before)
+                .checked_add(content_bytes_retired)
                 .ok_or_else(|| RepackError::Corrupt("report retired byte count overflow".into()))?,
             validated: true,
         })
@@ -587,13 +625,14 @@ fn list_loose_content_ids(root: &Path) -> Result<Vec<ContentId>, RepackError> {
 /// before it becomes authoritative for retirement. Each shard is one
 /// sequential, bounded-buffer scan: it neither seeks per entry nor
 /// materializes envelopes, so a 206k-entry / 120 MiB generation costs
-/// O(pack bytes + entries) I/O and O(64 KiB) scratch.
+/// O(pack bytes + entries) I/O and O(64 KiB) scratch. Returns the
+/// authenticated manifest so callers need not read it a second time.
 fn validate_content_generation(
     root: &Path,
     generation: PhysicalContentGeneration,
-) -> Result<(), RepackError> {
+) -> Result<Option<ContentGenerationManifest>, RepackError> {
     let Some(manifest) = read_content_manifest(root, generation)? else {
-        return Ok(());
+        return Ok(None);
     };
     if manifest.generation != generation.generation {
         return Err(RepackError::Corrupt(
@@ -707,7 +746,7 @@ fn validate_content_generation(
             ));
         }
     }
-    Ok(())
+    Ok(Some(manifest))
 }
 
 pub(super) fn read_content_manifest(
@@ -725,133 +764,102 @@ pub(super) fn read_content_manifest(
         })
 }
 
+/// Write `prepared` as a new content generation and return its authority.
 fn stage_content_generation(
     root: &Path,
-    plan: &RepackPlan,
-) -> Result<(PhysicalContentGeneration, ContentGenerationManifest), RepackError> {
+    prepared: &PreparedContentGeneration,
+) -> Result<PhysicalContentGeneration, RepackError> {
     let corrupt = |error: crate::ContentRepackError| RepackError::Corrupt(error.to_string());
-    match &plan.prepared_content {
-        ContentRepackPlan::NoOp { .. } => {
-            let current = plan.content_before.as_ref().ok_or_else(|| {
-                RepackError::Corrupt(
-                    "content without a selected generation cannot produce a no-op content plan"
-                        .into(),
-                )
+    let manifest = &prepared.manifest;
+    manifest.verify().map_err(corrupt)?;
+    let directory = root.join("content-generations");
+    fs::create_dir_all(&directory)?;
+    remove_partial_generation(&directory, manifest.generation)?;
+    let generation_dir = directory.join(manifest.generation.to_string());
+    fs::create_dir_all(&generation_dir)?;
+    // Production is grouped by shard, so each pack is written once, in
+    // order, and made durable before the next is opened: one fsync per
+    // shard, independent of the item count within it.
+    let mut open: Option<(usize, File, u64)> = None;
+    let mut finished = 0usize;
+    for envelope in prepared.envelopes().map_err(corrupt)? {
+        let envelope = envelope.map_err(corrupt)?;
+        let index = manifest
+            .entries
+            .binary_search_by_key(&envelope.id, |entry| entry.id)
+            .map_err(|_| {
+                RepackError::Corrupt("staged content ID is absent from manifest".into())
             })?;
-            let index = current
-                .index()
-                .map_err(corrupt)?
-                .encoded()
-                .map_err(corrupt)?;
-            Ok((
-                PhysicalContentGeneration {
-                    generation: current.generation,
-                    manifest: *blake3::hash(&index).as_bytes(),
-                },
-                current.clone(),
-            ))
-        }
-        ContentRepackPlan::Replace(_) => Err(RepackError::Corrupt(
-            "content analysis was not executed before staging".into(),
-        )),
-        ContentRepackPlan::ReplacePrepared(prepared) => {
-            let manifest = &prepared.manifest;
-            manifest.verify().map_err(corrupt)?;
-            let directory = root.join("content-generations");
-            fs::create_dir_all(&directory)?;
-            remove_partial_generation(&directory, manifest.generation)?;
-            let generation_dir = directory.join(manifest.generation.to_string());
-            fs::create_dir_all(&generation_dir)?;
-            // Production is grouped by shard, so each pack is written once, in
-            // order, and made durable before the next is opened: one fsync per
-            // shard, independent of the item count within it.
-            let mut open: Option<(usize, File, u64)> = None;
-            let mut finished = 0usize;
-            for envelope in prepared.envelopes().map_err(corrupt)? {
-                let envelope = envelope.map_err(corrupt)?;
-                let index = manifest
-                    .entries
-                    .binary_search_by_key(&envelope.id, |entry| entry.id)
-                    .map_err(|_| {
-                        RepackError::Corrupt("staged content ID is absent from manifest".into())
-                    })?;
-                let entry = &manifest.entries[index];
-                let shard = ContentGenerationManifest::shard_of(index);
-                if open
-                    .as_ref()
-                    .is_none_or(|(current, _, _)| *current != shard)
-                {
-                    if let Some((_, pack, _)) = open.take() {
-                        pack.sync_all()?;
-                        finished += 1;
-                    }
-                    if shard != finished {
-                        return Err(RepackError::Corrupt(
-                            "staged content is not grouped by shard".into(),
-                        ));
-                    }
-                    let path =
-                        content_generation_shard_pack_path(&directory, manifest.generation, shard);
-                    open = Some((shard, File::create(path)?, 0));
-                }
-                let (_, pack, pack_offset) = open.as_mut().expect("a shard pack is open");
-                if entry.pack_offset != *pack_offset
-                    || u64::try_from(envelope.bytes.len()).ok() != Some(entry.physical_length)
-                    || blake3::hash(&envelope.bytes).as_bytes() != &entry.envelope_digest
-                {
-                    return Err(RepackError::Corrupt(
-                        "staged content envelope differs from manifest".into(),
-                    ));
-                }
-                pack.write_all(&envelope.bytes)?;
-                *pack_offset = pack_offset
-                    .checked_add(entry.physical_length)
-                    .ok_or_else(|| RepackError::Corrupt("content pack offset overflow".into()))?;
-            }
+        let entry = &manifest.entries[index];
+        let shard = ContentGenerationManifest::shard_of(index);
+        if open
+            .as_ref()
+            .is_none_or(|(current, _, _)| *current != shard)
+        {
             if let Some((_, pack, _)) = open.take() {
                 pack.sync_all()?;
                 finished += 1;
             }
-            if finished != manifest.shard_count() {
+            if shard != finished {
                 return Err(RepackError::Corrupt(
-                    "staged content does not cover every shard".into(),
+                    "staged content is not grouped by shard".into(),
                 ));
             }
-            for shard in 0..manifest.shard_count() {
-                let path =
-                    content_generation_shard_manifest_path(&directory, manifest.generation, shard);
-                let mut file = File::create(path)?;
-                file.write_all(&manifest.encode_shard(shard).map_err(corrupt)?)?;
-                file.sync_all()?;
-            }
-            File::open(&generation_dir)?.sync_all()?;
-            // The index names every shard by digest; writing it last means an
-            // authenticated index implies its shards were already durable.
-            let index = manifest.index().map_err(corrupt)?;
-            if index.manifest_digest != manifest.manifest_digest {
-                return Err(RepackError::Corrupt(
-                    "staged content index differs from manifest".into(),
-                ));
-            }
-            let encoded = index.encoded().map_err(corrupt)?;
-            let digest = *blake3::hash(&encoded).as_bytes();
-            let mut file = File::create(content_generation_index_path(
-                &directory,
-                manifest.generation,
-                &digest,
-            ))?;
-            file.write_all(&encoded)?;
-            file.sync_all()?;
-            File::open(&directory)?.sync_all()?;
-            Ok((
-                PhysicalContentGeneration {
-                    generation: manifest.generation,
-                    manifest: digest,
-                },
-                manifest.clone(),
-            ))
+            let path = content_generation_shard_pack_path(&directory, manifest.generation, shard);
+            open = Some((shard, File::create(path)?, 0));
         }
+        let (_, pack, pack_offset) = open.as_mut().expect("a shard pack is open");
+        if entry.pack_offset != *pack_offset
+            || u64::try_from(envelope.bytes.len()).ok() != Some(entry.physical_length)
+            || blake3::hash(&envelope.bytes).as_bytes() != &entry.envelope_digest
+        {
+            return Err(RepackError::Corrupt(
+                "staged content envelope differs from manifest".into(),
+            ));
+        }
+        pack.write_all(&envelope.bytes)?;
+        *pack_offset = pack_offset
+            .checked_add(entry.physical_length)
+            .ok_or_else(|| RepackError::Corrupt("content pack offset overflow".into()))?;
     }
+    if let Some((_, pack, _)) = open.take() {
+        pack.sync_all()?;
+        finished += 1;
+    }
+    if finished != manifest.shard_count() {
+        return Err(RepackError::Corrupt(
+            "staged content does not cover every shard".into(),
+        ));
+    }
+    for shard in 0..manifest.shard_count() {
+        let path = content_generation_shard_manifest_path(&directory, manifest.generation, shard);
+        let mut file = File::create(path)?;
+        file.write_all(&manifest.encode_shard(shard).map_err(corrupt)?)?;
+        file.sync_all()?;
+    }
+    File::open(&generation_dir)?.sync_all()?;
+    // The index names every shard by digest; writing it last means an
+    // authenticated index implies its shards were already durable.
+    let index = manifest.index().map_err(corrupt)?;
+    if index.manifest_digest != manifest.manifest_digest {
+        return Err(RepackError::Corrupt(
+            "staged content index differs from manifest".into(),
+        ));
+    }
+    let encoded = index.encoded().map_err(corrupt)?;
+    let digest = *blake3::hash(&encoded).as_bytes();
+    let mut file = File::create(content_generation_index_path(
+        &directory,
+        manifest.generation,
+        &digest,
+    ))?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    File::open(&directory)?.sync_all()?;
+    Ok(PhysicalContentGeneration {
+        generation: manifest.generation,
+        manifest: digest,
+    })
 }
 
 /// Parse `{generation}-{hex digest}.manifest`: a top-level index file name.
@@ -969,13 +977,22 @@ fn remove_staged_content_generation(
 /// Retires only content whose replacement is already named by the committed
 /// catalog head. Callers hold the packed catalog process lock throughout;
 /// this function never changes catalog authority.
+///
+/// `manifest` is the authenticated manifest of `retained`, as
+/// [`validate_content_generation`] returned it.
 fn retire_repacked_content(
     root: &Path,
     retained: PhysicalContentGeneration,
+    manifest: Option<&ContentGenerationManifest>,
 ) -> Result<(), RepackError> {
-    let Some(manifest) = read_content_manifest(root, retained)? else {
+    let Some(manifest) = manifest else {
         return Ok(());
     };
+    if manifest.generation != retained.generation {
+        return Err(RepackError::Corrupt(
+            "retained content manifest names another generation".into(),
+        ));
+    }
 
     // A post-repack writer may add content after this manifest was staged. Only
     // IDs covered by this immutable manifest can lose their loose fallback.
@@ -1043,37 +1060,33 @@ fn retire_repacked_content(
     Ok(())
 }
 
-fn sum_content_bytes(manifest: &ContentGenerationManifest) -> Result<u64, RepackError> {
-    manifest.entries.iter().try_fold(0u64, |sum, entry| {
-        sum.checked_add(entry.physical_length)
-            .ok_or_else(|| RepackError::Corrupt("content byte count overflow".into()))
-    })
+/// What the repack report needs from one content generation, so the
+/// generation's manifest need not be kept for it.
+#[derive(Clone, Copy, Debug, Default)]
+struct ContentGenerationStats {
+    full: u64,
+    delta: u64,
+    max_depth: u8,
+    bytes: u64,
 }
 
-fn content_stats(manifest: &ContentGenerationManifest) -> Result<(u64, u64, u8), RepackError> {
-    let delta = u64::try_from(
-        manifest
-            .entries
-            .iter()
-            .filter(|entry| entry.delta_base.is_some())
-            .count(),
-    )
-    .map_err(|_| RepackError::Corrupt("content count overflow".into()))?;
-    let total = u64::try_from(manifest.entries.len())
-        .map_err(|_| RepackError::Corrupt("content count overflow".into()))?;
-    let full = total
-        .checked_sub(delta)
-        .ok_or_else(|| RepackError::Corrupt("content count underflow".into()))?;
-    Ok((
-        full,
-        delta,
-        manifest
-            .entries
-            .iter()
-            .map(|entry| entry.delta_depth)
-            .max()
-            .unwrap_or(0),
-    ))
+impl ContentGenerationStats {
+    fn of(manifest: Option<&ContentGenerationManifest>) -> Result<Self, RepackError> {
+        let mut stats = Self::default();
+        for entry in manifest.map_or(&[][..], |manifest| &manifest.entries) {
+            if entry.delta_base.is_some() {
+                stats.delta += 1;
+            } else {
+                stats.full += 1;
+            }
+            stats.max_depth = stats.max_depth.max(entry.delta_depth);
+            stats.bytes = stats
+                .bytes
+                .checked_add(entry.physical_length)
+                .ok_or_else(|| RepackError::Corrupt("content byte count overflow".into()))?;
+        }
+        Ok(stats)
+    }
 }
 
 fn object_catalog_error(error: CatalogError) -> ObjectStoreError {

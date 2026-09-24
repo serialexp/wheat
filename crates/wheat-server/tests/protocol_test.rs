@@ -15,7 +15,7 @@ use wheat_core::{
 use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
-use wheat_store::{ContentStore, LocalPublicationStore, LooseObjectStore, RepositoryPublisher};
+use wheat_store::{ContentStore, LocalPublicationStore, PackedObjectStore, RepositoryPublisher};
 
 fn edit(path: &str, value: &[u8]) -> RevisionEdits {
     let record = EditRecord::new(
@@ -39,10 +39,12 @@ fn edit(path: &str, value: &[u8]) -> RevisionEdits {
     }
 }
 
-fn stores(root: &std::path::Path) -> (LooseObjectStore, ContentStore, LocalPublicationStore) {
+fn stores(root: &std::path::Path) -> (PackedObjectStore, ContentStore, LocalPublicationStore) {
+    let objects = PackedObjectStore::open(root.join("storage")).unwrap();
+    let content = objects.content_store();
     (
-        LooseObjectStore::new(root.join("objects")),
-        ContentStore::new(root.join("content")),
+        objects,
+        content,
         LocalPublicationStore::new(root.join("repository.head")),
     )
 }
@@ -53,7 +55,7 @@ async fn start_server(
     data_dir: &std::path::Path,
     repo_name: &str,
 ) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
-    let registry = Registry::single_named(repo_name.to_string(), data_dir);
+    let registry = Registry::single_named(repo_name.to_string(), data_dir).unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 

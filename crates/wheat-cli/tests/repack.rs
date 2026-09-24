@@ -130,15 +130,14 @@ fn packed_repack_preserves_shared_workspace_authority_and_materialization() {
 }
 
 #[test]
-fn repack_rejects_loose_store() {
+fn repack_accepts_an_initialized_store() {
+    // `wheat init` creates the same packed layout that `wheat import` does.
     let root = tempfile::tempdir().unwrap();
     let stores = root.path().join("stores");
     let workspace = root.path().join("workspace");
     ok(root.path(), &stores, &["init", workspace.to_str().unwrap()]);
+    assert!(store_path(&workspace).join("storage").is_dir());
 
-    let output = run(&workspace, &stores, &["repack", "--force"]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("repack requires a packed Wheat store")
-    );
+    ok(&workspace, &stores, &["repack", "--force"]);
+    ok(&workspace, &stores, &["validate"]);
 }

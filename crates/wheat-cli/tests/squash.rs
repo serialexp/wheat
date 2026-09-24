@@ -7,7 +7,7 @@ use std::{
 };
 
 use wheat_store::{
-    LocalPublicationStore, LooseObjectStore, PublicationStore, RepositoryHead, RepositoryReader,
+    LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryHead, RepositoryReader,
 };
 
 fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -83,8 +83,8 @@ fn write_remote(store: &Path, observed: RepositoryHead) {
 }
 
 async fn revision(store: &Path, id: &str) -> wheat_core::RevisionRecord {
-    let objects = LooseObjectStore::new(store.join("objects"));
-    let content = wheat_store::ContentStore::new(store.join("content"));
+    let objects = PackedObjectStore::open(store.join("storage")).unwrap();
+    let content = objects.content_store();
     RepositoryReader::new(&objects, &content)
         .revision(id.parse().unwrap())
         .await

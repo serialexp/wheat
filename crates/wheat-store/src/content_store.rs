@@ -424,12 +424,7 @@ impl ContentStore {
         let path = self.path(id);
         let parent = path.parent().expect("content path has parent");
         fs::create_dir_all(parent)?;
-
-        let mut directory = Some(nonempty_path(&self.root));
-        while let Some(path) = directory {
-            self.durability.sync_directory(path)?;
-            directory = nonempty_parent(path);
-        }
+        self.sync_root_entries()?;
 
         if path.exists() {
             // Already stored (possibly by a concurrent writer).
@@ -462,6 +457,21 @@ impl ContentStore {
         result
     }
 
+    /// Persists the directory entries that reach a shard directory: the shard's entry in the
+    /// root and the root's entry in its parent. Do this even when the directories already
+    /// exist: they may be leftovers from a previous attempt whose directory sync failed, and
+    /// must not become an implicitly acknowledged success on retry. Directories above the
+    /// root belong to whoever created the store, so every put costs two syncs here rather
+    /// than one per ancestor up to the filesystem root.
+    fn sync_root_entries(&self) -> Result<(), ContentStoreError> {
+        let root = nonempty_path(&self.root);
+        self.durability.sync_directory(root)?;
+        if let Some(parent) = nonempty_parent(root) {
+            self.durability.sync_directory(parent)?;
+        }
+        Ok(())
+    }
+
     fn put_with_id(&self, id: ContentId, bytes: &[u8]) -> Result<(), ContentStoreError> {
         if ContentId::of(bytes) != id {
             return Err(ContentStoreError::Corrupt {
@@ -475,16 +485,7 @@ impl ContentStore {
         let path = self.path(id);
         let parent = path.parent().expect("content path has parent");
         fs::create_dir_all(parent)?;
-
-        // Persist both directory entries needed to reach a content file. Do this
-        // even when the directories already exist: they may be leftovers from a
-        // previous attempt whose directory sync failed, and must not become an
-        // implicitly acknowledged success on retry.
-        let mut directory = Some(nonempty_path(&self.root));
-        while let Some(path) = directory {
-            self.durability.sync_directory(path)?;
-            directory = nonempty_parent(path);
-        }
+        self.sync_root_entries()?;
 
         if path.exists() {
             self.verify_existing(id, bytes)?;

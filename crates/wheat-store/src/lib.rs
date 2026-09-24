@@ -21,9 +21,9 @@ pub use content_generation::{
 mod content_repack;
 mod content_set;
 pub use content_repack::{
-    ContentGenerationTarget, ContentRepackAnalysis, ContentRepackError, ContentRepackInput,
-    ContentRepackLimits, ContentRepackPlan, GenerationQualifiedEnvelope, PreparedContentGeneration,
-    plan_content_repack, prepare_content_repack, publish_content_repack,
+    ContentGenerationTarget, ContentHistoryPair, ContentRepackAnalysis, ContentRepackError,
+    ContentRepackInput, ContentRepackLimits, ContentRepackPlan, GenerationQualifiedEnvelope,
+    PreparedContentGeneration, plan_content_repack, prepare_content_repack, publish_content_repack,
 };
 mod codec;
 mod content_io;
@@ -88,7 +88,7 @@ pub use loose::{
 pub use merkle_tree::{
     FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, TreeContentCursor,
     TreeContentWalkLimits, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
-    TreePathLimits, TreePathSelection, TreeSelectionLimits, TreeWalkLimits,
+    TreePathLimits, TreePathSelection, TreePathShape, TreeSelectionLimits, TreeWalkLimits,
 };
 pub use mutation_publication::{
     PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,

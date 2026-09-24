@@ -1361,11 +1361,10 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Repack(arguments) => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            local::require_packed_layout(&store_root)?;
             let local = open(&store_root)?;
             let _operation =
                 rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
-            let backend = repack::PackedRepackBackend::new(&store_root, &local)?;
+            let backend = repack::PackedRepackBackend::new(&store_root, &local);
             let stdin = std::io::stdin();
             let stderr = std::io::stderr();
             let interactive = stdin.is_terminal() && stderr.is_terminal();
@@ -2160,8 +2159,8 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
     }
     std::fs::create_dir(&store_root)?;
 
-    let objects = wheat_store::LooseObjectStore::new(store_root.join("objects"));
-    let content = wheat_store::ContentStore::new(store_root.join("content"));
+    let objects = wheat_store::PackedObjectStore::open(store_root.join("storage"))?;
+    let content = objects.content_store();
     let heads = wheat_store::LocalPublicationStore::new(store_root.join("repository.head"));
 
     let rt = runtime()?;
@@ -2196,6 +2195,9 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
             .unwrap_or_else(|| "main".to_string());
         Ok::<_, anyhow::Error>((state, label))
     })?;
+    // Release the packed store's process lock; the workspace reopens the store below.
+    drop(content);
+    drop(objects);
 
     // Write the head.
     let head = wheat_store::RepositoryHead {

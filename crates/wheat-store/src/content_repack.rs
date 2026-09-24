@@ -4,13 +4,12 @@
 //! bodies and encoded envelopes are handled one at a time; envelopes are spilled
 //! to an unlinked temporary file and streamed to the publication target.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use wheat_core::{ContentId, Repository};
+use wheat_core::ContentId;
 
 use crate::content_generation::{
     CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationEntry, ContentGenerationManifest,
@@ -24,8 +23,7 @@ const MAX_DELTA_DEPTH: u8 = crate::content_store::MAX_DELTA_CHAIN_DEPTH as u8;
 #[derive(Clone, Copy, Debug)]
 pub struct ContentRepackLimits {
     pub max_content_ids: usize,
-    pub max_lineages: usize,
-    pub max_lineage_entries: usize,
+    pub max_history_pairs: usize,
     pub max_logical_bytes: u64,
     /// Bounds each logical read and therefore the planner's working set. Delta
     /// planning has at most two logical records and two encoded candidates live.
@@ -36,8 +34,7 @@ impl Default for ContentRepackLimits {
     fn default() -> Self {
         Self {
             max_content_ids: 250_000,
-            max_lineages: 250_000,
-            max_lineage_entries: 4_000_000,
+            max_history_pairs: 4_000_000,
             // This is a work/capacity bound, not a memory budget: bodies spill.
             max_logical_bytes: 1 << 40,
             max_record_logical_bytes: 64 * 1024 * 1024,
@@ -45,68 +42,26 @@ impl Default for ContentRepackLimits {
     }
 }
 
-/// Exact authenticated inventory and retained content lineages.
+/// Exact authenticated inventory and retained content history.
 ///
-/// Lineages are ordered newest (the retained tip) to oldest. Every inventory ID
-/// is retained even when it occurs in no lineage.
+/// Every inventory ID is retained even when it occurs in no pair or tip.
 #[derive(Clone, Debug)]
 pub struct ContentRepackInput {
     pub content_ids: Vec<ContentId>,
-    pub lineages_newest_first: Vec<Vec<ContentId>>,
+    /// Content of every file in a tip view (a view without children). Tips
+    /// are always stored whole.
+    pub tips: Vec<ContentId>,
+    /// File content before and after single-parent view-lineage edges.
+    pub history: Vec<ContentHistoryPair>,
 }
 
-/// Derive deterministic per-path content histories from authenticated retained
-/// views. A merge with conflicting parents terminates both histories rather than
-/// choosing a representation based on traversal order.
-pub(crate) fn retained_lineages(repository: &Repository) -> Vec<Vec<ContentId>> {
-    let views = repository
-        .retained_views()
-        .map(|view| (view.id, view))
-        .collect::<BTreeMap<_, _>>();
-    let mut parents = BTreeMap::<_, Vec<_>>::new();
-    let mut children = BTreeMap::<_, Vec<_>>::new();
-    for (parent, child) in repository.view_lineage() {
-        parents.entry(child).or_default().push(parent);
-        children.entry(parent).or_default().push(child);
-    }
-    for values in parents.values_mut() {
-        values.sort_unstable();
-    }
-    for values in children.values_mut() {
-        values.sort_unstable();
-    }
-
-    let mut result = Vec::new();
-    for (tip_id, tip) in &views {
-        if children
-            .get(tip_id)
-            .is_some_and(|values| !values.is_empty())
-        {
-            continue;
-        }
-        for path in tip.tree.keys() {
-            let mut lineage = Vec::new();
-            let mut cursor = *tip_id;
-            while let Some(view) = views.get(&cursor) {
-                let Some(content) = view.tree.get(path).map(|value| value.content) else {
-                    break;
-                };
-                if lineage.last() != Some(&content) {
-                    lineage.push(content);
-                }
-                let Some(parent) = parents.get(&cursor).filter(|values| values.len() == 1) else {
-                    break;
-                };
-                cursor = parent[0];
-            }
-            if !lineage.is_empty() {
-                result.push(lineage);
-            }
-        }
-    }
-    result.sort();
-    result.dedup();
-    result
+/// One file's content in a parent view (`older`) and at the same path in its
+/// only child view (`newer`). The newer content is the older's proposed
+/// reverse-delta base.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ContentHistoryPair {
+    pub older: ContentId,
+    pub newer: ContentId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,21 +71,15 @@ pub struct GenerationQualifiedEnvelope {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ScratchEnvelope {
-    entry_index: usize,
-    offset: u64,
-    length: u64,
-}
-
-/// Read-only deterministic content plan. It contains fixed-size authenticated
-/// metadata and source IDs only; replacement bytes are generated after capacity
-/// admission by [`prepare_content_repack`].
+/// Read-only deterministic content plan: the sealed manifest plus the order in
+/// which to produce its envelopes. Replacement bytes are generated after
+/// capacity admission by [`prepare_content_repack`].
 #[derive(Clone, Debug)]
 pub struct ContentRepackAnalysis {
     pub manifest: ContentGenerationManifest,
-    input: ContentRepackInput,
-    production_ids: Vec<ContentId>,
+    /// Manifest entry indexes in production order: grouped by shard, and
+    /// within a shard every delta base before the deltas on it.
+    production: Vec<u32>,
     limits: ContentRepackLimits,
     estimated_bytes: u64,
 }
@@ -148,7 +97,9 @@ impl ContentRepackAnalysis {
 pub struct PreparedContentGeneration {
     pub manifest: ContentGenerationManifest,
     scratch: NamedTempFile,
-    physical_order: Vec<ScratchEnvelope>,
+    /// Manifest entry indexes in scratch order. Envelopes are contiguous in
+    /// scratch, so each one's offset is the sum of the lengths before it.
+    production: Vec<u32>,
     scratch_bytes: u64,
 }
 
@@ -159,8 +110,8 @@ impl PreparedContentGeneration {
         Ok(ContentEnvelopeIter {
             generation: self.manifest.generation,
             entries: &self.manifest.entries,
-            locations: self.physical_order.iter(),
-            file: self.scratch.reopen()?,
+            production: self.production.iter(),
+            file: BufReader::with_capacity(64 * 1024, self.scratch.reopen()?),
         })
     }
 
@@ -173,24 +124,23 @@ impl PreparedContentGeneration {
 pub struct ContentEnvelopeIter<'a> {
     generation: u64,
     entries: &'a [ContentGenerationEntry],
-    locations: std::slice::Iter<'a, ScratchEnvelope>,
-    file: File,
+    production: std::slice::Iter<'a, u32>,
+    file: BufReader<File>,
 }
 
 impl Iterator for ContentEnvelopeIter<'_> {
     type Item = Result<GenerationQualifiedEnvelope, ContentRepackError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let location = self.locations.next()?;
+        let entry = &self.entries[*self.production.next()? as usize];
         Some((|| {
-            let length = usize::try_from(location.length)
+            let length = usize::try_from(entry.physical_length)
                 .map_err(|_| ContentRepackError::ArithmeticOverflow("scratch envelope length"))?;
-            self.file.seek(SeekFrom::Start(location.offset))?;
             let mut bytes = vec![0; length];
             self.file.read_exact(&mut bytes)?;
             Ok(GenerationQualifiedEnvelope {
                 generation: self.generation,
-                id: self.entries[location.entry_index].id,
+                id: entry.id,
                 bytes,
             })
         })())
@@ -204,8 +154,6 @@ pub enum ContentRepackPlan {
         fingerprint: [u8; 32],
     },
     Replace(ContentRepackAnalysis),
-    #[doc(hidden)]
-    ReplacePrepared(PreparedContentGeneration),
 }
 
 #[derive(Debug, Error)]
@@ -222,8 +170,8 @@ pub enum ContentRepackError {
     },
     #[error("content repack arithmetic overflow while computing {0}")]
     ArithmeticOverflow(&'static str),
-    #[error("lineage references content {0} outside the authenticated inventory")]
-    UnknownLineageContent(ContentId),
+    #[error("content history references content {0} outside the authenticated inventory")]
+    UnknownHistoryContent(ContentId),
     #[error("content generation overflow")]
     GenerationOverflow,
     #[error("invalid content generation manifest: {0}")]
@@ -289,22 +237,26 @@ pub fn publish_content_repack(
         .map_err(ContentRepackError::Integration)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BaseChoice {
-    Unique(ContentId),
-    Conflict,
-}
+/// Base-table mark: the ID has no proposed base (or is a tip).
+const NO_BASE: u32 = u32::MAX;
+/// Base-table mark: two different bases were proposed, so the ID stays whole.
+const CONFLICT: u32 = u32::MAX - 1;
+/// Inventory positions are `u32`; the two largest values are the marks above.
+const MAX_INDEXED_CONTENT_IDS: usize = CONFLICT as usize;
 
-#[derive(Clone, Copy, Debug)]
-struct ChosenEnvelope {
-    physical_length: u64,
-    logical_length: u64,
-    digest: [u8; 32],
-    base: Option<ContentId>,
-    depth: u8,
+/// Where planning stands for one inventory position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Visit {
+    Pending,
+    OnPath,
+    Chosen,
 }
 
 /// Build a deterministic reverse-delta generation with disk-backed staging.
+///
+/// Memory is a few flat per-ID tables indexed by inventory position (the
+/// manifest entries themselves, a `u32` base, a one-byte visit mark and a
+/// `u32` production slot), never maps keyed by `ContentId`.
 pub fn plan_content_repack(
     source: &ContentStore,
     current: Option<&ContentGenerationManifest>,
@@ -314,103 +266,98 @@ pub fn plan_content_repack(
     if let Some(current) = current {
         current.verify()?;
     }
-    let inventory = input.content_ids.into_iter().collect::<BTreeSet<_>>();
+    let ContentRepackInput {
+        content_ids: mut inventory,
+        tips,
+        history,
+    } = input;
+    inventory.sort_unstable();
+    inventory.dedup();
     check_limit("content IDs", inventory.len(), limits.max_content_ids)?;
     check_limit(
-        "lineages",
-        input.lineages_newest_first.len(),
-        limits.max_lineages,
+        "indexed content IDs",
+        inventory.len(),
+        MAX_INDEXED_CONTENT_IDS,
     )?;
-    let lineage_entries = input
-        .lineages_newest_first
-        .iter()
-        .try_fold(0usize, |sum, lineage| sum.checked_add(lineage.len()))
-        .ok_or(ContentRepackError::ArithmeticOverflow(
-            "lineage entry count",
-        ))?;
-    check_limit(
-        "lineage entries",
-        lineage_entries,
-        limits.max_lineage_entries,
-    )?;
+    check_limit("history pairs", history.len(), limits.max_history_pairs)?;
+    let position = |id: &ContentId| {
+        inventory
+            .binary_search(id)
+            .map(|index| index as u32)
+            .map_err(|_| ContentRepackError::UnknownHistoryContent(*id))
+    };
 
-    let mut tips = BTreeSet::new();
-    let mut bases = BTreeMap::<ContentId, BaseChoice>::new();
-    for lineage in &input.lineages_newest_first {
-        if let Some(tip) = lineage.first() {
-            tips.insert(*tip);
-        }
-        for id in lineage {
-            if !inventory.contains(id) {
-                return Err(ContentRepackError::UnknownLineageContent(*id));
-            }
-        }
-        for pair in lineage.windows(2) {
-            let (base, target) = (pair[0], pair[1]);
-            let proposed = if base == target {
-                BaseChoice::Conflict
-            } else {
-                BaseChoice::Unique(base)
-            };
-            bases
-                .entry(target)
-                .and_modify(|choice| {
-                    if *choice != proposed {
-                        *choice = BaseChoice::Conflict;
-                    }
-                })
-                .or_insert(proposed);
+    // Reverse deltas: the older content is the target, the newer its base.
+    let mut bases = vec![NO_BASE; inventory.len()];
+    for pair in &history {
+        let older = position(&pair.older)?;
+        let newer = position(&pair.newer)?;
+        let proposed = if older == newer { CONFLICT } else { newer };
+        let slot = &mut bases[older as usize];
+        if *slot == NO_BASE {
+            *slot = proposed;
+        } else if *slot != proposed {
+            *slot = CONFLICT;
         }
     }
+    drop(history);
     for tip in &tips {
-        bases.remove(tip);
+        bases[position(tip)? as usize] = NO_BASE;
     }
+    drop(tips);
 
+    // Entries are filled in place, in ID order; `inventory[i]` is `entries[i].id`.
+    let mut entries = inventory
+        .iter()
+        .map(|id| ContentGenerationEntry {
+            id: *id,
+            envelope_digest: [0; 32],
+            pack_offset: 0,
+            physical_length: 0,
+            logical_length: 0,
+            delta_base: None,
+            delta_depth: 0,
+        })
+        .collect::<Vec<_>>();
+    drop(inventory);
+    let mut visit = vec![Visit::Pending; entries.len()];
+    let mut production = Vec::<u32>::with_capacity(entries.len());
     let mut estimated_bytes = 0u64;
     let mut logical_bytes = 0u64;
-    let mut chosen = BTreeMap::<ContentId, ChosenEnvelope>::new();
-    let mut production_ids = Vec::with_capacity(inventory.len());
-    let mut path = Vec::new();
-    let mut on_path = HashSet::new();
+    let mut path = Vec::<usize>::new();
 
-    for start in &inventory {
-        if chosen.contains_key(start) {
+    for start in 0..entries.len() {
+        if visit[start] == Visit::Chosen {
             continue;
         }
         path.clear();
-        on_path.clear();
-        let mut cursor = *start;
+        let mut cursor = start;
         let cycle = loop {
-            if chosen.contains_key(&cursor)
-                || !matches!(bases.get(&cursor), Some(BaseChoice::Unique(_)))
-            {
+            if visit[cursor] == Visit::Chosen || bases[cursor] >= CONFLICT {
                 break false;
             }
-            if !on_path.insert(cursor) {
+            if visit[cursor] == Visit::OnPath {
                 break true;
             }
+            visit[cursor] = Visit::OnPath;
             path.push(cursor);
-            let Some(BaseChoice::Unique(base)) = bases.get(&cursor) else {
-                unreachable!()
-            };
-            cursor = *base;
+            cursor = bases[cursor] as usize;
         };
-        if !chosen.contains_key(&cursor) {
+        if visit[cursor] != Visit::Chosen {
             path.push(cursor);
         }
-        for id in path.iter().rev() {
-            if chosen.contains_key(id) {
+        for &index in path.iter().rev() {
+            if visit[index] == Visit::Chosen {
                 continue;
             }
-            let base = if cycle {
-                None
-            } else {
-                bases.get(id).and_then(|choice| match choice {
-                    BaseChoice::Unique(base) if chosen.contains_key(base) => Some(*base),
-                    BaseChoice::Unique(_) | BaseChoice::Conflict => None,
-                })
+            let base = match bases[index] {
+                base if !cycle && base < CONFLICT && visit[base as usize] == Visit::Chosen => {
+                    Some(base as usize)
+                }
+                _ => None,
             };
-            let target_bytes = source.get_bounded(*id, limits.max_record_logical_bytes)?;
+            let id = entries[index].id;
+            let target_bytes = source.get_bounded(id, limits.max_record_logical_bytes)?;
             let target_length = u64::try_from(target_bytes.len())
                 .map_err(|_| ContentRepackError::ArithmeticOverflow("record logical length"))?;
             logical_bytes = logical_bytes
@@ -423,10 +370,10 @@ pub fn plan_content_repack(
                     limit: limits.max_logical_bytes,
                 });
             }
-            let full = encode_full(*id, &target_bytes)?;
-            let (bytes, selected_base, depth) = if let Some(base_id) = base {
-                let base_meta = chosen[&base_id];
-                if base_meta.depth < MAX_DELTA_DEPTH {
+            let full = encode_full(id, &target_bytes)?;
+            let (bytes, selected_base, depth) = match base {
+                Some(base) if entries[base].delta_depth < MAX_DELTA_DEPTH => {
+                    let (base_id, base_depth) = (entries[base].id, entries[base].delta_depth);
                     let base_bytes =
                         source.get_bounded(base_id, limits.max_record_logical_bytes)?;
                     let candidate = delta::compute_delta(&base_bytes, &target_bytes)
@@ -435,58 +382,35 @@ pub fn plan_content_repack(
                         })
                         .filter(|candidate| candidate.len() < full.len());
                     candidate.map_or((full, None, 0), |bytes| {
-                        (bytes, Some(base_id), base_meta.depth + 1)
+                        (bytes, Some(base_id), base_depth + 1)
                     })
-                } else {
-                    (full, None, 0)
                 }
-            } else {
-                (full, None, 0)
+                _ => (full, None, 0),
             };
             let physical_length = u64::try_from(bytes.len())
                 .map_err(|_| ContentRepackError::ArithmeticOverflow("envelope length"))?;
             estimated_bytes = estimated_bytes.checked_add(physical_length).ok_or(
                 ContentRepackError::ArithmeticOverflow("replacement byte estimate"),
             )?;
-            let digest = *blake3::hash(&bytes).as_bytes();
-            chosen.insert(
-                *id,
-                ChosenEnvelope {
-                    physical_length,
-                    logical_length: target_length,
-                    digest,
-                    base: selected_base,
-                    depth,
-                },
-            );
-            production_ids.push(*id);
+            let entry = &mut entries[index];
+            entry.envelope_digest = *blake3::hash(&bytes).as_bytes();
+            entry.physical_length = physical_length;
+            entry.logical_length = target_length;
+            entry.delta_base = selected_base;
+            entry.delta_depth = depth;
+            visit[index] = Visit::Chosen;
+            production.push(index as u32);
         }
     }
+    drop((bases, visit, path));
 
-    let mut entries = Vec::with_capacity(chosen.len());
-    for (id, envelope) in &chosen {
-        entries.push(ContentGenerationEntry {
-            id: *id,
-            envelope_digest: envelope.digest,
-            pack_offset: 0,
-            physical_length: envelope.physical_length,
-            logical_length: envelope.logical_length,
-            delta_base: envelope.base,
-            delta_depth: envelope.depth,
-        });
-    }
     // Each shard has its own pack: group production by shard (keeping the
     // base-first order within it) and lay each pack out from offset zero.
-    let entry_index = |entries: &[ContentGenerationEntry], id: &ContentId| {
-        entries
-            .binary_search_by_key(id, |entry| entry.id)
-            .expect("every produced ID has an entry")
-    };
-    production_ids.sort_by_key(|id| entry_index(&entries, id) / CONTENT_GENERATION_SHARD_ENTRIES);
+    production.sort_by_key(|index| *index as usize / CONTENT_GENERATION_SHARD_ENTRIES);
     let mut shard = usize::MAX;
     let mut next_offset = 0u64;
-    for id in &production_ids {
-        let index = entry_index(&entries, id);
+    for &index in &production {
+        let index = index as usize;
         if index / CONTENT_GENERATION_SHARD_ENTRIES != shard {
             shard = index / CONTENT_GENERATION_SHARD_ENTRIES;
             next_offset = 0;
@@ -515,56 +439,40 @@ pub fn plan_content_repack(
     })?;
     Ok(ContentRepackPlan::Replace(ContentRepackAnalysis {
         manifest: ContentGenerationManifest::new(generation, entries)?,
-        input: ContentRepackInput {
-            content_ids: inventory.into_iter().collect(),
-            lineages_newest_first: input.lineages_newest_first,
-        },
-        production_ids,
+        production,
         limits,
         estimated_bytes,
     }))
 }
 
-/// Execute a previously analysed content plan into disk-backed scratch. The
-/// deterministic manifest is re-derived and compared before any result can be
-/// staged, binding execution to the exact authority inspected during planning.
+/// Execute a previously analysed content plan into disk-backed scratch.
+///
+/// Every envelope is re-encoded from the source and must match its planned
+/// length and digest exactly, and together they must match the planned byte
+/// total. That binds execution to the plan without planning a second time.
 pub fn prepare_content_repack(
     source: &ContentStore,
-    analysis: &ContentRepackAnalysis,
+    analysis: ContentRepackAnalysis,
 ) -> Result<PreparedContentGeneration, ContentRepackError> {
-    let replanned = plan_content_repack(source, None, analysis.input.clone(), analysis.limits)?;
-    let ContentRepackPlan::Replace(replanned) = replanned else {
+    let ContentRepackAnalysis {
+        manifest,
+        production,
+        limits,
+        estimated_bytes,
+    } = analysis;
+    if production.len() != manifest.entries.len() {
         return Err(ContentRepackError::InvalidManifest(
-            "execution unexpectedly produced a no-op analysis".into(),
-        ));
-    };
-    if replanned.manifest.content_fingerprint != analysis.manifest.content_fingerprint
-        || replanned.manifest.entries != analysis.manifest.entries
-        || replanned.production_ids != analysis.production_ids
-        || replanned.estimated_bytes != analysis.estimated_bytes
-    {
-        return Err(ContentRepackError::InvalidManifest(
-            "content source changed after planning".into(),
+            "production order does not cover the manifest".into(),
         ));
     }
-
     let mut scratch = NamedTempFile::new()?;
     let mut writer = BufWriter::new(scratch.as_file_mut());
-    let entry_indexes = analysis
-        .manifest
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.id, index))
-        .collect::<BTreeMap<_, _>>();
-    let mut physical_order = Vec::with_capacity(analysis.production_ids.len());
     let mut scratch_bytes = 0u64;
-    for id in &analysis.production_ids {
-        let bytes = encode_planned_envelope(source, &analysis.manifest, *id, analysis.limits)?;
-        let entry_index = *entry_indexes
-            .get(id)
-            .ok_or_else(|| ContentRepackError::InvalidManifest("production ID is absent".into()))?;
-        let entry = &analysis.manifest.entries[entry_index];
+    for &index in &production {
+        let entry = manifest.entries.get(index as usize).ok_or_else(|| {
+            ContentRepackError::InvalidManifest("production index is outside the manifest".into())
+        })?;
+        let bytes = encode_planned_envelope(source, entry, limits)?;
         if u64::try_from(bytes.len()).ok() != Some(entry.physical_length)
             || blake3::hash(&bytes).as_bytes() != &entry.envelope_digest
         {
@@ -572,39 +480,32 @@ pub fn prepare_content_repack(
                 "executed envelope differs from planned metadata".into(),
             ));
         }
-        let offset = scratch_bytes;
         scratch_bytes = scratch_bytes
             .checked_add(entry.physical_length)
             .ok_or(ContentRepackError::ArithmeticOverflow("scratch byte count"))?;
         writer.write_all(&bytes)?;
-        physical_order.push(ScratchEnvelope {
-            entry_index,
-            offset,
-            length: entry.physical_length,
-        });
     }
     writer.flush()?;
     drop(writer);
+    if scratch_bytes != estimated_bytes {
+        return Err(ContentRepackError::InvalidManifest(
+            "executed byte total differs from the plan".into(),
+        ));
+    }
     Ok(PreparedContentGeneration {
-        manifest: analysis.manifest.clone(),
+        manifest,
         scratch,
-        physical_order,
+        production,
         scratch_bytes,
     })
 }
 
 fn encode_planned_envelope(
     source: &ContentStore,
-    manifest: &ContentGenerationManifest,
-    id: ContentId,
+    entry: &ContentGenerationEntry,
     limits: ContentRepackLimits,
 ) -> Result<Vec<u8>, ContentRepackError> {
-    let entry = manifest
-        .entries
-        .binary_search_by_key(&id, |entry| entry.id)
-        .ok()
-        .map(|index| &manifest.entries[index])
-        .ok_or_else(|| ContentRepackError::InvalidManifest("planned ID is absent".into()))?;
+    let id = entry.id;
     let target = source.get_bounded(id, limits.max_record_logical_bytes)?;
     match entry.delta_base {
         Some(base) => {
@@ -652,17 +553,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quarter_million_record_metadata_has_no_body_sized_fields() {
-        // The planner's per-record state is fixed-size. At the production limit,
-        // payload bytes remain exclusively in scratch instead of multiplying RSS.
-        let records = ContentRepackLimits::default().max_content_ids;
-        assert!(std::mem::size_of::<ChosenEnvelope>() <= 96);
-        assert!(std::mem::size_of::<ScratchEnvelope>() <= 32);
-        assert!(
-            records
-                .checked_mul(std::mem::size_of::<ChosenEnvelope>())
-                .unwrap()
-                <= 24 * 1024 * 1024
-        );
+    fn per_id_planner_state_is_small_and_fixed_size() {
+        // Beyond the manifest entry every ID costs a u32 base, a one-byte visit
+        // mark and a u32 production slot. Payload bytes live only in scratch.
+        assert_eq!(std::mem::size_of::<Visit>(), 1);
+        assert!(std::mem::size_of::<ContentGenerationEntry>() <= 128);
+        let per_id = std::mem::size_of::<ContentGenerationEntry>()
+            + 2 * std::mem::size_of::<u32>()
+            + std::mem::size_of::<Visit>();
+        assert!(per_id <= 144, "{per_id} bytes per content ID");
     }
 }

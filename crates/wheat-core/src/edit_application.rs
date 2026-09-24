@@ -10,8 +10,17 @@ use crate::{
     guarded,
 };
 
+/// Default bound on the edits one revision may apply.
+///
+/// Application holds one record per edit plus the target values of the paths they touch, and
+/// resolves content one path group at a time, so its cost grows with the edit count rather than
+/// the repository. The bound matches the Merkle tree update bound that installs the result; the
+/// per-file bound on guarded hunks is separate ([`guarded::Limits::max_edits`]).
+pub const DEFAULT_MAX_REVISION_EDITS: usize = 250_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApplicationLimits {
+    /// Maximum edits in one revision, across every path.
     pub max_edits: usize,
     /// Maximum content bytes held while applying one path group.
     pub max_resolved_bytes: usize,
@@ -25,7 +34,7 @@ pub struct ApplicationLimits {
 impl Default for ApplicationLimits {
     fn default() -> Self {
         Self {
-            max_edits: guarded::DEFAULT_MAX_EDITS,
+            max_edits: DEFAULT_MAX_REVISION_EDITS,
             max_resolved_bytes: 64 * 1024 * 1024,
             max_generated_bytes: 16 * 1024 * 1024,
             allow_already_satisfied: false,
@@ -135,17 +144,8 @@ where
         }
     }
 
-    let guarded_count = edits
-        .iter()
-        .filter(|(_, record)| matches!(record.operation, EditOperation::GuardedText { .. }))
-        .count();
-    if guarded_count > limits.guarded.max_edits {
-        return Err(ApplicationError::Guarded(guarded::Error::TooManyEdits {
-            actual: guarded_count,
-            limit: limits.guarded.max_edits,
-        }));
-    }
-
+    // `limits.guarded.max_edits` bounds the hunks applied to one file; each path group below
+    // enforces it. The revision as a whole is bounded by `limits.max_edits` above.
     let mut tree = target.clone();
     let mut outcomes = BTreeMap::new();
     let mut generated_content = BTreeMap::new();

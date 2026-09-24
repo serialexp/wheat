@@ -76,7 +76,8 @@ const MAX_DEPTH: usize = 128;
 
 /// Register an old-to-new content transition. `active` carries the newest
 /// content seen for each terminal path while walking backwards through a unique
-/// parent chain. This is the same de-duplication rule as `retained_lineages`.
+/// parent chain. Like repack's history planner, it pairs only differing
+/// content.
 fn register_transition<Id: Copy + Ord>(
     choices: &mut BTreeMap<Id, BTreeSet<Id>>,
     older: Id,
@@ -117,8 +118,8 @@ fn derive_choices_from_edges<Id: Copy + Ord>(
 
 #[test]
 fn cursor_derivation_matches_retained_lineage_choices_on_a_small_history() {
-    // `retained_lineages` would produce [30, 20, 10] for path 1 and [40, 30]
-    // for path 2. Path 3 was created at the tip, so it stops at the first edge.
+    // Path 1's history is [30, 20, 10] (newest first) and path 2's is
+    // [40, 30]. Path 3 was created at the tip, so it stops at the first edge.
     let choices = derive_choices_from_edges(
         [(1, 30_u8), (2, 40), (3, 50)],
         [

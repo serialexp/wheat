@@ -2,7 +2,7 @@
 //!
 //! Serves one or more wheat repositories over WebSocket, implementing the
 //! fetch and publish protocol from `wheat-protocol`. Each repository is
-//! backed by a local `LooseObjectStore`, `ContentStore`, and
+//! backed by a local `PackedObjectStore` (or a remote packed store) and a
 //! `LocalPublicationStore`.
 
 pub mod connection;

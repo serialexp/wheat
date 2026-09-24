@@ -971,6 +971,62 @@ async fn collect_diff<S: ImmutableObjectStore>(
 }
 
 #[tokio::test]
+async fn lookup_many_matches_lookup_and_reads_each_directory_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::new(directory.path()));
+    let trees = MerkleTreeStore::new(&objects);
+    let empty = trees.empty_root().await.unwrap();
+    let mut edits = vec![
+        edit(&["a-sibling"], Some("sibling")),
+        edit(&["a", "deep", "leaf"], Some("leaf")),
+        edit(&["top"], Some("top")),
+    ];
+    for index in 0..500 {
+        edits.push(edit(&["a", &format!("f{index:03}")], Some("wide")));
+    }
+    let root = trees.apply_edits(empty, &edits).await.unwrap();
+
+    // Sorted, as a caller gets them from a BTreeSet: files, a directory, and missing paths
+    // (including one below a missing directory).
+    let mut paths = vec![
+        "a".to_owned(),
+        "a-sibling".to_owned(),
+        "a/deep".to_owned(),
+        "a/deep/leaf".to_owned(),
+        "a/missing".to_owned(),
+        "gone/below".to_owned(),
+        "top".to_owned(),
+    ];
+    paths.extend((0..500).map(|index| format!("a/f{index:03}")));
+    paths.sort();
+    let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let before = objects.reads();
+    let many = trees.lookup_many(root, &paths).await.unwrap();
+    // root, a, a/deep: every directory node is decoded once, however many paths lie below it.
+    assert_eq!(objects.reads() - before, 3);
+
+    for (path, value) in paths.iter().zip(&many) {
+        let components = path.split('/').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            *value,
+            trees.lookup(root, &components).await.unwrap(),
+            "{path}"
+        );
+    }
+    assert_eq!(many.iter().filter(|value| value.is_some()).count(), 503);
+
+    assert!(matches!(
+        trees.lookup_many(root, &["top/below"]).await,
+        Err(MerkleTreeError::FileInPath(component)) if component == "top"
+    ));
+    assert!(matches!(
+        trees.lookup_many(root, &[""]).await,
+        Err(MerkleTreeError::EmptyPath)
+    ));
+}
+
+#[tokio::test]
 async fn diff_identical_root_performs_zero_reads() {
     let directory = tempfile::tempdir().unwrap();
     let objects = CountingStore::new(LooseObjectStore::new(directory.path()));

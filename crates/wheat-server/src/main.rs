@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let registry = match cli.store {
-        StoreMode::Local => Registry::single_named(repo_name, &cli.data_dir),
+        StoreMode::Local => Registry::single_named(repo_name, &cli.data_dir)?,
         StoreMode::S3Packed => {
             let config = s3_config_from_env()?;
             let store = wheat_store::RemotePackedStore::open(&config).await?;

@@ -22,13 +22,16 @@
 //! when the workspace holds exactly that, which lets `materialize` authenticate the
 //! workspace bytes and install the descendant's result over them.
 
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::Result;
-use wheat_core::{ApplicationResultRecord, ChangeId, DirectoryEntry, FileValue, TreeId, ViewId};
+use wheat_core::{ApplicationResultRecord, ChangeId, FileValue, TreeId, ViewId};
 use wheat_store::{
-    ApplicationMapStore, ContentStore, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
-    RepositoryHead, RepositoryReader, TreeEdit,
+    ApplicationMapStore, ContentStore, ImmutableObjectStore, MerkleTreeStore, RepositoryHead,
+    RepositoryReader, TreeEdit, TreePathShape,
 };
 
 use crate::{materialization::workspace_holds, workspace_metadata::MaterializedState};
@@ -66,6 +69,7 @@ async fn captured_change_tree<O: ImmutableObjectStore>(
 }
 
 /// The shape of one path in a pinned tree.
+#[derive(Clone, Copy)]
 enum PathShape {
     /// The path and every ancestor directory may hold a leaf.
     Leaf(Option<FileValue>),
@@ -74,25 +78,23 @@ enum PathShape {
     Obstructed,
 }
 
-async fn path_shape<O: ImmutableObjectStore>(
+/// Classifies `paths` (sorted and unique) in one traversal of `root`; a lookup per path
+/// would decode a shared directory once for every captured file below it.
+async fn path_shapes<'p, O: ImmutableObjectStore>(
     trees: &MerkleTreeStore<'_, O>,
     root: TreeId,
-    components: &[String],
-) -> Result<PathShape> {
-    let (leaf, ancestors) = components.split_last().ok_or(MerkleTreeError::EmptyPath)?;
-    let mut node = trees.read_node(root).await?;
-    for component in ancestors {
-        match node.entries.get(component) {
-            None => return Ok(PathShape::Leaf(None)),
-            Some(DirectoryEntry::File(_)) => return Ok(PathShape::Obstructed),
-            Some(DirectoryEntry::Directory(child)) => node = trees.read_node(*child).await?,
-        }
-    }
-    Ok(match node.entries.get(leaf) {
-        None => PathShape::Leaf(None),
-        Some(DirectoryEntry::File(value)) => PathShape::Leaf(Some(*value)),
-        Some(DirectoryEntry::Directory(_)) => PathShape::Obstructed,
-    })
+    paths: &[&'p str],
+) -> Result<BTreeMap<&'p str, PathShape>> {
+    let shapes = trees.path_shapes(root, paths).await?;
+    Ok(paths
+        .iter()
+        .copied()
+        .zip(shapes.into_iter().map(|shape| match shape {
+            TreePathShape::Absent => PathShape::Leaf(None),
+            TreePathShape::File(value) => PathShape::Leaf(Some(value)),
+            TreePathShape::Directory | TreePathShape::BelowFile { .. } => PathShape::Obstructed,
+        }))
+        .collect())
 }
 
 /// Compute the pin that reflects `captured` workspace paths after the revision that
@@ -114,16 +116,22 @@ pub(crate) async fn settle<O: ImmutableObjectStore>(
     let resulting = reader.view(resulting_view).await?;
     let target_tree = resulting.tree;
     let trees = MerkleTreeStore::new(objects);
-    // Resolved on the first diverged path only.
-    let mut change_tree: Option<Option<TreeId>> = None;
+    let sorted = captured
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let targets = path_shapes(&trees, target_tree, &sorted).await?;
+    let currents = path_shapes(&trees, pinned.tree, &sorted).await?;
 
     let mut edits = Vec::new();
     let mut diverged = Vec::new();
+    // Diverged leaves the workspace still holds, with their pinned value; they are settled
+    // at the captured change's own value below.
+    let mut unsettled = Vec::new();
     for path in captured {
-        let components = path.split('/').map(str::to_owned).collect::<Vec<_>>();
-        let target = path_shape(&trees, target_tree, &components).await?;
-        let current = path_shape(&trees, pinned.tree, &components).await?;
-        let (target, current) = match (target, current) {
+        let (target, current) = match (targets[path.as_str()], currents[path.as_str()]) {
             (PathShape::Leaf(target), PathShape::Leaf(current)) => (target, current),
             // Neither tree holds a leaf here, so the capture recorded nothing the pin
             // lacks at this path.
@@ -136,35 +144,36 @@ pub(crate) async fn settle<O: ImmutableObjectStore>(
         if workspace_holds(root, content, path, target)? {
             if target != current {
                 edits.push(TreeEdit {
-                    path: components,
+                    path: path.split('/').map(str::to_owned).collect(),
                     value: target,
                 });
             }
             continue;
         }
         diverged.push(path.clone());
+        unsettled.push((path.as_str(), current));
+    }
 
-        let change_tree = match change_tree {
-            Some(tree) => tree,
-            None => {
-                let tree =
-                    captured_change_tree(&reader, objects, resulting.applications, change).await?;
-                change_tree = Some(tree);
-                tree
+    // The captured change's tree is resolved only when a path diverged.
+    let change_tree = if unsettled.is_empty() {
+        None
+    } else {
+        captured_change_tree(&reader, objects, resulting.applications, change).await?
+    };
+    if let Some(change_tree) = change_tree {
+        let mut paths = unsettled.iter().map(|(path, _)| *path).collect::<Vec<_>>();
+        paths.sort_unstable();
+        let captured_values = path_shapes(&trees, change_tree, &paths).await?;
+        for (path, current) in unsettled {
+            let PathShape::Leaf(captured_value) = captured_values[path] else {
+                continue;
+            };
+            if captured_value != current && workspace_holds(root, content, path, captured_value)? {
+                edits.push(TreeEdit {
+                    path: path.split('/').map(str::to_owned).collect(),
+                    value: captured_value,
+                });
             }
-        };
-        let Some(change_tree) = change_tree else {
-            continue;
-        };
-        let PathShape::Leaf(captured_value) = path_shape(&trees, change_tree, &components).await?
-        else {
-            continue;
-        };
-        if captured_value != current && workspace_holds(root, content, path, captured_value)? {
-            edits.push(TreeEdit {
-                path: components,
-                value: captured_value,
-            });
         }
     }
 

@@ -56,8 +56,8 @@ external review.
 - [x] **Phase 4a — nondestructive local repack.** `wheat repack` converts or
   rewrites an existing local packed/hybrid store through one authenticated V2
   physical-catalog generation. Structural records stream through bounded segment
-  builders; content uses one sharded generation with reverse deltas, every retained
-  lineage tip full, and depth capped at 16. Planning is read-only, capacity is
+  builders; content uses one sharded generation with reverse deltas, every file
+  in a tip view full, and depth capped at 16. Planning is read-only, capacity is
   confirmed before replacement bytes are produced, publication binds the exact
   repository and physical authorities, recovery resolves to the complete old or
   new generation, and a canonical second run is a true no-op. Loose stores and
@@ -72,6 +72,10 @@ external review.
   small index of 16,384-entry shards, each with its own manifest and pack, so
   the format has no entry cap and readers load one shard at a time. See
   [Sharded content generations](#sharded-content-generations).
+- [x] **Phase 4a+ — repack plans from stored records.** Repack no longer
+  hydrates the whole repository: peak RSS on Gothab dropped from 4,685 MiB
+  to 437 MiB and wall time from 183 s to 48.5 s. See
+  [Planning from stored records](#planning-from-stored-records).
 
 ### Outstanding
 - [ ] **Phase 3 — wire encoding compaction.** Switch binschema length
@@ -531,6 +535,71 @@ as content:
 
 The planner and the no-op check are deterministic, so a second repack of an
 unchanged store is still a no-op.
+
+### Planning from stored records
+
+Repack plans both kinds of history deltas in one pass over the stored state,
+without building an in-memory `Repository`:
+
+- The retained-view set and the view-lineage map give the views and edges.
+  The envelope was already fully validated, so planning trusts their shape.
+- For each single-parent edge, the paired tree walk proposes metadata bases
+  and also records file content that differs at the same path, as
+  (older, newer) pairs. Only directories whose IDs differ are read.
+- A walk over each tip view's tree keeps its metadata and its files' content
+  whole. Shared subtrees are walked once.
+- The content planner gets the inventory, the tip content IDs, and the pairs
+  (`ContentRepackInput { content_ids, tips, history }`). Pairs, tips, and
+  metadata proposals each have a limit, and going over one is an error.
+
+This also pairs content that the old per-path lineage walk missed: paths that
+were later deleted, and histories cut off below a merge. Merge edges are
+still never paired.
+
+Measured on the disposable Gothab import (2026-09-24). The old planner
+hydrated every view's full tree and required-content set (1,788 views, 6.45M
+tree entries):
+
+| | hydrate-based | stored records |
+|---|---|---|
+| `wheat repack` wall time | 183 s | 48.5 s |
+| `wheat repack` peak RSS | 4,685 MiB | 437 MiB |
+| plan phase peak RSS | 4,735 MiB | 399 MiB |
+| store after repack | 205.6 MB | 204.9 MB |
+
+The same state (`39c64381…`) validates in ~31 s at ~341 MiB, and a second
+repack is a no-op. The largest remaining phase is the envelope validation at
+the start of planning (~30 s, ~330 MiB).
+
+#### Compact content planner
+
+The content planner keeps flat per-ID tables indexed by position in the
+sorted inventory instead of maps keyed by `ContentId`:
+
+- the manifest entries themselves, filled in place in ID order;
+- a `u32` base per ID (two reserved values mark "no base" and "conflict");
+- a one-byte visit mark and a `u32` production slot.
+
+That is about 140 bytes per content ID. The analysis keeps only the sealed
+manifest and the production order. Execution does not plan a second time:
+every re-encoded envelope must match its planned length and digest, and the
+total must match the planned byte count. Repack also keeps summary counts of
+the old generation instead of its manifest, and reads each generation's
+manifest once when validating it.
+
+Measured with `tests/content_repack_scale.rs` (1,000,000 content IDs, 950,000
+history pairs, release build, 2026-09-24):
+
+| | map-based | flat tables |
+|---|---|---|
+| plan | 15.6 s, 545 MiB peak | 8.3 s, 157 MiB peak |
+| prepare | 21.8 s, 907 MiB peak | 6.7 s, 137 MiB peak |
+
+The plan is identical: repacking a store that the map-based planner produced
+is a no-op, and a fresh Gothab repack gives the same 204,873,206 bytes. The
+`max_content_ids` bound is still 250,000; the new value waits on measurements
+of repositories larger than Gothab, which cannot be imported yet (per-revision
+edit bound and ref limit).
 
 ### Sharded content generations
 

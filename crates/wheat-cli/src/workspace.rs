@@ -13,8 +13,8 @@ use wheat_core::{
     guarded::{GuardedEdit, Limits, authoring},
 };
 use wheat_store::{
-    ApplicationMapStore, ContentStore, ImmutableObjectStore, MerkleTreeStore, RepositoryHead,
-    RepositoryReader, RevisionMapStore,
+    ApplicationMapStore, ContentStore, ContentWriteBatch, ImmutableObjectStore, MerkleTreeStore,
+    RepositoryHead, RepositoryReader, RevisionMapStore,
 };
 
 use crate::{command_output::CliFailure, workspace_files::read_workspace_file};
@@ -71,6 +71,15 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     for id in &revision.edits {
         old_definitions.insert(*id, reader.edit(*id).await?);
     }
+    // Index the predecessor's definitions by path once; scanning them per selected path would
+    // make a large add against a large change quadratic.
+    let mut old_by_path = BTreeMap::<&str, Vec<(wheat_core::EditId, &EditRecord)>>::new();
+    for (id, edit) in &old_definitions {
+        old_by_path
+            .entry(edit.path.as_str())
+            .or_default()
+            .push((*id, edit));
+    }
 
     let selected = paths.iter().cloned().collect::<BTreeSet<_>>();
     if selected.len() != paths.len() {
@@ -79,6 +88,19 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     if guards.keys().any(|path| !selected.contains(path)) {
         return Err(CliFailure::invalid("a guard refers to an unselected path"));
     }
+    // Resolve every selected path in both trees with one sorted traversal each; a lookup per
+    // path would decode a shared directory once for every file below it.
+    let sorted = selected.iter().map(String::as_str).collect::<Vec<_>>();
+    let authored_values = sorted
+        .iter()
+        .copied()
+        .zip(trees.lookup_many(authored.tree, &sorted).await?)
+        .collect::<BTreeMap<_, _>>();
+    let baseline_values = sorted
+        .iter()
+        .copied()
+        .zip(trees.lookup_many(baseline, &sorted).await?)
+        .collect::<BTreeMap<_, _>>();
 
     let limits = Limits::default();
     let mut edits = old_definitions
@@ -90,19 +112,19 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     // Candidate lineage is emitted only from the normalizer's final fixed-point
     // components. Path equality alone is not evidence that two edits interacted.
     let mut component_lineage = Vec::new();
+    // Captured content is retained in bounded batches instead of one durable write per blob.
+    // Every blob is committed below, before the edits referring to it are returned.
+    let mut content = ContentWriteBatch::new(store);
 
     for path in paths {
         let workspace = read_workspace_file(root, Path::new(path), limits.max_input_bytes)
             .with_context(|| format!("cannot read workspace path {path:?}"))?;
-        let components = path.split('/').map(str::to_owned).collect::<Vec<_>>();
-        let a = trees.lookup(authored.tree, &components).await?;
-        let b = trees.lookup(baseline, &components).await?;
+        let a = authored_values[path.as_str()];
+        let b = baseline_values[path.as_str()];
         let ranges = guards.get(path).map(Vec::as_slice);
-        let old_on_path = old_definitions
-            .iter()
-            .filter(|(_, e)| e.path == *path)
-            .map(|(id, e)| (*id, e))
-            .collect::<Vec<_>>();
+        let old_on_path = old_by_path
+            .get(path.as_str())
+            .map_or(&[][..], Vec::as_slice);
 
         let can_normalize = matches!((a, b, workspace.as_ref()), (Some(a), Some(b), Some(w))
             if a.kind == b.kind && b.kind == w.kind && b.kind != wheat_core::FileKind::Symlink)
@@ -120,7 +142,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
                 .resolve(b.content)
                 .context("cannot resolve applied baseline file")?;
             let mut definitions = Vec::with_capacity(old_on_path.len());
-            for (_, record) in &old_on_path {
+            for (_, record) in old_on_path {
                 definitions.push(resolve_guard(record, store)?);
             }
             let normalized = authoring::normalize_with_lineage(
@@ -133,13 +155,13 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
             )
             .map_err(|e| anyhow::anyhow!("cannot normalize {path:?}: {e:?}"))?;
             for definition in normalized.edits {
-                let record = guarded_record(path, a.kind, definition, store)?;
+                let record = guarded_record(path, a.kind, definition, &mut content)?;
                 edits.insert(record.id(), record);
             }
             for component in normalized.components {
                 let replacement = component
                     .replacement
-                    .map(|definition| guarded_record(path, a.kind, definition, store))
+                    .map(|definition| guarded_record(path, a.kind, definition, &mut content))
                     .transpose()?
                     .map(|record| {
                         let id = record.id();
@@ -175,10 +197,11 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
                 limits,
             )
             .with_context(|| format!("cannot capture workspace path {path:?}"))?;
-            persist_content(store, captured.content)?;
+            stage_content(&mut content, captured.content)?;
             edits.extend(captured.edits);
         }
     }
+    content.commit()?;
     let new_ids = edits.keys().copied().collect::<BTreeSet<_>>();
     let preserved = old_ids.intersection(&new_ids).copied().collect();
     let added = new_ids
@@ -249,12 +272,12 @@ fn guarded_record(
     path: &str,
     kind: wheat_core::FileKind,
     d: GuardedEdit,
-    store: &ContentStore,
+    content: &mut ContentWriteBatch<'_>,
 ) -> Result<EditRecord> {
-    let before = store.put(&d.before)?;
-    let expected = store.put(&d.expected)?;
-    let replacement = store.put(&d.replacement)?;
-    let after = store.put(&d.after)?;
+    let before = content.put(&d.before)?;
+    let expected = content.put(&d.expected)?;
+    let replacement = content.put(&d.replacement)?;
+    let after = content.put(&d.after)?;
     Ok(EditRecord::new(
         path,
         EditOperation::GuardedText {
@@ -269,12 +292,24 @@ fn guarded_record(
     )?)
 }
 
+/// Durably retains captured content in bounded batches.
 pub(crate) fn persist_content(
     store: &ContentStore,
     content: BTreeMap<wheat_core::ContentId, Vec<u8>>,
 ) -> Result<()> {
+    let mut batch = ContentWriteBatch::new(store);
+    stage_content(&mut batch, content)?;
+    batch.commit()?;
+    Ok(())
+}
+
+/// Stages captured content; it is durable only once the batch is committed.
+fn stage_content(
+    batch: &mut ContentWriteBatch<'_>,
+    content: BTreeMap<wheat_core::ContentId, Vec<u8>>,
+) -> Result<()> {
     for (expected, bytes) in content {
-        let actual = store.put(&bytes)?;
+        let actual = batch.put(&bytes)?;
         if actual != expected {
             bail!("captured content identity mismatch");
         }

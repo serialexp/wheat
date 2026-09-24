@@ -12,8 +12,8 @@ use wheat_core::{
     RevisionId, ViewId,
 };
 use wheat_store::{
-    ApplicationMapStore, ConflictSetStore, PublicationStore, RepositoryReader, RetainedSetStore,
-    RevisionMapStore,
+    ApplicationMapStore, ConflictSetStore, ContentStore, ImmutableObjectStore, PublicationStore,
+    RepositoryReader, RetainedSetStore, RevisionMapStore,
 };
 
 use crate::{command_output::CliFailure, local::LocalRepository};
@@ -58,8 +58,23 @@ pub(crate) async fn inspect(
     repository: &LocalRepository,
     effective_view: ViewId,
 ) -> Result<ConflictDocument> {
-    let head = repository.heads.read()?;
-    let reader = RepositoryReader::new(&repository.objects, &repository.content);
+    inspect_store(
+        &repository.objects,
+        &repository.content,
+        &repository.heads,
+        effective_view,
+    )
+    .await
+}
+
+async fn inspect_store<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    heads: &impl PublicationStore,
+    effective_view: ViewId,
+) -> Result<ConflictDocument> {
+    let head = heads.read()?;
+    let reader = RepositoryReader::new(objects, content);
     // Every typed read authenticates the immutable object's bytes against the requested ID.
     // Follow only the roots selected by this head: complete validation is deliberately reserved
     // for `wheat validate`, since walking unrelated retained history makes inspection unbounded.
@@ -71,7 +86,7 @@ pub(crate) async fn inspect(
     if state.id() != envelope.state {
         return Err(CliFailure::corrupt("repository state identity mismatch"));
     }
-    let retained = RetainedSetStore::new(&repository.objects);
+    let retained = RetainedSetStore::new(objects);
     if !retained
         .contains(state.retained_views, ObjectId::from(effective_view))
         .await?
@@ -84,7 +99,7 @@ pub(crate) async fn inspect(
     if working.id() != effective_view {
         return Err(CliFailure::corrupt("effective view identity mismatch"));
     }
-    let applications = ApplicationMapStore::new(&repository.objects);
+    let applications = ApplicationMapStore::new(objects);
     let mut application_cursor = applications.cursor(working.applications).await?;
     let mut conflicted_applications = BTreeMap::<wheat_core::ConflictId, CurrentApplication>::new();
     let mut application_count = 0usize;
@@ -96,7 +111,7 @@ pub(crate) async fn inspect(
             "current application count",
         )?;
         let application = reader.application(application_id).await?;
-        let current_revision = RevisionMapStore::new(&repository.objects)
+        let current_revision = RevisionMapStore::new(objects)
             .get(working.revisions, change_id)
             .await?;
         if current_revision != Some(application.revision_id) {
@@ -122,7 +137,7 @@ pub(crate) async fn inspect(
             ));
         }
     }
-    let conflicts = ConflictSetStore::new(&repository.objects);
+    let conflicts = ConflictSetStore::new(objects);
     let mut cursor = conflicts.cursor(working.unresolved_conflicts).await?;
     let mut entries = Vec::new();
     let mut paths = BTreeMap::<EditId, String>::new();
@@ -397,6 +412,95 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// Refuses to read one object, standing in for damaged history.
+    struct Unreadable {
+        inner: wheat_store::PackedObjectStore,
+        refused: ObjectId,
+    }
+
+    #[async_trait::async_trait]
+    impl ImmutableObjectStore for Unreadable {
+        async fn put_if_absent(
+            &self,
+            id: ObjectId,
+            bytes: &[u8],
+        ) -> Result<(), wheat_store::ObjectStoreError> {
+            self.inner.put_if_absent(id, bytes).await
+        }
+
+        async fn get(
+            &self,
+            id: ObjectId,
+        ) -> Result<wheat_store::StoredObject, wheat_store::ObjectStoreError> {
+            if id == self.refused {
+                return Err(wheat_store::ObjectStoreError::Missing(id));
+            }
+            self.inner.get(id).await
+        }
+
+        async fn exists_many(
+            &self,
+            ids: &[ObjectId],
+        ) -> Result<Vec<bool>, wheat_store::ObjectStoreError> {
+            self.inner.exists_many(ids).await
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_inspection_does_not_read_unselected_retained_history() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = wheat_store::PackedObjectStore::open(root.path().join("storage")).unwrap();
+        let content = objects.content_store();
+        let heads = wheat_store::LocalPublicationStore::new(root.path().join("repository.head"));
+        content.put(b"value").unwrap();
+        let record = wheat_core::EditRecord::new(
+            "file",
+            wheat_core::EditOperation::ExactFile {
+                expected: None,
+                replacement: Some(FileValue {
+                    content: ContentId::of(b"value"),
+                    kind: FileKind::Regular,
+                }),
+            },
+        )
+        .unwrap();
+        let id = record.id();
+        let mut repository = wheat_core::Repository::new(wheat_core::Tree::new());
+        let base = repository.base_view().id;
+        let (_, outcome) = repository
+            .create_change(
+                base,
+                base,
+                [],
+                wheat_core::RevisionEdits {
+                    edits: [(id, record)].into(),
+                    transition: wheat_core::EditTransition {
+                        added: [id].into(),
+                        ..wheat_core::EditTransition::default()
+                    },
+                },
+                wheat_core::ApplicationContext::new(&content),
+            )
+            .unwrap();
+        wheat_store::RepositoryPublisher::new(&objects, &content, &heads)
+            .initialize(&repository)
+            .await
+            .unwrap();
+
+        // The revision stays retained, but an empty conflict inspection has no reason to read
+        // it; only a complete repository validation walks unrelated history.
+        let objects = Unreadable {
+            inner: objects,
+            refused: outcome.revision_id.into(),
+        };
+        let document = inspect_store(&objects, &content, &heads, outcome.resulting_view)
+            .await
+            .unwrap();
+        assert!(document.conflicts.is_empty());
+        let reader = RepositoryReader::new(&objects, &content);
+        assert!(reader.revision(outcome.revision_id).await.is_err());
     }
 
     #[test]

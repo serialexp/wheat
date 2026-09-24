@@ -15,6 +15,7 @@ use crate::{
     ApplicationMapError, ApplicationMapStore, CollectionError, ConflictSetStore, ContentSetStore,
     ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
     ObjectKind, ObjectStoreError, RevisionMapError, RevisionMapStore, TreeEdit,
+    merkle_tree::TreePathShape,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,14 +145,13 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
                 paths.insert(edit.path.clone(), parse_path(&edit.path)?);
             }
         }
-        for (path, parsed) in &paths {
-            let actual = match trees.lookup(parent_record.tree, parsed).await {
-                Ok(value) => value,
-                Err(MerkleTreeError::FileInPath(_)) => None,
-                Err(error) => return Err(error.into()),
-            };
-            if let Some(value) = actual {
-                target.insert(path.clone(), value);
+        // One sorted traversal resolves every path; a file where a directory was expected
+        // is an absent leaf here.
+        let sorted = paths.keys().map(String::as_str).collect::<Vec<_>>();
+        let shapes = trees.path_shapes(parent_record.tree, &sorted).await?;
+        for (path, shape) in sorted.into_iter().zip(shapes) {
+            if let TreePathShape::File(value) = shape {
+                target.insert(path.to_owned(), value);
             }
         }
         let output = apply_edits(

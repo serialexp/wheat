@@ -342,3 +342,65 @@ fn interference_ids_and_outcome_order_are_canonical() {
     );
     assert!(result.outcomes.keys().copied().is_sorted());
 }
+
+#[test]
+fn one_revision_applies_more_edits_than_one_file_may_hold() {
+    // The per-file guarded hunk bound must not cap the revision: a large initial import
+    // creates thousands of files, and a sweeping change edits thousands of existing ones.
+    let files = wheat_core::guarded::DEFAULT_MAX_EDITS + 904;
+    let (old_id, old) = blob(b"old\n");
+    let (new_id, new) = blob(b"new\n");
+    let (empty_id, empty) = blob(b"");
+    let blobs: BTreeMap<_, _> = [(old_id, old), (new_id, new), (empty_id, empty)].into();
+    let regular = |content| FileValue {
+        content,
+        kind: FileKind::Regular,
+    };
+    let mut target = Tree::new();
+    let mut edits = Vec::with_capacity(files * 2);
+    for index in 0..files {
+        let existing = format!("existing/{index:05}");
+        target.insert(existing.clone(), regular(old_id));
+        let guarded = EditRecord::new(
+            existing,
+            EditOperation::GuardedText {
+                kind: FileKind::Regular,
+                before: empty_id,
+                expected: old_id,
+                replacement: new_id,
+                after: empty_id,
+                start_anchor: true,
+                end_anchor: true,
+            },
+        )
+        .unwrap();
+        let created = EditRecord::new(
+            format!("created/{index:05}"),
+            EditOperation::ExactFile {
+                expected: None,
+                replacement: Some(regular(new_id)),
+            },
+        )
+        .unwrap();
+        edits.push((guarded.id(), guarded));
+        edits.push((created.id(), created));
+    }
+
+    let result = apply_edits(
+        &target,
+        edits,
+        |id| blobs.get(&id).cloned().ok_or("missing"),
+        ApplicationLimits::default(),
+    )
+    .unwrap();
+
+    assert_eq!(result.outcomes.len(), files * 2);
+    assert!(
+        result
+            .outcomes
+            .values()
+            .all(|outcome| matches!(outcome, ApplicationOutcome::Applied { .. }))
+    );
+    assert_eq!(result.tree.len(), files * 2);
+    assert!(result.tree.values().all(|value| value.content == new_id));
+}

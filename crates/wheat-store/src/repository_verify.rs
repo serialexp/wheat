@@ -172,6 +172,16 @@ struct Verifier<'a, 'r, O, F> {
     observer: F,
 }
 
+/// A revision's edits replayed against their target, with what the replay read so callers
+/// need not read it again.
+struct Replay {
+    definitions: BTreeMap<EditId, EditRecord>,
+    /// The file values the edits' paths hold in the target; a path crossing a file is
+    /// absent, as the commit writer records it.
+    target: Tree,
+    result: wheat_core::edit_application::ApplicationResult,
+}
+
 struct LineageGraph {
     retained: BTreeSet<ViewId>,
     children_by_parent: BTreeMap<ViewId, Vec<ViewId>>,
@@ -298,6 +308,9 @@ where
             return Ok(());
         }
         let trees = MerkleTreeStore::new(self.reader.objects);
+        // Resolved once, on the first file: a membership query resolves the whole set, so
+        // one per file would make this walk quadratic in the view's size.
+        let mut visible_members: Option<Vec<ContentId>> = None;
         let mut stack = vec![(root, trees.read_node(root).await?.entries.into_values())];
         while let Some((node, frame)) = stack.last_mut() {
             match frame.next() {
@@ -310,12 +323,20 @@ where
                 }
                 Some(DirectoryEntry::File(value)) => {
                     self.required(value.content)?;
-                    if let Some(visible) = visible
-                        && !ContentSetStore::new(self.reader.objects)
-                            .contains(visible, value.content)
-                            .await?
-                    {
-                        return Err(invalid("visible file absent from view manifest"));
+                    if let Some(visible) = visible {
+                        if visible_members.is_none() {
+                            visible_members = Some(
+                                ContentSetStore::new(self.reader.objects)
+                                    .resolve(visible)
+                                    .await?,
+                            );
+                        }
+                        if visible_members
+                            .as_deref()
+                            .is_some_and(|members| members.binary_search(&value.content).is_err())
+                        {
+                            return Err(invalid("visible file absent from view manifest"));
+                        }
                     }
                 }
                 Some(DirectoryEntry::Directory(id)) => {
@@ -467,8 +488,14 @@ where
                                         ));
                                     }
                                 }
-                                for content in added {
-                                    if !contents.contains(child_visible, content).await? {
+                                // One resolution serves every added file; a membership
+                                // query per file would resolve the whole set each time.
+                                if !added.is_empty() {
+                                    let members = contents.resolve(child_visible).await?;
+                                    if added
+                                        .iter()
+                                        .any(|content| members.binary_search(content).is_err())
+                                    {
                                         return Err(invalid(
                                             "visible file absent from view manifest",
                                         ));
@@ -757,30 +784,27 @@ where
         target_root: TreeId,
         result_root: TreeId,
         edit_ids: &BTreeSet<EditId>,
-    ) -> Result<wheat_core::edit_application::ApplicationResult> {
+    ) -> Result<Replay> {
         let trees = MerkleTreeStore::new(self.reader.objects);
-        let mut target = Tree::new();
         let mut definitions = Vec::with_capacity(edit_ids.len());
         for id in edit_ids {
-            let edit = self.reader.edit(*id).await?;
-            let components = edit.path.split('/').map(str::to_owned).collect::<Vec<_>>();
-            // The commit writer treats a file encountered before a requested
-            // descendant as an absent leaf. A simultaneous boundary deletion
-            // can then replace that file with the requested directory.
-            let value = match trees.lookup(target_root, &components).await {
-                Ok(value) => value,
-                Err(crate::MerkleTreeError::FileInPath(_)) => None,
-                Err(error) => return Err(error.into()),
-            };
-            if let Some(value) = value {
-                target.insert(edit.path.clone(), value);
-            }
-            definitions.push((*id, edit));
+            definitions.push((*id, self.reader.edit(*id).await?));
         }
-        let touched = definitions
+        let touched: BTreeSet<String> = definitions
             .iter()
             .map(|(_, edit)| edit.path.clone())
             .collect();
+        // The commit writer treats a file encountered before a requested
+        // descendant as an absent leaf. A simultaneous boundary deletion
+        // can then replace that file with the requested directory.
+        let paths = touched.iter().map(String::as_str).collect::<Vec<_>>();
+        let shapes = trees.path_shapes(target_root, &paths).await?;
+        let mut target = Tree::new();
+        for (path, shape) in paths.into_iter().zip(shapes) {
+            if let crate::merkle_tree::TreePathShape::File(value) = shape {
+                target.insert(path.to_owned(), value);
+            }
+        }
         self.verify_untouched(target_root, result_root, &touched)
             .await?;
         let limits = wheat_core::edit_application::ApplicationLimits {
@@ -794,14 +818,19 @@ where
             limits,
         )
         .map_err(|_| invalid("edit replay failed"))?;
-        for (_, edit) in &definitions {
-            let components = edit.path.split('/').map(str::to_owned).collect::<Vec<_>>();
-            if trees.lookup(result_root, &components).await? != replay.tree.get(&edit.path).copied()
-            {
+        // `touched` is sorted, so one traversal checks every claimed value.
+        let paths = touched.iter().map(String::as_str).collect::<Vec<_>>();
+        let claimed = trees.lookup_many(result_root, &paths).await?;
+        for (path, claimed) in paths.into_iter().zip(claimed) {
+            if claimed != replay.tree.get(path).copied() {
                 return Err(invalid("claimed result differs from semantic replay"));
             }
         }
-        Ok(replay)
+        Ok(Replay {
+            definitions: definitions.into_iter().collect(),
+            target,
+            result: replay,
+        })
     }
 
     async fn verify_lineage_semantics(
@@ -1135,7 +1164,7 @@ where
             let replay = self
                 .replay(authored.tree, revision.resulting_tree, &revision.edits)
                 .await?;
-            if replay.outcomes.values().any(|outcome| {
+            if replay.result.outcomes.values().any(|outcome| {
                 !matches!(
                     outcome,
                     wheat_core::edit_application::ApplicationOutcome::Applied { .. }
@@ -1178,16 +1207,8 @@ where
                 .await?;
             let mut replay_applied = BTreeMap::new();
             let mut replay_failed = BTreeMap::new();
-            for (edit, outcome) in replay.outcomes {
-                let definition = self.reader.edit(edit).await?;
-                let components = definition
-                    .path
-                    .split('/')
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                let target_value = MerkleTreeStore::new(self.reader.objects)
-                    .lookup(target.tree, &components)
-                    .await?;
+            for (edit, outcome) in replay.result.outcomes {
+                let target_value = replay.target.get(&replay.definitions[&edit].path).copied();
                 match outcome {
                     wheat_core::edit_application::ApplicationOutcome::Applied { read, write } => {
                         replay_applied.insert(

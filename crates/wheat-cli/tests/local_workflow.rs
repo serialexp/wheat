@@ -4,6 +4,8 @@ use std::process::{Command, Output};
 
 use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
 
+mod support;
+
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
     let mut adjusted = arguments.to_vec();
     if adjusted.first() == Some(&"init") && adjusted.len() == 1 {
@@ -118,11 +120,8 @@ fn initializes_mutates_and_reopens_local_repository() {
     );
     assert!(String::from_utf8_lossy(&created.stdout).contains("change "));
     let content_id = wheat_core::ContentId::of(b"world").to_string();
-    let object = store_path(directory.path())
-        .join("content")
-        .join(&content_id[..2])
-        .join(&content_id[2..]);
-    assert!(object.is_file());
+    assert!(store_path(directory.path()).join("storage").is_dir());
+    assert!(!store_path(directory.path()).join("objects").exists());
     let retained = wheat(directory.path(), &["cat", &content_id]);
     assert!(retained.status.success());
     assert_eq!(retained.stdout, b"world");
@@ -695,15 +694,15 @@ fn failed_mutation_keeps_head_and_emits_no_success() {
 
 #[test]
 fn corrupted_canonical_state_is_not_replaced() {
-    use wheat_store::{LocalPublicationStore, LooseObjectStore, PublicationStore};
+    use wheat_store::{LocalPublicationStore, PublicationStore};
     let dir = tempfile::tempdir().unwrap();
     assert!(wheat(dir.path(), &["init"]).status.success());
     let store = store_path(dir.path());
     let head_path = store.join("repository.head");
     let before = std::fs::read(&head_path).unwrap();
     let head = LocalPublicationStore::new(&head_path).read().unwrap();
-    let objects = LooseObjectStore::new(store.join("objects"));
-    std::fs::write(objects.path(head.envelope.into()), b"corrupt").unwrap();
+    let envelope: wheat_core::ObjectId = head.envelope.into();
+    support::corrupt_packed_record(&store, *envelope.as_bytes());
     let result = wheat(
         dir.path(),
         &["change", "new", "--path", "file", "--value", "one"],

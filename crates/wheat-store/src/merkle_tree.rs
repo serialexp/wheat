@@ -160,6 +160,19 @@ pub struct TreeFile {
     pub value: FileValue,
 }
 
+/// What one path names in a Merkle tree, from [`MerkleTreeStore::path_shapes`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreePathShape {
+    /// No entry exists at the path; any ancestors that exist are directories.
+    Absent,
+    File(FileValue),
+    Directory,
+    /// The ancestor component at index `depth` of the path is a file.
+    BelowFile {
+        depth: usize,
+    },
+}
+
 /// The kind and selected contents of one path in a pinned Merkle tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TreePathSelection {
@@ -487,6 +500,93 @@ where
             }
         }
         Ok(None)
+    }
+
+    /// Looks up many file paths with one shared traversal (see [`Self::path_shapes`]).
+    ///
+    /// Results follow `paths`; like [`Self::lookup`], a missing path or a directory yields
+    /// `None`, and a file in place of an ancestor directory is [`MerkleTreeError::FileInPath`].
+    pub async fn lookup_many(
+        &self,
+        root: TreeId,
+        paths: &[&str],
+    ) -> Result<Vec<Option<FileValue>>, MerkleTreeError> {
+        let shapes = self.path_shapes(root, paths).await?;
+        paths
+            .iter()
+            .zip(shapes)
+            .map(|(path, shape)| match shape {
+                TreePathShape::File(value) => Ok(Some(value)),
+                TreePathShape::Absent | TreePathShape::Directory => Ok(None),
+                TreePathShape::BelowFile { depth } => Err(MerkleTreeError::FileInPath(
+                    path.split('/').nth(depth).unwrap_or_default().to_owned(),
+                )),
+            })
+            .collect()
+    }
+
+    /// Classifies many paths with one shared traversal.
+    ///
+    /// Results follow `paths`. The directories along the previous path stay decoded and are
+    /// reused by the next one, so lexically sorted `paths` read each directory node at most
+    /// once instead of once per path below it. Memory holds one decoded node per open
+    /// directory level.
+    pub async fn path_shapes(
+        &self,
+        root: TreeId,
+        paths: &[&str],
+    ) -> Result<Vec<TreePathShape>, MerkleTreeError> {
+        // No path needs the root, so an empty request reads nothing.
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root_node = self.read_node(root).await?;
+        let mut open: Vec<(&str, DirectoryNode)> = Vec::new();
+        let mut components: Vec<&str> = Vec::new();
+        let mut results = Vec::with_capacity(paths.len());
+        for path in paths {
+            if path.is_empty() {
+                return Err(MerkleTreeError::EmptyPath);
+            }
+            components.clear();
+            for component in path.split('/') {
+                validate_directory_component(component)?;
+                components.push(component);
+            }
+            let (leaf, directories) = components.split_last().expect("split yields a component");
+            let shared = open
+                .iter()
+                .zip(directories)
+                .take_while(|((open, _), wanted)| open == *wanted)
+                .count();
+            open.truncate(shared);
+            let mut blocked = None;
+            for (depth, directory) in directories.iter().enumerate().skip(shared) {
+                let node = open.last().map_or(&root_node, |(_, node)| node);
+                let child = match node.entries.get(*directory) {
+                    None => {
+                        blocked = Some(TreePathShape::Absent);
+                        break;
+                    }
+                    Some(DirectoryEntry::File(_)) => {
+                        blocked = Some(TreePathShape::BelowFile { depth });
+                        break;
+                    }
+                    Some(DirectoryEntry::Directory(child)) => *child,
+                };
+                open.push((directory, self.read_node(child).await?));
+            }
+            let shape = blocked.unwrap_or_else(|| {
+                let node = open.last().map_or(&root_node, |(_, node)| node);
+                match node.entries.get(*leaf) {
+                    Some(DirectoryEntry::File(value)) => TreePathShape::File(*value),
+                    Some(DirectoryEntry::Directory(_)) => TreePathShape::Directory,
+                    None => TreePathShape::Absent,
+                }
+            });
+            results.push(shape);
+        }
+        Ok(results)
     }
 
     /// Resolve one path and, for a directory, return only its descendant files.

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use wheat_store::{
-    ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, PackedObjectStore,
+    ContentStore, ImmutableObjectStore, LocalPublicationStore, ObjectStoreError, PackedObjectStore,
 };
 
 /// A single repository's stores.
@@ -13,6 +13,19 @@ pub struct RepositoryEntry {
     pub objects: Box<dyn ImmutableObjectStore>,
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
+}
+
+impl RepositoryEntry {
+    /// Opens the packed store in `data_dir/storage` and its publication head.
+    pub fn open(data_dir: &Path) -> Result<Self, ObjectStoreError> {
+        let packed = PackedObjectStore::open(data_dir.join("storage"))?;
+        let content = packed.content_store();
+        Ok(Self {
+            objects: Box::new(packed),
+            content,
+            heads: LocalPublicationStore::new(data_dir.join("repository.head")),
+        })
+    }
 }
 
 /// In-memory registry of repositories available on this server.
@@ -23,9 +36,9 @@ pub struct Registry {
 impl Registry {
     /// Create a registry serving a single repository from a data directory.
     ///
-    /// The directory must contain `objects/`, `content/`, and `repository.head`.
+    /// The directory must contain a packed `storage/` directory and `repository.head`.
     /// The repository name defaults to the directory's file name.
-    pub fn single(data_dir: &Path) -> Self {
+    pub fn single(data_dir: &Path) -> Result<Self, ObjectStoreError> {
         let name = data_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -35,32 +48,11 @@ impl Registry {
     }
 
     /// Create a registry serving a single repository with an explicit name.
-    ///
-    /// Auto-detects packed stores (`storage/` directory) vs loose stores
-    /// (`objects/` directory).
-    pub fn single_named(name: String, data_dir: &Path) -> Self {
-        let (objects, content): (Box<dyn ImmutableObjectStore>, ContentStore) =
-            if data_dir.join("storage").is_dir() {
-                // Packed store (produced by `wheat import`).
-                let packed = PackedObjectStore::open(data_dir.join("storage"))
-                    .expect("open packed object store");
-                let content = packed.content_store();
-                (Box::new(packed), content)
-            } else {
-                // Loose store (produced by `wheat init`).
-                (
-                    Box::new(LooseObjectStore::new(data_dir.join("objects"))),
-                    ContentStore::new(data_dir.join("content")),
-                )
-            };
-        let entry = Arc::new(RepositoryEntry {
-            objects,
-            content,
-            heads: LocalPublicationStore::new(data_dir.join("repository.head")),
-        });
+    pub fn single_named(name: String, data_dir: &Path) -> Result<Self, ObjectStoreError> {
+        let entry = Arc::new(RepositoryEntry::open(data_dir)?);
         let mut repos = HashMap::new();
         repos.insert(name, entry);
-        Self { repos }
+        Ok(Self { repos })
     }
 
     /// Create a registry serving a single repository with pre-built stores.
@@ -105,12 +97,8 @@ impl Registry {
                     continue;
                 };
                 let name = format!("{owner_str}/{repo_str}");
-                let entry = Arc::new(RepositoryEntry {
-                    objects: Box::new(LooseObjectStore::new(repo_path.join("objects"))),
-                    content: ContentStore::new(repo_path.join("content")),
-                    heads: LocalPublicationStore::new(repo_path.join("repository.head")),
-                });
-                repos.insert(name, entry);
+                let entry = RepositoryEntry::open(&repo_path).map_err(std::io::Error::other)?;
+                repos.insert(name, Arc::new(entry));
             }
         }
         Ok(Self { repos })

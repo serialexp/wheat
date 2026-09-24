@@ -6,7 +6,7 @@ use std::{
 };
 
 use wheat_store::{
-    ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, ObjectKind, PublicationStore,
+    ImmutableObjectStore, LocalPublicationStore, ObjectKind, PackedObjectStore, PublicationStore,
     RepositoryReader, RetainedSetStore,
 };
 
@@ -52,8 +52,8 @@ async fn records(
     revision: wheat_core::RevisionId,
 ) -> (wheat_core::RevisionRecord, wheat_core::Change) {
     let store = store_path(root);
-    let objects = LooseObjectStore::new(store.join("objects"));
-    let content = wheat_store::ContentStore::new(store.join("content"));
+    let objects = PackedObjectStore::open(store.join("storage")).unwrap();
+    let content = objects.content_store();
     let heads = LocalPublicationStore::new(store.join("repository.head"));
     let reader = RepositoryReader::new(&objects, &content);
     let head = heads.read().unwrap();

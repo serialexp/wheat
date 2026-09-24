@@ -12,7 +12,7 @@ use wheat_store::{
 };
 
 use crate::command_output::{CliFailure, Success};
-use crate::local::{self, LocalObjects, LocalRepository};
+use crate::local::{self, LocalRepository};
 
 const MINIMUM_SAFETY_MARGIN: u64 = 64 * 1024 * 1024;
 
@@ -24,18 +24,12 @@ pub(crate) struct PackedRepackBackend<'a> {
 }
 
 impl<'a> PackedRepackBackend<'a> {
-    pub(crate) fn new(store_root: &Path, repository: &'a LocalRepository) -> Result<Self> {
-        let LocalObjects::Packed(objects) = &repository.objects else {
-            bail!(
-                "repack requires a packed Wheat store; {} uses the loose store layout",
-                store_root.display()
-            );
-        };
-        Ok(Self {
+    pub(crate) fn new(store_root: &Path, repository: &'a LocalRepository) -> Self {
+        Self {
             store_root: store_root.to_path_buf(),
-            objects,
+            objects: &repository.objects,
             publications: &repository.heads,
-        })
+        }
     }
 }
 

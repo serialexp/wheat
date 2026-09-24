@@ -3,10 +3,31 @@ use std::sync::Mutex;
 use wheat_core::ContentId;
 use wheat_store::{
     CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationEntry, ContentGenerationIndex,
-    ContentGenerationManifest, ContentGenerationTarget, ContentRepackInput, ContentRepackLimits,
-    ContentRepackPlan, ContentStore, Durability, PreparedContentGeneration, plan_content_repack,
-    prepare_content_repack, publish_content_repack,
+    ContentGenerationManifest, ContentGenerationTarget, ContentHistoryPair, ContentRepackInput,
+    ContentRepackLimits, ContentRepackPlan, ContentStore, Durability, PreparedContentGeneration,
+    plan_content_repack, prepare_content_repack, publish_content_repack,
 };
+
+/// History of one path given newest first: each version pairs with the next
+/// newer one.
+fn history(newest_first: &[ContentId]) -> Vec<ContentHistoryPair> {
+    newest_first
+        .windows(2)
+        .map(|pair| ContentHistoryPair {
+            older: pair[1],
+            newer: pair[0],
+        })
+        .collect()
+}
+
+/// Input with no history: every ID is stored whole.
+fn inventory_only(content_ids: Vec<ContentId>) -> ContentRepackInput {
+    ContentRepackInput {
+        content_ids,
+        tips: Vec::new(),
+        history: Vec::new(),
+    }
+}
 
 /// Encode a generation to its index and shard manifests, then decode it back.
 fn round_trip(manifest: &ContentGenerationManifest) -> ContentGenerationManifest {
@@ -46,14 +67,19 @@ fn reverse_plan_preserves_inventory_and_forces_every_tip_full() {
         .iter()
         .map(|bytes| source.put(bytes).unwrap())
         .collect::<Vec<_>>();
-    let orphan = source.put(b"authenticated but outside lineages").unwrap();
+    let orphan = source.put(b"authenticated but outside history").unwrap();
 
     let plan = plan_content_repack(
         &source,
         None,
         ContentRepackInput {
             content_ids: ids.iter().copied().chain([orphan]).collect(),
-            lineages_newest_first: vec![vec![ids[4], ids[3], ids[2]], vec![ids[2], ids[1], ids[0]]],
+            tips: vec![ids[4], ids[2]],
+            history: [
+                history(&[ids[4], ids[3], ids[2]]),
+                history(&[ids[2], ids[1], ids[0]]),
+            ]
+            .concat(),
         },
         ContentRepackLimits::default(),
     )
@@ -92,10 +118,7 @@ fn binary_index_and_shard_reject_oversized_counts_and_noncanonical_bytes() {
     let ContentRepackPlan::Replace(prepared) = plan_content_repack(
         &source,
         None,
-        ContentRepackInput {
-            content_ids: vec![id],
-            lineages_newest_first: vec![],
-        },
+        inventory_only(vec![id]),
         ContentRepackLimits::default(),
     )
     .unwrap() else {
@@ -221,10 +244,7 @@ fn shard_decoding_rejects_noncanonical_entry_order() {
     let ContentRepackPlan::Replace(prepared) = plan_content_repack(
         &source,
         None,
-        ContentRepackInput {
-            content_ids: vec![first, second],
-            lineages_newest_first: vec![],
-        },
+        inventory_only(vec![first, second]),
         ContentRepackLimits::default(),
     )
     .unwrap() else {
@@ -261,7 +281,8 @@ fn depth_greater_than_one_resolves_after_generation_import() {
         None,
         ContentRepackInput {
             content_ids: ids.clone(),
-            lineages_newest_first: vec![ids.iter().rev().copied().collect()],
+            tips: vec![ids[5]],
+            history: history(&ids.iter().rev().copied().collect::<Vec<_>>()),
         },
         ContentRepackLimits::default(),
     )
@@ -276,7 +297,7 @@ fn depth_greater_than_one_resolves_after_generation_import() {
             .any(|entry| entry.delta_depth > 1)
     );
 
-    let prepared = prepare_content_repack(&source, &analysis).unwrap();
+    let prepared = prepare_content_repack(&source, analysis).unwrap();
     let imported_dir = tempfile::tempdir().unwrap();
     let imported = ContentStore::new(imported_dir.path());
     // Import in the scratch stream's dependency-first order. The complete
@@ -303,7 +324,8 @@ fn deterministic_plan_has_noop_fingerprint_and_depth_cap() {
         .collect::<Vec<_>>();
     let input = || ContentRepackInput {
         content_ids: ids.iter().rev().copied().collect(),
-        lineages_newest_first: vec![ids.iter().rev().copied().collect()],
+        tips: vec![ids[19]],
+        history: history(&ids.iter().rev().copied().collect::<Vec<_>>()),
     };
     let ContentRepackPlan::Replace(first) =
         plan_content_repack(&source, None, input(), ContentRepackLimits::default()).unwrap()
@@ -339,27 +361,32 @@ fn deterministic_plan_has_noop_fingerprint_and_depth_cap() {
             assert_eq!(generation, first.manifest.generation);
             assert_eq!(fingerprint, first.manifest.content_fingerprint);
         }
-        ContentRepackPlan::Replace(_) | ContentRepackPlan::ReplacePrepared(_) => {
+        ContentRepackPlan::Replace(_) => {
             panic!("identical representation must be a no-op")
         }
     }
 }
 
 #[test]
-fn conflicting_lineage_parents_fall_back_to_full_deterministically() {
+fn conflicting_history_bases_fall_back_to_full_deterministically() {
     let dir = tempfile::tempdir().unwrap();
     let source = ContentStore::new(dir.path());
     let target = source.put(&version(0)).unwrap();
     let left = source.put(&version(1)).unwrap();
     let right = source.put(&version(2)).unwrap();
-    let input = |lineages| ContentRepackInput {
+    let input = |history| ContentRepackInput {
         content_ids: vec![target, left, right],
-        lineages_newest_first: lineages,
+        tips: vec![left, right],
+        history,
+    };
+    let to = |newer| ContentHistoryPair {
+        older: target,
+        newer,
     };
     let ContentRepackPlan::Replace(first) = plan_content_repack(
         &source,
         None,
-        input(vec![vec![left, target], vec![right, target]]),
+        input(vec![to(left), to(right)]),
         ContentRepackLimits::default(),
     )
     .unwrap() else {
@@ -368,7 +395,7 @@ fn conflicting_lineage_parents_fall_back_to_full_deterministically() {
     let ContentRepackPlan::Replace(second) = plan_content_repack(
         &source,
         None,
-        input(vec![vec![right, target], vec![left, target]]),
+        input(vec![to(right), to(left)]),
         ContentRepackLimits::default(),
     )
     .unwrap() else {
@@ -386,6 +413,44 @@ fn conflicting_lineage_parents_fall_back_to_full_deterministically() {
 }
 
 #[test]
+fn prepare_fails_when_planned_content_vanishes_after_planning() {
+    // Prepare re-encodes every envelope from the source instead of planning a
+    // second time; a delta base or target that is gone must fail, not skip.
+    let dir = tempfile::tempdir().unwrap();
+    let source = ContentStore::new(dir.path());
+    let ids = (0..4)
+        .map(|n| source.put(&version(n)).unwrap())
+        .collect::<Vec<_>>();
+    let plan = || {
+        let ContentRepackPlan::Replace(analysis) = plan_content_repack(
+            &source,
+            None,
+            ContentRepackInput {
+                content_ids: ids.clone(),
+                tips: vec![ids[3]],
+                history: history(&ids.iter().rev().copied().collect::<Vec<_>>()),
+            },
+            ContentRepackLimits::default(),
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        analysis
+    };
+    let analysis = plan();
+    assert!(
+        analysis
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.delta_base == Some(ids[3]))
+    );
+    // Remove the newest version: every delta chain starts from it.
+    std::fs::remove_file(source.path(ids[3])).unwrap();
+    assert!(prepare_content_repack(&source, analysis).is_err());
+}
+
+#[test]
 fn disk_backed_plan_streams_envelopes_without_retaining_bodies() {
     let dir = tempfile::tempdir().unwrap();
     let source = ContentStore::with_durability(dir.path(), Durability::Deferred);
@@ -400,16 +465,13 @@ fn disk_backed_plan_streams_envelopes_without_retaining_bodies() {
     let ContentRepackPlan::Replace(analysis) = plan_content_repack(
         &source,
         None,
-        ContentRepackInput {
-            content_ids: ids,
-            lineages_newest_first: Vec::new(),
-        },
+        inventory_only(ids),
         ContentRepackLimits::default(),
     )
     .unwrap() else {
         unreachable!()
     };
-    let prepared = prepare_content_repack(&source, &analysis).unwrap();
+    let prepared = prepare_content_repack(&source, analysis).unwrap();
     assert!(prepared.scratch_bytes() > 0);
     assert_eq!(
         prepared.envelopes().unwrap().map(Result::unwrap).count(),
@@ -432,10 +494,7 @@ fn default_inventory_bound_covers_realistic_quarter_million_records() {
     let error = plan_content_repack(
         &ContentStore::new(dir.path()),
         None,
-        ContentRepackInput {
-            content_ids,
-            lineages_newest_first: Vec::new(),
-        },
+        inventory_only(content_ids),
         limits,
     )
     .unwrap_err();
@@ -481,16 +540,13 @@ fn integration_stages_before_atomic_publish_and_exposes_recovery() {
     let ContentRepackPlan::Replace(analysis) = plan_content_repack(
         &source,
         None,
-        ContentRepackInput {
-            content_ids: vec![id],
-            lineages_newest_first: vec![],
-        },
+        inventory_only(vec![id]),
         ContentRepackLimits::default(),
     )
     .unwrap() else {
         unreachable!()
     };
-    let prepared = prepare_content_repack(&source, &analysis).unwrap();
+    let prepared = prepare_content_repack(&source, analysis).unwrap();
     let target = RecordingTarget {
         fail_publish: true,
         ..Default::default()
@@ -504,31 +560,32 @@ fn integration_stages_before_atomic_publish_and_exposes_recovery() {
 }
 
 #[test]
-fn limits_overflow_and_unknown_lineage_references_fail_closed() {
+fn limits_overflow_and_unknown_history_references_fail_closed() {
+    use wheat_store::ContentRepackError;
+
     let dir = tempfile::tempdir().unwrap();
     let source = ContentStore::new(dir.path());
     let id = source.put(b"one").unwrap();
     let unknown = ContentId::of(b"unknown");
+    let plan = |input, limits| plan_content_repack(&source, None, input, limits);
+    for (tips, history) in [
+        (vec![], history(&[unknown, id])),
+        (vec![], history(&[id, unknown])),
+        (vec![unknown], vec![]),
+    ] {
+        let input = ContentRepackInput {
+            content_ids: vec![id],
+            tips,
+            history,
+        };
+        assert!(matches!(
+            plan(input, ContentRepackLimits::default()),
+            Err(ContentRepackError::UnknownHistoryContent(reported)) if reported == unknown
+        ));
+    }
     assert!(
-        plan_content_repack(
-            &source,
-            None,
-            ContentRepackInput {
-                content_ids: vec![id],
-                lineages_newest_first: vec![vec![unknown]]
-            },
-            ContentRepackLimits::default(),
-        )
-        .is_err()
-    );
-    assert!(
-        plan_content_repack(
-            &source,
-            None,
-            ContentRepackInput {
-                content_ids: vec![id],
-                lineages_newest_first: vec![]
-            },
+        plan(
+            inventory_only(vec![id]),
             ContentRepackLimits {
                 max_content_ids: 0,
                 ..ContentRepackLimits::default()
@@ -536,17 +593,27 @@ fn limits_overflow_and_unknown_lineage_references_fail_closed() {
         )
         .is_err()
     );
-
-    let ContentRepackPlan::Replace(first) = plan_content_repack(
-        &source,
-        None,
+    let two = source.put(b"two").unwrap();
+    let error = plan(
         ContentRepackInput {
-            content_ids: vec![id],
-            lineages_newest_first: vec![],
+            content_ids: vec![id, two],
+            tips: vec![two],
+            history: history(&[two, id]),
         },
-        ContentRepackLimits::default(),
+        ContentRepackLimits {
+            max_history_pairs: 0,
+            ..ContentRepackLimits::default()
+        },
     )
-    .unwrap() else {
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("history pairs limit exceeded"),
+        "{error}"
+    );
+
+    let ContentRepackPlan::Replace(first) =
+        plan(inventory_only(vec![id]), ContentRepackLimits::default()).unwrap()
+    else {
         unreachable!()
     };
     let maximum_generation =
@@ -555,13 +622,10 @@ fn limits_overflow_and_unknown_lineage_references_fail_closed() {
         plan_content_repack(
             &source,
             Some(&maximum_generation),
-            ContentRepackInput {
-                content_ids: vec![id, source.put(b"two").unwrap()],
-                lineages_newest_first: vec![],
-            },
+            inventory_only(vec![id, two]),
             ContentRepackLimits::default(),
         ),
-        Err(wheat_store::ContentRepackError::GenerationOverflow)
+        Err(ContentRepackError::GenerationOverflow)
     ));
 }
 

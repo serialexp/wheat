@@ -2,6 +2,8 @@
 
 use std::process::{Command, Output};
 
+mod support;
+
 fn store_home(workspace: &std::path::Path) -> std::path::PathBuf {
     workspace
         .parent()
@@ -49,19 +51,8 @@ fn ok(workspace: &std::path::Path, arguments: &[&str]) -> Output {
     output
 }
 
-fn field(output: &Output, name: &str) -> String {
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix(&format!("{name} ")))
-        .unwrap()
-        .to_owned()
-}
-
-fn object_path(store: &std::path::Path, encoded: &str) -> std::path::PathBuf {
-    store
-        .join("objects")
-        .join(&encoded[..2])
-        .join(&encoded[2..])
+fn corrupt_object(store: &std::path::Path, id: impl Into<wheat_core::ObjectId>) {
+    support::corrupt_packed_record(store, *id.into().as_bytes());
 }
 
 fn initialized_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -72,24 +63,9 @@ fn initialized_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     (parent, workspace)
 }
 
-#[test]
-fn conflict_inspection_does_not_read_unselected_retained_history() {
-    let (_parent, workspace) = initialized_workspace();
-    let revision = field(
-        &ok(
-            &workspace,
-            &["change", "new", "--path", "file", "--value", "value"],
-        ),
-        "revision",
-    );
-
-    // This revision remains retained, but an empty conflict inspection has no reason to read it.
-    // A complete repository validation would encounter and reject these bytes.
-    std::fs::write(object_path(&store_path(&workspace), &revision), b"corrupt").unwrap();
-    let output = ok(&workspace, &["conflicts", "--format", "json"]);
-    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["result"]["conflicts"], serde_json::json!([]));
-}
+// That inspection leaves unselected retained history unread is a unit test beside `inspect`:
+// the packed store authenticates its whole active segment on open, so damaging one record on
+// disk rejects the store before any command could skip that record.
 
 #[test]
 fn conflict_inspection_rejects_a_corrupt_selected_working_view() {
@@ -98,17 +74,13 @@ fn conflict_inspection_rejects_a_corrupt_selected_working_view() {
         serde_json::from_slice(&ok(&workspace, &["status", "--format", "json"]).stdout).unwrap();
     let effective: wheat_core::ViewId =
         serde_json::from_value(status["result"]["effective_view"].clone()).unwrap();
-    std::fs::write(
-        object_path(&store_path(&workspace), &effective.to_string()),
-        b"corrupt",
-    )
-    .unwrap();
+    corrupt_object(&store_path(&workspace), effective);
 
     let output = wheat(&workspace, &["conflicts"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("invalid physical envelope"),
+        stderr.contains("immutable object storage integrity failure"),
         "unexpected diagnostic: {stderr}"
     );
 }

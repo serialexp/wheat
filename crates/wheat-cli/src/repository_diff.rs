@@ -239,8 +239,8 @@ fn read_side(
 }
 
 struct Snapshot<'a> {
-    reader: RepositoryReader<'a, crate::local::LocalObjects>,
-    retained: RetainedSetStore<'a, crate::local::LocalObjects>,
+    reader: RepositoryReader<'a, wheat_store::PackedObjectStore>,
+    retained: RetainedSetStore<'a, wheat_store::PackedObjectStore>,
     head_generation: u64,
     envelope: wheat_core::RepositoryEnvelopeRecord,
     state: wheat_core::RepositoryStateRecord,

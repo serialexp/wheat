@@ -340,7 +340,7 @@ fn delete_rejects_the_workspace_selected_label() {
 fn labels_enforce_the_repository_size_bound_on_create() {
     use wheat_core::{RepositoryEnvelopeRecord, ViewLabelManifestRecord};
     use wheat_store::{
-        ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, PublicationStore,
+        ImmutableObjectStore, LocalPublicationStore, PackedObjectStore, PublicationStore,
         RepositoryReader,
     };
 
@@ -350,10 +350,10 @@ fn labels_enforce_the_repository_size_bound_on_create() {
             .unwrap();
     let store = Path::new(workspace["store"]["path"].as_str().unwrap());
     let heads = LocalPublicationStore::new(store.join("repository.head"));
-    let objects = LooseObjectStore::new(store.join("objects"));
+    let objects = PackedObjectStore::open(store.join("storage")).unwrap();
     let head = heads.read().unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let content = wheat_store::ContentStore::new(store.join("content"));
+    let content = objects.content_store();
     let reader = RepositoryReader::new(&objects, &content);
     let envelope = runtime.block_on(reader.envelope(head.envelope)).unwrap();
     let current = runtime
@@ -378,6 +378,9 @@ fn labels_enforce_the_repository_size_bound_on_create() {
         .unwrap();
     let oversized_head = head.next(oversized_envelope.id()).unwrap();
     heads.compare_and_advance(head, oversized_head).unwrap();
+    // The packed store admits one opener per process; release it before the CLI opens it.
+    drop(content);
+    drop(objects);
 
     let rejected = wheat(
         root.path(),

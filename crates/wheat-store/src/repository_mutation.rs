@@ -294,16 +294,29 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let trees = MerkleTreeStore::new(self.objects);
         let target = reader.view(application.target_view).await?;
         let mut replacements = BTreeMap::new();
-        for (path, after_value) in &resolution.resolved {
-            let components = path_components(path);
-            let partial_value = trees.lookup(partial_tree, &components).await?;
+        // `resolved` is keyed by path, so each tree is resolved in one sorted traversal.
+        let resolved_paths = resolution
+            .resolved
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let partial_values = trees.lookup_many(partial_tree, &resolved_paths).await?;
+        let before_values = trees.lookup_many(target.tree, &resolved_paths).await?;
+        let content_error =
+            |error: crate::ContentStoreError| RepositoryError::ContentIo(error.to_string());
+        let mut captured_content = crate::ContentWriteBatch::new(self.content);
+        for (((path, after_value), partial_value), before_value) in resolution
+            .resolved
+            .iter()
+            .zip(partial_values)
+            .zip(before_values)
+        {
             if partial_value == *after_value {
                 continue;
             }
             if !conflict_paths.contains(path.as_str()) {
                 return Err(RepositoryError::InvalidConflictResolution.into());
             }
-            let before_value = trees.lookup(target.tree, &components).await?;
             // Resolve and authenticate content before constructing or persisting metadata which
             // refers to it. This also supplies capture without hydrating either tree.
             let before_bytes = before_value
@@ -341,12 +354,17 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             )
             .map_err(|error| RepositoryError::EditApplication(format!("capture: {error:?}")))?;
             for (id, bytes) in captured.content {
-                self.content
-                    .store_generated(id, &bytes)
-                    .map_err(|error| RepositoryError::ContentIo(error.to_string()))?;
+                let actual = captured_content.put(&bytes).map_err(content_error)?;
+                if actual != id {
+                    return Err(RepositoryError::ContentIo(format!(
+                        "captured content {id} hashed to {actual}"
+                    ))
+                    .into());
+                }
             }
             replacements.extend(captured.edits);
         }
+        captured_content.commit().map_err(content_error)?;
 
         let removed = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
         let preserved = predecessor_edits
@@ -706,11 +724,14 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         persist: bool,
     ) -> Result<ApplicationRecord> {
         let trees = MerkleTreeStore::new(self.objects);
+        let paths = edit_paths(edits);
         let mut flat = Tree::new();
-        for edit in edits.values() {
-            let path = path_components(&edit.path);
-            if let Some(value) = trees.lookup(target.tree, &path).await? {
-                flat.insert(edit.path.clone(), value);
+        for (path, value) in paths
+            .iter()
+            .zip(trees.lookup_many(target.tree, &paths).await?)
+        {
+            if let Some(value) = value {
+                flat.insert((*path).to_owned(), value);
             }
         }
         let before = flat.clone();
@@ -725,12 +746,22 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             limits,
         )
         .map_err(|error| RepositoryError::EditApplication(format!("{error:?}")))?;
+        // One application can generate a blob per guarded path; retain them in bounded batches
+        // rather than one durable write each.
+        let content_error =
+            |error: crate::ContentStoreError| RepositoryError::ContentIo(error.to_string());
+        let mut generated = crate::ContentWriteBatch::new(self.content);
         for (id, bytes) in &output.generated_content {
-            self.content
-                .store_generated(*id, bytes)
-                .map_err(|error| RepositoryError::ContentIo(error.to_string()))?;
+            let actual = generated.put(bytes).map_err(content_error)?;
+            if actual != *id {
+                return Err(RepositoryError::ContentIo(format!(
+                    "generated content {id} hashed to {actual}"
+                ))
+                .into());
+            }
             fresh.content.insert(*id);
         }
+        generated.commit().map_err(content_error)?;
         let mut tree_edits = Vec::new();
         for path in before
             .keys()
@@ -833,11 +864,11 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         fresh: &mut Fresh,
     ) -> Result<ContentManifestId> {
         let trees = MerkleTreeStore::new(self.objects);
+        let paths = edit_paths(edits);
+        let befores = trees.lookup_many(old_view.tree, &paths).await?;
+        let afters = trees.lookup_many(new_tree, &paths).await?;
         let mut touched = Vec::new();
-        for edit in edits.values() {
-            let path = path_components(&edit.path);
-            let before = trees.lookup(old_view.tree, &path).await?;
-            let after = trees.lookup(new_tree, &path).await?;
+        for (before, after) in befores.into_iter().zip(afters) {
             if before != after {
                 if let Some(value) = after {
                     fresh.content.insert(value.content);
@@ -1076,6 +1107,16 @@ fn validate_initial(edits: &RevisionEdits) -> Result<()> {
 
 fn path_components(path: &str) -> Vec<String> {
     path.split('/').map(str::to_owned).collect()
+}
+
+/// The distinct paths `edits` touch, sorted so one tree traversal resolves them all.
+fn edit_paths(edits: &BTreeMap<EditId, EditRecord>) -> Vec<&str> {
+    edits
+        .values()
+        .map(|edit| edit.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 fn byte_range(range: std::ops::Range<usize>) -> ByteRange {
     ByteRange {
