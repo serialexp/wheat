@@ -383,6 +383,11 @@ The plan classifies each path as:
 - blocked by an unrecorded local modification;
 - blocked by an unsafe filesystem object or path traversal.
 
+A leaf that no longer holds its pinned value but already holds its exact target
+kind and raw bytes, or a deleted leaf that is already absent, is unchanged:
+`materialize` drops it from the journal instead of refusing it. Nothing is
+overwritten, and only mismatched leaves pay for the second comparison.
+
 The default operation aborts the entire plan if any path is blocked. An explicit
 replacement mode may be added, but it must display or emit the exact paths it
 will discard and revalidate immediately before mutation. It must not be a broad
@@ -483,7 +488,23 @@ Exact names remain open, but the behavior should:
 5. revalidate files and repository head before publication;
 6. persist useful revision metadata;
 7. report descendant applications and conflicts caused by the revision;
-8. leave the workspace untouched unless a separate materialization is requested.
+8. leave the workspace untouched unless a separate materialization is requested;
+9. settle the pinned materialized tree for the captured paths, so they do not
+   read as untracked or modified and `materialize` does not refuse them.
+
+Settlement (`capture_settlement.rs`) never writes workspace files. It records in
+the pinned tree each captured path whose raw workspace bytes are exactly the
+resulting working view's value. If that accounts for every difference, the pin
+moves to the resulting view and head. Otherwise the working view also holds
+content this workspace has never materialized, typically a descendant reapplied
+over the captured change. The pin then keeps its view and head, its tree gains
+the settled paths, and `add` reports `materialize_required` with the message
+"lineage changed …; run `wheat materialize` to update it". A captured path that a
+reapplied descendant also edits is reported as `diverged` and pinned at the
+captured change's own applied value, so the later materialization authenticates
+the workspace bytes and installs the descendant's result over them. The settled
+tree is rooted through the registry's pending-materialization slot before
+metadata can reference it. An interrupted `add` recovers with the previous pin.
 
 Workspace-wide capture must first have ignore semantics and configured bounds.
 It must display or return the selected path set before mutation in interactive
