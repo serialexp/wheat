@@ -192,6 +192,71 @@ fn modification_inside_guard_consolidates_against_authored_base() {
 }
 
 #[test]
+fn modification_strictly_inside_an_existing_replacement_consolidates() {
+    // A multi-line replacement whose middle line is revised by the next add: the new
+    // hunk's endpoints lie strictly inside the existing edit's write in the applied
+    // baseline, so neither endpoint maps to an authored coordinate on its own.
+    let base = numbered_lines(14);
+    let first_result = replace_line(
+        &base,
+        6,
+        "inserted alpha\ninserted beta\ninserted gamma\ninserted delta\n",
+    );
+    let limits = Limits::default();
+    let first = normalize(
+        base.as_bytes(),
+        &[],
+        base.as_bytes(),
+        first_result.as_bytes(),
+        None,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(first.len(), 1);
+
+    let workspace = first_result.replace("inserted beta\n", "revised beta\nand more\n");
+    let next = normalize(
+        base.as_bytes(),
+        &first,
+        first_result.as_bytes(),
+        workspace.as_bytes(),
+        None,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].expected, first[0].expected);
+    assert_applies(&base, &next, &workspace, limits);
+
+    // An explicit guard on the revised interior lines attaches to the same component.
+    let guard_start = workspace.find("revised beta\n").unwrap();
+    let guard = guard_start..guard_start + "revised beta\nand more\n".len();
+    let guarded = normalize(
+        base.as_bytes(),
+        &first,
+        first_result.as_bytes(),
+        workspace.as_bytes(),
+        Some(std::slice::from_ref(&guard)),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(guarded.len(), 1);
+    assert_applies(&base, &guarded, &workspace, limits);
+
+    // Reverting the interior change restores exactly the original definition.
+    let reverted = normalize(
+        base.as_bytes(),
+        &next,
+        workspace.as_bytes(),
+        first_result.as_bytes(),
+        None,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(reverted, first);
+}
+
+#[test]
 fn shared_unchanged_guard_context_does_not_consolidate() {
     let base = numbered_lines(18);
     let first_result = replace_line(&base, 5, "left replacement\n");

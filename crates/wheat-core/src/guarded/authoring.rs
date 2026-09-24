@@ -498,6 +498,12 @@ fn reverse_envelope(
     }
     Some(*points.iter().min()?..*points.iter().max()?)
 }
+/// Maps a baseline boundary to the authored coordinate that conservatively bounds it.
+///
+/// A boundary strictly inside an existing edit's written bytes has no authored
+/// counterpart: those bytes exist only in the replacement. It therefore expands to the
+/// whole authored range that edit replaces, the start for a left boundary and the end
+/// for a right one, so a change inside a replacement consolidates with that edit.
 fn reverse_boundary_b(
     p: usize,
     loc: &[Located],
@@ -512,10 +518,10 @@ fn reverse_boundary_b(
         if p <= x.write_b.end {
             return Some(if p == x.write_b.start {
                 x.write_a.start
-            } else if p == x.write_b.end {
+            } else if p == x.write_b.end || right {
                 x.write_a.end
             } else {
-                return None;
+                x.write_a.start
             });
         }
         delta = delta

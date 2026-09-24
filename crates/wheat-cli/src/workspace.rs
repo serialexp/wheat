@@ -56,11 +56,10 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
             "current application does not correspond to predecessor",
         ));
     }
-    if revision.authored_against != application.target_view {
-        return Err(CliFailure::corrupt(
-            "predecessor authored base does not match its current application target",
-        ));
-    }
+    // Edits are captured against the view the predecessor is currently applied to, which the
+    // mutation layer also authors the new revision against. After an ancestor revision
+    // reapplies this change, that target differs from `revision.authored_against`; the existing
+    // definitions are still checked to reproduce the applied baseline on it during normalization.
     let ApplicationResultRecord::Clean { tree: baseline } = application.result else {
         return Err(CliFailure::conflict(
             "current application is conflicted; resolve it before adding",

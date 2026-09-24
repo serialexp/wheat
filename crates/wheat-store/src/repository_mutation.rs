@@ -372,7 +372,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 ..EditTransition::default()
             },
         };
-        self.revise_at(
+        self.revise(
             expected,
             basis_view,
             effective_view,
@@ -380,7 +380,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             resolution.conflict_revision,
             RevisionMetadata::default(),
             revision_edits,
-            Some(application.target_view),
         )
         .await
     }
@@ -395,30 +394,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         metadata: RevisionMetadata,
         edits: RevisionEdits,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        self.revise_at(
-            expected,
-            basis_view,
-            effective_view,
-            change,
-            predecessor,
-            metadata,
-            edits,
-            None,
-        )
-        .await
-    }
-
-    async fn revise_at(
-        &self,
-        expected: RepositoryHead,
-        basis_view: ViewId,
-        effective_view: ViewId,
-        change: ChangeId,
-        predecessor: RevisionId,
-        metadata: RevisionMetadata,
-        edits: RevisionEdits,
-        target_override: Option<ViewId>,
-    ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
         let mut active = self.open(expected, basis_view, effective_view).await?;
         let Some((current, old)) = active.revisions.get(&change).cloned() else {
             return Err(RepositoryError::UnknownChange(change).into());
@@ -430,11 +405,27 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         self.validate_revision_transition(change, predecessor, old_edits, &edits, &active)
             .await?;
         let mut fresh = Fresh::default();
-        // A revision is authored against exactly the predecessor's authenticated target.  Loading
-        // that view is both cheaper and more precise than reconstructing its dependency closure.
-        let target = RepositoryReader::new(self.objects, self.content)
-            .view(target_override.unwrap_or(old.authored_against))
-            .await?;
+        // A revision is authored against the exact view its predecessor is currently applied to.
+        // That equals the predecessor's own authored base until an ancestor revision reapplies
+        // the change onto the ancestor's new result; from then on the workspace shows the
+        // reapplied result, so a new revision must replay against the reapplied target to
+        // reproduce it. Loading the recorded target is also cheaper than recomposing the
+        // dependency closure.
+        let reader = RepositoryReader::new(self.objects, self.content);
+        let application = ApplicationMapStore::new(self.objects)
+            .get(active.effective.applications, change)
+            .await?
+            .ok_or(RepositoryPublicationError::InvalidReferences(
+                "active change has no current application",
+            ))?;
+        let application = reader.application(application).await?;
+        if application.revision_id != predecessor {
+            return Err(RepositoryPublicationError::InvalidReferences(
+                "current application does not correspond to the predecessor revision",
+            )
+            .into());
+        }
+        let target = reader.view(application.target_view).await?;
         let preliminary = self
             .apply(
                 RevisionId::from_digest([0; 32]),
