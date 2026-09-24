@@ -169,7 +169,7 @@ pub(crate) fn emit_error(format: OutputFormat, command: &str, error: &Error) -> 
     let classification = classify(error);
     let message = bounded_message(error);
     if format == OutputFormat::Human {
-        eprintln!("error: {message}");
+        write_stderr(format_args!("error: {message}\n"));
     } else {
         let envelope = ErrorEnvelope {
             format: FORMAT,
@@ -183,15 +183,15 @@ pub(crate) fn emit_error(format: OutputFormat, command: &str, error: &Error) -> 
                 message: &message,
             },
         };
-        match render_json(&envelope) {
-            Ok(bytes) => {
-                let _ = std::io::stdout().write_all(&bytes);
-            }
+        return match render_json(&envelope) {
+            Ok(bytes) => commit_error_json(&bytes, classification.exit),
             Err(render_error) => {
-                eprintln!("error: cannot render structured Wheat error: {render_error}");
-                return ExitCode::from(1);
+                write_stderr(format_args!(
+                    "error: cannot render structured Wheat error: {render_error}\n"
+                ));
+                ExitCode::from(1)
             }
-        }
+        };
     }
     ExitCode::from(classification.exit)
 }
@@ -245,17 +245,15 @@ pub(crate) fn clap_error(format: OutputFormat, error: clap::Error) -> ExitCode {
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     ) {
         if format == OutputFormat::Human {
-            print!("{error}");
-        } else {
-            let success = Success::new("help", json!({ "text": error.to_string() }), Vec::new())
-                .expect("help text is JSON serializable");
-            return emit_success(format, &success);
+            return commit_stdout(format, error.to_string().as_bytes());
         }
-        return ExitCode::SUCCESS;
+        let success = Success::new("help", json!({ "text": error.to_string() }), Vec::new())
+            .expect("help text is JSON serializable");
+        return emit_success(format, &success);
     }
     let message = bounded_text(error.to_string());
     if format == OutputFormat::Human {
-        eprint!("{message}");
+        write_stderr(format_args!("{message}"));
         return ExitCode::from(2);
     }
     let envelope = ErrorEnvelope {
@@ -271,12 +269,11 @@ pub(crate) fn clap_error(format: OutputFormat, error: clap::Error) -> ExitCode {
         },
     };
     match render_json(&envelope) {
-        Ok(bytes) => {
-            let _ = std::io::stdout().write_all(&bytes);
-            ExitCode::from(2)
-        }
+        Ok(bytes) => commit_error_json(&bytes, 2),
         Err(render_error) => {
-            eprintln!("error: cannot render structured Wheat error: {render_error}");
+            write_stderr(format_args!(
+                "error: cannot render structured Wheat error: {render_error}\n"
+            ));
             ExitCode::from(1)
         }
     }
@@ -293,12 +290,46 @@ fn render_json(value: &impl Serialize) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Exit status when the reader closes stdout early (`wheat … | head`): the status of
+/// a process killed by SIGPIPE (128 + 13). Rust ignores SIGPIPE, so the write fails
+/// with `BrokenPipe` instead, and Wheat exits the same way, without a message.
+const BROKEN_PIPE_EXIT: u8 = 141;
+
+/// Writes `bytes` to stdout and flushes, so a closed reader is seen here, not at exit.
+fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(bytes)?;
+    stdout.flush()
+}
+
+/// Writes a diagnostic to stderr. A failure is ignored: stderr is where it would be
+/// reported, and a closed stderr must not panic the way `eprintln!` does.
+pub(crate) fn write_stderr(text: fmt::Arguments<'_>) {
+    let _ = std::io::stderr().lock().write_fmt(text);
+}
+
+/// Writes a JSON error envelope and returns `exit`, or [`BROKEN_PIPE_EXIT`] when the
+/// reader is gone. Any other write failure has nowhere to be reported.
+fn commit_error_json(bytes: &[u8], exit: u8) -> ExitCode {
+    match write_stdout(bytes) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            ExitCode::from(BROKEN_PIPE_EXIT)
+        }
+        _ => ExitCode::from(exit),
+    }
+}
+
 fn commit_stdout(format: OutputFormat, bytes: &[u8]) -> ExitCode {
-    match std::io::stdout().write_all(bytes) {
+    match write_stdout(bytes) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            ExitCode::from(BROKEN_PIPE_EXIT)
+        }
         Err(error) => {
             if format == OutputFormat::Human {
-                eprintln!("error: cannot write command output: {error}");
+                write_stderr(format_args!(
+                    "error: cannot write command output: {error}\n"
+                ));
             }
             ExitCode::from(1)
         }

@@ -55,7 +55,7 @@ mod workspace_status;
 mod workspace_walk;
 use command_output::{
     CliFailure, OutputFormat, Success, clap_error, emit_error, emit_success, requested_format,
-    require_supported_platform,
+    require_supported_platform, write_stderr,
 };
 use discovery::{allocate_store_root, canonical_store_path, discover_workspace, store_home};
 use local::{content_store, initialize, open, projection_path, revision_with_edits, runtime};
@@ -364,7 +364,7 @@ fn change_message(value: Option<String>, format: OutputFormat) -> Result<String>
             "change message is required in non-interactive use; pass --message <message>",
         ));
     }
-    eprint!("Change message: ");
+    write_stderr(format_args!("Change message: "));
     std::io::stderr().flush()?;
     let mut value = String::new();
     std::io::stdin()
@@ -670,7 +670,7 @@ fn execute(cli: Cli) -> Result<Success> {
             let mut output = String::new();
             // Print diagnostics to stderr (they're informational, not command output).
             for diagnostic in &status.diagnostics {
-                eprintln!("note: {diagnostic}");
+                write_stderr(format_args!("note: {diagnostic}\n"));
             }
             writeln!(output, "active label: {}", status.active_label)?;
             writeln!(output, "basis view: {}", status.basis)?;
@@ -2222,7 +2222,9 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
         let content_count =
             remote::fetch_content(&mut session, 2, &objects, &content, state.envelope).await?;
 
-        eprintln!("fetched {obj_count} objects, {content_count} content blobs");
+        write_stderr(format_args!(
+            "fetched {obj_count} objects, {content_count} content blobs\n"
+        ));
 
         remote::close(&mut session).await?;
         // Pick the first label as the active label, or "main" as default.
