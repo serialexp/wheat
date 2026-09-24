@@ -136,6 +136,46 @@ fn bounded_content_reads_cover_sealed_packs() {
     assert_eq!(content.get_bounded(id, bytes.len()).unwrap(), bytes);
 }
 
+/// Content lengths come back from every place packed content can live (the pending bulk
+/// tail, a sealed segment, the active segment and a loose fallback) without a payload
+/// read, which the trace's content read counter shows.
+#[test]
+fn logical_length_covers_every_packed_location_without_reading_payloads() {
+    let root = tempfile::tempdir().unwrap();
+    let small = vec![13; 4096];
+    let (objects, trace) = PackedObjectStore::open_deferred_traced(root.path()).unwrap();
+    let content = objects.content_store();
+    let id = content.put(&small).unwrap();
+    // Before close the record sits in the unpublished bulk segment.
+    assert_eq!(content.logical_length(id).unwrap(), 4096);
+    assert_eq!(trace.snapshot().unwrap().content_gets, 0);
+    drop(content);
+    objects.close().unwrap();
+
+    let objects = PackedObjectStore::open(root.path()).unwrap();
+    let content = objects.content_store();
+    // Sealed by close.
+    assert_eq!(content.logical_length(id).unwrap(), 4096);
+    // Active segment.
+    let active = content.put(&[14; 100]).unwrap();
+    assert_eq!(content.logical_length(active).unwrap(), 100);
+    let empty = content.put(b"").unwrap();
+    assert_eq!(content.logical_length(empty).unwrap(), 0);
+    let missing = ContentId::of(b"never stored");
+    assert!(matches!(
+        content.logical_length(missing),
+        Err(ContentStoreError::Missing(actual)) if actual == missing
+    ));
+
+    // Loose fallback for content over the threshold.
+    let loose_root = tempfile::tempdir().unwrap();
+    let objects = PackedObjectStore::open_with_loose_threshold(loose_root.path(), 16).unwrap();
+    let content = objects.content_store();
+    let loose = content.put(&[15; 17]).unwrap();
+    assert!(content.path(loose).is_file());
+    assert_eq!(content.logical_length(loose).unwrap(), 17);
+}
+
 #[tokio::test]
 async fn large_metadata_uses_standalone_fallback() {
     let root = tempfile::tempdir().unwrap();

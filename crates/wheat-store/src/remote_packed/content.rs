@@ -220,6 +220,52 @@ async fn fetch_raw_envelope(
     Ok((header, payload))
 }
 
+/// Fetches only an envelope's fixed header with a ranged read, checking the object's
+/// full size against it. The payload is not downloaded.
+async fn fetch_envelope_header(
+    backend: &dyn BackendObjectStore,
+    path: &Path,
+    id: ContentId,
+) -> Result<codec::EnvelopeHeader, ContentStoreError> {
+    let header_length = codec::ENVELOPE_HEADER_LEN as u64;
+    let result = backend
+        .get_opts(
+            path,
+            object_store::GetOptions::new().with_range(Some(0..header_length)),
+        )
+        .await
+        .map_err(|error| match error {
+            object_store::Error::NotFound { .. } => ContentStoreError::Missing(id),
+            error => ContentStoreError::Io(std::io::Error::other(error)),
+        })?;
+    let physical_length = result.meta.size;
+    let bytes = result
+        .bytes()
+        .await
+        .map_err(|error| ContentStoreError::Io(std::io::Error::other(error)))?;
+    if bytes.len() != codec::ENVELOPE_HEADER_LEN {
+        return Err(codec_error(
+            id,
+            usize::MAX,
+            codec::CodecError::Format("bad envelope prefix"),
+        ));
+    }
+    let header =
+        codec::parse_envelope_header(&bytes).map_err(|error| codec_error(id, usize::MAX, error))?;
+    if header
+        .physical_length()
+        .map_err(|error| codec_error(id, usize::MAX, error))?
+        != physical_length
+    {
+        return Err(codec_error(
+            id,
+            usize::MAX,
+            codec::CodecError::Format("stored length differs"),
+        ));
+    }
+    Ok(header)
+}
+
 /// S3-backed content storage with one key per ContentId.
 ///
 /// Layout: `{prefix}/content/{first2hex}/{resthex}`
@@ -307,6 +353,16 @@ impl ContentBackend for RemoteContentBackend {
         tokio::task::block_in_place(|| {
             rt.block_on(fetch_raw_envelope(self.backend.as_ref(), &path, id))
         })
+    }
+
+    fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|e| ContentStoreError::Io(std::io::Error::other(e)))?;
+        let path = self.path(id);
+        tokio::task::block_in_place(|| {
+            rt.block_on(fetch_envelope_header(self.backend.as_ref(), &path, id))
+        })
+        .map(|header| header.logical_length)
     }
 
     fn get_many_bounded(
@@ -439,6 +495,44 @@ mod tests {
             .unwrap();
         assert!(matches!(
             fetch_bounded_envelope(&backend, &path, id, usize::MAX).await,
+            Err(ContentStoreError::InvalidFormat { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn header_fetch_reads_the_length_and_checks_the_object_size() {
+        let backend = InMemory::new();
+        let path = Path::from("content");
+        let logical = vec![b'y'; 4096];
+        let id = ContentId::of(&logical);
+        let missing = fetch_envelope_header(&backend, &path, id).await;
+        assert!(matches!(missing, Err(ContentStoreError::Missing(actual)) if actual == id));
+
+        let encoded = codec::encode_envelope(&logical).unwrap();
+        backend
+            .put(&path, PutPayload::from(encoded.clone()))
+            .await
+            .unwrap();
+        let header = fetch_envelope_header(&backend, &path, id).await.unwrap();
+        assert_eq!(header.logical_length, logical.len() as u64);
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        backend
+            .put(&path, PutPayload::from(trailing))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fetch_envelope_header(&backend, &path, id).await,
+            Err(ContentStoreError::InvalidFormat { .. })
+        ));
+
+        backend
+            .put(&path, PutPayload::from(encoded[..10].to_vec()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fetch_envelope_header(&backend, &path, id).await,
             Err(ContentStoreError::InvalidFormat { .. })
         ));
     }

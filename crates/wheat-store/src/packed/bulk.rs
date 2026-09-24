@@ -219,6 +219,20 @@ impl BulkSegment {
         Ok(())
     }
 
+    /// Logical length of a record in this bulk segment, without reading its payload.
+    pub(crate) fn logical_length(&self, namespace: u8, digest: [u8; 32]) -> Option<u64> {
+        if let Some(record) = self
+            .pending_block
+            .iter()
+            .find(|record| record.namespace == namespace && record.digest == digest)
+        {
+            return Some(record.logical_bytes.len() as u64);
+        }
+        self.entries_by_key
+            .get(&(namespace, digest))
+            .map(|&index| self.entries[index].logical_length)
+    }
+
     pub(crate) fn lookup_bounded(
         &mut self,
         namespace: u8,

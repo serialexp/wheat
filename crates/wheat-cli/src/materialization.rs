@@ -932,24 +932,13 @@ async fn plan_delta(
     while let Some(change) = cursor.next().await? {
         validate_path(&change.path)?;
         if let Some(value) = change.new {
-            let bytes = repository.content.get(value.content)?;
-            ensure!(
-                bytes.len() <= MAX_FILE_BYTES,
-                "materialized file exceeds byte limit"
-            );
             total = total
-                .checked_add(u64::try_from(bytes.len())?)
+                .checked_add(materializable_length(&repository.content, value)?)
                 .context("materialization byte count overflow")?;
             ensure!(
                 total <= MAX_TOTAL_BYTES,
                 "materialization exceeds total byte limit"
             );
-            if value.kind == FileKind::Symlink {
-                ensure!(
-                    !bytes.is_empty() && !bytes.contains(&0) && bytes.len() <= 4_095,
-                    "materialized symlink target is not representable"
-                );
-            }
         }
         let index = installs.len();
         installs.push(Install {
@@ -1175,26 +1164,39 @@ fn validate_path(path: &str) -> Result<()> {
 fn validate_materializable(repository: &LocalRepository, files: &[TreeFile]) -> Result<()> {
     let mut total = 0_u64;
     for file in files {
-        let bytes = repository.content.get(file.value.content)?;
-        ensure!(
-            bytes.len() <= MAX_FILE_BYTES,
-            "materialized file exceeds byte limit"
-        );
         total = total
-            .checked_add(u64::try_from(bytes.len())?)
+            .checked_add(materializable_length(&repository.content, file.value)?)
             .context("materialization byte count overflow")?;
         ensure!(
             total <= MAX_TOTAL_BYTES,
             "materialization exceeds total byte limit"
         );
-        if file.value.kind == FileKind::Symlink {
-            ensure!(
-                !bytes.is_empty() && !bytes.contains(&0) && bytes.len() <= 4_095,
-                "materialized symlink target is not representable"
-            );
-        }
     }
     Ok(())
+}
+
+/// Checks that `value` can be materialized and returns its byte length, from stored
+/// length metadata so planning does not load every file. Only a symlink target, at most
+/// 4,095 bytes, is read, to reject NUL bytes. Installation reads each file again and
+/// enforces [`MAX_FILE_BYTES`] on the real bytes.
+fn materializable_length(content: &ContentStore, value: FileValue) -> Result<u64> {
+    let length = content.logical_length(value.content)?;
+    ensure!(
+        length <= MAX_FILE_BYTES as u64,
+        "materialized file exceeds byte limit"
+    );
+    if value.kind == FileKind::Symlink {
+        ensure!(
+            (1..=4_095).contains(&length),
+            "materialized symlink target is not representable"
+        );
+        let target = content.get_bounded(value.content, 4_095)?;
+        ensure!(
+            !target.contains(&0),
+            "materialized symlink target is not representable"
+        );
+    }
+    Ok(length)
 }
 
 fn validate_initial_workspace(root: &Path, files: &[TreeFile]) -> Result<()> {
@@ -3133,6 +3135,50 @@ mod tests {
             assert!(validate_path(path).is_err(), "{path:?}");
         }
         validate_path("src/main.rs").unwrap();
+    }
+
+    /// Sizing a regular file reads only stored length metadata: a delta whose base is
+    /// gone still sizes, although reading it would fail. Symlink targets are still read
+    /// and checked.
+    #[test]
+    fn materializable_length_sizes_files_without_reading_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = ContentStore::new(directory.path());
+        let base = (0..200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let target = format!("{base}one more line\n");
+        let base_id = content.put(base.as_bytes()).unwrap();
+        let target_id = wheat_core::ContentId::of(target.as_bytes());
+        content
+            .put_with_base(target_id, target.as_bytes(), base_id)
+            .unwrap();
+        std::fs::remove_file(content.path(base_id)).unwrap();
+        let regular = |content| FileValue {
+            content,
+            kind: FileKind::Regular,
+        };
+        assert!(content.get(target_id).is_err());
+        assert_eq!(
+            materializable_length(&content, regular(target_id)).unwrap(),
+            target.len() as u64
+        );
+
+        let symlink = |bytes: &[u8]| FileValue {
+            content: content.put(bytes).unwrap(),
+            kind: FileKind::Symlink,
+        };
+        assert_eq!(
+            materializable_length(&content, symlink(b"../target")).unwrap(),
+            9
+        );
+        for bad in [&b""[..], b"a\0b", &[b'a'; 4_096]] {
+            let error = materializable_length(&content, symlink(bad)).unwrap_err();
+            assert!(
+                error.to_string().contains("symlink target"),
+                "{bad:?}: {error}"
+            );
+        }
     }
 
     #[test]

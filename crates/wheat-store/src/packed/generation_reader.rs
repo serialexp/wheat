@@ -93,6 +93,23 @@ impl GenerationReader {
         Ok(self.open.last_mut().expect("a shard was just opened"))
     }
 
+    /// The reconstructed length of `id` from its authenticated shard manifest entry; the
+    /// pack is not read.
+    pub(super) fn logical_length(
+        &mut self,
+        id: ContentId,
+    ) -> Result<Option<u64>, ContentStoreError> {
+        let Some(shard) = self.index.shard_for(id) else {
+            return Ok(None);
+        };
+        let open = self.shard(shard)?;
+        Ok(open
+            .entries
+            .binary_search_by_key(&id, |entry| entry.id)
+            .ok()
+            .map(|index| open.entries[index].logical_length))
+    }
+
     pub(super) fn read(
         &mut self,
         id: ContentId,

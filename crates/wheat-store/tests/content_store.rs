@@ -128,6 +128,38 @@ fn delta_falls_back_to_raw_for_unrelated_content() {
     assert_eq!(store.get(target_id).unwrap(), target_bytes);
 }
 
+/// A delta envelope's header records the reconstructed length, so sizing it never
+/// resolves the base: the length still comes back with the base gone.
+#[test]
+fn logical_length_of_a_delta_reads_only_its_header() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let mut base = String::new();
+    for i in 0..100 {
+        base.push_str(&format!("fn function_{i}() -> i32 {{ {i} }}\n"));
+    }
+    let target = format!("{base}fn extra() {{}}\n");
+    let base_id = store.put(base.as_bytes()).unwrap();
+    let target_id = ContentId::of(target.as_bytes());
+    store
+        .put_with_base(target_id, target.as_bytes(), base_id)
+        .unwrap();
+    assert!(fs::metadata(store.path(target_id)).unwrap().len() < target.len() as u64 / 2);
+
+    fs::remove_file(store.path(base_id)).unwrap();
+    assert_eq!(
+        store.logical_length(target_id).unwrap(),
+        target.len() as u64
+    );
+    assert!(store.get(target_id).is_err());
+
+    let missing = ContentId::of(b"never stored");
+    assert!(matches!(
+        store.logical_length(missing),
+        Err(ContentStoreError::Missing(actual)) if actual == missing
+    ));
+}
+
 #[test]
 fn delta_falls_back_when_base_is_missing() {
     let directory = tempfile::tempdir().unwrap();

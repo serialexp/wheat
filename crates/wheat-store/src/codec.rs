@@ -487,13 +487,12 @@ pub(crate) fn decode_envelope(encoded: &[u8], max: usize) -> Result<Vec<u8>, Cod
     decode_envelope_payload(header, encoded[ENVELOPE_HEADER_LEN..].to_vec(), max)
 }
 
-/// Read an envelope file and return the header + raw stored payload without
-/// decoding. Used by the delta-aware content store to inspect the codec before
-/// deciding whether to decode directly or follow a delta chain.
-pub(crate) fn read_envelope_file_raw(
+/// Read only an envelope file's fixed header, after checking the file's exact
+/// physical length against it. The stored payload is not read.
+pub(crate) fn read_envelope_file_header(
     reader: &mut impl Read,
     physical_length: u64,
-) -> Result<(EnvelopeHeader, Vec<u8>), EnvelopeFileError> {
+) -> Result<EnvelopeHeader, EnvelopeFileError> {
     if physical_length < ENVELOPE_HEADER_LEN as u64 {
         return Err(CodecError::Format("bad envelope prefix").into());
     }
@@ -506,11 +505,22 @@ pub(crate) fn read_envelope_file_raw(
         }
     })?;
     let header = parse_envelope_header(&header_bytes)?;
-    // Validate physical length match (but not logical limits — the caller
-    // handles that after delta resolution).
     if header.physical_length()? != physical_length {
         return Err(CodecError::Format("stored length differs").into());
     }
+    Ok(header)
+}
+
+/// Read an envelope file and return the header + raw stored payload without
+/// decoding. Used by the delta-aware content store to inspect the codec before
+/// deciding whether to decode directly or follow a delta chain.
+pub(crate) fn read_envelope_file_raw(
+    reader: &mut impl Read,
+    physical_length: u64,
+) -> Result<(EnvelopeHeader, Vec<u8>), EnvelopeFileError> {
+    // Validates the physical length but not logical limits; the caller handles
+    // those after delta resolution.
+    let header = read_envelope_file_header(reader, physical_length)?;
     let logical = usize::try_from(header.logical_length)
         .map_err(|_| CodecError::Format("logical length does not fit this platform"))?;
     if logical > HARD_LOGICAL_RECORD_BYTES {

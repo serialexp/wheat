@@ -468,6 +468,14 @@ impl ActiveSegment {
         &self.entries
     }
 
+    /// The authenticated index entry for a key, without reading its payload.
+    pub(crate) fn entry(&self, namespace: u8, digest: [u8; 32]) -> Option<&SegmentIndexEntry> {
+        self.entries
+            .binary_search_by_key(&(namespace, digest), super::segment::key)
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
     /// Reads through the index already authenticated when this active segment
     /// was created, reopened, or last committed.
     pub(crate) fn lookup_entry_bounded(

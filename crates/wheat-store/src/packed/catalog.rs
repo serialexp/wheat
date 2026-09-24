@@ -143,6 +143,43 @@ pub(crate) struct CatalogPhysicalAuthority {
 type CatalogCheckpoint = (CatalogHead, ActivePublishedState, u64);
 type LocatorRow = (u16, u64, u8, u64, u64, String);
 
+/// What a keyed catalog read fetches.
+#[derive(Clone, Copy, Debug)]
+enum ReadMode {
+    /// The verified logical payload, refused above `max` bytes before it is read.
+    Payload { max: usize },
+    /// Only the logical length from the authenticated index entry; no payload is read.
+    Length,
+}
+
+/// A keyed catalog read's result, shaped by its [`ReadMode`].
+enum Found {
+    Payload { kind: u16, bytes: Vec<u8> },
+    Length(u64),
+}
+
+/// A key's authenticated index entry, carrying its payload only in [`ReadMode::Payload`].
+struct Authority {
+    entry: SegmentIndexEntry,
+    payload: Option<Vec<u8>>,
+}
+
+impl Found {
+    fn into_payload(self) -> (u16, Vec<u8>) {
+        match self {
+            Self::Payload { kind, bytes } => (kind, bytes),
+            Self::Length(_) => unreachable!("a payload read returns a payload"),
+        }
+    }
+
+    fn into_length(self) -> u64 {
+        match self {
+            Self::Length(length) => length,
+            Self::Payload { .. } => unreachable!("a length read returns a length"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RepackIntent {
     old: CatalogHead,
@@ -879,34 +916,62 @@ impl PackedCatalog {
         digest: [u8; 32],
         max: usize,
     ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+        Ok(self
+            .read_traced(namespace, digest, ReadMode::Payload { max })?
+            .map(Found::into_payload))
+    }
+
+    /// The logical length of a record, from its authenticated index entry. The payload
+    /// is not read, so callers that only need sizes do not pay for the bytes.
+    pub(crate) fn logical_length(
+        &mut self,
+        namespace: u8,
+        digest: [u8; 32],
+    ) -> Result<Option<u64>, CatalogError> {
+        Ok(self
+            .read_traced(namespace, digest, ReadMode::Length)?
+            .map(Found::into_length))
+    }
+
+    fn read_traced(
+        &mut self,
+        namespace: u8,
+        digest: [u8; 32],
+        mode: ReadMode,
+    ) -> Result<Option<Found>, CatalogError> {
         let started = Instant::now();
         if let Some(trace) = &self.trace {
             trace.catalog_get();
         }
-        let result = self.get_bounded_inner(namespace, digest, max);
+        let result = self.read_keyed(namespace, digest, mode);
         if let Some(trace) = &self.trace {
             trace.catalog_lookup_duration(started.elapsed());
         }
         result
     }
 
-    fn get_bounded_inner(
+    fn read_keyed(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
-        max: usize,
-    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
-        if let Some(value) = self
-            .bulk
-            .as_mut()
-            .map(|bulk| bulk.segment.lookup_bounded(namespace, digest, max))
-            .transpose()?
-            .flatten()
-        {
+        mode: ReadMode,
+    ) -> Result<Option<Found>, CatalogError> {
+        let bulk_hit = match (self.bulk.as_mut(), mode) {
+            (None, _) => None,
+            (Some(bulk), ReadMode::Payload { max }) => bulk
+                .segment
+                .lookup_bounded(namespace, digest, max)?
+                .map(|(kind, bytes)| Found::Payload { kind, bytes }),
+            (Some(bulk), ReadMode::Length) => bulk
+                .segment
+                .logical_length(namespace, digest)
+                .map(Found::Length),
+        };
+        if let Some(found) = bulk_hit {
             if let Some(trace) = &self.trace {
                 trace.catalog_bulk_hit();
             }
-            return Ok(Some(value));
+            return Ok(Some(found));
         }
         for attempt in 0..2 {
             let location = (|| -> Result<Option<LocatorRow>, CatalogError> {
@@ -927,7 +992,7 @@ impl PackedCatalog {
             if let Ok(location) = location {
                 if location.is_none()
                     && self
-                        .lookup_authority_bounded(namespace, digest, None, max)?
+                        .lookup_authority(namespace, digest, None, mode)?
                         .is_some()
                 {
                     if attempt == 0 {
@@ -936,7 +1001,7 @@ impl PackedCatalog {
                     }
                     return Err(CatalogError::Corrupt("locator misses authoritative object"));
                 }
-                match self.read_authoritative_location(namespace, digest, location.as_ref(), max) {
+                match self.read_authoritative_location(namespace, digest, location.as_ref(), mode) {
                     Ok(value) => {
                         if value.is_some()
                             && let Some(trace) = &self.trace
@@ -962,8 +1027,8 @@ impl PackedCatalog {
         namespace: u8,
         digest: [u8; 32],
         locator: Option<&LocatorRow>,
-        max: usize,
-    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+        mode: ReadMode,
+    ) -> Result<Option<Found>, CatalogError> {
         let Some((kind, offset, codec, stored_length, logical_length, source)) = locator else {
             // The locator checkpoint is advanced in the same SQLite transaction as
             // its rows. Once it matches the authenticated catalog and active heads,
@@ -977,13 +1042,17 @@ impl PackedCatalog {
                 "locator stored length exceeds segment limit",
             ));
         }
-        if *logical_length > max as u64 {
+        if let ReadMode::Payload { max } = mode
+            && *logical_length > max as u64
+        {
             return Err(CatalogError::Segment(SegmentError::ReadLimit {
                 minimum: usize::try_from(*logical_length).unwrap_or(usize::MAX),
             }));
         }
-        let Some((entry, bytes)) =
-            self.lookup_authority_bounded(namespace, digest, Some(source), max)?
+        let Some(Authority {
+            entry,
+            payload: bytes,
+        }) = self.lookup_authority(namespace, digest, Some(source), mode)?
         else {
             return Err(CatalogError::Corrupt(
                 "locator source or key is not authoritative",
@@ -999,20 +1068,40 @@ impl PackedCatalog {
                 "locator disagrees with authoritative index",
             ));
         }
-        verify_logical(&entry, &bytes)?;
-        Ok(Some((*kind, bytes)))
+        Ok(Some(match bytes {
+            Some(bytes) => {
+                verify_logical(&entry, &bytes)?;
+                Found::Payload { kind: *kind, bytes }
+            }
+            None => Found::Length(entry.logical_length),
+        }))
     }
 
-    fn lookup_authority_bounded(
+    /// The authenticated index entry for a key, with its payload only in
+    /// [`ReadMode::Payload`].
+    fn lookup_authority(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
         requested_source: Option<&str>,
-        max: usize,
-    ) -> Result<Option<(SegmentIndexEntry, Vec<u8>)>, CatalogError> {
+        mode: ReadMode,
+    ) -> Result<Option<Authority>, CatalogError> {
         if requested_source.is_none_or(|source| source == ACTIVE_FILE) {
-            if let Some(value) = self.active.lookup_entry_bounded(namespace, digest, max)? {
-                return Ok(Some(value));
+            let found = match mode {
+                ReadMode::Payload { max } => self
+                    .active
+                    .lookup_entry_bounded(namespace, digest, max)?
+                    .map(|(entry, bytes)| Authority {
+                        entry,
+                        payload: Some(bytes),
+                    }),
+                ReadMode::Length => self.active.entry(namespace, digest).map(|entry| Authority {
+                    entry: entry.clone(),
+                    payload: None,
+                }),
+            };
+            if let Some(found) = found {
+                return Ok(Some(found));
             }
             if requested_source.is_some() {
                 return Ok(None);
@@ -1053,8 +1142,20 @@ impl PackedCatalog {
                 .sealed_readers
                 .get_mut(&source.segment)
                 .expect("reader was inserted");
-            if let Some((entry, bytes)) = reader.lookup_entry_bounded(namespace, digest, max)? {
-                return Ok(Some((entry.clone(), bytes)));
+            let found = match mode {
+                ReadMode::Payload { max } => reader
+                    .lookup_entry_bounded(namespace, digest, max)?
+                    .map(|(entry, bytes)| Authority {
+                        entry: entry.clone(),
+                        payload: Some(bytes),
+                    }),
+                ReadMode::Length => reader.entry(namespace, digest).map(|entry| Authority {
+                    entry: entry.clone(),
+                    payload: None,
+                }),
+            };
+            if let Some(found) = found {
+                return Ok(Some(found));
             }
         }
         Ok(None)

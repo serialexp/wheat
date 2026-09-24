@@ -801,6 +801,14 @@ impl SegmentReader {
         self.block_cache.insert(block_offset, block);
     }
 
+    /// Returns the authenticated index entry for a key without reading its payload.
+    pub(crate) fn entry(&self, namespace: u8, digest: [u8; 32]) -> Option<&SegmentIndexEntry> {
+        self.entries_by_key
+            .binary_search_by_key(&(namespace, digest), key)
+            .ok()
+            .map(|index| &self.entries_by_key[index])
+    }
+
     /// Returns the authenticated index entry and its logically verified payload.
     /// The index is neither read nor decoded again, and the payload length is
     /// checked against `max` before allocating its output buffer.

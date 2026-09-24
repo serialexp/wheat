@@ -146,6 +146,42 @@ impl fmt::Debug for PackedObjectStore {
     }
 }
 
+impl PackedEngine {
+    /// Runs `lookup` against the published content generation's reader, or returns
+    /// `None` when no generation is published. The catalog lock is held throughout so a
+    /// repack on this handle cannot retire the generation's pack mid-lookup.
+    fn with_generation<T>(
+        &self,
+        id: ContentId,
+        lookup: impl FnOnce(&mut GenerationReader) -> Result<Option<T>, ContentStoreError>,
+    ) -> Result<Option<T>, ContentStoreError> {
+        let catalog = self.catalog.lock().map_err(|_| {
+            ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned"))
+        })?;
+        let generation = catalog.content_generation();
+        if generation.generation == 0 && generation.manifest == [0; 32] {
+            return Ok(None);
+        }
+        let mut cached = self.generation_reader.lock().map_err(|_| {
+            ContentStoreError::Io(io::Error::other("content generation reader mutex poisoned"))
+        })?;
+        if cached
+            .as_ref()
+            .is_none_or(|reader| !reader.matches(generation))
+        {
+            *cached = None;
+            *cached = Some(
+                GenerationReader::open(&self.root, generation)
+                    .map_err(|reason| ContentStoreError::InvalidFormat { id, reason })?,
+            );
+        }
+        let result = lookup(cached.as_mut().expect("generation reader initialized"));
+        drop(cached);
+        drop(catalog);
+        result
+    }
+}
+
 impl fmt::Debug for PackedEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PackedEngine")
@@ -1315,35 +1351,9 @@ impl ContentBackend for PackedEngine {
         &self,
         id: ContentId,
     ) -> Result<(crate::codec::EnvelopeHeader, Vec<u8>), ContentStoreError> {
-        // Hold the catalog lock through the generation lookup so a repack on this
-        // handle cannot retire its pack before this read completes.
-        let catalog = self.catalog.lock().map_err(|_| {
-            ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned"))
-        })?;
-        let generation = catalog.content_generation();
-        if generation.generation != 0 || generation.manifest != [0; 32] {
-            let mut cached = self.generation_reader.lock().map_err(|_| {
-                ContentStoreError::Io(io::Error::other("content generation reader mutex poisoned"))
-            })?;
-            if cached
-                .as_ref()
-                .is_none_or(|reader| !reader.matches(generation))
-            {
-                *cached = None;
-                *cached = Some(
-                    GenerationReader::open(&self.root, generation)
-                        .map_err(|reason| ContentStoreError::InvalidFormat { id, reason })?,
-                );
-            }
-            if let Some(record) = cached
-                .as_mut()
-                .expect("generation reader initialized")
-                .read(id)?
-            {
-                return Ok(record);
-            }
+        if let Some(record) = self.with_generation(id, |reader| reader.read(id))? {
+            return Ok(record);
         }
-        drop(catalog);
         // Content not yet repacked lives in segments as raw bytes, not envelopes.
         let value = self
             .catalog
@@ -1361,6 +1371,25 @@ impl ContentBackend for PackedEngine {
         }
         // Fall back to loose content store (which uses envelope files).
         self.content.read_local_raw_envelope(id)
+    }
+
+    /// Answers from indexed metadata in the same order reads resolve content: the
+    /// published content generation's manifest, the segment index, then a loose
+    /// envelope's header. No payload is read.
+    fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
+        if let Some(length) = self.with_generation(id, |reader| reader.logical_length(id))? {
+            return Ok(length);
+        }
+        let length = self
+            .catalog
+            .lock()
+            .map_err(|_| ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned")))?
+            .logical_length(CONTENT_NAMESPACE, *id.as_bytes())
+            .map_err(|error| content_catalog_error(id, error))?;
+        match length {
+            Some(length) => Ok(length),
+            None => self.content.read_local_logical_length(id),
+        }
     }
 
     fn put_raw_envelopes(

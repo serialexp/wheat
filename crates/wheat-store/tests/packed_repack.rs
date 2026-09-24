@@ -209,6 +209,11 @@ async fn generation_only_content_survives_a_second_repack() {
         content.get(id).unwrap(),
         b"only in the selected generation after segment retirement"
     );
+    // The generation's manifest answers length lookups on its own.
+    assert_eq!(
+        content.logical_length(id).unwrap(),
+        b"only in the selected generation after segment retirement".len() as u64
+    );
 }
 
 fn file_inventory(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {

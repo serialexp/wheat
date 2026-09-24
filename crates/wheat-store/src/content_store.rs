@@ -34,6 +34,14 @@ fn codec_error(id: ContentId, max: usize, error: codec::CodecError) -> ContentSt
     }
 }
 
+fn envelope_file_error(id: ContentId, error: codec::EnvelopeFileError) -> ContentStoreError {
+    match error {
+        codec::EnvelopeFileError::Codec(error) => codec_error(id, usize::MAX, error),
+        codec::EnvelopeFileError::Changed => ContentStoreError::Changed { id },
+        codec::EnvelopeFileError::Io(error) => ContentStoreError::Io(error),
+    }
+}
+
 /// Maximum number of delta links to follow before giving up.
 pub(crate) const MAX_DELTA_CHAIN_DEPTH: usize = 16;
 
@@ -76,6 +84,14 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
         &self,
         id: ContentId,
     ) -> Result<(crate::codec::EnvelopeHeader, Vec<u8>), ContentStoreError>;
+
+    /// The content's logical length from stored metadata (see
+    /// [`ContentStore::logical_length`]). The default reads the raw envelope without
+    /// decoding it; backends that index lengths answer without reading the payload.
+    fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
+        self.get_raw_envelope(id)
+            .map(|(header, _)| header.logical_length)
+    }
 
     /// Write pre-encoded envelope bytes directly to storage.
     ///
@@ -558,11 +574,36 @@ impl ContentStore {
             Err(error) => return Err(ContentStoreError::Io(error)),
         };
         let physical_length = file.metadata()?.len();
-        codec::read_envelope_file_raw(&mut file, physical_length).map_err(|error| match error {
-            codec::EnvelopeFileError::Codec(error) => codec_error(id, usize::MAX, error),
-            codec::EnvelopeFileError::Changed => ContentStoreError::Changed { id },
-            codec::EnvelopeFileError::Io(error) => ContentStoreError::Io(error),
-        })
+        codec::read_envelope_file_raw(&mut file, physical_length)
+            .map_err(|error| envelope_file_error(id, error))
+    }
+
+    /// The byte length of `id`'s content, from stored metadata alone. No payload is read
+    /// and no delta chain is resolved, so sizing work stays cheap. The length is not
+    /// checked against the content itself; reading the bytes does that.
+    pub fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
+        if let Some(backend) = &self.backend {
+            return backend.logical_length(id);
+        }
+        self.read_local_logical_length(id)
+    }
+
+    /// The logical length recorded in a local envelope file's header.
+    pub(crate) fn read_local_logical_length(
+        &self,
+        id: ContentId,
+    ) -> Result<u64, ContentStoreError> {
+        let mut file = match fs::File::open(self.path(id)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ContentStoreError::Missing(id));
+            }
+            Err(error) => return Err(ContentStoreError::Io(error)),
+        };
+        let physical_length = file.metadata()?.len();
+        codec::read_envelope_file_header(&mut file, physical_length)
+            .map(|header| header.logical_length)
+            .map_err(|error| envelope_file_error(id, error))
     }
 
     #[must_use]
