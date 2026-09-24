@@ -1,41 +1,53 @@
-//! Reusable authenticated content-generation index and pack reader.
+//! Reusable authenticated content-generation index and shard reader.
 //!
-//! The catalog head selects the generation. A store handle retains only the
-//! currently selected immutable manifest and an open pack handle; a new head
-//! replaces both together before any lookup against the new generation.
+//! The catalog head selects the generation. A store handle retains its small
+//! top-level index and loads shard manifests and pack handles on demand. One
+//! read resolves a delta chain of at most `MAX_DELTA_CHAIN_DEPTH` bases, each
+//! possibly in another shard, so the reader keeps that many shards plus the
+//! target open; any more is evicted least-recently-used. A new head replaces
+//! the whole reader before any lookup against the new generation.
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use wheat_core::{ContentId, PhysicalContentGeneration};
 
-use crate::{ContentGenerationManifest, ContentStoreError, codec};
+use crate::content_store::MAX_DELTA_CHAIN_DEPTH;
+use crate::{
+    ContentGenerationEntry, ContentGenerationIndex, ContentStoreError, codec,
+    content_generation_shard_manifest_path, content_generation_shard_pack_path,
+    read_content_generation_index,
+};
 
-use super::store::read_content_manifest;
+/// Shards one chain read can touch: every base plus the target.
+const OPEN_SHARDS: usize = MAX_DELTA_CHAIN_DEPTH + 1;
+
+struct OpenShard {
+    shard: usize,
+    entries: Vec<ContentGenerationEntry>,
+    pack: File,
+}
 
 pub(super) struct GenerationReader {
     authority: PhysicalContentGeneration,
-    manifest: ContentGenerationManifest,
-    pack: File,
+    generations: PathBuf,
+    index: ContentGenerationIndex,
+    /// Most recently used last.
+    open: Vec<OpenShard>,
 }
 
 impl GenerationReader {
     pub(super) fn open(root: &Path, authority: PhysicalContentGeneration) -> Result<Self, String> {
-        let manifest = read_content_manifest(root, authority)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "missing selected content generation".to_owned())?;
-        let pack = File::open(
-            root.join("content-generations")
-                .join(authority.generation.to_string())
-                .join("content.pack"),
-        )
-        .map_err(|error| error.to_string())?;
+        let generations = root.join("content-generations");
+        let index = read_content_generation_index(&generations, authority)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             authority,
-            manifest,
-            pack,
+            generations,
+            index,
+            open: Vec::with_capacity(OPEN_SHARDS),
         })
     }
 
@@ -43,18 +55,56 @@ impl GenerationReader {
         self.authority == authority
     }
 
+    /// Open (or reuse) `shard` and move it to the most-recently-used slot.
+    fn shard(&mut self, shard: usize) -> Result<&mut OpenShard, ContentStoreError> {
+        if let Some(position) = self.open.iter().position(|open| open.shard == shard) {
+            let open = self.open.remove(position);
+            self.open.push(open);
+        } else {
+            let generation = self.authority.generation;
+            let encoded = std::fs::read(content_generation_shard_manifest_path(
+                &self.generations,
+                generation,
+                shard,
+            ))?;
+            let entries = self
+                .index
+                .decode_shard(shard, &encoded)
+                .map_err(|error| ContentStoreError::Io(std::io::Error::other(error.to_string())))?;
+            let pack = File::open(content_generation_shard_pack_path(
+                &self.generations,
+                generation,
+                shard,
+            ))?;
+            if pack.metadata()?.len() != self.index.shards[shard].pack_length {
+                return Err(ContentStoreError::Io(std::io::Error::other(
+                    "content shard pack length differs from its manifest",
+                )));
+            }
+            if self.open.len() == OPEN_SHARDS {
+                self.open.remove(0);
+            }
+            self.open.push(OpenShard {
+                shard,
+                entries,
+                pack,
+            });
+        }
+        Ok(self.open.last_mut().expect("a shard was just opened"))
+    }
+
     pub(super) fn read(
         &mut self,
         id: ContentId,
     ) -> Result<Option<(codec::EnvelopeHeader, Vec<u8>)>, ContentStoreError> {
-        let Ok(index) = self
-            .manifest
-            .entries
-            .binary_search_by_key(&id, |entry| entry.id)
-        else {
+        let Some(shard) = self.index.shard_for(id) else {
             return Ok(None);
         };
-        let entry = &self.manifest.entries[index];
+        let open = self.shard(shard)?;
+        let Ok(index) = open.entries.binary_search_by_key(&id, |entry| entry.id) else {
+            return Ok(None);
+        };
+        let entry = &open.entries[index];
         let length = usize::try_from(entry.physical_length).map_err(|_| {
             ContentStoreError::InvalidFormat {
                 id,
@@ -67,11 +117,11 @@ impl GenerationReader {
                 reason: "generation envelope differs from manifest".into(),
             });
         }
-        self.pack.seek(SeekFrom::Start(entry.pack_offset))?;
+        open.pack.seek(SeekFrom::Start(entry.pack_offset))?;
         let mut header_bytes = [0; codec::ENVELOPE_HEADER_LEN];
-        self.pack.read_exact(&mut header_bytes)?;
+        open.pack.read_exact(&mut header_bytes)?;
         let mut payload = vec![0; length - codec::ENVELOPE_HEADER_LEN];
-        self.pack.read_exact(&mut payload)?;
+        open.pack.read_exact(&mut payload)?;
         let mut digest = blake3::Hasher::new();
         digest.update(&header_bytes);
         digest.update(&payload);

@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::{
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
 };
@@ -14,7 +15,8 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::encode_segment_prefix;
 use wheat_core::{
-    CanonicalObjectError, ContentId, ObjectId, SEGMENT_FOOTER_ENCODED_SIZE,
+    CanonicalObjectError, ContentId, ObjectId, SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE,
+    SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_MAX_DELTA_DEPTH,
     SEGMENT_NAMESPACE_CONTENT, SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE,
     SegmentDirectory, SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry,
     SegmentIndexKey, SegmentIndexPage, SegmentRecordError, decode_segment_directory,
@@ -24,6 +26,12 @@ use wheat_core::{
 };
 
 use crate::codec::{self, Codec, PhysicalPayload};
+use crate::delta;
+
+const _: () = assert!(
+    SEGMENT_MAX_DELTA_DEPTH as usize == crate::content_store::MAX_DELTA_CHAIN_DEPTH,
+    "metadata and content delta chains share one depth limit"
+);
 
 /// Hard decode/allocation ceiling for a V1 segment. Active packs seal in this
 /// same format, so readers must accept the active-pack policy bounds.
@@ -37,6 +45,8 @@ pub(crate) const CONTENT_NAMESPACE: u8 = SEGMENT_NAMESPACE_CONTENT;
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 const PREFIX_LEN: u64 = SEGMENT_PREFIX_ENCODED_SIZE as u64;
 const FOOTER_LEN: u64 = SEGMENT_FOOTER_ENCODED_SIZE as u64;
+/// At most four maximum-size decompressed blocks remain resident per reader.
+const BLOCK_CACHE_BUDGET_BYTES: usize = 4 * codec::MAX_BLOCK_LOGICAL_BYTES;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SegmentRecord<'a> {
@@ -55,6 +65,25 @@ pub(crate) struct PreparedSegmentRecord<'a> {
 impl PreparedSegmentRecord<'_> {
     pub(crate) fn stored_length(&self) -> u64 {
         self.physical.bytes.len() as u64
+    }
+}
+
+/// A metadata record encoded as a git delta patch against another metadata
+/// record that must already be in the same segment builder.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSegmentDelta<'a> {
+    pub logical: SegmentRecord<'a>,
+    pub base: [u8; 32],
+    pub physical: PhysicalPayload,
+}
+
+impl PreparedSegmentDelta<'_> {
+    /// Physical bytes this record adds beyond a whole record: the payload plus
+    /// the base digest carried by its index entry.
+    pub(crate) fn physical_cost(&self) -> u64 {
+        (self.physical.bytes.len()
+            + (SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE - SEGMENT_INDEX_ENTRY_ENCODED_SIZE))
+            as u64
     }
 }
 
@@ -103,6 +132,8 @@ pub(crate) enum SegmentError {
     Canonical(#[from] CanonicalObjectError),
     #[error("segment payload codec failed: {0}")]
     Codec(#[from] codec::CodecError),
+    #[error("segment delta patch failed: {0}")]
+    Delta(#[from] delta::DeltaError),
 }
 
 pub(super) fn key(entry: &SegmentIndexEntry) -> (u8, [u8; 32]) {
@@ -117,6 +148,37 @@ pub(crate) fn prepare_record(
         logical: record,
         physical: codec::prepare(record.bytes)?,
     })
+}
+
+/// Encodes a metadata `record` as a delta against `base_bytes` (the logical
+/// bytes of metadata record `base`). Returns `None` when no patch fits under
+/// the target's own size. The patch is applied back before it is accepted, so a
+/// written delta always reproduces the exact target bytes.
+pub(crate) fn prepare_delta_record<'a>(
+    record: SegmentRecord<'a>,
+    base: [u8; 32],
+    base_bytes: &[u8],
+) -> Result<Option<PreparedSegmentDelta<'a>>, SegmentError> {
+    if record.namespace != METADATA_NAMESPACE || base == record.digest {
+        return Err(SegmentError::Format(
+            "delta records are metadata with another base",
+        ));
+    }
+    validate_record(record)?;
+    let Some(patch) = delta::compute_delta(base_bytes, record.bytes) else {
+        return Ok(None);
+    };
+    let rebuilt = delta::apply_delta(base_bytes, &patch, record.bytes.len(), record.bytes.len())?;
+    if rebuilt != record.bytes {
+        return Err(SegmentError::Format(
+            "delta patch does not reproduce its target",
+        ));
+    }
+    Ok(Some(PreparedSegmentDelta {
+        logical: record,
+        base,
+        physical: codec::prepare_segment_delta(record.bytes.len(), &patch)?,
+    }))
 }
 
 fn directory_key(entry: &SegmentDirectoryEntry) -> (u8, [u8; 32]) {
@@ -146,11 +208,16 @@ pub(super) fn validate_record(record: SegmentRecord<'_>) -> Result<(), SegmentEr
     Ok(())
 }
 
-/// Exact physical size of a V1 segment with the supplied payload and entry count.
+/// Exact physical size of a V1 segment with the supplied payload and entry
+/// counts; `delta_entries` of the `entry_count` entries carry a base digest.
 pub(crate) fn projected_total_length(
     entry_count: usize,
+    delta_entries: usize,
     payload_bytes: u64,
 ) -> Result<u64, SegmentError> {
+    if delta_entries > entry_count {
+        return Err(SegmentError::Format("more delta entries than entries"));
+    }
     if entry_count > MAX_SEGMENT_ENTRIES {
         return Err(SegmentError::TooManyEntries);
     }
@@ -161,7 +228,17 @@ pub(crate) fn projected_total_length(
     let pages = u64::try_from(entry_count.div_ceil(MAX_INDEX_PAGE_ENTRIES))
         .map_err(|_| SegmentError::TooManyEntries)?;
     // Both page and directory records have a four-byte count prefix.
-    let page_bytes = count.checked_mul(60).and_then(|n| n.checked_add(pages * 4));
+    let deltas = u64::try_from(delta_entries).map_err(|_| SegmentError::TooManyEntries)?;
+    let page_bytes = count
+        .checked_mul(SEGMENT_INDEX_ENTRY_ENCODED_SIZE as u64)
+        .and_then(|n| {
+            n.checked_add(
+                deltas
+                    * (SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE - SEGMENT_INDEX_ENTRY_ENCODED_SIZE)
+                        as u64,
+            )
+        })
+        .and_then(|n| n.checked_add(pages * 4));
     let directory_bytes = pages.checked_mul(81).and_then(|n| n.checked_add(4));
     let tail_bytes = page_bytes
         .and_then(|pages| directory_bytes.and_then(|directory| pages.checked_add(directory)))
@@ -193,7 +270,9 @@ struct PendingBlockRecord {
 ///
 /// Small metadata records (below [`codec::RAW_THRESHOLD`]) are buffered and
 /// flushed as compressed blocks (codec 4). Larger records are written
-/// individually with per-record compression (codec 0 or 1).
+/// individually with per-record compression (codec 0 or 1). Metadata deltas
+/// (codec 2 or 3) are always standalone and must name a metadata record
+/// already pushed to this builder.
 pub(crate) struct SegmentBuilder {
     file: NamedTempFile,
     entries: Vec<SegmentIndexEntry>,
@@ -203,6 +282,8 @@ pub(crate) struct SegmentBuilder {
     pending_block: Vec<PendingBlockRecord>,
     /// Sum of `logical_bytes.len()` across `pending_block`.
     pending_block_bytes: usize,
+    /// Delta depth of every metadata record pushed so far (zero when whole).
+    metadata_depths: HashMap<[u8; 32], u8>,
 }
 
 impl SegmentBuilder {
@@ -218,7 +299,40 @@ impl SegmentBuilder {
             io_buffer: vec![0; HASH_BUFFER_SIZE],
             pending_block: Vec::new(),
             pending_block_bytes: 0,
+            metadata_depths: HashMap::new(),
         })
+    }
+
+    /// Payload bytes written so far plus pending block bytes counted at their
+    /// uncompressed size, an upper bound on the sealed payload.
+    pub(crate) fn projected_payload_bytes(&self) -> u64 {
+        self.payload_bytes
+            .saturating_add(self.pending_block_bytes as u64)
+    }
+
+    /// Delta depth of a metadata record already in this builder, if any.
+    pub(crate) fn metadata_depth(&self, digest: [u8; 32]) -> Option<u8> {
+        self.metadata_depths.get(&digest).copied()
+    }
+
+    /// Appends a delta record. Its base must already be in this builder with
+    /// room for one more link under [`SEGMENT_MAX_DELTA_DEPTH`]. Returns the
+    /// record's depth.
+    pub(crate) fn push_delta(
+        &mut self,
+        prepared: PreparedSegmentDelta<'_>,
+    ) -> Result<u8, SegmentError> {
+        let record = prepared.logical;
+        let base_depth = self
+            .metadata_depth(prepared.base)
+            .ok_or(SegmentError::Format("delta base is not in the segment"))?;
+        if base_depth >= SEGMENT_MAX_DELTA_DEPTH {
+            return Err(SegmentError::Format("delta chain exceeds depth limit"));
+        }
+        let depth = base_depth + 1;
+        self.write_standalone(record, prepared.physical, Some(prepared.base), depth)?;
+        self.metadata_depths.insert(record.digest, depth);
+        Ok(depth)
     }
 
     #[cfg(test)]
@@ -231,6 +345,9 @@ impl SegmentBuilder {
         prepared: PreparedSegmentRecord<'_>,
     ) -> Result<(), SegmentError> {
         let record = prepared.logical;
+        if record.namespace == METADATA_NAMESPACE {
+            self.metadata_depths.insert(record.digest, 0);
+        }
 
         // Route small metadata records into the pending block buffer.
         // Content namespace records are never block-compressed (they have their
@@ -250,10 +367,19 @@ impl SegmentBuilder {
         }
 
         // Large record: write individually with per-record compression.
+        self.write_standalone(record, prepared.physical, None, 0)
+    }
+
+    fn write_standalone(
+        &mut self,
+        record: SegmentRecord<'_>,
+        physical: PhysicalPayload,
+        delta_base: Option<[u8; 32]>,
+        delta_depth: u8,
+    ) -> Result<(), SegmentError> {
         if self.entries.len() == MAX_SEGMENT_ENTRIES {
             return Err(SegmentError::TooManyEntries);
         }
-        let physical = prepared.physical;
         let stored_length = physical.bytes.len() as u64;
         if self
             .payload_bytes
@@ -274,6 +400,8 @@ impl SegmentBuilder {
             codec: physical.codec.to_byte(),
             stored_length,
             logical_length: physical.logical_length,
+            delta_base,
+            delta_depth,
         });
         Ok(())
     }
@@ -331,6 +459,8 @@ impl SegmentBuilder {
                 codec: Codec::ZstdBlock.to_byte(),
                 stored_length,
                 logical_length: record.logical_bytes.len() as u64,
+                delta_base: None,
+                delta_depth: 0,
             });
         }
         self.pending_block_bytes = 0;
@@ -457,9 +587,14 @@ pub(crate) struct SegmentReader {
     /// block. Zero for non-block entries. Indexed in parallel with
     /// `entries_by_key`.
     block_logical_offsets: Vec<u64>,
-    /// Cache of decompressed block payloads, keyed by the block's physical
-    /// byte offset in the segment file.
-    block_cache: std::collections::HashMap<u64, Vec<u8>>,
+    /// Authenticated aggregate logical size for each entry's block. Zero for
+    /// non-block entries. Indexed in parallel with `entries_by_key`.
+    block_logical_lengths: Vec<usize>,
+    /// Decompressed blocks keyed by physical offset, with FIFO insertion order
+    /// so eviction never scans the map on the lookup path.
+    block_cache: HashMap<u64, Vec<u8>>,
+    block_cache_order: VecDeque<u64>,
+    block_cache_bytes: usize,
 }
 
 impl SegmentReader {
@@ -568,14 +703,22 @@ impl SegmentReader {
         all_entries.sort_unstable_by_key(|entry| (entry.offset, entry.stored_length));
         {
             let mut next_payload_offset = PREFIX_LEN;
-            let mut prev_region: Option<(u64, u64)> = None;
+            let mut prev_region: Option<((u64, u64), u8)> = None;
             for entry in &all_entries {
                 if entry.logical_length > codec::HARD_LOGICAL_RECORD_BYTES as u64 {
                     return Err(SegmentError::Format("payload offsets or logical length"));
                 }
                 let region = (entry.offset, entry.stored_length);
-                if prev_region == Some(region) {
-                    // Same block as the previous entry — already accounted for.
+                if let Some((previous_region, previous_codec)) = prev_region
+                    && previous_region == region
+                {
+                    if previous_codec != Codec::ZstdBlock.to_byte()
+                        || entry.codec != Codec::ZstdBlock.to_byte()
+                    {
+                        return Err(SegmentError::Format(
+                            "overlapping payload regions are not one block",
+                        ));
+                    }
                     continue;
                 }
                 if entry.offset != next_payload_offset
@@ -587,7 +730,7 @@ impl SegmentReader {
                     return Err(SegmentError::Format("payload offsets or logical length"));
                 }
                 next_payload_offset = entry.offset + entry.stored_length;
-                prev_region = Some(region);
+                prev_region = Some((region, entry.codec));
             }
             if next_payload_offset != footer.index_start {
                 return Err(SegmentError::Format("payload coverage"));
@@ -596,9 +739,12 @@ impl SegmentReader {
 
         // Re-sort by key for binary-search lookup.
         all_entries.sort_unstable_by_key(key);
+        validate_delta_chains(&all_entries)?;
 
-        // Precompute within-block byte offsets for codec=4 entries.
-        let block_logical_offsets = compute_block_logical_offsets(&all_entries);
+        // Derive each block's exact logical extent from its authenticated index
+        // membership before any compressed payload can be decoded.
+        let (block_logical_offsets, block_logical_lengths) =
+            compute_block_logical_offsets(&all_entries)?;
 
         Ok(Self {
             file,
@@ -606,7 +752,10 @@ impl SegmentReader {
             metadata: metadata(&footer),
             entries_by_key: all_entries,
             block_logical_offsets,
-            block_cache: std::collections::HashMap::new(),
+            block_logical_lengths,
+            block_cache: HashMap::new(),
+            block_cache_order: VecDeque::new(),
+            block_cache_bytes: 0,
         })
     }
 
@@ -629,10 +778,27 @@ impl SegmentReader {
         &self.entries_by_key
     }
 
-    /// Drop decompressed block scratch between streaming repack reads. This keeps
-    /// residency bounded by one block rather than by every block in a segment.
+    /// Drop decompressed block scratch between streaming repack reads rather
+    /// than retaining the reader's normal bounded working set.
     pub(crate) fn clear_block_cache(&mut self) {
         self.block_cache.clear();
+        self.block_cache_order.clear();
+        self.block_cache_bytes = 0;
+    }
+
+    fn cache_block(&mut self, block_offset: u64, block: Vec<u8>) {
+        let block_bytes = block.len();
+        while self.block_cache_bytes.saturating_add(block_bytes) > BLOCK_CACHE_BUDGET_BYTES {
+            let Some(evicted_offset) = self.block_cache_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.block_cache.remove(&evicted_offset) {
+                self.block_cache_bytes -= evicted.len();
+            }
+        }
+        self.block_cache_bytes += block_bytes;
+        self.block_cache_order.push_back(block_offset);
+        self.block_cache.insert(block_offset, block);
     }
 
     /// Returns the authenticated index entry and its logically verified payload.
@@ -648,48 +814,110 @@ impl SegmentReader {
         let Ok(index) = self.entries_by_key.binary_search_by_key(&wanted, key) else {
             return Ok(None);
         };
-        let entry = &self.entries_by_key[index];
         let logical_length =
-            usize::try_from(entry.logical_length).map_err(|_| SegmentError::ReadLimit {
-                minimum: usize::MAX,
+            usize::try_from(self.entries_by_key[index].logical_length).map_err(|_| {
+                SegmentError::ReadLimit {
+                    minimum: usize::MAX,
+                }
             })?;
         if logical_length > max {
             return Err(SegmentError::ReadLimit {
                 minimum: logical_length,
             });
         }
-        let codec = Codec::from_byte(entry.codec)?;
-        let bytes =
-            if codec == Codec::ZstdBlock {
-                let block_offset = entry.offset;
-                let block_stored_length = entry.stored_length;
-                let within_block_offset = usize::try_from(self.block_logical_offsets[index])
-                    .map_err(|_| SegmentError::ReadLimit {
-                        minimum: usize::MAX,
-                    })?;
+        let bytes = if self.entries_by_key[index].delta_base.is_some() {
+            self.resolve_delta(index)?
+        } else {
+            self.read_whole(index)?
+        };
+        verify_logical(&self.entries_by_key[index], &bytes)?;
+        Ok(Some((&self.entries_by_key[index], bytes)))
+    }
 
-                // Decompress and cache the block.
-                if !self.block_cache.contains_key(&block_offset) {
-                    let compressed = read_range(&mut self.file, block_offset, block_stored_length)?;
-                    let decompressed = codec::decode_block(&compressed)?;
-                    self.block_cache.insert(block_offset, decompressed);
+    /// Logical bytes of a whole (non-delta) entry, unverified.
+    fn read_whole(&mut self, index: usize) -> Result<Vec<u8>, SegmentError> {
+        // Copy the authenticated entry so block-cache mutation does not retain
+        // an immutable borrow of the reader across eviction/insertion.
+        let entry = self.entries_by_key[index].clone();
+        let logical_length =
+            usize::try_from(entry.logical_length).map_err(|_| SegmentError::ReadLimit {
+                minimum: usize::MAX,
+            })?;
+        let codec = Codec::from_byte(entry.codec)?;
+        if codec.is_delta() {
+            return Err(SegmentError::Format("delta entry read as a whole record"));
+        }
+        if codec != Codec::ZstdBlock {
+            let stored = read_range(&mut self.file, entry.offset, entry.stored_length)?;
+            return Ok(codec::decode(
+                codec,
+                stored,
+                entry.logical_length,
+                logical_length,
+            )?);
+        }
+        let block_offset = entry.offset;
+        let within_block_offset =
+            usize::try_from(self.block_logical_offsets[index]).map_err(|_| {
+                SegmentError::ReadLimit {
+                    minimum: usize::MAX,
                 }
-                let block = &self.block_cache[&block_offset];
-                let end = within_block_offset
-                    .checked_add(logical_length)
-                    .ok_or(SegmentError::Format("block record overflows"))?;
-                if end > block.len() {
-                    return Err(SegmentError::Format(
-                        "block record exceeds decompressed block",
-                    ));
-                }
-                block[within_block_offset..end].to_vec()
-            } else {
-                let stored = read_range(&mut self.file, entry.offset, entry.stored_length)?;
-                codec::decode(codec, stored, entry.logical_length, max)?
-            };
-        verify_logical(entry, &bytes)?;
-        Ok(Some((entry, bytes)))
+            })?;
+        // Decompress and cache the block using its exact authenticated
+        // aggregate logical size. Cache hits are O(1); FIFO eviction is
+        // proportional only to the number of blocks actually evicted.
+        if !self.block_cache.contains_key(&block_offset) {
+            let compressed = read_range(&mut self.file, block_offset, entry.stored_length)?;
+            let decompressed = codec::decode_block(&compressed, self.block_logical_lengths[index])?;
+            self.cache_block(block_offset, decompressed);
+        }
+        let block = &self.block_cache[&block_offset];
+        let end = within_block_offset
+            .checked_add(logical_length)
+            .ok_or(SegmentError::Format("block record overflows"))?;
+        if end > block.len() {
+            return Err(SegmentError::Format(
+                "block record exceeds decompressed block",
+            ));
+        }
+        Ok(block[within_block_offset..end].to_vec())
+    }
+
+    /// Rebuilds a delta entry from the whole record at the bottom of its chain.
+    /// `open` proved every link's base is in this segment with a depth exactly
+    /// one lower, so the walk ends within [`SEGMENT_MAX_DELTA_DEPTH`] links.
+    /// Each patch is bounded by, and must produce exactly, its link's
+    /// authenticated logical length; the caller verifies the final object ID.
+    fn resolve_delta(&mut self, index: usize) -> Result<Vec<u8>, SegmentError> {
+        let mut chain = [0_usize; SEGMENT_MAX_DELTA_DEPTH as usize];
+        let mut links = 0;
+        let mut cursor = index;
+        while let Some(base) = self.entries_by_key[cursor].delta_base {
+            if links == chain.len() {
+                return Err(SegmentError::Format("delta chain exceeds depth limit"));
+            }
+            chain[links] = cursor;
+            links += 1;
+            cursor = self
+                .entries_by_key
+                .binary_search_by_key(&(METADATA_NAMESPACE, base), key)
+                .map_err(|_| SegmentError::Format("delta base is not in the segment"))?;
+        }
+        let mut bytes = self.read_whole(cursor)?;
+        for &link in chain[..links].iter().rev() {
+            let entry = &self.entries_by_key[link];
+            let (offset, stored_length, logical_length) =
+                (entry.offset, entry.stored_length, entry.logical_length);
+            let codec = Codec::from_byte(entry.codec)?;
+            let target_length =
+                usize::try_from(logical_length).map_err(|_| SegmentError::ReadLimit {
+                    minimum: usize::MAX,
+                })?;
+            let stored = read_range(&mut self.file, offset, stored_length)?;
+            let patch = codec::decode_segment_delta_patch(codec, stored, logical_length)?;
+            bytes = delta::apply_delta(&bytes, &patch, target_length, target_length)?;
+        }
+        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -724,26 +952,68 @@ pub(super) fn metadata(footer: &SegmentFooter) -> SegmentMetadata {
 /// preceding records in the same block.
 ///
 /// Non-block entries get offset 0 (unused).
-fn compute_block_logical_offsets(entries: &[SegmentIndexEntry]) -> Vec<u64> {
-    use std::collections::HashMap;
+fn compute_block_logical_offsets(
+    entries: &[SegmentIndexEntry],
+) -> Result<(Vec<u64>, Vec<usize>), SegmentError> {
     let mut offsets = vec![0u64; entries.len()];
-    // Group block entries by block physical offset, preserving key-sorted order.
-    let mut blocks: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut lengths = vec![0usize; entries.len()];
+    // Aggregate once per block without allocating a member list per block. A
+    // second linear pass broadcasts each aggregate to its entry slots, so
+    // lookups never rediscover membership.
+    let mut blocks: HashMap<(u64, u64), u64> = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
+        if entry.codec != Codec::ZstdBlock.to_byte() {
+            continue;
+        }
+        let logical_length = blocks
+            .entry((entry.offset, entry.stored_length))
+            .or_default();
+        offsets[i] = *logical_length;
+        *logical_length = logical_length
+            .checked_add(entry.logical_length)
+            .ok_or(SegmentError::Format("block logical length overflows"))?;
+    }
+    for logical_length in blocks.values() {
+        if *logical_length > codec::MAX_BLOCK_LOGICAL_BYTES as u64 {
+            return Err(SegmentError::Format("block logical length exceeds limit"));
+        }
+    }
+    for (index, entry) in entries.iter().enumerate() {
         if entry.codec == Codec::ZstdBlock.to_byte() {
-            blocks.entry(entry.offset).or_default().push(i);
+            lengths[index] = usize::try_from(blocks[&(entry.offset, entry.stored_length)])
+                .map_err(|_| SegmentError::Format("block logical length exceeds limit"))?;
         }
     }
-    for indices in blocks.values() {
-        // Indices are already in key order because entries is key-sorted and we
-        // iterate sequentially.
-        let mut cumulative = 0u64;
-        for &i in indices {
-            offsets[i] = cumulative;
-            cumulative += entries[i].logical_length;
+    Ok((offsets, lengths))
+}
+
+/// Proves every delta entry's chain is closed inside this segment: its base is a
+/// metadata entry here and its depth is exactly the base's depth plus one.
+/// Depths strictly decrease toward the base, so chains cannot cycle, and the
+/// record layer already capped depth at [`SEGMENT_MAX_DELTA_DEPTH`].
+///
+/// `entries` must be sorted by key.
+fn validate_delta_chains(entries: &[SegmentIndexEntry]) -> Result<(), SegmentError> {
+    for entry in entries {
+        let Some(base) = entry.delta_base else {
+            continue;
+        };
+        let base = entries
+            .binary_search_by_key(&(METADATA_NAMESPACE, base), key)
+            .map(|index| &entries[index])
+            .map_err(|_| SegmentError::Format("delta base is not in the segment"))?;
+        if base.delta_depth.checked_add(1) != Some(entry.delta_depth) {
+            return Err(SegmentError::Format("delta depth does not follow its base"));
+        }
+        if Codec::from_byte(entry.codec)? == Codec::Delta
+            && entry.stored_length > entry.logical_length
+        {
+            return Err(SegmentError::Format(
+                "delta patch exceeds its target length",
+            ));
         }
     }
-    offsets
+    Ok(())
 }
 
 pub(super) fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), SegmentError> {
@@ -967,6 +1237,8 @@ mod tests {
                     codec: 0,
                     stored_length: canonical.len() as u64,
                     logical_length: canonical.len() as u64,
+                    delta_base: None,
+                    delta_depth: 0,
                 },
                 &canonical,
             ),
@@ -1078,6 +1350,80 @@ mod tests {
         let digest = *ObjectId::of_canonical_bytes(&canonical).as_bytes();
         let kind = SegmentIndexEntry::canonical_kind_code(wheat_core::CanonicalObjectKind::Edit);
         (kind, digest, canonical)
+    }
+
+    #[test]
+    fn rejects_raw_entry_overlapping_a_shared_block_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = SegmentBuilder::new(directory.path()).unwrap();
+        for path in ["overlap-a", "overlap-b"] {
+            let (kind, digest, canonical) = make_edit(path);
+            builder
+                .push(SegmentRecord {
+                    namespace: METADATA_NAMESPACE,
+                    kind,
+                    digest,
+                    bytes: &canonical,
+                })
+                .unwrap();
+        }
+        let segment = builder.seal().unwrap();
+        let mut raw = bytes(&segment);
+        replace_page(&mut raw, |page| {
+            assert_eq!(page.entries[0].offset, page.entries[1].offset);
+            page.entries[1].codec = Codec::Raw.to_byte();
+            page.entries[1].logical_length = page.entries[1].stored_length;
+        });
+        assert!(matches!(
+            SegmentReader::open(file_with_bytes(&raw)),
+            Err(SegmentError::Format(
+                "overlapping payload regions are not one block"
+            ))
+        ));
+    }
+
+    #[test]
+    fn block_layout_rejects_forged_aggregate_limits_and_overflow() {
+        let block_entry = |logical_length| SegmentIndexEntry {
+            namespace: METADATA_NAMESPACE,
+            kind: 16,
+            digest: [logical_length as u8; 32],
+            offset: PREFIX_LEN,
+            codec: Codec::ZstdBlock.to_byte(),
+            stored_length: 32,
+            logical_length,
+            delta_base: None,
+            delta_depth: 0,
+        };
+
+        assert!(matches!(
+            compute_block_logical_offsets(&[
+                block_entry(codec::MAX_BLOCK_LOGICAL_BYTES as u64),
+                block_entry(1),
+            ]),
+            Err(SegmentError::Format("block logical length exceeds limit"))
+        ));
+        assert!(matches!(
+            compute_block_logical_offsets(&[block_entry(u64::MAX), block_entry(1)]),
+            Err(SegmentError::Format("block logical length overflows"))
+        ));
+    }
+
+    #[test]
+    fn block_cache_stays_within_its_byte_budget_without_map_scans() {
+        let segment = build(&[b"payload"]);
+        let mut reader = SegmentReader::open(segment.file.reopen().unwrap()).unwrap();
+        let block_size = codec::MAX_BLOCK_LOGICAL_BYTES / 4;
+        for offset in 0..32_u64 {
+            reader.cache_block(offset, vec![0; block_size]);
+            assert!(reader.block_cache_bytes <= BLOCK_CACHE_BUDGET_BYTES);
+            assert_eq!(
+                reader.block_cache_bytes,
+                reader.block_cache.values().map(Vec::len).sum::<usize>()
+            );
+        }
+        assert!(reader.block_cache.len() < 32);
+        assert_eq!(reader.block_cache.len(), reader.block_cache_order.len());
     }
 
     #[test]
@@ -1235,5 +1581,222 @@ mod tests {
             .iter()
             .map(|e| e.logical_length)
             .sum()
+    }
+
+    /// Canonical content-set snapshot with members `0..count` (by seed).
+    fn content_set(count: usize) -> ([u8; 32], Vec<u8>) {
+        let mut members = (0..count)
+            .map(|index| ContentId::of(format!("member {index}").as_bytes()))
+            .collect::<Vec<_>>();
+        members.sort_unstable();
+        let bytes = wheat_core::content_set_snapshot_bytes(&members);
+        (*ObjectId::of_canonical_bytes(&bytes).as_bytes(), bytes)
+    }
+
+    fn content_set_kind() -> u16 {
+        SegmentIndexEntry::canonical_kind_code(wheat_core::CanonicalObjectKind::ContentSetSnapshot)
+    }
+
+    fn metadata_record(digest: [u8; 32], bytes: &[u8]) -> SegmentRecord<'_> {
+        SegmentRecord {
+            namespace: METADATA_NAMESPACE,
+            kind: content_set_kind(),
+            digest,
+            bytes,
+        }
+    }
+
+    /// One canonical record: its digest and bytes.
+    type Record = ([u8; 32], Vec<u8>);
+
+    /// A whole tip of `tip_members` members followed by a reverse chain of
+    /// `links` deltas, each one member smaller than its base. Returns the
+    /// sealed segment and every record pushed, tip first.
+    fn delta_chain(tip_members: usize, links: usize) -> (SealedSegment, Vec<Record>) {
+        let records = (0..=links)
+            .map(|link| content_set(tip_members - link))
+            .collect::<Vec<_>>();
+        // The sealed temp file must outlive this helper, like `build`'s.
+        let mut builder = SegmentBuilder::new(std::env::temp_dir()).unwrap();
+        let (tip, tip_bytes) = &records[0];
+        builder.push(metadata_record(*tip, tip_bytes)).unwrap();
+        for pair in records.windows(2) {
+            let ((base, base_bytes), (target, target_bytes)) = (&pair[0], &pair[1]);
+            let prepared =
+                prepare_delta_record(metadata_record(*target, target_bytes), *base, base_bytes)
+                    .unwrap()
+                    .expect("adjacent sets delta well");
+            assert!(prepared.physical.codec.is_delta());
+            builder.push_delta(prepared).unwrap();
+        }
+        (builder.seal().unwrap(), records)
+    }
+
+    #[test]
+    fn delta_chains_read_back_exactly_up_to_the_depth_limit() {
+        let links = usize::from(SEGMENT_MAX_DELTA_DEPTH);
+        let (segment, records) = delta_chain(200, links);
+        let mut reader = SegmentReader::open(segment.file.reopen().unwrap()).unwrap();
+        for (depth, (digest, bytes)) in records.iter().enumerate() {
+            let (entry, read) = reader
+                .lookup_entry_bounded(METADATA_NAMESPACE, *digest, usize::MAX)
+                .unwrap()
+                .unwrap();
+            assert_eq!(usize::from(entry.delta_depth), depth);
+            assert_eq!(entry.delta_base.is_some(), depth > 0);
+            assert_eq!(&read, bytes);
+        }
+        let deltas = records.len() - 1;
+        let entries = reader.authenticated_entries();
+        assert_eq!(
+            projected_total_length(entries.len(), deltas, segment.metadata.payload_bytes).unwrap(),
+            segment.metadata.total_length
+        );
+        // Whole records would have cost far more than the chain.
+        let whole: usize = records.iter().map(|(_, bytes)| bytes.len()).sum();
+        assert!(segment.metadata.payload_bytes * 4 < whole as u64);
+    }
+
+    #[test]
+    fn builder_rejects_foreign_bases_and_chains_past_the_depth_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base, base_bytes) = content_set(50);
+        let (target, target_bytes) = content_set(49);
+        let mut builder = SegmentBuilder::new(directory.path()).unwrap();
+        let prepared =
+            prepare_delta_record(metadata_record(target, &target_bytes), base, &base_bytes)
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            builder.push_delta(prepared.clone()),
+            Err(SegmentError::Format("delta base is not in the segment"))
+        ));
+        // A small base lives in a shared block; deltas against it still work.
+        builder.push(metadata_record(base, &base_bytes)).unwrap();
+        assert_eq!(builder.push_delta(prepared).unwrap(), 1);
+        assert!(matches!(
+            prepare_delta_record(
+                content_record(b"content bytes are never deltas"),
+                base,
+                &base_bytes
+            ),
+            Err(SegmentError::Format(_))
+        ));
+
+        let links = usize::from(SEGMENT_MAX_DELTA_DEPTH) + 1;
+        let records = (0..=links)
+            .map(|link| content_set(300 - link))
+            .collect::<Vec<_>>();
+        let mut builder = SegmentBuilder::new(directory.path()).unwrap();
+        builder
+            .push(metadata_record(records[0].0, &records[0].1))
+            .unwrap();
+        for (index, pair) in records.windows(2).enumerate() {
+            let prepared = prepare_delta_record(
+                metadata_record(pair[1].0, &pair[1].1),
+                pair[0].0,
+                &pair[0].1,
+            )
+            .unwrap()
+            .unwrap();
+            let result = builder.push_delta(prepared);
+            if index < usize::from(SEGMENT_MAX_DELTA_DEPTH) {
+                result.unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SegmentError::Format("delta chain exceeds depth limit"))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn open_rejects_delta_bases_outside_the_segment_and_wrong_depths() {
+        let (segment, records) = delta_chain(120, 3);
+        let first_delta = records[1].0;
+        let raw = bytes(&segment);
+        SegmentReader::open(file_with_bytes(&raw)).unwrap();
+
+        let mut missing_base = raw.clone();
+        replace_page(&mut missing_base, |page| {
+            let entry = page
+                .entries
+                .iter_mut()
+                .find(|entry| entry.digest == first_delta)
+                .unwrap();
+            entry.delta_base = Some([0xee; 32]);
+        });
+        assert!(matches!(
+            SegmentReader::open(file_with_bytes(&missing_base)),
+            Err(SegmentError::Format("delta base is not in the segment"))
+        ));
+
+        let mut wrong_depth = raw.clone();
+        replace_page(&mut wrong_depth, |page| {
+            let entry = page
+                .entries
+                .iter_mut()
+                .find(|entry| entry.digest == first_delta)
+                .unwrap();
+            entry.delta_depth = 2;
+        });
+        assert!(matches!(
+            SegmentReader::open(file_with_bytes(&wrong_depth)),
+            Err(SegmentError::Format("delta depth does not follow its base"))
+        ));
+
+        // A delta whose base is itself: rejected by the record layer.
+        let value = footer(&raw);
+        let directory = decode_segment_directory(
+            &raw[value.directory_offset as usize
+                ..(value.directory_offset + value.directory_length) as usize],
+        )
+        .unwrap();
+        let descriptor = &directory.pages[0];
+        let range = descriptor.offset as usize..(descriptor.offset + descriptor.length) as usize;
+        let mut page = decode_segment_index_page(&raw[range]).unwrap();
+        let entry = page
+            .entries
+            .iter_mut()
+            .find(|entry| entry.digest == first_delta)
+            .unwrap();
+        entry.delta_base = Some(first_delta);
+        assert!(matches!(
+            encode_segment_index_page(&page),
+            Err(SegmentRecordError::InvalidDelta)
+        ));
+    }
+
+    #[test]
+    fn corrupt_delta_patch_fails_the_read_not_the_neighbours() {
+        let (segment, records) = delta_chain(150, 2);
+        let mut raw = bytes(&segment);
+        let reader = SegmentReader::open(file_with_bytes(&raw)).unwrap();
+        let target = records[2].0;
+        let entry = reader
+            .authenticated_entries()
+            .iter()
+            .find(|entry| entry.digest == target)
+            .unwrap()
+            .clone();
+        drop(reader);
+        // Flip the patch's last byte (an insert payload byte or copy operand).
+        let at = (entry.offset + entry.stored_length - 1) as usize;
+        raw[at] ^= 0x55;
+        repair_body_digest(&mut raw);
+        let mut reader = SegmentReader::open(file_with_bytes(&raw)).unwrap();
+        assert!(
+            reader
+                .lookup_entry_bounded(METADATA_NAMESPACE, target, usize::MAX)
+                .is_err()
+        );
+        for (digest, bytes) in &records[..2] {
+            let (_, read) = reader
+                .lookup_entry_bounded(METADATA_NAMESPACE, *digest, usize::MAX)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&read, bytes);
+        }
     }
 }

@@ -24,7 +24,6 @@ fn kind_name(kind: u16) -> &'static str {
         9 => "RevisionMapNode",
         10 => "ApplicationMapNode",
         11 => "ConflictSetNode",
-        12 => "ContentSetNode",
         13 => "RetainedSetNode",
         14 => "ViewLabelManifest",
         15 => "Envelope",

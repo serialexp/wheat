@@ -8,12 +8,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 
-use blake3::Hasher;
-use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{ContentId, Repository};
 
+use crate::content_generation::{
+    CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationEntry, ContentGenerationManifest,
+    fingerprint_entries,
+};
 use crate::{ContentStore, ContentStoreError, codec, delta};
 
 const MAX_DELTA_DEPTH: u8 = crate::content_store::MAX_DELTA_CHAIN_DEPTH as u8;
@@ -105,68 +107,6 @@ pub(crate) fn retained_lineages(repository: &Repository) -> Vec<Vec<ContentId>> 
     result.sort();
     result.dedup();
     result
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContentGenerationEntry {
-    pub id: ContentId,
-    pub envelope_digest: [u8; 32],
-    /// Offset in the generation's single immutable `content.pack` file.
-    pub pack_offset: u64,
-    pub physical_length: u64,
-    pub logical_length: u64,
-    pub delta_base: Option<ContentId>,
-    pub delta_depth: u8,
-}
-
-/// Authenticated description of one complete physical content generation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContentGenerationManifest {
-    pub generation: u64,
-    pub entries: Vec<ContentGenerationEntry>,
-    /// Generation-independent representation fingerprint used for no-op detection.
-    pub content_fingerprint: [u8; 32],
-    /// Digest over the generation number, fingerprint, and all entries.
-    pub manifest_digest: [u8; 32],
-}
-
-impl ContentGenerationManifest {
-    /// Authenticate the manifest and reject non-canonical entry ordering.
-    pub fn verify(&self) -> Result<(), ContentRepackError> {
-        if self.entries.windows(2).any(|pair| pair[0].id >= pair[1].id) {
-            return Err(ContentRepackError::InvalidManifest(
-                "entries are not strictly ordered".into(),
-            ));
-        }
-        let content_fingerprint = fingerprint_entries(&self.entries, None);
-        if content_fingerprint != self.content_fingerprint {
-            return Err(ContentRepackError::InvalidManifest(
-                "content fingerprint differs".into(),
-            ));
-        }
-        let digest = fingerprint_entries(
-            &self.entries,
-            Some((self.generation, self.content_fingerprint)),
-        );
-        if digest != self.manifest_digest {
-            return Err(ContentRepackError::InvalidManifest(
-                "manifest digest differs".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn encoded(&self) -> Result<Vec<u8>, ContentRepackError> {
-        serde_json::to_vec(self)
-            .map_err(|error| ContentRepackError::InvalidManifest(error.to_string()))
-    }
-
-    pub(crate) fn decode(encoded: &[u8]) -> Result<Self, ContentRepackError> {
-        let manifest: Self = serde_json::from_slice(encoded)
-            .map_err(|error| ContentRepackError::InvalidManifest(error.to_string()))?;
-        manifest.verify()?;
-        Ok(manifest)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -523,27 +463,42 @@ pub fn plan_content_repack(
         }
     }
 
-    let mut offsets = BTreeMap::new();
-    let mut next_offset = 0u64;
-    for id in &production_ids {
-        offsets.insert(*id, next_offset);
-        next_offset = next_offset.checked_add(chosen[id].physical_length).ok_or(
-            ContentRepackError::ArithmeticOverflow("content pack offset"),
-        )?;
-    }
     let mut entries = Vec::with_capacity(chosen.len());
     for (id, envelope) in &chosen {
         entries.push(ContentGenerationEntry {
             id: *id,
             envelope_digest: envelope.digest,
-            pack_offset: offsets[id],
+            pack_offset: 0,
             physical_length: envelope.physical_length,
             logical_length: envelope.logical_length,
             delta_base: envelope.base,
             delta_depth: envelope.depth,
         });
     }
-    let content_fingerprint = fingerprint_entries(&entries, None);
+    // Each shard has its own pack: group production by shard (keeping the
+    // base-first order within it) and lay each pack out from offset zero.
+    let entry_index = |entries: &[ContentGenerationEntry], id: &ContentId| {
+        entries
+            .binary_search_by_key(id, |entry| entry.id)
+            .expect("every produced ID has an entry")
+    };
+    production_ids.sort_by_key(|id| entry_index(&entries, id) / CONTENT_GENERATION_SHARD_ENTRIES);
+    let mut shard = usize::MAX;
+    let mut next_offset = 0u64;
+    for id in &production_ids {
+        let index = entry_index(&entries, id);
+        if index / CONTENT_GENERATION_SHARD_ENTRIES != shard {
+            shard = index / CONTENT_GENERATION_SHARD_ENTRIES;
+            next_offset = 0;
+        }
+        entries[index].pack_offset = next_offset;
+        next_offset = next_offset
+            .checked_add(entries[index].physical_length)
+            .ok_or(ContentRepackError::ArithmeticOverflow(
+                "content pack offset",
+            ))?;
+    }
+    let content_fingerprint = fingerprint_entries(&entries);
     if let Some(current) = current
         && current.content_fingerprint == content_fingerprint
     {
@@ -558,14 +513,8 @@ pub fn plan_content_repack(
             .checked_add(1)
             .ok_or(ContentRepackError::GenerationOverflow)
     })?;
-    let manifest_digest = fingerprint_entries(&entries, Some((generation, content_fingerprint)));
     Ok(ContentRepackPlan::Replace(ContentRepackAnalysis {
-        manifest: ContentGenerationManifest {
-            generation,
-            entries,
-            content_fingerprint,
-            manifest_digest,
-        },
+        manifest: ContentGenerationManifest::new(generation, entries)?,
         input: ContentRepackInput {
             content_ids: inventory.into_iter().collect(),
             lineages_newest_first: input.lineages_newest_first,
@@ -696,38 +645,6 @@ fn check_limit(kind: &'static str, actual: usize, limit: usize) -> Result<(), Co
         });
     }
     Ok(())
-}
-
-fn fingerprint_entries(
-    entries: &[ContentGenerationEntry],
-    generation: Option<(u64, [u8; 32])>,
-) -> [u8; 32] {
-    let mut hash = Hasher::new();
-    hash.update(b"wheat-content-generation-v1\0");
-    if let Some((generation, content_fingerprint)) = generation {
-        hash.update(&generation.to_be_bytes());
-        hash.update(&content_fingerprint);
-    }
-    let entry_count = u64::try_from(entries.len()).expect("usize must fit in u64");
-    hash.update(&entry_count.to_be_bytes());
-    for entry in entries {
-        hash.update(entry.id.as_bytes());
-        hash.update(&entry.envelope_digest);
-        hash.update(&entry.pack_offset.to_be_bytes());
-        hash.update(&entry.physical_length.to_be_bytes());
-        hash.update(&entry.logical_length.to_be_bytes());
-        match entry.delta_base {
-            Some(base) => {
-                hash.update(&[1]);
-                hash.update(base.as_bytes());
-            }
-            None => {
-                hash.update(&[0]);
-            }
-        }
-        hash.update(&[entry.delta_depth]);
-    }
-    *hash.finalize().as_bytes()
 }
 
 #[cfg(test)]

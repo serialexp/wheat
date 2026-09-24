@@ -30,13 +30,36 @@ fn repack_options() -> CatalogRepackOptions {
     }
 }
 
+static NO_BASES: std::collections::BTreeMap<[u8; 32], [u8; 32]> = std::collections::BTreeMap::new();
+
+fn refuse_loose(_: [u8; 32]) -> Result<Vec<u8>, CatalogError> {
+    Err(CatalogError::Corrupt("test offers no loose metadata"))
+}
+
+/// Metadata input with no delta bases and no loose objects.
+fn no_metadata(
+    read_loose: &mut dyn FnMut([u8; 32]) -> Result<Vec<u8>, CatalogError>,
+) -> MetadataRepackInput<'_> {
+    MetadataRepackInput {
+        bases: &NO_BASES,
+        loose: &[],
+        read_loose,
+    }
+}
+
 fn repack(store: &mut PackedCatalog) -> Result<CatalogRepackReport, CatalogError> {
     let authority = store.physical_authority()?;
-    store.repack_structural(repack_options(), legacy_content_generation(), authority)
+    store.repack_structural(
+        repack_options(),
+        no_content_generation(),
+        None,
+        authority,
+        no_metadata(&mut refuse_loose),
+    )
 }
 
 #[test]
-fn repack_converts_v1_to_v2_preserves_records_and_second_run_is_noop() {
+fn repack_merges_segments_preserves_records_and_second_run_is_noop() {
     let root = tempfile::tempdir().unwrap();
     let values = [
         record(b"one authenticated value"),
@@ -45,33 +68,117 @@ fn repack_converts_v1_to_v2_preserves_records_and_second_run_is_noop() {
     let mut store =
         PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
             .unwrap();
-    store.put_records(&values).unwrap();
-    let report = repack(&mut store).unwrap();
+    for value in values {
+        store.put_records(&[value]).unwrap();
+    }
+    assert_eq!(publication_names(root.path()).0.len(), 2);
+    let options = CatalogRepackOptions {
+        max_records: 100,
+        target_segment_bytes: 1 << 20,
+    };
+    let authority = store.physical_authority().unwrap();
+    let report = store
+        .repack_structural(
+            options,
+            no_content_generation(),
+            None,
+            authority,
+            no_metadata(&mut refuse_loose),
+        )
+        .unwrap();
     assert!(!report.no_op);
+    assert_eq!(report.segments_before, 2);
+    assert_eq!(report.segments_after, 1);
     assert_eq!(report.source_body_reads, 2);
     assert_eq!(report.max_resident_bodies, 1);
     assert_eq!(report.generation_after, report.generation_before + 1);
-    assert!(store.test_is_v2());
     for value in values {
         assert_value(&mut store, value);
     }
     let publications = publication_names(root.path());
+    assert_eq!(publications.0.len(), 1);
     assert_eq!(publications.1.len(), 1);
 
-    let second = repack(&mut store).unwrap();
+    let authority = store.physical_authority().unwrap();
+    let second = store
+        .repack_structural(
+            options,
+            no_content_generation(),
+            None,
+            authority,
+            no_metadata(&mut refuse_loose),
+        )
+        .unwrap();
     assert!(second.no_op);
     assert_eq!(second.generation_before, second.generation_after);
     drop(store);
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    assert!(reopened.test_is_v2());
     for value in values {
         assert_value(&mut reopened, value);
     }
 }
 
 #[test]
-fn ordinary_publication_after_repack_remains_v2() {
+fn repack_rejects_fabricated_content_generation_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"content must not disappear for a fabricated token");
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+            .unwrap();
+    store.put_records(&[value]).unwrap();
+    let generation = wheat_core::PhysicalContentGeneration {
+        generation: 1,
+        manifest: [0x42; 32],
+    };
+    assert!(matches!(
+        store.repack_structural(
+            repack_options(),
+            generation,
+            None,
+            store.physical_authority().unwrap(),
+            no_metadata(&mut refuse_loose),
+        ),
+        Err(CatalogError::Corrupt(_))
+    ));
+    assert_value(&mut store, value);
+}
+
+#[test]
+fn repack_rejects_validated_inventory_missing_segment_content() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"coverage proof must include every segment content ID");
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+            .unwrap();
+    store.put_records(&[value]).unwrap();
+    let manifest = crate::ContentGenerationManifest {
+        generation: 1,
+        entries: Vec::new(),
+        content_fingerprint: *blake3::hash(b"content").as_bytes(),
+        manifest_digest: [0; 32],
+    };
+    let generation = wheat_core::PhysicalContentGeneration {
+        generation: 1,
+        manifest: [0x42; 32],
+    };
+    assert!(matches!(
+        store.repack_structural(
+            repack_options(),
+            generation,
+            Some(ValidatedContentGeneration::after_pack_verification(
+                generation, &manifest,
+            )),
+            store.physical_authority().unwrap(),
+            no_metadata(&mut refuse_loose),
+        ),
+        Err(CatalogError::Corrupt(_))
+    ));
+    assert_value(&mut store, value);
+}
+
+#[test]
+fn ordinary_publication_after_repack_preserves_both_generations() {
     let root = tempfile::tempdir().unwrap();
     let first = record(b"first generation");
     let second = record(b"later ordinary publication");
@@ -81,11 +188,9 @@ fn ordinary_publication_after_repack_remains_v2() {
     store.put_records(&[first]).unwrap();
     repack(&mut store).unwrap();
     store.put_records(&[second]).unwrap();
-    assert!(store.test_is_v2());
     drop(store);
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    assert!(reopened.test_is_v2());
     assert_value(&mut reopened, first);
     assert_value(&mut reopened, second);
 }
@@ -99,6 +204,7 @@ fn interrupted_repack_recovers_old_or_new_authority() {
             PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
                 .unwrap();
         store.put_records(&values).unwrap();
+        let head_before = fs::read(root.path().join("catalog.head")).unwrap();
         store.test_set_repack_failpoint(failpoint);
         assert!(repack(&mut store).is_err());
         drop(store);
@@ -109,8 +215,8 @@ fn interrupted_repack_recovers_old_or_new_authority() {
         }
         assert!(!root.path().join("repack.intent").exists());
         assert_eq!(
-            reopened.test_is_v2(),
-            failpoint == RepackFailpoint::AfterHead
+            fs::read(root.path().join("catalog.head")).unwrap() == head_before,
+            failpoint == RepackFailpoint::AfterIntent
         );
     }
 }
@@ -131,8 +237,10 @@ fn repack_inventory_limit_fails_before_publication() {
                 max_records: 1,
                 target_segment_bytes: 32,
             },
-            legacy_content_generation(),
+            no_content_generation(),
+            None,
             authority,
+            no_metadata(&mut refuse_loose),
         ),
         Err(CatalogError::RepackInventoryLimit { limit: 1 })
     ));
@@ -142,22 +250,37 @@ fn repack_inventory_limit_fails_before_publication() {
     );
 }
 
-fn write_catalog_record(
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn write_catalog_snapshot(
     directory: &std::path::Path,
-    record: &wheat_core::SegmentCatalogRecord,
+    snapshot: &wheat_core::PhysicalCatalogSnapshot,
 ) -> [u8; 32] {
-    let encoded = wheat_core::encode_segment_catalog_record(record).unwrap();
+    let encoded = wheat_core::encode_physical_catalog_snapshot(snapshot).unwrap();
     let digest = *blake3::hash(&encoded).as_bytes();
-    let digest_hex = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
     fs::write(
-        directory.join(format!("{}-{digest_hex}.catalog", record.generation)),
+        directory.join(format!(
+            "{}-{}.catalog",
+            snapshot.generation,
+            lower_hex(&digest)
+        )),
         encoded,
     )
     .unwrap();
     digest
+}
+
+/// The authoritative snapshot. Superseded snapshots are removed as soon as a
+/// new head is durable, so exactly one catalog publication must remain.
+fn head_snapshot(root: &std::path::Path) -> wheat_core::PhysicalCatalogSnapshot {
+    let catalogs = publication_names(root).1;
+    assert_eq!(catalogs.len(), 1, "{catalogs:?}");
+    wheat_core::decode_physical_catalog_snapshot(
+        &fs::read(root.join("catalog").join(&catalogs[0])).unwrap(),
+    )
+    .unwrap()
 }
 
 fn publication_names(root: &std::path::Path) -> (Vec<String>, Vec<String>) {
@@ -240,19 +363,13 @@ fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
     let first_pack_inode = fs::metadata(&first_pack).unwrap().ino();
     let first_pack_bytes = fs::read(&first_pack).unwrap();
     // Each following append rolls the preceding pack; the last remains mutable.
-    assert_eq!(
-        fs::read_dir(root.path().join("catalog")).unwrap().count(),
-        2
-    );
+    assert_eq!(head_snapshot(root.path()).segments.len(), 2);
     store.close().unwrap();
     assert_eq!(
         fs::read_dir(root.path().join("segments")).unwrap().count(),
         3
     );
-    assert_eq!(
-        fs::read_dir(root.path().join("catalog")).unwrap().count(),
-        3
-    );
+    assert_eq!(head_snapshot(root.path()).segments.len(), 3);
     assert_eq!(fs::metadata(&first_pack).unwrap().ino(), first_pack_inode);
     assert_eq!(fs::read(&first_pack).unwrap(), first_pack_bytes);
 }
@@ -351,9 +468,9 @@ fn active_locator_append_does_not_rewrite_existing_rows() {
 }
 
 #[test]
-fn legacy_immutable_only_store_is_preserved_and_gains_an_active_pack() {
+fn immutable_only_store_is_preserved_and_gains_an_active_pack() {
     let root = tempfile::tempdir().unwrap();
-    let old = record(b"legacy immutable");
+    let old = record(b"immutable only");
     {
         let mut store =
             PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
@@ -615,7 +732,7 @@ fn seal_errors_after_authority_publication_poison_writer_and_recover_on_reopen()
 }
 
 #[test]
-fn empty_active_without_head_recovers_but_nonempty_legacy_window_is_rejected() {
+fn empty_active_without_head_recovers_but_nonempty_unpublished_active_is_rejected() {
     let fresh = tempfile::tempdir().unwrap();
     {
         let _store = PackedCatalog::open(fresh.path(), crate::Durability::Durable).unwrap();
@@ -623,14 +740,15 @@ fn empty_active_without_head_recovers_but_nonempty_legacy_window_is_rejected() {
     fs::remove_file(fresh.path().join("active.head")).unwrap();
     let _reopened = PackedCatalog::open(fresh.path(), crate::Durability::Durable).unwrap();
 
-    let legacy = tempfile::tempdir().unwrap();
+    let unpublished = tempfile::tempdir().unwrap();
     let value = record(b"not published by a head");
     {
-        let mut store = PackedCatalog::open(legacy.path(), crate::Durability::Durable).unwrap();
+        let mut store =
+            PackedCatalog::open(unpublished.path(), crate::Durability::Durable).unwrap();
         store.put_records(&[value]).unwrap();
     }
-    fs::remove_file(legacy.path().join("active.head")).unwrap();
-    assert!(PackedCatalog::open(legacy.path(), crate::Durability::Durable).is_err());
+    fs::remove_file(unpublished.path().join("active.head")).unwrap();
+    assert!(PackedCatalog::open(unpublished.path(), crate::Durability::Durable).is_err());
 }
 
 #[test]
@@ -673,9 +791,9 @@ fn valid_sqlite_semantic_corruption_is_rebuilt_before_read_allocation() {
 }
 
 #[test]
-fn legacy_head_discovery_ignores_malformed_and_orphan_higher_generations() {
+fn head_discovery_ignores_malformed_and_orphan_higher_generations() {
     let root = tempfile::tempdir().unwrap();
-    let value = record(b"valid chain root");
+    let value = record(b"valid discovered head");
     {
         let mut store =
             PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
@@ -691,13 +809,20 @@ fn legacy_head_discovery_ignores_malformed_and_orphan_higher_generations() {
         b"garbage",
     )
     .unwrap();
-    let orphan = wheat_core::SegmentCatalogRecord {
-        generation: 8,
-        previous: None,
-        segment: [9; 32],
-        stored_length: 123,
-    };
-    write_catalog_record(&catalogs, &orphan);
+    // A well-formed snapshot whose segment is missing must not win discovery.
+    write_catalog_snapshot(
+        &catalogs,
+        &wheat_core::PhysicalCatalogSnapshot {
+            generation: 8,
+            segments: vec![wheat_core::PhysicalSegmentDescriptor {
+                generation: 8,
+                sequence: 0,
+                segment: [9; 32],
+                stored_length: 123,
+            }],
+            content: no_content_generation(),
+        },
+    );
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
     assert_value(&mut reopened, value);
@@ -721,30 +846,30 @@ fn reopen_removes_only_authenticated_canonical_publications_unreachable_from_hea
     let catalogs = root.path().join("catalog");
     let segment_bytes = fs::read(segments.join(&authoritative.0[0])).unwrap();
     let catalog_bytes = fs::read(catalogs.join(&authoritative.1[0])).unwrap();
-    let authority = wheat_core::decode_segment_catalog_record(&catalog_bytes).unwrap();
-    let head_digest = *blake3::hash(&catalog_bytes).as_bytes();
-    let segment_hex = authority
-        .segment
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let authority = wheat_core::decode_physical_catalog_snapshot(&catalog_bytes).unwrap();
+    let sealed = authority.segments[0].clone();
+    let segment_hex = lower_hex(&sealed.segment);
     for generation in [authority.generation + 1, authority.generation + 2] {
-        let orphan_segment = format!("{generation}-{segment_hex}.segment");
+        let orphan_segment = format!("{generation}-0-{segment_hex}.segment");
         fs::write(segments.join(&orphan_segment), &segment_bytes).unwrap();
-        write_catalog_record(
+        write_catalog_snapshot(
             &catalogs,
-            &wheat_core::SegmentCatalogRecord {
+            &wheat_core::PhysicalCatalogSnapshot {
                 generation,
-                previous: Some(head_digest),
-                segment: authority.segment,
-                stored_length: authority.stored_length,
+                segments: vec![wheat_core::PhysicalSegmentDescriptor {
+                    generation,
+                    ..sealed.clone()
+                }],
+                content: authority.content,
             },
         );
     }
     // Fail closed for names or contents which cannot be proven to be a
     // canonical, authenticated immutable publication.
     fs::write(segments.join("01-deadbeef.segment"), b"preserve").unwrap();
-    let malformed_segment = format!("99-{}.segment", "0".repeat(64));
+    let two_part_segment = format!("99-{}.segment", "0".repeat(64));
+    fs::write(segments.join(&two_part_segment), b"preserve").unwrap();
+    let malformed_segment = format!("99-0-{}.segment", "0".repeat(64));
     fs::write(segments.join(&malformed_segment), b"preserve").unwrap();
     fs::write(catalogs.join("garbage.catalog"), b"preserve").unwrap();
     let malformed_catalog = format!("99-{}.catalog", "0".repeat(64));
@@ -761,6 +886,7 @@ fn reopen_removes_only_authenticated_canonical_publications_unreachable_from_hea
                 authoritative.0[0].clone(),
                 "01-deadbeef.segment".into(),
                 malformed_segment.clone(),
+                two_part_segment.clone(),
             ]
         );
         assert_eq!(
@@ -820,7 +946,9 @@ fn authoritative_publication_survives_cleanup_after_head_commit() {
     }
     let authoritative = publication_names(root.path());
     assert_eq!(authoritative.0.len(), 2);
-    assert_eq!(authoritative.1.len(), 2);
+    // Only the head snapshot survives: each seal removes the one it supersedes.
+    assert_eq!(authoritative.1.len(), 1);
+    assert!(authoritative.1[0].starts_with("1-"));
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
     assert_value(&mut reopened, first);
@@ -830,18 +958,20 @@ fn authoritative_publication_survives_cleanup_after_head_commit() {
 }
 
 #[test]
-fn legacy_head_discovery_rejects_duplicate_valid_latest_generation() {
+fn head_discovery_rejects_duplicate_valid_latest_generation() {
     let root = tempfile::tempdir().unwrap();
     let catalogs = root.path().join("catalog");
     fs::create_dir_all(&catalogs).unwrap();
-    for segment in [[1; 32], [2; 32]] {
-        write_catalog_record(
+    for manifest in [[1; 32], [2; 32]] {
+        write_catalog_snapshot(
             &catalogs,
-            &wheat_core::SegmentCatalogRecord {
+            &wheat_core::PhysicalCatalogSnapshot {
                 generation: 0,
-                previous: None,
-                segment,
-                stored_length: 1,
+                segments: Vec::new(),
+                content: wheat_core::PhysicalContentGeneration {
+                    generation: 1,
+                    manifest,
+                },
             },
         );
     }
@@ -1003,4 +1133,152 @@ fn threshold_seal_publishes_once_repoints_one_source_and_bounds_counts() {
         fs::read_dir(root.path().join("catalog")).unwrap().count(),
         1
     );
+}
+
+/// `count` canonical content sets, newest (largest) first; set `k + 1` is set
+/// `k` minus one member, so each older set is a small delta of its successor.
+fn content_set_history(count: usize) -> Vec<([u8; 32], Vec<u8>)> {
+    (0..count)
+        .map(|age| {
+            let mut members = (0..200 - age)
+                .map(|index| wheat_core::ContentId::of(format!("member {index}").as_bytes()))
+                .collect::<Vec<_>>();
+            members.sort_unstable();
+            let bytes = wheat_core::content_set_snapshot_bytes(&members);
+            (
+                *wheat_core::ObjectId::of_canonical_bytes(&bytes).as_bytes(),
+                bytes,
+            )
+        })
+        .collect()
+}
+
+fn metadata_records(history: &[([u8; 32], Vec<u8>)]) -> Vec<SegmentRecord<'_>> {
+    let kind = wheat_core::SegmentIndexEntry::canonical_kind_code(
+        wheat_core::CanonicalObjectKind::ContentSetSnapshot,
+    );
+    history
+        .iter()
+        .map(|(digest, bytes)| SegmentRecord {
+            namespace: super::segment::METADATA_NAMESPACE,
+            kind,
+            digest: *digest,
+            bytes,
+        })
+        .collect()
+}
+
+/// Every older set deltas against the next newer one.
+fn history_bases(
+    history: &[([u8; 32], Vec<u8>)],
+) -> std::collections::BTreeMap<[u8; 32], [u8; 32]> {
+    history
+        .windows(2)
+        .map(|pair| (pair[1].0, pair[0].0))
+        .collect()
+}
+
+fn metadata_catalog(root: &std::path::Path, history: &[([u8; 32], Vec<u8>)]) -> PackedCatalog {
+    let mut store =
+        PackedCatalog::open_with_test_threshold(root, crate::Durability::Durable, 4).unwrap();
+    for record in metadata_records(history) {
+        store.put_records(&[record]).unwrap();
+    }
+    store
+}
+
+fn repack_history(
+    store: &mut PackedCatalog,
+    bases: &std::collections::BTreeMap<[u8; 32], [u8; 32]>,
+    target_segment_bytes: u64,
+) -> Result<CatalogRepackReport, CatalogError> {
+    let authority = store.physical_authority()?;
+    store.repack_structural(
+        CatalogRepackOptions {
+            max_records: 1_000,
+            target_segment_bytes,
+        },
+        no_content_generation(),
+        None,
+        authority,
+        MetadataRepackInput {
+            bases,
+            loose: &[],
+            read_loose: &mut refuse_loose,
+        },
+    )
+}
+
+fn assert_history(store: &mut PackedCatalog, history: &[([u8; 32], Vec<u8>)]) {
+    for record in metadata_records(history) {
+        assert_eq!(
+            store
+                .get(super::segment::METADATA_NAMESPACE, record.digest)
+                .unwrap()
+                .unwrap(),
+            (record.kind, record.bytes.to_vec())
+        );
+    }
+}
+
+#[test]
+fn a_full_segment_cuts_the_chain_and_stores_the_next_record_whole() {
+    let history = content_set_history(12);
+    let bases = history_bases(&history);
+
+    let uncut_root = tempfile::tempdir().unwrap();
+    let mut uncut = metadata_catalog(uncut_root.path(), &history);
+    let whole_chain = repack_history(&mut uncut, &bases, 1 << 20).unwrap();
+    assert_eq!(whole_chain.segments_after, 1);
+    assert_eq!(whole_chain.delta_records, 11);
+    assert_eq!(whole_chain.max_delta_depth, 11);
+
+    // Room for one whole set and a delta or two (each patch here is a few
+    // dozen bytes): the chain must be cut, and each cut costs one delta.
+    let root = tempfile::tempdir().unwrap();
+    let mut store = metadata_catalog(root.path(), &history);
+    let target = history[0].1.len() as u64 + 48;
+    let report = repack_history(&mut store, &bases, target).unwrap();
+    assert!(report.segments_after > 1, "{report:?}");
+    assert_eq!(
+        report.delta_records,
+        whole_chain.delta_records + 1 - report.segments_after as u64,
+        "every segment after the first starts whole: {report:?}"
+    );
+    assert_history(&mut store, &history);
+    drop(store);
+
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_history(&mut reopened, &history);
+    let second = repack_history(&mut reopened, &bases, target).unwrap();
+    assert!(second.no_op, "{second:?}");
+    assert_eq!(second.delta_records, report.delta_records);
+}
+
+#[test]
+fn interrupted_delta_repack_recovers_old_or_new_authority() {
+    let history = content_set_history(6);
+    let bases = history_bases(&history);
+    for failpoint in [RepackFailpoint::AfterIntent, RepackFailpoint::AfterHead] {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = metadata_catalog(root.path(), &history);
+        let head_before = fs::read(root.path().join("catalog.head")).unwrap();
+        store.test_set_repack_failpoint(failpoint);
+        assert!(repack_history(&mut store, &bases, 1 << 20).is_err());
+        drop(store);
+
+        let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        assert_history(&mut reopened, &history);
+        assert!(!root.path().join("repack.intent").exists());
+        assert_eq!(
+            fs::read(root.path().join("catalog.head")).unwrap() == head_before,
+            failpoint == RepackFailpoint::AfterIntent
+        );
+        // Whichever authority survived, finishing the repack converges on
+        // the same delta layout.
+        let finished = repack_history(&mut reopened, &bases, 1 << 20).unwrap();
+        assert_eq!(finished.no_op, failpoint == RepackFailpoint::AfterHead);
+        assert_eq!(finished.delta_records, 5);
+        assert_history(&mut reopened, &history);
+    }
 }

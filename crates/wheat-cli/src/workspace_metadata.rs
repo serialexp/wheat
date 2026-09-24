@@ -14,7 +14,6 @@ use wheat_store::RepositoryHead;
 const STORE_FORMAT: &str = "wheat-store";
 const WORKSPACE_FORMAT: &str = "wheat-workspace";
 const STORE_FORMAT_VERSION: u32 = 1;
-const LEGACY_WORKSPACE_FORMAT_VERSION: u32 = 3;
 const WORKSPACE_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -158,33 +157,8 @@ impl WorkspaceMetadata {
     pub(crate) fn read(root: &Path) -> Result<Self> {
         let path = root.join(".wheat/workspace.json");
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
-        let version = value
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .context("workspace metadata lacks a numeric version")?;
-        if version == u64::from(LEGACY_WORKSPACE_FORMAT_VERSION) {
-            let object = value
-                .as_object_mut()
-                .context("workspace metadata must be a JSON object")?;
-            object.insert(
-                "version".into(),
-                serde_json::Value::from(WORKSPACE_FORMAT_VERSION),
-            );
-            let workspace_id = object
-                .get("workspace_id")
-                .and_then(serde_json::Value::as_str)
-                .context("legacy workspace metadata lacks a workspace identity")?;
-            object.insert(
-                "registration_token".into(),
-                serde_json::Value::String(workspace_id.to_owned()),
-            );
-        } else if version != u64::from(WORKSPACE_FORMAT_VERSION) {
-            bail!("unsupported Wheat workspace metadata at {}", path.display());
-        }
         let metadata: Self =
-            serde_json::from_value(value).with_context(|| format!("decode {}", path.display()))?;
+            serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
         if metadata.format != WORKSPACE_FORMAT
             || metadata.version != WORKSPACE_FORMAT_VERSION
             || metadata.workspace_id.is_nil()

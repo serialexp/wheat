@@ -49,21 +49,6 @@ struct StoredHead {
     envelope: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyRemoteConfig {
-    url: String,
-    last_fetched_generation: u64,
-    last_fetched_envelope: String,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredRemoteConfig {
-    Versioned(VersionedRemoteConfig),
-    Legacy(LegacyRemoteConfig),
-}
-
 impl RemoteConfig {
     /// Build a remote config from a URL and head.
     ///
@@ -82,11 +67,6 @@ impl RemoteConfig {
             last_fetched_generation: head.generation,
             last_fetched_envelope: head.envelope.to_string(),
         })
-    }
-
-    #[cfg(test)]
-    fn canonical_identity(&self) -> &str {
-        &self.canonical_identity
     }
 
     /// Compare this config to a parsed remote by canonical identity.
@@ -150,51 +130,30 @@ impl RemoteConfig {
                 path.display()
             );
         }
-        let stored: StoredRemoteConfig =
+        let stored: VersionedRemoteConfig =
             serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?;
-
-        let config = match stored {
-            StoredRemoteConfig::Versioned(stored) => {
-                if stored.version != REMOTE_CONFIG_VERSION {
-                    bail!(
-                        "unsupported remote config version {} in {}",
-                        stored.version,
-                        path.display()
-                    );
-                }
-                let parsed = parse_wheat_url(&stored.display_url)
-                    .with_context(|| format!("invalid display URL in {}", path.display()))?;
-                if parsed.canonical_identity() != stored.canonical_identity {
-                    bail!(
-                        "canonical remote identity does not match display URL in {}",
-                        path.display()
-                    );
-                }
-                parse_head(stored.head.generation, &stored.head.envelope)?;
-                Self {
-                    url: stored.display_url,
-                    canonical_identity: stored.canonical_identity,
-                    last_fetched_generation: stored.head.generation,
-                    last_fetched_envelope: stored.head.envelope,
-                }
-            }
-            StoredRemoteConfig::Legacy(legacy) => {
-                let parsed = parse_wheat_url(&legacy.url)
-                    .with_context(|| format!("invalid legacy URL in {}", path.display()))?;
-                let head = parse_head(
-                    legacy.last_fetched_generation,
-                    &legacy.last_fetched_envelope,
-                )?;
-                Self {
-                    url: legacy.url,
-                    canonical_identity: parsed.canonical_identity().to_owned(),
-                    last_fetched_generation: head.generation,
-                    last_fetched_envelope: head.envelope.to_string(),
-                }
-            }
-        };
-
-        Ok(Some(config))
+        if stored.version != REMOTE_CONFIG_VERSION {
+            bail!(
+                "unsupported remote config version {} in {}",
+                stored.version,
+                path.display()
+            );
+        }
+        let parsed = parse_wheat_url(&stored.display_url)
+            .with_context(|| format!("invalid display URL in {}", path.display()))?;
+        if parsed.canonical_identity() != stored.canonical_identity {
+            bail!(
+                "canonical remote identity does not match display URL in {}",
+                path.display()
+            );
+        }
+        parse_head(stored.head.generation, &stored.head.envelope)?;
+        Ok(Some(Self {
+            url: stored.display_url,
+            canonical_identity: stored.canonical_identity,
+            last_fetched_generation: stored.head.generation,
+            last_fetched_envelope: stored.head.envelope,
+        }))
     }
 
     /// Atomically and durably replace `remote.json`.
@@ -295,30 +254,19 @@ mod tests {
     }
 
     #[test]
-    fn safely_migrates_strict_legacy_shape_on_write() {
+    fn rejects_unversioned_shape() {
         let directory = tempfile::tempdir().unwrap();
-        let legacy = serde_json::json!({
-            "url": "wheat://EXAMPLE.com/Owner/Repo",
+        let unversioned = serde_json::json!({
+            "url": "wheat://example.com/Owner/Repo",
             "last_fetched_generation": 3,
             "last_fetched_envelope": head(3).envelope.to_string(),
         });
         fs::write(
             directory.path().join("remote.json"),
-            serde_json::to_vec(&legacy).unwrap(),
+            serde_json::to_vec(&unversioned).unwrap(),
         )
         .unwrap();
-
-        let loaded = RemoteConfig::read(directory.path()).unwrap().unwrap();
-        assert_eq!(
-            loaded.canonical_identity(),
-            "wheat://example.com/Owner/Repo"
-        );
-        loaded.write(directory.path()).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(directory.path().join("remote.json")).unwrap())
-                .unwrap();
-        assert_eq!(value["version"], 1);
-        assert!(value.get("last_fetched_generation").is_none());
+        assert!(RemoteConfig::read(directory.path()).is_err());
     }
 
     #[test]

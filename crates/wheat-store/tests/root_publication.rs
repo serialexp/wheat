@@ -154,7 +154,10 @@ async fn reopen_and_publish_only_persisted_roots_without_repository() {
 
 #[tokio::test]
 async fn conflicted_history_retains_conflict_terms_and_rejects_incomplete_aggregate() {
-    use wheat_core::{ContentManifestRecord, build_content_set, decode_repository_state_record};
+    use wheat_core::{
+        ContentManifestRecord, ContentSetId, content_set_snapshot_bytes,
+        decode_repository_state_record,
+    };
     let dir = tempfile::tempdir().unwrap();
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
@@ -205,16 +208,14 @@ async fn conflicted_history_retains_conflict_terms_and_rejects_incomplete_aggreg
     reader.validate_complete(closure.state.id).await.unwrap();
     let initial = publisher.initialize_root(closure.state.id).await.unwrap();
     let mut state = decode_repository_state_record(&closure.state.canonical_bytes()).unwrap();
-    let mut emitted = Vec::new();
-    let incomplete = build_content_set([ContentId::of(b"base"), ContentId::of(b"a2")], |o| {
-        emitted.push(o)
-    });
-    for object in emitted {
-        objects
-            .put_if_absent(object.id, &object.bytes)
-            .await
-            .unwrap();
-    }
+    let mut members = [ContentId::of(b"base"), ContentId::of(b"a2")];
+    members.sort();
+    let incomplete_bytes = content_set_snapshot_bytes(&members);
+    let incomplete = ContentSetId::of_canonical_bytes(&incomplete_bytes);
+    objects
+        .put_if_absent(incomplete.into(), &incomplete_bytes)
+        .await
+        .unwrap();
     let manifest = ContentManifestRecord {
         content: incomplete,
     };

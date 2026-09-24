@@ -11,12 +11,19 @@ mod commit_content;
 mod commit_writer;
 mod content_batch;
 pub use content_batch::ContentWriteBatch;
+mod content_generation;
+pub use content_generation::{
+    CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationEntry, ContentGenerationIndex,
+    ContentGenerationManifest, ContentGenerationShardRef, content_generation_index_path,
+    content_generation_shard_manifest_path, content_generation_shard_pack_path,
+    read_content_generation, read_content_generation_index,
+};
 mod content_repack;
+mod content_set;
 pub use content_repack::{
-    ContentGenerationEntry, ContentGenerationManifest, ContentGenerationTarget,
-    ContentRepackAnalysis, ContentRepackError, ContentRepackInput, ContentRepackLimits,
-    ContentRepackPlan, GenerationQualifiedEnvelope, PreparedContentGeneration, plan_content_repack,
-    prepare_content_repack, publish_content_repack,
+    ContentGenerationTarget, ContentRepackAnalysis, ContentRepackError, ContentRepackInput,
+    ContentRepackLimits, ContentRepackPlan, GenerationQualifiedEnvelope, PreparedContentGeneration,
+    plan_content_repack, prepare_content_repack, publish_content_repack,
 };
 mod codec;
 mod content_io;
@@ -24,6 +31,7 @@ mod delta;
 mod durability;
 mod loose;
 mod merkle_tree;
+mod metadata_repack;
 mod mutation_publication;
 mod object_store_adapter;
 mod ownership;
@@ -72,14 +80,15 @@ pub use change_map::{
 };
 pub use closure::collect_structural_closure;
 pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
+pub use content_set::{ContentSetCursor, ContentSetDelta, ContentSetStore};
 pub use durability::{Durability, sync_directory, sync_filesystem};
 pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };
 pub use merkle_tree::{
-    MerkleTreeError, MerkleTreeStore, TreeContentCursor, TreeContentWalkLimits, TreeDiff,
-    TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile, TreePathLimits, TreePathSelection,
-    TreeSelectionLimits, TreeWalkLimits,
+    FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, TreeContentCursor,
+    TreeContentWalkLimits, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
+    TreePathLimits, TreePathSelection, TreeSelectionLimits, TreeWalkLimits,
 };
 pub use mutation_publication::{
     PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,
@@ -101,9 +110,8 @@ pub use revision_map::{
     RevisionMapCursor, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore,
 };
 pub use sets::{
-    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetDelta,
-    ContentSetDeltaLimits, ContentSetStore, RetainedSetCursor, RetainedSetDelta,
-    RetainedSetDeltaLimits, RetainedSetStore,
+    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetDeltaLimits, RetainedSetCursor,
+    RetainedSetDelta, RetainedSetDeltaLimits, RetainedSetStore,
 };
 pub use view_lineage::{
     ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,
@@ -132,9 +140,14 @@ pub mod packed_segment_reader {
         pub namespace: u8,
         pub kind: u16,
         pub codec: u8,
+        pub digest: [u8; 32],
         pub offset: u64,
         pub logical_length: u64,
         pub stored_length: u64,
+        /// In-segment delta base, for metadata stored as a delta.
+        pub delta_base: Option<[u8; 32]>,
+        /// Links to the chain's whole record; 0 for whole entries.
+        pub delta_depth: u8,
     }
 
     impl AuthenticatedSegment {
@@ -147,11 +160,32 @@ pub mod packed_segment_reader {
                     namespace: e.namespace,
                     kind: e.kind,
                     codec: e.codec,
+                    digest: e.digest,
                     offset: e.offset,
                     logical_length: e.logical_length,
                     stored_length: e.stored_length,
+                    delta_base: e.delta_base,
+                    delta_depth: e.delta_depth,
                 })
                 .collect()
+        }
+
+        /// Reads and verifies one indexed payload, bounded before allocation.
+        pub fn read_entry_bounded(
+            &mut self,
+            namespace: u8,
+            digest: [u8; 32],
+            max: usize,
+        ) -> Result<Option<Vec<u8>>, String> {
+            self.reader
+                .lookup_entry_bounded(namespace, digest, max)
+                .map(|entry| entry.map(|(_, payload)| payload))
+                .map_err(|error| error.to_string())
+        }
+
+        /// Releases decompressed shared-block scratch during bounded traversals.
+        pub fn clear_block_cache(&mut self) {
+            self.reader.clear_block_cache();
         }
     }
 

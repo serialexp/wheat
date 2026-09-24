@@ -375,7 +375,10 @@ mod tests {
     impl ImmutableObjectStore for CountingStore {
         async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
             let object = self.inner.get(id).await?;
-            if object.kind == ObjectKind::ContentSetNode {
+            if matches!(
+                object.kind,
+                ObjectKind::ContentSetSnapshot | ObjectKind::ContentSetDelta
+            ) {
                 self.content_reads.fetch_add(1, Ordering::Relaxed);
             }
             Ok(object)
@@ -427,7 +430,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_manifest_subtrees_are_authenticated_once_per_path() {
+    async fn each_manifest_content_set_is_read_once() {
+        const MANIFESTS: usize = 40;
         let objects = CountingStore {
             inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), "shared-manifests"),
             content_reads: AtomicUsize::new(0),
@@ -447,7 +451,7 @@ mod tests {
             .await
             .unwrap();
         let mut accumulator = ContentAccumulator::new().unwrap();
-        for index in 0..40_u8 {
+        for index in 0..MANIFESTS as u8 {
             let mut bytes = [index; 32];
             bytes[0] = index.wrapping_add(32);
             let root = sets
@@ -465,9 +469,11 @@ mod tests {
         for id in common {
             assert!(sets.contains(actual, id).await.unwrap());
         }
+        // Each manifest's content set is read once; a shared delta base may
+        // add one more read, but never one per manifest.
         assert!(
-            reads < 700,
-            "shared authenticated subtrees must not be reread once per manifest: {reads} reads"
+            reads <= MANIFESTS + 1,
+            "content sets must be read once per manifest: {reads} reads for {MANIFESTS} manifests"
         );
     }
 }

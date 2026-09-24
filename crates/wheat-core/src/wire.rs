@@ -6,11 +6,11 @@ use wheat_binschema::generated as wire;
 use crate::{
     Actor, Application, ApplicationMapChild, ApplicationMapNode, ApplicationResult, Change,
     ChangeId, ChangeMapChild, ChangeMapNode, ChangeMetadata, ChangeRevision, Conflict,
-    ConflictSetChild, ConflictSetNode, ContentId, ContentManifestId, ContentSetChild,
-    ContentSetNode, DirectoryEntry, DirectoryNode, EditOperation, EditRecord, FileKind, FileValue,
-    RepositoryState, RepositoryView, RetainedSetChild, RetainedSetNode, RevisionId,
-    RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId,
-    ViewLineageMapChild, ViewLineageMapNode,
+    ConflictSetChild, ConflictSetNode, ContentId, ContentManifestId, DirectoryEntry, DirectoryNode,
+    EditOperation, EditRecord, FileKind, FileValue, RepositoryState, RepositoryView,
+    RetainedSetChild, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapNode,
+    RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId, ViewLineageMapChild,
+    ViewLineageMapNode,
 };
 
 const BLAKE3_256: u8 = 1;
@@ -53,7 +53,6 @@ pub enum CanonicalObjectKind {
     ChangeMapNode,
     ApplicationMapNode,
     ConflictSetNode,
-    ContentSetNode,
     ContentSetSnapshot,
     ContentSetDelta,
     RetainedSetNode,
@@ -152,7 +151,7 @@ pub fn decode_repository_state_record(
     bytes: &[u8],
 ) -> Result<crate::RepositoryStateRecord, CanonicalObjectError> {
     let object = decode_validated(bytes)?;
-    let wire::WheatObject::RepositoryStateV3(v) = object else {
+    let wire::WheatObject::RepositoryStateV1(v) = object else {
         return Err(CanonicalObjectError::WrongKind {
             expected: CanonicalObjectKind::RepositoryState,
             actual: object_kind(&object),
@@ -462,14 +461,6 @@ decode_set_node!(
     crate::ConflictSetId
 );
 decode_set_node!(
-    decode_content_set_node,
-    ContentSetNodeV1,
-    ContentSetNode,
-    ContentSetNode,
-    ContentSetChild,
-    crate::ContentSetId
-);
-decode_set_node!(
     decode_retained_set_node,
     RetainedSetNodeV1,
     RetainedSetNode,
@@ -657,21 +648,6 @@ pub(crate) fn validate_conflict_set_node(
         "conflict set node",
     )
 }
-pub(crate) fn validate_content_set_node(node: &ContentSetNode) -> Result<(), CanonicalObjectError> {
-    let entry_first_bytes: Vec<u8> = node
-        .entries
-        .iter()
-        .filter_map(|suffix| suffix.first().copied())
-        .collect();
-    validate_radix_node(
-        &node.prefix,
-        node.present,
-        &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
-        &entry_first_bytes,
-        32,
-        "content set node",
-    )
-}
 pub(crate) fn validate_retained_set_node(
     node: &RetainedSetNode,
 ) -> Result<(), CanonicalObjectError> {
@@ -783,15 +759,6 @@ set_node_bytes!(
     ConflictSetChildV1,
     conflict_set_id,
     ConflictSetNode
-);
-set_node_bytes!(
-    content_set_node_bytes,
-    validate_content_set_node,
-    ContentSetNodeV1,
-    ContentSetNodeV1Input,
-    ContentSetChildV1,
-    content_set_id,
-    ContentSetNode
 );
 set_node_bytes!(
     retained_set_node_bytes,
@@ -944,7 +911,7 @@ pub enum ContentSetBlob {
     },
 }
 
-/// Decode a content set blob (snapshot, delta, or legacy radix node).
+/// Decode a content set blob (snapshot or delta).
 ///
 /// Returns `Err` if the bytes don't decode as any content set type.
 pub fn decode_content_set_blob(bytes: &[u8]) -> Result<ContentSetBlob, CanonicalObjectError> {
@@ -1189,8 +1156,8 @@ pub(crate) fn repository_envelope_record_bytes(
 }
 
 pub(crate) fn repository_state_record_bytes(record: &crate::RepositoryStateRecord) -> Vec<u8> {
-    encode(wire::WheatObject::RepositoryStateV3(
-        wire::RepositoryStateV3Input {
+    encode(wire::WheatObject::RepositoryStateV1(
+        wire::RepositoryStateV1Input {
             base_view: view_id(record.base_view),
             changes: change_map_id(record.changes),
             view_lineage: view_lineage_map_id(record.view_lineage),
@@ -1474,21 +1441,6 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "conflict set node",
             )?;
         }
-        wire::WheatObject::ContentSetNodeV1(node) => {
-            let efb: Vec<u8> = node
-                .entries
-                .iter()
-                .filter_map(|e| e.suffix.first().copied())
-                .collect();
-            validate_radix_node(
-                &node.prefix,
-                node.present,
-                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
-                &efb,
-                32,
-                "content set node",
-            )?;
-        }
         wire::WheatObject::ContentSetSnapshotV1(snapshot) => {
             validate_sorted_unique_by(
                 &snapshot.members,
@@ -1557,7 +1509,7 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "view lineage map node",
             )?;
         }
-        wire::WheatObject::RepositoryStateV3(_) | wire::WheatObject::RepositoryEnvelopeV1(_) => {}
+        wire::WheatObject::RepositoryStateV1(_) | wire::WheatObject::RepositoryEnvelopeV1(_) => {}
         wire::WheatObject::ViewLabelManifestV1(manifest) => {
             validate_sorted_unique_by(
                 &manifest.labels,
@@ -1587,14 +1539,13 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ConflictV1(_) => CanonicalObjectKind::Conflict,
         wire::WheatObject::ViewV1(_) => CanonicalObjectKind::View,
         wire::WheatObject::ContentManifestV1(_) => CanonicalObjectKind::ContentManifest,
-        wire::WheatObject::RepositoryStateV3(_) => CanonicalObjectKind::RepositoryState,
+        wire::WheatObject::RepositoryStateV1(_) => CanonicalObjectKind::RepositoryState,
         wire::WheatObject::ViewLabelManifestV1(_) => CanonicalObjectKind::ViewLabelManifest,
         wire::WheatObject::RepositoryEnvelopeV1(_) => CanonicalObjectKind::RepositoryEnvelope,
         wire::WheatObject::RevisionMapNodeV1(_) => CanonicalObjectKind::RevisionMapNode,
         wire::WheatObject::ChangeMapNodeV1(_) => CanonicalObjectKind::ChangeMapNode,
         wire::WheatObject::ApplicationMapNodeV1(_) => CanonicalObjectKind::ApplicationMapNode,
         wire::WheatObject::ConflictSetNodeV1(_) => CanonicalObjectKind::ConflictSetNode,
-        wire::WheatObject::ContentSetNodeV1(_) => CanonicalObjectKind::ContentSetNode,
         wire::WheatObject::ContentSetSnapshotV1(_) => CanonicalObjectKind::ContentSetSnapshot,
         wire::WheatObject::ContentSetDeltaV1(_) => CanonicalObjectKind::ContentSetDelta,
         wire::WheatObject::RetainedSetNodeV1(_) => CanonicalObjectKind::RetainedSetNode,
@@ -1953,7 +1904,7 @@ pub fn extract_object_references(
                 &env.labels.digest,
             )?));
         }
-        wire::WheatObject::RepositoryStateV3(state) => {
+        wire::WheatObject::RepositoryStateV1(state) => {
             refs.push(crate::ObjectId::from_digest(digest_domain(
                 &state.base_view.digest,
             )?));
@@ -2134,13 +2085,6 @@ pub fn extract_object_references(
                 )?));
             }
         }
-        wire::WheatObject::ContentSetNodeV1(node) => {
-            for child in &node.children {
-                refs.push(crate::ObjectId::from_digest(digest_domain(
-                    &child.child.digest,
-                )?));
-            }
-        }
         // Snapshot has no object references — members are ContentIds, not ObjectIds.
         wire::WheatObject::ContentSetSnapshotV1(_) => {}
         // Delta references its base ContentSetId as a structural object.
@@ -2168,7 +2112,9 @@ fn encode(object: wire::WheatObject) -> Vec<u8> {
     let bytes = object
         .encode()
         .expect("validated Wheat domain values must encode");
-    debug_assert!(validate_canonical_object(&bytes).is_ok());
+    if let Err(error) = validate_canonical_object(&bytes) {
+        panic!("validated Wheat domain values must encode canonically: {error:?}");
+    }
     bytes
 }
 

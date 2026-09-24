@@ -52,20 +52,40 @@ pub(crate) fn compute_delta(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
 ///
 /// The `patch` must be a complete delta payload: base_size varint +
 /// result_size varint + copy/insert instructions. This is the format
-/// produced by `compute_delta` / `gunnar_delta::delta`.
+/// produced by `compute_delta` / `gunnar_delta::delta`. The result-size header
+/// must match the authenticated envelope's `expected_result_size` and fit
+/// within `max_result_size`; both are checked before allocating the target.
 ///
 /// Inlined from `gix_pack::data::delta::apply` (gix-pack 0.74.2,
 /// `src/data/delta.rs`) which is `pub(crate)` and not part of the public API.
-pub(crate) fn apply_delta(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, DeltaError> {
+pub(crate) fn apply_delta(
+    base: &[u8],
+    patch: &[u8],
+    expected_result_size: usize,
+    max_result_size: usize,
+) -> Result<Vec<u8>, DeltaError> {
     let (base_size, consumed) = decode_header_size(patch)?;
-    if base_size as usize != base.len() {
+    let base_size = usize::try_from(base_size)
+        .map_err(|_| DeltaError::Corrupt("delta base size does not fit in usize"))?;
+    if base_size != base.len() {
         return Err(DeltaError::Corrupt(
             "delta base size header does not match actual base",
         ));
     }
     let patch = &patch[consumed..];
     let (result_size, consumed) = decode_header_size(patch)?;
-    let result_size = result_size as usize;
+    let result_size = usize::try_from(result_size)
+        .map_err(|_| DeltaError::Corrupt("delta result size does not fit in usize"))?;
+    if result_size != expected_result_size {
+        return Err(DeltaError::Corrupt(
+            "delta result size header does not match envelope logical length",
+        ));
+    }
+    if result_size > max_result_size {
+        return Err(DeltaError::Corrupt(
+            "delta result size exceeds allowed limit",
+        ));
+    }
     let data = &patch[consumed..];
 
     let mut target = vec![0u8; result_size];
@@ -82,17 +102,17 @@ fn decode_header_size(d: &[u8]) -> Result<(u64, usize), DeltaError> {
     let mut size = 0u64;
     let mut consumed = 0;
     for cmd in d.iter() {
-        if shift >= u64::BITS {
+        if shift >= u64::BITS || (shift == 63 && cmd & 0x7e != 0) {
             return Err(DeltaError::Corrupt(
                 "delta header size uses more bits than fit into u64",
             ));
         }
         consumed += 1;
         size |= (u64::from(*cmd) & 0x7f) << shift;
-        shift += 7;
         if *cmd & 0x80 == 0 {
             return Ok((size, consumed));
         }
+        shift += 7;
     }
     Err(DeltaError::Corrupt("delta header size is truncated"))
 }
@@ -199,7 +219,7 @@ mod tests {
             "delta should be smaller than target"
         );
 
-        let reconstructed = apply_delta(&base, &patch).unwrap();
+        let reconstructed = apply_delta(&base, &patch, target.len(), target.len()).unwrap();
         assert_eq!(reconstructed, target);
     }
 
@@ -231,14 +251,41 @@ mod tests {
         // If we got a patch, try applying it with wrong base
         if let Some(patch) = patch {
             let wrong_base = b"wrong";
-            assert!(apply_delta(wrong_base, &patch).is_err());
+            assert!(apply_delta(wrong_base, &patch, target.len(), target.len()).is_err());
         }
     }
 
     #[test]
     fn apply_detects_truncated_patch() {
-        assert!(apply_delta(b"base", &[]).is_err());
-        assert!(apply_delta(b"base", &[0x80]).is_err()); // truncated varint
+        assert!(apply_delta(b"base", &[], 0, 0).is_err());
+        assert!(apply_delta(b"base", &[0x80], 0, 0).is_err()); // truncated base varint
+        assert!(apply_delta(b"base", &[4, 0x80], 0, 0).is_err()); // truncated result varint
+    }
+
+    #[test]
+    fn apply_rejects_varint_overflow_and_oversized_results_before_allocating() {
+        let overflow = [0x84, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert!(apply_delta(b"base", &overflow, 0, 0).is_err());
+        let continued = [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0,
+        ];
+        assert!(apply_delta(b"base", &continued, 0, 0).is_err());
+
+        // base size 4, result size u64::MAX, no instructions. The authenticated
+        // envelope size and caller limit reject this before any result allocation.
+        let mut huge = vec![4];
+        huge.extend([0xff; 9]);
+        huge.push(0x01);
+        assert!(apply_delta(b"base", &huge, 1, 1).is_err());
+    }
+
+    #[test]
+    fn apply_rejects_envelope_mismatch_and_request_limit() {
+        // Copy all four base bytes: base-size 4, result-size 4, copy command.
+        let patch = [4, 4, 0x90, 4];
+        assert!(apply_delta(b"base", &patch, 3, 4).is_err());
+        assert!(apply_delta(b"base", &patch, 4, 3).is_err());
+        assert_eq!(apply_delta(b"base", &patch, 4, 4).unwrap(), b"base");
     }
 
     #[test]
@@ -263,7 +310,8 @@ mod tests {
             "delta should be much smaller than target for a one-line change"
         );
 
-        let reconstructed = apply_delta(base_bytes, &patch).unwrap();
+        let reconstructed =
+            apply_delta(base_bytes, &patch, target_bytes.len(), target_bytes.len()).unwrap();
         assert_eq!(reconstructed, target_bytes);
     }
 }

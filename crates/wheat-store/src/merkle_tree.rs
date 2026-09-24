@@ -47,6 +47,14 @@ pub enum MerkleTreeError {
     NonCanonicalSelectors,
     #[error("tree selector {0:?} is absent")]
     MissingSelector(String),
+    #[error("tree update contains more than {limit} edits")]
+    EditLimitExceeded { limit: usize },
+    #[error("tree update paths contain more than {limit} components")]
+    EditComponentLimitExceeded { limit: usize },
+    #[error("tree update paths contain {size} bytes, exceeding the {limit}-byte limit")]
+    EditPathBytesExceeded { size: usize, limit: usize },
+    #[error("tree update stages {size} node bytes, exceeding the {limit}-byte limit")]
+    StagedNodeBytesExceeded { size: usize, limit: usize },
 }
 
 /// Resource bounds for a complete Merkle tree walk.
@@ -200,6 +208,35 @@ pub struct TreeEdit {
     pub path: Vec<String>,
     pub value: Option<FileValue>,
 }
+
+/// Resource bounds for one atomic final-tree update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalTreeUpdateLimits {
+    pub max_edits: usize,
+    pub max_path_components: usize,
+    pub max_path_bytes: usize,
+    pub max_depth: usize,
+    pub max_nodes: usize,
+    pub max_node_bytes: usize,
+    pub max_total_node_bytes: usize,
+}
+
+impl Default for FinalTreeUpdateLimits {
+    fn default() -> Self {
+        Self {
+            max_edits: 250_000,
+            max_path_components: 1_000_000,
+            max_path_bytes: 64 * 1024 * 1024,
+            max_depth: 128,
+            max_nodes: 250_000,
+            max_node_bytes: 16 * 1024 * 1024,
+            max_total_node_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+#[path = "merkle_tree/final_update.rs"]
+mod final_update;
 
 pub struct MerkleTreeStore<'a, S> {
     objects: &'a S,
@@ -1036,6 +1073,29 @@ where
             }
         }
         self.write_node(&root_node).await
+    }
+
+    /// Apply mixed deletions and insertions as one final-tree update.
+    ///
+    /// Unlike [`Self::apply_edits`], this accepts the paired edits needed for a
+    /// file/directory shape transition. It persists only final nodes, never a
+    /// deletion-only intermediate tree.
+    pub async fn apply_final_edits(
+        &self,
+        root: TreeId,
+        edits: &[TreeEdit],
+    ) -> Result<TreeId, MerkleTreeError> {
+        self.apply_final_edits_with_limits(root, edits, FinalTreeUpdateLimits::default())
+            .await
+    }
+
+    pub async fn apply_final_edits_with_limits(
+        &self,
+        root: TreeId,
+        edits: &[TreeEdit],
+        limits: FinalTreeUpdateLimits,
+    ) -> Result<TreeId, MerkleTreeError> {
+        final_update::apply(self, root, edits, limits).await
     }
 
     /// Stream file values without allocating or retaining full path strings.

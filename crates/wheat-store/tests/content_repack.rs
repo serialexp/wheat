@@ -2,10 +2,32 @@ use std::sync::Mutex;
 
 use wheat_core::ContentId;
 use wheat_store::{
+    CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationEntry, ContentGenerationIndex,
     ContentGenerationManifest, ContentGenerationTarget, ContentRepackInput, ContentRepackLimits,
     ContentRepackPlan, ContentStore, Durability, PreparedContentGeneration, plan_content_repack,
     prepare_content_repack, publish_content_repack,
 };
+
+/// Encode a generation to its index and shard manifests, then decode it back.
+fn round_trip(manifest: &ContentGenerationManifest) -> ContentGenerationManifest {
+    let index = manifest.index().unwrap().encoded().unwrap();
+    let shards = (0..manifest.shard_count())
+        .map(|shard| manifest.encode_shard(shard).unwrap())
+        .collect::<Vec<_>>();
+    ContentGenerationManifest::decode(&index, |shard| Ok(shards[shard].clone())).unwrap()
+}
+
+/// `index` with shard `shard` re-pointed at `forged`, so decoding reaches the
+/// checks behind the digest.
+fn forge_shard(
+    index: &ContentGenerationIndex,
+    shard: usize,
+    forged: &[u8],
+) -> ContentGenerationIndex {
+    let mut index = index.clone();
+    index.shards[shard].manifest = *blake3::hash(forged).as_bytes();
+    index
+}
 
 fn version(n: usize) -> Vec<u8> {
     let mut bytes = (0..8 * 1024)
@@ -52,9 +74,7 @@ fn reverse_plan_preserves_inventory_and_forces_every_tip_full() {
         assert_eq!(entry.delta_depth, 0);
     }
     prepared.manifest.verify().unwrap();
-    let serialized = serde_json::to_vec(&prepared.manifest).unwrap();
-    let decoded: ContentGenerationManifest = serde_json::from_slice(&serialized).unwrap();
-    assert_eq!(decoded, prepared.manifest);
+    assert_eq!(round_trip(&prepared.manifest), prepared.manifest);
     let orphan_entry = prepared
         .manifest
         .entries
@@ -62,6 +82,169 @@ fn reverse_plan_preserves_inventory_and_forces_every_tip_full() {
         .find(|entry| entry.id == orphan)
         .unwrap();
     assert_eq!(orphan_entry.delta_base, None);
+}
+
+#[test]
+fn binary_index_and_shard_reject_oversized_counts_and_noncanonical_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = ContentStore::new(dir.path());
+    let id = source.put(b"binary manifest").unwrap();
+    let ContentRepackPlan::Replace(prepared) = plan_content_repack(
+        &source,
+        None,
+        ContentRepackInput {
+            content_ids: vec![id],
+            lineages_newest_first: vec![],
+        },
+        ContentRepackLimits::default(),
+    )
+    .unwrap() else {
+        panic!("first plan cannot be a no-op");
+    };
+    let manifest = prepared.manifest;
+    let index = manifest.index().unwrap();
+    let encoded_index = index.encoded().unwrap();
+    let shard = manifest.encode_shard(0).unwrap();
+    assert_eq!(&encoded_index[..4], b"WHCM");
+    assert_eq!(&encoded_index[4..6], &1_u16.to_be_bytes());
+    assert_eq!(&shard[..4], b"WHCS");
+    assert_eq!(&shard[4..6], &1_u16.to_be_bytes());
+    assert_eq!(
+        ContentGenerationIndex::decode(&encoded_index).unwrap(),
+        index
+    );
+    assert_eq!(round_trip(&manifest), manifest);
+
+    let malformed = |bytes: &[u8], edit: &dyn Fn(&mut Vec<u8>)| {
+        let mut bytes = bytes.to_vec();
+        edit(&mut bytes);
+        bytes
+    };
+    // Index header: magic, version, generation, entry count (u64), then the
+    // u32 shard count at 22..26.
+    for (label, bytes) in [
+        ("JSON", br#"{\"generation\":1}"#.to_vec()),
+        (
+            "wrong magic",
+            malformed(&encoded_index, &|b| b[..4].copy_from_slice(b"JSON")),
+        ),
+        (
+            "wrong version",
+            malformed(&encoded_index, &|b| {
+                b[4..6].copy_from_slice(&2_u16.to_be_bytes())
+            }),
+        ),
+        (
+            "forged shard count",
+            malformed(&encoded_index, &|b| {
+                b[22..26].copy_from_slice(&u32::MAX.to_be_bytes())
+            }),
+        ),
+        (
+            "entry count disagrees with shards",
+            malformed(&encoded_index, &|b| {
+                b[14..22].copy_from_slice(&2_u64.to_be_bytes())
+            }),
+        ),
+        ("trailing byte", malformed(&encoded_index, &|b| b.push(0))),
+    ] {
+        assert!(
+            ContentGenerationIndex::decode(&bytes).is_err(),
+            "index {label}"
+        );
+    }
+    // Shard header: magic, version, generation, shard number, then the u32
+    // entry count at 18..22.
+    for (label, bytes) in [
+        (
+            "wrong magic",
+            malformed(&shard, &|b| b[..4].copy_from_slice(b"WHCM")),
+        ),
+        (
+            "wrong version",
+            malformed(&shard, &|b| b[4..6].copy_from_slice(&2_u16.to_be_bytes())),
+        ),
+        (
+            "more entries than a shard holds",
+            malformed(&shard, &|b| {
+                b[18..22]
+                    .copy_from_slice(&(CONTENT_GENERATION_SHARD_ENTRIES as u32 + 1).to_be_bytes())
+            }),
+        ),
+        ("trailing byte", malformed(&shard, &|b| b.push(0))),
+    ] {
+        assert!(
+            wheat_core::decode_content_generation_shard(&bytes).is_err(),
+            "shard {label}"
+        );
+        assert!(
+            forge_shard(&index, 0, &bytes)
+                .decode_shard(0, &bytes)
+                .is_err(),
+            "shard {label}"
+        );
+    }
+    // Any change to a shard is caught by the digest the index names.
+    assert!(
+        index
+            .decode_shard(0, &malformed(&shard, &|b| *b.last_mut().unwrap() ^= 1))
+            .unwrap_err()
+            .to_string()
+            .contains("digest")
+    );
+
+    // Shard header is 22 bytes; a ContentId starts with its algorithm discriminator.
+    let wrong_algorithm = malformed(&shard, &|b| b[22] = 2);
+    assert!(
+        forge_shard(&index, 0, &wrong_algorithm)
+            .decode_shard(0, &wrong_algorithm)
+            .unwrap_err()
+            .to_string()
+            .contains("content-id algorithm")
+    );
+
+    // The sole entry's optional-base discriminator follows the fixed 33-byte
+    // ContentId, digest, and three u64 fields. Claim a base then cut its ID.
+    let truncated_optional_base = malformed(&shard, &|b| {
+        b[22 + 33 + 32 + 24] = 1;
+        b.truncate(22 + 33 + 32 + 24 + 1);
+    });
+    assert!(wheat_core::decode_content_generation_shard(&truncated_optional_base).is_err());
+}
+
+#[test]
+fn shard_decoding_rejects_noncanonical_entry_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = ContentStore::new(dir.path());
+    let first = source.put(b"first binary manifest entry").unwrap();
+    let second = source.put(b"second binary manifest entry").unwrap();
+    let ContentRepackPlan::Replace(prepared) = plan_content_repack(
+        &source,
+        None,
+        ContentRepackInput {
+            content_ids: vec![first, second],
+            lineages_newest_first: vec![],
+        },
+        ContentRepackLimits::default(),
+    )
+    .unwrap() else {
+        panic!("first plan cannot be a no-op");
+    };
+    let index = prepared.manifest.index().unwrap();
+    let mut encoded = prepared.manifest.encode_shard(0).unwrap();
+    // Entries are fixed-width here because neither has a delta base. Exchange
+    // their complete ContentIds, retaining a generated-canonical byte shape.
+    const HEADER: usize = 22;
+    const ENTRY_SIZE: usize = 91;
+    let (before_second, second_and_after) = encoded.split_at_mut(HEADER + ENTRY_SIZE);
+    before_second[HEADER..HEADER + 33].swap_with_slice(&mut second_and_after[..33]);
+    let error = forge_shard(&index, 0, &encoded)
+        .decode_shard(0, &encoded)
+        .unwrap_err()
+        .to_string();
+    // The first entry no longer matches the index, or the order is wrong:
+    // both are ordering failures.
+    assert!(error.contains("strictly ordered"), "{error}");
 }
 
 #[test]
@@ -134,6 +317,12 @@ fn deterministic_plan_has_noop_fingerprint_and_depth_cap() {
             .iter()
             .all(|entry| entry.delta_depth <= 16)
     );
+    let decoded = round_trip(&first.manifest);
+    assert_eq!(
+        decoded.content_fingerprint,
+        first.manifest.content_fingerprint
+    );
+    assert_eq!(decoded.manifest_digest, first.manifest.manifest_digest);
 
     let second = plan_content_repack(
         &source,
@@ -360,9 +549,8 @@ fn limits_overflow_and_unknown_lineage_references_fail_closed() {
     .unwrap() else {
         unreachable!()
     };
-    let mut maximum_generation = first.manifest;
-    maximum_generation.generation = u64::MAX;
-    maximum_generation.manifest_digest = manifest_digest(&maximum_generation);
+    let maximum_generation =
+        ContentGenerationManifest::new(u64::MAX, first.manifest.entries).unwrap();
     assert!(matches!(
         plan_content_repack(
             &source,
@@ -377,25 +565,56 @@ fn limits_overflow_and_unknown_lineage_references_fail_closed() {
     ));
 }
 
-fn manifest_digest(manifest: &ContentGenerationManifest) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"wheat-content-generation-v1\0");
-    hash.update(&manifest.generation.to_be_bytes());
-    hash.update(&manifest.content_fingerprint);
-    hash.update(&(manifest.entries.len() as u64).to_be_bytes());
-    for entry in &manifest.entries {
-        hash.update(entry.id.as_bytes());
-        hash.update(&entry.envelope_digest);
-        hash.update(&entry.pack_offset.to_be_bytes());
-        hash.update(&entry.physical_length.to_be_bytes());
-        hash.update(&entry.logical_length.to_be_bytes());
-        if let Some(base) = entry.delta_base {
-            hash.update(&[1]);
-            hash.update(base.as_bytes());
-        } else {
-            hash.update(&[0]);
-        }
-        hash.update(&[entry.delta_depth]);
-    }
-    *hash.finalize().as_bytes()
+#[test]
+#[ignore = "representative-scale manifest codec benchmark"]
+fn benchmark_sharded_manifest_208k_entries() {
+    use std::time::Instant;
+
+    const ENTRIES: usize = 208_000;
+    let entries = (0..ENTRIES)
+        .map(|index| ContentGenerationEntry {
+            id: ContentId::from_digest((index as u64).to_be_bytes().repeat(4).try_into().unwrap()),
+            envelope_digest: ((index as u64).wrapping_mul(3))
+                .to_be_bytes()
+                .repeat(4)
+                .try_into()
+                .unwrap(),
+            pack_offset: (index % CONTENT_GENERATION_SHARD_ENTRIES) as u64 * 128,
+            physical_length: 128,
+            logical_length: 256,
+            delta_base: None,
+            delta_depth: 0,
+        })
+        .collect();
+    let started = Instant::now();
+    let manifest = ContentGenerationManifest::new(1, entries).unwrap();
+    let seal_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    let index = manifest.index().unwrap().encoded().unwrap();
+    let shards = (0..manifest.shard_count())
+        .map(|shard| manifest.encode_shard(shard).unwrap())
+        .collect::<Vec<_>>();
+    let encode_elapsed = started.elapsed();
+    let started = Instant::now();
+    let decoded =
+        ContentGenerationManifest::decode(&index, |shard| Ok(shards[shard].clone())).unwrap();
+    let decode_elapsed = started.elapsed();
+    let started = Instant::now();
+    let one_shard = ContentGenerationIndex::decode(&index)
+        .unwrap()
+        .decode_shard(shards.len() / 2, &shards[shards.len() / 2])
+        .unwrap();
+    let one_shard_elapsed = started.elapsed();
+
+    assert_eq!(decoded, manifest);
+    assert_eq!(one_shard.len(), CONTENT_GENERATION_SHARD_ENTRIES);
+    eprintln!(
+        "208k content generation: index {} bytes, {} shards of {} bytes total; \
+         seal {seal_elapsed:?}, encode {encode_elapsed:?}, decode {decode_elapsed:?}, \
+         index + one shard {one_shard_elapsed:?}",
+        index.len(),
+        shards.len(),
+        shards.iter().map(Vec::len).sum::<usize>(),
+    );
 }

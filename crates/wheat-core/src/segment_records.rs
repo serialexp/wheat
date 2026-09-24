@@ -11,7 +11,12 @@ use wheat_binschema::generated as wire;
 
 pub const SEGMENT_PREFIX_ENCODED_SIZE: usize = 6;
 pub const SEGMENT_FOOTER_ENCODED_SIZE: usize = 78;
-const INDEX_ENTRY_SIZE: usize = 60;
+/// Encoded size of a whole-record index entry; a delta entry adds the
+/// 32-byte base digest.
+pub const SEGMENT_INDEX_ENTRY_ENCODED_SIZE: usize = 62;
+pub const SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE: usize = SEGMENT_INDEX_ENTRY_ENCODED_SIZE + 32;
+/// Longest chain of in-segment metadata deltas above a whole record.
+pub const SEGMENT_MAX_DELTA_DEPTH: u8 = 16;
 const DIRECTORY_ENTRY_SIZE: usize = 81;
 
 pub const SEGMENT_NAMESPACE_METADATA: u8 = 1;
@@ -20,7 +25,9 @@ pub const SEGMENT_NAMESPACE_CONTENT: u8 = 2;
 /// Physical payload codec.
 ///
 /// `Raw` and `Zstd` are per-record codecs (each record's payload is
-/// independently encoded). `ZstdBlock` groups multiple small records into one
+/// independently encoded). `Delta` and `DeltaZstd` store a metadata record as a
+/// git delta patch (optionally one zstd frame) against the entry's
+/// `delta_base`, a record in the same segment. `ZstdBlock` groups multiple small records into one
 /// zstd frame: records within a block share the same `(offset, stored_length)`
 /// in their index entries. The reader decompresses the block and extracts each
 /// record at the logical position derived from co-block entries' `logical_length`
@@ -30,6 +37,8 @@ pub const SEGMENT_NAMESPACE_CONTENT: u8 = 2;
 pub enum SegmentCodec {
     Raw = 0,
     Zstd = 1,
+    Delta = 2,
+    DeltaZstd = 3,
     ZstdBlock = 4,
 }
 
@@ -38,6 +47,8 @@ impl SegmentCodec {
         match code {
             0 => Some(Self::Raw),
             1 => Some(Self::Zstd),
+            2 => Some(Self::Delta),
+            3 => Some(Self::DeltaZstd),
             4 => Some(Self::ZstdBlock),
             _ => None,
         }
@@ -54,10 +65,14 @@ pub struct SegmentIndexEntry {
     pub kind: u16,
     pub digest: [u8; 32],
     pub offset: u64,
-    /// [`SegmentCodec`] numeric identity (`Raw = 0`, `Zstd = 1`, `ZstdBlock = 4`).
+    /// [`SegmentCodec`] numeric identity.
     pub codec: u8,
     pub stored_length: u64,
     pub logical_length: u64,
+    /// Base record (same segment, metadata namespace) of a delta codec entry.
+    pub delta_base: Option<[u8; 32]>,
+    /// Zero for whole records; base depth plus one for deltas.
+    pub delta_depth: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,7 +110,7 @@ pub struct SegmentFooter {
     pub body_digest: [u8; 32],
 }
 
-/// Physical publication record for one immutable sealed segment.
+/// Remote packed-store publication record for one appended segment.
 ///
 /// This record is deliberately outside the logical `WheatObject` union.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,7 +121,7 @@ pub struct SegmentCatalogRecord {
     pub stored_length: u64,
 }
 
-/// One immutable segment named by a V2 physical catalog snapshot.
+/// One immutable segment named by a physical catalog snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalSegmentDescriptor {
     /// Physical generation used in the canonical segment filename.
@@ -119,8 +134,9 @@ pub struct PhysicalSegmentDescriptor {
 
 /// Content-envelope authority selected alongside structural segments.
 ///
-/// Generation zero with an all-zero manifest denotes the legacy content layout.
-/// Store-side structural repack deliberately preserves that layout unchanged.
+/// Generation zero with an all-zero manifest means no content generation has
+/// been selected yet: content still lives in segments and loose envelopes, as
+/// written by import and commits before the first repack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalContentGeneration {
     pub generation: u64,
@@ -135,10 +151,10 @@ pub struct PhysicalCatalogSnapshot {
     pub content: PhysicalContentGeneration,
 }
 
-/// Hard allocation bound for an authenticated V2 catalog snapshot.
+/// Hard allocation bound for an authenticated catalog snapshot.
 pub const MAX_PHYSICAL_CATALOG_SEGMENTS: usize = 1_000_000;
 const PHYSICAL_CATALOG_MAGIC: [u8; 4] = 0x5748_4354_u32.to_be_bytes();
-const PHYSICAL_CATALOG_V2: u16 = 2;
+const PHYSICAL_CATALOG_VERSION: u16 = 1;
 
 impl SegmentFooter {
     pub fn segment_id(&self) -> SegmentId {
@@ -161,7 +177,6 @@ impl SegmentIndexEntry {
             crate::CanonicalObjectKind::RevisionMapNode => 9,
             crate::CanonicalObjectKind::ApplicationMapNode => 10,
             crate::CanonicalObjectKind::ConflictSetNode => 11,
-            crate::CanonicalObjectKind::ContentSetNode => 12,
             crate::CanonicalObjectKind::ContentSetSnapshot => 19,
             crate::CanonicalObjectKind::ContentSetDelta => 20,
             crate::CanonicalObjectKind::RetainedSetNode => 13,
@@ -187,7 +202,6 @@ impl SegmentIndexEntry {
             9 => crate::CanonicalObjectKind::RevisionMapNode,
             10 => crate::CanonicalObjectKind::ApplicationMapNode,
             11 => crate::CanonicalObjectKind::ConflictSetNode,
-            12 => crate::CanonicalObjectKind::ContentSetNode,
             19 => crate::CanonicalObjectKind::ContentSetSnapshot,
             20 => crate::CanonicalObjectKind::ContentSetDelta,
             13 => crate::CanonicalObjectKind::RetainedSetNode,
@@ -213,6 +227,8 @@ pub enum SegmentRecordError {
     InvalidCodec(u8),
     #[error("raw segment payload has unequal stored and logical lengths")]
     InvalidRawLengths,
+    #[error("segment delta fields do not match the entry codec, namespace, or depth limit")]
+    InvalidDelta,
     #[error("segment record count cannot fit in supplied bytes")]
     InvalidCount,
 }
@@ -257,6 +273,17 @@ fn valid_entry(e: &SegmentIndexEntry) -> Result<(), SegmentRecordError> {
     // ZstdBlock entries: stored_length is the compressed block size (shared by
     // all entries in the block), logical_length is this record's decompressed
     // size. No per-entry length invariant to check.
+    let is_delta = matches!(codec, SegmentCodec::Delta | SegmentCodec::DeltaZstd);
+    let delta_valid = if is_delta {
+        e.namespace == SEGMENT_NAMESPACE_METADATA
+            && e.delta_base.is_some_and(|base| base != e.digest)
+            && (1..=SEGMENT_MAX_DELTA_DEPTH).contains(&e.delta_depth)
+    } else {
+        e.delta_base.is_none() && e.delta_depth == 0
+    };
+    if !delta_valid {
+        return Err(SegmentRecordError::InvalidDelta);
+    }
     Ok(())
 }
 
@@ -280,6 +307,8 @@ fn entry_wire(e: &SegmentIndexEntry) -> wire::SegmentIndexEntryV1 {
         codec: e.codec,
         stored_length: e.stored_length,
         logical_length: e.logical_length,
+        delta_base: e.delta_base.map(digest),
+        delta_depth: e.delta_depth,
     }
 }
 pub fn encode_segment_index_page(page: &SegmentIndexPage) -> Result<Vec<u8>, SegmentRecordError> {
@@ -293,7 +322,7 @@ pub fn encode_segment_index_page(page: &SegmentIndexPage) -> Result<Vec<u8>, Seg
     .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
 }
 pub fn decode_segment_index_page(bytes: &[u8]) -> Result<SegmentIndexPage, SegmentRecordError> {
-    preflight(bytes, INDEX_ENTRY_SIZE)?;
+    preflight_variable(bytes, SEGMENT_INDEX_ENTRY_ENCODED_SIZE)?;
     let w = wire::SegmentIndexPageV1::decode(bytes)
         .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
     let encoded = w.encode();
@@ -307,11 +336,26 @@ pub fn decode_segment_index_page(bytes: &[u8]) -> Result<SegmentIndexPage, Segme
             codec: e.codec,
             stored_length: e.stored_length,
             logical_length: e.logical_length,
+            delta_base: e.delta_base.map(digest_array).transpose()?,
+            delta_depth: e.delta_depth,
         };
         valid_entry(&e)?;
         entries.push(e);
     }
     checked(bytes, SegmentIndexPage { entries }, encoded)
+}
+
+/// Bounds a length-prefixed array of variable-size items before decoding. The
+/// canonical re-encode check afterwards proves the exact length.
+fn preflight_variable(bytes: &[u8], min_item_size: usize) -> Result<(), SegmentRecordError> {
+    if bytes.len() < 4 {
+        return Err(SegmentRecordError::InvalidCount);
+    }
+    let count = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    if count > (bytes.len() - 4) / min_item_size {
+        return Err(SegmentRecordError::InvalidCount);
+    }
+    Ok(())
 }
 
 fn preflight(bytes: &[u8], item_size: usize) -> Result<(), SegmentRecordError> {
@@ -432,35 +476,33 @@ pub fn decode_segment_catalog_record(
     checked(bytes, record, encoded)
 }
 
-/// Canonically encodes a complete V2 physical catalog snapshot.
-///
-/// The small hand-written envelope intentionally shares the existing catalog
-/// magic while retaining the generated V1 decoder unchanged. Integer fields are
-/// big-endian and descriptors must be sorted by contiguous sequence number.
+/// Canonically encodes a complete physical catalog snapshot.
 pub fn encode_physical_catalog_snapshot(
     snapshot: &PhysicalCatalogSnapshot,
 ) -> Result<Vec<u8>, SegmentRecordError> {
     validate_physical_catalog_snapshot(snapshot)?;
-    let count =
-        u32::try_from(snapshot.segments.len()).map_err(|_| SegmentRecordError::InvalidCount)?;
-    let capacity = 4 + 2 + 8 + 4 + snapshot.segments.len() * 56 + 8 + 32;
-    let mut encoded = Vec::with_capacity(capacity);
-    encoded.extend_from_slice(&PHYSICAL_CATALOG_MAGIC);
-    encoded.extend_from_slice(&PHYSICAL_CATALOG_V2.to_be_bytes());
-    encoded.extend_from_slice(&snapshot.generation.to_be_bytes());
-    encoded.extend_from_slice(&count.to_be_bytes());
-    for descriptor in &snapshot.segments {
-        encoded.extend_from_slice(&descriptor.generation.to_be_bytes());
-        encoded.extend_from_slice(&descriptor.sequence.to_be_bytes());
-        encoded.extend_from_slice(&descriptor.segment);
-        encoded.extend_from_slice(&descriptor.stored_length.to_be_bytes());
+    wire::PhysicalCatalogSnapshotV1Input {
+        generation: snapshot.generation,
+        segments: snapshot
+            .segments
+            .iter()
+            .map(|descriptor| wire::PhysicalSegmentDescriptorV1 {
+                generation: descriptor.generation,
+                sequence: descriptor.sequence,
+                segment: digest(descriptor.segment),
+                stored_length: descriptor.stored_length,
+            })
+            .collect(),
+        content: wire::PhysicalContentGenerationV1 {
+            generation: snapshot.content.generation,
+            manifest: digest(snapshot.content.manifest),
+        },
     }
-    encoded.extend_from_slice(&snapshot.content.generation.to_be_bytes());
-    encoded.extend_from_slice(&snapshot.content.manifest);
-    Ok(encoded)
+    .encode()
+    .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
 }
 
-/// Decodes and canonical-validates a complete V2 physical catalog snapshot.
+/// Decodes and canonical-validates a complete physical catalog snapshot.
 pub fn decode_physical_catalog_snapshot(
     bytes: &[u8],
 ) -> Result<PhysicalCatalogSnapshot, SegmentRecordError> {
@@ -469,13 +511,14 @@ pub fn decode_physical_catalog_snapshot(
     const CONTENT: usize = 8 + 32;
     if bytes.len() < HEADER + CONTENT
         || bytes[..4] != PHYSICAL_CATALOG_MAGIC
-        || u16::from_be_bytes(bytes[4..6].try_into().unwrap()) != PHYSICAL_CATALOG_V2
+        || u16::from_be_bytes(bytes[4..6].try_into().unwrap()) != PHYSICAL_CATALOG_VERSION
     {
         return Err(SegmentRecordError::Decode(
-            "not a V2 physical catalog snapshot".into(),
+            "not a physical catalog snapshot".into(),
         ));
     }
-    let generation = u64::from_be_bytes(bytes[6..14].try_into().unwrap());
+    // The generated decoder reserves the array from this count, so prove the
+    // complete fixed-width payload fits before giving it the untrusted bytes.
     let count = u32::from_be_bytes(bytes[14..18].try_into().unwrap()) as usize;
     if count > MAX_PHYSICAL_CATALOG_SEGMENTS
         || HEADER
@@ -489,30 +532,30 @@ pub fn decode_physical_catalog_snapshot(
     {
         return Err(SegmentRecordError::InvalidCount);
     }
-    let mut segments = Vec::with_capacity(count);
-    let mut offset = HEADER;
-    for _ in 0..count {
-        segments.push(PhysicalSegmentDescriptor {
-            generation: u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()),
-            sequence: u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()),
-            segment: bytes[offset + 16..offset + 48].try_into().unwrap(),
-            stored_length: u64::from_be_bytes(bytes[offset + 48..offset + 56].try_into().unwrap()),
-        });
-        offset += DESCRIPTOR;
-    }
+    let w = wire::PhysicalCatalogSnapshotV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    let encoded = w.encode();
     let snapshot = PhysicalCatalogSnapshot {
-        generation,
-        segments,
+        generation: w.generation,
+        segments: w
+            .segments
+            .into_iter()
+            .map(|descriptor| {
+                Ok(PhysicalSegmentDescriptor {
+                    generation: descriptor.generation,
+                    sequence: descriptor.sequence,
+                    segment: digest_array(descriptor.segment)?,
+                    stored_length: descriptor.stored_length,
+                })
+            })
+            .collect::<Result<_, SegmentRecordError>>()?,
         content: PhysicalContentGeneration {
-            generation: u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()),
-            manifest: bytes[offset + 8..offset + 40].try_into().unwrap(),
+            generation: w.content.generation,
+            manifest: digest_array(w.content.manifest)?,
         },
     };
     validate_physical_catalog_snapshot(&snapshot)?;
-    if encode_physical_catalog_snapshot(&snapshot)? != bytes {
-        return Err(SegmentRecordError::NonCanonicalEncoding);
-    }
-    Ok(snapshot)
+    checked(bytes, snapshot, encoded)
 }
 
 fn validate_physical_catalog_snapshot(

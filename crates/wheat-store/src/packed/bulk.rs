@@ -39,6 +39,9 @@ pub(crate) struct BulkSegment {
     file: File,
     entries: Vec<SegmentIndexEntry>,
     entries_by_key: HashMap<(u8, [u8; 32]), usize>,
+    /// Exact within-block offset and aggregate logical length recorded when the
+    /// writer flushes a block. This keeps active lookups O(1) in entry count.
+    block_layout_by_key: HashMap<(u8, [u8; 32]), (usize, usize)>,
     payload_bytes: u64,
     io_buffer: Vec<u8>,
     /// Small records waiting to be compressed into a block at finalization.
@@ -67,6 +70,7 @@ impl BulkSegment {
             file,
             entries: Vec::new(),
             entries_by_key: HashMap::new(),
+            block_layout_by_key: HashMap::new(),
             payload_bytes: 0,
             io_buffer: vec![0; IO_BUFFER_SIZE],
             pending_block: Vec::new(),
@@ -95,7 +99,8 @@ impl BulkSegment {
             .checked_add(self.pending_block_bytes as u64)
             .and_then(|n| n.checked_add(additional_payload))
             .ok_or(SegmentError::TooLarge)?;
-        projected_total_length(count, payload)
+        // Bulk segments hold whole records only.
+        projected_total_length(count, 0, payload)
     }
 
     pub(crate) fn append_prepared(
@@ -117,6 +122,8 @@ impl BulkSegment {
                 codec: Codec::ZstdBlock.to_byte(),
                 stored_length: 0,
                 logical_length: record.bytes.len() as u64,
+                delta_base: None,
+                delta_depth: 0,
             };
             self.entries_by_key.insert(
                 (entry.namespace, entry.digest),
@@ -147,6 +154,8 @@ impl BulkSegment {
             codec: physical.codec.to_byte(),
             stored_length,
             logical_length: physical.logical_length,
+            delta_base: None,
+            delta_depth: 0,
         };
         self.file.seek(SeekFrom::Start(entry.offset))?;
         self.file.write_all(&physical.bytes)?;
@@ -183,12 +192,16 @@ impl BulkSegment {
         self.file.write_all(&compressed)?;
         self.payload_bytes += stored_length;
 
-        // Emit entries. Rebuild entries_by_key for block records to point at
-        // their final position in the entries vec.
+        // Emit entries and retain the already-known writer layout so active
+        // lookups never scan the full entry table to rediscover block offsets.
+        let block_logical_length = concatenated.len();
+        let mut logical_offset = 0usize;
         for record in self.pending_block.drain(..) {
+            let key = (record.namespace, record.digest);
             let idx = self.entries.len();
-            self.entries_by_key
-                .insert((record.namespace, record.digest), idx);
+            self.entries_by_key.insert(key, idx);
+            self.block_layout_by_key
+                .insert(key, (logical_offset, block_logical_length));
             self.entries.push(SegmentIndexEntry {
                 namespace: record.namespace,
                 kind: record.kind,
@@ -197,7 +210,10 @@ impl BulkSegment {
                 codec: Codec::ZstdBlock.to_byte(),
                 stored_length,
                 logical_length: record.logical_bytes.len() as u64,
+                delta_base: None,
+                delta_depth: 0,
             });
+            logical_offset += record.logical_bytes.len();
         }
         self.pending_block_bytes = 0;
         Ok(())
@@ -227,6 +243,8 @@ impl BulkSegment {
                         codec: Codec::ZstdBlock.to_byte(),
                         stored_length: 0,
                         logical_length: logical_length as u64,
+                        delta_base: None,
+                        delta_depth: 0,
                     },
                     &record.logical_bytes,
                 )?;
@@ -257,23 +275,16 @@ impl BulkSegment {
             let mut stored = vec![0; stored_length];
             self.file.seek(SeekFrom::Start(entry.offset))?;
             self.file.read_exact(&mut stored)?;
-            let decompressed = codec::decode_block(&stored)?;
+            let (offset_in_block, block_logical_length) = self
+                .block_layout_by_key
+                .get(&(namespace, digest))
+                .copied()
+                .ok_or(SegmentError::Format("missing active block layout"))?;
+            let decompressed = codec::decode_block(&stored, block_logical_length)?;
 
-            // Find this record's position within the decompressed block.
-            // Block records are sorted by (namespace, digest) and concatenated.
-            let mut offset_in_block = 0usize;
-            for e in &self.entries {
-                if e.codec == Codec::ZstdBlock.to_byte()
-                    && e.offset == entry.offset
-                    && e.stored_length == entry.stored_length
-                {
-                    if e.namespace == namespace && e.digest == digest {
-                        break;
-                    }
-                    offset_in_block += e.logical_length as usize;
-                }
-            }
-            let end = offset_in_block + logical_length;
+            let end = offset_in_block
+                .checked_add(logical_length)
+                .ok_or(SegmentError::Format("block record overflows"))?;
             if end > decompressed.len() {
                 return Err(SegmentError::Format(
                     "block record exceeds decompressed block",

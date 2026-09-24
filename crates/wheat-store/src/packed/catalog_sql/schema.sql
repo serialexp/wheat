@@ -7,7 +7,7 @@ CREATE TABLE locator (
     digest BLOB NOT NULL CHECK(length(digest) = 32),
     kind INTEGER NOT NULL,
     offset INTEGER NOT NULL CHECK(offset >= 0),
-    codec INTEGER NOT NULL CHECK(codec IN (0, 1, 4)),
+    codec INTEGER NOT NULL CHECK(codec IN (0, 1, 2, 3, 4)),
     stored_length INTEGER NOT NULL CHECK(stored_length >= 0),
     logical_length INTEGER NOT NULL CHECK(logical_length >= 0),
     source_id INTEGER NOT NULL REFERENCES physical_source(id),

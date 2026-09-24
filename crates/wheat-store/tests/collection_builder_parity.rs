@@ -71,7 +71,7 @@ async fn pure_builders_match_incremental_store_roots() {
         }};
     }
     check_set!(build_conflict_set, ConflictSetStore, ConflictId);
-    // ContentSetStore now uses flat sorted blobs, not radix tries, so parity
-    // with `build_content_set` (which produces radix nodes) no longer applies.
+    // ContentSetStore uses flat sorted blobs rather than a radix trie, so it
+    // has no incremental-vs-builder parity to check here.
     check_set!(build_retained_set, RetainedSetStore, ObjectId);
 }

@@ -31,7 +31,6 @@ pub enum ObjectKind {
     RevisionMapNode = 9,
     ApplicationMapNode = 10,
     ConflictSetNode = 11,
-    ContentSetNode = 12,
     ContentSetSnapshot = 19,
     ContentSetDelta = 20,
     RetainedSetNode = 13,
@@ -56,7 +55,6 @@ impl ObjectKind {
             9 => Self::RevisionMapNode,
             10 => Self::ApplicationMapNode,
             11 => Self::ConflictSetNode,
-            12 => Self::ContentSetNode,
             19 => Self::ContentSetSnapshot,
             20 => Self::ContentSetDelta,
             13 => Self::RetainedSetNode,
@@ -84,7 +82,6 @@ impl From<CanonicalObjectKind> for ObjectKind {
             CanonicalObjectKind::RevisionMapNode => Self::RevisionMapNode,
             CanonicalObjectKind::ApplicationMapNode => Self::ApplicationMapNode,
             CanonicalObjectKind::ConflictSetNode => Self::ConflictSetNode,
-            CanonicalObjectKind::ContentSetNode => Self::ContentSetNode,
             CanonicalObjectKind::ContentSetSnapshot => Self::ContentSetSnapshot,
             CanonicalObjectKind::ContentSetDelta => Self::ContentSetDelta,
             CanonicalObjectKind::RetainedSetNode => Self::RetainedSetNode,
@@ -255,6 +252,70 @@ impl LooseObjectStore {
     pub fn path(&self, id: ObjectId) -> PathBuf {
         let encoded = id.to_string();
         self.root.join(&encoded[..2]).join(&encoded[2..])
+    }
+
+    /// Synchronous verified read, for callers already holding a store lock.
+    pub(crate) fn read_verified(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        Self::verify_bytes(id, self.read_existing(id)?)
+    }
+
+    /// IDs of every canonically named object file, sorted. Temporary files
+    /// (dot-prefixed) and foreign names are ignored.
+    pub(crate) fn list_ids(&self) -> Result<Vec<ObjectId>, ObjectStoreError> {
+        let mut ids = Vec::new();
+        let shards = match fs::read_dir(&self.root) {
+            Ok(shards) => shards,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ids),
+            Err(error) => return Err(error.into()),
+        };
+        for shard in shards {
+            let shard = shard?;
+            let Some(prefix) = shard.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if prefix.len() != 2 || !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(shard.path())? {
+                let entry = entry?;
+                let Some(rest) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                if let Ok(id) = format!("{prefix}{rest}").parse::<ObjectId>()
+                    && id.to_string() == format!("{prefix}{rest}")
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Removes the loose files of `ids` (missing files are fine), syncing each
+    /// changed shard directory once. Callers must already hold another durable
+    /// copy of every object.
+    pub(crate) fn retire(&self, ids: &[ObjectId]) -> Result<(), ObjectStoreError> {
+        let mut changed = std::collections::BTreeSet::new();
+        for id in ids {
+            let path = self.path(*id);
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        changed.insert(parent.to_path_buf());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for directory in changed {
+            self.durability.sync_directory(&directory)?;
+        }
+        Ok(())
     }
 
     fn verify_bytes(

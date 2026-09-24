@@ -6,8 +6,8 @@ use thiserror::Error;
 use wheat_core::{
     ApplicationId, ApplicationRecord, ApplicationResultRecord, AppliedEditEvidence, ByteRange,
     CanonicalObjectError, Change, ChangeId, ChangeObjectId, ChangeProposal, ContentIo,
-    ContentManifestRecord, DirectoryEntry, EditId, RevisionId, RevisionRecord, Tree, ViewId,
-    ViewRecord, decode_view_record,
+    ContentManifestRecord, EditId, RevisionId, RevisionRecord, Tree, ViewId, ViewRecord,
+    decode_view_record,
     edit_application::{ApplicationError, ApplicationLimits, ApplicationOutcome, apply_edits},
 };
 
@@ -219,51 +219,22 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             );
         }
 
-        // Preserve COW behavior: mutate only touched leaves, deleting first for shape changes.
-        let mut resulting_tree = parent_record.tree;
-        let deletions = paths
+        // Build and validate the final tree in one traversal. This preserves COW sharing while
+        // avoiding persisted deletion-only roots during file/directory shape changes.
+        let tree_edits = paths
             .iter()
-            .filter(|(path, _)| target.contains_key(*path))
-            .map(|(_, path)| TreeEdit {
-                path: path.clone(),
-                value: None,
+            .map(|(path, parsed)| TreeEdit {
+                path: parsed.clone(),
+                value: output.tree.get(path).copied(),
             })
             .collect::<Vec<_>>();
-        if !deletions.is_empty() {
-            resulting_tree = trees.apply_edits(resulting_tree, &deletions).await?;
-        }
-        for (path, parsed) in &paths {
-            if !output.tree.contains_key(path) {
-                continue;
-            }
-            let mut node = trees.read_node(resulting_tree).await?;
-            for (index, component) in parsed.iter().enumerate() {
-                match node.entries.get(component) {
-                    Some(DirectoryEntry::Directory(_)) if index + 1 == parsed.len() => {
-                        return Err(CommitWriterError::InvalidPath(path.clone()));
-                    }
-                    Some(DirectoryEntry::Directory(child)) => {
-                        node = trees.read_node(*child).await?
-                    }
-                    Some(DirectoryEntry::File(_)) if index + 1 != parsed.len() => {
-                        return Err(CommitWriterError::InvalidPath(path.clone()));
-                    }
-                    _ => break,
-                }
-            }
-        }
-        let insertions = paths
-            .iter()
-            .filter_map(|(path, parsed)| {
-                output.tree.get(path).copied().map(|value| TreeEdit {
-                    path: parsed.clone(),
-                    value: Some(value),
-                })
-            })
-            .collect::<Vec<_>>();
-        if !insertions.is_empty() {
-            resulting_tree = trees.apply_edits(resulting_tree, &insertions).await?;
-        }
+        let resulting_tree = trees
+            .apply_final_edits(parent_record.tree, &tree_edits)
+            .await
+            .map_err(|error| match error {
+                MerkleTreeError::FileInPath(component) => CommitWriterError::InvalidPath(component),
+                other => other.into(),
+            })?;
 
         // Persist definitions before revision/application/view metadata.
         for (id, edit) in &proposal.edits.edits {

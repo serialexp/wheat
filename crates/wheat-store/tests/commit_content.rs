@@ -25,7 +25,10 @@ impl ImmutableObjectStore for Counting {
         Ok(object)
     }
     async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
-        if validate_canonical_object(bytes)? == CanonicalObjectKind::ContentSetNode {
+        if matches!(
+            validate_canonical_object(bytes)?,
+            CanonicalObjectKind::ContentSetSnapshot | CanonicalObjectKind::ContentSetDelta
+        ) {
             self.sets.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.put_if_absent(id, bytes).await

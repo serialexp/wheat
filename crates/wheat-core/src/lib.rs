@@ -7,6 +7,7 @@
 mod branch_records;
 mod collection;
 mod collection_builders;
+mod content_generation_wire;
 mod content_io;
 pub mod diff_model;
 pub mod edit_application;
@@ -27,12 +28,17 @@ mod wire;
 pub use branch_records::{RepositoryEnvelopeRecord, ViewLabel, ViewLabelManifestRecord};
 pub use collection::{
     ApplicationMapChild, ApplicationMapNode, ChangeMapChild, ChangeMapNode, ConflictSetChild,
-    ConflictSetNode, ContentSetChild, ContentSetNode, RetainedSetChild, RetainedSetNode,
-    ViewLineageMapChild, ViewLineageMapNode,
+    ConflictSetNode, RetainedSetChild, RetainedSetNode, ViewLineageMapChild, ViewLineageMapNode,
 };
 pub use collection_builders::{
-    build_application_map, build_change_map, build_conflict_set, build_content_set,
-    build_retained_set, build_revision_map, build_view_lineage_map,
+    build_application_map, build_change_map, build_conflict_set, build_retained_set,
+    build_revision_map, build_view_lineage_map,
+};
+pub use content_generation_wire::{
+    CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationWireEntry, ContentGenerationWireError,
+    ContentGenerationWireIndex, ContentGenerationWireShard, ContentGenerationWireShardRef,
+    decode_content_generation_index, decode_content_generation_shard,
+    encode_content_generation_index, encode_content_generation_shard,
 };
 pub use content_io::{ApplicationContext, ContentIo};
 pub use edit_records::{EditOperation, EditRecord, decode_edit_record};
@@ -62,8 +68,9 @@ pub use root_builders::{
 };
 pub use segment_records::{
     MAX_PHYSICAL_CATALOG_SEGMENTS, PhysicalCatalogSnapshot, PhysicalContentGeneration,
-    PhysicalSegmentDescriptor, SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_NAMESPACE_CONTENT,
-    SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE, SegmentCatalogRecord,
+    PhysicalSegmentDescriptor, SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_FOOTER_ENCODED_SIZE,
+    SEGMENT_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_MAX_DELTA_DEPTH, SEGMENT_NAMESPACE_CONTENT,
+    SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE, SegmentCatalogRecord, SegmentCodec,
     SegmentDirectory, SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry,
     SegmentIndexKey, SegmentIndexPage, SegmentRecordError, decode_physical_catalog_snapshot,
     decode_segment_catalog_record, decode_segment_directory, decode_segment_footer,
@@ -79,8 +86,8 @@ pub use wire::{
     CanonicalObjectError, CanonicalObjectKind, ContentSetBlob, content_set_delta_bytes,
     content_set_snapshot_bytes, decode_application_map_node, decode_change_map_node,
     decode_conflict_set_node, decode_content_manifest_record, decode_content_set_blob,
-    decode_content_set_node, decode_directory_node, decode_repository_envelope_record,
-    decode_repository_state_record, decode_retained_set_node, decode_revision_map_node,
-    decode_view_label_manifest_record, decode_view_lineage_map_node, decode_view_record,
-    extract_object_references, validate_canonical_object, validate_directory_component,
+    decode_directory_node, decode_repository_envelope_record, decode_repository_state_record,
+    decode_retained_set_node, decode_revision_map_node, decode_view_label_manifest_record,
+    decode_view_lineage_map_node, decode_view_record, extract_object_references,
+    validate_canonical_object, validate_directory_component,
 };

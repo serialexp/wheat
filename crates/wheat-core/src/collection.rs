@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApplicationId, ApplicationMapId, CanonicalObjectError, ChangeMapId, ChangeObjectId,
-    ConflictSetId, ContentSetId, RetainedSetId, ViewLineageMapId,
+    ConflictSetId, RetainedSetId, ViewLineageMapId,
 };
 
 macro_rules! child {
@@ -18,7 +18,6 @@ macro_rules! child {
 child!(ApplicationMapChild, ApplicationMapId);
 child!(ChangeMapChild, ChangeMapId);
 child!(ConflictSetChild, ConflictSetId);
-child!(ContentSetChild, ContentSetId);
 child!(RetainedSetChild, RetainedSetId);
 child!(ViewLineageMapChild, ViewLineageMapId);
 
@@ -186,13 +185,6 @@ set_node!(
     ConflictSetId,
     validate_conflict_set_node,
     conflict_set_node_bytes
-);
-set_node!(
-    ContentSetNode,
-    ContentSetChild,
-    ContentSetId,
-    validate_content_set_node,
-    content_set_node_bytes
 );
 set_node!(
     RetainedSetNode,

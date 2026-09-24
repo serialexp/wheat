@@ -49,11 +49,10 @@ fn wire_tag_name(bytes: &[u8]) -> &'static str {
         0x0501 => "Conflict",
         0x0601 => "View",
         0x0701 => "ContentManifest",
-        0x0803 => "RepositoryState",
+        0x0801 => "RepositoryState",
         0x0901 => "RevisionMapNode",
         0x0a01 => "ApplicationMapNode",
         0x0b01 => "ConflictSetNode",
-        0x0c01 => "ContentSetNode",
         0x0c02 => "ContentSetSnapshot",
         0x0c03 => "ContentSetDelta",
         0x0d01 => "RetainedSetNode",
@@ -71,7 +70,6 @@ fn is_trie_node(name: &str) -> bool {
         name,
         "RevisionMapNode"
             | "ChangeMapNode"
-            | "ContentSetNode"
             | "RetainedSetNode"
             | "ConflictSetNode"
             | "ApplicationMapNode"

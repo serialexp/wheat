@@ -8,6 +8,11 @@ use wheat_core::ContentId;
 pub(crate) const RAW_THRESHOLD: usize = 1024;
 pub(crate) const ZSTD_LEVEL: i32 = 3;
 pub(crate) const HARD_LOGICAL_RECORD_BYTES: usize = 1024 * 1024 * 1024;
+/// Authenticated aggregate logical-size ceiling for one compressed block.
+///
+/// Current writers target 64 KiB blocks. Keeping the decode ceiling at 1 MiB
+/// preserves those blocks while leaving room for a future 256 KiB policy.
+pub(crate) const MAX_BLOCK_LOGICAL_BYTES: usize = 1024 * 1024;
 const ENVELOPE_MAGIC: &[u8; 4] = b"WHCE";
 const ENVELOPE_VERSION: u8 = 1;
 pub(crate) const ENVELOPE_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 8;
@@ -207,10 +212,37 @@ pub(crate) fn decode(
     }
 }
 
-/// Decompresses a zstd block payload (codec 4). Returns the full decompressed
-/// block buffer from which individual record bytes are extracted by offset.
-pub(crate) fn decode_block(compressed: &[u8]) -> Result<Vec<u8>, CodecError> {
-    zstd::bulk::decompress(compressed, HARD_LOGICAL_RECORD_BYTES).map_err(CodecError::Zstd)
+/// Decompresses exactly one zstd block payload (codec 4) whose logical size was
+/// derived from the authenticated index entries belonging to that block.
+pub(crate) fn decode_block(
+    compressed: &[u8],
+    expected_logical_length: usize,
+) -> Result<Vec<u8>, CodecError> {
+    if expected_logical_length > MAX_BLOCK_LOGICAL_BYTES {
+        return Err(CodecError::ReadLimit {
+            logical: expected_logical_length,
+            max: MAX_BLOCK_LOGICAL_BYTES,
+        });
+    }
+    let frame_size = zstd::zstd_safe::find_frame_compressed_size(compressed)
+        .map_err(|_| CodecError::Format("malformed or truncated zstd block frame"))?;
+    if frame_size != compressed.len() {
+        return Err(CodecError::Format("trailing zstd block frame bytes"));
+    }
+    let frame_logical = zstd::zstd_safe::get_frame_content_size(compressed)
+        .map_err(|_| CodecError::Format("malformed zstd block frame"))?
+        .ok_or(CodecError::Format("zstd block frame omits content size"))?;
+    if frame_logical != expected_logical_length as u64 {
+        return Err(CodecError::Format(
+            "zstd block frame logical length differs",
+        ));
+    }
+    let output =
+        zstd::bulk::decompress(compressed, expected_logical_length).map_err(CodecError::Zstd)?;
+    if output.len() != expected_logical_length {
+        return Err(CodecError::Format("zstd block output length differs"));
+    }
+    Ok(output)
 }
 
 /// Decode a stored payload into either final content or a delta reference.
@@ -329,6 +361,81 @@ pub(crate) fn encode_delta_envelope(
     encoded.extend_from_slice(base_id.as_bytes());
     encoded.extend_from_slice(&payload_after_base);
     Ok(encoded)
+}
+
+/// Physical payload of an in-segment metadata delta: the bare git delta patch
+/// (`Delta`) or one zstd frame of it (`DeltaZstd`), under the same savings
+/// rule as whole records. The base is named by the segment index entry, so,
+/// unlike a content envelope, the payload carries no base reference.
+pub(crate) fn prepare_segment_delta(
+    target_logical_length: usize,
+    patch: &[u8],
+) -> Result<PhysicalPayload, CodecError> {
+    if target_logical_length > HARD_LOGICAL_RECORD_BYTES {
+        return Err(CodecError::HardLimit);
+    }
+    if patch.len() > target_logical_length {
+        return Err(CodecError::Format("delta patch exceeds its target length"));
+    }
+    let logical_length = target_logical_length as u64;
+    if patch.len() >= RAW_THRESHOLD {
+        let compressed = zstd::bulk::compress(patch, ZSTD_LEVEL).map_err(CodecError::Zstd)?;
+        let required_saving = 64usize.max(patch.len() / 16);
+        if compressed.len().saturating_add(required_saving) <= patch.len() {
+            return Ok(PhysicalPayload {
+                codec: Codec::DeltaZstd,
+                logical_length,
+                bytes: compressed,
+            });
+        }
+    }
+    Ok(PhysicalPayload {
+        codec: Codec::Delta,
+        logical_length,
+        bytes: patch.to_vec(),
+    })
+}
+
+/// Decodes an in-segment delta payload into its git delta patch. Writers only
+/// store patches no longer than the target, so the target's authenticated
+/// logical length bounds the patch before any allocation.
+pub(crate) fn decode_segment_delta_patch(
+    codec: Codec,
+    stored: Vec<u8>,
+    logical_length: u64,
+) -> Result<Vec<u8>, CodecError> {
+    let bound = usize::try_from(logical_length).map_err(|_| CodecError::HardLimit)?;
+    if bound > HARD_LOGICAL_RECORD_BYTES {
+        return Err(CodecError::HardLimit);
+    }
+    match codec {
+        Codec::Delta => {
+            if stored.len() > bound {
+                return Err(CodecError::Format("delta patch exceeds its target length"));
+            }
+            Ok(stored)
+        }
+        Codec::DeltaZstd => {
+            let frame_size = zstd::zstd_safe::find_frame_compressed_size(&stored)
+                .map_err(|_| CodecError::Format("malformed or truncated zstd delta frame"))?;
+            if frame_size != stored.len() {
+                return Err(CodecError::Format("trailing zstd delta frame bytes"));
+            }
+            let patch_length = zstd::zstd_safe::get_frame_content_size(&stored)
+                .map_err(|_| CodecError::Format("malformed zstd delta frame"))?
+                .ok_or(CodecError::Format("zstd delta frame omits content size"))?;
+            if patch_length > logical_length {
+                return Err(CodecError::Format("delta patch exceeds its target length"));
+            }
+            let patch =
+                zstd::bulk::decompress(&stored, patch_length as usize).map_err(CodecError::Zstd)?;
+            if patch.len() as u64 != patch_length {
+                return Err(CodecError::Format("zstd delta output length differs"));
+            }
+            Ok(patch)
+        }
+        _ => Err(CodecError::Format("not a delta codec")),
+    }
 }
 
 pub(crate) fn encode_envelope(logical: &[u8]) -> Result<Vec<u8>, CodecError> {
@@ -484,6 +591,31 @@ mod tests {
         let second = prepare(&noisy).unwrap();
         assert_eq!(first.codec, Codec::Raw);
         assert_eq!(first.bytes, second.bytes);
+    }
+
+    #[test]
+    fn block_decoder_requires_exact_single_frame_and_logical_size() {
+        let logical = vec![b'x'; 64 * 1024];
+        let compressed = zstd::bulk::compress(&logical, ZSTD_LEVEL).unwrap();
+        assert_eq!(decode_block(&compressed, logical.len()).unwrap(), logical);
+        assert!(matches!(
+            decode_block(&compressed, logical.len() - 1),
+            Err(CodecError::Format(
+                "zstd block frame logical length differs"
+            ))
+        ));
+
+        let mut trailing = compressed.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_block(&trailing, logical.len()),
+            Err(CodecError::Format("trailing zstd block frame bytes"))
+        ));
+
+        assert!(matches!(
+            decode_block(&compressed, MAX_BLOCK_LOGICAL_BYTES + 1),
+            Err(CodecError::ReadLimit { .. })
+        ));
     }
 
     #[test]

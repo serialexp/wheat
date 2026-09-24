@@ -41,6 +41,24 @@ fn fixture() -> tempfile::TempDir {
     root
 }
 
+fn repeated_edit_fixture(commits: usize) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-b", "main"]);
+    let mut content = (0..256)
+        .map(|line| format!("line {line:04}: unchanged fixture content\n"))
+        .collect::<String>();
+    content.replace_range(0..4, "0000");
+    std::fs::write(root.path().join("file"), &content).unwrap();
+    git(root.path(), &["add", "file"]);
+    git(root.path(), &["commit", "-m", "root"]);
+    for revision in 1..=commits {
+        content.replace_range(0..4, &format!("{revision:04}"));
+        std::fs::write(root.path().join("file"), &content).unwrap();
+        git(root.path(), &["commit", "-am", "repeated edit"]);
+    }
+    root
+}
+
 fn large_binary_fixture() -> (tempfile::TempDir, Vec<u8>) {
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init", "-b", "main"]);
@@ -255,6 +273,35 @@ async fn traced_atomic_import_reports_bounded_progress_and_ordered_phases() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn atomic_import_handles_repeated_file_edits_beyond_delta_depth() {
+    let git = repeated_edit_fixture(600);
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("atomic");
+
+    let head = atomic_import(git.path(), &destination, "refs/heads/main")
+        .await
+        .unwrap();
+    let objects = PackedObjectStore::open(destination.join("storage")).unwrap();
+    let content = objects.content_store();
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    reader.validate_complete(envelope.state).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    let repository = reader.hydrate(envelope.state).await.unwrap();
+    let value = repository
+        .view(labels.labels["main"].view)
+        .unwrap()
+        .tree
+        .get("file")
+        .expect("final file is visible");
+    let expected = (0..256)
+        .map(|line| format!("line {line:04}: unchanged fixture content\n"))
+        .collect::<String>();
+    let expected = format!("0600{}", &expected[4..]);
+    assert_eq!(content.get(value.content).unwrap(), expected.as_bytes());
 }
 
 #[tokio::test]

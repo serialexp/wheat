@@ -139,58 +139,69 @@ pub(crate) fn resolve_delta_chain(
 ) -> Result<Vec<u8>, ContentStoreError> {
     use crate::delta;
 
-    let mut chain: Vec<Vec<u8>> = Vec::new();
+    // Each link carries the ID and envelope-declared target length that must be
+    // authenticated after applying its patch. Ancestor bases may legitimately
+    // exceed the caller's final-output bound, but no record may exceed the hard
+    // logical-record limit.
+    let mut chain: Vec<(ContentId, usize, Vec<u8>)> = Vec::new();
     let mut current_id = id;
 
     for depth in 0..=MAX_DELTA_CHAIN_DEPTH {
         let (header, stored) = fetch_raw(current_id)?;
+        let decode_max = if depth == 0 {
+            max.min(codec::HARD_LOGICAL_RECORD_BYTES)
+        } else {
+            codec::HARD_LOGICAL_RECORD_BYTES
+        };
+        let logical_length =
+            usize::try_from(header.logical_length).map_err(|_| ContentStoreError::TooLarge {
+                id: current_id,
+                max: decode_max,
+                minimum: codec::HARD_LOGICAL_RECORD_BYTES.saturating_add(1),
+            })?;
+        if logical_length > decode_max {
+            return Err(ContentStoreError::TooLarge {
+                id: current_id,
+                max: decode_max,
+                minimum: logical_length,
+            });
+        }
 
-        match codec::decode_payload(header.codec, stored, header.logical_length, usize::MAX)
-            .map_err(|e| codec_error(current_id, max, e))?
+        match codec::decode_payload(header.codec, stored, header.logical_length, decode_max)
+            .map_err(|e| codec_error(current_id, decode_max, e))?
         {
             codec::DecodedPayload::Content(bytes) => {
-                // Non-delta codec — this is the base of the chain.
-                if chain.is_empty() {
-                    // No delta chain at all — direct content.
-                    if bytes.len() > max {
-                        return Err(ContentStoreError::TooLarge {
-                            id,
-                            max,
-                            minimum: bytes.len(),
-                        });
-                    }
-                    let actual = ContentId::of(&bytes);
-                    if actual != id {
+                // The terminal base is content-addressed too. Verify it before
+                // trusting it as input to any patch in the chain.
+                let actual = ContentId::of(&bytes);
+                if actual != current_id {
+                    return Err(ContentStoreError::Corrupt {
+                        expected: current_id,
+                        actual,
+                    });
+                }
+
+                let mut result = bytes;
+                for (link_index, (target_id, expected_size, patch)) in
+                    chain.iter().rev().enumerate()
+                {
+                    let result_limit = if link_index + 1 == chain.len() {
+                        max.min(codec::HARD_LOGICAL_RECORD_BYTES)
+                    } else {
+                        codec::HARD_LOGICAL_RECORD_BYTES
+                    };
+                    result = delta::apply_delta(&result, patch, *expected_size, result_limit)
+                        .map_err(|e| ContentStoreError::DeltaResolution {
+                            id: *target_id,
+                            reason: e.to_string(),
+                        })?;
+                    let actual = ContentId::of(&result);
+                    if actual != *target_id {
                         return Err(ContentStoreError::Corrupt {
-                            expected: id,
+                            expected: *target_id,
                             actual,
                         });
                     }
-                    return Ok(bytes);
-                }
-                // Apply patches in reverse order (base → target).
-                let mut result = bytes;
-                for patch in chain.iter().rev() {
-                    result = delta::apply_delta(&result, patch).map_err(|e| {
-                        ContentStoreError::DeltaResolution {
-                            id,
-                            reason: e.to_string(),
-                        }
-                    })?;
-                }
-                if result.len() > max {
-                    return Err(ContentStoreError::TooLarge {
-                        id,
-                        max,
-                        minimum: result.len(),
-                    });
-                }
-                let actual = ContentId::of(&result);
-                if actual != id {
-                    return Err(ContentStoreError::Corrupt {
-                        expected: id,
-                        actual,
-                    });
                 }
                 return Ok(result);
             }
@@ -198,7 +209,7 @@ pub(crate) fn resolve_delta_chain(
                 if depth == MAX_DELTA_CHAIN_DEPTH {
                     return Err(ContentStoreError::DeltaChainTooDeep { id });
                 }
-                chain.push(patch);
+                chain.push((current_id, logical_length, patch));
                 current_id = base_id;
             }
         }
@@ -702,7 +713,51 @@ fn nonempty_path(path: &Path) -> &Path {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    fn raw_envelope(bytes: &[u8]) -> (codec::EnvelopeHeader, Vec<u8>) {
+        (
+            codec::EnvelopeHeader {
+                codec: codec::Codec::Raw,
+                stored_length: bytes.len() as u64,
+                logical_length: bytes.len() as u64,
+            },
+            bytes.to_vec(),
+        )
+    }
+
+    fn delta_envelope(
+        base_id: ContentId,
+        target_length: usize,
+        patch: Vec<u8>,
+    ) -> (codec::EnvelopeHeader, Vec<u8>) {
+        let mut stored = Vec::with_capacity(crate::delta::BASE_REFERENCE_SIZE + patch.len());
+        stored.extend_from_slice(base_id.as_bytes());
+        stored.extend_from_slice(&patch);
+        (
+            codec::EnvelopeHeader {
+                codec: codec::Codec::Delta,
+                stored_length: stored.len() as u64,
+                logical_length: target_length as u64,
+            },
+            stored,
+        )
+    }
+
+    fn resolve_from(
+        envelopes: HashMap<ContentId, (codec::EnvelopeHeader, Vec<u8>)>,
+        id: ContentId,
+        max: usize,
+    ) -> Result<Vec<u8>, ContentStoreError> {
+        resolve_delta_chain(id, max, |current_id| {
+            envelopes
+                .get(&current_id)
+                .cloned()
+                .ok_or(ContentStoreError::Missing(current_id))
+        })
+    }
 
     #[test]
     fn exact_content_reader_detects_shrink_and_growth() {
@@ -718,6 +773,153 @@ mod tests {
         assert_eq!(
             read_exact_content(&mut &b"exact"[..], id, 5).unwrap(),
             b"exact"
+        );
+    }
+
+    #[test]
+    fn delta_resolution_allows_large_base_for_small_bounded_target() {
+        let base = b"large base that is larger than the requested target";
+        let target = b"small";
+        let base_id = ContentId::of(base);
+        let target_id = ContentId::of(target);
+        let patch = crate::delta::compute_delta(base, target).unwrap_or_else(|| {
+            // Git delta: base length, target length, then a five-byte literal.
+            vec![
+                base.len() as u8,
+                target.len() as u8,
+                target.len() as u8,
+                b's',
+                b'm',
+                b'a',
+                b'l',
+                b'l',
+            ]
+        });
+        let envelopes = HashMap::from([
+            (base_id, raw_envelope(base)),
+            (target_id, delta_envelope(base_id, target.len(), patch)),
+        ]);
+
+        assert_eq!(
+            resolve_from(envelopes, target_id, target.len()).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn delta_resolution_enforces_request_boundary_before_patch_allocation() {
+        let base = b"base";
+        let target = b"base!";
+        let base_id = ContentId::of(base);
+        let target_id = ContentId::of(target);
+        // The patch body is immaterial: the envelope target is rejected first.
+        let envelopes = HashMap::from([
+            (base_id, raw_envelope(base)),
+            (target_id, delta_envelope(base_id, target.len(), vec![4, 5])),
+        ]);
+
+        assert!(matches!(
+            resolve_from(envelopes, target_id, target.len() - 1),
+            Err(ContentStoreError::TooLarge { id, max: 4, minimum: 5 }) if id == target_id
+        ));
+    }
+
+    #[test]
+    fn delta_resolution_rejects_patch_and_envelope_target_mismatch() {
+        let base = b"base";
+        let target_id = ContentId::of(b"base!");
+        let base_id = ContentId::of(base);
+        // Patch declares four output bytes while the envelope authenticates five.
+        let envelopes = HashMap::from([
+            (base_id, raw_envelope(base)),
+            (target_id, delta_envelope(base_id, 5, vec![4, 4, 0x90, 4])),
+        ]);
+
+        assert!(matches!(
+            resolve_from(envelopes, target_id, 5),
+            Err(ContentStoreError::DeltaResolution { .. })
+        ));
+    }
+
+    #[test]
+    fn delta_resolution_enforces_hard_limit_even_with_unbounded_request() {
+        let base_id = ContentId::of(b"base");
+        let target_id = ContentId::of(b"target");
+        let mut envelope = delta_envelope(base_id, 0, vec![4, 0]);
+        envelope.0.logical_length = codec::HARD_LOGICAL_RECORD_BYTES as u64 + 1;
+        let envelopes = HashMap::from([(target_id, envelope)]);
+
+        assert!(matches!(
+            resolve_from(envelopes, target_id, usize::MAX),
+            Err(ContentStoreError::TooLarge { id, minimum, .. })
+                if id == target_id && minimum == codec::HARD_LOGICAL_RECORD_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn delta_resolution_rejects_wrong_base_even_when_patch_replaces_every_byte() {
+        let base_id = ContentId::of(b"good");
+        let target = b"small";
+        let target_id = ContentId::of(target);
+        let patch = vec![4, 5, 5, b's', b'm', b'a', b'l', b'l'];
+        let envelopes = HashMap::from([
+            (base_id, raw_envelope(b"evil")),
+            (target_id, delta_envelope(base_id, target.len(), patch)),
+        ]);
+        assert!(matches!(
+            resolve_from(envelopes, target_id, target.len()),
+            Err(ContentStoreError::Corrupt { expected, .. }) if expected == base_id
+        ));
+    }
+
+    #[test]
+    fn delta_resolution_rejects_wrong_intermediate_even_when_final_patch_ignores_it() {
+        let base_id = ContentId::of(b"base");
+        let middle_id = ContentId::of(b"good");
+        let target = b"small";
+        let target_id = ContentId::of(target);
+        let envelopes = HashMap::from([
+            (base_id, raw_envelope(b"base")),
+            (
+                middle_id,
+                delta_envelope(base_id, 4, vec![4, 4, 4, b'e', b'v', b'i', b'l']),
+            ),
+            (
+                target_id,
+                delta_envelope(middle_id, 5, vec![4, 5, 5, b's', b'm', b'a', b'l', b'l']),
+            ),
+        ]);
+        assert!(matches!(
+            resolve_from(envelopes, target_id, target.len()),
+            Err(ContentStoreError::Corrupt { expected, .. }) if expected == middle_id
+        ));
+    }
+
+    #[test]
+    fn delta_resolution_verifies_each_link_and_resolves_valid_chain() {
+        let base = b"the quick brown fox jumps over the lazy dog".repeat(4);
+        let middle = [base.as_slice(), b" middle"].concat();
+        let target = [middle.as_slice(), b" target"].concat();
+        let base_id = ContentId::of(&base);
+        let middle_id = ContentId::of(&middle);
+        let target_id = ContentId::of(&target);
+        let middle_patch = crate::delta::compute_delta(&base, &middle).unwrap();
+        let target_patch = crate::delta::compute_delta(&middle, &target).unwrap();
+        let envelopes = HashMap::from([
+            (base_id, raw_envelope(&base)),
+            (
+                middle_id,
+                delta_envelope(base_id, middle.len(), middle_patch),
+            ),
+            (
+                target_id,
+                delta_envelope(middle_id, target.len(), target_patch),
+            ),
+        ]);
+
+        assert_eq!(
+            resolve_from(envelopes, target_id, target.len()).unwrap(),
+            target
         );
     }
 }

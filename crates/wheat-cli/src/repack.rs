@@ -113,6 +113,9 @@ pub(crate) struct RepackOutput {
     delta_content_after: u64,
     max_delta_depth_before: u8,
     max_delta_depth_after: u8,
+    metadata_delta_records: u64,
+    max_metadata_delta_depth: u8,
+    loose_metadata_absorbed: u64,
     estimated_temporary_bytes: u64,
     available_temporary_bytes: Option<u64>,
     capacity_forced: bool,
@@ -152,6 +155,9 @@ impl RepackOutput {
             delta_content_after: report.delta_content_after,
             max_delta_depth_before: report.max_delta_depth_before,
             max_delta_depth_after: report.max_delta_depth_after,
+            metadata_delta_records: report.metadata_delta_records,
+            max_metadata_delta_depth: report.max_metadata_delta_depth,
+            loose_metadata_absorbed: report.loose_metadata_absorbed,
             estimated_temporary_bytes: report.estimated_temporary_bytes,
             available_temporary_bytes: None,
             capacity_forced: false,
@@ -253,7 +259,7 @@ fn format_report(report: &RepackOutput) -> String {
         )
     };
     format!(
-        "{first}\nsegments {} -> {}; physical bytes {} -> {}\ncontent full/delta {}/{} -> {}/{}; max delta depth {} -> {}\nrepository generation {} and envelope {} unchanged; logical objects/content preserved\n",
+        "{first}\nsegments {} -> {}; physical bytes {} -> {}\ncontent full/delta {}/{} -> {}/{}; max delta depth {} -> {}\nmetadata deltas {} (max depth {}); loose metadata absorbed {}\nrepository generation {} and envelope {} unchanged; logical objects/content preserved\n",
         report.segments_before,
         report.segments_after,
         report.physical_bytes_before,
@@ -264,6 +270,9 @@ fn format_report(report: &RepackOutput) -> String {
         report.delta_content_after,
         report.max_delta_depth_before,
         report.max_delta_depth_after,
+        report.metadata_delta_records,
+        report.max_metadata_delta_depth,
+        report.loose_metadata_absorbed,
         report.repository_generation,
         report.envelope_before,
     )
@@ -317,6 +326,9 @@ mod tests {
                 delta_content_after: 8,
                 max_delta_depth_before: 5,
                 max_delta_depth_after: 2,
+                metadata_delta_records: 7,
+                max_metadata_delta_depth: 3,
+                loose_metadata_absorbed: 10,
                 estimated_temporary_bytes: 0,
                 available_temporary_bytes: None,
                 capacity_forced: false,
@@ -384,5 +396,19 @@ mod tests {
         assert_eq!(success.result["capacity_forced"], true);
         assert_eq!(backend.executions.get(), 1);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn report_shows_metadata_delta_statistics() {
+        let report = fixture().report.take().unwrap();
+        let text = format_report(&report);
+        assert!(
+            text.contains("\nmetadata deltas 7 (max depth 3); loose metadata absorbed 10\n"),
+            "{text}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["metadata_delta_records"], 7);
+        assert_eq!(json["max_metadata_delta_depth"], 3);
+        assert_eq!(json["loose_metadata_absorbed"], 10);
     }
 }

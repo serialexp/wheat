@@ -19,11 +19,10 @@ pub enum WheatObject {
     ConflictV1(ConflictV1Output),
     ViewV1(ViewV1Output),
     ContentManifestV1(ContentManifestV1Output),
-    RepositoryStateV3(RepositoryStateV3Output),
+    RepositoryStateV1(RepositoryStateV1Output),
     RevisionMapNodeV1(RevisionMapNodeV1Output),
     ApplicationMapNodeV1(ApplicationMapNodeV1Output),
     ConflictSetNodeV1(ConflictSetNodeV1Output),
-    ContentSetNodeV1(ContentSetNodeV1Output),
     ContentSetSnapshotV1(ContentSetSnapshotV1Output),
     ContentSetDeltaV1(ContentSetDeltaV1Output),
     RetainedSetNodeV1(RetainedSetNodeV1Output),
@@ -105,7 +104,7 @@ impl WheatObject {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 v.content.encode_into(encoder)?;
             }
-            WheatObject::RepositoryStateV3(v) => {
+            WheatObject::RepositoryStateV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 v.base_view.encode_into(encoder)?;
                 v.changes.encode_into(encoder)?;
@@ -155,22 +154,6 @@ impl WheatObject {
                 }
             }
             WheatObject::ConflictSetNodeV1(v) => {
-                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
-                for item in &v.prefix {
-                    encoder.write_uint8(*item);
-                }
-                encoder.write_uint8(if v.present { 1 } else { 0 });
-                encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
-                for item in &v.children {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
-                for item in &v.entries {
-                    item.encode_into(encoder)?;
-                }
-            }
-            WheatObject::ContentSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
                 for item in &v.prefix {
@@ -320,9 +303,9 @@ impl WheatObject {
             Ok(WheatObject::ContentManifestV1(
                 ContentManifestV1Output::decode_with_decoder(decoder)?,
             ))
-        } else if value == 0x0803 {
-            Ok(WheatObject::RepositoryStateV3(
-                RepositoryStateV3Output::decode_with_decoder(decoder)?,
+        } else if value == 0x0801 {
+            Ok(WheatObject::RepositoryStateV1(
+                RepositoryStateV1Output::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x0901 {
             Ok(WheatObject::RevisionMapNodeV1(
@@ -335,10 +318,6 @@ impl WheatObject {
         } else if value == 0x0b01 {
             Ok(WheatObject::ConflictSetNodeV1(
                 ConflictSetNodeV1Output::decode_with_decoder(decoder)?,
-            ))
-        } else if value == 0x0c01 {
-            Ok(WheatObject::ContentSetNodeV1(
-                ContentSetNodeV1Output::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x0c02 {
             Ok(WheatObject::ContentSetSnapshotV1(
@@ -4129,156 +4108,6 @@ impl ConflictSetChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContentSetNodeV1Input {
-    pub prefix: Vec<u8>,
-    pub present: bool,
-    pub children: Vec<ContentSetChildV1>,
-    pub entries: Vec<SetEntryV1>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentSetNodeV1Output {
-    pub wire_tag: u16,
-    pub prefix: Vec<u8>,
-    pub present: bool,
-    pub children: Vec<ContentSetChildV1>,
-    pub entries: Vec<SetEntryV1>,
-}
-
-pub type ContentSetNodeV1 = ContentSetNodeV1Output;
-
-impl ContentSetNodeV1Input {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u16_be(3073);
-        encoder.write_u32_be(self.prefix.len() as u32);
-        for item in &self.prefix {
-            encoder.write_byte(*item);
-        }
-        encoder.write_byte(if self.present { 1 } else { 0 });
-        encoder.write_u32_be(self.children.len() as u32);
-        for item in &self.children {
-            item.encode_into(encoder)?;
-        }
-        encoder.write_u32_be(self.entries.len() as u32);
-        for item in &self.entries {
-            item.encode_into(encoder)?;
-        }
-        Ok(())
-    }
-}
-
-impl ContentSetNodeV1Output {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let wire_tag = decoder.read_u16_be()?;
-        if wire_tag != 3073u16 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 3073, got {}",
-                wire_tag
-            )));
-        }
-        let length = decoder.read_u32_be()? as usize;
-        let mut prefix = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            prefix.push(item);
-        }
-        let present = decoder.read_byte()? != 0;
-        let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = ContentSetChildV1::decode_with_decoder(decoder)?;
-            children.push(item);
-        }
-        let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = SetEntryV1::decode_with_decoder(decoder)?;
-            entries.push(item);
-        }
-        Ok(Self {
-            wire_tag,
-            prefix,
-            present,
-            children,
-            entries,
-        })
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        ContentSetNodeV1Input::from(self.clone()).encode()
-    }
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ContentSetNodeV1Input::from(self.clone()).encode_into(encoder)
-    }
-}
-
-impl From<ContentSetNodeV1Output> for ContentSetNodeV1Input {
-    fn from(o: ContentSetNodeV1Output) -> Self {
-        Self {
-            prefix: o.prefix,
-            present: o.present,
-            children: o.children,
-            entries: o.entries,
-        }
-    }
-}
-
-impl From<ContentSetNodeV1Input> for ContentSetNodeV1Output {
-    fn from(i: ContentSetNodeV1Input) -> Self {
-        Self {
-            wire_tag: 3073u16,
-            prefix: i.prefix,
-            present: i.present,
-            children: i.children,
-            entries: i.entries,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentSetChildV1 {
-    pub edge: u8,
-    pub child: ContentSetId,
-}
-
-impl ContentSetChildV1 {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_byte(self.edge);
-        self.child.encode_into(encoder)?;
-        Ok(())
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let edge = decoder.read_byte()?;
-        let child = ContentSetId::decode_with_decoder(decoder)?;
-        Ok(Self { edge, child })
-    }
-}
-
-// --- ContentSetSnapshotV1 ---
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct ContentSetSnapshotV1Input {
     pub members: Vec<ContentId>,
 }
@@ -4299,7 +4128,7 @@ impl ContentSetSnapshotV1Input {
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u16_be(0x0c02);
+        encoder.write_u16_be(3074);
         encoder.write_u32_be(self.members.len() as u32);
         for item in &self.members {
             item.encode_into(encoder)?;
@@ -4316,9 +4145,9 @@ impl ContentSetSnapshotV1Output {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let wire_tag = decoder.read_u16_be()?;
-        if wire_tag != 0x0c02u16 {
+        if wire_tag != 3074u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 0x0c02, got {}",
+                "expected 3074, got {}",
                 wire_tag
             )));
         }
@@ -4347,13 +4176,11 @@ impl From<ContentSetSnapshotV1Output> for ContentSetSnapshotV1Input {
 impl From<ContentSetSnapshotV1Input> for ContentSetSnapshotV1Output {
     fn from(i: ContentSetSnapshotV1Input) -> Self {
         Self {
-            wire_tag: 0x0c02u16,
+            wire_tag: 3074u16,
             members: i.members,
         }
     }
 }
-
-// --- ContentSetDeltaV1 ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentSetDeltaV1Input {
@@ -4380,7 +4207,7 @@ impl ContentSetDeltaV1Input {
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u16_be(0x0c03);
+        encoder.write_u16_be(3075);
         self.base.encode_into(encoder)?;
         encoder.write_u32_be(self.added.len() as u32);
         for item in &self.added {
@@ -4402,9 +4229,9 @@ impl ContentSetDeltaV1Output {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let wire_tag = decoder.read_u16_be()?;
-        if wire_tag != 0x0c03u16 {
+        if wire_tag != 3075u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 0x0c03, got {}",
+                "expected 3075, got {}",
                 wire_tag
             )));
         }
@@ -4449,7 +4276,7 @@ impl From<ContentSetDeltaV1Output> for ContentSetDeltaV1Input {
 impl From<ContentSetDeltaV1Input> for ContentSetDeltaV1Output {
     fn from(i: ContentSetDeltaV1Input) -> Self {
         Self {
-            wire_tag: 0x0c03u16,
+            wire_tag: 3075u16,
             base: i.base,
             added: i.added,
             removed: i.removed,
@@ -4642,7 +4469,7 @@ impl SetEntryV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RepositoryStateV3Input {
+pub struct RepositoryStateV1Input {
     pub base_view: ViewId,
     pub changes: ChangeMapId,
     pub view_lineage: ViewLineageMapId,
@@ -4654,7 +4481,7 @@ pub struct RepositoryStateV3Input {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RepositoryStateV3Output {
+pub struct RepositoryStateV1Output {
     pub wire_tag: u16,
     pub base_view: ViewId,
     pub changes: ChangeMapId,
@@ -4666,9 +4493,9 @@ pub struct RepositoryStateV3Output {
     pub retained_applications: RetainedSetId,
 }
 
-pub type RepositoryStateV3 = RepositoryStateV3Output;
+pub type RepositoryStateV1 = RepositoryStateV1Output;
 
-impl RepositoryStateV3Input {
+impl RepositoryStateV1Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4676,7 +4503,7 @@ impl RepositoryStateV3Input {
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u16_be(2051);
+        encoder.write_u16_be(2049);
         self.base_view.encode_into(encoder)?;
         self.changes.encode_into(encoder)?;
         self.view_lineage.encode_into(encoder)?;
@@ -4689,7 +4516,7 @@ impl RepositoryStateV3Input {
     }
 }
 
-impl RepositoryStateV3Output {
+impl RepositoryStateV1Output {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
         Self::decode_with_decoder(&mut decoder)
@@ -4697,9 +4524,9 @@ impl RepositoryStateV3Output {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let wire_tag = decoder.read_u16_be()?;
-        if wire_tag != 2051u16 {
+        if wire_tag != 2049u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 2051, got {}",
+                "expected 2049, got {}",
                 wire_tag
             )));
         }
@@ -4724,15 +4551,15 @@ impl RepositoryStateV3Output {
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
-        RepositoryStateV3Input::from(self.clone()).encode()
+        RepositoryStateV1Input::from(self.clone()).encode()
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        RepositoryStateV3Input::from(self.clone()).encode_into(encoder)
+        RepositoryStateV1Input::from(self.clone()).encode_into(encoder)
     }
 }
 
-impl From<RepositoryStateV3Output> for RepositoryStateV3Input {
-    fn from(o: RepositoryStateV3Output) -> Self {
+impl From<RepositoryStateV1Output> for RepositoryStateV1Input {
+    fn from(o: RepositoryStateV1Output) -> Self {
         Self {
             base_view: o.base_view,
             changes: o.changes,
@@ -4746,10 +4573,10 @@ impl From<RepositoryStateV3Output> for RepositoryStateV3Input {
     }
 }
 
-impl From<RepositoryStateV3Input> for RepositoryStateV3Output {
-    fn from(i: RepositoryStateV3Input) -> Self {
+impl From<RepositoryStateV1Input> for RepositoryStateV1Output {
+    fn from(i: RepositoryStateV1Input) -> Self {
         Self {
-            wire_tag: 2051u16,
+            wire_tag: 2049u16,
             base_view: i.base_view,
             changes: i.changes,
             view_lineage: i.view_lineage,
@@ -5415,6 +5242,8 @@ pub struct SegmentIndexEntryV1 {
     pub codec: u8,
     pub stored_length: u64,
     pub logical_length: u64,
+    pub delta_base: Option<Digest256>,
+    pub delta_depth: u8,
 }
 
 impl SegmentIndexEntryV1 {
@@ -5432,6 +5261,13 @@ impl SegmentIndexEntryV1 {
         encoder.write_byte(self.codec);
         encoder.write_u64_be(self.stored_length);
         encoder.write_u64_be(self.logical_length);
+        if let Some(ref v) = self.delta_base {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        encoder.write_byte(self.delta_depth);
         Ok(())
     }
 
@@ -5448,6 +5284,13 @@ impl SegmentIndexEntryV1 {
         let codec = decoder.read_byte()?;
         let stored_length = decoder.read_u64_be()?;
         let logical_length = decoder.read_u64_be()?;
+        let has_value = decoder.read_uint8()? != 0;
+        let delta_base = if has_value {
+            Some(Digest256::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let delta_depth = decoder.read_byte()?;
         Ok(Self {
             namespace,
             kind,
@@ -5456,6 +5299,8 @@ impl SegmentIndexEntryV1 {
             codec,
             stored_length,
             logical_length,
+            delta_base,
+            delta_depth,
         })
     }
 }
@@ -5751,7 +5596,7 @@ impl SegmentCatalogRecordV1Input {
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u32_be(1464353620);
+        encoder.write_u32_be(1464353618);
         encoder.write_u16_be(1);
         encoder.write_u64_be(self.generation);
         if let Some(ref v) = self.previous {
@@ -5774,9 +5619,9 @@ impl SegmentCatalogRecordV1Output {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let magic = decoder.read_u32_be()?;
-        if magic != 1464353620u32 {
+        if magic != 1464353618u32 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 1464353620, got {}",
+                "expected 1464353618, got {}",
                 magic
             )));
         }
@@ -5827,12 +5672,523 @@ impl From<SegmentCatalogRecordV1Output> for SegmentCatalogRecordV1Input {
 impl From<SegmentCatalogRecordV1Input> for SegmentCatalogRecordV1Output {
     fn from(i: SegmentCatalogRecordV1Input) -> Self {
         Self {
-            magic: 1464353620u32,
+            magic: 1464353618u32,
             version: 1u16,
             generation: i.generation,
             previous: i.previous,
             segment: i.segment,
             stored_length: i.stored_length,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalCatalogSnapshotV1Input {
+    pub generation: u64,
+    pub segments: Vec<PhysicalSegmentDescriptorV1>,
+    pub content: PhysicalContentGenerationV1,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalCatalogSnapshotV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub generation: u64,
+    pub segments: Vec<PhysicalSegmentDescriptorV1>,
+    pub content: PhysicalContentGenerationV1,
+}
+
+pub type PhysicalCatalogSnapshotV1 = PhysicalCatalogSnapshotV1Output;
+
+impl PhysicalCatalogSnapshotV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353620);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.generation);
+        encoder.write_u32_be(self.segments.len() as u32);
+        for item in &self.segments {
+            item.encode_into(encoder)?;
+        }
+        self.content.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl PhysicalCatalogSnapshotV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353620u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353620, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let generation = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut segments = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = PhysicalSegmentDescriptorV1::decode_with_decoder(decoder)?;
+            segments.push(item);
+        }
+        let content = PhysicalContentGenerationV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            generation,
+            segments,
+            content,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        PhysicalCatalogSnapshotV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        PhysicalCatalogSnapshotV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<PhysicalCatalogSnapshotV1Output> for PhysicalCatalogSnapshotV1Input {
+    fn from(o: PhysicalCatalogSnapshotV1Output) -> Self {
+        Self {
+            generation: o.generation,
+            segments: o.segments,
+            content: o.content,
+        }
+    }
+}
+
+impl From<PhysicalCatalogSnapshotV1Input> for PhysicalCatalogSnapshotV1Output {
+    fn from(i: PhysicalCatalogSnapshotV1Input) -> Self {
+        Self {
+            magic: 1464353620u32,
+            version: 1u16,
+            generation: i.generation,
+            segments: i.segments,
+            content: i.content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalSegmentDescriptorV1 {
+    pub generation: u64,
+    pub sequence: u64,
+    pub segment: Digest256,
+    pub stored_length: u64,
+}
+
+impl PhysicalSegmentDescriptorV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be(self.generation);
+        encoder.write_u64_be(self.sequence);
+        self.segment.encode_into(encoder)?;
+        encoder.write_u64_be(self.stored_length);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let generation = decoder.read_u64_be()?;
+        let sequence = decoder.read_u64_be()?;
+        let segment = Digest256::decode_with_decoder(decoder)?;
+        let stored_length = decoder.read_u64_be()?;
+        Ok(Self {
+            generation,
+            sequence,
+            segment,
+            stored_length,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalContentGenerationV1 {
+    pub generation: u64,
+    pub manifest: Digest256,
+}
+
+impl PhysicalContentGenerationV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be(self.generation);
+        self.manifest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let generation = decoder.read_u64_be()?;
+        let manifest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            generation,
+            manifest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationEntryV1 {
+    pub id: ContentId,
+    pub envelope_digest: Digest256,
+    pub pack_offset: u64,
+    pub physical_length: u64,
+    pub logical_length: u64,
+    pub delta_base: Option<ContentId>,
+    pub delta_depth: u8,
+}
+
+impl ContentGenerationEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.id.encode_into(encoder)?;
+        self.envelope_digest.encode_into(encoder)?;
+        encoder.write_u64_be(self.pack_offset);
+        encoder.write_u64_be(self.physical_length);
+        encoder.write_u64_be(self.logical_length);
+        if let Some(ref v) = self.delta_base {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        encoder.write_byte(self.delta_depth);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let id = ContentId::decode_with_decoder(decoder)?;
+        let envelope_digest = Digest256::decode_with_decoder(decoder)?;
+        let pack_offset = decoder.read_u64_be()?;
+        let physical_length = decoder.read_u64_be()?;
+        let logical_length = decoder.read_u64_be()?;
+        let has_value = decoder.read_uint8()? != 0;
+        let delta_base = if has_value {
+            Some(ContentId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let delta_depth = decoder.read_byte()?;
+        Ok(Self {
+            id,
+            envelope_digest,
+            pack_offset,
+            physical_length,
+            logical_length,
+            delta_base,
+            delta_depth,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationShardRefV1 {
+    pub first_id: ContentId,
+    pub entry_count: u32,
+    pub pack_length: u64,
+    pub manifest: Digest256,
+}
+
+impl ContentGenerationShardRefV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.first_id.encode_into(encoder)?;
+        encoder.write_u32_be(self.entry_count);
+        encoder.write_u64_be(self.pack_length);
+        self.manifest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let first_id = ContentId::decode_with_decoder(decoder)?;
+        let entry_count = decoder.read_u32_be()?;
+        let pack_length = decoder.read_u64_be()?;
+        let manifest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            first_id,
+            entry_count,
+            pack_length,
+            manifest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationManifestV1Input {
+    pub generation: u64,
+    pub entry_count: u64,
+    pub shards: Vec<ContentGenerationShardRefV1>,
+    pub content_fingerprint: Digest256,
+    pub manifest_digest: Digest256,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationManifestV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub generation: u64,
+    pub entry_count: u64,
+    pub shards: Vec<ContentGenerationShardRefV1>,
+    pub content_fingerprint: Digest256,
+    pub manifest_digest: Digest256,
+}
+
+pub type ContentGenerationManifestV1 = ContentGenerationManifestV1Output;
+
+impl ContentGenerationManifestV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353613);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.generation);
+        encoder.write_u64_be(self.entry_count);
+        encoder.write_u32_be(self.shards.len() as u32);
+        for item in &self.shards {
+            item.encode_into(encoder)?;
+        }
+        self.content_fingerprint.encode_into(encoder)?;
+        self.manifest_digest.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl ContentGenerationManifestV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353613u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353613, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let generation = decoder.read_u64_be()?;
+        let entry_count = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut shards = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ContentGenerationShardRefV1::decode_with_decoder(decoder)?;
+            shards.push(item);
+        }
+        let content_fingerprint = Digest256::decode_with_decoder(decoder)?;
+        let manifest_digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            generation,
+            entry_count,
+            shards,
+            content_fingerprint,
+            manifest_digest,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentGenerationManifestV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentGenerationManifestV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentGenerationManifestV1Output> for ContentGenerationManifestV1Input {
+    fn from(o: ContentGenerationManifestV1Output) -> Self {
+        Self {
+            generation: o.generation,
+            entry_count: o.entry_count,
+            shards: o.shards,
+            content_fingerprint: o.content_fingerprint,
+            manifest_digest: o.manifest_digest,
+        }
+    }
+}
+
+impl From<ContentGenerationManifestV1Input> for ContentGenerationManifestV1Output {
+    fn from(i: ContentGenerationManifestV1Input) -> Self {
+        Self {
+            magic: 1464353613u32,
+            version: 1u16,
+            generation: i.generation,
+            entry_count: i.entry_count,
+            shards: i.shards,
+            content_fingerprint: i.content_fingerprint,
+            manifest_digest: i.manifest_digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationShardV1Input {
+    pub generation: u64,
+    pub shard: u32,
+    pub entries: Vec<ContentGenerationEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationShardV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub generation: u64,
+    pub shard: u32,
+    pub entries: Vec<ContentGenerationEntryV1>,
+}
+
+pub type ContentGenerationShardV1 = ContentGenerationShardV1Output;
+
+impl ContentGenerationShardV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353619);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.generation);
+        encoder.write_u32_be(self.shard);
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ContentGenerationShardV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353619u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353619, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let generation = decoder.read_u64_be()?;
+        let shard = decoder.read_u32_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = ContentGenerationEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            generation,
+            shard,
+            entries,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentGenerationShardV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentGenerationShardV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentGenerationShardV1Output> for ContentGenerationShardV1Input {
+    fn from(o: ContentGenerationShardV1Output) -> Self {
+        Self {
+            generation: o.generation,
+            shard: o.shard,
+            entries: o.entries,
+        }
+    }
+}
+
+impl From<ContentGenerationShardV1Input> for ContentGenerationShardV1Output {
+    fn from(i: ContentGenerationShardV1Input) -> Self {
+        Self {
+            magic: 1464353619u32,
+            version: 1u16,
+            generation: i.generation,
+            shard: i.shard,
+            entries: i.entries,
         }
     }
 }

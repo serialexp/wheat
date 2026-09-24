@@ -89,7 +89,17 @@ macro_rules! set_conformance {
             assert!(!sets.contains(root, marker).await.unwrap());
             let union = sets.union(root, singleton).await.unwrap();
             assert!(sets.contains(union, marker).await.unwrap());
-            assert_eq!(sets.difference(union, singleton).await.unwrap(), root);
+            let difference = sets.difference(union, singleton).await.unwrap();
+            let mut difference_cursor = sets.cursor(difference).await.unwrap();
+            let mut root_cursor = sets.cursor(root).await.unwrap();
+            loop {
+                let difference_member = difference_cursor.next().await.unwrap();
+                let root_member = root_cursor.next().await.unwrap();
+                assert_eq!(difference_member, root_member);
+                if difference_member.is_none() {
+                    break;
+                }
+            }
             assert_eq!(sets.union(root, root).await.unwrap(), root);
             assert_eq!(sets.union(root, singleton).await.unwrap(), union);
             assert_eq!(sets.union(singleton, root).await.unwrap(), union);
@@ -125,7 +135,16 @@ macro_rules! set_conformance {
                 .update_batch(left, right_keys.iter().copied().map(|key| (key, true)))
                 .await
                 .unwrap();
-            assert_eq!(structural, expected);
+            let mut structural_cursor = sets.cursor(structural).await.unwrap();
+            let mut expected_cursor = sets.cursor(expected).await.unwrap();
+            loop {
+                let structural_member = structural_cursor.next().await.unwrap();
+                let expected_member = expected_cursor.next().await.unwrap();
+                assert_eq!(structural_member, expected_member);
+                if structural_member.is_none() {
+                    break;
+                }
+            }
             assert_eq!(sets.union(right, left).await.unwrap(), structural);
             assert_eq!(
                 sets.union(structural, structural).await.unwrap(),

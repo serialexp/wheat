@@ -2191,9 +2191,9 @@ fn cleanup_aborted(
     cleanup_abandoned_transaction(root, journal.transaction_id, tx)
 }
 
-/// Remove authenticated displaced leaves only after durable commit (the metadata
-/// publication for legacy/in-flight materializations or the progress completion
-/// record), then remove the journal that makes the transaction recoverable.
+/// Remove authenticated displaced leaves only after durable commit (the progress
+/// completion record), then remove the journal that makes the transaction
+/// recoverable.
 fn cleanup_committed(
     root: &Path,
     repository: &LocalRepository,

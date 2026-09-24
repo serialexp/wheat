@@ -61,7 +61,7 @@ async fn digest_set_batches_write_only_changed_snapshots() {
         .update_batch(empty, [(a, true), (b, true)])
         .await
         .unwrap();
-    // With flat blobs: one snapshot object written.
+    // A tiny set is cheaper as one snapshot than as a delta with a base reference.
     assert_eq!(objects.reset(), 1, "one snapshot with two members");
     // No-op edit produces the same root, no writes.
     assert_eq!(

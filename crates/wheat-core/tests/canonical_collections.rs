@@ -116,13 +116,6 @@ set_rules!(
     11
 );
 set_rules!(
-    content_set_rules,
-    ContentSetNode,
-    ContentSetChild,
-    decode_content_set_node,
-    12
-);
-set_rules!(
     retained_set_rules,
     RetainedSetNode,
     RetainedSetChild,

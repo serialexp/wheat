@@ -8,10 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     ApplicationId, ApplicationMapChild, ApplicationMapId, ApplicationMapNode, CanonicalObject,
     ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ConflictId,
-    ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentSetChild, ContentSetId,
-    ContentSetNode, ObjectId, RetainedSetChild, RetainedSetId, RetainedSetNode, RevisionId,
-    RevisionMapChild, RevisionMapId, RevisionMapNode, ViewId, ViewLineageMapChild,
-    ViewLineageMapId, ViewLineageMapNode,
+    ConflictSetChild, ConflictSetId, ConflictSetNode, ObjectId, RetainedSetChild, RetainedSetId,
+    RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapId, RevisionMapNode, ViewId,
+    ViewLineageMapChild, ViewLineageMapId, ViewLineageMapNode,
 };
 
 trait RadixShape {
@@ -278,13 +277,6 @@ set_shape!(
     ConflictSetChild
 );
 set_shape!(
-    ContentShape,
-    ContentId,
-    ContentSetId,
-    ContentSetNode,
-    ContentSetChild
-);
-set_shape!(
     RetainedShape,
     ObjectId,
     RetainedSetId,
@@ -380,5 +372,4 @@ macro_rules! set_builder {
 }
 
 set_builder!(build_conflict_set, ConflictId, ConflictSetId, ConflictShape);
-set_builder!(build_content_set, ContentId, ContentSetId, ContentShape);
 set_builder!(build_retained_set, ObjectId, RetainedSetId, RetainedShape);

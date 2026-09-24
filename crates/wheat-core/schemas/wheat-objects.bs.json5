@@ -27,11 +27,10 @@
         { type: "ConflictV1", when: "value == 0x0501" },
         { type: "ViewV1", when: "value == 0x0601" },
         { type: "ContentManifestV1", when: "value == 0x0701" },
-        { type: "RepositoryStateV3", when: "value == 0x0803" },
+        { type: "RepositoryStateV1", when: "value == 0x0801" },
         { type: "RevisionMapNodeV1", when: "value == 0x0901" },
         { type: "ApplicationMapNodeV1", when: "value == 0x0a01" },
         { type: "ConflictSetNodeV1", when: "value == 0x0b01" },
-        { type: "ContentSetNodeV1", when: "value == 0x0c01" },
         { type: "ContentSetSnapshotV1", when: "value == 0x0c02" },
         { type: "ContentSetDeltaV1", when: "value == 0x0c03" },
         { type: "RetainedSetNodeV1", when: "value == 0x0d01" },
@@ -451,22 +450,6 @@
       ],
     },
 
-    ContentSetNodeV1: {
-      sequence: [
-        { name: "wire_tag", type: "uint16", const: 0x0c01 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
-        { name: "present", type: "bool" },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentSetChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
-      ],
-    },
-    ContentSetChildV1: {
-      sequence: [
-        { name: "edge", type: "uint8" },
-        { name: "child", type: "ContentSetId" },
-      ],
-    },
-
     // Flat sorted blob of ContentId members — a full snapshot of content set membership.
     ContentSetSnapshotV1: {
       sequence: [
@@ -508,9 +491,9 @@
       ],
     },
 
-    RepositoryStateV3: {
+    RepositoryStateV1: {
       sequence: [
-        { name: "wire_tag", type: "uint16", const: 0x0803 },
+        { name: "wire_tag", type: "uint16", const: 0x0801 },
         { name: "base_view", type: "ViewId" },
         { name: "changes", type: "ChangeMapId" },
         { name: "view_lineage", type: "ViewLineageMapId" },
@@ -599,10 +582,16 @@
         { name: "digest", type: "Digest256" },
         { name: "offset", type: "uint64" },
         // Codec identity is part of every physical record. 0 = raw, 1 = one
-        // independent zstd frame. Identity remains over the logical bytes.
+        // independent zstd frame, 2 = git delta patch, 3 = zstd'd git delta
+        // patch, 4 = shared zstd block. Identity remains over the logical bytes.
         { name: "codec", type: "uint8" },
         { name: "stored_length", type: "uint64" },
         { name: "logical_length", type: "uint64" },
+        // Delta records (codecs 2 and 3, metadata only) name a base record in
+        // the same segment; depth is the base's depth plus one. Whole records
+        // have no base and depth zero.
+        { name: "delta_base", type: "optional", value_type: "Digest256" },
+        { name: "delta_depth", type: "uint8" },
       ],
     },
     SegmentIndexPageV1: {
@@ -641,14 +630,89 @@
         { name: "body_digest", type: "Digest256" },
       ],
     },
+    // Remote (object-store) packed catalog: one record per appended segment,
+    // chained through `previous`.
     SegmentCatalogRecordV1: {
       sequence: [
-        { name: "magic", type: "uint32", const: 0x57484354 },
+        { name: "magic", type: "uint32", const: 0x57484352 },
         { name: "version", type: "uint16", const: 1 },
         { name: "generation", type: "uint64" },
         { name: "previous", type: "optional", value_type: "Digest256" },
         { name: "segment", type: "Digest256" },
         { name: "stored_length", type: "uint64" },
+      ],
+    },
+    // Complete physical authority for the local packed-store catalog.
+    PhysicalCatalogSnapshotV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484354 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "generation", type: "uint64" },
+        { name: "segments", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "PhysicalSegmentDescriptorV1" } },
+        { name: "content", type: "PhysicalContentGenerationV1" },
+      ],
+    },
+    PhysicalSegmentDescriptorV1: {
+      sequence: [
+        { name: "generation", type: "uint64" },
+        { name: "sequence", type: "uint64" },
+        { name: "segment", type: "Digest256" },
+        { name: "stored_length", type: "uint64" },
+      ],
+    },
+    PhysicalContentGenerationV1: {
+      sequence: [
+        { name: "generation", type: "uint64" },
+        { name: "manifest", type: "Digest256" },
+      ],
+    },
+
+    // Physical content-repack manifests. These are outside WheatObject: they
+    // describe replaceable storage representation, not logical object identity.
+    // A generation is a top-level index of ID-range shards. Each shard has its
+    // own manifest and pack; entries are split in ID order into shards of
+    // exactly CONTENT_GENERATION_SHARD_ENTRIES (the last may hold fewer).
+    ContentGenerationEntryV1: {
+      sequence: [
+        { name: "id", type: "ContentId" },
+        { name: "envelope_digest", type: "Digest256" },
+        // Offset in this entry's shard pack. A delta base may live in any shard.
+        { name: "pack_offset", type: "uint64" },
+        { name: "physical_length", type: "uint64" },
+        { name: "logical_length", type: "uint64" },
+        { name: "delta_base", type: "optional", value_type: "ContentId" },
+        { name: "delta_depth", type: "uint8" },
+      ],
+    },
+    // One shard as the top-level index names it. `manifest` is the BLAKE3
+    // digest of the shard's encoded ContentGenerationShardV1.
+    ContentGenerationShardRefV1: {
+      sequence: [
+        { name: "first_id", type: "ContentId" },
+        { name: "entry_count", type: "uint32" },
+        { name: "pack_length", type: "uint64" },
+        { name: "manifest", type: "Digest256" },
+      ],
+    },
+    // Top-level generation index; the catalog names its BLAKE3 digest.
+    ContentGenerationManifestV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x5748434d },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "generation", type: "uint64" },
+        { name: "entry_count", type: "uint64" },
+        { name: "shards", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentGenerationShardRefV1" } },
+        { name: "content_fingerprint", type: "Digest256" },
+        { name: "manifest_digest", type: "Digest256" },
+      ],
+    },
+    ContentGenerationShardV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484353 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "generation", type: "uint64" },
+        { name: "shard", type: "uint32" },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentGenerationEntryV1" } },
       ],
     },
   },

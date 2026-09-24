@@ -2,7 +2,7 @@
 
 Status: partial — Phases 0–2 and local Phase 4a landed; Phase 3, remote maintenance, and Phase 4b outstanding
 Owner: bart
-Last updated: 2026-09-22
+Last updated: 2026-09-24
 
 ## Implementation status
 
@@ -56,12 +56,22 @@ external review.
 - [x] **Phase 4a — nondestructive local repack.** `wheat repack` converts or
   rewrites an existing local packed/hybrid store through one authenticated V2
   physical-catalog generation. Structural records stream through bounded segment
-  builders; content uses one generation pack with reverse deltas, every retained
+  builders; content uses one sharded generation with reverse deltas, every retained
   lineage tip full, and depth capped at 16. Planning is read-only, capacity is
   confirmed before replacement bytes are produced, publication binds the exact
   repository and physical authorities, recovery resolves to the complete old or
   new generation, and a canonical second run is a true no-op. Loose stores and
   shared remote backends are refused rather than silently migrated or swept.
+- [x] **Phase 4a+ — metadata history deltas.** Repack now stores older
+  metadata (per-view ContentSetSnapshots, Trees, RevisionMap and
+  ApplicationMap nodes) as git-delta patches against the newer version of the
+  same object along the view lineage, inside segments. Loose metadata is
+  absorbed into segments and its files are retired after the new head commits.
+  See [Metadata history deltas](#metadata-history-deltas).
+- [x] **Phase 4a+ — sharded content generations.** A content generation is a
+  small index of 16,384-entry shards, each with its own manifest and pack, so
+  the format has no entry cap and readers load one shard at a time. See
+  [Sharded content generations](#sharded-content-generations).
 
 ### Outstanding
 - [ ] **Phase 3 — wire encoding compaction.** Switch binschema length
@@ -488,6 +498,72 @@ Note: until repack runs, the fast-HEAD goal does not hold — forward
 deltas built during publish require traversing the chain to read the
 newest version. Repack should run after a configurable number of
 publishes, or as a background task.
+
+### Metadata history deltas
+
+Most of a fresh import's metadata is near-duplicate: each view has its own
+ContentSetSnapshot (one full ~180 KiB snapshot per commit on Gothab), and each
+commit rewrites the Trees and map nodes on its changed paths. Repack pairs
+each object with its successor along the view lineage, using the same rule
+as content:
+
+- **Pairing.** For each lineage edge whose child has exactly one parent:
+  the parent's and child's ContentSetSnapshots; Trees at the same directory
+  path (a paired walk that only descends where IDs differ); RevisionMap and
+  ApplicationMap nodes at the same key position.
+- **Reverse deltas.** The newer object is the base and the older one is the
+  delta. Tips stay whole. An object that two different newer objects claim, or
+  that sits on a cycle, stays whole (cycles keep their smallest member whole).
+  A delta is kept only if its payload plus the 32-byte base reference is
+  smaller than the whole record.
+- **Inside segments.** The segment index entry carries an optional
+  `delta_base` digest and a `delta_depth`; codecs 2/3 (Delta / DeltaZstd) are
+  metadata-only standalone records. A base must be in the same segment, and
+  chains are written base-first and contiguously. A chain that would overflow
+  a segment is cut and the next record is stored whole. Readers therefore
+  resolve and verify a chain within one segment, and the remote store (one
+  segment at a time) keeps working.
+- **Depth.** At most 16, the same as content (`SEGMENT_MAX_DELTA_DEPTH`).
+  Open-time checks: base present in the same segment, depth equals base depth
+  plus one, no delta inside a ZstdBlock.
+- **Canonical identity is untouched.** Every read re-verifies the
+  `ObjectId` of the rebuilt canonical bytes.
+
+The planner and the no-op check are deterministic, so a second repack of an
+unchanged store is still a no-op.
+
+### Sharded content generations
+
+A content generation used to be one manifest and one `content.pack`, with a
+250,000-entry format cap. It is now:
+
+- `content-generations/{generation}-{digest}.manifest`: the top-level
+  **index** (`ContentGenerationManifestV1`). It lists every shard by first
+  `ContentId`, entry count, pack length, and the BLAKE3 digest of its
+  manifest, plus the content fingerprint used for no-op detection. The catalog
+  names the index by its digest; the index's own `manifest_digest` covers the
+  generation number, fingerprint, entry count, and every shard reference.
+- `content-generations/{generation}/shard-{n:06}.manifest`
+  (`ContentGenerationShardV1`) and `shard-{n:06}.pack`. Entries are split in
+  `ContentId` order into shards of exactly 16,384 entries; only the last may
+  be smaller, and an empty generation has no shards. `pack_offset` is an
+  offset in the entry's own shard pack.
+
+A delta base may live in any shard of the same generation. The reader keeps
+the small index and opens shards on demand, caching up to 17 (one chain of
+16 bases plus its target). Repack writes each shard pack once, in order, then
+the shard manifests, then the index last, so an authenticated index implies
+its shards were already durable. Cleanup only removes a generation directory
+that holds nothing but the shard files its authenticated index names.
+
+The format no longer bounds the entry count. The planner still has a work
+bound (`ContentRepackLimits::max_content_ids`, 250,000); see `TODO.md`.
+
+Measured on a disposable Gothab import (208,190 content IDs, 2026-09-24):
+13 shards, a 1,091-byte index, ~1.5 MB per shard manifest. Loading the index
+takes ~8 µs, loading and verifying one shard manifest ~4 ms, and reading one
+envelope from a loaded shard ~1 µs. Store size (205.6 MB) and validate time
+(~29 s) are unchanged by sharding.
 
 ### Dead object collection
 

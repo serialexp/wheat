@@ -1303,9 +1303,6 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Store(StoreCommand::Analyze) => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
-            let local = open(&store_root)?;
-            let _operation =
-                rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
             store_analyze::analyze(&store_root)
         }
         Command::Repack(arguments) => {

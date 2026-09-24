@@ -353,6 +353,8 @@ impl ActiveSegment {
                     codec: physical.codec.to_byte(),
                     stored_length,
                     logical_length: physical.logical_length,
+                    delta_base: None,
+                    delta_depth: 0,
                 });
             }
             #[cfg(test)]

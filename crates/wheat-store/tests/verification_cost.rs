@@ -12,7 +12,7 @@ struct Counting {
     gets: AtomicUsize,
     changes: AtomicUsize,
     trees: AtomicUsize,
-    content_set_nodes: AtomicUsize,
+    content_set_blobs: AtomicUsize,
     revision_map_nodes: AtomicUsize,
     application_map_nodes: AtomicUsize,
     applications: AtomicUsize,
@@ -32,8 +32,8 @@ impl ImmutableObjectStore for Counting {
             ObjectKind::Tree => {
                 self.trees.fetch_add(1, Ordering::SeqCst);
             }
-            ObjectKind::ContentSetNode => {
-                self.content_set_nodes.fetch_add(1, Ordering::SeqCst);
+            ObjectKind::ContentSetSnapshot | ObjectKind::ContentSetDelta => {
+                self.content_set_blobs.fetch_add(1, Ordering::SeqCst);
             }
             ObjectKind::RevisionMapNode => {
                 self.revision_map_nodes.fetch_add(1, Ordering::SeqCst);
@@ -62,7 +62,7 @@ async fn verification_indexes_changes_once_and_reuses_identical_tree_contexts() 
         gets: AtomicUsize::new(0),
         changes: AtomicUsize::new(0),
         trees: AtomicUsize::new(0),
-        content_set_nodes: AtomicUsize::new(0),
+        content_set_blobs: AtomicUsize::new(0),
         revision_map_nodes: AtomicUsize::new(0),
         application_map_nodes: AtomicUsize::new(0),
         applications: AtomicUsize::new(0),
@@ -117,7 +117,7 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
         gets: AtomicUsize::new(0),
         changes: AtomicUsize::new(0),
         trees: AtomicUsize::new(0),
-        content_set_nodes: AtomicUsize::new(0),
+        content_set_blobs: AtomicUsize::new(0),
         revision_map_nodes: AtomicUsize::new(0),
         application_map_nodes: AtomicUsize::new(0),
         applications: AtomicUsize::new(0),
@@ -154,14 +154,14 @@ async fn cumulative_history_verification_is_bounded_by_shared_dag_size() {
         .await
         .unwrap();
     let gets = objects.gets.load(Ordering::SeqCst);
-    let content_set_nodes = objects.content_set_nodes.load(Ordering::SeqCst);
+    let content_set_blobs = objects.content_set_blobs.load(Ordering::SeqCst);
     let revision_map_nodes = objects.revision_map_nodes.load(Ordering::SeqCst);
     let application_map_nodes = objects.application_map_nodes.load(Ordering::SeqCst);
     let applications = objects.applications.load(Ordering::SeqCst);
     assert!(gets < 40_000, "shared history required {gets} object reads");
     assert!(
-        content_set_nodes < 200,
-        "contextual visible-set receipts reread {content_set_nodes} nodes"
+        content_set_blobs < 200,
+        "contextual visible-set receipts reread {content_set_blobs} blobs"
     );
     assert!(
         revision_map_nodes < 200,

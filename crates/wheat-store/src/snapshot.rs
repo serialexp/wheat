@@ -1015,19 +1015,6 @@ impl ClosureWalk {
                     &node.entries,
                 )?;
             }
-            ObjectKind::ContentSetNode => {
-                let node = wheat_core::decode_content_set_node(bytes)?;
-                self.follow_radix_with_set_entries(
-                    stored.id,
-                    &node.prefix,
-                    node.children
-                        .into_iter()
-                        .map(|child| (child.edge, child.child.into())),
-                    node.present,
-                    false,
-                    &node.entries,
-                )?;
-            }
             // Snapshot has no child object references — just a flat array of ContentIds.
             ObjectKind::ContentSetSnapshot => {}
             // Delta references its base as a child object.
