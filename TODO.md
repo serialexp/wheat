@@ -28,6 +28,17 @@ budget passes, but by only about 0.7 s.
   the release numbers are in.
 - `[ ]` **Move `WHEAT_IMPORT_PROFILE` (wheat-git) onto tracing spans**, so there is one
   profiler instead of two.
+- `[ ]` **`open` walks every view since the basis on each mutation (2026-09-26).**
+  `PersistedRepositoryMutator::open` checks the effective view with
+  `ViewLineageMapStore::is_descendant(basis, effective)`, a forward search from the basis
+  over every view created since. Every `change new`/`add` is therefore linear in the
+  views since the label basis, and building a history is quadratic. Found while building
+  the `git_export_notes` bench history (release, deferred durability): 4,000 revisions
+  took 283 s to build, about 70 ms per mutation by the end, almost all of it decoding
+  view-lineage nodes. The bench is held at 2,000 revisions because of it. A walk from
+  the effective view back to the basis (or a depth/ancestor index) would make the check
+  proportional to the stack, not the history. `descendant_frontiers` (status/refresh)
+  does the same forward walk.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
@@ -54,7 +65,9 @@ budget passes, but by only about 0.7 s.
 - `[ ]` **Building 505 changes takes 127 s.** `transition_validate.build.wall` in the
   first `wheat-quick` results: `Repository::create_change` plus two publishes,
   about 250 ms per change in release. Trace where the time goes; it is also 40% of
-  the suite's runtime.
+  the suite's runtime. Lead (2026-09-26): profiling a 20,000-revision in-memory build
+  showed most time in `String`/`BTreeMap<String, FileValue>` and `Change` clones, so the
+  in-memory `Repository` seems to copy the whole tree and change set per revision.
 - `[ ]` **Tighten the quick contract rules.** The budgets came from debug builds (for
   example `deep_stack.*_overhead ≤ 1.5 s`, measured 0.35–0.47 s in release, and
   `add_scale.*.wall ≤ 30 s`, measured at most 5.5 s). Set them from a few `pt-default`
@@ -78,11 +91,6 @@ semantics and safety contracts are in `docs/design/wheat-local-cli.md` and
   for structural GC and all sharing domains for global content GC, publish replacement
   segments before retirement, and never let a client sweep shared storage from one
   repository closure.
-- `[ ]` **Composed squash provenance for complex edit lineage.** Routine squash now
-  preserves transition evidence when it can be represented exactly at the retained
-  boundary and fails closed otherwise. Add an explicit composed-evidence representation
-  before allowing collapse of checkpoint chains whose subsumption/resolution records
-  refer to intermediate edits or applications that cannot survive verbatim.
 
 Squash only makes old objects unreachable. Physical reclamation remains a later GC
 operation; repack is independently useful and may run without either squash or GC.

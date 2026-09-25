@@ -2,7 +2,7 @@
 
 Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, `add --all`, and explicit revision collapse are landed; extended configuration keys are stored but not yet read; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-09-25
+Last updated: 2026-09-26
 
 ## Implementation status
 
@@ -144,16 +144,26 @@ both lists.
   CAS can create a third head, and finalizes all affected workspace references without
   rewriting materialized bytes. Missing registrations are pruned; inaccessible,
   mismatched, or locked workspaces fail closed.
+- [x] **Phase 2 — composed squash provenance.** (2026-09-26) Squash composes
+  subsumption chains across the collapsed suffix: a boundary edit replaced
+  through intermediate edits is recorded as replaced by the surviving final edits,
+  and chains that end re-added or empty are dropped. A wholly unpublished change
+  collapses to an initial revision with no evidence. Resolutions of intermediate
+  checkpoints are dropped (the collapsed revision is re-proven at its spot); a
+  resolution of a conflict still present at the boundary is kept with its
+  replacement edits mapped through the same lineage. Anything else still fails
+  closed. Extended beyond the original plan: retaining such a resolution also
+  retains the view its application produced (a rewrite previously kept the
+  application but dropped that view and failed verification), squash folds every
+  suffix message instead of keeping only the latest, and `--no-coauthors` skips
+  new trailers. See "Rewrite semantics".
+- [x] **Git push commit messages come from the change.** (2026-09-26) See "Git
+  compatibility workflow".
 
 ### Outstanding
 - [ ] **Phase 2 — dependency and integration workflow.** Expose stack revision,
   dependency movement, joins, deterministic descendant reapplication, and durable
   conflict outcomes as Wheat operations rather than Git-shaped rebase state.
-- [ ] **Phase 2 — composed squash provenance.** The landed rewrite preserves
-  transition evidence that is exactly representable at the retained boundary and
-  fails closed with no publication otherwise. Define a canonical composed-evidence
-  representation for complex intermediate subsumption/resolution chains before
-  allowing those chains to collapse.
 - [~] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
   capture all non-ignored modified and deleted tracked paths. Untracked files
   require `--include-untracked` or explicit path arguments. Depends on the
@@ -617,6 +627,28 @@ time. The latest checkpoint message and provenance remain; one canonical
 author other than the squasher, deduplicated against existing equivalent trailers
 and sorted deterministically. Routine squash has no metadata override flags.
 
+Follow-up (2026-09-26): keeping only the latest checkpoint message lost the change's
+title. `wheat change new -m` stores its text in the first revision, and later
+`wheat add` checkpoints have empty messages, so a squashed change often ended with an
+empty message. Squash now folds every suffix message, oldest first: empty and exactly
+repeated messages are skipped, and existing `Co-authored-by` trailers are gathered into
+one block at the end before new ones are appended. It also gained one metadata flag,
+`--no-coauthors` on `wheat change squash` and `wheat stack squash`. The flag skips the
+new trailers, for the case where the superseded "authors" are the same person under an
+old identity; trailers already in the messages stay.
+
+Follow-up (2026-09-26), evidence composition as built: the suffix is walked oldest
+first. For each boundary edit, the pass tracks the set of edits that currently replace
+it. A subsumption `s → R` substitutes `R` for `s` in every tracked set. A removal
+without subsumption drops the edit. At the end, `s → R` is emitted only when `s` is
+still removed and `R` is non-empty; `R` must lie within the collapsed revision's
+added edits, or squash fails closed. A resolution is kept only when the conflict
+it resolves belongs to a revision outside the suffix; its replacement edits are
+mapped through the same lineage and must be selected. Resolutions of intermediate
+checkpoints are dropped, since the collapsed revision is re-proven at its spot. With
+no retained boundary, nothing is emitted. When a kept resolution's application is
+newly retained, the view that application produced is retained with it.
+
 ### Roots, transactions, and reporting
 
 A rewrite changes repository semantics and uses a completely validated,
@@ -831,6 +863,23 @@ Import from a URL temporary-mirrors the complete Git repository and then deletes
 the mirror. It establishes no native remote or incremental-fetch relationship.
 Push exports one selected clean view and intentionally loses Wheat-only evidence.
 Neither operation is native clone, fetch, pull, or synchronization.
+
+Push writes one Git commit per change application. Its author and committer come
+from the change's newest revision. Its message (2026-09-26) comes from the change,
+not from that revision alone. Previously an empty newest message became "Wheat
+revision". A revision with Git provenance (imported history) keeps its message byte
+for byte, so round trips stay exact. Otherwise the message is:
+
+- the change title, then its description;
+- then every non-empty revision message along the predecessor chain, oldest first,
+  with a leading line equal to the title dropped;
+- empty and exactly repeated parts are skipped;
+- `Co-authored-by` trailers are gathered into one block at the end.
+
+Composition is bounded by `ExportLimits::max_note_revisions` (checkpoint reads per
+export) and `max_message_bytes`. Exceeding either is a typed limit error, never a
+truncated message. A change missing from the state's change map is refused. The
+`git_export_notes` quick bench case tracks the cost.
 
 A configured compatibility remote may remove repetitive URL/ref arguments later,
 but configuration must identify it as a Git projection endpoint. Receiving

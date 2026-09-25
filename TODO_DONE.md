@@ -35,6 +35,14 @@ Finished items, moved here from `TODO.md` under the same headings.
   is slightly smaller (204.9 MB vs 205.6 MB), and the same state validates.
   See "Planning from stored records" in
   `docs/design/wheat-storage-efficiency.md`.
+- `[x]` **Composed squash provenance for complex edit lineage.** Routine squash now
+  preserves transition evidence when it can be represented exactly at the retained
+  boundary and fails closed otherwise. Add an explicit composed-evidence representation
+  before allowing collapse of checkpoint chains whose subsumption/resolution records
+  refer to intermediate edits or applications that cannot survive verbatim.
+  Done 2026-09-26: squash composes subsumption chains through the suffix and keeps
+  only resolutions of conflicts still present at the boundary (with the view their
+  application produced). See "Rewrite semantics" in `docs/design/wheat-local-cli.md`.
 
 ## Authoring workflow follow-ups (2026-09-24)
 
