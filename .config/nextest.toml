@@ -1,0 +1,11 @@
+# A test that runs longer than this is killed and marked as failed. The slow-timeout
+# escalation prints a SLOW warning every 60s before the hard kill, so stuck tests are
+# easy to spot.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# CI profile: inherits the default settings and writes JUnit XML.
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = true

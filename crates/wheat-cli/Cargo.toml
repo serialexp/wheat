@@ -33,8 +33,5 @@ wheat-git = { path = "../wheat-git" }
 wheat-protocol = { path = "../wheat-protocol" }
 wheat-store = { path = "../wheat-store" }
 
-[dev-dependencies]
-gothab-profile = { workspace = true }
-
 [lints]
 workspace = true

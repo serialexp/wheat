@@ -1,0 +1,67 @@
+[workspace]
+members = ["crates/*"]
+# The `generated/` directories are committed binschema output (see
+# `scripts/wheat-gen-schema` and `scripts/wheat-protocol-gen-schema`). Each one ships
+# its own pinned binschema runtime crate, so they stay outside the workspace and are
+# used through plain `path =` dependencies.
+exclude = [
+    "crates/wheat-core/generated",
+    "crates/wheat-protocol/generated",
+    "vendor/gix-pack-0.74.2",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+
+# Workspace-wide clippy policy.
+#
+# - `too_many_arguments`: some store and CLI functions naturally take many
+#   parameters; argument structs would hide the call sites without reducing
+#   complexity.
+# - `doc_lazy_continuation` / `doc_overindented_list_items`: continuation text in
+#   doc lists is indented with two spaces on purpose and renders correctly.
+# - `should_implement_trait`: some inherent `from_str` methods return a domain
+#   `Result` on purpose instead of implementing `std::str::FromStr`.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+should_implement_trait = "allow"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+gix = { version = "0.87.1", features = ["blame", "blob-diff", "merge"] }
+hdrhistogram = "7"
+hex = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+similar = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+
+# Delta decoding with bounded peak memory for large deltified Git objects. See
+# `vendor/gix-pack-0.74.2/PATCHES.md` and `NOTICE.md`.
+[patch.crates-io]
+gix-pack = { path = "vendor/gix-pack-0.74.2" }
+
+# Debuginfo is reduced to `line-tables-only` for dev and test builds. File and line
+# backtraces still work; a debugger can't inspect locals. This keeps `target/` much
+# smaller. Override per crate when you need full DWARF:
+#
+#     [profile.dev.package.wheat-store]
+#     debug = "full"
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

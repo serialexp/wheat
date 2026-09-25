@@ -1,0 +1,19 @@
+{
+  "//": "Static S3 identity for the local-dev SeaweedFS that backs scry's",
+  "//2": "parquet blocks. DEV-ONLY fake credentials — safe to commit; they",
+  "//3": "only ever authenticate against the throwaway local SeaweedFS in the",
+  "//4": "Tilt stack. Mirror any change here into the SCRY_OBJSTORE_* env of",
+  "//5": "the `scry` service in docker-compose.local.yml.",
+  "identities": [
+    {
+      "name": "scry",
+      "credentials": [
+        {
+          "accessKey": "scrydevaccesskey",
+          "secretKey": "scrydevsecretkey0000000000000000"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write"]
+    }
+  ]
+}

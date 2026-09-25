@@ -1,0 +1,17 @@
+# Tests must not depend on the developer's own git setup. A personal
+# `~/.gitconfig` (`init.defaultBranch`, `commit.gpgsign`, hooks, aliases, ...)
+# changes what `git` does inside tests and inside the tools they start. Pointing
+# git at an empty global config and skipping the system one gives every run git's
+# built-in defaults. Repository-local config (`git -C <repo> config ...`) still
+# works.
+#
+# Cargo applies `[env]` to the processes it starts: `cargo test`,
+# `cargo nextest run` (nextest reads this section too), build scripts, and
+# `cargo run`. So a binary started through `cargo run` ignores your git config as
+# well; use the installed binary when you need your own settings. `force` makes
+# these win over values already set in the shell. The `tests_see_no_git_config`
+# guard in wheat-git fails when a test run can see a global or system git config
+# anyway.
+[env]
+GIT_CONFIG_GLOBAL = { value = "/dev/null", force = true }
+GIT_CONFIG_NOSYSTEM = { value = "1", force = true }
