@@ -1,0 +1,20 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20260925-171326
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	false
+# git_export_notes	{"changes":50,"checkpoints_per_change":40,"samples":3}
+# release	true
+# rev	d82cee990d18
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+git_export_notes.total.wall	74.669415846	s
+git_export_notes.total.peak_rss	31825920	bytes
+git_export_notes.build.wall	74.498653082	s
+git_export_notes.export.wall	0.030828717	s
+run.total_time	74.669704348	s
+process.peak_rss	31825920	bytes
+suite.cases	1	count
+suite.case_failures	0	count
