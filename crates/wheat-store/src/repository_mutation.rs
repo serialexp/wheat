@@ -127,6 +127,14 @@ impl AppliedEdits {
     }
 }
 
+/// A revision waiting to be authored at its spot in the canonical composition.
+pub(crate) struct PendingRevision {
+    pub(crate) predecessor: Option<RevisionId>,
+    pub(crate) dependencies: BTreeSet<ChangeId>,
+    pub(crate) metadata: RevisionMetadata,
+    pub(crate) edits: RevisionEdits,
+}
+
 #[derive(Default)]
 pub(crate) struct Fresh {
     pub(crate) changes: BTreeSet<ChangeObjectId>,
@@ -156,7 +164,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         proposal: ChangeProposal,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
         let active = self.open(expected, basis_view, effective_view).await?;
-        self.create_opened(expected, active, proposal, false).await
+        self.create_opened(expected, active, proposal).await
     }
 
     /// Create a change on the current graph frontier.
@@ -180,7 +188,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             .iter()
             .filter_map(|(change, dependents)| dependents.is_empty().then_some(*change))
             .collect();
-        self.create_opened(expected, active, proposal, true).await
+        self.create_opened(expected, active, proposal).await
     }
 
     async fn create_opened(
@@ -188,7 +196,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         expected: RepositoryHead,
         mut active: Active,
         proposal: ChangeProposal,
-        authored_against_effective: bool,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
         if active.revisions.contains_key(&proposal.id) {
             return Err(RepositoryError::DuplicateChange(proposal.id).into());
@@ -200,35 +207,19 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
         validate_initial(&proposal.edits)?;
         let mut fresh = Fresh::default();
-        let target = if authored_against_effective {
-            active.effective
-        } else {
-            self.compose(&active, &proposal.dependencies, &mut fresh)
-                .await?
-        };
-        let preliminary = self
-            .apply(
-                RevisionId::from_digest([0; 32]),
-                &target,
-                &proposal.edits.edits,
-                &mut fresh,
-                false,
-            )
+        let pending = BTreeMap::from([(
+            proposal.id,
+            PendingRevision {
+                predecessor: None,
+                dependencies: proposal.dependencies,
+                metadata: proposal.revision_metadata,
+                edits: proposal.edits,
+            },
+        )]);
+        let (resulting, revised) = self
+            .compose_authoring(&mut active, pending, &mut fresh)
             .await?;
-        let tree = preliminary.clean_tree(&proposal.edits.edits)?;
-        let revision = RevisionRecord {
-            change_id: proposal.id,
-            metadata: proposal.revision_metadata,
-            predecessor: None,
-            dependencies: proposal.dependencies,
-            authored_against: target.id(),
-            edits: proposal.edits.edits.keys().copied().collect(),
-            transition: proposal.edits.transition,
-            resulting_tree: tree,
-        };
-        self.persist_edits(&proposal.edits.edits, &mut fresh)
-            .await?;
-        let revision_id = self.put_revision(&revision, &mut fresh).await?;
+        let revision_id = revised[&proposal.id];
         let change = Change {
             id: proposal.id,
             metadata: proposal.metadata,
@@ -242,14 +233,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         active.state.changes = crate::ChangeMapStore::new(self.objects)
             .insert(active.state.changes, proposal.id, change_id)
             .await?;
-        active
-            .revisions
-            .insert(proposal.id, (revision_id, revision));
-        active.rebuild_graph();
-        let selected = active.revisions.keys().copied().collect();
-        let resulting = self.compose(&active, &selected, &mut fresh).await?;
         // Ensure the lineage records a continuation edge from the previous effective
-        // view to the new result.  `compose` rebuilds the composed view from the base
+        // view to the new result.  Composition rebuilds the composed view from the base
         // and records only intra-compose edges (base → result), so when the effective
         // view was already a descendant of the base (e.g. from a prior `change new`),
         // its vertex becomes an orphaned leaf unless we connect it explicitly.
@@ -431,73 +416,93 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         metadata: RevisionMetadata,
         edits: RevisionEdits,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        let mut active = self.open(expected, basis_view, effective_view).await?;
-        let Some((current, old)) = active.revisions.get(&change).cloned() else {
-            return Err(RepositoryError::UnknownChange(change).into());
+        let request = RevisionRequest {
+            predecessor,
+            metadata,
+            edits,
         };
-        if current != predecessor {
-            return Err(RepositoryError::StaleRevision(change).into());
-        }
-        let old_edits = self.load_edits(&old).await?;
-        self.validate_revision_transition(change, predecessor, old_edits, &edits, &active)
+        let (prepared, outcome) = self
+            .revise_changes(
+                expected,
+                basis_view,
+                effective_view,
+                BTreeMap::from([(change, request)]),
+            )
             .await?;
-        let mut fresh = Fresh::default();
-        // A revision is authored against the exact view its predecessor is currently applied to.
-        // That equals the predecessor's own authored base until an ancestor revision reapplies
-        // the change onto the ancestor's new result; from then on the workspace shows the
-        // reapplied result, so a new revision must replay against the reapplied target to
-        // reproduce it. Loading the recorded target is also cheaper than recomposing the
-        // dependency closure.
-        let reader = RepositoryReader::new(self.objects, self.content);
-        let application = ApplicationMapStore::new(self.objects)
-            .get(active.effective.applications, change)
-            .await?
-            .ok_or(RepositoryPublicationError::InvalidReferences(
-                "active change has no current application",
-            ))?;
-        let application = reader.application(application).await?;
-        if application.revision_id != predecessor {
-            return Err(RepositoryPublicationError::InvalidReferences(
-                "current application does not correspond to the predecessor revision",
+        let outcome = RevisionOutcome {
+            revision_id: outcome.revisions[&change],
+            resulting_view: outcome.resulting_view,
+            reapplied: outcome.reapplied,
+        };
+        Ok((prepared, outcome))
+    }
+
+    /// Revises several changes in one publication.
+    ///
+    /// Each new revision is authored at its change's spot: the view after every change before it
+    /// in canonical order, including revisions made earlier in this same call. That is what the
+    /// workspace shows underneath the change, so work written on top of earlier siblings relies
+    /// on them; reapplying the change elsewhere reports a conflict if its edits no longer fit.
+    pub async fn revise_changes(
+        &self,
+        expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
+        requests: BTreeMap<ChangeId, RevisionRequest>,
+    ) -> Result<(PreparedRepositoryMutation, RevisionsOutcome)> {
+        if requests.is_empty() {
+            return Err(RepositoryError::InvalidEditTransition(
+                "a revision needs at least one change",
             )
             .into());
         }
-        let target = reader.view(application.target_view).await?;
-        let preliminary = self
-            .apply(
-                RevisionId::from_digest([0; 32]),
-                &target,
-                &edits.edits,
-                &mut fresh,
-                false,
+        let mut active = self.open(expected, basis_view, effective_view).await?;
+        let mut pending = BTreeMap::new();
+        for (change, request) in requests {
+            let Some((current, old)) = active.revisions.get(&change) else {
+                return Err(RepositoryError::UnknownChange(change).into());
+            };
+            if *current != request.predecessor {
+                return Err(RepositoryError::StaleRevision(change).into());
+            }
+            let dependencies = old.dependencies.clone();
+            let old_edits = self.load_edits(old).await?;
+            self.validate_revision_transition(
+                change,
+                request.predecessor,
+                old_edits,
+                &request.edits,
+                &active,
             )
             .await?;
-        let tree = preliminary.clean_tree(&edits.edits)?;
-        let revision = RevisionRecord {
-            change_id: change,
-            metadata,
-            predecessor: Some(predecessor),
-            dependencies: old.dependencies,
-            authored_against: target.id(),
-            edits: edits.edits.keys().copied().collect(),
-            transition: edits.transition,
-            resulting_tree: tree,
-        };
-        self.persist_edits(&edits.edits, &mut fresh).await?;
-        let revision_id = self.put_revision(&revision, &mut fresh).await?;
-        active.revisions.insert(change, (revision_id, revision));
-        active.rebuild_graph();
-        let descendants = descendants(change, &active.reverse_dependencies);
-        let selected = active.revisions.keys().copied().collect();
-        let resulting = self.compose(&active, &selected, &mut fresh).await?;
+            pending.insert(
+                change,
+                PendingRevision {
+                    predecessor: Some(request.predecessor),
+                    dependencies,
+                    metadata: request.metadata,
+                    edits: request.edits,
+                },
+            );
+        }
+        let revised_changes = pending.keys().copied().collect::<BTreeSet<_>>();
+        let mut fresh = Fresh::default();
+        let (resulting, revisions) = self
+            .compose_authoring(&mut active, pending, &mut fresh)
+            .await?;
         Self::ensure_continuation_edge(&active, &resulting, &mut fresh);
-        let outcome = RevisionOutcome {
-            revision_id,
+        let mut reapplied = BTreeSet::new();
+        for change in &revised_changes {
+            reapplied.extend(descendants(*change, &active.reverse_dependencies));
+        }
+        let reapplied = topological(&active.revisions, &reapplied)?
+            .into_iter()
+            .filter(|id| !revised_changes.contains(id))
+            .collect();
+        let outcome = RevisionsOutcome {
+            revisions,
             resulting_view: resulting.id(),
-            reapplied: topological(&active.revisions, &descendants)?
-                .into_iter()
-                .filter(|id| *id != change)
-                .collect(),
+            reapplied,
         };
         let prepared = self
             .finish(expected, active.state, resulting.id(), fresh)
@@ -609,100 +614,144 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(active)
     }
 
-    pub(crate) async fn compose(
+    /// Authors every pending revision at its change's spot while composing all active changes.
+    ///
+    /// A change's spot is the view after every change before it in canonical order. Pending
+    /// changes that are new join the canonical order through their dependencies; revised changes
+    /// keep theirs, so the order of the others is unchanged. Each authored revision's edits must
+    /// apply cleanly at its spot. Returns the composed view and the new revision of each pending
+    /// change, which also replaces it in `active`.
+    pub(crate) async fn compose_authoring(
         &self,
-        active: &Active,
-        selected: &BTreeSet<ChangeId>,
+        active: &mut Active,
+        mut pending: BTreeMap<ChangeId, PendingRevision>,
+        fresh: &mut Fresh,
+    ) -> Result<(ViewRecord, BTreeMap<ChangeId, RevisionId>)> {
+        let all = active
+            .revisions
+            .keys()
+            .chain(pending.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let order = topological_by(&all, |change| {
+            pending
+                .get(change)
+                .map(|revision| &revision.dependencies)
+                .or_else(|| active.revisions.get(change).map(|(_, r)| &r.dependencies))
+        })?;
+        let prefix = unchanged_prefix(active, &order, &pending);
+        let mut view = self.prefix_view(active, prefix).await?;
+        let mut authored = BTreeMap::new();
+        for change in order.into_iter().skip(prefix) {
+            let (revision_id, edits) = if let Some(revision) = pending.remove(&change) {
+                let preliminary = self
+                    .apply(
+                        RevisionId::from_digest([0; 32]),
+                        &view,
+                        &revision.edits.edits,
+                        fresh,
+                        false,
+                    )
+                    .await?;
+                let tree = preliminary.clean_tree(&revision.edits.edits)?;
+                let record = RevisionRecord {
+                    change_id: change,
+                    metadata: revision.metadata,
+                    predecessor: revision.predecessor,
+                    dependencies: revision.dependencies,
+                    authored_against: view.id(),
+                    edits: revision.edits.edits.keys().copied().collect(),
+                    transition: revision.edits.transition,
+                    resulting_tree: tree,
+                };
+                self.persist_edits(&revision.edits.edits, fresh).await?;
+                let revision_id = self.put_revision(&record, fresh).await?;
+                active.revisions.insert(change, (revision_id, record));
+                authored.insert(change, revision_id);
+                (revision_id, revision.edits.edits)
+            } else {
+                let (revision_id, revision) = &active.revisions[&change];
+                (*revision_id, self.load_edits(revision).await?)
+            };
+            view = self
+                .apply_step(view, change, revision_id, &edits, fresh)
+                .await?;
+        }
+        active.rebuild_graph();
+        Ok((view, authored))
+    }
+
+    /// The view after the first `prefix` changes of the persisted canonical order.
+    ///
+    /// The target of the next persisted application is precisely that intermediate view, so no
+    /// edit or tree in the prefix needs to be read.
+    async fn prefix_view(&self, active: &Active, prefix: usize) -> Result<ViewRecord> {
+        if prefix == 0 {
+            return Ok(active.base);
+        }
+        if prefix == active.persisted_order.len() {
+            return Ok(active.effective);
+        }
+        let next = active.persisted_order[prefix];
+        let application = ApplicationMapStore::new(self.objects)
+            .get(active.effective.applications, next)
+            .await?
+            .ok_or(RepositoryError::InvalidRepositoryState(
+                "effective view lacks canonical application",
+            ))?;
+        let reader = RepositoryReader::new(self.objects, self.content);
+        let application = reader.application(application).await?;
+        Ok(reader.view(application.target_view).await?)
+    }
+
+    /// Applies one change's revision onto `view` and records the resulting view.
+    async fn apply_step(
+        &self,
+        view: ViewRecord,
+        change: ChangeId,
+        revision_id: RevisionId,
+        edits: &BTreeMap<EditId, EditRecord>,
         fresh: &mut Fresh,
     ) -> Result<ViewRecord> {
-        let selected = dependency_closure(selected, &active.revisions)?;
-        let order = topological(&active.revisions, &selected)?;
-        let revisions = RevisionMapStore::new(self.objects);
-        let applications = ApplicationMapStore::new(self.objects);
-        let conflicts = ConflictSetStore::new(self.objects);
-
-        // Preserve the exact authenticated identity of the longest unchanged canonical prefix.
-        // The target of the next persisted application is precisely that intermediate view, so no
-        // edit or tree in the prefix needs to be read.  Boundaries avoid needless map lookups.
-        let unchanged_prefix = order
-            .iter()
-            .zip(&active.persisted_order)
-            .take_while(|(new, old)| {
-                new == old
-                    && active.persisted_revisions.get(new)
-                        == active.revisions.get(new).map(|(revision, _)| revision)
-            })
-            .count();
-        let composing_all = selected.len() == active.revisions.len();
-        let prefix = if composing_all
-            || (unchanged_prefix == order.len() && order.len() <= active.persisted_order.len())
-        {
-            unchanged_prefix
-        } else {
-            0
+        let application = self
+            .apply(revision_id, &view, edits, fresh, true)
+            .await?
+            .application;
+        let application_id = application.id();
+        let tree = match application.result {
+            ApplicationResultRecord::Clean { tree } => tree,
+            ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
         };
-        let mut view = if prefix == 0 {
-            active.base
-        } else if prefix == active.persisted_order.len() {
-            active.effective
-        } else {
-            let next = active.persisted_order[prefix];
-            let application = applications
-                .get(active.effective.applications, next)
-                .await?
-                .ok_or(RepositoryError::InvalidRepositoryState(
-                    "effective view lacks canonical application",
-                ))?;
-            let application = RepositoryReader::new(self.objects, self.content)
-                .application(application)
-                .await?;
-            RepositoryReader::new(self.objects, self.content)
-                .view(application.target_view)
-                .await?
-        };
-        for change in order.into_iter().skip(prefix) {
-            let (revision_id, revision) = &active.revisions[&change];
-            let edits = self.load_edits(revision).await?;
-            let application = self
-                .apply(*revision_id, &view, &edits, fresh, true)
-                .await?
-                .application;
-            let application_id = application.id();
-            let tree = match application.result {
-                ApplicationResultRecord::Clean { tree } => tree,
-                ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
-            };
-            let revision_root = revisions
-                .insert(view.revisions, change, *revision_id)
-                .await?;
-            let application_root = applications
-                .insert(view.applications, change, application_id)
-                .await?;
-            let conflict_root = match application.result {
-                ApplicationResultRecord::Conflicted { conflict, .. } => {
-                    conflicts
-                        .insert(view.unresolved_conflicts, conflict)
-                        .await?
-                }
-                ApplicationResultRecord::Clean { .. } => view.unresolved_conflicts,
-            };
-            let content = self
-                .update_visible_manifest(view.required_content, &edits, tree, &view, fresh)
-                .await?;
-            let parent = view.id();
-            view = ViewRecord {
-                tree,
-                revisions: revision_root,
-                applications: application_root,
-                unresolved_conflicts: conflict_root,
-                required_content: content,
-            };
-            self.put_view(&view, fresh).await?;
-            if parent != view.id() {
-                fresh.view_edges.insert((parent, view.id()));
+        let revision_root = RevisionMapStore::new(self.objects)
+            .insert(view.revisions, change, revision_id)
+            .await?;
+        let application_root = ApplicationMapStore::new(self.objects)
+            .insert(view.applications, change, application_id)
+            .await?;
+        let conflict_root = match application.result {
+            ApplicationResultRecord::Conflicted { conflict, .. } => {
+                ConflictSetStore::new(self.objects)
+                    .insert(view.unresolved_conflicts, conflict)
+                    .await?
             }
+            ApplicationResultRecord::Clean { .. } => view.unresolved_conflicts,
+        };
+        let content = self
+            .update_visible_manifest(view.required_content, edits, tree, &view, fresh)
+            .await?;
+        let parent = view.id();
+        let next = ViewRecord {
+            tree,
+            revisions: revision_root,
+            applications: application_root,
+            unresolved_conflicts: conflict_root,
+            required_content: content,
+        };
+        self.put_view(&next, fresh).await?;
+        if parent != next.id() {
+            fresh.view_edges.insert((parent, next.id()));
         }
-        Ok(view)
+        Ok(next)
     }
 
     /// Record a lineage edge from the prior effective view to the new composed result so that the
@@ -1168,36 +1217,47 @@ impl Active {
     }
 }
 
-fn dependency_closure(
-    roots: &BTreeSet<ChangeId>,
-    records: &BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
-) -> Result<BTreeSet<ChangeId>> {
-    let mut closure = BTreeSet::new();
-    let mut pending = roots.iter().copied().collect::<Vec<_>>();
-    while let Some(change) = pending.pop() {
-        if !closure.insert(change) {
-            continue;
-        }
-        let Some((_, revision)) = records.get(&change) else {
-            return Err(RepositoryError::UnknownDependency(change).into());
-        };
-        pending.extend(revision.dependencies.iter().copied());
-    }
-    Ok(closure)
+/// The number of leading changes in `order` that the persisted composition already applied with
+/// the same revision at the same position. Pending changes are never part of it.
+fn unchanged_prefix(
+    active: &Active,
+    order: &[ChangeId],
+    pending: &BTreeMap<ChangeId, PendingRevision>,
+) -> usize {
+    order
+        .iter()
+        .zip(&active.persisted_order)
+        .take_while(|(new, old)| {
+            new == old
+                && !pending.contains_key(new)
+                && active.persisted_revisions.get(new)
+                    == active.revisions.get(new).map(|(revision, _)| revision)
+        })
+        .count()
 }
 
 fn topological(
     records: &BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
     selected: &BTreeSet<ChangeId>,
 ) -> Result<Vec<ChangeId>> {
+    topological_by(selected, |id| {
+        records.get(id).map(|(_, record)| &record.dependencies)
+    })
+}
+
+/// Canonical order of `selected`: dependencies first, ties broken by the lowest change id.
+fn topological_by<'a>(
+    selected: &BTreeSet<ChangeId>,
+    dependencies_of: impl Fn(&ChangeId) -> Option<&'a BTreeSet<ChangeId>>,
+) -> Result<Vec<ChangeId>> {
     let mut remaining = BTreeMap::new();
     let mut reverse: BTreeMap<ChangeId, Vec<ChangeId>> = BTreeMap::new();
     for id in selected {
-        let Some((_, record)) = records.get(id) else {
+        let Some(dependencies) = dependencies_of(id) else {
             return Err(RepositoryError::UnknownDependency(*id).into());
         };
-        remaining.insert(*id, record.dependencies.intersection(selected).count());
-        for dependency in record.dependencies.intersection(selected) {
+        remaining.insert(*id, dependencies.intersection(selected).count());
+        for dependency in dependencies.intersection(selected) {
             reverse.entry(*dependency).or_default().push(*id);
         }
     }

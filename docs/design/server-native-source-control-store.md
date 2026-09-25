@@ -721,6 +721,18 @@ Revision {
 apply(selected_edits, authored_against.tree) == resulting_tree
 ```
 
+`authored_against` is the change's **spot** in the view the author was looking
+at: the view after every change before it in canonical order (dependencies
+first, ties broken by the lowest change id). That includes earlier siblings the
+change never declared as dependencies. Work written in a tree that already shows
+them relies on them, just as it relies on its declared dependencies. Nothing
+forces a change onto that base later: applying it to a view without those
+siblings replays its edits there and records a clean result or structured
+conflict. Creating, revising, resolving, and squashing all use this rule, and a
+mutation that revises several changes authors each one at its spot in the new
+composition. History import is the exception, since an imported commit records
+its parents' tree, which is what its author saw.
+
 The experimental V1 encoding implements this envelope. Text changes use guarded
 fragment replacements; creation, deletion, binary/symlink replacement, and kind
 changes use exact file operations. The authored view, exact resulting tree, and

@@ -15,7 +15,7 @@ use crate::{
     MerkleTreeStore, PublicationError, PublicationStore, RepositoryHead, RepositoryMutationError,
     RepositoryPublicationError, RepositoryPublisher, RepositoryReader, RetainedSetStore,
     RevisionMapStore, TransitionValidationOptions, TreeContentWalkLimits, ViewLineageMapStore,
-    repository_mutation::{Fresh, PersistedRepositoryMutator},
+    repository_mutation::{Fresh, PendingRevision, PersistedRepositoryMutator},
 };
 
 #[derive(Clone, Debug)]
@@ -239,49 +239,27 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
         let order = topo(&active.revisions, &affected, &reverse_dependencies)?;
         let mut fresh = Fresh::default();
         let mut revision_mapping = BTreeMap::new();
+        let mutator =
+            PersistedRepositoryMutator::new(self.objects, self.content, self.publications);
 
+        let mut pending = BTreeMap::new();
+        let mut collapsed = BTreeMap::new();
         for change in &order {
             let (old_id, old) = active.revisions[change].clone();
             // A dependency rewrite changes where descendants are applied, not what their revision
             // was authored to mean. Keep that clean authored revision byte-for-byte and let compose
             // produce the (possibly conflicted) descendant application against the new dependency.
-            if !request.retained_predecessors.contains_key(change) {
+            let Some(boundary) = request.retained_predecessors.get(change) else {
                 revision_mapping.insert(old_id, old_id);
                 continue;
-            }
-            let predecessor = if let Some(boundary) = request.retained_predecessors.get(change) {
-                validate_boundary(&reader, old_id, *boundary).await?;
-                *boundary
-            } else {
-                old.predecessor
             };
+            validate_boundary(&reader, old_id, *boundary).await?;
+            let predecessor = *boundary;
             let metadata = request
                 .revision_metadata
                 .get(change)
                 .cloned()
                 .unwrap_or_else(|| old.metadata.clone());
-            let dependencies = old.dependencies.clone();
-            let dependency_view =
-                PersistedRepositoryMutator::new(self.objects, self.content, self.publications)
-                    .compose(&active, &dependencies, &mut fresh)
-                    .await?;
-            let edits =
-                PersistedRepositoryMutator::new(self.objects, self.content, self.publications)
-                    .load_edits(&old)
-                    .await?;
-            let preliminary =
-                PersistedRepositoryMutator::new(self.objects, self.content, self.publications)
-                    .apply(
-                        RevisionId::from_digest([0; 32]),
-                        &dependency_view,
-                        &edits,
-                        &mut fresh,
-                        false,
-                    )
-                    .await?;
-            let ApplicationResultRecord::Clean { tree } = preliminary.application.result else {
-                return Err(RepositoryRewriteError::SemanticDrift);
-            };
             let edit_ids = old.edits.clone();
             let predecessor_edits = if let Some(id) = predecessor {
                 reader.revision(id).await?.edits
@@ -291,44 +269,46 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
             let preserved = edit_ids.intersection(&predecessor_edits).copied().collect();
             let added: BTreeSet<_> = edit_ids.difference(&predecessor_edits).copied().collect();
             let removed: BTreeSet<_> = predecessor_edits.difference(&edit_ids).copied().collect();
-            let (subsumed, resolutions) = if request.retained_predecessors.contains_key(change) {
+            let (subsumed, resolutions) =
                 collapsed_evidence(&reader, old_id, predecessor, &added, &removed, &edit_ids)
-                    .await?
-            } else {
-                (
-                    old.transition.subsumed.clone(),
-                    old.transition.resolutions.clone(),
-                )
-            };
-            let revision = RevisionRecord {
-                change_id: *change,
-                metadata,
-                predecessor,
-                dependencies,
-                authored_against: dependency_view.id(),
-                edits: edit_ids.clone(),
-                transition: EditTransition {
-                    preserved,
-                    added,
-                    removed,
-                    subsumed,
-                    resolutions,
-                },
-                resulting_tree: tree,
-            };
-            let new_id =
-                PersistedRepositoryMutator::new(self.objects, self.content, self.publications)
-                    .put_revision(&revision, &mut fresh)
                     .await?;
-            revision_mapping.insert(old_id, new_id);
-            active.revisions.insert(*change, (new_id, revision));
+            pending.insert(
+                *change,
+                PendingRevision {
+                    predecessor,
+                    dependencies: old.dependencies.clone(),
+                    metadata,
+                    edits: RevisionEdits {
+                        edits: mutator.load_edits(&old).await?,
+                        transition: EditTransition {
+                            preserved,
+                            added,
+                            removed,
+                            subsumed,
+                            resolutions,
+                        },
+                    },
+                },
+            );
+            collapsed.insert(*change, old_id);
         }
 
-        let selected = active.revisions.keys().copied().collect();
-        let resulting =
-            PersistedRepositoryMutator::new(self.objects, self.content, self.publications)
-                .compose(&active, &selected, &mut fresh)
-                .await?;
+        // Each collapsed revision keeps its edits and is re-authored at its spot, like any other
+        // revision. Its edits applied cleanly there before, so failing now means the rewrite
+        // would change what the change means.
+        let (resulting, authored) = match mutator
+            .compose_authoring(&mut active, pending, &mut fresh)
+            .await
+        {
+            Ok(composed) => composed,
+            Err(RepositoryMutationError::Model(RepositoryError::InvalidEdits(_))) => {
+                return Err(RepositoryRewriteError::SemanticDrift);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        for (change, old_id) in collapsed {
+            revision_mapping.insert(old_id, authored[&change]);
+        }
         if semantic_view(&reader, &old_effective).await?
             != semantic_view(&reader, &resulting).await?
         {

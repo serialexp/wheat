@@ -33,6 +33,32 @@ pub struct RevisionOutcome {
     pub reapplied: Vec<ChangeId>,
 }
 
+/// The result of revising several changes in one mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionsOutcome {
+    /// The new revision of each revised change.
+    pub revisions: BTreeMap<ChangeId, RevisionId>,
+    pub resulting_view: ViewId,
+    /// Descendants of the revised changes that were reapplied, in canonical order.
+    pub reapplied: Vec<ChangeId>,
+}
+
+/// One change's next revision in a multi-change revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionRequest {
+    pub predecessor: RevisionId,
+    pub metadata: RevisionMetadata,
+    pub edits: RevisionEdits,
+}
+
+/// A revision waiting to be authored at its spot in the canonical composition.
+struct PendingRevision {
+    predecessor: Option<RevisionId>,
+    dependencies: BTreeSet<ChangeId>,
+    metadata: RevisionMetadata,
+    edits: RevisionEdits,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangeProposal {
     pub id: ChangeId,
@@ -714,17 +740,17 @@ impl Repository {
                 metadata: change_metadata,
             },
         );
-        match self.add_revision(
-            effective,
-            selection,
+        let pending = BTreeMap::from([(
             change,
-            None,
-            dependencies,
-            revision_metadata,
-            edits,
-            context,
-        ) {
-            Ok(outcome) => Ok(outcome),
+            PendingRevision {
+                predecessor: None,
+                dependencies,
+                metadata: revision_metadata,
+                edits,
+            },
+        )]);
+        match self.add_revisions(effective, selection, pending, context) {
+            Ok(outcome) => Ok(single_outcome(outcome, change)),
             Err(error) => {
                 *self = before;
                 Err(error)
@@ -781,34 +807,65 @@ impl Repository {
         edits: RevisionEdits,
         context: ApplicationContext<'_, C>,
     ) -> Result<RevisionOutcome, RepositoryError> {
+        let request = RevisionRequest {
+            predecessor,
+            metadata,
+            edits,
+        };
+        self.revise_changes_with_metadata(
+            basis,
+            effective,
+            BTreeMap::from([(change, request)]),
+            context,
+        )
+        .map(|outcome| single_outcome(outcome, change))
+    }
+
+    /// Revises several changes in one mutation. Each new revision is authored at its change's
+    /// spot: the view after every change before it in canonical order, including earlier
+    /// revisions made by this same call.
+    pub fn revise_changes_with_metadata<C: ContentIo + ?Sized>(
+        &mut self,
+        basis: ViewId,
+        effective: ViewId,
+        requests: BTreeMap<ChangeId, RevisionRequest>,
+        context: ApplicationContext<'_, C>,
+    ) -> Result<RevisionsOutcome, RepositoryError> {
         if !self.views.contains_key(&basis) {
             return Err(RepositoryError::UnknownView(basis));
         }
-        let selection = self.active_selection(effective)?;
-        if selection.revisions.get(&change).copied() != Some(predecessor) {
-            return Err(if selection.revisions.contains_key(&change) {
-                RepositoryError::StaleRevision(change)
-            } else {
-                RepositoryError::UnknownChange(change)
-            });
+        if requests.is_empty() {
+            return Err(RepositoryError::InvalidEditTransition(
+                "a revision needs at least one change",
+            ));
         }
-        self.validate_edit_transition(change, Some(predecessor), &edits)?;
-        let dependencies = selection
-            .dependencies
-            .parents(change)
-            .cloned()
-            .ok_or(RepositoryError::UnknownChange(change))?;
+        let selection = self.active_selection(effective)?;
+        let mut pending = BTreeMap::new();
+        for (change, request) in requests {
+            if selection.revisions.get(&change).copied() != Some(request.predecessor) {
+                return Err(if selection.revisions.contains_key(&change) {
+                    RepositoryError::StaleRevision(change)
+                } else {
+                    RepositoryError::UnknownChange(change)
+                });
+            }
+            let dependencies = selection
+                .dependencies
+                .parents(change)
+                .cloned()
+                .ok_or(RepositoryError::UnknownChange(change))?;
+            pending.insert(
+                change,
+                PendingRevision {
+                    predecessor: Some(request.predecessor),
+                    dependencies,
+                    metadata: request.metadata,
+                    edits: request.edits,
+                },
+            );
+        }
         let before = self.clone();
-        let result = self.add_revision(
-            effective,
-            selection,
-            change,
-            Some(predecessor),
-            dependencies,
-            metadata,
-            edits,
-            context,
-        );
+        let result = self.add_revisions(effective, selection, pending, context);
         if result.is_err() {
             *self = before;
         }
@@ -938,21 +995,21 @@ impl Repository {
             .parents(change)
             .cloned()
             .ok_or(RepositoryError::UnknownChange(change))?;
-        let before = self.clone();
-        let result = self.add_revision(
-            effective,
-            selection,
+        let pending = BTreeMap::from([(
             change,
-            Some(resolution.conflict_revision),
-            dependencies,
-            RevisionMetadata::default(),
-            revision_edits,
-            context,
-        );
+            PendingRevision {
+                predecessor: Some(resolution.conflict_revision),
+                dependencies,
+                metadata: RevisionMetadata::default(),
+                edits: revision_edits,
+            },
+        )]);
+        let before = self.clone();
+        let result = self.add_revisions(effective, selection, pending, context);
         if result.is_err() {
             *self = before;
         }
-        result
+        result.map(|outcome| single_outcome(outcome, change))
     }
 
     fn import_changes_inner<C: ContentIo + ?Sized>(
@@ -1068,92 +1125,103 @@ impl Repository {
         Ok(outcomes)
     }
 
-    fn add_revision<C: ContentIo + ?Sized>(
+    /// Authors every pending revision at its change's spot and composes the whole selection.
+    ///
+    /// A change's spot is the view after every change before it in canonical order, which is
+    /// what the workspace shows underneath that change. That includes earlier siblings the change
+    /// never declared as dependencies: work written on top of them relies on them. Moving the
+    /// change onto a view without them later reapplies its edits there, which reports a conflict
+    /// if they no longer fit.
+    fn add_revisions<C: ContentIo + ?Sized>(
         &mut self,
         effective: ViewId,
         mut selection: ActiveSelection,
-        change: ChangeId,
-        predecessor: Option<RevisionId>,
-        dependencies: BTreeSet<ChangeId>,
-        metadata: RevisionMetadata,
-        edits: RevisionEdits,
+        mut pending: BTreeMap<ChangeId, PendingRevision>,
         context: ApplicationContext<'_, C>,
-    ) -> Result<RevisionOutcome, RepositoryError> {
-        self.validate_edit_transition(change, predecessor, &edits)?;
-        selection
-            .dependencies
-            .add_change(change, dependencies.clone());
-        let target = self.dependency_view(&selection, change, context)?;
-        let preliminary = application::execute(
-            RevisionId::from_digest([0; 32]),
-            &target,
-            &edits.edits,
-            context,
-            false,
-        )?;
-        let authored_tree = match &preliminary.result {
-            ApplicationResult::Clean { tree } => tree,
-            ApplicationResult::Conflicted { conflict, .. } => {
-                return Err(RepositoryError::InvalidEdits(RejectedEdit::collect(
-                    &edits.edits,
-                    &conflict.edits,
-                )));
+    ) -> Result<RevisionsOutcome, RepositoryError> {
+        for (change, revision) in &pending {
+            self.validate_edit_transition(*change, revision.predecessor, &revision.edits)?;
+            selection
+                .dependencies
+                .add_change(*change, revision.dependencies.clone());
+        }
+        let revised_changes = pending.keys().copied().collect::<BTreeSet<_>>();
+        let all = selection
+            .revisions
+            .keys()
+            .chain(pending.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut revised = BTreeMap::new();
+        let mut target = self.views[&self.base_view].clone();
+        for change in Self::topological_order(&selection.dependencies, &all) {
+            if let Some(revision) = pending.remove(&change) {
+                let revision_id = self.author_at(&target, change, revision, context)?;
+                selection.revisions.insert(change, revision_id);
+                revised.insert(change, revision_id);
             }
-        };
-        let mut revision = ChangeRevision {
-            id: RevisionId::from_digest([0; 32]),
-            change_id: change,
-            metadata,
-            predecessor,
-            dependencies,
-            authored_against: target.id,
-            edits,
-            resulting_tree: authored_tree.clone(),
-        };
-        let revision_id = RevisionId::of_canonical_bytes(&crate::wire::revision_bytes(&revision));
-        revision.id = revision_id;
-        self.revisions.insert(revision_id, revision);
-        selection.revisions.insert(change, revision_id);
-
-        let reapplied = Self::topological_order(
-            &selection.dependencies,
-            &Self::descendants(&selection.dependencies, change),
-        )
-        .into_iter()
-        .filter(|descendant| *descendant != change)
-        .collect::<Vec<_>>();
-        let all = selection.revisions.keys().copied().collect::<BTreeSet<_>>();
-        let resulting = self.compose(&selection, &all, context)?;
+            target = self.apply_at(target, &selection, change, context)?;
+        }
+        let mut descendants = BTreeSet::new();
+        for change in &revised_changes {
+            descendants.extend(Self::descendants(&selection.dependencies, *change));
+        }
+        let reapplied = Self::topological_order(&selection.dependencies, &descendants)
+            .into_iter()
+            .filter(|descendant| !revised_changes.contains(descendant))
+            .collect::<Vec<_>>();
         // Ensure the lineage records a continuation edge from the prior effective view
-        // to the new result.  compose rebuilds from base_view and only records intra-
+        // to the new result.  Composition rebuilds from base_view and only records intra-
         // compose edges, so a prior effective that was already a descendant of the base
         // would become an orphaned leaf without this edge.
-        if effective != self.base_view && effective != resulting.id {
-            self.view_lineage.insert((effective, resulting.id));
+        if effective != self.base_view && effective != target.id {
+            self.view_lineage.insert((effective, target.id));
         }
-        Ok(RevisionOutcome {
-            revision_id,
-            resulting_view: resulting.id,
+        Ok(RevisionsOutcome {
+            revisions: revised,
+            resulting_view: target.id,
             reapplied,
         })
     }
 
-    fn dependency_view<C: ContentIo + ?Sized>(
+    /// Records `revision` as authored against `spot`, where its edits must apply cleanly.
+    fn author_at<C: ContentIo + ?Sized>(
         &mut self,
-        selection: &ActiveSelection,
+        spot: &RepositoryView,
         change: ChangeId,
+        revision: PendingRevision,
         context: ApplicationContext<'_, C>,
-    ) -> Result<RepositoryView, RepositoryError> {
-        let parents = selection
-            .dependencies
-            .parents(change)
-            .ok_or(RepositoryError::UnknownChange(change))?
-            .clone();
-        let mut closure = BTreeSet::new();
-        for parent in parents {
-            Self::collect_ancestors(&selection.dependencies, parent, &mut closure)?;
-        }
-        self.compose(selection, &closure, context)
+    ) -> Result<RevisionId, RepositoryError> {
+        let preliminary = application::execute(
+            RevisionId::from_digest([0; 32]),
+            spot,
+            &revision.edits.edits,
+            context,
+            false,
+        )?;
+        let authored_tree = match preliminary.result {
+            ApplicationResult::Clean { tree } => tree,
+            ApplicationResult::Conflicted { conflict, .. } => {
+                return Err(RepositoryError::InvalidEdits(RejectedEdit::collect(
+                    &revision.edits.edits,
+                    &conflict.edits,
+                )));
+            }
+        };
+        let mut record = ChangeRevision {
+            id: RevisionId::from_digest([0; 32]),
+            change_id: change,
+            metadata: revision.metadata,
+            predecessor: revision.predecessor,
+            dependencies: revision.dependencies,
+            authored_against: spot.id,
+            edits: revision.edits,
+            resulting_tree: authored_tree,
+        };
+        record.id = RevisionId::of_canonical_bytes(&crate::wire::revision_bytes(&record));
+        let id = record.id;
+        self.revisions.insert(id, record);
+        Ok(id)
     }
 
     fn compose<C: ContentIo + ?Sized>(
@@ -1164,33 +1232,44 @@ impl Repository {
     ) -> Result<RepositoryView, RepositoryError> {
         let mut target = self.views[&self.base_view].clone();
         for change in Self::topological_order(&selection.dependencies, selected) {
-            let revision_id = selection
-                .revisions
-                .get(&change)
-                .copied()
-                .ok_or(RepositoryError::UnknownChange(change))?;
-            let revision = &self.revisions[&revision_id];
-            let application =
-                application::execute(revision_id, &target, revision.edits(), context, true)?;
-            let mut frontier = target.frontier.clone();
-            frontier.insert(change, revision_id);
-            let mut applications = target.applications.clone();
-            applications.insert(change, application.id);
-            let mut conflicts = target.unresolved_conflicts.clone();
-            if let ApplicationResult::Conflicted { conflict, .. } = &application.result {
-                conflicts.insert(conflict.id);
-            }
-            let parent = target.id;
-            target = RepositoryView::from_manifest(
-                application.result.materialized_tree().clone(),
-                frontier,
-                applications,
-                conflicts,
-            );
-            self.applications.insert(application.id, application);
-            self.record_view(parent, target.clone());
+            target = self.apply_at(target, selection, change, context)?;
         }
         Ok(target)
+    }
+
+    /// Applies `change`'s selected revision onto `target` and records the resulting view.
+    fn apply_at<C: ContentIo + ?Sized>(
+        &mut self,
+        target: RepositoryView,
+        selection: &ActiveSelection,
+        change: ChangeId,
+        context: ApplicationContext<'_, C>,
+    ) -> Result<RepositoryView, RepositoryError> {
+        let revision_id = selection
+            .revisions
+            .get(&change)
+            .copied()
+            .ok_or(RepositoryError::UnknownChange(change))?;
+        let revision = &self.revisions[&revision_id];
+        let application =
+            application::execute(revision_id, &target, revision.edits(), context, true)?;
+        let mut frontier = target.frontier.clone();
+        frontier.insert(change, revision_id);
+        let mut applications = target.applications.clone();
+        applications.insert(change, application.id);
+        let mut conflicts = target.unresolved_conflicts.clone();
+        if let ApplicationResult::Conflicted { conflict, .. } = &application.result {
+            conflicts.insert(conflict.id);
+        }
+        let view = RepositoryView::from_manifest(
+            application.result.materialized_tree().clone(),
+            frontier,
+            applications,
+            conflicts,
+        );
+        self.applications.insert(application.id, application);
+        self.record_view(target.id, view.clone());
+        Ok(view)
     }
 
     fn collect_ancestors(
@@ -1254,6 +1333,14 @@ impl Repository {
         }
         debug_assert_eq!(ordered.len(), selected.len(), "dependency graph is acyclic");
         ordered
+    }
+}
+
+fn single_outcome(outcome: RevisionsOutcome, change: ChangeId) -> RevisionOutcome {
+    RevisionOutcome {
+        revision_id: outcome.revisions[&change],
+        resulting_view: outcome.resulting_view,
+        reapplied: outcome.reapplied,
     }
 }
 

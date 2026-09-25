@@ -60,8 +60,8 @@ pub use model::{
 };
 pub use persisted::{ContentManifestRecord, RepositoryStateRecord, ViewRecord};
 pub use repository::{
-    ChangeProposal, Repository, RepositoryError, RepositoryParts, RevisionOutcome,
-    TargetPolicyResult,
+    ChangeProposal, Repository, RepositoryError, RepositoryParts, RevisionOutcome, RevisionRequest,
+    RevisionsOutcome, TargetPolicyResult,
 };
 pub use root_builders::{
     build_content_manifest_record, build_repository_state_record, build_view_record,
