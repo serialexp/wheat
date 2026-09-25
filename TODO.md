@@ -13,7 +13,9 @@ budget passes, but by only about 0.7 s.
 
 - `[ ]` **Measure a release build first.** All numbers above are from the debug test
   profile. Rerun the benchmark against a release binary to see which costs still
-  matter (`just bench --case deep_stack`).
+  matter (`just bench --case deep_stack`). First release numbers (2026-09-25,
+  `bench/results/wheat-quick/20260925-052553-0581f94c5f96.tsv`): reapply 1.17 s,
+  fitting 1.64 s, moving 1.52 s. The trace breakdown is still to do.
 - `[ ]` **Batch `apply_step`'s per-change map inserts.** `compose_authoring` does two
   single-item `radix_update`s per change (revision map, application map): 1002 calls,
   about 0.64 s. Build them in one pass per composition instead.
@@ -42,6 +44,21 @@ budget passes, but by only about 0.7 s.
   `wheat-local-cli.md`'s release gate refers to
   `~/.claude/projects/-home-bart-Projects-gothab/memory/feedback_no_format_version_bumps.md`;
   agents working in this repo don't load it (the rule is in `CLAUDE.md` here anyway).
+
+## Benchmarks (2026-09-25)
+
+- `[ ]` **Run `wheat-quick` on Gothab end to end.** `gt profile wheat-quick` needs the
+  `serialexp/wheat` mirror, which still showed `mirror_status: "failed"` and 0 commits
+  on 2026-09-25. Once it syncs, check that the run passes on `pt-default`, and how
+  long it takes there (5 min on a Ryzen 9 9900X).
+- `[ ]` **Building 505 changes takes 127 s.** `transition_validate.build.wall` in the
+  first `wheat-quick` results: `Repository::create_change` plus two publishes,
+  about 250 ms per change in release. Trace where the time goes; it is also 40% of
+  the suite's runtime.
+- `[ ]` **Tighten the quick contract rules.** The budgets came from debug builds (for
+  example `deep_stack.*_overhead ≤ 1.5 s`, measured 0.35–0.47 s in release, and
+  `add_scale.*.wall ≤ 30 s`, measured at most 5.5 s). Set them from a few `pt-default`
+  runs instead.
 
 ## Explicit history collapse, repack, and GC
 
