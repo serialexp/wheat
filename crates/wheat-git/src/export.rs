@@ -5,13 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use gix::bstr::BString;
 use thiserror::Error;
 use wheat_core::{
-    Actor, ApplicationId, ApplicationResultRecord, ChangeId, DirectoryEntry, FileKind, RevisionId,
-    Timestamp, TreeId, ViewId,
+    Actor, ApplicationId, ApplicationResultRecord, ChangeId, ChangeMapId, DirectoryEntry, FileKind,
+    RevisionId, Timestamp, TreeId, ViewId,
+    message::{fold_messages, strip_title_line},
 };
 use wheat_store::{
-    ApplicationMapError, ApplicationMapStore, ConflictSetStore, ContentStore, ContentStoreError,
-    ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, RepositoryPublicationError,
-    RepositoryReader,
+    ApplicationMapError, ApplicationMapStore, ChangeMapError, ChangeMapStore, ConflictSetStore,
+    ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
+    RepositoryPublicationError, RepositoryReader,
 };
 
 /// Hard bounds for an export. Exceeding one fails before a partial history is reported.
@@ -21,6 +22,10 @@ pub struct ExportLimits {
     pub max_tree_entries: usize,
     pub max_tree_depth: usize,
     pub max_content_bytes: usize,
+    /// Revisions read while collecting the notes of every projected change's checkpoints.
+    pub max_note_revisions: usize,
+    /// Bytes of one composed commit message.
+    pub max_message_bytes: usize,
 }
 
 impl Default for ExportLimits {
@@ -36,6 +41,11 @@ impl Default for ExportLimits {
             // residency: blobs are written to Git and released one at a time.
             // Keep headroom for the qualified Gothab history's distinct revisions.
             max_content_bytes: 1024 * 1024 * 1024,
+            // Matches the checkpoint bound of routine squash.
+            max_note_revisions: 250_000,
+            // A change title, description, and each revision note are each bounded at 1 MiB
+            // when authored; a composed message beyond this is refused, never truncated.
+            max_message_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -101,6 +111,8 @@ pub enum ExportLimit {
     TreeEntries,
     TreeDepth,
     ContentBytes,
+    NoteRevisions,
+    MessageBytes,
 }
 
 #[derive(Debug, Error)]
@@ -109,6 +121,10 @@ pub enum ExportError {
     Repository(#[from] RepositoryPublicationError),
     #[error("application-map read failed")]
     ApplicationMap(#[from] ApplicationMapError),
+    #[error("change-map read failed")]
+    ChangeMap(#[from] ChangeMapError),
+    #[error("projected change {0} is not in the supplied change map")]
+    UnknownChange(ChangeId),
     #[error("conflict-set read failed")]
     ConflictSet(#[from] wheat_store::CollectionError),
     #[error("Wheat tree read failed")]
@@ -162,14 +178,20 @@ struct ChainEntry {
 /// Project the clean applications from `base` through `selected` into `git`.
 ///
 /// Neither view is discovered from mutable repository state: both are pinned
-/// content IDs supplied by the caller. The destination must be a bare Git
-/// repository. Objects are written directly through gix; refs are left to the
-/// caller so publication can use its own compare-and-swap policy.
+/// content IDs supplied by the caller, as is `changes`, the repository state's
+/// logical-change map used for each commit's message. The destination must be a
+/// bare Git repository. Objects are written directly through gix; refs are left
+/// to the caller so publication can use its own compare-and-swap policy.
+///
+/// One commit is written per projected change application. Its message is
+/// described by [`commit_message`]; author and committer come from the applied
+/// revision.
 pub async fn export_revision_history<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
     selected: ViewId,
     base: ViewId,
+    changes: ChangeMapId,
     git: &gix::Repository,
     options: &ExportOptions,
 ) -> Result<ExportResult, ExportError> {
@@ -231,6 +253,7 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
     };
     let mut parent = options.anchor;
     let mut object_cache = ObjectCache::default();
+    let mut messages = MessageBuilder::new(objects, changes, options.limits);
     let start = anchor_index.unwrap_or(usize::MAX);
     for (index, entry) in chain.into_iter().enumerate() {
         if anchor_index.is_some() && index < start {
@@ -253,7 +276,17 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
                 0,
             )
             .await?;
-            write_commit(git, tree, parent, &entry.revision, &options.fallback)?
+            let message = messages
+                .commit_message(&reader, entry.change, &entry.revision)
+                .await?;
+            write_commit(
+                git,
+                tree,
+                parent,
+                &entry.revision,
+                &message,
+                &options.fallback,
+            )?
         };
         parent = Some(oid);
         output.applications.insert(entry.application, oid);
@@ -512,11 +545,117 @@ fn write_tree<'a, O: ImmutableObjectStore>(
     })
 }
 
+/// Builds commit messages for one export, bounding the checkpoint reads across all of it.
+struct MessageBuilder<'a, O> {
+    changes: ChangeMapStore<'a, O>,
+    root: ChangeMapId,
+    limits: ExportLimits,
+    note_reads: usize,
+}
+
+impl<'a, O: ImmutableObjectStore> MessageBuilder<'a, O> {
+    fn new(objects: &'a O, root: ChangeMapId, limits: ExportLimits) -> Self {
+        Self {
+            changes: ChangeMapStore::new(objects),
+            root,
+            limits,
+            note_reads: 0,
+        }
+    }
+
+    /// The commit message for `revision`, the applied revision of `change`.
+    ///
+    /// A revision imported from another system (it carries source provenance) keeps its
+    /// message byte-for-byte, so projecting imported history reproduces the original commits.
+    ///
+    /// Otherwise the commit describes the logical change: its title, then its description,
+    /// then the note of every revision of the change from its first checkpoint through
+    /// `revision`, folded by [`fold_messages`]. A note's leading line equal to the title is
+    /// dropped (the first checkpoint records the whole `-m` text), empty and repeated parts are
+    /// skipped, and `Co-authored-by` trailers are gathered into one block at the end. The
+    /// message ends with a newline, like Git's own. An empty result selects the caller's
+    /// fallback message.
+    async fn commit_message(
+        &mut self,
+        reader: &RepositoryReader<'_, O>,
+        change: ChangeId,
+        revision: &wheat_core::RevisionRecord,
+    ) -> Result<String, ExportError> {
+        if revision.metadata.provenance.is_some() {
+            return Ok(revision.metadata.message.clone());
+        }
+        let object = self
+            .changes
+            .get(self.root, change)
+            .await?
+            .ok_or(ExportError::UnknownChange(change))?;
+        let record = reader.change(object).await?;
+        if record.id != change {
+            return Err(ExportError::UnknownChange(change));
+        }
+
+        // Walk back from the applied revision, keeping only notes that say something. The raw
+        // notes are bounded like the composed message so a long chain cannot grow unbounded.
+        let mut notes = Vec::new();
+        let mut note_bytes = 0usize;
+        let mut keep = |message: String| -> Result<(), ExportError> {
+            if message.trim().is_empty() {
+                return Ok(());
+            }
+            note_bytes = note_bytes.saturating_add(message.len());
+            if note_bytes > self.limits.max_message_bytes {
+                return Err(ExportError::LimitExceeded {
+                    limit: ExportLimit::MessageBytes,
+                    actual: note_bytes,
+                    maximum: self.limits.max_message_bytes,
+                });
+            }
+            notes.push(message);
+            Ok(())
+        };
+        keep(revision.metadata.message.clone())?;
+        let mut at = revision.predecessor;
+        while let Some(id) = at {
+            self.note_reads = self.note_reads.saturating_add(1);
+            if self.note_reads > self.limits.max_note_revisions {
+                return Err(ExportError::LimitExceeded {
+                    limit: ExportLimit::NoteRevisions,
+                    actual: self.note_reads,
+                    maximum: self.limits.max_note_revisions,
+                });
+            }
+            let predecessor = reader.revision(id).await?;
+            at = predecessor.predecessor;
+            keep(predecessor.metadata.message)?;
+        }
+        notes.reverse();
+
+        let title = record.metadata.title.as_str();
+        let mut message = fold_messages(
+            [title, record.metadata.description.as_str()]
+                .into_iter()
+                .chain(notes.iter().map(|note| strip_title_line(note, title))),
+        );
+        if !message.is_empty() {
+            message.push('\n');
+        }
+        if message.len() > self.limits.max_message_bytes {
+            return Err(ExportError::LimitExceeded {
+                limit: ExportLimit::MessageBytes,
+                actual: message.len(),
+                maximum: self.limits.max_message_bytes,
+            });
+        }
+        Ok(message)
+    }
+}
+
 fn write_commit(
     git: &gix::Repository,
     tree: gix::ObjectId,
     parent: Option<gix::ObjectId>,
     revision: &wheat_core::RevisionRecord,
+    message: &str,
     fallback: &ExportFallbackMetadata,
 ) -> Result<gix::ObjectId, ExportError> {
     let metadata = &revision.metadata;
@@ -544,10 +683,10 @@ fn write_commit(
             metadata.committed_at
         },
     );
-    let message = if metadata.message.is_empty() {
+    let message = if message.is_empty() {
         fallback.message.as_str()
     } else {
-        metadata.message.as_str()
+        message
     };
     git.write_object(&gix::objs::Commit {
         tree,

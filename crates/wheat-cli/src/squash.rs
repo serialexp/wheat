@@ -22,7 +22,7 @@ use crate::{
     local::{LocalRepository, runtime},
     remote_config::RemoteConfig,
     rewrite_transaction::{self, RewritePlan, WorkspaceRewrite},
-    squash_attribution::attributed_squash_metadata,
+    squash_attribution::{Coauthors, attributed_squash_metadata},
     workspace_metadata::WorkspaceMetadata,
 };
 
@@ -69,6 +69,7 @@ pub(crate) fn execute(
     workspace: &Path,
     explicit_store: Option<&Path>,
     scope: Scope<'_>,
+    coauthors: Coauthors,
 ) -> Result<Success> {
     let context = crate::resolve_context(workspace, explicit_store)?;
     let local = crate::local::open(&context.store_root)?;
@@ -92,6 +93,7 @@ pub(crate) fn execute(
         scope,
         &actor,
         now,
+        coauthors,
     ))?;
     let Some((request, workspaces, rewritten)) = planned else {
         return report(
@@ -199,6 +201,7 @@ async fn plan<O: ImmutableObjectStore>(
     scope: Scope<'_>,
     actor: &wheat_core::Actor,
     now: Timestamp,
+    coauthors: Coauthors,
 ) -> Result<
     Option<(
         SquashRewriteRequest,
@@ -284,18 +287,13 @@ async fn plan<O: ImmutableObjectStore>(
         if records.len() <= 1 {
             continue;
         }
-        let latest_metadata = records
-            .first()
-            .expect("suffix contains latest")
-            .1
-            .metadata
-            .clone();
-        let replacement = attributed_squash_metadata(
-            &latest_metadata,
-            records.iter().map(|(_, r)| &r.metadata.author),
-            actor,
-            now,
-        )?;
+        // `suffix` walks back from the latest checkpoint; attribution folds oldest first.
+        let oldest_first = records
+            .iter()
+            .rev()
+            .map(|(_, record)| &record.metadata)
+            .collect::<Vec<_>>();
+        let replacement = attributed_squash_metadata(&oldest_first, actor, now, coauthors)?;
         predecessors.insert(change, boundary);
         metadata.insert(change, replacement);
         rewritten.push(change);

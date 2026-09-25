@@ -115,6 +115,8 @@ pub enum RepositoryRewriteError {
     UnsupportedEvidence,
     #[error("rewrite changed effective repository semantics")]
     SemanticDrift,
+    #[error("resolved conflict application does not have exactly one retained resulting view")]
+    MissingProducedView,
     #[error("authority root is not retained by the current repository")]
     UnknownAuthorityRoot,
 }
@@ -269,9 +271,16 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
             let preserved = edit_ids.intersection(&predecessor_edits).copied().collect();
             let added: BTreeSet<_> = edit_ids.difference(&predecessor_edits).copied().collect();
             let removed: BTreeSet<_> = predecessor_edits.difference(&edit_ids).copied().collect();
-            let (subsumed, resolutions) =
-                collapsed_evidence(&reader, old_id, predecessor, &added, &removed, &edit_ids)
-                    .await?;
+            let (subsumed, resolutions) = collapsed_evidence(
+                &reader,
+                old_id,
+                predecessor,
+                &predecessor_edits,
+                &added,
+                &removed,
+                &edit_ids,
+            )
+            .await?;
             pending.insert(
                 *change,
                 PendingRevision {
@@ -407,6 +416,39 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
         }))
     }
 
+    /// The one view in `old`'s lineage that `application` produced from its target.
+    async fn produced_view(
+        &self,
+        old: &RepositoryStateRecord,
+        application_id: ApplicationId,
+    ) -> Result<ViewId> {
+        let reader = RepositoryReader::new(self.objects, self.content);
+        let application = reader.application(application_id).await?;
+        let change = reader.revision(application.revision_id).await?.change_id;
+        let tree = match application.result {
+            ApplicationResultRecord::Clean { tree } => tree,
+            ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
+        };
+        let children = ViewLineageMapStore::new(self.objects)
+            .get(old.view_lineage, application.target_view)
+            .await?
+            .ok_or(RepositoryRewriteError::MissingProducedView)?;
+        let maps = ApplicationMapStore::new(self.objects);
+        let mut produced = None;
+        let mut cursor = RetainedSetStore::new(self.objects).cursor(children).await?;
+        while let Some(child) = cursor.next().await? {
+            let child = ViewId::from_digest(*child.as_bytes());
+            let view = reader.view(child).await?;
+            if view.tree == tree
+                && maps.get(view.applications, change).await? == Some(application_id)
+                && produced.replace(child).is_some()
+            {
+                return Err(RepositoryRewriteError::MissingProducedView);
+            }
+        }
+        produced.ok_or(RepositoryRewriteError::MissingProducedView)
+    }
+
     async fn build_state(
         &self,
         old: &RepositoryStateRecord,
@@ -460,6 +502,13 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
                 for resolution in revision.transition.resolutions {
                     if applications.insert(resolution.application) {
                         application_queue.push_back(resolution.application);
+                        // A resolved conflicted application is not selected by any view on the
+                        // retained chain, so the view it produced is only reachable from here.
+                        // A retained application must keep its exactly one lineage edge.
+                        let produced = self.produced_view(old, resolution.application).await?;
+                        if views.insert(produced) {
+                            view_queue.push_back(produced);
+                        }
                     }
                 }
             }
@@ -626,48 +675,152 @@ async fn validate_boundary<O: ImmutableObjectStore>(
     Err(RepositoryRewriteError::InvalidBoundary)
 }
 
+/// Composes the transition evidence of a collapsed checkpoint suffix into the evidence that is
+/// still semantically required at the retained boundary.
+///
+/// Evidence only means something relative to the boundary predecessor, because every checkpoint
+/// in the suffix is replaced. So the suffix is replayed oldest first while tracking what each
+/// retained term turned into:
+///
+/// - a boundary edit `s` that a checkpoint subsumes starts a lineage `s -> R`; a later
+///   subsumption of any member of `R` substitutes that member's replacements, and a later plain
+///   removal drops the member. The collapsed revision records `s -> R` only when `s` is still
+///   removed and something of `R` survives. A boundary edit that was re-added, or whose
+///   replacements were all removed again, needs no evidence;
+/// - a subsumption whose source was itself introduced inside the suffix is an intermediate step:
+///   it only rewrites existing lineages and leaves no record of its own;
+/// - a conflict resolution is kept when its conflicted application belongs to a revision outside
+///   the suffix (the conflict is still real at the boundary), with its replacement edits mapped
+///   through the same lineage. A resolution of an intermediate checkpoint's application is
+///   dropped: the collapsed revision is re-authored at its spot and must apply cleanly there.
+///
+/// Anything that still cannot be expressed as a direct transition from the boundary fails
+/// closed with [`RepositoryRewriteError::UnsupportedEvidence`] rather than being erased.
 async fn collapsed_evidence<O: ImmutableObjectStore>(
     reader: &RepositoryReader<'_, O>,
     current: RevisionId,
     boundary: Option<RevisionId>,
+    boundary_edits: &BTreeSet<EditId>,
     added: &BTreeSet<EditId>,
     removed: &BTreeSet<EditId>,
     selected: &BTreeSet<EditId>,
 ) -> Result<(Vec<EditSubsumption>, Vec<ConflictResolutionEvidence>)> {
     let mut suffix = Vec::new();
+    let mut suffix_ids = BTreeSet::new();
     let mut at = Some(current);
     while at != boundary {
         let id = at.ok_or(RepositoryRewriteError::InvalidBoundary)?;
         let revision = reader.revision(id).await?;
         at = revision.predecessor;
+        suffix_ids.insert(id);
         suffix.push(revision);
     }
     suffix.reverse();
 
-    let mut subsumed = Vec::new();
-    let mut resolutions = Vec::new();
+    let mut lineage = Lineage::default();
+    let mut kept_resolutions = Vec::new();
     for revision in suffix {
-        for evidence in revision.transition.subsumed {
-            // A collapsed transition can faithfully carry evidence only when the original source
-            // and replacements remain terms of its own before/after partition. More involved
-            // chains need an explicit composed-evidence representation; reject rather than erase.
-            if !removed.contains(&evidence.source) || !evidence.replacements.is_subset(added) {
-                return Err(RepositoryRewriteError::UnsupportedEvidence);
-            }
-            if !subsumed.contains(&evidence) {
-                subsumed.push(evidence);
+        let transition = revision.transition;
+        let mut subsumed_sources = BTreeSet::new();
+        for evidence in transition.subsumed {
+            subsumed_sources.insert(evidence.source);
+            lineage.substitute(evidence.source, &evidence.replacements);
+            if boundary_edits.contains(&evidence.source) {
+                lineage.extend(Term::Source(evidence.source), &evidence.replacements);
             }
         }
-        for evidence in revision.transition.resolutions {
-            if !evidence.replacement_edits.is_subset(selected) {
+        for edit in transition.removed.difference(&subsumed_sources) {
+            lineage.remove(*edit);
+        }
+        for evidence in transition.resolutions {
+            let application = reader.application(evidence.application).await?;
+            if suffix_ids.contains(&application.revision_id) {
+                continue;
+            }
+            // An initial revision cannot carry resolution evidence, so a conflict that is still
+            // real without any retained predecessor has no direct representation.
+            if boundary.is_none() {
                 return Err(RepositoryRewriteError::UnsupportedEvidence);
             }
-            if !resolutions.contains(&evidence) {
-                resolutions.push(evidence);
-            }
+            let term = Term::Resolution(kept_resolutions.len());
+            lineage.extend(term, &evidence.replacement_edits);
+            kept_resolutions.push(evidence);
+        }
+    }
+
+    let mut subsumed = Vec::new();
+    for (term, replacements) in &lineage.members {
+        let Term::Source(source) = term else {
+            continue;
+        };
+        if !removed.contains(source) || replacements.is_empty() {
+            continue;
+        }
+        if !replacements.is_subset(added) {
+            return Err(RepositoryRewriteError::UnsupportedEvidence);
+        }
+        subsumed.push(EditSubsumption {
+            source: *source,
+            replacements: replacements.clone(),
+        });
+    }
+    let mut resolutions: Vec<ConflictResolutionEvidence> = Vec::new();
+    for (index, mut evidence) in kept_resolutions.into_iter().enumerate() {
+        evidence.replacement_edits = lineage
+            .members
+            .remove(&Term::Resolution(index))
+            .unwrap_or_default();
+        if !evidence.replacement_edits.is_subset(selected) {
+            return Err(RepositoryRewriteError::UnsupportedEvidence);
+        }
+        if !resolutions.contains(&evidence) {
+            resolutions.push(evidence);
         }
     }
     Ok((subsumed, resolutions))
+}
+
+/// A retained term whose current edits are tracked through a collapsed suffix.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Term {
+    /// A boundary edit that a checkpoint subsumed.
+    Source(EditId),
+    /// A kept conflict resolution, by its index in suffix order.
+    Resolution(usize),
+}
+
+/// The edits each tracked term currently maps to, with a reverse index so a substitution or
+/// removal touches only the terms that hold the edit instead of scanning every lineage.
+#[derive(Default)]
+struct Lineage {
+    members: BTreeMap<Term, BTreeSet<EditId>>,
+    holders: BTreeMap<EditId, BTreeSet<Term>>,
+}
+
+impl Lineage {
+    fn extend(&mut self, term: Term, edits: &BTreeSet<EditId>) {
+        self.members.entry(term).or_default().extend(edits);
+        for edit in edits {
+            self.holders.entry(*edit).or_default().insert(term);
+        }
+    }
+
+    fn substitute(&mut self, edit: EditId, replacements: &BTreeSet<EditId>) {
+        for term in self.holders.remove(&edit).unwrap_or_default() {
+            if let Some(members) = self.members.get_mut(&term) {
+                members.remove(&edit);
+            }
+            self.extend(term, replacements);
+        }
+    }
+
+    fn remove(&mut self, edit: EditId) {
+        for term in self.holders.remove(&edit).unwrap_or_default() {
+            if let Some(members) = self.members.get_mut(&term) {
+                members.remove(&edit);
+            }
+        }
+    }
 }
 
 fn reverse_dependencies(

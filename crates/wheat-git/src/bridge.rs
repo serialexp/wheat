@@ -6,7 +6,7 @@ use std::{
 };
 
 use thiserror::Error;
-use wheat_core::ViewId;
+use wheat_core::{ChangeMapId, ViewId};
 use wheat_store::{ContentStore, ImmutableObjectStore};
 
 use crate::{
@@ -50,11 +50,15 @@ pub enum BridgeError {
 }
 
 /// Prepare a deterministic Git projection without changing the remote.
+///
+/// `changes` is the pinned repository state's logical-change map, from which each
+/// commit's message is built.
 pub async fn prepare_push<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
     selected: ViewId,
     base: ViewId,
+    changes: ChangeMapId,
     projection_path: &Path,
     remote_url: &str,
     destination: &str,
@@ -73,30 +77,33 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         options.anchor = Some(oid.object_id()?);
     }
 
-    let export = match export_revision_history(objects, content, selected, base, &git, &options)
-        .await
-    {
-        Ok(export) => export,
-        Err(ExportError::UnmatchedAnchor(_)) | Err(ExportError::MissingAnchor(_)) => {
-            options.anchor = None;
-            let complete =
-                export_revision_history(objects, content, selected, base, &git, &options).await?;
-            if !force_with_lease {
-                let tip = complete.tip.ok_or(BridgeError::EmptyProjection)?;
-                let RemoteState::Present(oid) = &remote_state else {
-                    unreachable!("an unmatched anchor requires a present remote ref")
-                };
-                if !is_ancestor(projection_path, oid, tip)? {
-                    return Err(BridgeError::UnknownRemoteTip {
-                        destination: destination.into(),
-                        oid: oid.as_str().into(),
-                    });
+    let export =
+        match export_revision_history(objects, content, selected, base, changes, &git, &options)
+            .await
+        {
+            Ok(export) => export,
+            Err(ExportError::UnmatchedAnchor(_)) | Err(ExportError::MissingAnchor(_)) => {
+                options.anchor = None;
+                let complete = export_revision_history(
+                    objects, content, selected, base, changes, &git, &options,
+                )
+                .await?;
+                if !force_with_lease {
+                    let tip = complete.tip.ok_or(BridgeError::EmptyProjection)?;
+                    let RemoteState::Present(oid) = &remote_state else {
+                        unreachable!("an unmatched anchor requires a present remote ref")
+                    };
+                    if !is_ancestor(projection_path, oid, tip)? {
+                        return Err(BridgeError::UnknownRemoteTip {
+                            destination: destination.into(),
+                            oid: oid.as_str().into(),
+                        });
+                    }
                 }
+                complete
             }
-            complete
-        }
-        Err(error) => return Err(error.into()),
-    };
+            Err(error) => return Err(error.into()),
+        };
     let tip = export.tip.ok_or(BridgeError::EmptyProjection)?;
     git.reference(
         PROJECTION_REF,

@@ -1,14 +1,21 @@
-use std::{collections::BTreeMap, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    process::Command,
+};
 
 use gix::bstr::ByteSlice;
 use wheat_core::{
-    Actor, ChangeId, ChangeProposal, Conflict, EditOperation, EditRecord, EditTransition, FileKind,
-    FileValue, RevisionEdits, RevisionMetadata, SourceProvenance, Timestamp, ViewRecord,
+    Actor, Change, ChangeId, ChangeMapId, ChangeMetadata, ChangeObjectId, ChangeProposal, Conflict,
+    EditId, EditOperation, EditRecord, EditTransition, FileKind, FileValue, Repository,
+    RevisionEdits, RevisionMetadata, RevisionOutcome, SourceProvenance, Timestamp, Tree, ViewId,
+    ViewRecord,
 };
-use wheat_git::export::{ExportError, ExportOptions, export_revision_history};
+use wheat_git::export::{ExportError, ExportLimit, ExportOptions, export_revision_history};
 use wheat_store::{
-    ConflictSetStore, ContentStore, ImmutableObjectStore, LooseObjectStore, PersistedCommit,
-    PersistedCommitWriter, RepositoryReader,
+    ChangeMapStore, ConflictSetStore, ContentStore, ImmutableObjectStore, LocalPublicationStore,
+    LooseObjectStore, PersistedCommit, PersistedCommitWriter, PersistedRepositoryMutator,
+    RepositoryPublisher, RepositoryReader,
 };
 
 struct Fixture {
@@ -90,6 +97,27 @@ fn metadata(message: &str, seconds: i64) -> RevisionMetadata {
     }
 }
 
+/// The change map for changes written by [`proposal`], whose change metadata is empty.
+async fn default_changes(fixture: &Fixture, numbers: &[u8]) -> ChangeMapId {
+    let store = ChangeMapStore::new(&fixture.objects);
+    let mut root = store.empty_root().await.unwrap();
+    for number in numbers {
+        let change = Change {
+            id: ChangeId::from_bytes([*number; 16]),
+            metadata: Default::default(),
+        };
+        root = store
+            .insert(
+                root,
+                change.id,
+                ChangeObjectId::of_canonical_bytes(&change.canonical_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+    root
+}
+
 fn bare() -> (tempfile::TempDir, gix::Repository) {
     let directory = tempfile::tempdir().unwrap();
     let repository = gix::init_bare(directory.path()).unwrap();
@@ -152,12 +180,14 @@ async fn two_revisions(
 async fn projects_multiple_native_revisions_deterministically_and_passes_fsck() {
     let fixture = Fixture::new();
     let (base, first, second) = two_revisions(&fixture).await;
+    let changes = default_changes(&fixture, &[1, 2]).await;
     let (first_dir, first_git) = bare();
     let first_export = export_revision_history(
         &fixture.objects,
         &fixture.content,
         second.resulting_view,
         base,
+        changes,
         &first_git,
         &ExportOptions::default(),
     )
@@ -188,6 +218,7 @@ async fn projects_multiple_native_revisions_deterministically_and_passes_fsck() 
         &fixture.content,
         second.resulting_view,
         base,
+        changes,
         &second_git,
         &ExportOptions::default(),
     )
@@ -226,6 +257,7 @@ async fn empty_revision_metadata_uses_stable_caller_fallback() {
         &fixture.content,
         revision.resulting_view,
         base,
+        default_changes(&fixture, &[1]).await,
         &git_repo,
         &options,
     )
@@ -330,6 +362,7 @@ async fn reuses_imported_anchor_and_projects_only_its_suffix() {
         &fixture.content,
         native.resulting_view,
         base,
+        default_changes(&fixture, &[1, 2]).await,
         &git_repo,
         &ExportOptions {
             anchor: Some(anchor),
@@ -351,12 +384,14 @@ async fn reuses_imported_anchor_and_projects_only_its_suffix() {
 async fn rejects_a_projected_anchor_whose_tree_does_not_match_its_application() {
     let fixture = Fixture::new();
     let (base, first, second) = two_revisions(&fixture).await;
+    let changes = default_changes(&fixture, &[1, 2]).await;
     let (_git_dir, git_repo) = bare();
     let initial = export_revision_history(
         &fixture.objects,
         &fixture.content,
         second.resulting_view,
         base,
+        changes,
         &git_repo,
         &ExportOptions::default(),
     )
@@ -395,6 +430,7 @@ async fn rejects_a_projected_anchor_whose_tree_does_not_match_its_application() 
         &fixture.content,
         second.resulting_view,
         base,
+        changes,
         &git_repo,
         &ExportOptions {
             anchor: Some(forged),
@@ -493,6 +529,7 @@ async fn emits_regular_executable_symlink_and_binary_blobs() {
         &fixture.content,
         fourth.resulting_view,
         base,
+        default_changes(&fixture, &[1, 2, 3, 4]).await,
         &git_repo,
         &ExportOptions::default(),
     )
@@ -550,8 +587,241 @@ async fn rejects_a_selected_view_with_unresolved_conflicts() {
         .await
         .unwrap();
     let (_git_dir, git_repo) = bare();
+    let changes = default_changes(&fixture, &[1, 2]).await;
     assert!(matches!(
-        export_revision_history(&fixture.objects, &fixture.content, conflicted.id(), base, &git_repo, &ExportOptions::default()).await,
+        export_revision_history(&fixture.objects, &fixture.content, conflicted.id(), base, changes, &git_repo, &ExportOptions::default()).await,
         Err(ExportError::ConflictedView(id)) if id == conflicted.id()
+    ));
+}
+
+/// One native change with one checkpoint per note, each rewriting `file`, authored the way
+/// `wheat change new -m` and `wheat add` do. Returns the base, the latest view, and the
+/// repository state's change map.
+async fn native_history(
+    fixture: &Fixture,
+    title: &str,
+    description: &str,
+    notes: &[&str],
+) -> (ViewId, ViewId, ChangeMapId) {
+    let heads = LocalPublicationStore::new(fixture._directory.path().join("head"));
+    let repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    let mut head = RepositoryPublisher::new(&fixture.objects, &fixture.content, &heads)
+        .initialize(&repository)
+        .await
+        .unwrap();
+    let mutator = PersistedRepositoryMutator::new(&fixture.objects, &fixture.content, &heads);
+    let change = ChangeId::new();
+    let mut previous: Option<(RevisionOutcome, EditId)> = None;
+    for (index, note) in notes.iter().enumerate() {
+        let bytes = format!("version {index}\n");
+        let edit = EditRecord::new(
+            "file",
+            EditOperation::ExactFile {
+                expected: None,
+                replacement: Some(value(&fixture.content, bytes.as_bytes(), FileKind::Regular)),
+            },
+        )
+        .unwrap();
+        let id = edit.id();
+        let mut edits = RevisionEdits {
+            edits: BTreeMap::from([(id, edit)]),
+            transition: EditTransition {
+                added: [id].into(),
+                ..Default::default()
+            },
+        };
+        let revision_metadata = metadata(note, 1_700_000_000 + index as i64);
+        let (prepared, outcome) = match &previous {
+            None => mutator
+                .create(
+                    head,
+                    base,
+                    base,
+                    ChangeProposal {
+                        id: change,
+                        metadata: ChangeMetadata {
+                            title: title.into(),
+                            description: description.into(),
+                            ..Default::default()
+                        },
+                        dependencies: BTreeSet::new(),
+                        revision_metadata,
+                        edits,
+                    },
+                )
+                .await
+                .unwrap(),
+            Some((outcome, previous_edit)) => {
+                edits.transition.removed.insert(*previous_edit);
+                mutator
+                    .revise(
+                        head,
+                        base,
+                        outcome.resulting_view,
+                        change,
+                        outcome.revision_id,
+                        revision_metadata,
+                        edits,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        head = mutator.publish(prepared).await.unwrap();
+        previous = Some((outcome, id));
+    }
+    let reader = RepositoryReader::new(&fixture.objects, &fixture.content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    let state = reader.state(envelope.state).await.unwrap();
+    (base, previous.unwrap().0.resulting_view, state.changes)
+}
+
+async fn exported_message(
+    fixture: &Fixture,
+    history: (ViewId, ViewId, ChangeMapId),
+    options: &ExportOptions,
+) -> Result<(String, gix::actor::Signature), ExportError> {
+    let (base, latest, changes) = history;
+    let (_git_dir, git_repo) = bare();
+    let exported = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        latest,
+        base,
+        changes,
+        &git_repo,
+        options,
+    )
+    .await?;
+    let commit = git_repo.find_commit(exported.tip.unwrap()).unwrap();
+    let message = commit.message_raw().unwrap().to_str().unwrap().to_owned();
+    let author = commit.author().unwrap().to_owned().unwrap();
+    Ok((message, author))
+}
+
+#[tokio::test]
+async fn a_native_commit_describes_the_change_rather_than_its_newest_checkpoint() {
+    let fixture = Fixture::new();
+    let history = native_history(
+        &fixture,
+        "Survive agent restarts",
+        "",
+        &[
+            "Survive agent restarts\n\nContainers must outlive the agent.",
+            "",
+            "Fix the digest mode\n\nCo-authored-by: Alice <alice@example.invalid>",
+            "",
+        ],
+    )
+    .await;
+    let (message, author) = exported_message(&fixture, history, &ExportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        message,
+        "Survive agent restarts\n\nContainers must outlive the agent.\n\nFix the digest mode\n\nCo-authored-by: Alice <alice@example.invalid>\n"
+    );
+    assert_eq!(author.email, "alice@example.com");
+    assert_eq!(author.time.seconds, 1_700_000_003);
+}
+
+#[tokio::test]
+async fn a_native_commit_includes_the_change_description() {
+    let fixture = Fixture::new();
+    let history = native_history(
+        &fixture,
+        "Initial import",
+        "Everything so far.",
+        &["Initial import", ""],
+    )
+    .await;
+    let (message, _) = exported_message(&fixture, history, &ExportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(message, "Initial import\n\nEverything so far.\n");
+}
+
+#[tokio::test]
+async fn composing_a_message_is_bounded_by_checkpoint_reads_and_message_size() {
+    let fixture = Fixture::new();
+    let history = native_history(&fixture, "Title", "", &["Title", "", "", "Last note"]).await;
+    let mut options = ExportOptions::default();
+    options.limits.max_note_revisions = 2;
+    assert!(matches!(
+        exported_message(&fixture, history, &options).await,
+        Err(ExportError::LimitExceeded {
+            limit: ExportLimit::NoteRevisions,
+            actual: 3,
+            maximum: 2,
+        })
+    ));
+    options.limits.max_note_revisions = 3;
+    assert!(exported_message(&fixture, history, &options).await.is_ok());
+
+    let mut options = ExportOptions::default();
+    options.limits.max_message_bytes = "Title\n\nLast note".len();
+    assert!(matches!(
+        exported_message(&fixture, history, &options).await,
+        Err(ExportError::LimitExceeded {
+            limit: ExportLimit::MessageBytes,
+            ..
+        })
+    ));
+    options.limits.max_message_bytes += 1;
+    assert_eq!(
+        exported_message(&fixture, history, &options)
+            .await
+            .unwrap()
+            .0,
+        "Title\n\nLast note\n"
+    );
+}
+
+#[tokio::test]
+async fn an_imported_revision_keeps_its_message_byte_for_byte() {
+    let fixture = Fixture::new();
+    let writer = PersistedCommitWriter::new(&fixture.objects, &fixture.content);
+    let base = writer.empty_view().await.unwrap();
+    let raw = "imported title  \n\n\nbody with Co-authored-by: nobody\n\n";
+    let mut imported_metadata = metadata(raw, 1_600_000_000);
+    imported_metadata.provenance = Some(SourceProvenance {
+        system: "git-sha1".into(),
+        object_id: vec![7; 20],
+        parent_object_ids: Vec::new(),
+    });
+    let imported = writer
+        .write(
+            base,
+            proposal(
+                1,
+                None,
+                "file.txt",
+                None,
+                Some(value(&fixture.content, b"imported\n", FileKind::Regular)),
+                imported_metadata,
+            ),
+        )
+        .await
+        .unwrap();
+    let changes = default_changes(&fixture, &[1]).await;
+    let (message, _) = exported_message(
+        &fixture,
+        (base, imported.resulting_view, changes),
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(message, raw);
+}
+
+#[tokio::test]
+async fn a_change_missing_from_the_change_map_is_refused() {
+    let fixture = Fixture::new();
+    let (base, _first, second) = two_revisions(&fixture).await;
+    let only_first = default_changes(&fixture, &[1]).await;
+    assert!(matches!(
+        exported_message(&fixture, (base, second.resulting_view, only_first), &ExportOptions::default()).await,
+        Err(ExportError::UnknownChange(change)) if change == ChangeId::from_bytes([2; 16])
     ));
 }

@@ -225,7 +225,7 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
         "{}",
         String::from_utf8_lossy(&pushed.stderr)
     );
-    assert!(String::from_utf8_lossy(&pushed.stdout).contains("pushed 1 Wheat revisions"));
+    assert!(String::from_utf8_lossy(&pushed.stdout).contains("pushed 1 commit (one per change)"));
 
     let projected = git(Some(&remote), &["rev-parse", "refs/heads/main"]);
     assert_ne!(projected, original);

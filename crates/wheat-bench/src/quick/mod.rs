@@ -14,6 +14,7 @@
 mod add_scale;
 mod content_repack_plan;
 mod deep_stack;
+mod git_export_notes;
 mod packed_append;
 mod sharded_manifest;
 mod transition_validate;
@@ -46,6 +47,7 @@ pub const CASES: &[&str] = &[
     packed_append::NAME,
     content_repack_plan::NAME,
     sharded_manifest::NAME,
+    git_export_notes::NAME,
 ];
 
 /// How big the cases are.
@@ -181,6 +183,7 @@ pub fn run_case(
         packed_append::NAME => packed_append::run(&context),
         content_repack_plan::NAME => content_repack_plan::run(&context),
         sharded_manifest::NAME => sharded_manifest::run(&context),
+        git_export_notes::NAME => git_export_notes::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

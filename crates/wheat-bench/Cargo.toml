@@ -17,7 +17,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+gix = { workspace = true }
 wheat-core = { path = "../wheat-core" }
+wheat-git = { path = "../wheat-git" }
 wheat-store = { path = "../wheat-store" }
 
 [lints]

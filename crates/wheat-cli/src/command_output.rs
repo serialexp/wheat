@@ -510,12 +510,14 @@ fn classify(error: &Error) -> Classification {
                 ExportError::Cycle(_)
                 | ExportError::AmbiguousApplication { .. }
                 | ExportError::InconsistentApplication { .. }
+                | ExportError::UnknownChange(_)
                 | ExportError::MismatchedProjectedAnchor { .. } => {
                     class("integrity", "corrupt_repository", false, 6)
                 }
                 ExportError::Git(_) => class("io", "git_projection_io", true, 8),
                 ExportError::Repository(_)
                 | ExportError::ApplicationMap(_)
+                | ExportError::ChangeMap(_)
                 | ExportError::ConflictSet(_)
                 | ExportError::Tree(_)
                 | ExportError::Content(_) => continue,
@@ -576,6 +578,7 @@ fn classify(error: &Error) -> Classification {
                 RepositoryRewriteError::InvalidBoundary
                 | RepositoryRewriteError::MissingMetadata
                 | RepositoryRewriteError::SemanticDrift
+                | RepositoryRewriteError::MissingProducedView
                 | RepositoryRewriteError::UnknownAuthorityRoot => {
                     class("integrity", "invalid_repository_rewrite", false, 6)
                 }

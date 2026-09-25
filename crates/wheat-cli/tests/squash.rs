@@ -298,6 +298,79 @@ fn squash_is_noop_for_one_unpublished_checkpoint_and_stack_squashes_all_changes(
     ok(wheat(&workspace, &config, &["validate"]));
 }
 
+/// The common local flow: `change new -m`, then several `wheat add`s that touch the same line.
+/// The later add subsumes the earlier guarded edit, which squash once refused to collapse.
+#[tokio::test]
+async fn stack_squash_collapses_a_twice_edited_line_and_folds_notes_without_coauthors() {
+    let (_temp, workspace, config) = setup();
+    initialize(&workspace, &config);
+    set_actor(&config, "Bart", "bart@old.invalid");
+    ok(wheat(
+        &workspace,
+        &config,
+        &[
+            "change",
+            "new",
+            "-m",
+            "Base file",
+            "--path",
+            "file",
+            "--value",
+            "l1\nl2\nl3\nl4\nl5\n",
+        ],
+    ));
+    materialize(&workspace, &config);
+    let created = ok(wheat(
+        &workspace,
+        &config,
+        &["change", "new", "-m", "Edit line three\n\nWhy it changed."],
+    ));
+    let change = field(&created, "change ");
+    fs::write(workspace.join("file"), "l1\nl2\nchanged\nl4\nl5\n").unwrap();
+    ok(wheat(&workspace, &config, &["add", "file"]));
+    fs::write(workspace.join("file"), "l1\nl2\nchanged again\nl4\nl5\n").unwrap();
+    let latest = field(
+        &ok(wheat(&workspace, &config, &["add", "file"])),
+        "revision ",
+    );
+    let store = workspace_store(&workspace);
+    assert!(
+        !revision(&store, &latest)
+            .await
+            .transition
+            .subsumed
+            .is_empty(),
+        "the second add must subsume the first edit for this test to mean anything"
+    );
+
+    set_actor(&config, "Bart", "bart@new.invalid");
+    let result = json(
+        &workspace,
+        &config,
+        &["--format", "json", "stack", "squash", "--no-coauthors"],
+    );
+    assert!(
+        result["result"]["rewritten"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String(change))
+    );
+    let replacement = result["result"]["revisions"][&latest].as_str().unwrap();
+    let persisted = revision(&store, replacement).await;
+    assert_eq!(persisted.predecessor, None);
+    assert!(persisted.transition.subsumed.is_empty());
+    assert_eq!(persisted.metadata.author.email, "bart@new.invalid");
+    assert_eq!(
+        persisted.metadata.message,
+        "Edit line three\n\nWhy it changed."
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("file")).unwrap(),
+        "l1\nl2\nchanged again\nl4\nl5\n"
+    );
+    ok(wheat(&workspace, &config, &["validate"]));
+}
+
 #[tokio::test]
 async fn squash_persists_multi_actor_coauthors() {
     let (_temp, workspace, config) = setup();

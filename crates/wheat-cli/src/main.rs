@@ -255,13 +255,35 @@ enum ChangeCommand {
     /// Select an existing active change for subsequent `wheat add` commands.
     Select { change: String },
     /// Collapse the unpublished checkpoint suffix of one logical change.
-    Squash { change: Option<String> },
+    Squash {
+        change: Option<String>,
+        #[command(flatten)]
+        options: SquashOptions,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum StackCommand {
     /// Collapse unpublished checkpoint suffixes throughout the selected stack.
-    Squash,
+    Squash(SquashOptions),
+}
+
+#[derive(Debug, clap::Args)]
+struct SquashOptions {
+    /// Do not add `Co-authored-by` trailers for checkpoint authors other than you, for
+    /// example when they are you under an old email. Trailers already in the messages stay.
+    #[arg(long)]
+    no_coauthors: bool,
+}
+
+impl SquashOptions {
+    fn coauthors(&self) -> squash_attribution::Coauthors {
+        if self.no_coauthors {
+            squash_attribution::Coauthors::Omit
+        } else {
+            squash_attribution::Coauthors::Credit
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -600,7 +622,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Change(ChangeCommand::New(_)) => "change.new",
         Command::Change(ChangeCommand::Select { .. }) => "change.select",
         Command::Change(ChangeCommand::Squash { .. }) => "change.squash",
-        Command::Stack(StackCommand::Squash) => "stack.squash",
+        Command::Stack(StackCommand::Squash(_)) => "stack.squash",
         Command::Resolve(_) => "resolve",
         Command::Workspace(WorkspaceCommand::List) => "workspace.list",
         Command::Workspace(WorkspaceCommand::Unregister) => "workspace.unregister",
@@ -1407,15 +1429,17 @@ fn execute(cli: Cli) -> Result<Success> {
                 format!("selected change {change} — {}\n", selected.title),
             )
         }
-        Command::Change(ChangeCommand::Squash { change }) => squash::execute(
+        Command::Change(ChangeCommand::Squash { change, options }) => squash::execute(
             &requested_workspace,
             cli.store.as_deref(),
             squash::Scope::Change(change.as_deref()),
+            options.coauthors(),
         ),
-        Command::Stack(StackCommand::Squash) => squash::execute(
+        Command::Stack(StackCommand::Squash(options)) => squash::execute(
             &requested_workspace,
             cli.store.as_deref(),
             squash::Scope::Stack,
+            options.coauthors(),
         ),
         Command::Resolve(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
@@ -1888,7 +1912,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
     let _operation = rewrite_transaction::StoreOperationGuard::acquire(root, &local)?;
     let expected = local.heads.read()?;
     let runtime = runtime()?;
-    let (base, selected) = runtime.block_on(async {
+    let (base, selected, changes) = runtime.block_on(async {
         let reader = RepositoryReader::new(&local.objects, &local.content);
         let envelope = reader.validate_envelope(expected.envelope).await?;
         let state = reader.state(envelope.state).await?;
@@ -1906,13 +1930,14 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
                 .with_context(|| format!("unknown Wheat label {name}"))?,
             PushSource::View(view) => *view,
         };
-        Ok::<_, anyhow::Error>((state.base_view, selected))
+        Ok::<_, anyhow::Error>((state.base_view, selected, state.changes))
     })?;
     let prepared = runtime.block_on(wheat_git::bridge::prepare_push(
         &local.objects,
         &local.content,
         selected,
         base,
+        changes,
         &projection_path(root)?,
         &arguments.remote,
         &arguments.to,
@@ -1941,7 +1966,8 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         format!("{} is already at {tip}\n", arguments.to)
     } else {
         format!(
-            "pushed {projected} Wheat revisions to {} at {tip}\n",
+            "pushed {projected} commit{} (one per change) to {} at {tip}\n",
+            if projected == 1 { "" } else { "s" },
             arguments.to
         )
     };
@@ -1950,7 +1976,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         json!({
             "destination": arguments.to,
             "tip": tip.to_string(),
-            "projected_revisions": projected,
+            "projected_commits": projected,
             "up_to_date": up_to_date,
         }),
         human,

@@ -17,6 +17,7 @@ mod edit_records;
 pub mod guarded;
 mod hydration;
 mod id;
+pub mod message;
 mod model;
 mod persisted;
 mod repository;
