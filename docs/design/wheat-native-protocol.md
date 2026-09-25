@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-09-20
+Last updated: 2026-09-25
 
 ## Implementation status
 
@@ -91,10 +91,14 @@ top of them.
 - [ ] **Phase 1 — TypeScript client.** Generate TypeScript encode/decode from the
   same binschema schema, implement the client protocol over browser-native
   WebSocket, and demonstrate a round-trip from a Bun/browser client.
-- [ ] **Phase 2 — remote tracking.** Persist observed remote views locally
+- [~] **Phase 2 — remote tracking.** Persist observed remote views locally
   (`wheat-remote` configuration, remote-view observations) without treating them
   as local authority. Enable incremental fetch (only transfer objects the client
-  is missing).
+  is missing). (2026-09-25: `crates/wheat-cli/src/remote_config.rs` persists one
+  remote and its last observed head, and content fetch is incremental. There is
+  no named or multi-remote configuration, and structural fetch is not
+  incremental: `crates/wheat-server/src/fetch.rs` always sends the whole
+  structural closure and ignores `since_generation`.)
 - [ ] **Phase 1 — authentication.** Bearer token auth in `ClientHello`, TLS
   required, localhost-only default when no auth is configured. Standalone
   server refuses non-loopback binding without explicit auth config. Origin

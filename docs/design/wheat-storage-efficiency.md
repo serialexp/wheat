@@ -2,7 +2,7 @@
 
 Status: partial — Phases 0–2 and local Phase 4a landed; Phase 3, remote maintenance, and Phase 4b outstanding
 Owner: bart
-Last updated: 2026-09-24
+Last updated: 2026-09-25
 
 ## Implementation status
 
@@ -86,10 +86,14 @@ external review.
   unreachable from every authority in the collection scope. GC must use exact,
   fail-closed marking, include transitive delta-base `ContentId`s, and respect
   writer fencing plus reader grace periods.
-- [ ] **Measurement prerequisite.** Before implementing, measure the
+- [~] **Measurement prerequisite.** Before implementing, measure the
   actual benchmark repository: object count by kind, bytes by kind
   (canonical + stored), objects reachable from HEAD vs total ever
-  written. The estimates in this doc need grounding.
+  written. The estimates in this doc need grounding. (2026-09-25: `wheat store
+  analyze` reports counts and canonical/stored bytes per kind and codec, plus
+  bytes in unselected generations, and measured numbers are recorded below. A
+  count of metadata objects reachable from HEAD versus all ever written is still
+  missing.)
 
 ## Why this exists
 

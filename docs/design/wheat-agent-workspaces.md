@@ -1,8 +1,10 @@
 # Wheat Root-Agent Workspaces — Design
 
-Status: draft, not yet implemented
+Status: partial — exact view materialization landed and tracked-path workspace
+capture is partial; the workspace contract, agent integration, commit/resume,
+stacking, physical optimization, and the concurrency corpus are outstanding
 Owner: bart
-Last updated: 2026-09-02
+Last updated: 2026-09-25
 
 ## Implementation status
 
@@ -19,6 +21,14 @@ land and move completed bullets from Outstanding to Done.
 - [x] **Incremental explicit authoring proof.** `wheat add` proves that a later
   revision can preserve unaffected edit identities, replace or consolidate
   changed edits, remove undone edits, and retain historical revisions.
+- [x] **Phase 1 — exact view materialization.** Materialize any retained Wheat
+  view as a safe private filesystem tree, with authenticated content, file-kind
+  fidelity, deterministic paths, and no dependency on a live Git checkout.
+  (`crates/wheat-cli/src/materialization.rs`: no-follow descriptor traversal,
+  `renameat2` exchange, regular/executable/symlink kinds. Any retained view is
+  reachable through `label create --view` plus `switch`. Tests in
+  `crates/wheat-cli/tests/materialization_recovery.rs` and
+  `phase1_acceptance.rs`.)
 
 ### Outstanding
 
@@ -26,13 +36,13 @@ land and move completed bullets from Outstanding to Done.
   a root-agent workspace, including whether `WorkspaceId` is durable, how its
   owning `ChangeId` and fixed base `ViewId` are represented, and what survives
   suspension, abandonment, and local-directory loss.
-- [ ] **Phase 1 — exact view materialization.** Materialize any retained Wheat
-  view as a safe private filesystem tree, with authenticated content, file-kind
-  fidelity, deterministic paths, and no dependency on a live Git checkout.
-- [ ] **Phase 2 — whole-workspace capture.** Compare a private workspace with
+- [~] **Phase 2 — whole-workspace capture.** Compare a private workspace with
   its fixed base and derive one complete revision of its stable change,
   including additions, deletions, binary files, symlinks, executable bits,
   guarded text edits, transition lineage, and bounded race-safe traversal.
+  (2026-09-25: `wheat add --all` captures modified and deleted tracked paths in
+  one revision; tests in `crates/wheat-cli/tests/workspace_add_all.rs`. New files
+  are excluded from `--all`, so additions are not captured workspace-wide yet.)
 - [ ] **Phase 3 — root-agent integration.** Give every root `gt agent` session
   its own Wheat workspace while keeping the parent and all delegated workers in
   that same workspace. Route typed tools, Bash, indexes, builds, checkpoints,

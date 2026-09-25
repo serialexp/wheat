@@ -1,8 +1,10 @@
 # Wheat Phase 2 — Local Tooling Design
 
-Status: draft, not yet implemented
+Status: partial — Phase 0 discovery and Phase 1 ignore-aware status landed; the
+extended configuration, `--exclude`, `add --all` follow-ups, hooks, and remotes
+are outstanding
 Owner: bart
-Last updated: 2026-09-17
+Last updated: 2026-09-25
 
 ## Implementation status
 
@@ -11,46 +13,69 @@ land; move whole sections to "done" once everything inside them is checked.
 
 ### Done
 
-_(nothing yet)_
-
-### Outstanding
-
-- [ ] **Phase 0 — repository discovery.** Walk the directory hierarchy upward from
+- [x] **Phase 0 — repository discovery.** Walk the directory hierarchy upward from
   the working directory to find the `.wheat` control directory, stop at filesystem
   boundaries, and expose the resolved workspace/store paths to every subsequent
-  command without requiring `--repository`.
-- [ ] **Phase 0 — extended configuration model.** Extend the existing bounded
-  versioned JSON configuration (XDG user scope and repository scope) with keys for
-  editor, pager, default label, default output format, compatibility remotes,
-  ignore overrides, and hook declarations. Repository configuration takes
-  precedence per key over user configuration, as the existing actor identity
-  contract already does.
-- [ ] **Phase 1 — ignore evaluation engine.** Implement `.gitignore`-compatible
+  command without requiring `--repository`. (`crates/wheat-cli/src/discovery.rs`
+  `discover_workspace`: stops at a `st_dev` change, refuses a symlinked `.wheat`,
+  and checks the workspace's store identity against the store. Test:
+  `untracked_status::discovery_from_subdirectory`.)
+- [x] **Phase 1 — ignore evaluation engine.** Implement `.gitignore`-compatible
   pattern matching: anchored and unanchored globs, directory-only patterns,
   negation, and comment lines. The engine is a shared library used by status,
   capture, diff, and any future workspace-scanning command. Evaluation is bounded
-  and must not follow symlinked directories.
-- [ ] **Phase 1 — `.wheatignore` file loading.** Load ignore rules from three
-  sources in precedence order: repository-versioned `.wheatignore` files
-  (directory-scoped, nested), user-global `${XDG_CONFIG_HOME}/wheat/ignore`, and
-  command-local `--exclude` flags. Tracked paths remain visible even when a later
-  rule matches them.
-- [ ] **Phase 1 — `.gitignore` fallback with diagnostic.** When a directory
+  and must not follow symlinked directories. (`crates/wheat-ignore`. Its only
+  consumer today is `wheat status`. The walk is bounded by
+  `workspace_walk::WalkLimits`; the ignore-file and pattern-count bound is still
+  outstanding below.)
+- [x] **Phase 1 — `.wheatignore` file loading (repository and user-global
+  sources).** Nested, directory-scoped `.wheatignore` files and the user-global
+  `${XDG_CONFIG_HOME}/wheat/ignore`. Tracked paths remain visible even when a rule
+  matches them. (Tests: `untracked_status::nested_wheatignore_overrides_parent`,
+  `global_ignore_file`, `tracked_paths_remain_visible_despite_ignore_rule`.) The
+  `--exclude` source is outstanding below.
+- [x] **Phase 1 — `.gitignore` fallback with diagnostic.** When a directory
   contains `.gitignore` but no `.wheatignore`, wheat reads the `.gitignore` at the
   lowest precedence beneath repository-versioned rules and prints a one-line
   diagnostic noting the fallback. The diagnostic should suggest creating a
   `.wheatignore` (or running `wheat ignore import`) to make the rules explicit and
   silence the message. A `.wheatignore` in the same directory fully replaces its
-  sibling `.gitignore` — they are not merged.
-- [ ] **Phase 1 — workspace-wide status with ignore rules.** Extend `wheat status`
+  sibling `.gitignore` — they are not merged. (Tests:
+  `untracked_status::gitignore_fallback_with_diagnostic`,
+  `wheatignore_replaces_gitignore_in_same_directory`. The suggested
+  `wheat ignore import` command does not exist yet; see Outstanding.)
+- [x] **Phase 1 — workspace-wide status with ignore rules.** Extend `wheat status`
   to traverse untracked workspace paths, classify them as untracked or ignored, and
   bound the scan. This is the first consumer of the ignore engine and gates
-  workspace-wide capture.
-- [ ] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
-  select all non-ignored modified and deleted tracked paths rather than requiring
-  explicit path arguments. New untracked files are excluded by default; they
-  require an explicit `--include-untracked` flag or explicit path arguments. The
-  capture plan must be displayed or emitted before mutation in interactive flows.
+  workspace-wide capture. (Status schema version 2 with `untracked` and
+  `diagnostics`; symlinked directories are not followed. Tests in
+  `crates/wheat-cli/tests/untracked_status.rs`.)
+- [x] **Phase 2 — workspace-wide capture (`wheat add --all`).** `--all` selects
+  all modified and deleted tracked paths instead of explicit path arguments, and
+  excludes new untracked files. (Tests in
+  `crates/wheat-cli/tests/workspace_add_all.rs`.) The `--include-untracked` flag
+  and the pre-mutation capture plan are outstanding below.
+
+### Outstanding
+
+- [ ] **Phase 0 — extended configuration model (partial).** `core.editor`,
+  `core.pager`, `core.default_label`, and `core.default_format` can be stored with
+  `wheat config set`, but no command reads them yet. Keys for compatibility
+  remotes, ignore overrides, and hook declarations do not exist. Repository
+  configuration takes precedence per key over user configuration, as the existing
+  actor identity contract already does.
+- [ ] **Phase 1 — command-local `--exclude`.** `wheat_ignore::stack::IgnoreStack`
+  already accepts exclude patterns, but `wheat status` passes none and no command
+  exposes an `--exclude` flag.
+- [ ] **Phase 1 — ignore-file and pattern-count bounds.** The walk has entry,
+  directory, and depth limits with a truncation diagnostic, but the number of
+  loaded ignore files and patterns is not bounded, and no test covers truncation
+  (acceptance criterion 9).
+- [ ] **Phase 1 — `wheat ignore import`.** The `.gitignore` fallback diagnostic
+  tells the user to run this command, but it does not exist yet.
+- [ ] **Phase 2 — `add --all` follow-ups.** Add `--include-untracked` (the help
+  text currently says to name untracked paths explicitly instead), and display or
+  emit the capture plan before mutation in interactive flows.
 - [ ] **Phase 2 — lifecycle hook execution.** Implement the hook runner: resolve
   registered executables from `.wheat/hooks/<event>`, enforce timeout and output
   bounds, pass structured JSON context on stdin, collect exit status and optional

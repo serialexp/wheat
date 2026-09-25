@@ -1,8 +1,8 @@
 # Wheat — Server-Native Source Control
 
-Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, Phase 1 local CLI workflow, Git import paths, and local active-pack growth/sealing are implemented and qualified; the Phase 2 immutable-label and workspace-frontier model is settled but not implemented, and model/store qualification, concurrency, retention/recovery, forge review policy, remote protocol work, and product commitment remain open
+Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, Phase 1 local CLI workflow, Git import paths, local active-pack growth/sealing, and Phase 2 immutable labels and workspace frontiers are implemented and qualified; a first native protocol and server exist; model/store qualification, concurrency, deletion/GC, forge review policy, protocol resumability and remote-CLI qualification, and product commitment remain open
 Owner: bart
-Last updated: 2026-09-14
+Last updated: 2026-09-25
 
 ## Implementation status
 
@@ -63,9 +63,15 @@ described here.
   settled short repository-local labels bound to immutable views, imported Git-ref
   provenance, per-workspace basis and selected frontier, and the zero/one/many
   selection rule. Label advancement and frontier consolidation remain deferred.
-
-### Outstanding
-
+- [x] **Phase 2 — immutable labels and workspace frontiers.** Implement short
+  repository-local labels bound to immutable views, retain original Git ref
+  provenance on imported labels, and store workspace basis plus selected frontier.
+  Zero descendant frontiers selects the basis, one existing frontier auto-selects,
+  and multiple require an explicit choice; never synthesize their union.
+  (`crates/wheat-cli/src/label_service.rs`, `frontier_service.rs`,
+  `BranchRecord::original_git_ref`, `WorkspaceMetadata::{basis,
+  selected_frontier}`; tests in `crates/wheat-cli/tests/labels.rs` and
+  `materialization_recovery.rs`.)
 - [x] **Guarded edits — canonical model and retention.** Standalone content-addressed
   guarded/exact edit definitions, revision selections and transition lineage,
   per-edit application evidence, historical closure, semantic replay, and reopen
@@ -84,16 +90,36 @@ described here.
   seconds, revision in 3.75
   seconds, reopen/status in 3.19 seconds, and explicit complete validation in 757.35 seconds;
   the retained-history audit remains deliberately distinct from interactive mutation latency.
-- [~] **Guarded edits — interdiff and review continuity.** Revision transitions expose
-  preserved, added, removed, subsumed, and resolution relationships, and applications
-  bind outcomes to exact edit definitions and targets. Forge reviewer evidence and
-  approval/publication policy remain a separate follow-up.
 - [x] **Decision gate — guarded-edit edge algorithms and encoding.** The prototype V1
   now fixes symmetric context growth, anchored boundaries, deterministic bounded line
   mapping and fixed-point consolidation, content-derived identity and transition
   lineage, canonical LF text versus byte-exact binary/symlinks, exact file operations,
   resolution evidence, and bounded failures. The native schema remains experimental
   until the separate schema-lock decision gate below is approved.
+- [x] **Phase 2 — active pack growth and sealing.** Durable local mutations now use one
+  process-exclusive active pack, preserve payload offsets, replace its cumulative authenticated
+  tail, journal exact rollback state, publish a checksummed physical head, update locator rows
+  incrementally, and seal/start a new pack at a 128 MiB initial policy bound with independent
+  count/payload/tail limits. Resumable imports acknowledge bounded groups only after one durable
+  flush and authenticated readback. Isolated atomic imports use a one-pass deferred writer that
+  appends each payload once and emits a final V1 tail only on rollover or consuming close before
+  the terminal filesystem sync and no-replace rename. A fresh 1,624-change Gothab import produced
+  seven packs (six near 128 MiB) in 290.61 seconds with 317 MiB peak RSS; reopen status took 1.18
+  seconds, log 0.41 seconds, and explicit complete validation 178.18 seconds. Crash, tampering,
+  rollover, close-failure, restart, acknowledgement, cached-read, and orphan-publication cleanup
+  regressions are covered. Marker-authenticated stale atomic-import directories are reclaimed under
+  the per-destination lock; unrelated, malformed, and symlinked candidates are preserved. An ignored
+  release benchmark tracks the intentionally expensive one-object durable path: 128–2,048 small
+  appends sustained roughly 39–49 objects/second on the qualification host, reinforcing that bulk
+  ingestion must use bounded batches or the deferred writer rather than treating per-object fsync as
+  a throughput path.
+
+### Outstanding
+
+- [~] **Guarded edits — interdiff and review continuity.** Revision transitions expose
+  preserved, added, removed, subsumed, and resolution relationships, and applications
+  bind outcomes to exact edit definitions and targets. Forge reviewer evidence and
+  approval/publication policy remain a separate follow-up.
 - [ ] **Separate follow-up — structural review warnings.** Use language-aware
   enclosing-scope analysis to flag broader context changes without weakening exact
   guards or making parser behavior part of native identity/application validity.
@@ -123,26 +149,31 @@ described here.
   through ordinary Git, what may be a lossy projection, and whether
   `git-remote-gothab` initially delegates to Git or materializes Git objects
   from a native service.
-- [ ] **Phase 1 — qualify the native model and store prototype.** Generate and
+- [~] **Phase 1 — qualify the native model and store prototype.** Generate and
   integrate the new BinSchema canonical-object encoding; replace the walking
   skeleton's deliberately simple whole-file transformations and YAML state
   snapshot with complete content manifests and reachability, transactional
   metadata/content publication, dependency validation, and property tests. The
   prototype now retains verified content bytes, but does not yet prove ownership,
   recovery, or safe reclamation; Git and gix remain outside the core.
-- [ ] **Phase 1 — complete the conflict and concurrency corpus.** Extend the
+  (2026-09-25: BinSchema encoding, YAML-snapshot removal, content manifests,
+  transactional publication, proptests in `wheat-core/tests/generated_contracts.rs`
+  and `wheat-store/tests/generated_backend_parity.rs`, and ownership proofs in
+  `wheat-store/src/ownership.rs` have landed. Safe reclamation remains.)
+- [~] **Phase 1 — complete the conflict and concurrency corpus.** Extend the
   current chain/branch/join/conflict/CAS tests to concurrent human/agent
   mutations, independent simultaneous conflicts, retries, dependency movement,
   and property-tested deterministic outcomes without a mutable Git ref as truth.
-- [ ] **Phase 1 — lifecycle and content-retention prototype.** Exercise
+  (2026-09-25: `wheat-store/tests/actor_concurrency_corpus.rs` covers concurrent
+  human/agent CAS, retry/reapply, competing resolutions, and dependency movement.
+  Independent simultaneous conflicts and property-tested concurrent outcomes
+  remain.)
+- [~] **Phase 1 — lifecycle and content-retention prototype.** Exercise
   publication, crash recovery, content manifests, shared-content retention,
   snapshot/restore, and deletion as native store invariants rather than adding
-  them after the format is fixed.
-- [ ] **Phase 2 — immutable labels and workspace frontiers.** Implement short
-  repository-local labels bound to immutable views, retain original Git ref
-  provenance on imported labels, and store workspace basis plus selected frontier.
-  Zero descendant frontiers selects the basis, one existing frontier auto-selects,
-  and multiple require an explicit choice; never synthesize their union.
+  them after the format is fixed. (2026-09-25: everything except deletion has
+  landed, including `wheat-store/src/snapshot.rs` and
+  `tests/snapshot_restore.rs`. Nothing deletes unreachable data yet.)
 - [ ] **Defer — label advancement and frontier consolidation.** Define explicit
   operations and policy for moving a label or consolidating several retained
   descendant frontiers. Repository state has no global workspace working/published
@@ -178,33 +209,27 @@ described here.
   unreachable loose object less than 24 hours after its backend modification
   time; verify the proposed closure immediately before publication and initially
   leave sealed-segment deletion disabled.
-- [x] **Phase 2 — active pack growth and sealing.** Durable local mutations now use one
-  process-exclusive active pack, preserve payload offsets, replace its cumulative authenticated
-  tail, journal exact rollback state, publish a checksummed physical head, update locator rows
-  incrementally, and seal/start a new pack at a 128 MiB initial policy bound with independent
-  count/payload/tail limits. Resumable imports acknowledge bounded groups only after one durable
-  flush and authenticated readback. Isolated atomic imports use a one-pass deferred writer that
-  appends each payload once and emits a final V1 tail only on rollover or consuming close before
-  the terminal filesystem sync and no-replace rename. A fresh 1,624-change Gothab import produced
-  seven packs (six near 128 MiB) in 290.61 seconds with 317 MiB peak RSS; reopen status took 1.18
-  seconds, log 0.41 seconds, and explicit complete validation 178.18 seconds. Crash, tampering,
-  rollover, close-failure, restart, acknowledgement, cached-read, and orphan-publication cleanup
-  regressions are covered. Marker-authenticated stale atomic-import directories are reclaimed under
-  the per-destination lock; unrelated, malformed, and symlinked candidates are preserved. An ignored
-  release benchmark tracks the intentionally expensive one-object durable path: 128–2,048 small
-  appends sustained roughly 39–49 objects/second on the qualification host, reinforcing that bulk
-  ingestion must use bounded batches or the deferred writer rather than treating per-object fsync as
-  a throughput path.
-- [ ] **Phase 2 — physical store qualification.** Benchmark and refine object
+- [~] **Phase 2 — physical store qualification.** Benchmark and refine object
   encoding, index fan-out, active-pack sealing thresholds, deltas, sharding, replication,
   caching, and garbage collection against deep stacks and wide agent fan-out on local files and
-  real object-storage range requests.
-- [ ] **Phase 2 — native protocol and remote CLI.** Specify a resumable,
+  real object-storage range requests. (2026-09-25: deltas and sharding are
+  implemented, with benchmarks such as `object_store_bench`, `packed_active_bench`,
+  `content_repack_scale`, and `s3_packed_test::publish_clone_s3_benchmark`.
+  Replication, GC, deep-stack and fan-out benchmarks, and real ranged remote
+  segment reads remain; the remote cache downloads whole segments.)
+- [~] **Phase 2 — native protocol and remote CLI.** Specify a resumable,
   versioned client/server protocol and run the same workflow corpus through the
-  reference CLI against an ephemeral repository daemon.
-- [ ] **Phase 3 — separate gix compatibility adapter.** Import Git into native
+  reference CLI against an ephemeral repository daemon. (2026-09-25: the
+  versioned protocol (`wheat-protocol`), `wheat-server`, and CLI
+  `clone`/`fetch`/`publish` exist. Transfers are not resumable, and no test runs
+  the `wheat` binary against a `wheat://` server; the server end-to-end tests use
+  hand-written protocol clients.)
+- [~] **Phase 3 — separate gix compatibility adapter.** Import Git into native
   objects and project selected native views to disposable Git repositories or
   synthesized packs without allowing Git identities to become authoritative.
+  (2026-09-25: `crates/wheat-git` imports, projects, and pushes, and neither
+  `wheat-core` nor `wheat-store` depends on gix. Projection handles only clean,
+  linear history, and synthesized-pack serving does not exist.)
 - [ ] **Phase 3 — repository-daemon integration.** Let gitd (or its successor)
   serve native repositories through the native protocol and Git projections
   through the gix adapter, with one explicitly canonical store per repository.

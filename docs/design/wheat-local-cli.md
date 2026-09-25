@@ -1,8 +1,8 @@
 # Wheat Local CLI — Design
 
-Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, extended configuration, and explicit revision collapse are landed; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
+Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, `add --all`, and explicit revision collapse are landed; extended configuration keys are stored but not yet read; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-09-22
+Last updated: 2026-09-25
 
 ## Implementation status
 
@@ -154,10 +154,12 @@ both lists.
   fails closed with no publication otherwise. Define a canonical composed-evidence
   representation for complex intermediate subsumption/resolution chains before
   allowing those chains to collapse.
-- [ ] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
+- [~] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
   capture all non-ignored modified and deleted tracked paths. Untracked files
   require `--include-untracked` or explicit path arguments. Depends on the
-  completed ignore rules.
+  completed ignore rules. (2026-09-25: `wheat add --all` landed with tests in
+  `crates/wheat-cli/tests/workspace_add_all.rs`. `--include-untracked` does not
+  exist yet; untracked files can only be added by naming them.)
 - [ ] **Phase 2 — lifecycle tooling.** Choose and implement the contract for
   formatters, linters, policy checks, and notifications around capture, revision,
   materialization, and publication. The design is settled in
@@ -167,14 +169,24 @@ both lists.
 - [ ] **Phase 2 — repository discovery and local configuration.** Discovery walks
   ancestors to `.wheat` and is already implemented. Remaining: editor/pager
   integration, aliases, compatibility remotes, and `wheat ignore import`
-  convenience command.
-- [ ] **Phase 3 — client/protocol boundary.** Introduce `wheat-client` and
+  convenience command. (2026-09-25: `core.editor`, `core.pager`,
+  `core.default_label`, and `core.default_format` can be set, but no command
+  reads them yet. The `.gitignore` fallback diagnostic already tells users to run
+  the missing `wheat ignore import`.)
+- [~] **Phase 3 — client/protocol boundary.** Introduce `wheat-client` and
   `wheat-protocol`, move local workspace operations behind the client contract,
   and remove the CLI's direct dependence on production store capabilities before
-  adding remote mode.
-- [ ] **Phase 3 — local synchronization.** Add persisted remote-view observations
+  adding remote mode. (2026-09-25: `wheat-protocol` exists and remote mode
+  landed first. There is no `wheat-client` crate; the protocol engine lives in
+  `crates/wheat-cli/src/remote.rs` and the CLI still depends on `wheat-store`
+  directly.)
+- [~] **Phase 3 — local synchronization.** Add persisted remote-view observations
   and incremental synchronization once the versioned native protocol exists;
   one-shot Git import remains a compatibility bootstrap, not native clone/pull.
+  (2026-09-25: `remote.json` persists the last observed remote head, and
+  `clone`/`fetch`/`publish` exist. Content fetch is incremental, but the server
+  ignores `since_generation` and resends the whole structural closure on every
+  fetch. There is no pull or integration.)
 - [ ] **Phase 3 — concurrent multi-workspace authoring policy.** Durable workspace
   identity, shared-store creation/list/detach, operation locks, and content pins are
   implemented. Still define user-facing integration when two workspaces advance

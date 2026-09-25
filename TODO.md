@@ -27,6 +27,22 @@ that. The budget passes, but by only about 0.7 s.
 - `[ ]` **Move `WHEAT_IMPORT_PROFILE` (wheat-git) onto tracing spans**, so there is one
   profiler instead of two.
 
+## Loose ends found in the design-doc audit (2026-09-25)
+
+- `[ ]` **`wheat+tls://` URLs parse but cannot connect.** `crates/wheat-cli/src/remote.rs`
+  accepts the scheme, but `tokio-tungstenite` is built with only the `connect`
+  feature (no rustls/native-tls), in both wheat-cli and wheat-server.
+- `[ ]` **The `.gitignore` fallback diagnostic points at a missing command.**
+  `workspace_status.rs` tells users to run `wheat ignore import`, which does not
+  exist (tracked in `wheat-local-tooling.md`).
+- `[ ]` **Stale `#[allow(dead_code)]` markers in `workspace_walk.rs`.** They say
+  "wired in the next step (status integration)", but `wheat status` already uses the
+  walk.
+- `[ ]` **The release-gate memory note lives under the gothab project.**
+  `wheat-local-cli.md`'s release gate refers to
+  `~/.claude/projects/-home-bart-Projects-gothab/memory/feedback_no_format_version_bumps.md`;
+  agents working in this repo don't load it (the rule is in `CLAUDE.md` here anyway).
+
 ## Explicit history collapse, repack, and GC
 
 Successive `add` operations intentionally retain immutable revision/view checkpoints
