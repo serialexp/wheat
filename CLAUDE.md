@@ -23,8 +23,10 @@ structs, no version bumps.
   against git's built-in defaults.
 - Anything more than a one-line change ships with a test. Leave the suite green.
 - Performance is part of correctness: work that scales with repository size needs a
-  scale test or benchmark (ignored benchmarks are fine; run them before calling
-  the work done).
+  scale test or benchmark. Benchmarks are cases in `crates/wheat-bench` (`just bench`),
+  not ignored tests. A new case gets a smoke size so `just test` keeps it running, and
+  a contract rule when it has a budget. Run the case in release before calling the work
+  done, and commit the results file it saves under `bench/results/`.
 
 ## Finding where time goes
 

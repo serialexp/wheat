@@ -1,11 +1,17 @@
-#![cfg(target_os = "linux")]
+//! The `wheat-gothab-workflow` profile: Wheat's whole CLI workflow against a large
+//! Git corpus.
+//!
+//! It imports the corpus (every commit reachable from its `HEAD`), then runs status,
+//! log, diff, change creation and capture, a conflicting revision and its resolution,
+//! materialization, a Git push checked with `git fsck` and a clone, a nested status
+//! and a complete validation. Each phase is one `wheat` process, measured on its own.
 
-#[path = "wheat_gothab_profile/mod.rs"]
-mod wheat_gothab_profile;
+mod fixture;
+mod report;
+mod session;
 
 use std::{
-    collections::BTreeMap,
-    env, fs,
+    fs,
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -14,39 +20,35 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use wheat_gothab_profile::{
-    command::{BoundedOutput, ProfileRun, peak_process_rss_bytes},
+
+pub use self::report::PROFILE;
+use self::{
     fixture::{
         create_exact_fixture, directory_size, git, git_clone, git_init_bare, select_paths,
         source_inventory,
     },
-    report::write_report,
+    report::build_report,
+    session::{BoundedOutput, Session},
+};
+use crate::{
+    host::{self, Checkout},
+    measure, path_text,
+    report::ProfileReportV1,
 };
 
-fn main() -> Result<()> {
+/// Profiles `wheat` against the Git checkout `source`, which must not be shallow.
+///
+/// The imported fixture is `source`'s exact `HEAD`; uncommitted changes in `source`
+/// are ignored and reported as `corpus_worktree_dirty`. Temporary files go under
+/// `scratch_root`, which should be a local disk that allows directory `fsync`.
+pub fn run(
+    source: &Path,
+    wheat: PathBuf,
+    scratch_root: &Path,
+    checkout: &Checkout,
+) -> Result<ProfileReportV1> {
     let full_run_started = Instant::now();
-    const USAGE: &str = "usage: wheat_gothab_profile CORPUS [OUTPUT]\n\
-        CORPUS is a full (not shallow) Git checkout to profile against, e.g. gothab.\n\
-        The wheat binary is the one built next to this example \
-        (target/release/wheat); set WHEAT_PROFILE_BINARY to use another.";
-    let mut arguments = env::args_os().skip(1);
-    let source = fs::canonicalize(arguments.next().context(USAGE)?)?;
-    let output = arguments
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("profile.json"));
-    ensure!(arguments.next().is_none(), USAGE);
-    let wheat = wheat_binary()?;
-    ensure!(
-        wheat.is_file(),
-        "release Wheat binary missing at {}; build it with `cargo build --release --bin wheat`",
-        wheat.display()
-    );
-    ensure!(
-        Path::new("/usr/bin/time").is_file(),
-        "GNU /usr/bin/time is required"
-    );
-
+    let source = fs::canonicalize(source)?;
     let (
         corpus_sha,
         corpus_worktree_dirty,
@@ -57,20 +59,9 @@ fn main() -> Result<()> {
     ) = source_inventory(&source)?;
     let selected = select_paths(&source)?;
 
-    let scratch_parent = match env::var_os("WHEAT_PROFILE_SCRATCH_ROOT") {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            fs::create_dir_all(&path)?;
-            path
-        }
-        None => source
-            .parent()
-            .context("source checkout has no parent")?
-            .to_owned(),
-    };
     let scratch = tempfile::Builder::new()
         .prefix("wheat-gothab-profile-")
-        .tempdir_in(scratch_parent)?;
+        .tempdir_in(scratch_root)?;
     let fixture = scratch.path().join("source.git");
     let workspace = scratch.path().join("workspace");
     let remote = scratch.path().join("remote.git");
@@ -79,12 +70,7 @@ fn main() -> Result<()> {
     // when the corpus checkout has uncommitted changes (`corpus_worktree_dirty`).
     create_exact_fixture(&source, &fixture, &corpus_sha)?;
 
-    let mut run = ProfileRun::new(
-        wheat,
-        workspace.clone(),
-        scratch.path().join("stores"),
-        scratch.path().join("config"),
-    );
+    let mut run = Session::new(wheat, scratch.path().to_owned());
     let fixture_s = path_text(&fixture)?;
     let workspace_s = path_text(&workspace)?;
     run.wheat_ok(
@@ -332,41 +318,25 @@ fn main() -> Result<()> {
 
     let storage_bytes = directory_size(run.store_home())?;
     let total_seconds = full_run_started.elapsed().as_secs_f64();
-    let peak_rss_bytes = peak_process_rss_bytes(&run.timings);
-    write_report(
-        &output,
+    let peak_rss_bytes = measure::peak_rss_bytes(run.timings.iter().map(|(_, timing)| timing));
+    let mut parameters = host::parameters(checkout, scratch.path())?;
+    parameters.extend([
+        ("corpus_sha".into(), json!(corpus_sha)),
+        ("corpus_worktree_dirty".into(), json!(corpus_worktree_dirty)),
+        ("reachable_commits".into(), json!(reachable_commits)),
+        ("tracked_files".into(), json!(tracked_files)),
+        ("git_objects".into(), json!(git_objects)),
+        ("git_bytes".into(), json!(git_bytes)),
+        ("samples".into(), json!(1)),
+    ]);
+    build_report(
         &run.timings,
-        BTreeMap::from([
-            ("corpus_sha".into(), json!(corpus_sha)),
-            ("corpus_worktree_dirty".into(), json!(corpus_worktree_dirty)),
-            ("reachable_commits".into(), json!(reachable_commits)),
-            ("tracked_files".into(), json!(tracked_files)),
-            ("git_objects".into(), json!(git_objects)),
-            ("git_bytes".into(), json!(git_bytes)),
-            ("release".into(), json!(cfg!(not(debug_assertions)))),
-            ("samples".into(), json!(1)),
-        ]),
+        parameters,
         storage_bytes,
         reachable_commits,
         total_seconds,
         peak_rss_bytes,
-    )?;
-    Ok(())
-}
-
-/// The wheat binary to profile: `WHEAT_PROFILE_BINARY`, or the `wheat` that cargo built
-/// into the same profile directory as this example (`target/release/examples/..` →
-/// `target/release/wheat`).
-fn wheat_binary() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("WHEAT_PROFILE_BINARY") {
-        return Ok(PathBuf::from(path));
-    }
-    let example = env::current_exe()?;
-    let profile_directory = example
-        .parent()
-        .and_then(Path::parent)
-        .context("the example binary is not inside a cargo target directory")?;
-    Ok(profile_directory.join("wheat"))
+    )
 }
 
 fn assert_clean_status(value: &Value) -> Result<()> {
@@ -394,8 +364,4 @@ fn output_field(output: &BoundedOutput, name: &str) -> Result<String> {
         .lines()
         .find_map(|line| line.strip_prefix(&format!("{name} ")).map(str::to_owned))
         .with_context(|| format!("missing {name} in Wheat output"))
-}
-
-fn path_text(path: &Path) -> Result<&str> {
-    path.to_str().context("profile scratch path is not UTF-8")
 }

@@ -6,14 +6,14 @@ the same commit.
 ## Revise/compose cost at stack depth (2026-09-25)
 
 Found with the span tracer (`WHEAT_TRACE_SUMMARY=1`, `WHEAT_TRACE=<file.json>`) on the
-ignored `placing_an_edit_under_a_deep_stack_stays_fast` benchmark
-(`crates/wheat-cli/tests/edit_move.rs`: 500 changes above B, 50 of them editing a 1 MB
-file, debug build). `wheat add` takes about 5.1 s. Radix updates are about 2.1 s of
-that. The budget passes, but by only about 0.7 s.
+deep-stack benchmark (then an ignored test, now the `deep_stack` case of
+`wheat-bench quick`: 500 changes above B, 50 of them editing a 1 MB file; debug
+build). `wheat add` takes about 5.1 s. Radix updates are about 2.1 s of that. The
+budget passes, but by only about 0.7 s.
 
 - `[ ]` **Measure a release build first.** All numbers above are from the debug test
   profile. Rerun the benchmark against a release binary to see which costs still
-  matter.
+  matter (`just bench --case deep_stack`).
 - `[ ]` **Batch `apply_step`'s per-change map inserts.** `compose_authoring` does two
   single-item `radix_update`s per change (revision map, application map): 1002 calls,
   about 0.64 s. Build them in one pass per composition instead.

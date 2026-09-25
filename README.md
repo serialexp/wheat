@@ -16,6 +16,7 @@ through import and push.
 | `wheat-ignore` | `.gitignore`-compatible ignore rules for workspaces. |
 | `wheat-protocol` | Native wire protocol messages and framing. |
 | `wheat-server` | Standalone native protocol server. |
+| `wheat-bench` | Benchmark profiles, uploaded to Gothab. |
 
 Storage records are BinSchema-generated binary only. The schemas live in
 `crates/wheat-core/schemas/`; the generated code is committed under each crate's
@@ -42,6 +43,26 @@ Any `wheat` command can report its own timing:
   to stderr when the command ends.
 - `WHEAT_TRACE=trace.json wheat ...` writes a Chrome trace event timeline. Open it in
   [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`.
+
+## Benchmarks
+
+`wheat-bench` runs two profiles against release binaries:
+
+- `wheat-quick` (`just bench`): focused scale cases, such as `add` over 20,000
+  files, placing an edit under a 500-change stack, and content repack planning.
+  It takes a few minutes. `just bench --case deep_stack` runs one case.
+- `wheat-gothab-workflow` (`just bench-corpus ~/Projects/gothab`): the whole CLI
+  workflow against a full Git clone. It takes about 55 minutes on the Gothab
+  repository.
+
+Each run writes `profile.json` (a Gothab profile report) and saves
+`bench/results/<profile>/<stamp>-<rev>.tsv`. Commit that file. To see what changed,
+run `just bench-compare OLD.tsv NEW.tsv`. Only compare runs from the same machine;
+the command warns when the CPU or case sizes differ.
+
+On Gothab, `gt profile wheat-quick` (or `wheat-gothab-workflow`) runs the profile on
+a pinned runner and uploads it. Results show under the repository's performance page.
+`.gothab/profiles.yml` names the workflows.
 
 ## Design docs
 

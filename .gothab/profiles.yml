@@ -1,0 +1,9 @@
+version: 1
+default: wheat-quick
+profiles:
+  wheat-quick:
+    workflow: .gothab/workflows/profile-wheat-quick.yml
+    job: profile
+  wheat-gothab-workflow:
+    workflow: .gothab/workflows/profile-wheat.yml
+    job: profile

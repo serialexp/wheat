@@ -18,7 +18,7 @@ jobs:
       CARGO_TERM_COLOR: always
       # The runner checkout is a mounted workspace whose filesystem rejects
       # directory fsync; profile the durable store on the runner's local disk.
-      WHEAT_PROFILE_SCRATCH_ROOT: /tmp
+      WHEAT_BENCH_SCRATCH_ROOT: /tmp
     steps:
       - uses: actions/checkout@v5
 
@@ -32,10 +32,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build Wheat profile binaries
-        run: cargo build --release -p wheat-cli --bin wheat --example wheat_gothab_profile
+        run: cargo build --release -p wheat-cli -p wheat-bench --bin wheat --bin wheat-bench
 
       - name: Run Wheat Gothab workflow profile
-        run: target/release/examples/wheat_gothab_profile "$GITHUB_WORKSPACE/corpus" profile.json
+        run: target/release/wheat-bench corpus "$GITHUB_WORKSPACE/corpus" --output profile.json --no-save
 
       - uses: actions/profile@v1
         with:

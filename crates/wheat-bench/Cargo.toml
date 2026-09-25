@@ -1,0 +1,24 @@
+[package]
+name = "wheat-bench"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "wheat-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+wheat-core = { path = "../wheat-core" }
+wheat-store = { path = "../wheat-store" }
+
+[lints]
+workspace = true

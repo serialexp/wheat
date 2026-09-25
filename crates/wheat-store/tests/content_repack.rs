@@ -2,10 +2,10 @@ use std::sync::Mutex;
 
 use wheat_core::ContentId;
 use wheat_store::{
-    CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationEntry, ContentGenerationIndex,
-    ContentGenerationManifest, ContentGenerationTarget, ContentHistoryPair, ContentRepackInput,
-    ContentRepackLimits, ContentRepackPlan, ContentStore, Durability, PreparedContentGeneration,
-    plan_content_repack, prepare_content_repack, publish_content_repack,
+    CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationIndex, ContentGenerationManifest,
+    ContentGenerationTarget, ContentHistoryPair, ContentRepackInput, ContentRepackLimits,
+    ContentRepackPlan, ContentStore, Durability, PreparedContentGeneration, plan_content_repack,
+    prepare_content_repack, publish_content_repack,
 };
 
 /// History of one path given newest first: each version pairs with the next
@@ -629,56 +629,5 @@ fn limits_overflow_and_unknown_history_references_fail_closed() {
     ));
 }
 
-#[test]
-#[ignore = "representative-scale manifest codec benchmark"]
-fn benchmark_sharded_manifest_208k_entries() {
-    use std::time::Instant;
-
-    const ENTRIES: usize = 208_000;
-    let entries = (0..ENTRIES)
-        .map(|index| ContentGenerationEntry {
-            id: ContentId::from_digest((index as u64).to_be_bytes().repeat(4).try_into().unwrap()),
-            envelope_digest: ((index as u64).wrapping_mul(3))
-                .to_be_bytes()
-                .repeat(4)
-                .try_into()
-                .unwrap(),
-            pack_offset: (index % CONTENT_GENERATION_SHARD_ENTRIES) as u64 * 128,
-            physical_length: 128,
-            logical_length: 256,
-            delta_base: None,
-            delta_depth: 0,
-        })
-        .collect();
-    let started = Instant::now();
-    let manifest = ContentGenerationManifest::new(1, entries).unwrap();
-    let seal_elapsed = started.elapsed();
-
-    let started = Instant::now();
-    let index = manifest.index().unwrap().encoded().unwrap();
-    let shards = (0..manifest.shard_count())
-        .map(|shard| manifest.encode_shard(shard).unwrap())
-        .collect::<Vec<_>>();
-    let encode_elapsed = started.elapsed();
-    let started = Instant::now();
-    let decoded =
-        ContentGenerationManifest::decode(&index, |shard| Ok(shards[shard].clone())).unwrap();
-    let decode_elapsed = started.elapsed();
-    let started = Instant::now();
-    let one_shard = ContentGenerationIndex::decode(&index)
-        .unwrap()
-        .decode_shard(shards.len() / 2, &shards[shards.len() / 2])
-        .unwrap();
-    let one_shard_elapsed = started.elapsed();
-
-    assert_eq!(decoded, manifest);
-    assert_eq!(one_shard.len(), CONTENT_GENERATION_SHARD_ENTRIES);
-    eprintln!(
-        "208k content generation: index {} bytes, {} shards of {} bytes total; \
-         seal {seal_elapsed:?}, encode {encode_elapsed:?}, decode {decode_elapsed:?}, \
-         index + one shard {one_shard_elapsed:?}",
-        index.len(),
-        shards.len(),
-        shards.iter().map(Vec::len).sum::<usize>(),
-    );
-}
+// The 208,000-entry codec benchmark is the `sharded_manifest` case of
+// `wheat-bench quick`.

@@ -592,7 +592,8 @@ the old generation instead of its manifest, and reads each generation's
 manifest once when validating it.
 
 Measured with `tests/content_repack_scale.rs` (1,000,000 content IDs, 950,000
-history pairs, release build, 2026-09-24):
+history pairs, release build, 2026-09-24; that test is now the `content_repack_plan`
+case of `wheat-bench quick`):
 
 | | map-based | flat tables |
 |---|---|---|

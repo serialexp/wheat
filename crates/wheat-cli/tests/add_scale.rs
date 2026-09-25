@@ -5,9 +5,7 @@
 //! square of the file count. These tests pin both: the command succeeds past the old
 //! limit, and each step stays inside a budget a quadratic step cannot meet.
 //!
-//! The larger benchmark is ignored by default:
-//! `cargo nextest run -p wheat-cli --test add_scale --run-ignored only --no-capture`
-//! (`WHEAT_ADD_SCALE_FILES` overrides its file count).
+//! The 20,000-file benchmark is the `add_scale` case of `wheat-bench quick`.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -20,11 +18,9 @@ use serde_json::Value;
 
 /// More than the former 4,096-edit revision limit.
 const FILES: usize = 5_000;
-/// Default size of the ignored benchmark.
-const BENCHMARK_FILES: usize = 20_000;
 /// Budget for one command in a debug build. At 5,000 files the linear steps take about
 /// two seconds; the quadratic ones they replaced took 65 s (`add` of new files) and
-/// 200 s (`add` of modified files). At 20,000 files `validate` took 127 s.
+/// 200 s (`add` of modified files).
 const STEP_BUDGET: Duration = Duration::from_secs(30);
 
 struct Workspace {
@@ -127,31 +123,18 @@ impl Workspace {
     }
 }
 
-fn add_new_then_modified(files: usize) {
+#[test]
+fn add_past_the_former_revision_edit_limit() {
     let workspace = Workspace::new();
     workspace.ok(&["change", "new", "--message", "create"]);
-    let paths = workspace.write_files(files, "one");
+    let paths = workspace.write_files(FILES, "one");
     workspace.add("add new files", &paths);
     workspace.assert_settled();
 
     workspace.ok(&["change", "new", "--message", "modify"]);
-    workspace.write_files(files, "two");
+    workspace.write_files(FILES, "two");
     workspace.add("add modified files", &paths);
     workspace.assert_settled();
 
     workspace.timed("validate", &["validate"]);
-}
-
-#[test]
-fn add_past_the_former_revision_edit_limit() {
-    add_new_then_modified(FILES);
-}
-
-#[test]
-#[ignore = "benchmark: run explicitly"]
-fn add_scale_benchmark() {
-    let files = std::env::var("WHEAT_ADD_SCALE_FILES")
-        .map(|value| value.parse().expect("WHEAT_ADD_SCALE_FILES is a number"))
-        .unwrap_or(BENCHMARK_FILES);
-    add_new_then_modified(files);
 }

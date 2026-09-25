@@ -1,0 +1,36 @@
+name: Wheat Quick Performance Profile
+
+# Runs the `wheat-bench quick` scale cases. Needs a Gothab-hosted runner:
+# `pt-default` and `actions/profile` are Gothab's.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  profile:
+    name: Wheat quick
+    # Keep profile comparisons on the pinned c8id.large performance pool.
+    runs-on: pt-default
+    # The suite itself targets under 10 minutes; leave headroom for a cold release
+    # build and the upload.
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      # The runner checkout is a mounted workspace whose filesystem rejects
+      # directory fsync; run the durable stores on the runner's local disk.
+      WHEAT_BENCH_SCRATCH_ROOT: /tmp
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Wheat profile binaries
+        run: cargo build --release -p wheat-cli -p wheat-bench --bin wheat --bin wheat-bench
+
+      - name: Run Wheat quick profile
+        run: target/release/wheat-bench quick --output profile.json --no-save
+
+      - uses: actions/profile@v1
+        with:
+          path: profile.json
+          name: wheat-quick

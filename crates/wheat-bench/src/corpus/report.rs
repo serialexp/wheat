@@ -1,47 +1,20 @@
-use std::{collections::BTreeMap, fs, path::Path};
+//! The `wheat-gothab-workflow` report: one wall time and peak RSS per phase, each
+//! phase with its own wall-time ceiling.
+
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::{
-    command::Timing,
-    profile_report::{
-        Comparison, Contract, ContractOutcome, ContractRule, Measurement, ProfileReportV1, Workload,
-    },
+use crate::{
+    measure::Timing,
+    report::{Comparison, Contract, ContractRule, Measurement, ProfileReportV1, Workload},
 };
 
-const PROFILE: &str = "wheat-gothab-workflow";
+pub const PROFILE: &str = "wheat-gothab-workflow";
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-pub(crate) fn write_report(
-    output: &Path,
-    timings: &[(String, Timing)],
-    parameters: BTreeMap<String, Value>,
-    storage_bytes: u64,
-    reachable_commits: u64,
-    total_seconds: f64,
-    peak_rss_bytes: f64,
-) -> Result<()> {
-    let report = build_report(
-        timings,
-        parameters,
-        storage_bytes,
-        reachable_commits,
-        total_seconds,
-        peak_rss_bytes,
-    )?;
-    // Canonicalize and persist before evaluating. A failed contract is still a
-    // valid profile result and must remain available to workflow ingestion.
-    fs::write(output, report.canonical_json()?)?;
-    match report.evaluate()? {
-        ContractOutcome::Passed => Ok(()),
-        ContractOutcome::Failed { violations } => {
-            anyhow::bail!("performance contract failed: {violations:?}")
-        }
-    }
-}
-
-fn build_report(
+pub(crate) fn build_report(
     timings: &[(String, Timing)],
     parameters: BTreeMap<String, Value>,
     storage_bytes: u64,
@@ -158,8 +131,8 @@ fn phase_wall_limit(name: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::ContractOutcome;
     use serde_json::json;
-    use tempfile::tempdir;
 
     fn all_timings(seconds: f64) -> Vec<(String, Timing)> {
         [
@@ -231,22 +204,10 @@ mod tests {
     }
 
     #[test]
-    fn failing_report_is_written_canonically_and_returns_failure() {
-        let directory = tempdir().unwrap();
-        let output = directory.path().join("profile.json");
-        let timings = all_timings(700.0);
-        let expected = build_report(&timings, BTreeMap::new(), 42, 10, 700.0, 2048.0)
-            .unwrap()
-            .canonical_json()
-            .unwrap();
-
-        let error =
-            write_report(&output, &timings, BTreeMap::new(), 42, 10, 700.0, 2048.0).unwrap_err();
-        assert!(error.to_string().contains("performance contract failed"));
-
-        let bytes = fs::read(&output).unwrap();
-        assert_eq!(bytes, expected);
-        let report: ProfileReportV1 = serde_json::from_slice(&bytes).unwrap();
+    fn slow_phases_fail_the_contract() {
+        let report =
+            build_report(&all_timings(700.0), BTreeMap::new(), 42, 10, 700.0, 2048.0).unwrap();
+        report.canonical_json().unwrap();
         assert!(matches!(
             report.evaluate().unwrap(),
             ContractOutcome::Failed { .. }

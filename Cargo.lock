@@ -3963,6 +3963,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wheat-bench"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wheat-core",
+ "wheat-store",
+]
+
+[[package]]
 name = "wheat-binschema-generated"
 version = "0.1.0"
 dependencies = [

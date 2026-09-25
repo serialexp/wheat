@@ -213,8 +213,9 @@ described here.
   encoding, index fan-out, active-pack sealing thresholds, deltas, sharding, replication,
   caching, and garbage collection against deep stacks and wide agent fan-out on local files and
   real object-storage range requests. (2026-09-25: deltas and sharding are
-  implemented, with benchmarks such as `object_store_bench`, `packed_active_bench`,
-  `content_repack_scale`, and `s3_packed_test::publish_clone_s3_benchmark`.
+  implemented, with benchmarks such as `object_store_bench`,
+  `s3_packed_test::publish_clone_s3_benchmark`, and the `packed_append` and
+  `content_repack_plan` cases of `wheat-bench quick`.
   Replication, GC, deep-stack and fan-out benchmarks, and real ranged remote
   segment reads remain; the remote cache downloads whole segments.)
 - [~] **Phase 2 — native protocol and remote CLI.** Specify a resumable,

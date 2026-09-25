@@ -52,22 +52,6 @@ impl Workspace {
             .expect("wheat command runs")
     }
 
-    /// Runs a command that must succeed and prints the span summary it reports.
-    fn traced(&self, arguments: &[&str]) -> Output {
-        let output = self
-            .command(arguments)
-            .env("WHEAT_TRACE_SUMMARY", "1")
-            .output()
-            .expect("wheat command runs");
-        assert!(
-            output.status.success(),
-            "command {arguments:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        eprintln!("wheat {}\n{}", arguments.join(" "), stderr(&output));
-        output
-    }
-
     fn ok(&self, arguments: &[&str]) -> Output {
         let output = self.run(arguments);
         assert!(
@@ -304,102 +288,7 @@ fn only_the_later_changes_the_workspace_shows_are_moved_from() {
     workspace.settled(&[("file", &edited.replace("l20\n", "D20\n"))]);
 }
 
-/// 500 changes sit above B, and 50 of them edit B's 1 MiB file.
-///
-/// Any add to B reapplies all 500 changes; that cost is measured on a file no later change
-/// touches. Placing an edit in the big file additionally reads the applications above B and
-/// replays the 50 edits on the one file, which must stay within 1.5 s of that in a debug build.
-/// Setting up the stack takes minutes of process launches, so this runs on request.
-#[test]
-#[ignore = "scale benchmark; run explicitly with --run-ignored only --no-capture"]
-fn placing_an_edit_under_a_deep_stack_stays_fast() {
-    const LINES: usize = 11_000;
-    let line = |n: usize, tag: &str| format!("{n:05} {tag} {}\n", "x".repeat(90));
-    let workspace = Workspace::new();
-    let b = field(&workspace.ok(&["change", "new", "-m", "B"]), "change");
-    let mut lines = (0..LINES).map(|n| line(n, "base")).collect::<Vec<_>>();
-    workspace.write("big", &lines.concat());
-    workspace.write("own", "one\n");
-    workspace.ok(&["add", "-m", "B1", "big", "own"]);
-    assert!(workspace.read("big").len() >= 1024 * 1024);
-
-    for n in 0..500 {
-        let message = format!("S{n}");
-        if n % 10 == 0 {
-            // Every tenth change rewrites its own line of the big file.
-            workspace.ok(&["change", "new", "-m", &message]);
-            let at = (n / 10) * 200 + 100;
-            lines[at] = line(at, &message);
-            workspace.write("big", &lines.concat());
-            workspace.ok(&["add", "-m", &message, "big"]);
-        } else {
-            let path = format!("other-{n}");
-            workspace.ok(&[
-                "change", "new", "-m", &message, "--path", &path, "--value", "x\n",
-            ]);
-        }
-    }
-    workspace.ok(&["materialize"]);
-
-    // A single run swings by about a second, so each case takes the middle of three runs.
-    let median = |mut runs: Vec<std::time::Duration>| {
-        runs.sort();
-        runs[runs.len() / 2]
-    };
-    // Each timed command prints where its time went (see `span_trace` in the CLI).
-    let timed = |arguments: &[&str]| {
-        let started = std::time::Instant::now();
-        let output = workspace.traced(arguments);
-        (output, started.elapsed())
-    };
-
-    // Revising B reapplies all 500 changes, whatever the edit.
-    let reapply = median(
-        ["two", "three", "four"]
-            .into_iter()
-            .map(|value| {
-                workspace.write("own", &format!("{value}\n"));
-                timed(&["add", "-m", "B own", "--change", &b, "own"]).1
-            })
-            .collect(),
-    );
-
-    // Edit one of B's own lines far from any block: nothing moves.
-    let fitting = median(
-        [5_150, 5_350, 5_550]
-            .into_iter()
-            .map(|at| {
-                lines[at] = line(at, "mine");
-                workspace.write("big", &lines.concat());
-                let (fits, took) = timed(&["add", "-m", "B fits", "--change", &b, "big"]);
-                assert!(!stdout(&fits).contains("moved"));
-                took
-            })
-            .collect(),
-    );
-
-    // Overlap the blocks changes S120, S140 and S160 wrote.
-    let moving = median(
-        [2_500, 2_900, 3_300]
-            .into_iter()
-            .map(|at| {
-                lines[at] = line(at, "mine");
-                workspace.write("big", &lines.concat());
-                let arguments = ["add", "-m", "B moves", "--change", &b, "big", "--force"];
-                let (moves, took) = timed(&arguments);
-                let out = stdout(&moves);
-                assert_eq!(out.matches("moved big: your edit").count(), 1, "{out}");
-                took
-            })
-            .collect(),
-    );
-
-    eprintln!("reapplying 500 changes: {reapply:?}; fitting: {fitting:?}; moving: {moving:?}");
-    let budget = reapply + std::time::Duration::from_millis(1_500);
-    assert!(fitting < budget, "{fitting:?} over {budget:?}");
-    assert!(moving < budget, "{moving:?} over {budget:?}");
-    workspace.settled(&[("big", &lines.concat())]);
-}
+// The deep-stack scale benchmark is the `deep_stack` case of `wheat-bench quick`.
 
 #[test]
 fn adding_to_the_top_change_never_moves_anything() {

@@ -1,14 +1,27 @@
+//! The Git corpus: its inventory, the exact fixture a run imports, and the Git
+//! commands that check the projected result.
+
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Write},
     path::Path,
     process::{Child, Command, Stdio},
 };
 
 use anyhow::{Context, Result, ensure};
 
-const MAX_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
+use crate::{
+    isolate,
+    measure::{MAX_CAPTURE_BYTES as MAX_GIT_OUTPUT_BYTES, read_bounded},
+};
+
 const MAX_GIT_LINE_BYTES: usize = 64 * 1024;
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    isolate(&mut command);
+    command
+}
 
 pub(crate) struct SelectedPaths {
     pub(crate) readme: String,
@@ -86,12 +99,11 @@ fn tree_mode(source: &Path, path: &str) -> Result<Option<String>> {
 }
 
 pub(crate) fn create_exact_fixture(source: &Path, fixture: &Path, head: &str) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .args(["clone", "--bare", "--no-local"])
         .arg(source)
-        .arg(fixture)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .arg(fixture);
     run_command_ok("git clone fixture", &mut command)?;
     let refs = git(fixture, &["for-each-ref", "--format=%(refname)"])?;
     for reference in refs
@@ -115,29 +127,24 @@ pub(crate) fn create_exact_fixture(source: &Path, fixture: &Path, head: &str) ->
 }
 
 pub(crate) fn git(directory: &Path, arguments: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(directory)
-        .args(arguments)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = git_command();
+    command.arg("-C").arg(directory).args(arguments);
     let output = run_command("git", &mut command)?;
     Ok(String::from_utf8(output)?.trim().to_owned())
 }
 
 pub(crate) fn git_init_bare(path: &Path) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command.args(["init", "--bare"]).arg(path);
     run_command_ok("git init --bare", &mut command)
 }
 
 pub(crate) fn git_clone(remote: &Path, destination: &Path) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .args(["clone", "--branch", "main"])
         .arg(remote)
-        .arg(destination)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .arg(destination);
     run_command_ok("git clone validation", &mut command)
 }
 
@@ -221,12 +228,8 @@ fn command_stream(command: &mut Command) -> Result<GitStream> {
 }
 
 fn git_stream(directory: &Path, arguments: &[&str]) -> Result<GitStream> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(directory)
-        .args(arguments)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = git_command();
+    command.arg("-C").arg(directory).args(arguments);
     command_stream(&mut command)
 }
 
@@ -255,12 +258,11 @@ fn reachable_git_size(source: &Path) -> Result<(u64, u64)> {
         .take()
         .context("rev-list stdout unavailable")?;
 
-    let mut cat_command = Command::new("git");
+    let mut cat_command = git_command();
     cat_command
         .arg("-C")
         .arg(source)
         .args(["cat-file", "--batch-check=%(objectsize)"])
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::piped());
     let mut cat_file = command_stream(&mut cat_command)?;
     let mut cat_input = cat_file
@@ -379,17 +381,6 @@ fn ensure_bounded_lines(bytes: &[u8], limit: usize) -> Result<()> {
         "Git output line exceeded {limit} byte limit"
     );
     Ok(())
-}
-
-fn read_bounded(mut file: File, limit: usize) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::with_capacity(limit.min(8192));
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= limit,
-        "command output exceeded {limit} byte limit"
-    );
-    Ok(bytes)
 }
 
 pub(crate) fn directory_size(root: &Path) -> Result<u64> {
