@@ -25,20 +25,21 @@ use wheat_gothab_profile::{
 
 fn main() -> Result<()> {
     let full_run_started = Instant::now();
+    const USAGE: &str = "usage: wheat_gothab_profile CORPUS [OUTPUT]\n\
+        CORPUS is a full (not shallow) Git checkout to profile against, e.g. gothab.\n\
+        The wheat binary is the one built next to this example \
+        (target/release/wheat); set WHEAT_PROFILE_BINARY to use another.";
     let mut arguments = env::args_os().skip(1);
-    let source = fs::canonicalize(arguments.next().unwrap_or_else(|| ".".into()))?;
+    let source = fs::canonicalize(arguments.next().context(USAGE)?)?;
     let output = arguments
         .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("profile.json"));
-    ensure!(
-        arguments.next().is_none(),
-        "usage: wheat_gothab_profile [SOURCE] [OUTPUT]"
-    );
-    let wheat = source.join("target/release/wheat");
+    ensure!(arguments.next().is_none(), USAGE);
+    let wheat = wheat_binary()?;
     ensure!(
         wheat.is_file(),
-        "release Wheat binary missing at {}",
+        "release Wheat binary missing at {}; build it with `cargo build --release --bin wheat`",
         wheat.display()
     );
     ensure!(
@@ -48,7 +49,7 @@ fn main() -> Result<()> {
 
     let (
         corpus_sha,
-        tested_worktree_dirty,
+        corpus_worktree_dirty,
         reachable_commits,
         tracked_files,
         git_objects,
@@ -74,8 +75,8 @@ fn main() -> Result<()> {
     let workspace = scratch.path().join("workspace");
     let remote = scratch.path().join("remote.git");
     let clone = scratch.path().join("clone");
-    // The fixture is deliberately the clean, reproducible Git corpus at HEAD;
-    // the release binaries may still contain a dirty worktree overlay.
+    // The fixture is deliberately the clean, reproducible Git corpus at HEAD, even
+    // when the corpus checkout has uncommitted changes (`corpus_worktree_dirty`).
     create_exact_fixture(&source, &fixture, &corpus_sha)?;
 
     let mut run = ProfileRun::new(
@@ -337,7 +338,7 @@ fn main() -> Result<()> {
         &run.timings,
         BTreeMap::from([
             ("corpus_sha".into(), json!(corpus_sha)),
-            ("tested_worktree_dirty".into(), json!(tested_worktree_dirty)),
+            ("corpus_worktree_dirty".into(), json!(corpus_worktree_dirty)),
             ("reachable_commits".into(), json!(reachable_commits)),
             ("tracked_files".into(), json!(tracked_files)),
             ("git_objects".into(), json!(git_objects)),
@@ -351,6 +352,21 @@ fn main() -> Result<()> {
         peak_rss_bytes,
     )?;
     Ok(())
+}
+
+/// The wheat binary to profile: `WHEAT_PROFILE_BINARY`, or the `wheat` that cargo built
+/// into the same profile directory as this example (`target/release/examples/..` →
+/// `target/release/wheat`).
+fn wheat_binary() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("WHEAT_PROFILE_BINARY") {
+        return Ok(PathBuf::from(path));
+    }
+    let example = env::current_exe()?;
+    let profile_directory = example
+        .parent()
+        .and_then(Path::parent)
+        .context("the example binary is not inside a cargo target directory")?;
+    Ok(profile_directory.join("wheat"))
 }
 
 fn assert_clean_status(value: &Value) -> Result<()> {

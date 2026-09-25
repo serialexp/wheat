@@ -1,12 +1,14 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result};
-use gothab_profile::{
-    Comparison, Contract, ContractOutcome, ContractRule, Measurement, ProfileReportV1, Workload,
-};
 use serde_json::Value;
 
-use super::command::Timing;
+use super::{
+    command::Timing,
+    profile_report::{
+        Comparison, Contract, ContractOutcome, ContractRule, Measurement, ProfileReportV1, Workload,
+    },
+};
 
 const PROFILE: &str = "wheat-gothab-workflow";
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -123,8 +125,6 @@ fn build_report(
         },
         contract: Contract { rules },
         measurements,
-        saturation: None,
-        attachments: Vec::new(),
     })
 }
 

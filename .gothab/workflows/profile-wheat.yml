@@ -1,5 +1,8 @@
 name: Wheat Gothab Workflow Performance Profile
 
+# Runs Wheat's end-to-end workflow against the Gothab repository as a corpus.
+# Needs a Gothab-hosted runner: `pt-heavy` and `actions/profile` are Gothab's.
+
 on:
   workflow_dispatch:
 
@@ -13,12 +16,18 @@ jobs:
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
-      SQLX_OFFLINE: "true"
       # The runner checkout is a mounted workspace whose filesystem rejects
       # directory fsync; profile the durable store on the runner's local disk.
       WHEAT_PROFILE_SCRATCH_ROOT: /tmp
     steps:
       - uses: actions/checkout@v5
+
+      # The corpus: full history, since the profile imports every reachable commit.
+      - uses: actions/checkout@v5
+        with:
+          repository: serialexp/gothab
+          path: corpus
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -26,7 +35,7 @@ jobs:
         run: cargo build --release -p wheat-cli --bin wheat --example wheat_gothab_profile
 
       - name: Run Wheat Gothab workflow profile
-        run: target/release/examples/wheat_gothab_profile "$GITHUB_WORKSPACE" profile.json
+        run: target/release/examples/wheat_gothab_profile "$GITHUB_WORKSPACE/corpus" profile.json
 
       - uses: actions/profile@v1
         with:
