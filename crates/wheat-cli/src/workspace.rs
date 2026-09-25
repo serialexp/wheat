@@ -7,36 +7,69 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use wheat_core::{
-    ApplicationResultRecord, ContentIo, EditOperation, EditRecord, EditSubsumption, EditTransition,
-    RevisionEdits, RevisionId,
+    ApplicationResultRecord, ChangeId, ContentIo, EditId, EditOperation, EditRecord,
+    EditSubsumption, EditTransition, RevisionEdits, RevisionId, RevisionMetadata, RevisionRequest,
+    TreeId, ViewId,
     edit_capture::{FileSnapshot, capture_edit},
+    edit_placement::LaterEdit,
     guarded::{GuardedEdit, Limits, authoring},
 };
 use wheat_store::{
-    ApplicationMapStore, ContentStore, ContentWriteBatch, ImmutableObjectStore, MerkleTreeStore,
-    RepositoryHead, RepositoryReader, RevisionMapStore,
+    ApplicationMapStore, AuthoringSession, ContentStore, ContentWriteBatch, ImmutableObjectStore,
+    MerkleTreeStore, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
+    RevisionMapStore,
 };
 
-use crate::{command_output::CliFailure, workspace_files::read_workspace_file};
+use crate::{
+    command_output::CliFailure,
+    edit_move::{FileBytes, PathPlacement, describe, place_path},
+    workspace_files::read_workspace_file,
+};
 
-pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
-    root: &Path,
-    objects: &O,
-    store: &ContentStore,
-    _head: RepositoryHead,
-    effective_view: wheat_core::ViewId,
-    change: wheat_core::ChangeId,
+/// The revisions one `add` publishes: the destination change, plus every later change that
+/// gives up edits moved into it.
+pub(crate) struct Authored {
+    pub(crate) requests: BTreeMap<ChangeId, RevisionRequest>,
+    /// One line per move, empty when every edit fits the destination as it is.
+    pub(crate) moves: Vec<String>,
+    pub(crate) moved: Vec<MovedEdit>,
+}
+
+pub(crate) struct MovedEdit {
+    pub(crate) path: String,
+    pub(crate) from: ChangeId,
+    pub(crate) edit: EditId,
+}
+
+/// Where `add` reads the workspace and publishes the revisions.
+pub(crate) struct AddTarget<'a, 'm, O, P> {
+    pub(crate) root: &'a Path,
+    pub(crate) objects: &'a O,
+    pub(crate) store: &'a ContentStore,
+    pub(crate) mutator: &'a PersistedRepositoryMutator<'m, O, P>,
+    pub(crate) session: &'a AuthoringSession,
+    pub(crate) effective_view: ViewId,
+    /// The tree the workspace was materialized from, if any.
+    pub(crate) pinned: Option<TreeId>,
+}
+
+#[tracing::instrument(level = "debug", skip_all, fields(paths = paths.len()))]
+pub(crate) async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>(
+    target: &AddTarget<'_, '_, O, P>,
+    change: ChangeId,
     predecessor: RevisionId,
     paths: &[String],
     guards: &BTreeMap<String, Vec<Range<usize>>>,
-) -> Result<RevisionEdits> {
+    metadata: RevisionMetadata,
+) -> Result<Authored> {
+    let (root, objects, store) = (target.root, target.objects, target.store);
     if paths.is_empty() {
         return Err(CliFailure::invalid(
             "at least one explicit workspace path is required",
         ));
     }
     let reader = RepositoryReader::new(objects, store);
-    let working = reader.view(effective_view).await?;
+    let working = reader.view(target.effective_view).await?;
     let current = RevisionMapStore::new(objects)
         .get(working.revisions, change)
         .await?;
@@ -56,8 +89,8 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
             "current application does not correspond to predecessor",
         ));
     }
-    // Edits are captured against the view the predecessor is currently applied to, which the
-    // mutation layer also authors the new revision against. After an ancestor revision
+    // Edits are captured against the change's spot, the view it is applied to, which the
+    // mutation layer also authors the new revision against. After an earlier revision
     // reapplies this change, that target differs from `revision.authored_against`; the existing
     // definitions are still checked to reproduce the applied baseline on it during normalization.
     let ApplicationResultRecord::Clean { tree: baseline } = application.result else {
@@ -73,7 +106,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     }
     // Index the predecessor's definitions by path once; scanning them per selected path would
     // make a large add against a large change quadratic.
-    let mut old_by_path = BTreeMap::<&str, Vec<(wheat_core::EditId, &EditRecord)>>::new();
+    let mut old_by_path = BTreeMap::<&str, Vec<(EditId, &EditRecord)>>::new();
     for (id, edit) in &old_definitions {
         old_by_path
             .entry(edit.path.as_str())
@@ -103,6 +136,9 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
         .collect::<BTreeMap<_, _>>();
 
     let limits = Limits::default();
+    let placements =
+        place_later_edits(target, working.tree, change, &selected, guards, limits).await?;
+
     let mut edits = old_definitions
         .iter()
         .filter(|(_, edit)| !selected.contains(&edit.path))
@@ -117,8 +153,19 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
     let mut content = ContentWriteBatch::new(store);
 
     for path in paths {
-        let workspace = read_workspace_file(root, Path::new(path), limits.max_input_bytes)
-            .with_context(|| format!("cannot read workspace path {path:?}"))?;
+        // Nothing in this loop awaits, so the entered span stays on this task.
+        let _span = tracing::debug_span!("capture_path", path = path.as_str()).entered();
+        // The change's new version of the path: the workspace file, or its placement at the
+        // change's spot when later changes also edit it.
+        let file = match placements.get(path) {
+            Some(placement) => placement.below.clone(),
+            None => read_workspace_file(root, Path::new(path), limits.max_input_bytes)
+                .with_context(|| format!("cannot read workspace path {path:?}"))?
+                .map(|snapshot| FileBytes {
+                    kind: snapshot.kind,
+                    bytes: canonical_workspace(&snapshot),
+                }),
+        };
         let a = authored_values[path.as_str()];
         let b = baseline_values[path.as_str()];
         let ranges = guards.get(path).map(Vec::as_slice);
@@ -126,7 +173,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
             .get(path.as_str())
             .map_or(&[][..], Vec::as_slice);
 
-        let can_normalize = matches!((a, b, workspace.as_ref()), (Some(a), Some(b), Some(w))
+        let can_normalize = matches!((a, b, file.as_ref()), (Some(a), Some(b), Some(w))
             if a.kind == b.kind && b.kind == w.kind && b.kind != wheat_core::FileKind::Symlink)
             && old_on_path
                 .iter()
@@ -134,7 +181,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
         if can_normalize {
             let a = a.unwrap();
             let b = b.unwrap();
-            let w = workspace.as_ref().unwrap();
+            let w = file.as_ref().unwrap();
             let authored_bytes = store
                 .resolve(a.content)
                 .context("cannot resolve authored file")?;
@@ -149,7 +196,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
                 &authored_bytes,
                 &definitions,
                 &baseline_bytes,
-                &canonical_workspace(w),
+                &w.bytes,
                 ranges,
                 limits,
             )
@@ -189,7 +236,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
                         kind: v.kind,
                         bytes,
                     }),
-                workspace.as_ref().map(|w| FileSnapshot {
+                file.as_ref().map(|w| FileSnapshot {
                     kind: w.kind,
                     bytes: &w.bytes,
                 }),
@@ -226,7 +273,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
             });
         }
     }
-    Ok(RevisionEdits {
+    let destination = RevisionEdits {
         edits,
         transition: EditTransition {
             preserved,
@@ -235,7 +282,192 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore>(
             subsumed,
             resolutions: vec![],
         },
-    })
+    };
+
+    let mut authored = Authored {
+        requests: BTreeMap::new(),
+        moves: Vec::new(),
+        moved: Vec::new(),
+    };
+    let mut giving_up = BTreeMap::<ChangeId, (RevisionId, BTreeSet<EditId>, Vec<&str>)>::new();
+    for (path, placement) in &placements {
+        authored.moves.extend(
+            placement
+                .notices
+                .iter()
+                .map(|notice| describe(path, change, notice)),
+        );
+        for later in &placement.moved {
+            let revision = placement.revisions[&later.change];
+            let entry = giving_up
+                .entry(later.change)
+                .or_insert_with(|| (revision, BTreeSet::new(), Vec::new()));
+            entry.1.insert(later.edit);
+            if entry.2.last() != Some(&path.as_str()) {
+                entry.2.push(path);
+            }
+            authored.moved.push(MovedEdit {
+                path: path.clone(),
+                from: later.change,
+                edit: later.edit,
+            });
+        }
+    }
+    for (from, (revision_id, moved, moved_paths)) in giving_up {
+        let revision = reader.revision(revision_id).await?;
+        let mut kept = BTreeMap::new();
+        for id in revision.edits.difference(&moved) {
+            kept.insert(*id, reader.edit(*id).await?);
+        }
+        authored.requests.insert(
+            from,
+            RevisionRequest {
+                predecessor: revision_id,
+                metadata: RevisionMetadata {
+                    message: format!(
+                        "Move edits on {} into change {change}",
+                        moved_paths.join(", ")
+                    ),
+                    ..metadata.clone()
+                },
+                edits: RevisionEdits {
+                    transition: EditTransition {
+                        preserved: kept.keys().copied().collect(),
+                        removed: moved,
+                        ..EditTransition::default()
+                    },
+                    edits: kept,
+                },
+            },
+        );
+    }
+    authored.requests.insert(
+        change,
+        RevisionRequest {
+            predecessor,
+            metadata,
+            edits: destination,
+        },
+    );
+    Ok(authored)
+}
+
+/// A placement with the current revision of every change it moves edits out of.
+struct Placed {
+    below: Option<FileBytes>,
+    moved: BTreeSet<LaterEdit>,
+    notices: Vec<wheat_core::edit_placement::MoveNotice>,
+    revisions: BTreeMap<ChangeId, RevisionId>,
+}
+
+/// Places every selected path that a change after `change` also edits.
+///
+/// A change that gives up edits gets a new revision, so its remaining edits must apply exactly;
+/// when a move adds such a change, every path is placed again with it.
+#[tracing::instrument(level = "debug", skip_all)]
+async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
+    target: &AddTarget<'_, '_, O, P>,
+    effective_tree: TreeId,
+    change: ChangeId,
+    selected: &BTreeSet<String>,
+    guards: &BTreeMap<String, Vec<Range<usize>>>,
+    limits: Limits,
+) -> Result<BTreeMap<String, Placed>> {
+    let (root, store) = (target.root, target.store);
+    let later = target
+        .mutator
+        .later_edits(target.session, change, selected)
+        .await?;
+    let edited = later
+        .paths
+        .into_iter()
+        .filter(|(_, history)| !history.steps.is_empty())
+        .collect::<BTreeMap<_, _>>();
+    if edited.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let trees = MerkleTreeStore::new(target.objects);
+    let paths = edited.keys().map(String::as_str).collect::<Vec<_>>();
+    let effective = trees.lookup_many(effective_tree, &paths).await?;
+    let shown = match target.pinned {
+        Some(pinned) => trees.lookup_many(pinned, &paths).await?,
+        None => effective.clone(),
+    };
+    // The workspace may predate some later changes; only the steps it shows were seen.
+    let mut histories = BTreeMap::new();
+    let mut current = Vec::new();
+    for ((path, history), (effective, shown)) in
+        edited.into_iter().zip(effective.into_iter().zip(shown))
+    {
+        let history = if shown == effective {
+            history
+        } else {
+            history.up_to(shown).ok_or_else(|| {
+                CliFailure::stale(format!(
+                    "{path:?} changed in the working view since this workspace was materialized; run `wheat materialize` and retry"
+                ))
+            })?
+        };
+        if !history.steps.is_empty() {
+            histories.insert(path, history);
+            current.push(shown);
+        }
+    }
+    if let Some(path) = histories.keys().find(|path| guards.contains_key(*path)) {
+        return Err(CliFailure::invalid(format!(
+            "--guard cannot be used on {path:?}: changes after {change} also edit it"
+        )));
+    }
+    let sorted = histories.keys().map(String::as_str).collect::<Vec<_>>();
+    let mut files = BTreeMap::new();
+    for path in &sorted {
+        let file = read_workspace_file(root, Path::new(path), limits.max_input_bytes)
+            .with_context(|| format!("cannot read workspace path {path:?}"))?
+            .map(|snapshot| FileBytes {
+                kind: snapshot.kind,
+                bytes: canonical_workspace(&snapshot),
+            });
+        files.insert(*path, file);
+    }
+    let mut reauthored = BTreeSet::new();
+    loop {
+        let mut placements = BTreeMap::new();
+        let mut giving_up = BTreeSet::new();
+        for (path, current) in sorted.iter().zip(&current) {
+            let history = &histories[*path];
+            let PathPlacement {
+                below,
+                moved,
+                notices,
+            } = place_path(
+                store,
+                path,
+                history,
+                *current,
+                files[path].as_ref(),
+                &reauthored,
+            )?;
+            giving_up.extend(moved.iter().map(|edit| edit.change));
+            let revisions = history
+                .steps
+                .iter()
+                .map(|step| (step.change, step.revision))
+                .collect();
+            placements.insert(
+                (*path).to_owned(),
+                Placed {
+                    below,
+                    moved,
+                    notices,
+                    revisions,
+                },
+            );
+        }
+        if giving_up.is_subset(&reauthored) {
+            return Ok(placements);
+        }
+        reauthored.extend(giving_up);
+    }
 }
 
 fn canonical_workspace(snapshot: &crate::workspace_files::WorkspaceFileSnapshot) -> Vec<u8> {

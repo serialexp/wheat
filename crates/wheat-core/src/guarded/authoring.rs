@@ -109,6 +109,7 @@ pub fn normalize(
 }
 
 /// Normalize changes and report each rebuilt final fixed-point component.
+#[tracing::instrument(level = "debug", skip_all, fields(bytes = workspace.len()))]
 pub fn normalize_with_lineage(
     authored: &[u8],
     existing: &[GuardedEdit],

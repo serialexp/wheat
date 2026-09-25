@@ -440,6 +440,12 @@ where
         }
     }
 
+    #[tracing::instrument(
+        name = "radix_update",
+        level = "debug",
+        skip_all,
+        fields(collection = std::any::type_name::<C>().rsplit("::").next())
+    )]
     pub(crate) async fn update_batch(
         &self,
         root: C::Id,

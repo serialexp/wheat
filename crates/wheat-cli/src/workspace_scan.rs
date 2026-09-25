@@ -74,6 +74,7 @@ pub(crate) fn scan(
 
 /// Compares the tracked files `filter` selects with the workspace. Unselected files are
 /// neither read nor reported, though they stay in `tracked_paths`.
+#[tracing::instrument(name = "workspace_scan", level = "debug", skip_all)]
 pub(crate) fn scan_locked(
     workspace_root: &Path,
     repository: &LocalRepository,

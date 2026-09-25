@@ -102,6 +102,7 @@ async fn path_shapes<'p, O: ImmutableObjectStore>(
 ///
 /// New tree nodes are written to `objects`; the caller must make them durable and
 /// root them before publishing workspace metadata that references them.
+#[tracing::instrument(name = "settle_pin", level = "debug", skip_all)]
 pub(crate) async fn settle<O: ImmutableObjectStore>(
     root: &Path,
     objects: &O,

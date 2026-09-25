@@ -274,6 +274,7 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
     }
 
     /// Inserts edges after grouping children by parent, updating each child set once.
+    #[tracing::instrument(name = "view_lineage_insert", level = "debug", skip_all)]
     pub async fn insert_edges(
         &self,
         root: ViewLineageMapId,

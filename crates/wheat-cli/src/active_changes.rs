@@ -92,6 +92,7 @@ fn display_ids<T: std::fmt::Display, S: serde::Serializer>(
         .serialize(serializer)
 }
 
+#[tracing::instrument(name = "active_changes", level = "debug", skip_all)]
 pub(crate) async fn inspect(
     repository: &LocalRepository,
     head: RepositoryHead,

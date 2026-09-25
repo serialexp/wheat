@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
+use tracing::Instrument;
 use wheat_core::*;
 
 use crate::{
@@ -78,8 +79,8 @@ impl PreparedRepositoryMutation {
 }
 
 pub struct PersistedRepositoryMutator<'a, O, P> {
-    objects: &'a O,
-    content: &'a ContentStore,
+    pub(crate) objects: &'a O,
+    pub(crate) content: &'a ContentStore,
     publications: &'a P,
 }
 
@@ -95,6 +96,15 @@ pub struct PersistedConflictResolution {
     pub resolved: BTreeMap<String, Option<FileValue>>,
 }
 
+/// A repository opened once by [`PersistedRepositoryMutator::open_authoring`]. It is read with
+/// [`PersistedRepositoryMutator::later_edits`] and consumed by
+/// [`PersistedRepositoryMutator::revise_changes_in`], which publishes only if the head is still
+/// the one it was opened at.
+pub struct AuthoringSession {
+    pub(crate) expected: RepositoryHead,
+    pub(crate) active: Active,
+}
+
 pub(crate) struct Active {
     pub(crate) state: RepositoryStateRecord,
     pub(crate) base: ViewRecord,
@@ -102,7 +112,7 @@ pub(crate) struct Active {
     pub(crate) revisions: BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
     /// The revision identities and canonical order represented by `effective` before this mutation.
     persisted_revisions: BTreeMap<ChangeId, RevisionId>,
-    persisted_order: Vec<ChangeId>,
+    pub(crate) persisted_order: Vec<ChangeId>,
     reverse_dependencies: BTreeMap<ChangeId, BTreeSet<ChangeId>>,
 }
 
@@ -450,13 +460,43 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         effective_view: ViewId,
         requests: BTreeMap<ChangeId, RevisionRequest>,
     ) -> Result<(PreparedRepositoryMutation, RevisionsOutcome)> {
+        let session = self
+            .open_authoring(expected, basis_view, effective_view)
+            .await?;
+        self.revise_changes_in(session, requests).await
+    }
+
+    /// Opens the repository once for an authoring command that reads it before revising it.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn open_authoring(
+        &self,
+        expected: RepositoryHead,
+        basis_view: ViewId,
+        effective_view: ViewId,
+    ) -> Result<AuthoringSession> {
+        Ok(AuthoringSession {
+            expected,
+            active: self.open(expected, basis_view, effective_view).await?,
+        })
+    }
+
+    /// [`Self::revise_changes`] on an already opened repository.
+    #[tracing::instrument(level = "debug", skip_all, fields(changes = requests.len()))]
+    pub async fn revise_changes_in(
+        &self,
+        session: AuthoringSession,
+        requests: BTreeMap<ChangeId, RevisionRequest>,
+    ) -> Result<(PreparedRepositoryMutation, RevisionsOutcome)> {
         if requests.is_empty() {
             return Err(RepositoryError::InvalidEditTransition(
                 "a revision needs at least one change",
             )
             .into());
         }
-        let mut active = self.open(expected, basis_view, effective_view).await?;
+        let AuthoringSession {
+            expected,
+            mut active,
+        } = session;
         let mut pending = BTreeMap::new();
         for (change, request) in requests {
             let Some((current, old)) = active.revisions.get(&change) else {
@@ -510,6 +550,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok((prepared, outcome))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn publish(&self, prepared: PreparedRepositoryMutation) -> Result<RepositoryHead> {
         let actual = self
             .publications
@@ -536,6 +577,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(proposed)
     }
 
+    #[tracing::instrument(name = "open_repository", level = "debug", skip_all)]
     pub(crate) async fn open(
         &self,
         expected: RepositoryHead,
@@ -621,6 +663,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     /// keep theirs, so the order of the others is unchanged. Each authored revision's edits must
     /// apply cleanly at its spot. Returns the composed view and the new revision of each pending
     /// change, which also replaces it in `active`.
+    #[tracing::instrument(level = "debug", skip_all, fields(pending = pending.len()))]
     pub(crate) async fn compose_authoring(
         &self,
         active: &mut Active,
@@ -685,6 +728,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     ///
     /// The target of the next persisted application is precisely that intermediate view, so no
     /// edit or tree in the prefix needs to be read.
+    #[tracing::instrument(level = "debug", skip_all, fields(prefix))]
     async fn prefix_view(&self, active: &Active, prefix: usize) -> Result<ViewRecord> {
         if prefix == 0 {
             return Ok(active.base);
@@ -705,6 +749,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     }
 
     /// Applies one change's revision onto `view` and records the resulting view.
+    #[tracing::instrument(level = "debug", skip_all, fields(change = %change))]
     async fn apply_step(
         &self,
         view: ViewRecord,
@@ -772,6 +817,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(edits = revision.edits.len()))]
     pub(crate) async fn load_edits(
         &self,
         revision: &RevisionRecord,
@@ -784,6 +830,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(edits)
     }
 
+    #[tracing::instrument(name = "apply_revision", level = "debug", skip_all, fields(edits = edits.len()))]
     pub(crate) async fn apply(
         &self,
         revision: RevisionId,
@@ -930,6 +977,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn update_visible_manifest(
         &self,
         old: ContentManifestId,
@@ -964,6 +1012,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(manifest.id())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn put_view(&self, view: &ViewRecord, fresh: &mut Fresh) -> Result<()> {
         self.objects
             .put_if_absent(view.id().into(), &view.canonical_bytes())
@@ -985,6 +1034,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         fresh.revisions.insert(id);
         Ok(id)
     }
+    #[tracing::instrument(level = "debug", skip_all, fields(edits = edits.len()))]
     async fn persist_edits(
         &self,
         edits: &BTreeMap<EditId, EditRecord>,
@@ -1016,6 +1066,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn validate_revision_transition(
         &self,
         change: ChangeId,
@@ -1084,6 +1135,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(())
     }
 
+    #[tracing::instrument(name = "finish_mutation", level = "debug", skip_all)]
     async fn finish(
         &self,
         expected: RepositoryHead,
@@ -1091,11 +1143,16 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         resulting_view: ViewId,
         fresh: Fresh,
     ) -> Result<PreparedRepositoryMutation> {
-        for id in &fresh.content {
-            self.content
-                .resolve(*id)
-                .map_err(RepositoryPublicationError::Content)?;
-        }
+        tracing::debug_span!("resolve_fresh_content", count = fresh.content.len()).in_scope(
+            || -> Result<()> {
+                for id in &fresh.content {
+                    self.content
+                        .resolve(*id)
+                        .map_err(RepositoryPublicationError::Content)?;
+                }
+                Ok(())
+            },
+        )?;
         let retained = RetainedSetStore::new(self.objects);
         let retained_changes = retained
             .update_batch(
@@ -1124,6 +1181,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let sets = ContentSetStore::new(self.objects);
         let old_manifest = RepositoryReader::new(self.objects, self.content)
             .manifest(old.required_content)
+            .instrument(tracing::debug_span!("read_manifest"))
             .await?;
         let content = sets
             .update_batch(

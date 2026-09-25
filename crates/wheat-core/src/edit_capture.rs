@@ -92,6 +92,7 @@ impl From<Limits> for CaptureLimits {
 /// Existing text-to-text transitions within `limits.max_input_bytes` are always sent
 /// through guarded authoring; an authoring failure is returned and never converted
 /// into an `ExactFile` edit.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn capture_edit(
     path: &str,
     before: Option<FileSnapshot<'_>>,

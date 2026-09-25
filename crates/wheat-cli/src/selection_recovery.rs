@@ -4,6 +4,7 @@ use wheat_store::PublicationStore;
 use crate::{local::LocalRepository, workspace_metadata::WorkspaceMetadata};
 
 /// Complete or discard a workspace publication intent after an interrupted repository CAS.
+#[tracing::instrument(name = "recover_selection", level = "debug", skip_all)]
 pub(crate) fn recover(
     root: &std::path::Path,
     repository: &LocalRepository,

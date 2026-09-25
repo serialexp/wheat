@@ -196,6 +196,7 @@ impl<'a, S: ImmutableObjectStore> ContentSetStore<'a, S> {
             .await
     }
 
+    #[tracing::instrument(name = "content_set_update", level = "debug", skip_all)]
     async fn update_batch_compressing_inner(
         &self,
         root: ContentSetId,

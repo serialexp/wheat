@@ -69,6 +69,7 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
     /// If any backend write fails, the entire batch remains buffered so that a
     /// later call can retry it idempotently. Some objects may already have been
     /// durably written by the failed attempt.
+    #[tracing::instrument(name = "object_flush", level = "debug", skip_all)]
     pub async fn flush(&self) -> Result<(), ObjectStoreError> {
         let mut pending = self.pending.lock().await;
         self.flush_locked(&mut pending).await

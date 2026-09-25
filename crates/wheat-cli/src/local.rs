@@ -43,6 +43,7 @@ pub(crate) fn projection_path(root: &Path) -> Result<PathBuf> {
     Ok(root.join("projections/git.git"))
 }
 
+#[tracing::instrument(name = "open_store", level = "debug", skip_all)]
 pub(crate) fn open(root: &Path) -> Result<LocalRepository> {
     let store_id = crate::workspace_metadata::StoreMetadata::read(root)?.store_id;
     let objects = PackedObjectStore::open(storage_path(root)?)?;

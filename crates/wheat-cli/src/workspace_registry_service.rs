@@ -75,6 +75,7 @@ pub(crate) fn pin_for(
     Ok(pin)
 }
 
+#[tracing::instrument(name = "reconcile_registry", level = "debug", skip_all)]
 pub(crate) fn reconcile(
     workspace_root: &Path,
     store_root: &Path,
@@ -84,6 +85,7 @@ pub(crate) fn reconcile(
     registry.publish(&pin_for(workspace_root, store_root, metadata)?)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) fn transition_materialization(
     workspace_root: &Path,
     store_root: &Path,

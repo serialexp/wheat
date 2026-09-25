@@ -12,6 +12,7 @@ mod content_io;
 pub mod diff_model;
 pub mod edit_application;
 pub mod edit_capture;
+pub mod edit_placement;
 mod edit_records;
 pub mod guarded;
 mod hydration;

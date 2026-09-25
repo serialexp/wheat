@@ -615,12 +615,30 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         fs::read(harness.workspace.join("not-selected.txt")).unwrap(),
         b"never capture me\n"
     );
+    // The descendant's edit of shared.txt is captured without touching the workspace, so the
+    // workspace keeps showing the ancestor's version. Revising the ancestor from that version
+    // below the unseen edit conflicts the descendant; an edit the workspace showed would move
+    // into the ancestor instead.
     let descendant = harness.ok(
         &harness.workspace,
-        &["change", "new", "--message", "Descendant change"],
+        &[
+            "change",
+            "new",
+            "--message",
+            "Descendant change",
+            "--path",
+            "shared.txt",
+            "--expected",
+            "ancestor one\n",
+            "--value",
+            "descendant value\n",
+        ],
     );
     let descendant_change = output_field(&descendant, "change");
-    fs::write(harness.workspace.join("shared.txt"), b"descendant value\n").unwrap();
+    assert_eq!(
+        fs::read(harness.workspace.join("shared.txt")).unwrap(),
+        b"ancestor one\n"
+    );
     fs::create_dir(harness.workspace.join("nested")).unwrap();
     fs::write(
         harness.workspace.join("nested/created.txt"),
@@ -632,12 +650,11 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         &[
             "add",
             "--message",
-            "Capture descendant and newly created path",
-            "shared.txt",
+            "Capture newly created path",
             "nested/created.txt",
         ],
     );
-    assert_eq!(descendant_added["result"]["paths"], 2);
+    assert_eq!(descendant_added["result"]["paths"], 1);
 
     fs::write(harness.workspace.join("shared.txt"), b"ancestor revised\n").unwrap();
     let revised = harness.ok(

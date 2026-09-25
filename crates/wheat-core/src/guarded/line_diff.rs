@@ -136,6 +136,7 @@ struct RankPossible {
 /// an after-line insertion. This stable rule makes output deterministic. The
 /// `ambiguous` bit prevents this rule from being mistaken for evidence that a
 /// repeated line has a unique identity.
+#[tracing::instrument(level = "debug", skip_all, fields(before = before.len(), after = after.len()))]
 pub fn line_diff(
     before: &[u8],
     after: &[u8],

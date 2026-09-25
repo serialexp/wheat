@@ -25,6 +25,7 @@ mod command_output;
 mod conflict_inspection;
 mod diff_render;
 mod discovery;
+mod edit_move;
 mod frontier_service;
 mod import_trace;
 mod inspection;
@@ -38,6 +39,7 @@ mod repack;
 mod repository_diff;
 mod rewrite_transaction;
 mod selection_recovery;
+mod span_trace;
 mod squash;
 mod squash_attribution;
 mod store_analyze;
@@ -357,6 +359,10 @@ struct AddArgs {
     /// Wider guard as PATH:START:END, using byte offsets in canonical-LF workspace content.
     #[arg(long = "guard", value_parser = parse_guard)]
     guards: Vec<GuardRange>,
+    /// Move blocks and files that later changes wrote into the change without asking, when
+    /// your edit overlaps them.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +556,8 @@ struct ResolveArgs {
 }
 
 fn main() -> ExitCode {
+    // Reports when dropped, after the command's output.
+    let _span_trace = span_trace::install_from_env();
     let args = std::env::args_os().collect::<Vec<_>>();
     let requested = requested_format(&args);
     if let Err(error) = require_supported_platform() {
@@ -561,7 +569,7 @@ fn main() -> ExitCode {
     };
     let format = cli.format;
     let command = command_name(&cli.command);
-    match execute(cli) {
+    match tracing::info_span!("command", command).in_scope(|| execute(cli)) {
         Ok(success) => emit_success(format, &success),
         Err(error) => emit_error(format, command, &error),
     }
@@ -1039,17 +1047,6 @@ fn execute(cli: Cli) -> Result<Success> {
                     .push(guard.range);
             }
             let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
-            let edits = runtime.block_on(workspace::author_from_workspace(
-                &context.root,
-                &objects,
-                &local.content,
-                expected,
-                context.workspace.effective_view(),
-                change,
-                predecessor,
-                &paths,
-                &guards,
-            ))?;
             let (_, revision_metadata) = authoring_metadata::metadata(
                 &context.store_root,
                 authoring_metadata::MetadataArgs {
@@ -1062,15 +1059,49 @@ fn execute(cli: Cli) -> Result<Success> {
                 false,
             )?;
             let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
-            let (prepared, outcome) = runtime.block_on(mutator.revise(
+            let session = runtime.block_on(mutator.open_authoring(
                 expected,
                 context.workspace.basis,
                 context.workspace.effective_view(),
+            ))?;
+            let authored = runtime.block_on(workspace::author_from_workspace(
+                &workspace::AddTarget {
+                    root: &context.root,
+                    objects: &objects,
+                    store: &local.content,
+                    mutator: &mutator,
+                    session: &session,
+                    effective_view: context.workspace.effective_view(),
+                    pinned: context
+                        .workspace
+                        .materialized
+                        .as_ref()
+                        .map(|pinned| pinned.tree),
+                },
                 change,
                 predecessor,
+                &paths,
+                &guards,
                 revision_metadata,
-                edits,
             ))?;
+            if !authored.moves.is_empty() && !arguments.force {
+                let stdin = std::io::stdin();
+                let stderr = std::io::stderr();
+                let interactive =
+                    format == OutputFormat::Human && stdin.is_terminal() && stderr.is_terminal();
+                edit_move::confirm(
+                    change,
+                    &authored.moves,
+                    &mut edit_move::PromptIo {
+                        input: &mut stdin.lock(),
+                        diagnostics: &mut stderr.lock(),
+                        interactive,
+                    },
+                )?;
+            }
+            let (prepared, outcome) =
+                runtime.block_on(mutator.revise_changes_in(session, authored.requests))?;
+            let revision_id = outcome.revisions[&change];
             let resulting_frontier = prepared.resulting_view();
             let publication = runtime.block_on(prepare_mutation_publication(
                 &objects,
@@ -1152,7 +1183,10 @@ fn execute(cli: Cli) -> Result<Success> {
                 output,
                 "added {path_count} path(s) to change {change} — {title}",
             )?;
-            writeln!(output, "revision {}", outcome.revision_id)?;
+            writeln!(output, "revision {revision_id}")?;
+            for line in &authored.moves {
+                writeln!(output, "moved {line}")?;
+            }
             if arguments.change.is_some()
                 && context.workspace.selected_change != Some(change)
                 && let Some(selected) = context.workspace.selected_change
@@ -1179,8 +1213,14 @@ fn execute(cli: Cli) -> Result<Success> {
                 "add",
                 json!({
                     "change": change.to_string(),
-                    "revision": outcome.revision_id.to_string(),
+                    "revision": revision_id.to_string(),
                     "paths": path_count,
+                    "moved": authored.moved.iter().map(|moved| json!({
+                        "path": moved.path,
+                        "from": moved.from.to_string(),
+                        "revision": outcome.revisions[&moved.from].to_string(),
+                        "edit": moved.edit.to_string(),
+                    })).collect::<Vec<_>>(),
                     "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     "materialize_required": materialize_required,
                     "diverged": diverged,

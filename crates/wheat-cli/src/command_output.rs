@@ -47,6 +47,9 @@ pub(crate) enum CliFailure {
     CorruptState(String),
     #[error("{0}")]
     TransportFailure(String),
+    /// Adding would move edits out of later changes, which needs confirmation or `--force`.
+    #[error("{0}")]
+    EditsWouldMove(String),
 }
 
 impl CliFailure {
@@ -72,6 +75,10 @@ impl CliFailure {
 
     pub(crate) fn transport(message: impl Into<String>) -> Error {
         Self::TransportFailure(message.into()).into()
+    }
+
+    pub(crate) fn would_move(message: impl Into<String>) -> Error {
+        Self::EditsWouldMove(message.into()).into()
     }
 }
 
@@ -439,6 +446,7 @@ fn classify(error: &Error) -> Classification {
                 CliFailure::LimitExceeded(_) => class("limit", "limit_exceeded", false, 5),
                 CliFailure::CorruptState(_) => class("integrity", "corrupt_state", false, 6),
                 CliFailure::TransportFailure(_) => class("transport", "transport_failure", true, 8),
+                CliFailure::EditsWouldMove(_) => class("input", "edits_would_move", false, 2),
             };
         }
         if let Some(import) = cause.downcast_ref::<ImportError>() {

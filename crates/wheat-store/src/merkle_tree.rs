@@ -568,6 +568,7 @@ where
     ///
     /// Results follow `paths`; like [`Self::lookup`], a missing path or a directory yields
     /// `None`, and a file in place of an ancestor directory is [`MerkleTreeError::FileInPath`].
+    #[tracing::instrument(name = "tree_lookup_many", level = "debug", skip_all, fields(paths = paths.len()))]
     pub async fn lookup_many(
         &self,
         root: TreeId,
@@ -1182,6 +1183,7 @@ where
         Ok(node)
     }
 
+    #[tracing::instrument(name = "tree_apply_edits", level = "debug", skip_all, fields(edits = edits.len()))]
     pub async fn apply_edits(
         &self,
         root: TreeId,

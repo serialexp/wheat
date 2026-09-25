@@ -41,6 +41,7 @@ impl PreparedMutationPublication {
 /// before passing the returned value to [`finalize_mutation_publication`]. The current head is
 /// checked before the old envelope is read, matching the stale-error behavior of ordinary
 /// mutation publication.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn prepare_mutation_publication<O: ImmutableObjectStore, P: PublicationStore>(
     objects: &O,
     content: &ContentStore,
@@ -80,6 +81,7 @@ pub async fn prepare_mutation_publication<O: ImmutableObjectStore, P: Publicatio
 ///
 /// This compare-and-advance is the authoritative concurrency check. On failure the publication is
 /// left unchanged; immutable objects prepared by the losing writer may safely remain stored.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn finalize_mutation_publication<P: PublicationStore>(
     publications: &P,
     prepared: PreparedMutationPublication,

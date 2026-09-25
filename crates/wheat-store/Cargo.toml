@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 gunnar-delta = "1.1"
 zstd = "0.13"

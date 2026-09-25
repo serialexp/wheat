@@ -107,6 +107,7 @@ pub enum ApplicationError {
 }
 
 /// Applies `edits` deterministically. Every definition is matched against the immutable target.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn apply_edits<E>(
     target: &Tree,
     edit_iter: impl IntoIterator<Item = (EditId, EditRecord)>,

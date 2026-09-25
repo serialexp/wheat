@@ -63,6 +63,7 @@ impl<'a> ContentWriteBatch<'a> {
     }
 
     /// Durably retains the pending tail. Failed batches remain available for retry.
+    #[tracing::instrument(name = "content_commit", level = "debug", skip_all, fields(objects = self.pending.len(), bytes = self.bytes))]
     pub fn commit(&mut self) -> Result<(), ContentStoreError> {
         if self.pending.is_empty() {
             return Ok(());

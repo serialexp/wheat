@@ -371,6 +371,7 @@ pub(crate) struct WorkspaceLock {
 }
 
 impl WorkspaceLock {
+    #[tracing::instrument(name = "workspace_lock", level = "debug", skip_all)]
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
         #[cfg(not(target_os = "linux"))]
         bail!("Wheat workspace materialization is currently supported only on Linux");
@@ -797,6 +798,7 @@ async fn expand_restore_selectors(
         .collect())
 }
 
+#[tracing::instrument(name = "recover_materialization", level = "debug", skip_all)]
 pub(crate) async fn recover(
     root: &Path,
     repository: &LocalRepository,

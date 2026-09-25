@@ -268,6 +268,7 @@ impl ContentStore {
         }
     }
 
+    #[tracing::instrument(name = "content_put", level = "debug", skip_all, fields(bytes = bytes.len()))]
     pub fn put(&self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
         let id = ContentId::of(bytes);
         self.put_with_id(id, bytes)?;
@@ -540,6 +541,7 @@ impl ContentStore {
         result
     }
 
+    #[tracing::instrument(name = "content_get", level = "debug", skip_all)]
     pub fn get(&self, id: ContentId) -> Result<Vec<u8>, ContentStoreError> {
         self.get_bounded(id, usize::MAX)
     }

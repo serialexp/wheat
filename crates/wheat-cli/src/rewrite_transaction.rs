@@ -170,6 +170,7 @@ pub(crate) struct StoreOperationGuard<'a> {
 }
 
 impl<'a> StoreOperationGuard<'a> {
+    #[tracing::instrument(name = "store_lock", level = "debug", skip_all)]
     pub(crate) fn acquire(store_root: &'a Path, repository: &LocalRepository) -> Result<Self> {
         let rewrite = RewriteGuard::acquire(store_root)?;
         if let Some(transaction) = read_transaction(store_root)? {

@@ -41,6 +41,7 @@ pub use ownership::{
     prove_union_liveness_with,
 };
 mod packed;
+mod provenance;
 pub use packed::{
     PackedObjectStore, PackedStoreTrace, PackedStoreTraceSnapshot, RepackError, RepackOptions,
     RepackPlan, RepackReport,
@@ -97,10 +98,11 @@ pub use mutation_publication::{
 pub use object_store_adapter::{
     ObjectStoreAdapter, ObjectStoreAdapterBuildError, S3ObjectStoreConfig,
 };
+pub use provenance::{LaterEdits, PathHistory, PathStep};
 pub use publication::{LocalPublicationStore, PublicationError, PublicationStore, RepositoryHead};
 pub use repository_mutation::{
-    PersistedConflictResolution, PersistedRepositoryMutator, PreparedRepositoryMutation,
-    RepositoryMutationError,
+    AuthoringSession, PersistedConflictResolution, PersistedRepositoryMutator,
+    PreparedRepositoryMutation, RepositoryMutationError,
 };
 pub use repository_publication::{RepositoryPublicationError, RepositoryPublisher};
 pub use repository_rewrite::{
