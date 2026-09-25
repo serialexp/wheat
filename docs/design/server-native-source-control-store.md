@@ -1714,15 +1714,17 @@ that a migration cannot silently change.
 
 ## References
 
-- `crates/gothab-remote-helper/` — current `gothab://` and
-  `gothab+ssh://` Git compatibility seam.
-- [`large-file-storage.md`](large-file-storage.md) — out-of-band blob transfer
-  and the present remote-helper architecture.
-- [`gitd-per-host-storage.md`](gitd-per-host-storage.md) — server-side Git
-  authority, routing, fencing, mutation, and recovery.
-- [`repository-blob-ownership.md`](repository-blob-ownership.md) — ownership
-  manifests and content retention independent of one local ODB.
-- [`stacked-pull-request-reconciliation.md`](stacked-pull-request-reconciliation.md)
+The gothab references below live in the gothab repository.
+
+- [`crates/gothab-remote-helper/`](https://github.com/serialexp/gothab/tree/main/crates/gothab-remote-helper)
+  — current `gothab://` and `gothab+ssh://` Git compatibility seam.
+- [`large-file-storage.md`](https://github.com/serialexp/gothab/blob/main/docs/design/large-file-storage.md)
+  — out-of-band blob transfer and the present remote-helper architecture.
+- [`gitd-per-host-storage.md`](https://github.com/serialexp/gothab/blob/main/docs/design/done/gitd-per-host-storage.md)
+  — server-side Git authority, routing, fencing, mutation, and recovery.
+- [`repository-blob-ownership.md`](https://github.com/serialexp/gothab/blob/main/docs/design/repository-blob-ownership.md)
+  — ownership manifests and content retention independent of one local ODB.
+- [`stacked-pull-request-reconciliation.md`](https://github.com/serialexp/gothab/blob/main/docs/design/stacked-pull-request-reconciliation.md)
   — durable stack/review identity currently reconstructed around Git commits
   and refs.
 - [Jujutsu architecture](https://docs.jj-vcs.dev/latest/technical/architecture/)

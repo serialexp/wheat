@@ -875,7 +875,8 @@ Content is access-gated, not access-open. The server serves content only
 to clients whose authorized repository graph references that ContentId —
 knowing a hash is not sufficient to download the bytes. This is the same
 model Gothab already uses for git blob ownership
-(`docs/design/repository-blob-ownership.md`): content exists once
+([`repository-blob-ownership.md`](https://github.com/serialexp/gothab/blob/main/docs/design/repository-blob-ownership.md)
+in the gothab repository): content exists once
 physically, but authorization is checked against the requesting
 repository's tree.
 
@@ -1090,8 +1091,9 @@ All initial open questions have been settled:
   existing `gothab://` seam.
 - `docs/design/wheat-local-cli.md` — the local CLI design, including Phase 3
   synchronization placeholders that this document supersedes.
-- `docs/design/repository-blob-ownership.md` — the existing git-blob
-  ownership model; the content-reachability design above is the wheat analog.
+- [`repository-blob-ownership.md`](https://github.com/serialexp/gothab/blob/main/docs/design/repository-blob-ownership.md)
+  (gothab repository) — the existing git-blob ownership model; the
+  content-reachability design above is the wheat analog.
 - `crates/wheat-core/generated/` — the existing binschema-generated object
   format (Rust).
 - `crates/wheat-store/src/publication.rs` — `RepositoryHead` with
