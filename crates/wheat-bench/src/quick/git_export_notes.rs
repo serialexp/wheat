@@ -10,17 +10,15 @@ use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
 use wheat_core::{
-    Actor, ChangeId, ChangeMetadata, ChangeProposal, ContentId, EditId, EditOperation, EditRecord,
-    EditTransition, FileKind, FileValue, Repository, RevisionEdits, RevisionId, RevisionMetadata,
-    Tree, ViewId,
+    ChangeId, ChangeMetadata, ChangeProposal, EditId, RevisionId, RevisionMetadata, ViewId,
 };
 use wheat_git::export::{ExportOptions, export_revision_history};
-use wheat_store::{
-    ContentStore, Durability, LocalPublicationStore, PackedObjectStore, PersistedRepositoryMutator,
-    RepositoryHead, RepositoryPublisher, RepositoryReader,
-};
+use wheat_store::{RepositoryHead, RepositoryReader};
 
-use super::{CaseContext, CaseOutput, Recorder};
+use super::{
+    CaseContext, CaseOutput, Recorder,
+    history::{Scratch, author, rewrite},
+};
 use crate::measure;
 
 pub(crate) const NAME: &str = "git_export_notes";
@@ -33,7 +31,7 @@ const NOTE_EVERY: usize = 10;
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     // Building the history costs far more than exporting it: every mutation walks all
-    // views since the basis (see TODO.md, "open walks every view since the basis"), so
+    // views since the basis (the `checkpoint_stack` case measures that on its own), so
     // the build grows with the square of the revision count. 2,000 revisions keep it
     // near a minute.
     let changes = context.scale.pick(50, 5);
@@ -61,19 +59,12 @@ async fn measure_export(
     checkpoints: usize,
     recorder: &mut Recorder,
 ) -> Result<()> {
-    // Building thousands of revisions with a sync per publication would dwarf
-    // the export being measured, so the scratch repository defers its syncs.
-    let objects = PackedObjectStore::open_deferred(root.join("objects"))?;
-    let content = ContentStore::with_durability(root.join("content"), Durability::Deferred);
-    let heads =
-        LocalPublicationStore::with_durability(root.join("repository.head"), Durability::Deferred);
-
+    let scratch = Scratch::open(root)?;
     let started = Instant::now();
-    let (base, selected, head) =
-        build_repository(&objects, &content, &heads, changes, checkpoints).await?;
+    let (base, selected, head) = build_repository(&scratch, changes, checkpoints).await?;
     recorder.wall("build", started.elapsed().as_secs_f64());
 
-    let reader = RepositoryReader::new(&objects, &content);
+    let reader = RepositoryReader::new(&scratch.objects, &scratch.content);
     let state = reader
         .state(reader.envelope(head.envelope).await?.state)
         .await?;
@@ -84,8 +75,8 @@ async fn measure_export(
         let git = gix::init_bare(root.join(format!("git-{sample}")))?;
         let started = Instant::now();
         let exported = export_revision_history(
-            &objects,
-            &content,
+            &scratch.objects,
+            &scratch.content,
             selected,
             base,
             state.changes,
@@ -121,50 +112,16 @@ async fn measure_export(
     Ok(())
 }
 
-fn rewrite(path: &str, value: &[u8], previous: Option<EditId>) -> Result<(EditId, RevisionEdits)> {
-    let record = EditRecord::new(
-        path,
-        EditOperation::ExactFile {
-            expected: None,
-            replacement: Some(FileValue {
-                content: ContentId::of(value),
-                kind: FileKind::Regular,
-            }),
-        },
-    )?;
-    let id = record.id();
-    Ok((
-        id,
-        RevisionEdits {
-            edits: [(id, record)].into(),
-            transition: EditTransition {
-                added: [id].into(),
-                removed: previous.into_iter().collect(),
-                ..EditTransition::default()
-            },
-        },
-    ))
-}
-
-/// Builds the stack one published revision at a time, the way `wheat change new` and
-/// `wheat add` do; returns the base view, the selected view, and the published head.
+/// Builds the stack one published revision at a time; returns the base view, the
+/// selected view, and the published head.
 async fn build_repository(
-    objects: &PackedObjectStore,
-    content: &ContentStore,
-    heads: &LocalPublicationStore,
+    scratch: &Scratch,
     changes: usize,
     checkpoints: usize,
 ) -> Result<(ViewId, ViewId, RepositoryHead)> {
-    let author = Actor {
-        name: "Wheat Bench".into(),
-        email: "wheat-bench@example.invalid".into(),
-    };
-    let repository = Repository::new(Tree::new());
-    let base = repository.base_view().id;
-    let mut head = RepositoryPublisher::new(objects, content, heads)
-        .initialize(&repository)
-        .await?;
-    let mutator = PersistedRepositoryMutator::new(objects, content, heads);
+    let author = author();
+    let (base, mut head) = scratch.initialize().await?;
+    let mutator = scratch.mutator();
     let mut effective = base;
     let mut below: Option<ChangeId> = None;
     for index in 0..changes {
@@ -173,8 +130,12 @@ async fn build_repository(
         let mut previous: Option<(RevisionId, EditId)> = None;
         for checkpoint in 0..checkpoints {
             let value = format!("change {index}\ncheckpoint {checkpoint}\n");
-            content.put(value.as_bytes())?;
-            let (edit, edits) = rewrite(&path, value.as_bytes(), previous.map(|(_, e)| e))?;
+            let (edit, edits) = rewrite(
+                &scratch.content,
+                &path,
+                value.as_bytes(),
+                previous.map(|(_, e)| e),
+            )?;
             let message = if checkpoint == 0 {
                 format!("Change {index}\n\nWhy change {index} exists.")
             } else if checkpoint % NOTE_EVERY == 0 {
