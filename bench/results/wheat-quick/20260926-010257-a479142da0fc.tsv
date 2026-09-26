@@ -1,0 +1,30 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20260926-010257
+# checkpoint_stack	{"checkpoints":2000,"depth":50,"per_change":40,"window":100}
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	a479142da0fc
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+checkpoint_stack.total.wall	124.998241089	s
+checkpoint_stack.total.peak_rss	35979264	bytes
+checkpoint_stack.single.build.wall	9.872214443	s
+checkpoint_stack.deep.build.wall	15.050468552	s
+checkpoint_stack.spread.build.wall	100.008283765	s
+checkpoint_stack.single.early.per_revision	1.341444	ms
+checkpoint_stack.single.late.per_revision	5.019667	ms
+checkpoint_stack.single.added.per_revision	3.678223	ms
+checkpoint_stack.deep.early.per_revision	3.913094	ms
+checkpoint_stack.deep.late.per_revision	7.430012	ms
+checkpoint_stack.deep.added.per_revision	3.516918	ms
+checkpoint_stack.spread.early.per_revision	3.913094	ms
+checkpoint_stack.spread.late.per_revision	92.90829	ms
+checkpoint_stack.spread.added.per_revision	88.995196	ms
+run.total_time	124.998874152	s
+process.peak_rss	35979264	bytes
+suite.cases	1	count
+suite.case_failures	0	count
