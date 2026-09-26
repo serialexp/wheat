@@ -3,6 +3,98 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Security and performance scan (2026-09-26)
+
+Two read-only Antigravity scans of the whole repo, one for security and one for
+performance. "Confirmed" means a Claude agent checked the claim in the code; the rest
+are the scanner's word only and need checking before a fix.
+
+Security, most serious first:
+
+- `[ ]` **wheat-server has no authentication or access control (confirmed).**
+  `run_session` (`crates/wheat-server/src/connection.rs`) never looks at
+  `ClientHello.auth_token`, so any client that can connect can open, fetch, publish or
+  force-publish any repository. Needs a token check before `SessionEstablished`,
+  per-repository read/write permission, and a separate right for `force`.
+- `[ ]` **Materialization does not reserve `.git` (confirmed).** `RESERVED` in
+  `crates/wheat-cli/src/materialization.rs` (and the matching list in
+  `workspace_files.rs`) blocks `.wheat`, `.wheat-git`, `storage` and
+  `repository.head`, but not `.git`. A repository could carry `.git/hooks/...` or
+  `.git/config` and plant something git runs later if the workspace is also a git
+  checkout. Less urgent because the workspace is a wheat repo, but cheap to block.
+  Check every path component, not only the first.
+- `[ ]` **Decoders trust untrusted lengths (partly confirmed).**
+  - The BinSchema-generated decoders (`wheat-core` and `wheat-protocol`
+    `generated.rs`) call `Vec::with_capacity(length)` with the length read from the
+    input, before any payload bytes are read. A 4-byte `0xFFFFFFFF` asks for gigabytes.
+    Fix in the BinSchema generator: cap the reservation by the bytes left.
+  - `Codec::DeltaZstd` decode (`crates/wheat-store/src/codec.rs`, around line 311)
+    calls `zstd::bulk::decompress(patch, HARD_LOGICAL_RECORD_BYTES)`, which reserves
+    1 GiB per call; a 16-deep delta chain could ask for 16 GiB. Line seen, real memory
+    use not measured. `decode_segment_delta_patch` already uses the frame's content
+    size instead.
+  - Chunked downloads (`crates/wheat-cli/src/remote.rs`, `ContentChunk` loop) have no
+    byte cap and ignore `chunk.offset`. Publish (`crates/wheat-server/src/publish.rs`)
+    holds every uploaded blob in `content_batch` until `ContentUploadComplete`, with
+    no per-session byte limit.
+- `[ ]` **Directory symlinks get the wrong type (scanner only).**
+  `crates/wheat-cli/src/workspace_walk.rs` around line 179 tests
+  `is_symlink && is_dir` on `symlink_metadata()`, which is never true for a symlink,
+  so that branch is dead and directory symlinks are classified as files.
+- `[ ]` **File descriptors leak on error (scanner only).**
+  `cleanup_orphan_transactions` and `ensure_progress_only` in `materialization.rs`
+  `libc::dup` a descriptor and close it by hand; an early `?` skips the close. Wrap it
+  in `OwnedFd` straight away.
+- `[ ]` **Unchecked addition in delta apply (scanner only).**
+  `crates/wheat-store/src/delta.rs` around lines 172 and 190 index
+  `written..written + size` without `checked_add`, unlike the `ofs` check just above.
+- `[ ]` **Non-Unix workspace reads follow symlinks (scanner only).** The
+  `#[cfg(not(unix))]` path in `workspace_files.rs` (around line 825) checks
+  `symlink_metadata` and then `File::open`s, which races and follows symlinks. Refuse
+  non-Unix until it has a no-follow, descriptor-relative walk.
+
+Performance, most serious first:
+
+- `[ ]` **Fetch always sends the whole repository (confirmed).** `handle_fetch`
+  (`crates/wheat-server/src/fetch.rs`) calls `collect_structural_closure`
+  (`crates/wheat-store/src/closure.rs`) over all history, ignores what the client
+  already has (`since_envelope`), and holds the closure in memory before sending.
+- `[ ]` **Publish walks the whole content manifest (confirmed).** `handle_publish`
+  (`publish.rs`, around lines 208–249) walks every content ID in the proposed
+  envelope, even for a one-line change. It also asks for at most `MAX_WANT_IDS`
+  (4,096) missing blobs, once; check whether publishes needing more than that fail
+  (possible correctness bug).
+- `[ ]` **Accidental O(E²) in staged-import verification (confirmed).**
+  `verify_mapping` (`crates/wheat-git/src/staged_import.rs`, around line 700) does a
+  linear `definitions.iter().find` per replay outcome. At 100,000 edits per commit that
+  is 10¹⁰ comparisons. Index the definitions.
+- `[ ]` **About four fsyncs per file during materialization (scanner only).**
+  `execute_materialization` syncs the staged file, the install-intent progress record,
+  the parent directory and the transaction for every file. Batch the intent records
+  and directory syncs.
+- `[ ]` **About four fsyncs per object when objects go in one by one (scanner only).**
+  `apply_change_authoring` (`repository_mutation.rs`, around line 1045) and
+  `handle_publish` (around lines 150–158) call `put_if_absent` in a loop, so each
+  object is its own journaled active-segment commit. Use `put_batch`.
+- `[ ]` **wheat-server does blocking disk work on async threads (scanner only).**
+  Publication, packed-object and content stores are synchronous and called straight
+  from Tokio tasks in `connection.rs`, `publish.rs` and `fetch.rs`. Move them onto
+  `spawn_blocking` or give them async drivers.
+- `[ ]` **`wheat status` re-reads and re-hashes every file (scanner only).**
+  `workspace_scan.rs` has no saved stat cache (mtime, ctime, size, inode, content ID),
+  so every status reads all tracked files and their baselines, and fails once the
+  workspace passes `MAX_TOTAL_READ_BYTES` (1 GiB).
+- `[ ]` **Uploads go one file per message (scanner only).** `publish_to_remote`
+  (`remote.rs`, around line 950) sends each blob as its own `ContentUpload`. Add a
+  batched upload message and stream large blobs to disk on the server.
+- `[ ]` **One-by-one edit reads in import and authoring (scanner only).**
+  `staged_import.rs` (around lines 674–691, 721–729) and `workspace.rs` (around line
+  103) read edits with `reader.edit(id)` per edit and look paths up from the root one
+  at a time. Use batch reads and `lookup_many`.
+- `[ ]` **`MerkleTreeStore::apply_edits` re-reads the node it just wrote (scanner
+  only).** `merkle_tree.rs` around line 1230 decodes the child node only to check
+  whether it is empty. Return that from the recursive call instead.
+
 ## Revise/compose cost at stack depth (2026-09-25)
 
 Found with the span tracer (`WHEAT_TRACE_SUMMARY=1`, `WHEAT_TRACE=<file.json>`) on the
