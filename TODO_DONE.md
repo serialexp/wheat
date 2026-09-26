@@ -80,6 +80,20 @@ Finished items, moved here from `TODO.md` under the same headings.
   one instruction adds at most 16 MiB. Done 2026-09-26 anyway, to match the checks
   around it: both use `checked_add`. Test: `instructions_cannot_write_past_the_result`
   (nothing covered those two errors before).
+- `[x]` **Accidental O(E²) in staged-import verification (confirmed).**
+  `verify_mapping` (`crates/wheat-git/src/staged_import.rs`) found each replay
+  outcome's edit with a linear search, and also looked every touched path up from the
+  root one at a time, decoding a wide directory again for each file in it. Profiling
+  showed the lookups were the bigger half. Done 2026-09-26: a binary search over the
+  sorted edits, and one shared `path_shapes` walk per tree. Benchmark:
+  `import_resume_wide` (resume after a 100,000-file commit: 20.8 s → 2.2 s, budget
+  6 s). Tests: `resuming_one_commit_at_a_time_accepts_every_valid_mapping` and
+  `resuming_after_a_tampered_mapping_is_refused` in
+  `crates/wheat-git/tests/import_modes.rs` (nothing checked the resume either way
+  before). The first test found a real bug: a Git commit that turns a directory into
+  a file could not be imported at all. The result checks in `verify_mapping` and in
+  `RepositoryVerifier::replay` (`repository_verify.rs`) looked up the deleted paths
+  below the new file and failed with `FileInPath`; such a path is now read as absent.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 

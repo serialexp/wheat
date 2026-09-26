@@ -1,0 +1,21 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20260926-041325
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# import_resume_wide	{"files":100000}
+# release	true
+# rev	cb4c30161d16
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+import_resume_wide.total.wall	13.137021425	s
+import_resume_wide.total.peak_rss	316444672	bytes
+import_resume_wide.git_fixture.wall	4.167477935	s
+import_resume_wide.stage_wide.wall	5.505885671	s
+import_resume_wide.resume.wall	2.226120772	s
+run.total_time	13.137299689	s
+process.peak_rss	316444672	bytes
+suite.cases	1	count
+suite.case_failures	0	count

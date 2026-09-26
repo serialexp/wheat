@@ -818,10 +818,15 @@ where
             limits,
         )
         .map_err(|_| invalid("edit replay failed"))?;
-        // `touched` is sorted, so one traversal checks every claimed value.
+        // `touched` is sorted, so one traversal checks every claimed value. A touched
+        // path below a file in the result is absent: its directory became a file.
         let paths = touched.iter().map(String::as_str).collect::<Vec<_>>();
-        let claimed = trees.lookup_many(result_root, &paths).await?;
-        for (path, claimed) in paths.into_iter().zip(claimed) {
+        let claimed = trees.path_shapes(result_root, &paths).await?;
+        for (path, shape) in paths.into_iter().zip(claimed) {
+            let claimed = match shape {
+                crate::merkle_tree::TreePathShape::File(value) => Some(value),
+                _ => None,
+            };
             if claimed != replay.tree.get(path).copied() {
                 return Err(invalid("claimed result differs from semantic replay"));
             }

@@ -1,7 +1,7 @@
 //! Resumable import into immutable storage. This module deliberately does not publish a repository head.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
 };
 
@@ -16,7 +16,7 @@ use wheat_core::{
 use wheat_store::{
     ApplicationMapStore, CommitWriterError, ConflictSetStore, ContentSetStore, ContentStore,
     ContentStoreError, ImmutableObjectStore, MerkleTreeStore, PersistedCommitWriter,
-    RepositoryReader, RevisionMapStore,
+    RepositoryReader, RevisionMapStore, TreePathShape,
 };
 
 use crate::{
@@ -669,25 +669,34 @@ async fn verify_mapping<O: ImmutableObjectStore>(
         .await
         .map_err(|e| bad(&e.to_string()))?;
     let trees = MerkleTreeStore::new(objects);
-    let mut target = Tree::new();
     let mut definitions = Vec::with_capacity(revision.edits.len());
     for id in &revision.edits {
         let edit = reader.edit(*id).await.map_err(|e| bad(&e.to_string()))?;
         if edit.id() != *id {
             return Err(bad("edit identity"));
         }
-        let components = edit.path.split('/').map(str::to_owned).collect::<Vec<_>>();
-        let value = match trees.lookup(parent.tree, &components).await {
-            Ok(value) => value,
-            // A file at an ancestor means this exact touched path is absent, matching the
-            // staged writer's file-to-directory transition semantics.
-            Err(wheat_store::MerkleTreeError::FileInPath(_)) => None,
-            Err(error) => return Err(bad(&error.to_string())),
-        };
-        if let Some(value) = value {
-            target.insert(edit.path.clone(), value);
-        }
         definitions.push((*id, edit));
+    }
+    // Both trees are read with one shared walk over the sorted touched paths, which
+    // decodes each directory once. A lookup per edit decoded a wide directory again for
+    // every edit below it.
+    let paths = definitions
+        .iter()
+        .map(|(_, edit)| edit.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut target = Tree::new();
+    let before = trees
+        .path_shapes(parent.tree, &paths)
+        .await
+        .map_err(|e| bad(&e.to_string()))?;
+    for (path, shape) in paths.iter().zip(before) {
+        // A file at an ancestor means this exact touched path is absent, matching the
+        // staged writer's file-to-directory transition semantics.
+        if let TreePathShape::File(value) = shape {
+            target.insert((*path).to_owned(), value);
+        }
     }
     let replay = apply_edits(
         &target,
@@ -698,10 +707,10 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     .map_err(|_| bad("edit replay"))?;
     let mut evidence = BTreeMap::new();
     for (id, outcome) in &replay.outcomes {
+        // `definitions` follows `revision.edits`, a `BTreeSet`, so it is sorted by ID.
         let edit = definitions
-            .iter()
-            .find(|(candidate, _)| candidate == id)
-            .map(|(_, edit)| edit)
+            .binary_search_by(|(candidate, _)| candidate.cmp(id))
+            .map(|index| &definitions[index].1)
             .expect("replay reports selected edit");
         let ApplicationOutcome::Applied { read, write } = outcome else {
             return Err(bad("replayed edit did not apply cleanly"));
@@ -718,14 +727,18 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     if evidence != application.applied {
         return Err(bad("application evidence differs from replay"));
     }
-    for (_, edit) in &definitions {
-        let components = edit.path.split('/').map(str::to_owned).collect::<Vec<_>>();
-        if trees
-            .lookup(tree, &components)
-            .await
-            .map_err(|e| bad(&e.to_string()))?
-            != replay.tree.get(&edit.path).copied()
-        {
+    let after = trees
+        .path_shapes(tree, &paths)
+        .await
+        .map_err(|e| bad(&e.to_string()))?;
+    for (path, shape) in paths.iter().zip(after) {
+        // Likewise a touched path below a file in the result is absent: its directory
+        // became a file.
+        let value = match shape {
+            TreePathShape::File(value) => Some(value),
+            _ => None,
+        };
+        if value != replay.tree.get(*path).copied() {
             return Err(bad("resulting tree differs from replay"));
         }
     }

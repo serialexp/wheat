@@ -27,10 +27,6 @@ Performance, most serious first:
   envelope, even for a one-line change. It also asks for at most `MAX_WANT_IDS`
   (4,096) missing blobs, once; check whether publishes needing more than that fail
   (possible correctness bug).
-- `[ ]` **Accidental O(E²) in staged-import verification (confirmed).**
-  `verify_mapping` (`crates/wheat-git/src/staged_import.rs`, around line 700) does a
-  linear `definitions.iter().find` per replay outcome. At 100,000 edits per commit that
-  is 10¹⁰ comparisons. Index the definitions.
 - `[ ]` **About four fsyncs per file during materialization (scanner only).**
   `execute_materialization` syncs the staged file, the install-intent progress record,
   the parent directory and the transaction for every file. Batch the intent records
@@ -51,9 +47,9 @@ Performance, most serious first:
   (`remote.rs`, around line 950) sends each blob as its own `ContentUpload`. Add a
   batched upload message and stream large blobs to disk on the server.
 - `[ ]` **One-by-one edit reads in import and authoring (scanner only).**
-  `staged_import.rs` (around lines 674–691, 721–729) and `workspace.rs` (around line
-  103) read edits with `reader.edit(id)` per edit and look paths up from the root one
-  at a time. Use batch reads and `lookup_many`.
+  `staged_import.rs` (`verify_mapping`) and `workspace.rs` (around line 103) read
+  edits with `reader.edit(id)` per edit. Use batch reads. (The per-path lookups in
+  `verify_mapping` share one walk since 2026-09-26; check `workspace.rs`.)
 - `[ ]` **`MerkleTreeStore::apply_edits` re-reads the node it just wrote (scanner
   only).** `merkle_tree.rs` around line 1230 decodes the child node only to check
   whether it is empty. Return that from the recursive call instead.
@@ -119,6 +115,15 @@ budget passes, but by only about 0.7 s.
   `wheat-local-cli.md`'s release gate refers to
   `~/.claude/projects/-home-bart-Projects-gothab/memory/feedback_no_format_version_bumps.md`;
   agents working in this repo don't load it (the rule is in `CLAUDE.md` here anyway).
+- `[ ]` **Other `lookup_many` callers may fail when a directory became a file
+  (2026-09-26).** `MerkleTreeStore::lookup_many` (and `lookup`) return `FileInPath`
+  for a path below a file. Import verification hit this for paths deleted when a
+  directory turned into a file (fixed there by reading such a path as absent). Other
+  callers compare before and after trees the same way and may fail the same way:
+  `repository_mutation.rs` (around lines 317, 884, 1028), `provenance.rs` (around
+  lines 173, 223) and `workspace.rs` in wheat-cli (around lines 130, 391). Check each
+  with a directory → file change, then either fix them one by one or make
+  `lookup_many` itself read such paths as absent.
 - `[ ]` **A content fetch can hang the client (2026-09-26).** `handle_content_fetch`
   (`crates/wheat-server/src/fetch.rs`) only logs (`debug!`) a requested blob it cannot
   read and sends nothing for it; its second fallback path (after a non-`TooLarge`

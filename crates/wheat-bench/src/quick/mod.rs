@@ -17,6 +17,7 @@ mod content_repack_plan;
 mod deep_stack;
 mod git_export_notes;
 mod history;
+mod import_resume_wide;
 mod packed_append;
 mod publish_content;
 mod sharded_manifest;
@@ -53,6 +54,7 @@ pub const CASES: &[&str] = &[
     git_export_notes::NAME,
     checkpoint_stack::NAME,
     publish_content::NAME,
+    import_resume_wide::NAME,
 ];
 
 /// How big the cases are.
@@ -191,6 +193,7 @@ pub fn run_case(
         git_export_notes::NAME => git_export_notes::run(&context),
         checkpoint_stack::NAME => checkpoint_stack::run(&context),
         publish_content::NAME => publish_content::run(&context),
+        import_resume_wide::NAME => import_resume_wide::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

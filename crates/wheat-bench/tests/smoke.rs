@@ -61,6 +61,7 @@ fn every_quick_case_runs_at_smoke_size() {
         "sharded_manifest.index_and_one_shard.wall",
         "publish_content.publish_server.peak_rss",
         "publish_content.clone.peak_rss",
+        "import_resume_wide.resume.wall",
     ];
     let totals = CASES
         .iter()

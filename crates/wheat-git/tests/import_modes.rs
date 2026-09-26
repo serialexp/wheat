@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use wheat_git::{AtomicImportError, atomic_import, finalize_import, stage_import};
+use wheat_git::{
+    AtomicImportError, StagedImportError, atomic_import, finalize_import, stage_import,
+};
 use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
 
 fn git(root: &Path, args: &[&str]) -> String {
@@ -80,6 +82,136 @@ fn oversized_binary_fixture() -> tempfile::TempDir {
     git(root.path(), &["add", "too-large.bin"]);
     git(root.path(), &["commit", "-m", "oversized binary"]);
     root
+}
+
+/// A history that edits files in nested directories, deletes one, turns a file into a
+/// directory, a directory into a file, and back.
+fn reshaping_fixture() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    let write = |path: &str, text: &str| {
+        let path = r.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    git(r, &["init", "-b", "main"]);
+    write("a/b/c.txt", "c\n");
+    write("a/d.txt", "d\n");
+    write("x", "x is a file\n");
+    write("top.txt", "top\n");
+    git(r, &["add", "-A"]);
+    git(r, &["commit", "-m", "root"]);
+
+    std::fs::remove_file(r.join("x")).unwrap();
+    write("x/y.txt", "x is a directory\n");
+    write("a/d.txt", "d, changed\n");
+    std::fs::remove_file(r.join("top.txt")).unwrap();
+    git(r, &["add", "-A"]);
+    git(r, &["commit", "-m", "x becomes a directory"]);
+
+    std::fs::remove_dir_all(r.join("a/b")).unwrap();
+    write("a/b", "a/b is a file\n");
+    write("x/y.txt", "x is still a directory\n");
+    git(r, &["add", "-A"]);
+    git(r, &["commit", "-m", "a/b becomes a file"]);
+
+    std::fs::remove_dir_all(r.join("x")).unwrap();
+    write("x", "x is a file again\n");
+    git(r, &["add", "-A"]);
+    git(r, &["commit", "-m", "x becomes a file again"]);
+    root
+}
+
+fn oid_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+        .collect()
+}
+
+/// Staging one commit per call makes every call re-check the mapping of the commit
+/// before it: its edits are replayed and every touched path is looked up in both
+/// trees. Valid mappings must pass, and the result must match an atomic import.
+#[tokio::test]
+async fn resuming_one_commit_at_a_time_accepts_every_valid_mapping() {
+    let history = reshaping_fixture();
+    let root = tempfile::tempdir().unwrap();
+    let atomic_head = atomic_import(
+        history.path(),
+        &root.path().join("atomic"),
+        "refs/heads/main",
+    )
+    .await
+    .unwrap();
+
+    let resumable = root.path().join("resumable");
+    std::fs::create_dir(&resumable).unwrap();
+    let objects = PackedObjectStore::open(resumable.join("storage")).unwrap();
+    let content = objects.content_store();
+    let journal = resumable.join("import.sqlite");
+    let mut calls = 0;
+    loop {
+        let progress = stage_import(history.path(), &journal, &objects, &content, Some(1))
+            .await
+            .unwrap();
+        calls += 1;
+        if progress.complete {
+            break;
+        }
+        assert!(calls < 16, "staging made no progress");
+    }
+    assert!(calls >= 4, "each of the four commits needs its own call");
+    let head = finalize_import(
+        history.path(),
+        &journal,
+        &objects,
+        &content,
+        &LocalPublicationStore::new(resumable.join("repository.head")),
+        "refs/heads/main",
+    )
+    .await
+    .unwrap();
+    assert_eq!(head, atomic_head);
+}
+
+/// The re-check is what makes resuming safe: a completed mapping pointed at the
+/// wrong view is refused, not built upon.
+#[tokio::test]
+async fn resuming_after_a_tampered_mapping_is_refused() {
+    let history = reshaping_fixture();
+    let root = tempfile::tempdir().unwrap();
+    let objects = PackedObjectStore::open(root.path().join("storage")).unwrap();
+    let content = objects.content_store();
+    let journal = root.path().join("import.sqlite");
+    let mut calls = 0;
+    loop {
+        let progress = stage_import(history.path(), &journal, &objects, &content, Some(1))
+            .await
+            .unwrap();
+        if progress.completed_commits >= 2 {
+            break;
+        }
+        calls += 1;
+        assert!(calls < 16, "staging made no progress");
+    }
+
+    let first = oid_bytes(&git(history.path(), &["rev-parse", "HEAD~3"]));
+    let second = oid_bytes(&git(history.path(), &["rev-parse", "HEAD~2"]));
+    let connection = rusqlite::Connection::open(&journal).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE work SET view_id = (SELECT view_id FROM work WHERE oid = ?1) WHERE oid = ?2",
+            [&first, &second],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(connection);
+
+    let result = stage_import(history.path(), &journal, &objects, &content, Some(1)).await;
+    assert!(
+        matches!(result, Err(StagedImportError::InvalidMapping(..))),
+        "{result:?}"
+    );
 }
 
 fn private_stage(root: &Path, destination: &str, id: &str) -> PathBuf {
