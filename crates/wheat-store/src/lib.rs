@@ -70,6 +70,10 @@ pub use snapshot::{
     SnapshotId, SnapshotLimits, SnapshotManifest, SnapshotSink, SnapshotSource, export_snapshot,
     export_snapshot_to, restore_snapshot, restore_snapshot_from,
 };
+mod structural_delta;
+pub use structural_delta::{
+    DeltaStep, StructuralDelta, StructuralDeltaError, StructuralDeltaLimits, StructuralDeltaStats,
+};
 mod view_lineage;
 
 pub use application_map::{

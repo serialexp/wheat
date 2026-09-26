@@ -91,7 +91,7 @@ impl From<radix::Error> for ViewLineageError {
     }
 }
 
-struct ViewLineageCollection;
+pub(crate) struct ViewLineageCollection;
 impl radix::Key for ViewId {
     const LEN: usize = 32;
 

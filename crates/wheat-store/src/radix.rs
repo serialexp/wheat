@@ -57,6 +57,44 @@ pub(crate) struct Node<I, V> {
     pub entries: Vec<(Vec<u8>, V)>,
 }
 
+/// Checks a node's shape at key byte `position`, for keys of `key_len` bytes: the
+/// prefix stays within the key, children and inline entries end exactly at full
+/// depth, a value only sits on a terminal node at full depth, and an interior node
+/// branches at least twice (only an empty root may be bare).
+pub(crate) fn validate_node_at<I, V>(
+    node: &Node<I, V>,
+    position: usize,
+    key_len: usize,
+) -> Result<(), Error> {
+    let end = position
+        .checked_add(node.prefix.len())
+        .ok_or(Error::InvalidChildDepth)?;
+    if end > key_len {
+        return Err(Error::InvalidChildDepth);
+    }
+    // A child consumes one edge byte; an inline entry holds the rest of its key.
+    if (end == key_len && !(node.children.is_empty() && node.entries.is_empty()))
+        || node
+            .entries
+            .iter()
+            .any(|(suffix, _)| suffix.len() != key_len - end)
+    {
+        return Err(Error::InvalidChildDepth);
+    }
+    let total_branches = node.children.len() + node.entries.len();
+    if node.value.is_some() {
+        // Terminal: at full key depth, no children or entries.
+        if end != key_len || total_branches != 0 {
+            return Err(Error::InvalidTerminalNode);
+        }
+    } else if total_branches == 1
+        || (total_branches == 0 && !(position == 0 && node.prefix.is_empty()))
+    {
+        return Err(Error::InvalidTerminalNode);
+    }
+    Ok(())
+}
+
 pub(crate) trait Collection: Send + Sync {
     type Id: Copy + Eq + Into<ObjectId> + Send + Sync;
     type Key: Key;
@@ -298,24 +336,7 @@ where
     }
 
     fn validate_at(&self, node: &Node<C::Id, C::Value>, position: usize) -> Result<(), Error> {
-        let end = position
-            .checked_add(node.prefix.len())
-            .ok_or(Error::InvalidChildDepth)?;
-        if end > C::Key::LEN {
-            return Err(Error::InvalidChildDepth);
-        }
-        let total_branches = node.children.len() + node.entries.len();
-        if node.value.is_some() {
-            // Terminal: at full key depth, no children or entries.
-            if end != C::Key::LEN || total_branches != 0 {
-                return Err(Error::InvalidTerminalNode);
-            }
-        } else if total_branches == 1
-            || (total_branches == 0 && !(position == 0 && node.prefix.is_empty()))
-        {
-            return Err(Error::InvalidTerminalNode);
-        }
-        Ok(())
+        validate_node_at(node, position, C::Key::LEN)
     }
 
     async fn root(&self, id: C::Id) -> Result<Node<C::Id, C::Value>, Error> {
@@ -2230,5 +2251,53 @@ mod paired_context_tests {
             walk.next().await,
             Err(DiffError::PendingLimitExceeded { limit: 1 })
         ) {}
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    fn node(prefix: usize, children: usize, entries: &[usize]) -> Node<u8, ()> {
+        Node {
+            prefix: vec![0; prefix],
+            value: None,
+            children: (0..children).map(|edge| (edge as u8, 0)).collect(),
+            entries: entries
+                .iter()
+                .enumerate()
+                .map(|(index, len)| {
+                    let mut suffix = vec![0; *len];
+                    if let Some(first) = suffix.first_mut() {
+                        *first = 100 + index as u8;
+                    }
+                    (suffix, ())
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn entries_must_hold_exactly_the_rest_of_the_key() {
+        assert!(validate_node_at(&node(2, 0, &[6, 6]), 0, 8).is_ok());
+        assert!(validate_node_at(&node(2, 1, &[5]), 1, 8).is_ok());
+        for bad in [&[6, 5][..], &[6, 7], &[0, 6]] {
+            assert!(matches!(
+                validate_node_at(&node(2, 0, bad), 0, 8),
+                Err(Error::InvalidChildDepth)
+            ));
+        }
+    }
+
+    #[test]
+    fn nothing_branches_below_full_depth() {
+        assert!(matches!(
+            validate_node_at(&node(8, 2, &[]), 0, 8),
+            Err(Error::InvalidChildDepth)
+        ));
+        assert!(matches!(
+            validate_node_at(&node(7, 1, &[0]), 1, 8),
+            Err(Error::InvalidChildDepth)
+        ));
     }
 }

@@ -89,7 +89,7 @@ impl Default for ChangeMapDeltaLimits {
     }
 }
 
-struct ChangeCollection;
+pub(crate) struct ChangeCollection;
 impl radix::Collection for ChangeCollection {
     type Id = ChangeMapId;
     type Key = ChangeId;
