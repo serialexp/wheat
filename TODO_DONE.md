@@ -145,6 +145,10 @@ Finished items, moved here from `TODO.md` under the same headings.
 - `[x]` **Stale `#[allow(dead_code)]` markers in `workspace_walk.rs`.** Done
   2026-09-26: removed. The one field they hid that nothing read,
   `gitignore_fallback_paths`, is gone too; the ignore stack still has the paths.
+- `[x]` **`extract_object_references` is incomplete and no longer used.** Done
+  2026-09-26: deleted from `crates/wheat-core/src/wire.rs`, with its two tests and
+  its re-export. It missed several references, and nothing but its own tests called
+  it after publish moved to `StructuralDelta`.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 

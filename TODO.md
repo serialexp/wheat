@@ -140,17 +140,6 @@ budget passes, but by only about 0.7 s.
   benchmark: one change pushes 6 KiB after 10 changes but 44 KiB after 200. Send
   such objects as deltas against their aligned old counterpart, which the client
   has. Then add a bytes budget to `fetch_incremental`.
-- `[ ]` **`extract_object_references` is incomplete and no longer used
-  (2026-09-26).** `crates/wheat-core/src/wire.rs` misses several references
-  (retained-set and conflict-set keys, predecessor and transition references,
-  `applied[].edit`), and its doc comment says wheat-server uses it for publish, which
-  is no longer true. Only its own tests call it now. Delete it, or fix it to follow
-  the same references as `StructuralDelta` (`crates/wheat-store/src/structural_delta.rs`).
-- `[ ]` **Server stores published to before 2026-09-26 may lack objects.** The old
-  publish could move the head with objects missing (it rediscovered after every
-  batch, dropped its frontier past 4,096 IDs, and never checked completeness).
-  Run `wheat --store <server store> validate` on existing server stores; a store
-  that fails needs its missing objects published again.
 - `[ ]` **A content fetch can hang the client (2026-09-26).** `handle_content_fetch`
   (`crates/wheat-server/src/fetch.rs`) only logs (`debug!`) a requested blob it cannot
   read and sends nothing for it; its second fallback path (after a non-`TooLarge`

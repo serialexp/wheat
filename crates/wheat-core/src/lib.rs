@@ -93,6 +93,6 @@ pub use wire::{
     decode_conflict_set_node, decode_content_manifest_record, decode_content_set_blob,
     decode_directory_node, decode_repository_envelope_record, decode_repository_state_record,
     decode_retained_set_node, decode_revision_map_node, decode_view_label_manifest_record,
-    decode_view_lineage_map_node, decode_view_record, extract_object_references,
-    validate_canonical_object, validate_directory_component,
+    decode_view_lineage_map_node, decode_view_record, validate_canonical_object,
+    validate_directory_component,
 };
