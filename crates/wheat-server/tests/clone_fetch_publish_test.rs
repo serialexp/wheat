@@ -508,8 +508,28 @@ async fn clone_round_trip() {
     let _ = shutdown.send(());
 }
 
-#[tokio::test]
-async fn publish_round_trip() {
+/// The op id of every publish in these tests.
+const PUBLISH_OP: u32 = 3;
+
+/// A publish driven up to its content phase: the server's `ContentNeeded`
+/// has arrived and nothing has been uploaded yet.
+struct ContentPhase {
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// The content the server asked for.
+    needed: Vec<Digest256>,
+    /// The publishing clone's content store.
+    content: ContentStore,
+    /// The server's generation before the publish.
+    generation: u64,
+    addr: SocketAddr,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    _server_dir: tempfile::TempDir,
+    _clone_dir: tempfile::TempDir,
+}
+
+/// Start a server, clone it, add `farewell.txt` holding `farewell` as a new
+/// change, and publish it until the server asks for content.
+async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
     // Set up server with an initial repo.
     let server_dir = tempfile::tempdir().unwrap();
     let _repo = setup_repo(server_dir.path()).await;
@@ -538,7 +558,7 @@ async fn publish_round_trip() {
     clone_heads.initialize(head).unwrap();
 
     // Create a change locally using the mutator (same as wheat-cli does).
-    clone_content.put(b"goodbye wheat").unwrap();
+    clone_content.put(farewell).unwrap();
 
     let reader = RepositoryReader::new(&clone_objects, &clone_content);
     let envelope_rec = reader.envelope(env_id).await.unwrap();
@@ -583,7 +603,7 @@ async fn publish_round_trip() {
             },
             provenance: None,
         },
-        edits: edit("farewell.txt", b"goodbye wheat"),
+        edits: edit("farewell.txt", farewell),
     };
 
     let objects_batch = BatchObjectStore::new(&clone_objects, 1024, 8 * 1024 * 1024);
@@ -674,69 +694,152 @@ async fn publish_round_trip() {
     }
 
     // Content phase.
-    let msg = recv_msg(&mut ws).await;
-    match msg {
+    let needed = match recv_msg(&mut ws).await {
         WheatProtocolMessage::ContentNeeded(cn) => {
-            assert_eq!(cn.op_id, 3);
-            for digest in &cn.content_ids {
-                let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
-                let data = clone_content.get(id).unwrap();
-                send_msg(
-                    &mut ws,
-                    &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                        message_type: 0x44,
-                        op_id: 3,
-                        content_id: digest.clone(),
-                        data,
-                    }),
-                )
-                .await;
-            }
-            send_msg(
-                &mut ws,
-                &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
-                    message_type: 0x46,
-                    op_id: 3,
-                }),
-            )
-            .await;
+            assert_eq!(cn.op_id, PUBLISH_OP);
+            cn.content_ids
         }
         other => panic!("expected ContentNeeded, got {other:?}"),
+    };
+    ContentPhase {
+        ws,
+        needed,
+        content: clone_content,
+        generation,
+        addr,
+        shutdown,
+        _server_dir: server_dir,
+        _clone_dir: clone_dir,
     }
+}
 
-    // Commit.
+async fn upload_whole(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    digest: &Digest256,
+    data: Vec<u8>,
+) {
     send_msg(
-        &mut ws,
-        &WheatProtocolMessage::PublishCommit(PublishCommitOutput {
-            message_type: 0x47,
-            op_id: 3,
+        ws,
+        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
+            message_type: 0x44,
+            op_id: PUBLISH_OP,
+            content_id: digest.clone(),
+            data,
         }),
     )
     .await;
+}
 
-    // Wait for result.
+async fn upload_chunk(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    digest: &Digest256,
+    offset: u64,
+    data: &[u8],
+    is_final: bool,
+) {
+    send_msg(
+        ws,
+        &WheatProtocolMessage::ContentUploadChunk(ContentUploadChunkOutput {
+            message_type: 0x45,
+            op_id: PUBLISH_OP,
+            content_id: digest.clone(),
+            offset,
+            data: data.to_vec(),
+            is_final,
+        }),
+    )
+    .await;
+}
+
+async fn upload_complete(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    send_msg(
+        ws,
+        &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
+            message_type: 0x46,
+            op_id: PUBLISH_OP,
+        }),
+    )
+    .await;
+}
+
+/// Ask the server to commit and return its answer.
+async fn commit_publish(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+) -> PublishResultOutput {
+    send_msg(
+        ws,
+        &WheatProtocolMessage::PublishCommit(PublishCommitOutput {
+            message_type: 0x47,
+            op_id: PUBLISH_OP,
+        }),
+    )
+    .await;
     loop {
-        let msg = recv_msg(&mut ws).await;
-        match msg {
+        match recv_msg(ws).await {
             WheatProtocolMessage::PublishProgress(_) => continue,
             WheatProtocolMessage::PublishResult(pr) => {
-                assert_eq!(pr.op_id, 3);
-                assert!(
-                    matches!(pr.status, PublishResultStatus::PublishStatusOk(_)),
-                    "publish should succeed, got: {:?}, message: {}",
-                    pr.status,
-                    pr.message,
-                );
-                assert!(pr.new_generation > generation, "generation should advance");
-                break;
+                assert_eq!(pr.op_id, PUBLISH_OP);
+                return pr;
             }
             other => panic!("expected PublishResult, got {other:?}"),
         }
     }
+}
+
+fn assert_published(pr: &PublishResultOutput, generation: u64) {
+    assert!(
+        matches!(pr.status, PublishResultStatus::PublishStatusOk(_)),
+        "publish should succeed, got: {:?}, message: {}",
+        pr.status,
+        pr.message,
+    );
+    assert!(pr.new_generation > generation, "generation should advance");
+}
+
+/// The server refuses the upload as soon as it breaks a rule, without waiting
+/// for a commit, and its head stays where it was.
+async fn assert_upload_refused(phase: &mut ContentPhase, reason: &str) {
+    let pr = match recv_msg(&mut phase.ws).await {
+        WheatProtocolMessage::PublishResult(pr) => pr,
+        other => panic!("expected PublishResult, got {other:?}"),
+    };
+    assert_eq!(pr.op_id, PUBLISH_OP);
+    assert!(
+        matches!(pr.status, PublishResultStatus::PublishStatusRejected(_)),
+        "upload should be refused, got: {:?}, message: {}",
+        pr.status,
+        pr.message,
+    );
+    assert!(
+        pr.message.contains(reason),
+        "refusal {:?} should mention {reason:?}",
+        pr.message
+    );
+    assert_eq!(pr.new_generation, phase.generation);
+
+    let mut ws = connect_and_handshake(phase.addr).await;
+    let (server_gen, _) = open_repo(&mut ws, "test/repo").await;
+    assert_eq!(server_gen, phase.generation, "head must not move");
+    ws.close(None).await.ok();
+}
+
+#[tokio::test]
+async fn publish_round_trip() {
+    let mut phase = publish_to_content_phase(b"goodbye wheat").await;
+    let ws = &mut phase.ws;
+    for digest in &phase.needed {
+        let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
+        let data = phase.content.get(id).unwrap();
+        upload_whole(ws, digest, data).await;
+    }
+    upload_complete(ws).await;
+    let pr = commit_publish(ws).await;
+    let generation = phase.generation;
+    assert_published(&pr, generation);
 
     // Verify: reconnect and check the server's head advanced.
-    ws.close(None).await.ok();
-    let mut ws = connect_and_handshake(addr).await;
+    phase.ws.close(None).await.ok();
+    let mut ws = connect_and_handshake(phase.addr).await;
     let (new_server_gen, _new_server_env) = open_repo(&mut ws, "test/repo").await;
     assert!(
         new_server_gen > generation,
@@ -744,7 +847,97 @@ async fn publish_round_trip() {
     );
 
     ws.close(None).await.ok();
-    let _ = shutdown.send(());
+    let _ = phase.shutdown.send(());
+}
+
+#[tokio::test]
+async fn publish_reassembles_chunked_content() {
+    let farewell = b"goodbye wheat, in three pieces";
+    let mut phase = publish_to_content_phase(farewell).await;
+    let digest = Digest256 {
+        bytes: ContentId::of(farewell).as_bytes().to_vec(),
+    };
+    assert_eq!(phase.needed, vec![digest.clone()]);
+
+    let ws = &mut phase.ws;
+    upload_chunk(ws, &digest, 0, &farewell[..7], false).await;
+    upload_chunk(ws, &digest, 7, &farewell[7..20], false).await;
+    upload_chunk(ws, &digest, 20, &farewell[20..], true).await;
+    upload_complete(ws).await;
+    let pr = commit_publish(ws).await;
+    assert_published(&pr, phase.generation);
+
+    // A fresh clone gets the reassembled bytes back.
+    let clone_dir = tempfile::tempdir().unwrap();
+    let (clone_objects, clone_content, _) = stores(clone_dir.path());
+    let mut ws = connect_and_handshake(phase.addr).await;
+    let (_, envelope) = open_repo(&mut ws, "test/repo").await;
+    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
+        envelope.bytes.as_slice().try_into().unwrap(),
+    );
+    client_fetch_objects(&mut ws, 1, &clone_objects, &clone_content, env_id).await;
+    client_fetch_content(&mut ws, 2, &clone_objects, &clone_content, &envelope).await;
+    assert_eq!(
+        clone_content.get(ContentId::of(farewell)).unwrap(),
+        farewell
+    );
+    ws.close(None).await.ok();
+    let _ = phase.shutdown.send(());
+}
+
+#[tokio::test]
+async fn publish_refuses_content_it_did_not_ask_for() {
+    let mut phase = publish_to_content_phase(b"goodbye wheat").await;
+    let stray = b"not requested".to_vec();
+    let digest = Digest256 {
+        bytes: ContentId::of(&stray).as_bytes().to_vec(),
+    };
+    upload_whole(&mut phase.ws, &digest, stray).await;
+    assert_upload_refused(&mut phase, "was not requested").await;
+}
+
+#[tokio::test]
+async fn publish_refuses_content_sent_twice() {
+    let mut phase = publish_to_content_phase(b"goodbye wheat").await;
+    let digest = phase.needed[0].clone();
+    upload_whole(&mut phase.ws, &digest, b"goodbye wheat".to_vec()).await;
+    upload_chunk(&mut phase.ws, &digest, 0, b"goodbye wheat", true).await;
+    assert_upload_refused(&mut phase, "was not requested").await;
+}
+
+#[tokio::test]
+async fn publish_refuses_a_chunk_that_skips_ahead() {
+    let farewell = b"goodbye wheat";
+    let mut phase = publish_to_content_phase(farewell).await;
+    let digest = phase.needed[0].clone();
+    upload_chunk(&mut phase.ws, &digest, 0, &farewell[..4], false).await;
+    upload_chunk(&mut phase.ws, &digest, 5, &farewell[5..], true).await;
+    assert_upload_refused(&mut phase, "offset 5, expected 4").await;
+}
+
+#[tokio::test]
+async fn publish_refuses_an_upload_missing_content() {
+    let mut phase = publish_to_content_phase(b"goodbye wheat").await;
+    upload_complete(&mut phase.ws).await;
+    assert_upload_refused(&mut phase, "were not sent").await;
+}
+
+#[tokio::test]
+async fn publish_refuses_an_unfinished_chunked_upload() {
+    let farewell = b"goodbye wheat";
+    let mut phase = publish_to_content_phase(farewell).await;
+    let digest = phase.needed[0].clone();
+    upload_chunk(&mut phase.ws, &digest, 0, &farewell[..4], false).await;
+    upload_complete(&mut phase.ws).await;
+    assert_upload_refused(&mut phase, "ended before its final chunk").await;
+}
+
+#[tokio::test]
+async fn publish_refuses_content_that_does_not_match_its_id() {
+    let mut phase = publish_to_content_phase(b"goodbye wheat").await;
+    let digest = phase.needed[0].clone();
+    upload_whole(&mut phase.ws, &digest, b"something else".to_vec()).await;
+    assert_upload_refused(&mut phase, "identity mismatch").await;
 }
 
 #[tokio::test]

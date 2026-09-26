@@ -4025,6 +4025,7 @@ dependencies = [
  "tokio",
  "wheat-core",
  "wheat-git",
+ "wheat-server",
  "wheat-store",
 ]
 

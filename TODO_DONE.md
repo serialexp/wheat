@@ -38,8 +38,7 @@ Finished items, moved here from `TODO.md` under the same headings.
   `f48a34a` while the committed output came from `b99d34b` (a later commit on
   `main`); it now names the revision that produced the output. Tests:
   `crates/wheat-core/tests/forged_lengths.rs`,
-  `crates/wheat-protocol/tests/forged_lengths.rs`. Chunk limits are still open
-  under the same heading in `TODO.md`.
+  `crates/wheat-protocol/tests/forged_lengths.rs`.
 - `[x]` **`DeltaZstd` decode reserved 1 GiB per patch (confirmed).**
   `zstd::bulk::decompress(patch, HARD_LOGICAL_RECORD_BYTES)` reserves the whole
   capacity up front, so a 16-deep delta chain could ask for 16 GiB. Done 2026-09-26:
@@ -48,6 +47,21 @@ Finished items, moved here from `TODO.md` under the same headings.
   that. The writer already kept patches shorter than their target; it now refuses a
   longer one too. Test: `delta_patches_are_bounded_by_their_target_before_decompressing`
   in `crates/wheat-store/src/codec.rs`.
+- `[x]` **Content transfers had no limits (confirmed).** The client's `ContentChunk`
+  loop ignored `offset`, had no size cap and took content it never asked for; publish
+  held every uploaded blob until `ContentUploadComplete`, took any ID, dropped
+  multi-chunk uploads with a warning, and the client could not publish a blob over one
+  16 MiB message. Done 2026-09-26: both ends receive through
+  `wheat_protocol::ContentReceiver` (requested IDs only, each once, contiguous chunks,
+  at most `MAX_CONTENT_SIZE` = 1 GiB, nothing missing at the end); the server stores
+  uploads in batches of up to 64 MiB as they arrive and refuses a broken upload with a
+  rejected `PublishResult`; the client sends blobs over 4 MiB as
+  `ContentUploadChunk`s. Tests: `content_receiver` unit tests,
+  `publish_reassembles_chunked_content` and six `publish_refuses_*` tests in
+  `crates/wheat-server/tests/clone_fetch_publish_test.rs`,
+  `crates/wheat-cli/tests/remote_large_content.rs` (a 17 MiB file through `publish`
+  and `clone`). Benchmark: `publish_content` (server peak 210 MiB for a 384 MiB
+  publish, flat at twice the size; budget 256 MiB).
 
 ## Revise/compose cost at stack depth (2026-09-25)
 

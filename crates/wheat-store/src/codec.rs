@@ -7,7 +7,9 @@ use wheat_core::ContentId;
 
 pub(crate) const RAW_THRESHOLD: usize = 1024;
 pub(crate) const ZSTD_LEVEL: i32 = 3;
-pub(crate) const HARD_LOGICAL_RECORD_BYTES: usize = 1024 * 1024 * 1024;
+/// The largest logical record (one content blob, one object) the store will
+/// write or read back.
+pub const HARD_LOGICAL_RECORD_BYTES: usize = 1024 * 1024 * 1024;
 /// Authenticated aggregate logical-size ceiling for one compressed block.
 ///
 /// Current writers target 64 KiB blocks. Keeping the decode ceiling at 1 MiB

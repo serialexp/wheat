@@ -20,6 +20,7 @@ tokio = { workspace = true }
 gix = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-git = { path = "../wheat-git" }
+wheat-server = { path = "../wheat-server" }
 wheat-store = { path = "../wheat-store" }
 
 [lints]

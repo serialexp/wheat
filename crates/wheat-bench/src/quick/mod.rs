@@ -18,6 +18,7 @@ mod deep_stack;
 mod git_export_notes;
 mod history;
 mod packed_append;
+mod publish_content;
 mod sharded_manifest;
 mod transition_validate;
 mod workspace;
@@ -51,6 +52,7 @@ pub const CASES: &[&str] = &[
     sharded_manifest::NAME,
     git_export_notes::NAME,
     checkpoint_stack::NAME,
+    publish_content::NAME,
 ];
 
 /// How big the cases are.
@@ -188,6 +190,7 @@ pub fn run_case(
         sharded_manifest::NAME => sharded_manifest::run(&context),
         git_export_notes::NAME => git_export_notes::run(&context),
         checkpoint_stack::NAME => checkpoint_stack::run(&context),
+        publish_content::NAME => publish_content::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

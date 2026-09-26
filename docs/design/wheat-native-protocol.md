@@ -337,6 +337,26 @@ Large content (multi-megabyte files) is streamed in bounded chunks rather
 than sent as a single message, to respect WebSocket message size limits
 and proxy constraints.
 
+Both directions follow the same receiving rules (`ContentReceiver` in
+`wheat-protocol`), because the sender is untrusted:
+
+- Only content that was asked for is accepted (the `ContentFetchRequest` batch
+  on the client, the `ContentNeeded` list on the server), each blob once.
+- A blob comes whole or as chunks. The first chunk has offset 0 and each next
+  chunk starts where the last one ended. Chunks of one blob are not interleaved
+  with chunks of another; whole blobs may arrive in between.
+- A blob is at most 1 GiB (`MAX_CONTENT_SIZE`), the content store's hard record
+  limit, whatever number of chunks it comes in.
+- The finished bytes must hash to the claimed ID.
+- On publish, `ContentUploadComplete` with a requested blob missing, or with a
+  chunked blob unfinished, is refused.
+
+Any broken rule ends the transfer: the client fails the fetch, and the server
+answers with a rejected `PublishResult` and leaves the head where it was.
+Senders use one message for blobs up to 4 MiB and chunks of 4 MiB above that.
+The server stores uploads in batches of up to 64 MiB as they arrive, so a
+publish holds one batch and the blob being reassembled, not every upload.
+
 ### Publication protocol
 
 Publication is the write path: a client has composed a new view (with new
@@ -627,7 +647,7 @@ ContentBatch
 ContentChunk                                  // streaming large content
   op_id: u32
   content_id: bytes[32]
-  offset: u64                                 // byte offset in the file
+  offset: u64                                 // bytes of this id sent so far
   data: bytes (max 4 MiB)
   final: bool                                 // last chunk for this id
 
@@ -666,7 +686,7 @@ ContentUpload                                 // client pushes content bytes
 ContentUploadChunk                            // client pushes large content
   op_id: u32
   content_id: bytes[32]
-  offset: u64
+  offset: u64                                 // bytes of this id sent so far
   data: bytes (max 4 MiB)
   final: bool
 

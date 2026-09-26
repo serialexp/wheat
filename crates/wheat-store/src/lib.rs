@@ -26,6 +26,7 @@ pub use content_repack::{
     PreparedContentGeneration, plan_content_repack, prepare_content_repack, publish_content_repack,
 };
 mod codec;
+pub use codec::HARD_LOGICAL_RECORD_BYTES;
 mod content_io;
 mod delta;
 mod durability;

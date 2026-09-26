@@ -21,6 +21,9 @@
 //! rejected. The framing layer (not binschema) enforces aggregate
 //! message-size bounds and per-field maximums before allocating.
 
+mod content_receiver;
+
+pub use content_receiver::{ContentReceiveError, ContentReceiver};
 pub use wheat_protocol_generated::generated::*;
 pub use wheat_protocol_generated::{BitOrder, BitStreamDecoder, BitStreamEncoder};
 
@@ -38,6 +41,11 @@ pub const MAX_OBJECT_ITEM_SIZE: usize = 1024 * 1024;
 
 /// Maximum per-item/chunk content data (4 MiB).
 pub const MAX_CONTENT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Maximum size of one content blob, however many chunks it arrives in
+/// (1 GiB). Matches the content store's hard record limit, so a peer never
+/// accepts a blob it could not store.
+pub const MAX_CONTENT_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Maximum items in an ObjectBatch.
 pub const MAX_OBJECT_BATCH_ITEMS: usize = 256;

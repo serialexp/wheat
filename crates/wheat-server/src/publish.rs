@@ -20,6 +20,9 @@ use crate::wire::{
     publish_rejected_status, publish_result, publish_stale_status, recv, send,
 };
 
+// A blob the protocol accepts must also fit the store.
+const _: () = assert!(MAX_CONTENT_SIZE == wheat_store::HARD_LOGICAL_RECORD_BYTES);
+
 /// Handle a publish request. Returns the new head if publication succeeded.
 pub async fn handle_publish(
     ws: &mut WebSocketStream<TcpStream>,
@@ -227,130 +230,82 @@ pub async fn handle_publish(
         .existing_ids(&all_content_ids)
         .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
 
-    let missing_content: Vec<Digest256> = all_content_ids
+    let mut requested: Vec<ContentId> = all_content_ids
         .iter()
         .filter(|id| !existing.contains(id))
-        .map(|id| Digest256 {
-            bytes: id.as_bytes().to_vec(),
-        })
+        .copied()
         .collect();
+    requested.truncate(MAX_WANT_IDS);
 
     // Always send ContentNeeded — even with an empty list — so the client
     // doesn't hang waiting for it. An empty list means no content upload needed.
-    let batch_size = missing_content.len().min(MAX_WANT_IDS);
     send(
         ws,
         &WheatProtocolMessage::ContentNeeded(ContentNeededOutput {
             message_type: 0x43,
             op_id,
-            content_ids: missing_content[..batch_size].to_vec(),
+            content_ids: requested
+                .iter()
+                .map(|id| Digest256 {
+                    bytes: id.as_bytes().to_vec(),
+                })
+                .collect(),
         }),
     )
     .await?;
 
-    if !missing_content.is_empty() {
-        // Collect all content uploads first, then store them in a single
-        // batch (concurrent S3 PUTs for remote backends).
-        let mut content_batch: Vec<(ContentId, Vec<u8>)> = Vec::new();
-        loop {
-            let msg = recv(ws).await?;
-            match msg {
-                WheatProtocolMessage::ContentUpload(upload) => {
-                    if upload.op_id != op_id {
-                        continue;
-                    }
-                    let content_id = digest_to_content_id(&upload.content_id)?;
-                    let actual_id = ContentId::of(&upload.data);
-                    if actual_id != content_id {
-                        send(
-                            ws,
-                            &publish_result(
-                                op_id,
-                                publish_rejected_status(),
-                                current_head.generation,
-                                current_head.envelope.as_bytes(),
-                                "content identity mismatch",
-                            ),
-                        )
-                        .await?;
-                        return Ok(None);
-                    }
-                    content_batch.push((content_id, upload.data));
-                }
-                WheatProtocolMessage::ContentUploadChunk(chunk) => {
-                    if chunk.op_id != op_id {
-                        continue;
-                    }
-                    // For v1: accumulate chunks in memory, verify on final chunk.
-                    // TODO: stream to disk for very large files.
-                    // For now, we only handle single-chunk "large" uploads that
-                    // fit in memory — the is_final flag must be true.
-                    if chunk.is_final && chunk.offset == 0 {
-                        // Single-chunk case: treat like ContentUpload.
-                        let content_id = digest_to_content_id(&chunk.content_id)?;
-                        let actual_id = ContentId::of(&chunk.data);
-                        if actual_id != content_id {
-                            send(
-                                ws,
-                                &publish_result(
-                                    op_id,
-                                    publish_rejected_status(),
-                                    current_head.generation,
-                                    current_head.envelope.as_bytes(),
-                                    "chunked content identity mismatch",
-                                ),
-                            )
-                            .await?;
-                            return Ok(None);
-                        }
-                        content_batch.push((content_id, chunk.data));
-                    } else {
-                        // Multi-chunk reassembly: not yet implemented.
-                        // For v1 this is acceptable — the client can always
-                        // fall back to single-message ContentUpload for files
-                        // under 4 MiB.
-                        warn!(
-                            op_id,
-                            offset = chunk.offset,
-                            "publish: multi-chunk content reassembly not yet implemented"
-                        );
-                    }
-                }
-                WheatProtocolMessage::ContentUploadComplete(cuc) => {
-                    if cuc.op_id == op_id {
-                        debug!(op_id, "publish: content upload complete");
-                        break;
-                    }
-                }
-                _ => {
-                    warn!(op_id, "publish: unexpected message during content upload");
-                }
-            }
-        }
-
-        // Store all content, with delta compression when possible.
-        //
+    if !requested.is_empty() {
         // Diff the old and new trees to find which files changed, then use
         // the old ContentId as a delta base for each new ContentId. This
         // produces much smaller stored objects for typical edits.
-        if !content_batch.is_empty() {
-            let base_map =
-                compute_delta_base_map(&entry.objects, &reader, current_head, &envelope_record)
-                    .await;
-            let with_bases: Vec<(ContentId, Vec<u8>, Option<ContentId>)> = content_batch
-                .into_iter()
-                .map(|(id, bytes)| {
-                    let base = base_map.get(&id).copied();
-                    (id, bytes, base)
-                })
-                .collect();
-            entry
-                .content
-                .put_many_with_bases(with_bases, 8)
-                .map_err(|e| {
-                    ConnectionError::Internal(format!("failed to store content batch: {e}"))
-                })?;
+        let base_map =
+            compute_delta_base_map(&entry.objects, &reader, current_head, &envelope_record).await;
+
+        // Accept only the requested blobs, each once, and store them in
+        // batches as they arrive so the session never holds more than one
+        // batch plus the blob being reassembled.
+        let mut receiver = ContentReceiver::new(requested.iter().copied(), MAX_CONTENT_SIZE);
+        let mut pending = PendingContent::default();
+        loop {
+            let msg = recv(ws).await?;
+            let received = match msg {
+                WheatProtocolMessage::ContentUpload(upload) if upload.op_id == op_id => {
+                    let id = digest_to_content_id(&upload.content_id)?;
+                    if let Err(e) = receiver.accept_whole(id, upload.data.len()) {
+                        return reject(ws, op_id, current_head, &format!("{e}")).await;
+                    }
+                    Some((id, upload.data))
+                }
+                WheatProtocolMessage::ContentUploadChunk(chunk) if chunk.op_id == op_id => {
+                    let id = digest_to_content_id(&chunk.content_id)?;
+                    match receiver.accept_chunk(id, chunk.offset, chunk.data, chunk.is_final) {
+                        Ok(finished) => finished,
+                        Err(e) => return reject(ws, op_id, current_head, &format!("{e}")).await,
+                    }
+                }
+                WheatProtocolMessage::ContentUploadComplete(cuc) if cuc.op_id == op_id => {
+                    debug!(op_id, "publish: content upload complete");
+                    if let Err(e) = receiver.finish() {
+                        return reject(ws, op_id, current_head, &format!("{e}")).await;
+                    }
+                    break;
+                }
+                _ => {
+                    warn!(op_id, "publish: unexpected message during content upload");
+                    None
+                }
+            };
+            if let Some((id, data)) = received {
+                if ContentId::of(&data) != id {
+                    return reject(ws, op_id, current_head, "content identity mismatch").await;
+                }
+                let base = base_map.get(&id).copied();
+                if pending.push(id, data, base) {
+                    pending.store(entry)?;
+                }
+            }
         }
+        pending.store(entry)?;
     }
 
     // --- Commit phase ---
@@ -475,6 +430,62 @@ pub async fn handle_publish(
             .await?;
             Ok(None)
         }
+    }
+}
+
+/// Refuse the publish: tell the client, leave the head where it is.
+async fn reject(
+    ws: &mut WebSocketStream<TcpStream>,
+    op_id: u32,
+    current_head: &RepositoryHead,
+    message: &str,
+) -> Result<Option<RepositoryHead>, ConnectionError> {
+    info!(op_id, message, "publish: content upload refused");
+    send(
+        ws,
+        &publish_result(
+            op_id,
+            publish_rejected_status(),
+            current_head.generation,
+            current_head.envelope.as_bytes(),
+            message,
+        ),
+    )
+    .await?;
+    Ok(None)
+}
+
+/// Uploaded bytes held before they are stored together. Storing in batches
+/// keeps concurrent writes for remote backends; the cap keeps a publish
+/// from holding every uploaded blob in memory at once.
+const PENDING_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Uploaded content waiting to be stored, with its delta base.
+#[derive(Default)]
+struct PendingContent {
+    items: Vec<(ContentId, Vec<u8>, Option<ContentId>)>,
+    bytes: usize,
+}
+
+impl PendingContent {
+    /// Add a blob. Returns true once the batch is full and should be stored.
+    fn push(&mut self, id: ContentId, data: Vec<u8>, base: Option<ContentId>) -> bool {
+        self.bytes += data.len();
+        self.items.push((id, data, base));
+        self.bytes >= PENDING_CONTENT_BYTES
+    }
+
+    /// Store everything pending, with delta compression where a base is known.
+    fn store(&mut self, entry: &RepositoryEntry) -> Result<(), ConnectionError> {
+        if self.items.is_empty() {
+            return Ok(());
+        }
+        let items = std::mem::take(&mut self.items);
+        self.bytes = 0;
+        entry
+            .content
+            .put_many_with_bases(items, 8)
+            .map_err(|e| ConnectionError::Internal(format!("failed to store content batch: {e}")))
     }
 }
 

@@ -794,15 +794,12 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
         )
         .await?;
 
-        // Receive ContentBatch / ContentChunk messages until all content
-        // in this batch is received.
-        let mut received_this_batch = 0;
-        let batch_len = batch.len();
+        // Receive ContentBatch / ContentChunk messages until every blob in
+        // this batch has arrived. Only the requested blobs are accepted, each
+        // once, chunk by chunk in order and no larger than the store takes.
+        let mut receiver = ContentReceiver::new(batch.iter().copied(), MAX_CONTENT_SIZE);
 
-        // Track chunked content being assembled.
-        let mut chunk_buffer: Option<(ContentId, Vec<u8>)> = None;
-
-        while received_this_batch < batch_len {
+        while !receiver.is_complete() {
             let msg = recv_msg(&mut session.ws).await?;
             match msg {
                 WheatProtocolMessage::ContentBatch(cb) => {
@@ -811,12 +808,14 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                     }
                     for entry in &cb.contents {
                         let id = digest_to_content_id(&entry.id)?;
+                        receiver
+                            .accept_whole(id, entry.data.len())
+                            .context("server sent content that breaks the fetch rules")?;
                         let actual = ContentId::of(&entry.data);
                         if actual != id {
                             bail!("content identity mismatch: claimed {id}, actual {actual}");
                         }
                         content.put(&entry.data)?;
-                        received_this_batch += 1;
                     }
                 }
                 WheatProtocolMessage::ContentChunk(chunk) => {
@@ -824,22 +823,10 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                         continue;
                     }
                     let chunk_id = digest_to_content_id(&chunk.content_id)?;
-
-                    // Append to the buffer.
-                    match &mut chunk_buffer {
-                        Some((buf_id, buf)) if *buf_id == chunk_id => {
-                            buf.extend_from_slice(&chunk.data);
-                        }
-                        Some((old_id, _)) => {
-                            bail!("interleaved content chunks: expected {old_id}, got {chunk_id}");
-                        }
-                        None => {
-                            chunk_buffer = Some((chunk_id, chunk.data.clone()));
-                        }
-                    }
-
-                    if chunk.is_final {
-                        let (id, data) = chunk_buffer.take().unwrap();
+                    let finished = receiver
+                        .accept_chunk(chunk_id, chunk.offset, chunk.data, chunk.is_final)
+                        .context("server sent content that breaks the fetch rules")?;
+                    if let Some((id, data)) = finished {
                         let actual = ContentId::of(&data);
                         if actual != id {
                             bail!(
@@ -847,7 +834,6 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                             );
                         }
                         content.put(&data)?;
-                        received_this_batch += 1;
                     }
                 }
                 WheatProtocolMessage::Error(e) if e.op_id == op_id => {
@@ -977,16 +963,7 @@ pub async fn publish<O: ImmutableObjectStore>(
                 for digest in &cn.content_ids {
                     let id = digest_to_content_id(digest)?;
                     let data = content.get(id)?;
-                    send_msg(
-                        &mut session.ws,
-                        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                            message_type: 0x44,
-                            op_id,
-                            content_id: digest.clone(),
-                            data,
-                        }),
-                    )
-                    .await?;
+                    upload_content(session, op_id, digest, data).await?;
                 }
 
                 // Signal that all content has been uploaded.
@@ -1032,6 +1009,47 @@ pub async fn publish<O: ImmutableObjectStore>(
             _ => {}
         }
     }
+}
+
+/// Send one requested blob: in one `ContentUpload` when it fits a chunk,
+/// otherwise as `ContentUploadChunk` messages of at most
+/// `MAX_CONTENT_CHUNK_SIZE` bytes each, so no message passes the size limit.
+async fn upload_content(
+    session: &mut WheatSession,
+    op_id: u32,
+    digest: &Digest256,
+    data: Vec<u8>,
+) -> Result<()> {
+    if data.len() <= MAX_CONTENT_CHUNK_SIZE {
+        return send_msg(
+            &mut session.ws,
+            &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
+                message_type: 0x44,
+                op_id,
+                content_id: digest.clone(),
+                data,
+            }),
+        )
+        .await;
+    }
+    let mut offset = 0;
+    for piece in data.chunks(MAX_CONTENT_CHUNK_SIZE) {
+        let end = offset + piece.len();
+        send_msg(
+            &mut session.ws,
+            &WheatProtocolMessage::ContentUploadChunk(ContentUploadChunkOutput {
+                message_type: 0x45,
+                op_id,
+                content_id: digest.clone(),
+                offset: offset as u64,
+                data: piece.to_vec(),
+                is_final: end == data.len(),
+            }),
+        )
+        .await?;
+        offset = end;
+    }
+    Ok(())
 }
 
 fn decode_publish_result(pr: PublishResultOutput) -> Result<PublishOutcome> {

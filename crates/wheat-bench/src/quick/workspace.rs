@@ -1,6 +1,10 @@
 //! A fresh Wheat workspace driven through the `wheat` binary, for the CLI cases.
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result};
 
@@ -51,6 +55,26 @@ impl Workspace {
         let captured = measure::run(&mut command, &self.scratch)?;
         captured.ensure_success(&format!("wheat {}", arguments.join(" ")))?;
         Ok(captured)
+    }
+
+    /// Runs `wheat <arguments>` in `directory`, with this workspace's store home and
+    /// config, which must succeed, and measures it. For commands that make or use
+    /// another workspace, such as `clone`.
+    pub(crate) fn ok_in(&self, directory: &Path, arguments: &[&str]) -> Result<Captured> {
+        let mut command = Command::new(&self.wheat);
+        crate::isolate(&mut command)
+            .current_dir(directory)
+            .args(arguments)
+            .env("WHEAT_STORE_HOME", &self.stores)
+            .env("XDG_CONFIG_HOME", &self.config);
+        let captured = measure::run(&mut command, &self.scratch)?;
+        captured.ensure_success(&format!("wheat {}", arguments.join(" ")))?;
+        Ok(captured)
+    }
+
+    /// The directory the workspace was initialized in.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn path(&self, path: &str) -> PathBuf {
