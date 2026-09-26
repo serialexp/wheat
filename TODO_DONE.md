@@ -28,6 +28,18 @@ Finished items, moved here from `TODO.md` under the same headings.
   workspace set up and says to run `wheat materialize --allow-dot-git`. The three
   reserved-name lists are now one, `wheat_ignore::WORKSPACE_CONTROL_NAMES`. Tests:
   `crates/wheat-cli/tests/dot_git.rs`. Capture is still open (see "Loose ends").
+- `[x]` **Generated decoders trust untrusted lengths (confirmed).** The
+  BinSchema-generated decoders reserved `Vec::with_capacity(length)` straight from a
+  length read from the input; six bytes (a `TreeV1` tag and a `u32::MAX` entry
+  count) asked for hundreds of GiB, and a failed allocation aborts the process.
+  Done 2026-09-26 in BinSchema `7377cb9`: every input-sized reservation goes
+  through `BitStreamDecoder::capacity_hint`, capped at the bytes left, and byte
+  arrays decode with one bounds-checked `read_bytes_vec`. The pin had said
+  `f48a34a` while the committed output came from `b99d34b` (a later commit on
+  `main`); it now names the revision that produced the output. Tests:
+  `crates/wheat-core/tests/forged_lengths.rs`,
+  `crates/wheat-protocol/tests/forged_lengths.rs`. DeltaZstd and chunk limits are
+  still open under the same heading in `TODO.md`.
 
 ## Explicit history collapse, repack, and GC
 

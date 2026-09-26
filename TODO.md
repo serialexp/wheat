@@ -11,11 +11,8 @@ are the scanner's word only and need checking before a fix.
 
 Security, most serious first:
 
-- `[ ]` **Decoders trust untrusted lengths (partly confirmed).**
-  - The BinSchema-generated decoders (`wheat-core` and `wheat-protocol`
-    `generated.rs`) call `Vec::with_capacity(length)` with the length read from the
-    input, before any payload bytes are read. A 4-byte `0xFFFFFFFF` asks for gigabytes.
-    Fix in the BinSchema generator: cap the reservation by the bytes left.
+- `[ ]` **Decoders trust untrusted lengths (partly confirmed).** The generated
+  decoders are fixed (see `TODO_DONE.md`); two parts are left.
   - `Codec::DeltaZstd` decode (`crates/wheat-store/src/codec.rs`, around line 311)
     calls `zstd::bulk::decompress(patch, HARD_LOGICAL_RECORD_BYTES)`, which reserves
     1 GiB per call; a 16-deep delta chain could ask for 16 GiB. Line seen, real memory

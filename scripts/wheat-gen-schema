@@ -17,7 +17,7 @@ CRATE_DIR="${REPO_ROOT}/crates/wheat-core"
 SCHEMA="${CRATE_DIR}/schemas/wheat-objects.bs.json5"
 OUT_DIR="${CRATE_DIR}/generated"
 BINSCHEMA_REPO="${BINSCHEMA_REPO:-${HOME}/Projects/binschema}"
-BINSCHEMA_REVISION="f48a34a77aae6fd0f476ed246f03083db8953045"
+BINSCHEMA_REVISION="7377cb916843aa325071dd096de66be63cd0cc25"
 BINSCHEMA_CLI="${BINSCHEMA_REPO}/packages/binschema/dist/cli/index.js"
 
 if [[ ! -f "${BINSCHEMA_CLI}" ]]; then

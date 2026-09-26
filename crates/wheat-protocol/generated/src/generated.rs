@@ -557,11 +557,7 @@ impl ObjectEntry {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let id = Digest256::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut data = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            data.push(item);
-        }
+        let data = decoder.read_bytes_vec(length)?;
         Ok(Self { id, data })
     }
 }
@@ -596,11 +592,7 @@ impl ContentEntry {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let id = Digest256::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut data = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            data.push(item);
-        }
+        let data = decoder.read_bytes_vec(length)?;
         Ok(Self { id, data })
     }
 }
@@ -667,7 +659,7 @@ impl ServerHelloOutput {
         let protocol_version_max = decoder.read_u16_be()?;
         let server_id = decoder.read_bytes_vec(32)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut capabilities = Vec::with_capacity(length);
+        let mut capabilities = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_u16_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -769,11 +761,7 @@ impl ClientHelloOutput {
         }
         let selected_version = decoder.read_u16_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut auth_token = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            auth_token.push(item);
-        }
+        let auth_token = decoder.read_bytes_vec(length)?;
         let receive_window_bytes = decoder.read_u32_be()?;
         let receive_window_messages = decoder.read_u16_be()?;
         Ok(Self {
@@ -1301,7 +1289,7 @@ impl RepositoryStateOutput {
         let head_generation = decoder.read_u64_be()?;
         let head_envelope = Digest256::decode_with_decoder(decoder)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelEntry::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -1395,11 +1383,7 @@ impl ListLabelsOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut cursor = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            cursor.push(item);
-        }
+        let cursor = decoder.read_bytes_vec(length)?;
         Ok(Self {
             message_type,
             op_id,
@@ -1488,17 +1472,13 @@ impl ListLabelsResultOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = LabelEntry::decode_with_decoder(decoder)?;
             labels.push(item);
         }
         let length = decoder.read_u16_be()? as usize;
-        let mut next_cursor = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            next_cursor.push(item);
-        }
+        let next_cursor = decoder.read_bytes_vec(length)?;
         Ok(Self {
             message_type,
             op_id,
@@ -1593,7 +1573,7 @@ impl FetchRequestOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let str_len = decoder.read_u16_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -1695,7 +1675,7 @@ impl ObjectBatchOutput {
         let op_id = decoder.read_u32_be()?;
         let sequence = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut objects = Vec::with_capacity(length);
+        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = ObjectEntry::decode_with_decoder(decoder)?;
             objects.push(item);
@@ -1785,7 +1765,7 @@ impl ObjectWantOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut ids = Vec::with_capacity(length);
+        let mut ids = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             ids.push(item);
@@ -1942,7 +1922,7 @@ impl ContentFetchRequestOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut content_ids = Vec::with_capacity(length);
+        let mut content_ids = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             content_ids.push(item);
@@ -2033,7 +2013,7 @@ impl ContentBatchOutput {
         let op_id = decoder.read_u32_be()?;
         let sequence = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut contents = Vec::with_capacity(length);
+        let mut contents = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = ContentEntry::decode_with_decoder(decoder)?;
             contents.push(item);
@@ -2134,11 +2114,7 @@ impl ContentChunkOutput {
         let content_id = Digest256::decode_with_decoder(decoder)?;
         let offset = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut data = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            data.push(item);
-        }
+        let data = decoder.read_bytes_vec(length)?;
         let is_final = decoder.read_byte()? != 0;
         Ok(Self {
             message_type,
@@ -2438,7 +2414,7 @@ impl ObjectsNeededOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut ids = Vec::with_capacity(length);
+        let mut ids = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             ids.push(item);
@@ -2595,7 +2571,7 @@ impl ContentNeededOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut content_ids = Vec::with_capacity(length);
+        let mut content_ids = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             content_ids.push(item);
@@ -2686,11 +2662,7 @@ impl ContentUploadOutput {
         let op_id = decoder.read_u32_be()?;
         let content_id = Digest256::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut data = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            data.push(item);
-        }
+        let data = decoder.read_bytes_vec(length)?;
         Ok(Self {
             message_type,
             op_id,
@@ -2787,11 +2759,7 @@ impl ContentUploadChunkOutput {
         let content_id = Digest256::decode_with_decoder(decoder)?;
         let offset = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut data = Vec::with_capacity(length);
-        for _ in 0..length {
-            let item = decoder.read_byte()?;
-            data.push(item);
-        }
+        let data = decoder.read_bytes_vec(length)?;
         let is_final = decoder.read_byte()? != 0;
         Ok(Self {
             message_type,
