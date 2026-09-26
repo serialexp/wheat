@@ -304,6 +304,45 @@ async fn from_nothing_yields_exactly_the_closure() {
     }
 }
 
+/// The objects a snapshot export of `envelope` lists.
+async fn snapshot_objects(
+    objects: &LooseObjectStore,
+    content: &ContentStore,
+    envelope: RepositoryEnvelopeId,
+) -> HashSet<ObjectId> {
+    let dir = tempfile::tempdir().unwrap();
+    let publications = LocalPublicationStore::new(dir.path().join("head"));
+    publications
+        .initialize(RepositoryHead::initial(envelope))
+        .unwrap();
+    let snapshot = export_snapshot(objects, content, &publications, SnapshotLimits::default())
+        .await
+        .unwrap();
+    snapshot
+        .manifest
+        .objects
+        .iter()
+        .map(|entry| entry.id)
+        .collect()
+}
+
+/// Snapshot export and the walk get their references from one place, so both find
+/// the whole closure.
+#[tokio::test]
+async fn a_snapshot_export_lists_the_same_closure_as_the_walk() {
+    let history = history().await;
+    for (index, (envelope, closure)) in history
+        .envelopes
+        .iter()
+        .zip(&history.closures)
+        .chain([(&history.unrelated, &history.unrelated_closure)])
+        .enumerate()
+    {
+        let listed = snapshot_objects(&history.objects, &history.content, *envelope).await;
+        assert_eq!(&listed, closure, "envelope {index}");
+    }
+}
+
 #[tokio::test]
 async fn every_pair_yields_the_difference_and_nothing_outside_the_closure() {
     let history = history().await;
@@ -432,6 +471,14 @@ async fn a_long_history_pairs_radix_trees_node_by_node() {
     }
     let (last, last_closure) = recorded.last().unwrap();
     assert_eq!(&walk(&objects, None, *last).await, last_closure);
+    // Big enough for sets with members stored inline in their nodes.
+    let listed = snapshot_objects(&objects, &content, *last).await;
+    let mut left_out = Vec::new();
+    for id in last_closure.difference(&listed) {
+        left_out.push(objects.get(*id).await.unwrap().kind);
+    }
+    assert!(left_out.is_empty(), "snapshot left out {left_out:?}");
+    assert!(listed.is_subset(last_closure));
 }
 
 /// Answers `Missing` for some IDs, as a store that lacks them would.

@@ -6,6 +6,10 @@
 //! and the client runs the same walk over its own store afterwards to check that it
 //! has everything, asking for whatever is still missing.
 //!
+//! What each object refers to comes from [`crate::object_graph`], the same list a
+//! snapshot export follows. This module only decides how to pair each reference with
+//! the old side.
+//!
 //! # What may be skipped
 //!
 //! Objects are content-addressed, so an object's ID fixes everything below it. The walk
@@ -47,19 +51,18 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use wheat_core::{
-    ApplicationId, ApplicationResultRecord, CanonicalObjectError, ChangeObjectId, ContentSetBlob,
-    ContentSetId, DirectoryEntry, EditFailure, EditId, ObjectId, RepositoryEnvelopeId,
-    RetainedSetId, RevisionId, TreeId, ViewId,
+    CanonicalObjectError, DirectoryEntry, ObjectId, RepositoryEnvelopeId, RetainedSetId,
+    RevisionId, ViewId,
 };
 
 use crate::{
     ImmutableObjectStore, ObjectKind, ObjectStoreError, RetainedSetStore, StoredObject,
-    application_map::ApplicationCollection,
-    change_map::ChangeCollection,
-    radix::{self, Collection, Key as _, Node},
-    revision_map::RevisionCollection,
-    sets::{CollectionError, ConflictCollection, RetainedCollection},
-    view_lineage::ViewLineageCollection,
+    object_graph::{
+        self, ApplicationSite, ConflictSite, ContentSetSite, EnvelopeSite, LabelSite,
+        MalformedRadix, ManifestSite, RadixKind, RadixNode, RadixSite, Ref, RevisionSite,
+        StateSite, TreeSite, ViewSite,
+    },
+    sets::CollectionError,
 };
 
 /// Bounds on one walk.
@@ -144,6 +147,12 @@ pub enum StructuralDeltaError {
     LimitExceeded(&'static str),
 }
 
+impl From<MalformedRadix> for StructuralDeltaError {
+    fn from(MalformedRadix { id, position }: MalformedRadix) -> Self {
+        Self::MalformedRadix { id, position }
+    }
+}
+
 type Result<T> = std::result::Result<T, StructuralDeltaError>;
 
 /// Which radix collection a node belongs to, and what its keys and values mean.
@@ -164,34 +173,23 @@ enum Role {
 }
 
 impl Role {
-    fn kind(self) -> ObjectKind {
+    fn radix_kind(self) -> RadixKind {
         match self {
             Self::RetainedViews
             | Self::RetainedRevisions
             | Self::RetainedApplications
             | Self::RetainedChanges
-            | Self::LineageChildren => ObjectKind::RetainedSetNode,
-            Self::Lineage => ObjectKind::ViewLineageMapNode,
-            Self::ChangeMap => ObjectKind::ChangeMapNode,
-            Self::RevisionMap => ObjectKind::RevisionMapNode,
-            Self::ApplicationMap => ObjectKind::ApplicationMapNode,
-            Self::ConflictSet => ObjectKind::ConflictSetNode,
+            | Self::LineageChildren => RadixKind::RetainedSet,
+            Self::Lineage => RadixKind::ViewLineage,
+            Self::ChangeMap => RadixKind::ChangeMap,
+            Self::RevisionMap => RadixKind::RevisionMap,
+            Self::ApplicationMap => RadixKind::ApplicationMap,
+            Self::ConflictSet => RadixKind::ConflictSet,
         }
     }
 
-    fn key_len(self) -> usize {
-        match self {
-            Self::RetainedViews
-            | Self::RetainedRevisions
-            | Self::RetainedApplications
-            | Self::RetainedChanges
-            | Self::LineageChildren => <RetainedCollection as Collection>::Key::LEN,
-            Self::Lineage => <ViewLineageCollection as Collection>::Key::LEN,
-            Self::ChangeMap => <ChangeCollection as Collection>::Key::LEN,
-            Self::RevisionMap => <RevisionCollection as Collection>::Key::LEN,
-            Self::ApplicationMap => <ApplicationCollection as Collection>::Key::LEN,
-            Self::ConflictSet => <ConflictCollection as Collection>::Key::LEN,
-        }
+    fn kind(self) -> ObjectKind {
+        self.radix_kind().object_kind()
     }
 
     /// Radix structures hanging off the state are walked before any view.
@@ -203,63 +201,8 @@ impl Role {
     }
 
     fn decode(self, bytes: &[u8]) -> std::result::Result<RadixNode, CanonicalObjectError> {
-        match self {
-            Self::RetainedViews
-            | Self::RetainedRevisions
-            | Self::RetainedApplications
-            | Self::RetainedChanges
-            | Self::LineageChildren => uniform::<RetainedCollection>(bytes),
-            Self::Lineage => uniform::<ViewLineageCollection>(bytes),
-            Self::ChangeMap => uniform::<ChangeCollection>(bytes),
-            Self::RevisionMap => uniform::<RevisionCollection>(bytes),
-            Self::ApplicationMap => uniform::<ApplicationCollection>(bytes),
-            Self::ConflictSet => uniform::<ConflictCollection>(bytes),
-        }
+        self.radix_kind().decode(bytes)
     }
-}
-
-/// A radix node of any collection: values are object IDs, or nothing for sets.
-type RadixNode = Node<ObjectId, Option<ObjectId>>;
-
-/// A radix value as an object reference, if it is one.
-trait RadixValue {
-    fn object(self) -> Option<ObjectId>;
-}
-impl RadixValue for () {
-    fn object(self) -> Option<ObjectId> {
-        None
-    }
-}
-macro_rules! radix_value {
-    ($($id:ty),+) => {$(
-        impl RadixValue for $id {
-            fn object(self) -> Option<ObjectId> {
-                Some(self.into())
-            }
-        }
-    )+};
-}
-radix_value!(RevisionId, ApplicationId, ChangeObjectId, RetainedSetId);
-
-fn uniform<C: Collection>(bytes: &[u8]) -> std::result::Result<RadixNode, CanonicalObjectError>
-where
-    C::Value: RadixValue,
-{
-    let node = C::unpack(C::decode(bytes)?);
-    Ok(Node {
-        prefix: node.prefix,
-        value: node.value.map(RadixValue::object),
-        children: node
-            .children
-            .into_iter()
-            .map(|(edge, child)| (edge, child.into()))
-            .collect(),
-        entries: node
-            .entries
-            .into_iter()
-            .map(|(suffix, value)| (suffix, value.object()))
-            .collect(),
-    })
 }
 
 /// The key bytes above a radix node.
@@ -509,10 +452,12 @@ pub struct StructuralDelta<'a, S> {
     counterparts: HashMap<ViewId, Option<ViewId>>,
     old_views: HashMap<ViewId, Option<wheat_core::ViewRecord>>,
     /// Edits of old retained revisions, and which revisions have been looked at.
-    old_edits: HashSet<EditId>,
+    old_edits: HashSet<ObjectId>,
     old_revisions_learned: HashSet<RevisionId>,
     /// New lineage links, child → parent.
     parent_of: HashMap<ViewId, ViewId>,
+    /// Reused for the references of each radix node.
+    radix_references: Vec<Ref<RadixSite>>,
     stats: StructuralDeltaStats,
 }
 
@@ -540,6 +485,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             old_edits: HashSet::new(),
             old_revisions_learned: HashSet::new(),
             parent_of: HashMap::new(),
+            radix_references: Vec::new(),
             stats: StructuralDeltaStats::default(),
         };
         if old != Some(new) {
@@ -728,19 +674,21 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Some(old) => Some(decode(&old, wheat_core::decode_repository_envelope_record)?),
             None => None,
         };
-        self.push_paired(
-            Task::State {
-                id: record.state.into(),
-                old: old.as_ref().map(|old| old.state.into()),
-            },
-            old.as_ref().map(|old| old.state.into()),
-        )?;
-        self.push_paired(
-            Task::Labels {
-                id: record.labels.into(),
-            },
-            old.as_ref().map(|old| old.labels.into()),
-        )?;
+        object_graph::envelope(&record, |reference| {
+            let Ref::Object(site, id) = reference else {
+                return Ok(());
+            };
+            match site {
+                EnvelopeSite::State => {
+                    let old = old.as_ref().map(|old| old.state.into());
+                    self.push_paired(Task::State { id, old }, old)
+                }
+                EnvelopeSite::Labels => self.push_paired(
+                    Task::Labels { id },
+                    old.as_ref().map(|old| old.labels.into()),
+                ),
+            }
+        })?;
         Ok(self.emit(stored))
     }
 
@@ -773,53 +721,52 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         let old_field =
             |pick: fn(&wheat_core::RepositoryStateRecord) -> ObjectId| old.as_ref().map(pick);
 
-        if old_field(|state| state.base_view.into()) == Some(new.base_view.into()) {
-            self.stats.pruned_aligned += 1;
-        } else {
-            self.push_entity(new.base_view.into(), Entity::View, false)?;
-        }
-        for (role, id, old) in [
-            (
-                Role::RetainedViews,
-                new.retained_views.into(),
-                old_field(|state| state.retained_views.into()),
-            ),
-            (
-                Role::RetainedRevisions,
-                new.retained_revisions.into(),
-                old_field(|state| state.retained_revisions.into()),
-            ),
-            (
-                Role::RetainedApplications,
-                new.retained_applications.into(),
-                old_field(|state| state.retained_applications.into()),
-            ),
-            (
-                Role::RetainedChanges,
-                new.retained_changes.into(),
-                old_field(|state| state.retained_changes.into()),
-            ),
-            (
-                Role::Lineage,
-                new.view_lineage.into(),
-                old_field(|state| state.view_lineage.into()),
-            ),
-            (
-                Role::ChangeMap,
-                new.changes.into(),
-                old_field(|state| state.changes.into()),
-            ),
-        ] {
-            self.push_radix_root(id, role, old, None)?;
-        }
-        self.push_paired(
-            Task::Manifest {
-                id: new.required_content.into(),
-                old: old_field(|state| state.required_content.into()),
-                state_level: true,
-            },
-            old_field(|state| state.required_content.into()),
-        )?;
+        object_graph::state(&new, |reference| {
+            let Ref::Object(site, id) = reference else {
+                return Ok(());
+            };
+            let (role, old) = match site {
+                StateSite::BaseView => {
+                    if old_field(|state| state.base_view.into()) == Some(id) {
+                        self.stats.pruned_aligned += 1;
+                        return Ok(());
+                    }
+                    return self.push_entity(id, Entity::View, false);
+                }
+                StateSite::RequiredContent => {
+                    let old = old_field(|state| state.required_content.into());
+                    return self.push_paired(
+                        Task::Manifest {
+                            id,
+                            old,
+                            state_level: true,
+                        },
+                        old,
+                    );
+                }
+                StateSite::RetainedViews => (
+                    Role::RetainedViews,
+                    old_field(|state| state.retained_views.into()),
+                ),
+                StateSite::RetainedRevisions => (
+                    Role::RetainedRevisions,
+                    old_field(|state| state.retained_revisions.into()),
+                ),
+                StateSite::RetainedApplications => (
+                    Role::RetainedApplications,
+                    old_field(|state| state.retained_applications.into()),
+                ),
+                StateSite::RetainedChanges => (
+                    Role::RetainedChanges,
+                    old_field(|state| state.retained_changes.into()),
+                ),
+                StateSite::ViewLineage => {
+                    (Role::Lineage, old_field(|state| state.view_lineage.into()))
+                }
+                StateSite::Changes => (Role::ChangeMap, old_field(|state| state.changes.into())),
+            };
+            self.push_radix_root(id, role, old, None)
+        })?;
         Ok(self.emit(stored))
     }
 
@@ -855,9 +802,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(None);
         };
         let record = decode(&stored, wheat_core::decode_view_label_manifest_record)?;
-        for label in record.labels.values() {
-            self.push_entity(label.view.into(), Entity::View, false)?;
-        }
+        object_graph::labels(&record, |reference| match reference {
+            Ref::Object(LabelSite::View, id) => self.push_entity(id, Entity::View, false),
+            Ref::Content(_) => Ok(()),
+        })?;
         Ok(self.emit(stored))
     }
 
@@ -881,14 +829,17 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             )),
             None => None,
         };
-        self.push_paired(
-            Task::ContentSet {
-                id: record.content.into(),
+        object_graph::manifest(&record, |reference| match reference {
+            Ref::Object(ManifestSite::ContentSet, id) => self.push_paired(
+                Task::ContentSet {
+                    id,
+                    old,
+                    state_level,
+                },
                 old,
-                state_level,
-            },
-            old,
-        )?;
+            ),
+            Ref::Content(_) => Ok(()),
+        })?;
         Ok(self.emit(stored))
     }
 
@@ -913,11 +864,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         else {
             return Ok(None);
         };
-        if stored.kind == ObjectKind::ContentSetDelta
-            && let ContentSetBlob::Delta { base, .. } =
-                decode(&stored, wheat_core::decode_content_set_blob)?
-        {
-            let base: ObjectId = base.into();
+        if let Some(base) = content_set_base(&stored)? {
             if old == Some(base) || self.old_content_chain(old).await?.contains(&base) {
                 self.stats.pruned_aligned += 1;
             } else {
@@ -952,11 +899,8 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             }
             chain.push(id);
             next = None;
-            if let Some(stored) = self.read_old(Some(id), ObjectKind::ContentSetDelta).await?
-                && let ContentSetBlob::Delta { base, .. } =
-                    decode(&stored, wheat_core::decode_content_set_blob)?
-            {
-                next = Some(ContentSetId::into(base));
+            if let Some(stored) = self.read_old(Some(id), ObjectKind::ContentSetDelta).await? {
+                next = content_set_base(&stored)?;
             }
         }
         let chain: Arc<[ObjectId]> = chain.into();
@@ -980,22 +924,16 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Some(old) => Some(decode(&old, wheat_core::decode_directory_node)?),
             None => None,
         };
-        for (name, entry) in &node.entries {
-            let DirectoryEntry::Directory(child) = entry else {
-                continue;
-            };
-            let old_child = old.as_ref().and_then(|old| match old.entries.get(name) {
-                Some(DirectoryEntry::Directory(id)) => Some(ObjectId::from(*id)),
-                _ => None,
-            });
-            self.push_paired(
-                Task::Tree {
-                    id: (*child).into(),
-                    old: old_child,
-                },
-                old_child,
-            )?;
-        }
+        object_graph::tree(&node, |reference| match reference {
+            Ref::Object(TreeSite::Directory(name), id) => {
+                let old_child = old.as_ref().and_then(|old| match old.entries.get(name) {
+                    Some(DirectoryEntry::Directory(id)) => Some(ObjectId::from(*id)),
+                    _ => None,
+                });
+                self.push_paired(Task::Tree { id, old: old_child }, old_child)
+            }
+            Ref::Content(_) => Ok(()),
+        })?;
         Ok(self.emit(stored))
     }
 
@@ -1020,48 +958,75 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(None);
         };
         let node = decode(&stored, |bytes| role.decode(bytes))?;
-        let position = usize::from(path.len);
-        radix::validate_node_at(&node, position, role.key_len())
-            .map_err(|_| StructuralDeltaError::MalformedRadix { id, position })?;
+        let mut references = std::mem::take(&mut self.radix_references);
+        references.clear();
+        object_graph::radix(
+            role.radix_kind(),
+            id,
+            &node,
+            &path.bytes[..usize::from(path.len)],
+            |reference| {
+                references.push(reference);
+                Ok::<_, StructuralDeltaError>(())
+            },
+        )?;
         let old_here = self.advance(old, &node.prefix, role).await?;
         let here = path.extended(&node.prefix);
 
-        if let Some(value) = node.value {
-            let old_value = old_value_at(&old_here);
-            self.key_event(role, parent, here, value, old_value).await?;
-        }
-        for (suffix, value) in &node.entries {
-            let old_value = old_value_at(&self.advance(old_here.clone(), suffix, role).await?);
-            self.key_event(role, parent, here.extended(suffix), *value, old_value)
-                .await?;
-        }
-        for &(edge, child) in &node.children {
-            let child_old = match &old_here {
-                OldRadix::At(old, skip) if *skip == old.prefix.len() => {
-                    match old.children.iter().find(|(old_edge, _)| *old_edge == edge) {
-                        Some(&(_, old_child)) if old_child == child => {
-                            self.stats.pruned_aligned += 1;
-                            continue;
-                        }
-                        Some(&(_, old_child)) => OldRadix::Id(old_child),
-                        None => keys_below(&old.entries, &[edge]),
-                    }
-                }
-                OldRadix::At(old, skip) if old.prefix[*skip] == edge => {
-                    OldRadix::At(Arc::clone(old), skip + 1)
-                }
-                OldRadix::At(..) => OldRadix::absent(),
-                OldRadix::Keys(keys) => keys_below(keys.iter(), &[edge]),
-                OldRadix::Unknown | OldRadix::Id(_) => OldRadix::Unknown,
+        for reference in references.drain(..) {
+            let Ref::Object(site, target) = reference else {
+                continue;
             };
-            self.push(Task::Radix {
-                id: child,
-                role,
-                path: here.extended(&[edge]),
-                old: child_old,
-                parent,
-            })?;
+            match site {
+                RadixSite::Key { entry } => {
+                    let (suffix, value, old_value) = match entry {
+                        None => (&[][..], node.value.flatten(), old_value_at(&old_here)),
+                        Some(index) => {
+                            let (suffix, value) = &node.entries[index];
+                            let old_there = self.advance(old_here.clone(), suffix, role).await?;
+                            (suffix.as_slice(), *value, old_value_at(&old_there))
+                        }
+                    };
+                    self.key_event(
+                        role,
+                        parent,
+                        here.extended(suffix),
+                        value,
+                        target,
+                        old_value,
+                    )
+                    .await?;
+                }
+                RadixSite::Child { edge } => {
+                    let child_old = match &old_here {
+                        OldRadix::At(old, skip) if *skip == old.prefix.len() => {
+                            match old.children.iter().find(|(old_edge, _)| *old_edge == edge) {
+                                Some(&(_, old_child)) if old_child == target => {
+                                    self.stats.pruned_aligned += 1;
+                                    continue;
+                                }
+                                Some(&(_, old_child)) => OldRadix::Id(old_child),
+                                None => keys_below(&old.entries, &[edge]),
+                            }
+                        }
+                        OldRadix::At(old, skip) if old.prefix[*skip] == edge => {
+                            OldRadix::At(Arc::clone(old), skip + 1)
+                        }
+                        OldRadix::At(..) => OldRadix::absent(),
+                        OldRadix::Keys(keys) => keys_below(keys.iter(), &[edge]),
+                        OldRadix::Unknown | OldRadix::Id(_) => OldRadix::Unknown,
+                    };
+                    self.push(Task::Radix {
+                        id: target,
+                        role,
+                        path: here.extended(&[edge]),
+                        old: child_old,
+                        parent,
+                    })?;
+                }
+            }
         }
+        self.radix_references = references;
         Ok(self.emit(stored))
     }
 
@@ -1119,12 +1084,14 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
     }
 
     /// A key of the new collection whose value is new, or not known to be old.
+    /// `target` is what the key refers to: the key itself in a set, `value` in a map.
     async fn key_event(
         &mut self,
         role: Role,
         parent: Option<ViewId>,
         key: KeyPath,
         value: Option<ObjectId>,
+        target: ObjectId,
         old: OldValue,
     ) -> Result<()> {
         if let OldValue::Present(old_value) = old
@@ -1134,46 +1101,32 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(());
         }
         let known_new = matches!(old, OldValue::Absent);
-        let key_object = || ObjectId::from_digest(key.full());
         match role {
-            Role::RetainedViews => self.push_entity(key_object(), Entity::View, known_new),
-            Role::RetainedRevisions => self.push_entity(key_object(), Entity::Revision, known_new),
-            Role::RetainedApplications => {
-                self.push_entity(key_object(), Entity::Application, known_new)
-            }
-            Role::RetainedChanges => self.push_entity(key_object(), Entity::Change, known_new),
-            Role::ConflictSet => self.push_entity(key_object(), Entity::Conflict, false),
+            Role::RetainedViews => self.push_entity(target, Entity::View, known_new),
+            Role::RetainedRevisions => self.push_entity(target, Entity::Revision, known_new),
+            Role::RetainedApplications => self.push_entity(target, Entity::Application, known_new),
+            Role::RetainedChanges => self.push_entity(target, Entity::Change, known_new),
+            Role::ConflictSet => self.push_entity(target, Entity::Conflict, false),
             Role::LineageChildren => {
-                let child = ViewId::from_digest(key.full());
                 if let Some(parent) = parent {
-                    self.parent_of.entry(child).or_insert(parent);
+                    self.parent_of
+                        .entry(ViewId::from_digest(*target.as_bytes()))
+                        .or_insert(parent);
                 }
-                self.push_entity(child.into(), Entity::View, false)
+                self.push_entity(target, Entity::View, false)
             }
             Role::Lineage => {
-                let Some(children) = value else {
-                    return Ok(());
-                };
                 let parent = ViewId::from_digest(key.full());
                 let old_children = match old {
                     OldValue::Present(old) => old,
                     OldValue::Absent => None,
                     OldValue::Unknown => self.old_lineage_children(parent).await?,
                 };
-                self.push_radix_root(children, Role::LineageChildren, old_children, Some(parent))
+                self.push_radix_root(target, Role::LineageChildren, old_children, Some(parent))
             }
-            Role::ChangeMap => match value {
-                Some(change) => self.push_entity(change, Entity::Change, false),
-                None => Ok(()),
-            },
-            Role::RevisionMap => match value {
-                Some(revision) => self.push_entity(revision, Entity::Revision, false),
-                None => Ok(()),
-            },
-            Role::ApplicationMap => match value {
-                Some(application) => self.push_entity(application, Entity::Application, false),
-                None => Ok(()),
-            },
+            Role::ChangeMap => self.push_entity(target, Entity::Change, false),
+            Role::RevisionMap => self.push_entity(target, Entity::Revision, false),
+            Role::ApplicationMap => self.push_entity(target, Entity::Application, false),
         }
     }
 
@@ -1279,7 +1232,13 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             .await?
         {
             let record = decode(&stored, wheat_core::decode_revision_record)?;
-            self.old_edits.extend(revision_edits(&record));
+            let old_edits = &mut self.old_edits;
+            object_graph::revision(&record, |reference| {
+                if let Ref::Object(RevisionSite::Edit, id) = reference {
+                    old_edits.insert(id);
+                }
+                Ok::<_, StructuralDeltaError>(())
+            })?;
         }
         Ok(())
     }
@@ -1298,10 +1257,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(None);
         }
         if !known_new && self.old_retains(entity, id).await?
-            || entity == Entity::Edit
-                && self
-                    .old_edits
-                    .contains(&EditId::from_digest(*id.as_bytes()))
+            || entity == Entity::Edit && self.old_edits.contains(&id)
         {
             self.stats.pruned_retained += 1;
             return Ok(None);
@@ -1322,7 +1278,20 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Entity::Revision => self.follow_revision(&stored).await?,
             Entity::Application => self.follow_application(&stored).await?,
             Entity::Conflict => self.follow_conflict(&stored)?,
-            Entity::Change | Entity::Edit => {}
+            Entity::Edit => {
+                let edit = decode(&stored, wheat_core::decode_edit_record)?;
+                object_graph::edit(&edit, |reference| match reference {
+                    Ref::Object(site, _) => match site {},
+                    Ref::Content(_) => Ok::<_, StructuralDeltaError>(()),
+                })?;
+            }
+            Entity::Change => {
+                let change = decode(&stored, wheat_core::decode_change)?;
+                object_graph::change(&change, |reference| match reference {
+                    Ref::Object(site, _) => match site {},
+                    Ref::Content(_) => Ok::<_, StructuralDeltaError>(()),
+                })?;
+            }
         }
         Ok(self.emit(stored))
     }
@@ -1333,42 +1302,47 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             .old_counterpart(ViewId::from_digest(*stored.id.as_bytes()))
             .await?;
         let old = self.old_view(counterpart).await?;
-        let old_tree = old.map(|old| ObjectId::from(old.tree));
-        self.push_paired(
-            Task::Tree {
-                id: view.tree.into(),
-                old: old_tree,
-            },
-            old_tree,
-        )?;
-        for (role, id, old_id) in [
-            (
-                Role::RevisionMap,
-                ObjectId::from(view.revisions),
-                old.map(|old| old.revisions.into()),
-            ),
-            (
-                Role::ApplicationMap,
-                view.applications.into(),
-                old.map(|old| old.applications.into()),
-            ),
-            (
-                Role::ConflictSet,
-                view.unresolved_conflicts.into(),
-                old.map(|old| old.unresolved_conflicts.into()),
-            ),
-        ] {
-            self.push_radix_root(id, role, old_id, None)?;
-        }
-        let old_manifest = old.map(|old| ObjectId::from(old.required_content));
-        self.push_paired(
-            Task::Manifest {
-                id: view.required_content.into(),
-                old: old_manifest,
-                state_level: false,
-            },
-            old_manifest,
-        )
+        let old_field = |pick: fn(wheat_core::ViewRecord) -> ObjectId| old.map(pick);
+        object_graph::view(&view, |reference| {
+            let Ref::Object(site, id) = reference else {
+                return Ok(());
+            };
+            match site {
+                ViewSite::Tree => {
+                    let old = old_field(|old| old.tree.into());
+                    self.push_paired(Task::Tree { id, old }, old)
+                }
+                ViewSite::Revisions => self.push_radix_root(
+                    id,
+                    Role::RevisionMap,
+                    old_field(|old| old.revisions.into()),
+                    None,
+                ),
+                ViewSite::Applications => self.push_radix_root(
+                    id,
+                    Role::ApplicationMap,
+                    old_field(|old| old.applications.into()),
+                    None,
+                ),
+                ViewSite::UnresolvedConflicts => self.push_radix_root(
+                    id,
+                    Role::ConflictSet,
+                    old_field(|old| old.unresolved_conflicts.into()),
+                    None,
+                ),
+                ViewSite::RequiredContent => {
+                    let old = old_field(|old| old.required_content.into());
+                    self.push_paired(
+                        Task::Manifest {
+                            id,
+                            old,
+                            state_level: false,
+                        },
+                        old,
+                    )
+                }
+            }
+        })
     }
 
     /// The tree of the old view a tree based on `view` is best compared with.
@@ -1382,97 +1356,89 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
 
     async fn follow_revision(&mut self, stored: &StoredObject) -> Result<()> {
         let revision = decode(stored, wheat_core::decode_revision_record)?;
-        self.push_entity(revision.authored_against.into(), Entity::View, false)?;
+        // Before the edits are pushed: those the predecessor had may be old.
         if let Some(predecessor) = revision.predecessor {
-            self.push_entity(predecessor.into(), Entity::Revision, false)?;
             self.learn_old_edits(predecessor).await?;
         }
         let old_tree = self.old_tree_for(revision.authored_against).await?;
-        self.push_paired(
-            Task::Tree {
-                id: revision.resulting_tree.into(),
-                old: old_tree,
-            },
-            old_tree,
-        )?;
-        for edit in revision_edits(&revision) {
-            self.push_edit(edit)?;
-        }
-        for resolution in &revision.transition.resolutions {
-            self.push_entity(resolution.application.into(), Entity::Application, false)?;
-        }
-        Ok(())
+        object_graph::revision(&revision, |reference| {
+            let Ref::Object(site, id) = reference else {
+                return Ok(());
+            };
+            match site {
+                RevisionSite::Predecessor => self.push_entity(id, Entity::Revision, false),
+                RevisionSite::AuthoredAgainst => self.push_entity(id, Entity::View, false),
+                RevisionSite::Tree => self.push_paired(Task::Tree { id, old: old_tree }, old_tree),
+                RevisionSite::Edit => self.push_edit(id),
+                RevisionSite::ResolutionApplication => {
+                    self.push_entity(id, Entity::Application, false)
+                }
+            }
+        })
     }
 
     async fn follow_application(&mut self, stored: &StoredObject) -> Result<()> {
         let application = decode(stored, wheat_core::decode_application_record)?;
         // Before the conflict below is followed: its edits are mostly the revision's.
         self.learn_old_edits(application.revision_id).await?;
-        self.push_entity(application.revision_id.into(), Entity::Revision, false)?;
-        self.push_entity(application.target_view.into(), Entity::View, false)?;
         let old_tree = self.old_tree_for(application.target_view).await?;
-        let tree = match application.result {
-            ApplicationResultRecord::Clean { tree } => tree,
-            ApplicationResultRecord::Conflicted {
-                partial_tree,
-                conflict,
-            } => {
-                self.push_entity(conflict.into(), Entity::Conflict, false)?;
-                partial_tree
+        object_graph::application(&application, |reference| {
+            let Ref::Object(site, id) = reference else {
+                return Ok(());
+            };
+            match site {
+                ApplicationSite::Revision => self.push_entity(id, Entity::Revision, false),
+                ApplicationSite::TargetView => self.push_entity(id, Entity::View, false),
+                ApplicationSite::Tree => {
+                    self.push_paired(Task::Tree { id, old: old_tree }, old_tree)
+                }
+                ApplicationSite::Conflict => self.push_entity(id, Entity::Conflict, false),
+                ApplicationSite::Edit => self.push_edit(id),
             }
-        };
-        self.push_paired(
-            Task::Tree {
-                id: TreeId::into(tree),
-                old: old_tree,
-            },
-            old_tree,
-        )?;
-        for edit in application.applied.keys() {
-            self.push_edit(*edit)?;
-        }
-        Ok(())
+        })
     }
 
     fn follow_conflict(&mut self, stored: &StoredObject) -> Result<()> {
         let conflict = decode(stored, wheat_core::decode_conflict)?;
-        self.push_entity(conflict.base_view.into(), Entity::View, false)?;
-        for (edit, evidence) in &conflict.edits {
-            self.push_edit(*edit)?;
-            if let EditFailure::Interference { with } = &evidence.reason {
-                for other in with {
-                    self.push_edit(*other)?;
-                }
+        object_graph::conflict(&conflict, |reference| {
+            let Ref::Object(site, id) = reference else {
+                return Ok(());
+            };
+            match site {
+                ConflictSite::BaseView => self.push_entity(id, Entity::View, false),
+                ConflictSite::Edit => self.push_edit(id),
             }
-        }
-        Ok(())
+        })
     }
 
-    fn push_edit(&mut self, edit: EditId) -> Result<()> {
+    fn push_edit(&mut self, edit: ObjectId) -> Result<()> {
         if self.old_edits.contains(&edit) {
             self.stats.pruned_retained += 1;
             return Ok(());
         }
-        self.push_entity(edit.into(), Entity::Edit, false)
+        self.push_entity(edit, Entity::Edit, false)
     }
 }
 
-/// Every edit a revision refers to.
-fn revision_edits(revision: &wheat_core::RevisionRecord) -> impl Iterator<Item = EditId> + '_ {
-    let transition = &revision.transition;
-    revision
-        .edits
-        .iter()
-        .chain(transition.resolutions.iter().flat_map(|resolution| {
-            resolution
-                .conflicted_edits
-                .iter()
-                .chain(&resolution.replacement_edits)
-        }))
-        .chain(transition.subsumed.iter().flat_map(|subsumption| {
-            std::iter::once(&subsumption.source).chain(&subsumption.replacements)
-        }))
-        .copied()
+/// The set a content-set delta applies to; `None` for a snapshot.
+fn content_set_base(stored: &StoredObject) -> Result<Option<ObjectId>> {
+    let blob = object_graph::decode_content_set(stored).map_err(|source| {
+        StructuralDeltaError::Decode {
+            id: stored.id,
+            source,
+        }
+    })?;
+    let mut base = None;
+    if let Some(blob) = blob {
+        object_graph::content_set(&blob, |reference| {
+            match reference {
+                Ref::Object(ContentSetSite::Base, id) => base = Some(id),
+                Ref::Content(_) => {}
+            }
+            Ok::<_, StructuralDeltaError>(())
+        })?;
+    }
+    Ok(base)
 }
 
 fn decode<T>(

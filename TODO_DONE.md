@@ -149,6 +149,14 @@ Finished items, moved here from `TODO.md` under the same headings.
   2026-09-26: deleted from `crates/wheat-core/src/wire.rs`, with its two tests and
   its re-export. It missed several references, and nothing but its own tests called
   it after publish moved to `StructuralDelta`.
+- `[x]` **Snapshot export may skip retained-set members.** Done 2026-09-26: it did.
+  A snapshot of a 150-change history left out views, revisions, trees and more,
+  because set members stored inline in a node were only followed when the node had a
+  key of its own, which such a node never has. Fixed by taking every reference from
+  `crates/wheat-store/src/object_graph.rs`, which `StructuralDelta` uses too. Tested
+  by `a_snapshot_export_lists_the_same_closure_as_the_walk` and the long-history test
+  in `crates/wheat-store/tests/structural_delta.rs`. The scratch index no longer
+  syncs to disk on every write, which took that test from 67 s to 6 s.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 

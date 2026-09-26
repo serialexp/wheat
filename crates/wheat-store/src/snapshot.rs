@@ -5,15 +5,12 @@ use async_trait::async_trait;
 use rusqlite::{Connection, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use wheat_core::{
-    ApplicationResultRecord, ContentId, DirectoryEntry, EditFailure, EditOperation, ObjectId,
-    RepositoryEnvelopeId,
-};
+use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 
 use crate::{
-    ContentStore, ContentStoreError, ImmutableObjectStore, ObjectKind, ObjectStoreError,
-    PublicationError, PublicationStore, RepositoryHead, RepositoryPublicationError,
-    RepositoryReader, StoredObject,
+    ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError, PublicationError,
+    PublicationStore, RepositoryHead, RepositoryPublicationError, RepositoryReader, StoredObject,
+    object_graph::{self, MalformedRadix, RadixKind, Reference},
 };
 
 const MAGIC: &[u8; 8] = b"WHEATSNP";
@@ -458,6 +455,12 @@ pub enum SnapshotError {
     Repository(#[from] RepositoryPublicationError),
 }
 
+impl From<MalformedRadix> for SnapshotError {
+    fn from(_: MalformedRadix) -> Self {
+        Self::InvalidManifest("radix node does not fit where it is reached")
+    }
+}
+
 /// Convenience adapter which intentionally aggregates payloads in memory. Production callers
 /// should use [`export_snapshot_to`].
 pub async fn export_snapshot<O: ImmutableObjectStore, P: PublicationStore>(
@@ -564,6 +567,8 @@ impl ClosureWalk {
         let connection = Connection::open(file.path())?;
         connection.execute_batch(
             "PRAGMA temp_store = MEMORY;
+             PRAGMA journal_mode = OFF;
+             PRAGMA synchronous = OFF;
              PRAGMA cache_size = -2048;
              CREATE TABLE objects (
                  id BLOB PRIMARY KEY,
@@ -790,333 +795,25 @@ impl ClosureWalk {
             .map_err(Into::into)
     }
 
+    /// Enqueues everything `stored` refers to.
     fn follow(&mut self, stored: &StoredObject) -> Result<(), SnapshotError> {
-        let bytes = &stored.canonical_bytes;
-        match stored.kind {
-            ObjectKind::RepositoryEnvelope => {
-                let record = wheat_core::decode_repository_envelope_record(bytes)?;
-                self.enqueue_object(record.state.into())?;
-                self.enqueue_object(record.labels.into())?;
+        let radix_path = if RadixKind::of(stored.kind).is_some() {
+            match self.radix_path(stored.id)? {
+                Some(path) => Some(path),
+                // Reached so far only as a value elsewhere. If it is reached as a node
+                // later, enqueue_object_at resets it with its authenticated path.
+                None => return Ok(()),
             }
-            ObjectKind::ViewLabelManifest => {
-                let record = wheat_core::decode_view_label_manifest_record(bytes)?;
-                for label in record.labels.values() {
-                    self.enqueue_object(label.view.into())?;
-                }
-            }
-            ObjectKind::RepositoryState => {
-                let record = wheat_core::decode_repository_state_record(bytes)?;
-                self.enqueue_object(record.base_view.into())?;
-                for id in [
-                    record.changes.into(),
-                    record.view_lineage.into(),
-                    record.retained_changes.into(),
-                    record.retained_views.into(),
-                    record.retained_revisions.into(),
-                    record.retained_applications.into(),
-                ] {
-                    self.enqueue_radix_root(id)?;
-                }
-                self.enqueue_object(record.required_content.into())?;
-            }
-            ObjectKind::View => {
-                let record = wheat_core::decode_view_record(bytes)?;
-                self.enqueue_object(record.tree.into())?;
-                for id in [
-                    record.revisions.into(),
-                    record.applications.into(),
-                    record.unresolved_conflicts.into(),
-                ] {
-                    self.enqueue_radix_root(id)?;
-                }
-                self.enqueue_object(record.required_content.into())?;
-            }
-            ObjectKind::ContentManifest => {
-                self.enqueue_radix_root(
-                    wheat_core::decode_content_manifest_record(bytes)?
-                        .content
-                        .into(),
-                )?;
-            }
-            ObjectKind::Tree => {
-                let node = wheat_core::decode_directory_node(bytes)?;
-                for entry in node.entries.values() {
-                    match entry {
-                        DirectoryEntry::File(value) => self.enqueue_content(value.content)?,
-                        DirectoryEntry::Directory(id) => self.enqueue_object((*id).into())?,
-                    }
-                }
-            }
-            ObjectKind::Revision => {
-                let record = wheat_core::decode_revision_record(bytes)?;
-                if let Some(id) = record.predecessor {
-                    self.enqueue_object(id.into())?;
-                }
-                self.enqueue_object(record.authored_against.into())?;
-                self.enqueue_object(record.resulting_tree.into())?;
-                for id in &record.edits {
-                    self.enqueue_object((*id).into())?;
-                }
-                for resolution in &record.transition.resolutions {
-                    self.enqueue_object(resolution.application.into())?;
-                    for id in resolution
-                        .conflicted_edits
-                        .iter()
-                        .chain(&resolution.replacement_edits)
-                    {
-                        self.enqueue_object((*id).into())?;
-                    }
-                }
-                for subsumption in &record.transition.subsumed {
-                    self.enqueue_object(subsumption.source.into())?;
-                    for id in &subsumption.replacements {
-                        self.enqueue_object((*id).into())?;
-                    }
-                }
-            }
-            ObjectKind::Application => {
-                let record = wheat_core::decode_application_record(bytes)?;
-                self.enqueue_object(record.revision_id.into())?;
-                self.enqueue_object(record.target_view.into())?;
-                match record.result {
-                    ApplicationResultRecord::Clean { tree } => self.enqueue_object(tree.into())?,
-                    ApplicationResultRecord::Conflicted {
-                        partial_tree,
-                        conflict,
-                    } => {
-                        self.enqueue_object(partial_tree.into())?;
-                        self.enqueue_object(conflict.into())?;
-                    }
-                }
-                for (edit, evidence) in record.applied {
-                    self.enqueue_object(edit.into())?;
-                    if let Some(value) = evidence.target {
-                        self.enqueue_content(value.content)?;
-                    }
-                }
-            }
-            ObjectKind::Conflict => {
-                let record = wheat_core::decode_conflict(bytes)?;
-                self.enqueue_object(record.base_view.into())?;
-                for (edit, evidence) in record.edits {
-                    self.enqueue_object(edit.into())?;
-                    if let Some(value) = evidence.target {
-                        self.enqueue_content(value.content)?;
-                    }
-                    if let EditFailure::Interference { with } = evidence.reason {
-                        for id in with {
-                            self.enqueue_object(id.into())?;
-                        }
-                    }
-                }
-            }
-            ObjectKind::Edit => match wheat_core::decode_edit_record(bytes)?.operation {
-                EditOperation::GuardedText {
-                    before,
-                    expected,
-                    replacement,
-                    after,
-                    ..
-                } => {
-                    for id in [before, expected, replacement, after] {
-                        self.enqueue_content(id)?;
-                    }
-                }
-                EditOperation::ExactFile {
-                    expected,
-                    replacement,
-                } => {
-                    for value in expected.into_iter().chain(replacement) {
-                        self.enqueue_content(value.content)?;
-                    }
-                }
-            },
-            ObjectKind::Change => {}
-            ObjectKind::RevisionMapNode => {
-                let node = wheat_core::decode_revision_map_node(bytes)?;
-                self.follow_radix(
-                    stored.id,
-                    &node.prefix,
-                    node.value.map(Into::into),
-                    node.children
-                        .into_iter()
-                        .map(|child| (child.edge, child.child.into())),
-                    false,
-                    false,
-                )?;
-                // Inline entry values are object references.
-                for (_, value) in &node.entries {
-                    self.enqueue_object((*value).into())?;
-                }
-            }
-            ObjectKind::ApplicationMapNode => {
-                let node = wheat_core::decode_application_map_node(bytes)?;
-                self.follow_radix(
-                    stored.id,
-                    &node.prefix,
-                    node.value.map(Into::into),
-                    node.children
-                        .into_iter()
-                        .map(|child| (child.edge, child.child.into())),
-                    false,
-                    false,
-                )?;
-                for (_, value) in &node.entries {
-                    self.enqueue_object((*value).into())?;
-                }
-            }
-            ObjectKind::ChangeMapNode => {
-                let node = wheat_core::decode_change_map_node(bytes)?;
-                self.follow_radix(
-                    stored.id,
-                    &node.prefix,
-                    node.value.map(Into::into),
-                    node.children
-                        .into_iter()
-                        .map(|child| (child.edge, child.child.into())),
-                    false,
-                    false,
-                )?;
-                for (_, value) in &node.entries {
-                    self.enqueue_object((*value).into())?;
-                }
-            }
-            ObjectKind::ViewLineageMapNode => {
-                let node = wheat_core::decode_view_lineage_map_node(bytes)?;
-                let child_set = node.value;
-                self.follow_radix(
-                    stored.id,
-                    &node.prefix,
-                    None,
-                    node.children
-                        .into_iter()
-                        .map(|child| (child.edge, child.child.into())),
-                    false,
-                    false,
-                )?;
-                if let Some(id) = child_set {
-                    self.enqueue_radix_root(id.into())?;
-                }
-                // Inline entry values are RetainedSetIds (radix roots).
-                for (_, value) in &node.entries {
-                    self.enqueue_radix_root((*value).into())?;
-                }
-            }
-            ObjectKind::ConflictSetNode => {
-                let node = wheat_core::decode_conflict_set_node(bytes)?;
-                self.follow_radix_with_set_entries(
-                    stored.id,
-                    &node.prefix,
-                    node.children
-                        .into_iter()
-                        .map(|child| (child.edge, child.child.into())),
-                    false,
-                    node.present,
-                    &node.entries,
-                )?;
-            }
-            // Snapshot has no child object references — just a flat array of ContentIds.
-            ObjectKind::ContentSetSnapshot => {}
-            // Delta references its base as a child object.
-            ObjectKind::ContentSetDelta => {
-                let blob = wheat_core::decode_content_set_blob(bytes)?;
-                if let wheat_core::ContentSetBlob::Delta { base, .. } = blob {
-                    self.enqueue_object(base.into())?;
-                }
-            }
-            ObjectKind::RetainedSetNode => {
-                let node = wheat_core::decode_retained_set_node(bytes)?;
-                self.follow_radix_with_set_entries(
-                    stored.id,
-                    &node.prefix,
-                    node.children
-                        .into_iter()
-                        .map(|child| (child.edge, child.child.into())),
-                    false,
-                    node.present,
-                    &node.entries,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn follow_radix_with_set_entries(
-        &mut self,
-        id: ObjectId,
-        prefix: &[u8],
-        children: impl IntoIterator<Item = (u8, ObjectId)>,
-        content_terminal: bool,
-        object_terminal: bool,
-        entries: &[Vec<u8>],
-    ) -> Result<(), SnapshotError> {
-        self.follow_radix(
-            id,
-            prefix,
-            None,
-            children,
-            content_terminal,
-            object_terminal,
-        )?;
-        // Set inline entries are terminal keys. Their suffix appended to the
-        // radix path at this node gives the full key/digest.
-        if !entries.is_empty()
-            && let Some(mut path) = self.radix_path(id)?
-        {
-            path.extend_from_slice(prefix);
-            for suffix in entries {
-                let mut full = path.clone();
-                full.extend_from_slice(suffix);
-                let digest: [u8; 32] = full
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| SnapshotError::InvalidManifest("invalid set entry terminal"))?;
-                if content_terminal {
-                    self.enqueue_content(ContentId::from_digest(digest))?;
-                }
-                if object_terminal {
-                    self.enqueue_object(ObjectId::from_digest(digest))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn follow_radix(
-        &mut self,
-        id: ObjectId,
-        prefix: &[u8],
-        value: Option<ObjectId>,
-        children: impl IntoIterator<Item = (u8, ObjectId)>,
-        content_terminal: bool,
-        object_terminal: bool,
-    ) -> Result<(), SnapshotError> {
-        let Some(mut path) = self.radix_path(id)? else {
-            // The same immutable object can also be a semantic value elsewhere. If it is later
-            // reached structurally, enqueue_object_at resets it with the authenticated path.
-            return Ok(());
+        } else {
+            None
         };
-        path.extend_from_slice(prefix);
-        if let Some(value) = value {
-            self.enqueue_object(value)?;
-        }
-        if content_terminal || object_terminal {
-            let digest: [u8; 32] = path
-                .as_slice()
-                .try_into()
-                .map_err(|_| SnapshotError::InvalidManifest("invalid set terminal"))?;
-            if content_terminal {
-                self.enqueue_content(ContentId::from_digest(digest))?;
-            } else {
-                self.enqueue_object(ObjectId::from_digest(digest))?;
-            }
-        }
-        for (edge, child) in children {
-            path.push(edge);
-            self.enqueue_radix_child(child, &path)?;
-            path.pop();
-        }
-        Ok(())
+        object_graph::for_each_reference(stored, radix_path.as_deref(), |reference| match reference
+        {
+            Reference::Object(id) => self.enqueue_object(id),
+            Reference::RadixRoot(id) => self.enqueue_radix_root(id),
+            Reference::RadixChild { id, above } => self.enqueue_radix_child(id, above),
+            Reference::Content(id) => self.enqueue_content(id),
+        })
     }
 }
 

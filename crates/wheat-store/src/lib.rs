@@ -33,6 +33,7 @@ mod loose;
 mod merkle_tree;
 mod metadata_repack;
 mod mutation_publication;
+mod object_graph;
 mod object_store_adapter;
 mod ownership;
 pub use ownership::{

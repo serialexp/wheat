@@ -127,12 +127,20 @@ budget passes, but by only about 0.7 s.
   lines 173, 223) and `workspace.rs` in wheat-cli (around lines 130, 391). Check each
   with a directory → file change, then either fix them one by one or make
   `lookup_many` itself read such paths as absent.
-- `[ ]` **Snapshot export may skip retained-set members (2026-09-26, unchecked).**
-  `ClosureWalk::follow_radix_with_set_entries` (`crates/wheat-store/src/snapshot.rs`)
-  follows a set node's inline entries only when the node itself is `present` (the
-  same flag is passed for both). A retained or conflict set node with inline entries
-  but no own key would leave those members out, unless something else reaches them.
-  Write a test with such a node, then fix or explain.
+- `[ ]` **Snapshot export scans its whole scratch table for every object
+  (2026-09-26).** `ClosureWalk::next_object` and `next_content`
+  (`crates/wheat-store/src/snapshot.rs`) run `SELECT id ... WHERE processed = 0 LIMIT
+  1` with no index on `processed`, so each call steps over every row already done:
+  quadratic in the closure size. Export and restore both walk this way. There is no
+  benchmark for either; add a `wheat-bench` case at a realistic closure size first,
+  then fix (an index, or a queue of pending rows).
+- `[ ]` **Snapshot export refuses a radix node that sits under two edges
+  (2026-09-26, not tried).** `ClosureWalk::enqueue_object_at` fails with "radix node
+  reached at multiple paths" when one node ID turns up at a second key path. A
+  node's ID does not include its key path, so two subtrees that differ only in their
+  edge byte are one node (`one_subtree_under_two_edges_is_walked_under_both` in
+  `structural_delta.rs` builds such a set). With hashed keys this takes crafted
+  input. Export should keep one row per (node, path).
 - `[ ]` **Fetch pushes whole objects, even when the client has the old version
   (2026-09-26).** The push sends every object the walk finds in full. Some objects
   grow with the repository and change with every view: a content-set snapshot is
