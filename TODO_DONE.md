@@ -157,6 +157,25 @@ Finished items, moved here from `TODO.md` under the same headings.
   by `a_snapshot_export_lists_the_same_closure_as_the_walk` and the long-history test
   in `crates/wheat-store/tests/structural_delta.rs`. The scratch index no longer
   syncs to disk on every write, which took that test from 67 s to 6 s.
+- `[x]` **Snapshot export scans its whole scratch table for every object.** Done
+  2026-09-26: `ClosureWalk` (`crates/wheat-store/src/snapshot.rs`) now keeps what is
+  left to do in two stacks (`pending`, `pending_contents`) and pops the top row with
+  one indexed `DELETE ... RETURNING`, with every statement cached. Bench case
+  `snapshot_export` (10,000 vs 40,000 files, 50 changes each, median of 3): time per
+  item for the large repository is 107% (export) and 108% (restore) of the small
+  one's, budget 150% (`bench/results/wheat-quick/20260926-134434-7fe1d5c5de7c.tsv`).
+  One run under heavy load measured restore at 191%. No
+  before-numbers: they need the old code built next to the new. Growing files and
+  changes together is not a fair size test, because every view keeps a list of all
+  its files: 4× both gave 15× the bytes.
+- `[x]` **Snapshot export refuses a radix node that sits under two edges.** Done
+  2026-09-26: the walk visits an object once per place it is reached (a `visits`
+  table keyed by object and place: a plain reference, or a radix node's key path),
+  and records it on the first visit. A crafted map can repeat one subtree at every
+  level, so visits are capped at twice `max_objects` (`LimitExceeded("closure
+  visits")`). Tests in `snapshot.rs`: `one_subtree_under_two_edges_is_followed_under_both`
+  and `repeated_subtrees_are_capped_by_the_visit_limit`. The fetch walk still lacks
+  such a cap (new item in `TODO.md`).
 
 ## Revise/compose cost at stack depth (2026-09-25)
 

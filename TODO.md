@@ -127,20 +127,25 @@ budget passes, but by only about 0.7 s.
   lines 173, 223) and `workspace.rs` in wheat-cli (around lines 130, 391). Check each
   with a directory → file change, then either fix them one by one or make
   `lookup_many` itself read such paths as absent.
-- `[ ]` **Snapshot export scans its whole scratch table for every object
-  (2026-09-26).** `ClosureWalk::next_object` and `next_content`
-  (`crates/wheat-store/src/snapshot.rs`) run `SELECT id ... WHERE processed = 0 LIMIT
-  1` with no index on `processed`, so each call steps over every row already done:
-  quadratic in the closure size. Export and restore both walk this way. There is no
-  benchmark for either; add a `wheat-bench` case at a realistic closure size first,
-  then fix (an index, or a queue of pending rows).
-- `[ ]` **Snapshot export refuses a radix node that sits under two edges
-  (2026-09-26, not tried).** `ClosureWalk::enqueue_object_at` fails with "radix node
-  reached at multiple paths" when one node ID turns up at a second key path. A
-  node's ID does not include its key path, so two subtrees that differ only in their
-  edge byte are one node (`one_subtree_under_two_edges_is_walked_under_both` in
-  `structural_delta.rs` builds such a set). With hashed keys this takes crafted
-  input. Export should keep one row per (node, path).
+- `[ ]` **The fetch walk has no cap on repeated radix subtrees (2026-09-26).** A
+  radix node's ID does not include its key path, so one node can sit under several
+  edges, and a crafted map can repeat that at every level: a few nodes, walked 2^depth
+  times. `StructuralDelta` (`crates/wheat-store/src/structural_delta.rs`) walks a node
+  once per (node, role, path) and keeps every such triple in `radix_walked`, so both
+  its time and its memory follow the repeats. `max_pending` does not help: the queue
+  stays short. Snapshot's `ClosureWalk` caps visits at twice `max_objects`
+  (`LimitExceeded("closure visits")`); the fetch walk needs a similar cap. Check
+  first which maps a client can fill with chosen keys (change IDs are UUIDs the
+  client picks).
+- `[ ]` **`one_step_forward_yields_little_more_than_the_difference` fails about one
+  run in twelve (2026-09-26).** `crates/wheat-store/tests/structural_delta.rs`, step 5
+  (revising `a` under `b` and `c`): the walk yields one old `RevisionMapNode`. Likely
+  cause, not yet proven: change IDs are UUIDv7, so whether two changes share a
+  millisecond, and so a map node, varies per run. The revise makes new views in
+  between whose nearest old ancestor is the base view (an empty map), so an
+  unchanged node shared with an old map is sent again. That is extra data, not
+  missing data. Options: fixed change IDs in the test, better pairing for such
+  views, or a looser test.
 - `[ ]` **Fetch pushes whole objects, even when the client has the old version
   (2026-09-26).** The push sends every object the walk finds in full. Some objects
   grow with the repository and change with every view: a content-set snapshot is

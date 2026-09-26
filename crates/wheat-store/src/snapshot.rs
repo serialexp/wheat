@@ -10,7 +10,7 @@ use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 use crate::{
     ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError, PublicationError,
     PublicationStore, RepositoryHead, RepositoryPublicationError, RepositoryReader, StoredObject,
-    object_graph::{self, MalformedRadix, RadixKind, Reference},
+    object_graph::{self, MalformedRadix, Reference},
 };
 
 const MAGIC: &[u8; 8] = b"WHEATSNP";
@@ -490,24 +490,29 @@ pub async fn export_snapshot_to<O: ImmutableObjectStore, P: PublicationStore, S:
     let mut object_batch = Vec::with_capacity(limits.batch_items);
     let mut batch_bytes = 0usize;
 
-    while let Some(id) = walk.next_object()? {
-        let stored = objects.get(id).await?;
+    while let Some(visit) = walk.next_object()? {
+        let stored = objects.get(visit.id).await?;
         let len = stored.canonical_bytes.len();
-        account(
-            &mut total,
-            len,
-            limits.max_object_bytes,
-            limits.max_total_bytes,
-        )?;
-        walk.record_object(id, len)?;
-        walk.follow(&stored)?;
+        if visit.first {
+            account(
+                &mut total,
+                len,
+                limits.max_object_bytes,
+                limits.max_total_bytes,
+            )?;
+            walk.record_object(visit.id, len)?;
+        }
+        walk.follow(&stored, &visit)?;
+        if !visit.first {
+            continue;
+        }
         if should_flush(&object_batch, batch_bytes, len, limits)? {
             sink.write_objects(&object_batch).await?;
             object_batch.clear();
             batch_bytes = 0;
         }
         batch_bytes += len;
-        object_batch.push((id, stored.canonical_bytes.to_vec()));
+        object_batch.push((visit.id, stored.canonical_bytes.to_vec()));
     }
     if !object_batch.is_empty() {
         sink.write_objects(&object_batch).await?;
@@ -553,30 +558,112 @@ pub async fn export_snapshot_to<O: ImmutableObjectStore, P: PublicationStore, S:
     Ok(id)
 }
 
+/// How many visits the walk allows per object in the inventory limit. A radix node's
+/// ID does not include where it sits, so one node can sit under several edges and is
+/// followed once for each; a crafted set could repeat that at every level.
+const VISITS_PER_OBJECT: usize = 2;
+
+/// The closure of an envelope, walked with its bookkeeping in a scratch SQLite file so
+/// memory stays flat however big the repository is.
+///
+/// An object is visited once for each place it is reached: once as a plain reference,
+/// and once for each key path it sits under as a radix node (a node lists its keys
+/// relative to that path). The first visit records it in the inventory.
 struct ClosureWalk {
     connection: Connection,
     _file: NamedTempFile,
     limits: SnapshotLimits,
     object_count: usize,
     content_count: usize,
+    visit_count: usize,
+    /// Scratch for the place being enqueued, encoded as [`encode_place`] does.
+    place: Vec<u8>,
+}
+
+/// One visit of an object: read it, record it if it is the first, and follow it.
+struct Visit {
+    id: ObjectId,
+    /// Whether this is the object's first visit, the one that records it.
+    first: bool,
+    /// The key bytes above it, when it was reached as a radix node.
+    radix_path: Option<RadixPath>,
+}
+
+/// Key bytes above a radix node. Full keys are 32 bytes, so no path is longer.
+struct RadixPath {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl Visit {
+    fn radix_path(&self) -> Option<&[u8]> {
+        self.radix_path.as_ref().map(|path| &path.bytes[..path.len])
+    }
+}
+
+/// A place as stored in the scratch file: empty for a plain reference, `1` and the
+/// key path for a radix node.
+fn encode_place(place: &mut Vec<u8>, radix_path: Option<&[u8]>) {
+    place.clear();
+    if let Some(path) = radix_path {
+        place.push(1);
+        place.extend_from_slice(path);
+    }
+}
+
+fn decode_place(place: &[u8]) -> Result<Option<RadixPath>, SnapshotError> {
+    match place {
+        [] => Ok(None),
+        [1, path @ ..] if path.len() <= 32 => {
+            let mut bytes = [0; 32];
+            bytes[..path.len()].copy_from_slice(path);
+            Ok(Some(RadixPath {
+                bytes,
+                len: path.len(),
+            }))
+        }
+        _ => Err(SnapshotError::InventoryMismatch),
+    }
+}
+
+/// Column `index` of a scratch row, which the walk only ever fills with a blob.
+fn blob<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> Result<&'a [u8], SnapshotError> {
+    row.get_ref(index)?
+        .as_blob()
+        .map_err(|_| SnapshotError::InventoryMismatch)
+}
+
+fn digest(bytes: &[u8]) -> Result<[u8; 32], SnapshotError> {
+    bytes
+        .try_into()
+        .map_err(|_| SnapshotError::InventoryMismatch)
 }
 
 impl ClosureWalk {
     fn new(limits: SnapshotLimits) -> Result<Self, SnapshotError> {
         let file = NamedTempFile::new().map_err(SnapshotError::ScratchFile)?;
         let connection = Connection::open(file.path())?;
+        // `pending` and `pending_contents` are stacks: the walk pops the highest
+        // `seq`, which the rowid index finds without a scan.
         connection.execute_batch(
             "PRAGMA temp_store = MEMORY;
              PRAGMA journal_mode = OFF;
              PRAGMA synchronous = OFF;
              PRAGMA cache_size = -2048;
-             CREATE TABLE objects (
-                 id BLOB PRIMARY KEY,
-                 processed INTEGER NOT NULL,
-                 bytes INTEGER,
-                 radix_path BLOB
+             CREATE TABLE objects (id BLOB PRIMARY KEY, bytes INTEGER) WITHOUT ROWID;
+             CREATE TABLE visits (
+                 id BLOB NOT NULL,
+                 place BLOB NOT NULL,
+                 PRIMARY KEY (id, place)
+             ) WITHOUT ROWID;
+             CREATE TABLE pending (
+                 seq INTEGER PRIMARY KEY,
+                 id BLOB NOT NULL,
+                 place BLOB NOT NULL,
+                 first INTEGER NOT NULL
              );
-             CREATE TABLE contents (id BLOB PRIMARY KEY, processed INTEGER NOT NULL, bytes INTEGER);",
+             CREATE TABLE contents (id BLOB PRIMARY KEY, bytes INTEGER) WITHOUT ROWID;
+             CREATE TABLE pending_contents (seq INTEGER PRIMARY KEY, id BLOB NOT NULL);",
         )?;
         Ok(Self {
             connection,
@@ -584,6 +671,8 @@ impl ClosureWalk {
             limits,
             object_count: 0,
             content_count: 0,
+            visit_count: 0,
+            place: Vec::with_capacity(33),
         })
     }
 
@@ -604,45 +693,46 @@ impl ClosureWalk {
         id: ObjectId,
         radix_path: Option<&[u8]>,
     ) -> Result<(), SnapshotError> {
-        let inserted = self.connection.execute(
-            "INSERT OR IGNORE INTO objects (id, processed, radix_path) VALUES (?1, 0, ?2)",
-            params![id.as_bytes().as_slice(), radix_path],
-        )?;
-        if inserted != 0 {
+        let id = id.as_bytes().as_slice();
+        encode_place(&mut self.place, radix_path);
+        let new_visit = self
+            .connection
+            .prepare_cached("INSERT OR IGNORE INTO visits (id, place) VALUES (?1, ?2)")?
+            .execute(params![id, self.place])?;
+        if new_visit == 0 {
+            return Ok(());
+        }
+        self.visit_count += 1;
+        if self.visit_count > self.limits.max_objects.saturating_mul(VISITS_PER_OBJECT) {
+            return Err(SnapshotError::LimitExceeded("closure visits"));
+        }
+        let first = self
+            .connection
+            .prepare_cached("INSERT OR IGNORE INTO objects (id) VALUES (?1)")?
+            .execute([id])?
+            != 0;
+        if first {
             self.object_count += 1;
             self.check_inventory_limits()?;
-        } else if let Some(path) = radix_path {
-            let existing = self.connection.query_row(
-                "SELECT radix_path FROM objects WHERE id = ?1",
-                [id.as_bytes().as_slice()],
-                |row| row.get::<_, Option<Vec<u8>>>(0),
-            )?;
-            match existing {
-                None => {
-                    self.connection.execute(
-                        "UPDATE objects SET radix_path = ?2, processed = 0 WHERE id = ?1",
-                        params![id.as_bytes().as_slice(), path],
-                    )?;
-                }
-                Some(existing) if existing == path => {}
-                Some(_) => {
-                    return Err(SnapshotError::InvalidManifest(
-                        "radix node reached at multiple paths",
-                    ));
-                }
-            }
         }
+        self.connection
+            .prepare_cached("INSERT INTO pending (id, place, first) VALUES (?1, ?2, ?3)")?
+            .execute(params![id, self.place, first])?;
         Ok(())
     }
 
     fn enqueue_content(&mut self, id: ContentId) -> Result<(), SnapshotError> {
-        let inserted = self.connection.execute(
-            "INSERT OR IGNORE INTO contents (id, processed) VALUES (?1, 0)",
-            [id.as_bytes().as_slice()],
-        )?;
+        let id = id.as_bytes().as_slice();
+        let inserted = self
+            .connection
+            .prepare_cached("INSERT OR IGNORE INTO contents (id) VALUES (?1)")?
+            .execute([id])?;
         if inserted != 0 {
             self.content_count += 1;
             self.check_inventory_limits()?;
+            self.connection
+                .prepare_cached("INSERT INTO pending_contents (id) VALUES (?1)")?
+                .execute([id])?;
         }
         Ok(())
     }
@@ -667,73 +757,53 @@ impl ClosureWalk {
         Ok(())
     }
 
-    fn next_object(&self) -> Result<Option<ObjectId>, SnapshotError> {
-        let mut statement = self
-            .connection
-            .prepare_cached("SELECT id FROM objects WHERE processed = 0 LIMIT 1")?;
+    fn next_object(&self) -> Result<Option<Visit>, SnapshotError> {
+        // Every change a RETURNING statement makes happens on its first step, so
+        // stopping after the one row it returns is fine.
+        let mut statement = self.connection.prepare_cached(
+            "DELETE FROM pending WHERE seq = (SELECT max(seq) FROM pending)
+             RETURNING id, place, first",
+        )?;
         let mut rows = statement.query([])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        let bytes: Vec<u8> = row.get(0)?;
-        let id = ObjectId::from_digest(
-            bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| SnapshotError::InventoryMismatch)?,
-        );
-        drop(rows);
-        drop(statement);
-        self.connection.execute(
-            "UPDATE objects SET processed = 1 WHERE id = ?1",
-            [id.as_bytes().as_slice()],
-        )?;
-        Ok(Some(id))
+        Ok(Some(Visit {
+            id: ObjectId::from_digest(digest(blob(row, 0)?)?),
+            radix_path: decode_place(blob(row, 1)?)?,
+            first: row.get(2)?,
+        }))
     }
 
     fn next_content(&self) -> Result<Option<ContentId>, SnapshotError> {
-        let mut statement = self
-            .connection
-            .prepare_cached("SELECT id FROM contents WHERE processed = 0 LIMIT 1")?;
+        let mut statement = self.connection.prepare_cached(
+            "DELETE FROM pending_contents WHERE seq = (SELECT max(seq) FROM pending_contents)
+             RETURNING id",
+        )?;
         let mut rows = statement.query([])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        let bytes: Vec<u8> = row.get(0)?;
-        let id = ContentId::from_digest(
-            bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| SnapshotError::InventoryMismatch)?,
-        );
-        drop(rows);
-        drop(statement);
-        self.connection.execute(
-            "UPDATE contents SET processed = 1 WHERE id = ?1",
-            [id.as_bytes().as_slice()],
-        )?;
-        Ok(Some(id))
+        Ok(Some(ContentId::from_digest(digest(blob(row, 0)?)?)))
     }
 
     fn record_object(&self, id: ObjectId, bytes: usize) -> Result<(), SnapshotError> {
-        self.connection.execute(
-            "UPDATE objects SET bytes = ?2 WHERE id = ?1",
-            params![
+        self.connection
+            .prepare_cached("UPDATE objects SET bytes = ?2 WHERE id = ?1")?
+            .execute(params![
                 id.as_bytes().as_slice(),
                 i64::try_from(bytes).map_err(|_| SnapshotError::LimitExceeded("item bytes"))?
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
     fn record_content(&self, id: ContentId, bytes: usize) -> Result<(), SnapshotError> {
-        self.connection.execute(
-            "UPDATE contents SET bytes = ?2 WHERE id = ?1",
-            params![
+        self.connection
+            .prepare_cached("UPDATE contents SET bytes = ?2 WHERE id = ?1")?
+            .execute(params![
                 id.as_bytes().as_slice(),
                 i64::try_from(bytes).map_err(|_| SnapshotError::LimitExceeded("item bytes"))?
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -741,21 +811,13 @@ impl ClosureWalk {
         let mut statement = self
             .connection
             .prepare("SELECT id, bytes FROM objects ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let bytes: i64 = row.get(1)?;
-            Ok((id, bytes))
-        })?;
+        let mut rows = statement.query([])?;
         let mut inventory = Vec::with_capacity(self.object_count);
-        for row in rows {
-            let (id, bytes) = row?;
+        while let Some(row) = rows.next()? {
             inventory.push(InventoryEntry {
-                id: ObjectId::from_digest(
-                    id.as_slice()
-                        .try_into()
-                        .map_err(|_| SnapshotError::InventoryMismatch)?,
-                ),
-                bytes: u64::try_from(bytes).map_err(|_| SnapshotError::InventoryMismatch)?,
+                id: ObjectId::from_digest(digest(blob(row, 0)?)?),
+                bytes: u64::try_from(row.get::<_, i64>(1)?)
+                    .map_err(|_| SnapshotError::InventoryMismatch)?,
             });
         }
         Ok(inventory)
@@ -765,50 +827,22 @@ impl ClosureWalk {
         let mut statement = self
             .connection
             .prepare("SELECT id, bytes FROM contents ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let bytes: i64 = row.get(1)?;
-            Ok((id, bytes))
-        })?;
+        let mut rows = statement.query([])?;
         let mut inventory = Vec::with_capacity(self.content_count);
-        for row in rows {
-            let (id, bytes) = row?;
+        while let Some(row) = rows.next()? {
             inventory.push(InventoryEntry {
-                id: ContentId::from_digest(
-                    id.as_slice()
-                        .try_into()
-                        .map_err(|_| SnapshotError::InventoryMismatch)?,
-                ),
-                bytes: u64::try_from(bytes).map_err(|_| SnapshotError::InventoryMismatch)?,
+                id: ContentId::from_digest(digest(blob(row, 0)?)?),
+                bytes: u64::try_from(row.get::<_, i64>(1)?)
+                    .map_err(|_| SnapshotError::InventoryMismatch)?,
             });
         }
         Ok(inventory)
     }
 
-    fn radix_path(&self, id: ObjectId) -> Result<Option<Vec<u8>>, SnapshotError> {
-        self.connection
-            .query_row(
-                "SELECT radix_path FROM objects WHERE id = ?1",
-                [id.as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    }
-
-    /// Enqueues everything `stored` refers to.
-    fn follow(&mut self, stored: &StoredObject) -> Result<(), SnapshotError> {
-        let radix_path = if RadixKind::of(stored.kind).is_some() {
-            match self.radix_path(stored.id)? {
-                Some(path) => Some(path),
-                // Reached so far only as a value elsewhere. If it is reached as a node
-                // later, enqueue_object_at resets it with its authenticated path.
-                None => return Ok(()),
-            }
-        } else {
-            None
-        };
-        object_graph::for_each_reference(stored, radix_path.as_deref(), |reference| match reference
-        {
+    /// Enqueues everything `stored` refers to from where `visit` reached it. A radix
+    /// node reached only as a plain reference (a value elsewhere) lists nothing.
+    fn follow(&mut self, stored: &StoredObject, visit: &Visit) -> Result<(), SnapshotError> {
+        object_graph::for_each_reference(stored, visit.radix_path(), |reference| match reference {
             Reference::Object(id) => self.enqueue_object(id),
             Reference::RadixRoot(id) => self.enqueue_radix_root(id),
             Reference::RadixChild { id, above } => self.enqueue_radix_child(id, above),
@@ -904,17 +938,19 @@ async fn exact_closure_inventory<O: ImmutableObjectStore>(
     let mut walk = ClosureWalk::new(limits)?;
     walk.enqueue_object(envelope.into())?;
     let mut total = 0usize;
-    while let Some(id) = walk.next_object()? {
-        let stored = objects.get(id).await?;
-        let len = stored.canonical_bytes.len();
-        account(
-            &mut total,
-            len,
-            limits.max_object_bytes,
-            limits.max_total_bytes,
-        )?;
-        walk.record_object(id, len)?;
-        walk.follow(&stored)?;
+    while let Some(visit) = walk.next_object()? {
+        let stored = objects.get(visit.id).await?;
+        if visit.first {
+            let len = stored.canonical_bytes.len();
+            account(
+                &mut total,
+                len,
+                limits.max_object_bytes,
+                limits.max_total_bytes,
+            )?;
+            walk.record_object(visit.id, len)?;
+        }
+        walk.follow(&stored, &visit)?;
     }
     while let Some(id) = walk.next_content()? {
         let bytes = content.get_bounded(id, limits.max_content_bytes)?;
@@ -1058,4 +1094,137 @@ fn account(
         return Err(SnapshotError::LimitExceeded("total bytes"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use wheat_core::{ChangeId, RevisionId};
+
+    use super::*;
+    use crate::{Durability, LooseObjectStore, RetainedSetStore, RevisionMapStore};
+
+    fn store() -> (tempfile::TempDir, LooseObjectStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::with_durability(dir.path(), Durability::Deferred);
+        (dir, objects)
+    }
+
+    /// What a walk from one radix root found.
+    struct Walked {
+        /// Every object in the inventory: the nodes and what their keys point at.
+        inventory: HashSet<ObjectId>,
+        /// The ones not in the store: a set's members or a map's values.
+        absent: HashSet<ObjectId>,
+        visits: usize,
+    }
+
+    /// Walks from `root` the way export does, except that objects missing from the
+    /// store are noted instead of read.
+    async fn walk_from(
+        objects: &LooseObjectStore,
+        root: ObjectId,
+        limits: SnapshotLimits,
+    ) -> Result<Walked, SnapshotError> {
+        let mut walk = ClosureWalk::new(limits)?;
+        walk.enqueue_radix_root(root)?;
+        let mut absent = HashSet::new();
+        while let Some(visit) = walk.next_object()? {
+            let Ok(stored) = objects.get(visit.id).await else {
+                absent.insert(visit.id);
+                walk.record_object(visit.id, 0)?;
+                continue;
+            };
+            if visit.first {
+                walk.record_object(visit.id, stored.canonical_bytes.len())?;
+            }
+            walk.follow(&stored, &visit)?;
+        }
+        Ok(Walked {
+            inventory: walk
+                .object_inventory()?
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect(),
+            absent,
+            visits: walk.visit_count,
+        })
+    }
+
+    fn key(bytes: &[u8]) -> ObjectId {
+        let mut digest = [0; 32];
+        digest[..bytes.len()].copy_from_slice(bytes);
+        ObjectId::from_digest(digest)
+    }
+
+    #[tokio::test]
+    async fn one_subtree_under_two_edges_is_followed_under_both() {
+        let (_dir, objects) = store();
+        let keys = [
+            key(&[1, 5, 5, 5, 1]),
+            key(&[1, 5, 5, 5, 2]),
+            key(&[2, 5, 5, 5, 1]),
+            key(&[2, 5, 5, 5, 2]),
+        ];
+        let sets = RetainedSetStore::new(&objects);
+        let empty = sets.empty_root().await.unwrap();
+        let root = sets
+            .update_batch(empty, keys.iter().map(|key| (*key, true)))
+            .await
+            .unwrap();
+
+        let walked = walk_from(&objects, root.into(), SnapshotLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(walked.absent, keys.into(), "every member is found");
+        // The root and one node shared by both edges, then the four members.
+        assert_eq!(walked.inventory.len(), 6);
+        assert_eq!(walked.visits, 7, "the shared node is followed twice");
+    }
+
+    /// A map whose keys branch the same way at three levels, all with one value, is
+    /// four nodes and one value, but a walk follows the bottom node eight times.
+    #[tokio::test]
+    async fn repeated_subtrees_are_capped_by_the_visit_limit() {
+        let (_dir, objects) = store();
+        let value = RevisionId::from_digest([9; 32]);
+        let mut entries = Vec::new();
+        for a in 1..=2 {
+            for b in 1..=2 {
+                for c in 1..=2 {
+                    for d in 1..=2 {
+                        let mut key = [5; 16];
+                        key[..3].copy_from_slice(&[a, b, c]);
+                        key[15] = d;
+                        entries.push((ChangeId::from_bytes(key), Some(value)));
+                    }
+                }
+            }
+        }
+        let maps = RevisionMapStore::new(&objects);
+        let empty = maps.empty_root().await.unwrap();
+        let root = maps.update_batch(empty, entries).await.unwrap();
+
+        let walked = walk_from(&objects, root.into(), SnapshotLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(walked.absent, [value.into()].into());
+        assert_eq!(walked.inventory.len(), 5);
+        assert_eq!(walked.visits, 1 + 2 + 4 + 8 + 1);
+
+        // Five objects allow ten visits, fewer than the walk needs.
+        let limits = SnapshotLimits {
+            max_objects: 5,
+            ..SnapshotLimits::default()
+        };
+        let error = walk_from(&objects, root.into(), limits)
+            .await
+            .err()
+            .expect("the walk is refused");
+        assert!(
+            matches!(error, SnapshotError::LimitExceeded("closure visits")),
+            "{error:?}"
+        );
+    }
 }

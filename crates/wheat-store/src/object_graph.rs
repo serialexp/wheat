@@ -383,18 +383,6 @@ pub(crate) enum RadixKind {
 }
 
 impl RadixKind {
-    pub(crate) fn of(kind: ObjectKind) -> Option<Self> {
-        Some(match kind {
-            ObjectKind::RetainedSetNode => Self::RetainedSet,
-            ObjectKind::ConflictSetNode => Self::ConflictSet,
-            ObjectKind::RevisionMapNode => Self::RevisionMap,
-            ObjectKind::ApplicationMapNode => Self::ApplicationMap,
-            ObjectKind::ChangeMapNode => Self::ChangeMap,
-            ObjectKind::ViewLineageMapNode => Self::ViewLineage,
-            _ => return None,
-        })
-    }
-
     pub(crate) fn object_kind(self) -> ObjectKind {
         match self {
             Self::RetainedSet => ObjectKind::RetainedSetNode,
