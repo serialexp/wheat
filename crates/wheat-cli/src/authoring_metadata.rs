@@ -29,6 +29,16 @@ struct Config {
     actor: ActorConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     core: Option<CoreConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<CredentialConfig>,
+}
+
+/// How to get a token for a native remote.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct CredentialConfig {
+    /// Shell command that prints a token; see `credential.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    helper: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -57,6 +67,7 @@ impl Default for Config {
             version: CONFIG_VERSION,
             actor: ActorConfig::default(),
             core: None,
+            credential: None,
         }
     }
 }
@@ -69,6 +80,22 @@ pub(crate) enum ConfigKey {
     CorePager,
     CoreDefaultLabel,
     CoreDefaultFormat,
+    CredentialHelper,
+}
+
+impl ConfigKey {
+    /// The key as the user writes it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::ActorName => "actor.name",
+            Self::ActorEmail => "actor.email",
+            Self::CoreEditor => "core.editor",
+            Self::CorePager => "core.pager",
+            Self::CoreDefaultLabel => "core.default_label",
+            Self::CoreDefaultFormat => "core.default_format",
+            Self::CredentialHelper => "credential.helper",
+        }
+    }
 }
 
 impl std::str::FromStr for ConfigKey {
@@ -82,10 +109,11 @@ impl std::str::FromStr for ConfigKey {
             "core.pager" => Ok(Self::CorePager),
             "core.default_label" => Ok(Self::CoreDefaultLabel),
             "core.default_format" => Ok(Self::CoreDefaultFormat),
+            "credential.helper" => Ok(Self::CredentialHelper),
             _ => Err(format!(
                 "unknown configuration key '{value}'; valid keys: \
                  actor.name, actor.email, core.editor, core.pager, \
-                 core.default_label, core.default_format"
+                 core.default_label, core.default_format, credential.helper"
             )),
         }
     }
@@ -142,10 +170,30 @@ pub(crate) fn set(
                 _ => unreachable!(),
             }
         }
+        ConfigKey::CredentialHelper => {
+            config
+                .credential
+                .get_or_insert_with(CredentialConfig::default)
+                .helper = Some(value.to_owned());
+        }
     }
     let result = write_config(&path, &config);
     let unlock = unlock(&lock);
     result.and_then(|()| unlock.map_err(Into::into))
+}
+
+/// The configured `credential.helper`: the repository's if it sets one, else
+/// the user's. `store_root` is `None` before a store exists (clone).
+pub(crate) fn credential_helper(store_root: Option<&Path>) -> Result<Option<String>> {
+    let repository = match store_root {
+        Some(root) => read_optional(&root.join("config.json"))?,
+        None => None,
+    };
+    let from = |config: Option<Config>| config.and_then(|c| c.credential).and_then(|c| c.helper);
+    match from(repository) {
+        Some(helper) => Ok(Some(helper)),
+        None => Ok(from(read_optional(&user_config_path()?)?)),
+    }
 }
 
 pub(crate) fn actor(store_root: &Path) -> Result<Actor> {
@@ -259,6 +307,7 @@ fn validate_value(key: ConfigKey, value: &str) -> Result<()> {
         ConfigKey::CorePager => ("core.pager", MAX_CORE_VALUE_BYTES),
         ConfigKey::CoreDefaultLabel => ("core.default_label", MAX_CORE_VALUE_BYTES),
         ConfigKey::CoreDefaultFormat => ("core.default_format", MAX_CORE_VALUE_BYTES),
+        ConfigKey::CredentialHelper => ("credential.helper", MAX_CORE_VALUE_BYTES),
     };
     ensure_text(field, value, limit)?;
     ensure!(

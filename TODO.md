@@ -11,11 +11,11 @@ are the scanner's word only and need checking before a fix.
 
 Security, most serious first:
 
-- `[ ]` **wheat-server has no authentication or access control (confirmed).**
-  `run_session` (`crates/wheat-server/src/connection.rs`) never looks at
-  `ClientHello.auth_token`, so any client that can connect can open, fetch, publish or
-  force-publish any repository. Needs a token check before `SessionEstablished`,
-  per-repository read/write permission, and a separate right for `force`.
+- `[ ]` **The repository registry is not pluggable.** `Registry`
+  (`crates/wheat-server/src/registry.rs`) is a fixed struct, and `main.rs` serves one
+  repository. Access is pluggable now (`AccessProvider`), but an embedder such as
+  Gothab also needs to look repositories up itself, and the standalone server has no
+  way to serve several (`Registry::from_repos_dir` exists but nothing calls it).
 - `[ ]` **Materialization does not reserve `.git` (confirmed).** `RESERVED` in
   `crates/wheat-cli/src/materialization.rs` (and the matching list in
   `workspace_files.rs`) blocks `.wheat`, `.wheat-git`, `storage` and
@@ -136,7 +136,10 @@ budget passes, but by only about 0.7 s.
 
 - `[ ]` **`wheat+tls://` URLs parse but cannot connect.** `crates/wheat-cli/src/remote.rs`
   accepts the scheme, but `tokio-tungstenite` is built with only the `connect`
-  feature (no rustls/native-tls), in both wheat-cli and wheat-server.
+  feature (no rustls/native-tls), in both wheat-cli and wheat-server. Since
+  2026-09-26 the client sends a bearer token from `credential.helper`, so over plain
+  `wheat://` to another machine the token travels in clear text. Once TLS works,
+  consider refusing to send a token over plain `wheat://` to a non-loopback host.
 - `[ ]` **The `.gitignore` fallback diagnostic points at a missing command.**
   `workspace_status.rs` tells users to run `wheat ignore import`, which does not
   exist (tracked in `wheat-local-tooling.md`).

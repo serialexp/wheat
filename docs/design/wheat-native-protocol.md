@@ -99,13 +99,23 @@ top of them.
   no named or multi-remote configuration, and structural fetch is not
   incremental: `crates/wheat-server/src/fetch.rs` always sends the whole
   structural closure and ignores `since_generation`.)
-- [ ] **Phase 1 — authentication.** Bearer token auth in `ClientHello`, TLS
+- [~] **Phase 1 — authentication.** Bearer token auth in `ClientHello`, TLS
   required, localhost-only default when no auth is configured. Standalone
   server refuses non-loopback binding without explicit auth config. Origin
-  validation for browser WebSocket connections.
-- [ ] **Phase 2 — authorization and publish gates.** Server-side namespace/
+  validation for browser WebSocket connections. (2026-09-26: done except TLS.
+  `crates/wheat-server/src/access.rs` has the pluggable `AccessProvider`; the
+  standalone server reads token hashes from the `[auth]` table of
+  `--config wheat-server.toml`, runs open only on loopback, and refuses
+  upgrades whose `Origin` is not in `allowed_origins`. The client gets its token
+  from `credential.helper` (`crates/wheat-cli/src/credential.rs`). TLS is still
+  missing: `wheat+tls://` cannot connect, so tokens travel in clear text unless a
+  TLS proxy sits in front.)
+- [~] **Phase 2 — authorization and publish gates.** Server-side namespace/
   repository permission checks, read vs publish access control, and
-  publish-gate enforcement (e.g. CI-required, review-required).
+  publish-gate enforcement (e.g. CI-required, review-required). (2026-09-26:
+  per-repository `read` / `publish` / `force` access is checked before every
+  operation, and a repository without access answers like a missing one.
+  Publish gates are not started.)
 - [ ] **Phase 2 — Gothab integration.** Let gothab-server (or gitd's successor)
   serve wheat repositories through the native protocol alongside Git projections,
   with one canonical store per repository.
@@ -762,13 +772,30 @@ wheat-server \
   --endpoint https://s3.eu-central-1.amazonaws.com \
   --bucket wheat-repos \
   --registry ./repos.json \
-  --auth-config ./auth.json
+  --config ./wheat-server.toml
 ```
 
 The standalone server is a single binary. It reads repository configuration
 from a registry file or environment and serves over WebSocket. This is the
 "anyone can run it" deployment. It defaults to localhost-only binding;
-non-loopback addresses require explicit `--auth-config`.
+non-loopback addresses require an `[auth]` table in the `--config` file:
+
+```toml
+[auth]
+allowed_origins = ["https://example.com"]   # browser origins; none by default
+
+[[auth.principals]]
+name = "bart"
+token_hashes = ["<wheat-server hash-token output>"]
+
+[auth.principals.repositories]
+"*" = "read"                 # exact names win over "*"
+"serialexp/wheat" = "force"  # read < publish < force
+```
+
+The file holds BLAKE3 hashes of tokens, never tokens.
+`openssl rand -hex 32 | tee token | wheat-server hash-token` makes a token and
+its hash.
 
 ### Embedded in Gothab
 

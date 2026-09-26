@@ -5,6 +5,8 @@
 //! backed by a local `PackedObjectStore` (or a remote packed store) and a
 //! `LocalPublicationStore`.
 
+pub mod access;
+pub mod config;
 pub mod connection;
 pub mod fetch;
 pub mod publish;

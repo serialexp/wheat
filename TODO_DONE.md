@@ -2,6 +2,22 @@
 
 Finished items, moved here from `TODO.md` under the same headings.
 
+## Security and performance scan (2026-09-26)
+
+- `[x]` **wheat-server has no authentication or access control (confirmed).**
+  `run_session` (`crates/wheat-server/src/connection.rs`) never looked at
+  `ClientHello.auth_token`, so any client that could connect could open, fetch,
+  publish or force-publish any repository. Done 2026-09-26: `AccessProvider`
+  (`crates/wheat-server/src/access.rs`) checks the token before `SessionEstablished`
+  and `read` / `publish` / `force` access before every operation; a repository
+  without access answers like a missing one. The standalone server reads token
+  hashes from the `[auth]` table of `--config wheat-server.toml`
+  (`wheat-server hash-token` makes them), runs open only on loopback, and refuses
+  browser upgrades whose `Origin` is not allowed. The client gets its token from
+  `credential.helper` (`crates/wheat-cli/src/credential.rs`). Tests:
+  `crates/wheat-server/tests/access_test.rs`, `cli_test.rs`,
+  `crates/wheat-cli/tests/remote_auth.rs`. TLS is still open (see "Loose ends").
+
 ## Explicit history collapse, repack, and GC
 
 - `[x]` **`wheat change squash`.** Collapse one change's unpublished checkpoint

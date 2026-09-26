@@ -208,7 +208,12 @@ core.editor         string    (repo, user)   — editor command for interactive 
 core.pager          string    (repo, user)   — pager command for long output
 core.default_label  string    (repo)         — default active label for new workspaces
 core.default_format string    (repo, user)   — "human" or "json"; default "human"
+credential.helper   string    (repo, user)   — shell command that prints `token=<token>`
+                                               for a native remote (implemented; see
+                                               `crates/wheat-cli/src/credential.rs`)
 ```
+
+The config holds the helper command, never the token itself.
 
 Hooks and remotes use structured sub-objects rather than flat keys:
 

@@ -23,6 +23,7 @@ mod authoring_metadata;
 mod capture_settlement;
 mod command_output;
 mod conflict_inspection;
+mod credential;
 mod diff_render;
 mod discovery;
 mod edit_move;
@@ -242,7 +243,9 @@ enum ConfigCommand {
         /// Write user configuration instead of the current repository configuration.
         #[arg(long)]
         global: bool,
-        /// Configuration key: actor.name or actor.email.
+        /// Configuration key: actor.name, actor.email, core.editor, core.pager,
+        /// core.default_label, core.default_format, or credential.helper (a
+        /// shell command that prints `token=<token>` for native remotes).
         key: authoring_metadata::ConfigKey,
         value: String,
     },
@@ -953,14 +956,7 @@ fn execute(cli: Cli) -> Result<Success> {
                     cli.store.as_deref(),
                 )?)
             };
-            let key_name = match key {
-                authoring_metadata::ConfigKey::ActorName => "actor.name",
-                authoring_metadata::ConfigKey::ActorEmail => "actor.email",
-                authoring_metadata::ConfigKey::CoreEditor => "core.editor",
-                authoring_metadata::ConfigKey::CorePager => "core.pager",
-                authoring_metadata::ConfigKey::CoreDefaultLabel => "core.default_label",
-                authoring_metadata::ConfigKey::CoreDefaultFormat => "core.default_format",
-            };
+            let key_name = key.name();
             authoring_metadata::set(store_root.as_deref(), global, key, &value)?;
             Success::new(
                 "config.set",
@@ -2290,6 +2286,8 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
         return workspace_clone::clone_local(&store_root, &workspace_root);
     }
 
+    // Ask the helper before creating anything, so a failure leaves no store.
+    let token = credential::token_for(None, &parsed)?;
     let store_root = allocate_store_root()?;
     if store_root.exists() {
         return Err(CliFailure::invalid(format!(
@@ -2305,7 +2303,7 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
 
     let rt = runtime()?;
     let (remote_state, label_name) = rt.block_on(async {
-        let mut session = remote::connect(&parsed.ws_url).await?;
+        let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         // Fetch all structural objects.
@@ -2438,9 +2436,10 @@ fn native_fetch(
         ));
     }
 
+    let token = credential::token_for(Some(&context.store_root), &parsed)?;
     let rt = runtime()?;
     let (remote_state, obj_count, content_count) = rt.block_on(async {
-        let mut session = remote::connect(&parsed.ws_url).await?;
+        let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         if state.generation == last_fetched.generation && state.envelope == last_fetched.envelope {
@@ -2549,9 +2548,10 @@ fn native_publish(
 
     let last_fetched = remote_cfg.last_fetched_head()?;
 
+    let token = credential::token_for(Some(&context.store_root), &parsed)?;
     let rt = runtime()?;
     let outcome = rt.block_on(async {
-        let mut session = remote::connect(&parsed.ws_url).await?;
+        let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         // Check that the remote hasn't advanced past what we last fetched.

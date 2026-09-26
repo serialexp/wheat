@@ -27,6 +27,10 @@ use wheat_store::{ContentStore, ImmutableObjectStore, RepositoryHead, Repository
 ///         `wheat+tls://host:port/owner/repo` (WSS).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WheatUrl {
+    /// `wheat` or `wheat+tls`.
+    pub scheme: &'static str,
+    /// Canonical `host` or `host:port` (IPv6 hosts in brackets).
+    pub authority: String,
     /// WebSocket URL: `ws://host:port` or `wss://host:port`.
     pub ws_url: String,
     /// Repository name extracted from the URL path (e.g. `owner/repo`).
@@ -131,9 +135,11 @@ pub fn parse_wheat_url(input: &str) -> Result<WheatUrl> {
         .join("/");
 
     Ok(WheatUrl {
+        scheme: wheat_scheme,
         ws_url: format!("{ws_scheme}://{authority}"),
         repo_name,
         canonical_identity: format!("{wheat_scheme}://{authority}/{canonical_path}"),
+        authority,
     })
 }
 
@@ -366,8 +372,10 @@ fn content_id_to_digest(id: ContentId) -> Digest256 {
 // Connect and handshake
 // ---------------------------------------------------------------------------
 
-/// Connect to a wheat-server and perform the session handshake.
-pub async fn connect(ws_url: &str) -> Result<WheatSession> {
+/// Connect to a wheat-server and perform the session handshake, sending
+/// `token` (empty for none) as the bearer token.
+pub async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
+    let ws_url = url.ws_url.as_str();
     let (mut ws, _) = connect_async(ws_url)
         .await
         .with_context(|| format!("failed to connect to {ws_url}"))?;
@@ -393,7 +401,7 @@ pub async fn connect(ws_url: &str) -> Result<WheatSession> {
         &WheatProtocolMessage::ClientHello(ClientHelloOutput {
             message_type: 0x02,
             selected_version: 1,
-            auth_token: vec![],
+            auth_token: token.to_vec(),
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
         }),
@@ -408,8 +416,20 @@ pub async fn connect(ws_url: &str) -> Result<WheatSession> {
             SessionEstablishedStatus::SessionStatusVersionMismatch(_) => {
                 bail!("server rejected protocol version: {}", se.message);
             }
+            SessionEstablishedStatus::SessionStatusAuthFailed(_) if token.is_empty() => {
+                bail!(
+                    "{} refused the connection ({}); it needs a token: \
+                     set a command that prints one with `wheat config set credential.helper <command>`",
+                    url.authority,
+                    se.message
+                );
+            }
             SessionEstablishedStatus::SessionStatusAuthFailed(_) => {
-                bail!("authentication failed: {}", se.message);
+                bail!(
+                    "{} refused the token from credential.helper: {}",
+                    url.authority,
+                    se.message
+                );
             }
         },
         other => bail!("expected SessionEstablished, got {other:?}"),
@@ -651,6 +671,9 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
                 )
                 .await?;
             }
+            WheatProtocolMessage::Error(e) => {
+                bail!("server refused the fetch: {}", e.message);
+            }
             other => {
                 bail!("unexpected message during fetch: {other:?}");
             }
@@ -826,6 +849,9 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                         content.put(&data)?;
                         received_this_batch += 1;
                     }
+                }
+                WheatProtocolMessage::Error(e) if e.op_id == op_id => {
+                    bail!("server refused the content fetch: {}", e.message);
                 }
                 _ => {
                     // Ignore unexpected messages during content fetch.

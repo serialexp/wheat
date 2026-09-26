@@ -7,12 +7,20 @@
 //!   wheat-server --data-dir ./my-repo
 //!   wheat-server --data-dir ./my-repo --listen 127.0.0.1:7420
 //!   wheat-server --data-dir ./my-repo --store s3-packed  # S3 config from env vars
+//!   wheat-server --data-dir ./my-repo --config wheat-server.toml --listen 0.0.0.0:7420
+//!   openssl rand -hex 32 | wheat-server hash-token        # hash for token_hashes
+//!
+//! Without a config file that has an `[auth]` table, the server lets anyone in
+//! and so refuses to listen on anything but a loopback address.
 
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
+use wheat_server::access::{MAX_AUTH_TOKEN_BYTES, token_hash_hex};
+use wheat_server::config::FileConfig;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run};
 
@@ -25,16 +33,35 @@ enum StoreMode {
     S3Packed,
 }
 
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// Read a token from stdin and print the hash to put in `token_hashes`.
+    HashToken,
+}
+
 #[derive(Parser)]
-#[command(name = "wheat-server", about = "Wheat native protocol server")]
+#[command(
+    name = "wheat-server",
+    about = "Wheat native protocol server",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<ServerCommand>,
+
     /// Directory containing a wheat repository. For `--store local`, this
     /// may be either a loose store (objects/, content/, repository.head) or
     /// a packed store (storage/, repository.head) — auto-detected. For
     /// `--store s3-packed`, the repository.head is read from this directory
     /// while objects and content are stored on S3.
+    #[arg(long, required = true)]
+    data_dir: Option<PathBuf>,
+
+    /// TOML config file. Its `[auth]` table lists principals, their token
+    /// hashes and their access per repository.
     #[arg(long)]
-    data_dir: PathBuf,
+    config: Option<PathBuf>,
 
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:7420")]
@@ -59,9 +86,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    if let Some(ServerCommand::HashToken) = cli.command {
+        println!("{}", hash_token_from_stdin()?);
+        return Ok(());
+    }
+    let data_dir = cli.data_dir.expect("clap requires --data-dir when serving");
+
+    let file_config = match &cli.config {
+        Some(path) => FileConfig::load(path)?,
+        None => FileConfig::default(),
+    };
+    let server_config = ServerConfig::from_file(&file_config)?;
+    server_config.check_listen_address(cli.listen)?;
 
     let repo_name = cli.name.clone().unwrap_or_else(|| {
-        cli.data_dir
+        data_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("default")
@@ -69,19 +108,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let registry = match cli.store {
-        StoreMode::Local => Registry::single_named(repo_name, &cli.data_dir)?,
+        StoreMode::Local => Registry::single_named(repo_name, &data_dir)?,
         StoreMode::S3Packed => {
             let config = s3_config_from_env()?;
             let store = wheat_store::RemotePackedStore::open(&config).await?;
             let content = store.content_store();
-            let heads =
-                wheat_store::LocalPublicationStore::new(cli.data_dir.join("repository.head"));
+            let heads = wheat_store::LocalPublicationStore::new(data_dir.join("repository.head"));
             Registry::single_with_stores(repo_name, Box::new(store), content, heads)
         }
     };
 
-    run(cli.listen, registry, ServerConfig::new()).await?;
+    run(cli.listen, registry, server_config).await?;
     Ok(())
+}
+
+/// Read one token from stdin and return its hash for `token_hashes`. Reading
+/// stdin keeps the token out of shell history and `ps`.
+fn hash_token_from_stdin() -> Result<String, Box<dyn std::error::Error>> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(MAX_AUTH_TOKEN_BYTES as u64 + 3)
+        .read_to_end(&mut input)?;
+    let token = input
+        .strip_suffix(b"\r\n")
+        .or_else(|| input.strip_suffix(b"\n"))
+        .unwrap_or(&input);
+    if token.is_empty() {
+        return Err("no token on stdin".into());
+    }
+    if token.len() > MAX_AUTH_TOKEN_BYTES {
+        return Err(format!("tokens are at most {MAX_AUTH_TOKEN_BYTES} bytes").into());
+    }
+    if token.contains(&b'\n') {
+        return Err("the token must be a single line".into());
+    }
+    Ok(token_hash_hex(token))
 }
 
 fn s3_config_from_env() -> Result<wheat_store::RemotePackedStoreConfig, Box<dyn std::error::Error>>
