@@ -102,8 +102,11 @@ impl IgnoreStack {
         }
 
         // Built-in patterns: always ignore wheat control paths at top level.
-        let builtin_content = "/.wheat\n/.wheat-git\n/repository.head\n/repository.lock\n/storage";
-        let builtin_patterns = parse_ignore_file(builtin_content, 0);
+        let builtin_content: String = crate::WORKSPACE_CONTROL_NAMES
+            .iter()
+            .map(|name| format!("/{name}\n"))
+            .collect();
+        let builtin_patterns = parse_ignore_file(&builtin_content, 0);
 
         IgnoreStack {
             layers,

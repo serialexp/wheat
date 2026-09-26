@@ -31,3 +31,14 @@
 pub mod loader;
 pub mod pattern;
 pub mod stack;
+
+/// Top-level workspace names that belong to Wheat itself. The walk always
+/// ignores them, and a repository may not materialize a file at or under them.
+/// This is the one list; every check uses it.
+pub const WORKSPACE_CONTROL_NAMES: &[&str] = &[
+    ".wheat",
+    ".wheat-git",
+    "repository.head",
+    "repository.lock",
+    "storage",
+];

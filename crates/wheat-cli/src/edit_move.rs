@@ -9,7 +9,6 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    io::{BufRead, Write},
 };
 
 use anyhow::{Result, bail};
@@ -23,6 +22,7 @@ use wheat_core::{
 use wheat_store::{ContentStore, PathHistory};
 
 use crate::command_output::CliFailure;
+use crate::prompt::PromptIo;
 
 /// A file's kind and canonical bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,14 +245,6 @@ fn replay(
     Ok(Replay::Reached(file.map(|(value, _)| value)))
 }
 
-/// Where the confirmation prompt reads and writes.
-pub(crate) struct PromptIo<'a> {
-    pub(crate) input: &'a mut dyn BufRead,
-    pub(crate) diagnostics: &'a mut dyn Write,
-    /// A person can answer: stdin and stderr are terminals and the output is not JSON.
-    pub(crate) interactive: bool,
-}
-
 /// Asks before moving edits out of later changes into `change`. Without anyone to ask, it
 /// lists the moves and refuses; `--force` skips the question.
 pub(crate) fn confirm(change: ChangeId, moves: &[String], io: &mut PromptIo<'_>) -> Result<()> {
@@ -267,11 +259,8 @@ pub(crate) fn confirm(change: ChangeId, moves: &[String], io: &mut PromptIo<'_>)
             "{listing}rerun with --force to move them"
         )));
     }
-    write!(io.diagnostics, "{listing}Proceed? [y/N] ")?;
-    io.diagnostics.flush()?;
-    let mut answer = String::new();
-    io.input.read_line(&mut answer)?;
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+    write!(io.diagnostics, "{listing}")?;
+    if io.ask_yes_no("Proceed?")? {
         Ok(())
     } else {
         bail!(CliFailure::would_move("add cancelled; nothing was changed"))

@@ -203,16 +203,9 @@ fn validate_path(path: &Path) -> Result<Vec<&std::ffi::OsStr>, WorkspaceFileErro
         match component {
             Component::Normal(name) => {
                 if result.is_empty()
-                    && matches!(
-                        name.to_str(),
-                        Some(
-                            ".wheat"
-                                | ".wheat-git"
-                                | "repository.head"
-                                | "repository.lock"
-                                | "storage"
-                        )
-                    )
+                    && name
+                        .to_str()
+                        .is_some_and(|name| wheat_ignore::WORKSPACE_CONTROL_NAMES.contains(&name))
                 {
                     return Err(WorkspaceFileError::InvalidPath);
                 }

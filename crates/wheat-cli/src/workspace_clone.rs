@@ -7,6 +7,7 @@ use wheat_store::{PublicationStore, RepositoryReader};
 use crate::{
     command_output::Success,
     discovery::{canonical_store_path, discover_workspace},
+    dot_git::DotGitGate,
     frontier_service,
     local::{open, runtime},
     materialize_resolved,
@@ -14,7 +15,11 @@ use crate::{
     workspace_registry_service,
 };
 
-pub(crate) fn clone_local(source: &Path, workspace_root: &Path) -> Result<Success> {
+pub(crate) fn clone_local(
+    source: &Path,
+    workspace_root: &Path,
+    dot_git: DotGitGate,
+) -> Result<Success> {
     super::ensure_fresh_workspace(workspace_root)?;
     let store_root = match discover_workspace(source) {
         Ok(context) => context.store_root,
@@ -69,7 +74,8 @@ pub(crate) fn clone_local(source: &Path, workspace_root: &Path) -> Result<Succes
     );
     workspace_registry_service::reconcile(workspace_root, &store_root, &metadata)?;
     metadata.initialize(workspace_root)?;
-    let (view, root) = materialize_resolved(workspace_root, Some(&store_root), label, resolved)?;
+    let (view, root) =
+        materialize_resolved(workspace_root, Some(&store_root), label, resolved, dot_git)?;
     ensure!(
         root == workspace_root.canonicalize()?,
         "materialized a different workspace root"

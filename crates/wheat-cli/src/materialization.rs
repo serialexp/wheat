@@ -24,12 +24,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{FileKind, FileValue, TreeId, ViewId};
+use wheat_ignore::WORKSPACE_CONTROL_NAMES as RESERVED;
 use wheat_store::{
     ContentStore, MerkleTreeStore, PublicationStore, RepositoryHead, TreeDiffLimits, TreeFile,
     TreeWalkLimits,
 };
 
 use crate::{
+    dot_git::DotGitGate,
     local::LocalRepository,
     workspace_files::{
         RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot, authenticate_preimage_at,
@@ -70,13 +72,6 @@ const MAX_SELECTORS: usize = 250_000;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
 static CHECKPOINT_OCCURRENCE: AtomicUsize = AtomicUsize::new(0);
-const RESERVED: &[&str] = &[
-    ".wheat",
-    ".wheat-git",
-    "repository.head",
-    "repository.lock",
-    "storage",
-];
 
 #[derive(Debug, Error)]
 #[error("{message}")]
@@ -425,6 +420,7 @@ pub(crate) async fn materialize(
     basis: ViewId,
     selected_frontier: Option<ViewId>,
     tree: TreeId,
+    dot_git: DotGitGate,
 ) -> Result<()> {
     let _lock = WorkspaceLock::acquire(root)?;
     materialize_locked(
@@ -436,6 +432,7 @@ pub(crate) async fn materialize(
         basis,
         selected_frontier,
         tree,
+        dot_git,
     )
     .await
 }
@@ -449,6 +446,7 @@ pub(crate) async fn materialize_locked(
     basis: ViewId,
     selected_frontier: Option<ViewId>,
     tree: TreeId,
+    dot_git: DotGitGate,
 ) -> Result<()> {
     let persisted = WorkspaceMetadata::read(root)?;
     ensure!(
@@ -503,6 +501,8 @@ pub(crate) async fn materialize_locked(
             .collect()
     };
     let installs = preflight_materialization(root, repository, installs)?;
+    // Before the journal exists, so a refusal leaves the workspace untouched.
+    dot_git.check(writes(&installs))?;
     let journal = Journal {
         version: VERSION,
         operation: Operation::Materialize,
@@ -570,6 +570,7 @@ pub(crate) async fn restore(
     repository: &LocalRepository,
     metadata: &mut WorkspaceMetadata,
     selectors: &[String],
+    dot_git: DotGitGate,
 ) -> Result<usize> {
     let _lock = WorkspaceLock::acquire(root)?;
     let persisted = WorkspaceMetadata::read(root)?;
@@ -692,6 +693,8 @@ pub(crate) async fn restore(
                 Some(format!("wheat-delete-v1:{transaction_id}:{index:08x}").into_bytes());
         }
     }
+    // Before the journal exists, so a refusal leaves the workspace untouched.
+    dot_git.check(writes(&installs))?;
     let journal = Journal {
         version: VERSION,
         operation: Operation::Restore,
@@ -744,6 +747,14 @@ pub(crate) async fn restore(
         .iter()
         .filter(|install| install.new.is_some())
         .count())
+}
+
+/// The paths `installs` writes a file to. Deletions write nothing.
+fn writes(installs: &[Install]) -> impl Iterator<Item = &str> {
+    installs
+        .iter()
+        .filter(|install| install.new.is_some())
+        .map(|install| install.path.as_str())
 }
 
 fn validate_selectors(selectors: &[String]) -> Result<()> {

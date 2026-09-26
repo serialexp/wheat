@@ -26,6 +26,7 @@ mod conflict_inspection;
 mod credential;
 mod diff_render;
 mod discovery;
+mod dot_git;
 mod edit_move;
 mod frontier_service;
 mod import_trace;
@@ -34,6 +35,7 @@ mod label_service;
 mod local;
 mod log_inspection;
 mod materialization;
+mod prompt;
 mod remote;
 mod remote_config;
 mod repack;
@@ -85,7 +87,7 @@ enum Command {
     /// Initialize an empty native repository and workspace.
     Init(InitArgs),
     /// Materialize the active label and its selected descendant frontier.
-    Materialize,
+    Materialize(DotGitArgs),
     /// Switch to a label and one exact descendant frontier.
     Switch(FrontierSelectionArgs),
     /// Refresh the active label binding and descendant-frontier selection.
@@ -158,12 +160,29 @@ struct InitArgs {
     workspace: Option<PathBuf>,
 }
 
+/// For commands that write repository files into the workspace.
+#[derive(Debug, Args)]
+struct DotGitArgs {
+    /// Write files inside `.git` directories without asking. Otherwise Wheat
+    /// asks at a terminal and refuses when nobody can answer.
+    #[arg(long)]
+    allow_dot_git: bool,
+}
+
+impl DotGitArgs {
+    fn gate(&self, format: OutputFormat) -> dot_git::DotGitGate {
+        dot_git::DotGitGate::for_command(format, self.allow_dot_git)
+    }
+}
+
 #[derive(Debug, Args)]
 struct FrontierSelectionArgs {
     label: String,
     /// Exact descendant frontier view. Required when more than one exists.
     #[arg(long)]
     frontier: Option<String>,
+    #[command(flatten)]
+    dot_git: DotGitArgs,
 }
 
 #[derive(Debug, Args)]
@@ -171,6 +190,8 @@ struct RefreshArgs {
     /// Exact descendant frontier view. Required when more than one exists.
     #[arg(long)]
     frontier: Option<String>,
+    #[command(flatten)]
+    dot_git: DotGitArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -188,6 +209,8 @@ struct RestoreArgs {
     /// Tracked leaf or directory paths in the currently pinned tree.
     #[arg(required = true)]
     paths: Vec<String>,
+    #[command(flatten)]
+    dot_git: DotGitArgs,
 }
 
 #[derive(Debug, Args)]
@@ -495,6 +518,8 @@ struct ImportArgs {
     /// Write bounded internal import diagnostics as JSON Lines.
     #[arg(long, value_name = "PATH")]
     trace: Option<PathBuf>,
+    #[command(flatten)]
+    dot_git: DotGitArgs,
 }
 
 #[derive(Clone, Debug)]
@@ -540,6 +565,8 @@ struct NativeCloneArgs {
     url: String,
     /// Workspace directory. Defaults to a directory named after the repository.
     workspace: Option<PathBuf>,
+    #[command(flatten)]
+    dot_git: DotGitArgs,
 }
 
 #[derive(Debug, Args)]
@@ -603,7 +630,7 @@ fn main() -> ExitCode {
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Init(_) => "init",
-        Command::Materialize => "materialize",
+        Command::Materialize(_) => "materialize",
         Command::Switch(_) => "switch",
         Command::Refresh(_) => "refresh",
         Command::Frontier(FrontierCommand::List { .. }) => "frontier.list",
@@ -649,16 +676,21 @@ fn execute(cli: Cli) -> Result<Success> {
                 .as_deref()
                 .unwrap_or(&requested_workspace),
             cli.store.as_deref(),
+            format,
         ),
-        Command::Materialize => {
-            materialize_active_workspace(&requested_workspace, cli.store.as_deref(), "materialize")
-        }
+        Command::Materialize(dot_git) => materialize_active_workspace(
+            &requested_workspace,
+            cli.store.as_deref(),
+            "materialize",
+            dot_git.gate(format),
+        ),
         Command::Switch(arguments) => switch_workspace(
             &requested_workspace,
             cli.store.as_deref(),
             arguments.label,
             parse_optional_view(arguments.frontier)?,
             "switch",
+            arguments.dot_git.gate(format),
         ),
         Command::Refresh(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
@@ -668,6 +700,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 context.workspace.active_label,
                 parse_optional_view(arguments.frontier)?,
                 "refresh",
+                arguments.dot_git.gate(format),
             )
         }
         Command::Frontier(FrontierCommand::List { label }) => {
@@ -684,8 +717,12 @@ fn execute(cli: Cli) -> Result<Success> {
             Success::new("frontier.list", &document, human)
         }
         Command::Restore(arguments) => {
-            let restored =
-                restore_workspace(&requested_workspace, cli.store.as_deref(), &arguments.paths)?;
+            let restored = restore_workspace(
+                &requested_workspace,
+                cli.store.as_deref(),
+                &arguments.paths,
+                arguments.dot_git.gate(format),
+            )?;
             Success::new(
                 "restore",
                 json!({ "restored": restored }),
@@ -1103,19 +1140,9 @@ fn execute(cli: Cli) -> Result<Success> {
                 revision_metadata,
             ))?;
             if !authored.moves.is_empty() && !arguments.force {
-                let stdin = std::io::stdin();
-                let stderr = std::io::stderr();
-                let interactive =
-                    format == OutputFormat::Human && stdin.is_terminal() && stderr.is_terminal();
-                edit_move::confirm(
-                    change,
-                    &authored.moves,
-                    &mut edit_move::PromptIo {
-                        input: &mut stdin.lock(),
-                        diagnostics: &mut stderr.lock(),
-                        interactive,
-                    },
-                )?;
+                prompt::with_terminal(format, |io| {
+                    edit_move::confirm(change, &authored.moves, io)
+                })?;
             }
             let (prepared, outcome) =
                 runtime.block_on(mutator.revise_changes_in(session, authored.requests))?;
@@ -1474,8 +1501,19 @@ fn execute(cli: Cli) -> Result<Success> {
                 &mut io,
             )
         }
-        Command::Import(arguments) => import(arguments, cli.store.as_deref(), &requested_workspace),
-        Command::Clone(arguments) => native_clone(arguments, cli.store.as_deref()),
+        Command::Import(arguments) => {
+            let dot_git = arguments.dot_git.gate(format);
+            import(
+                arguments,
+                cli.store.as_deref(),
+                &requested_workspace,
+                dot_git,
+            )
+        }
+        Command::Clone(arguments) => {
+            let dot_git = arguments.dot_git.gate(format);
+            native_clone(arguments, cli.store.as_deref(), dot_git)
+        }
         Command::Fetch(arguments) => {
             native_fetch(&requested_workspace, cli.store.as_deref(), arguments)
         }
@@ -1505,6 +1543,7 @@ fn import(
     arguments: ImportArgs,
     explicit_store: Option<&Path>,
     default_workspace: &Path,
+    dot_git: dot_git::DotGitGate,
 ) -> Result<Success> {
     let workspace_root = arguments.workspace.as_deref().unwrap_or(default_workspace);
     ensure_fresh_workspace(workspace_root)?;
@@ -1610,8 +1649,13 @@ fn import(
     if let Some(trace) = &mut trace {
         trace.phase_started("materialize");
     }
-    let (view, materialized_root) =
-        materialize_resolved(workspace_root, Some(&store_root), selected_label, resolved)?;
+    let (view, materialized_root) = materialize_resolved(
+        workspace_root,
+        Some(&store_root),
+        selected_label,
+        resolved,
+        dot_git,
+    )?;
     if let Some(trace) = &mut trace {
         trace.phase_finished("materialize", phase_started.elapsed());
     }
@@ -1637,7 +1681,11 @@ fn import(
     )
 }
 
-fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Success> {
+fn init_workspace(
+    workspace_root: &Path,
+    explicit_store: Option<&Path>,
+    format: OutputFormat,
+) -> Result<Success> {
     ensure_fresh_workspace(workspace_root)?;
     let store_root = explicit_store
         .map(Path::to_path_buf)
@@ -1657,8 +1705,14 @@ fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Resul
     );
     workspace_registry_service::reconcile(workspace_root, &store_root, &workspace)?;
     workspace.initialize(workspace_root)?;
-    let (view, materialized_root) =
-        materialize_resolved(workspace_root, Some(&store_root), "main".into(), resolved)?;
+    // A new repository is empty, so there is never a `.git` path to ask about.
+    let (view, materialized_root) = materialize_resolved(
+        workspace_root,
+        Some(&store_root),
+        "main".into(),
+        resolved,
+        dot_git::DotGitGate::for_command(format, false),
+    )?;
     Success::new(
         "init",
         json!({ "view": view.to_string() }),
@@ -1730,6 +1784,7 @@ fn materialize_active_workspace(
     workspace: &Path,
     explicit_store: Option<&Path>,
     command: &'static str,
+    dot_git: dot_git::DotGitGate,
 ) -> Result<Success> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
@@ -1759,6 +1814,7 @@ fn materialize_active_workspace(
         resolved.basis,
         resolved.selected_frontier,
         resolved.tree,
+        dot_git,
     ))?;
     Success::new(
         command,
@@ -1773,6 +1829,7 @@ fn switch_workspace(
     label: String,
     requested_frontier: Option<ViewId>,
     command: &'static str,
+    dot_git: dot_git::DotGitGate,
 ) -> Result<Success> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
@@ -1802,6 +1859,7 @@ fn switch_workspace(
         resolved.basis,
         resolved.selected_frontier,
         resolved.tree,
+        dot_git,
     ))?;
     let root = context.root;
     Success::new(
@@ -1814,16 +1872,18 @@ fn switch_workspace(
     )
 }
 
+/// Fill a freshly created workspace (init, import, clone).
 fn materialize_resolved(
     workspace: &Path,
     explicit_store: Option<&Path>,
     label: String,
     resolved: frontier_service::ResolvedFrontier,
+    dot_git: dot_git::DotGitGate,
 ) -> Result<(ViewId, PathBuf)> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
     let view = resolved.effective_view();
-    runtime()?.block_on(materialization::materialize(
+    let materialized = runtime()?.block_on(materialization::materialize(
         &context.root,
         &repository,
         &mut context.workspace,
@@ -1832,7 +1892,24 @@ fn materialize_resolved(
         resolved.basis,
         resolved.selected_frontier,
         resolved.tree,
-    ))?;
+        dot_git,
+    ));
+    if let Err(error) = materialized {
+        // The workspace already exists, so running the same command again would
+        // fail; say how to finish this one instead.
+        if matches!(
+            error.downcast_ref::<CliFailure>(),
+            Some(CliFailure::DotGitPaths(_))
+        ) {
+            return Err(CliFailure::dot_git(format!(
+                "{error}\nthe workspace {} is set up but its files were not written; \
+                 to write them, run `wheat --workspace {} materialize --allow-dot-git`",
+                context.root.display(),
+                context.root.display()
+            )));
+        }
+        return Err(error);
+    }
     Ok((view, context.root))
 }
 
@@ -1866,6 +1943,7 @@ fn restore_workspace(
     workspace: &Path,
     explicit_store: Option<&Path>,
     paths: &[String],
+    dot_git: dot_git::DotGitGate,
 ) -> Result<usize> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let repository = open(&context.store_root)?;
@@ -1876,6 +1954,7 @@ fn restore_workspace(
         &repository,
         &mut context.workspace,
         paths,
+        dot_git,
     ))?;
     Ok(restored)
 }
@@ -2234,7 +2313,11 @@ fn put_captured_value(
 // Native protocol commands: clone, fetch, publish
 // ---------------------------------------------------------------------------
 
-fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Result<Success> {
+fn native_clone(
+    arguments: NativeCloneArgs,
+    explicit_store: Option<&Path>,
+    dot_git: dot_git::DotGitGate,
+) -> Result<Success> {
     if let Some(source) = workspace_clone::local_source(&arguments.url) {
         let workspace_root = arguments.workspace.unwrap_or_else(|| {
             let name = source
@@ -2253,7 +2336,7 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
                 ));
             }
         }
-        return workspace_clone::clone_local(&source, &workspace_root);
+        return workspace_clone::clone_local(&source, &workspace_root, dot_git);
     }
     let parsed = remote::parse_wheat_url(&arguments.url)?;
 
@@ -2283,7 +2366,7 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
         store_lookup::find_remote_store(&store_home()?, &parsed)?
     };
     if let Some(store_root) = existing_store {
-        return workspace_clone::clone_local(&store_root, &workspace_root);
+        return workspace_clone::clone_local(&store_root, &workspace_root, dot_git);
     }
 
     // Ask the helper before creating anything, so a failure leaves no store.
@@ -2391,8 +2474,13 @@ fn native_clone(arguments: NativeCloneArgs, explicit_store: Option<&Path>) -> Re
     );
     workspace_registry_service::reconcile(&workspace_root, &store_root, &workspace)?;
     workspace.initialize(&workspace_root)?;
-    let (view, materialized_root) =
-        materialize_resolved(&workspace_root, Some(&store_root), label_name, resolved)?;
+    let (view, materialized_root) = materialize_resolved(
+        &workspace_root,
+        Some(&store_root),
+        label_name,
+        resolved,
+        dot_git,
+    )?;
 
     let human = format!(
         "cloned {} into {}\nmaterialized view {view}\ngeneration {}, envelope {}\n",

@@ -425,7 +425,17 @@ Filesystem requirements:
 - remove directories only when empty and owned by the materialization plan;
 - reserve repository authority (`.wheat/`, packed `repository.head`/`storage/`),
   projection (`.wheat-git/`), workspace metadata, and journal paths from every
-  capture and materialization operation;
+  capture and materialization operation (one list, `WORKSPACE_CONTROL_NAMES` in
+  `wheat-ignore`, shared by capture, materialization, and the built-in ignore
+  rules);
+- ask before writing any path with a `.git` component (any letter case). A tree
+  may hold such files legitimately, but in a workspace that is also a git
+  checkout they could plant hooks or config that git runs. Materialize, switch,
+  refresh, restore, clone, and import list those paths before writing anything:
+  a person at a terminal is asked, anything else (a script, `--format json`)
+  is refused with `dot_git_paths` (exit 2) unless `--allow-dot-git` is given. A
+  clone or import refused this way leaves the workspace set up but empty;
+  `wheat materialize --allow-dot-git` finishes it;
 - bound path count, individual content size, total bytes, and concurrent writes;
 - journal per-path preparation/publication and define whether recovery rolls
   forward or rolls back after a partially visible multi-path update;
@@ -436,9 +446,9 @@ Filesystem requirements:
 Initial commands may be:
 
 ```text
-wheat materialize [--source <view-or-label>] [DIRECTORY]
-wheat restore [PATH ...]          # restore from the pinned workspace view
-wheat switch <label> [--frontier <view>]  # label activation plus safe materialization
+wheat materialize [--source <view-or-label>] [DIRECTORY] [--allow-dot-git]
+wheat restore [PATH ...] [--allow-dot-git]  # restore from the pinned workspace view
+wheat switch <label> [--frontier <view>] [--allow-dot-git]  # label activation plus safe materialization
 ```
 
 Names are provisional; the safety, immutable-label, and explicit-frontier

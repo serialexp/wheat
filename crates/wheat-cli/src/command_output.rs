@@ -50,6 +50,10 @@ pub(crate) enum CliFailure {
     /// Adding would move edits out of later changes, which needs confirmation or `--force`.
     #[error("{0}")]
     EditsWouldMove(String),
+    /// Materializing would write inside a `.git` directory, which needs confirmation or
+    /// `--allow-dot-git`.
+    #[error("{0}")]
+    DotGitPaths(String),
 }
 
 impl CliFailure {
@@ -79,6 +83,10 @@ impl CliFailure {
 
     pub(crate) fn would_move(message: impl Into<String>) -> Error {
         Self::EditsWouldMove(message.into()).into()
+    }
+
+    pub(crate) fn dot_git(message: impl Into<String>) -> Error {
+        Self::DotGitPaths(message.into()).into()
     }
 }
 
@@ -447,6 +455,7 @@ fn classify(error: &Error) -> Classification {
                 CliFailure::CorruptState(_) => class("integrity", "corrupt_state", false, 6),
                 CliFailure::TransportFailure(_) => class("transport", "transport_failure", true, 8),
                 CliFailure::EditsWouldMove(_) => class("input", "edits_would_move", false, 2),
+                CliFailure::DotGitPaths(_) => class("input", "dot_git_paths", false, 2),
             };
         }
         if let Some(import) = cause.downcast_ref::<ImportError>() {

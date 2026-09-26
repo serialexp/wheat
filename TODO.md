@@ -11,18 +11,6 @@ are the scanner's word only and need checking before a fix.
 
 Security, most serious first:
 
-- `[ ]` **The repository registry is not pluggable.** `Registry`
-  (`crates/wheat-server/src/registry.rs`) is a fixed struct, and `main.rs` serves one
-  repository. Access is pluggable now (`AccessProvider`), but an embedder such as
-  Gothab also needs to look repositories up itself, and the standalone server has no
-  way to serve several (`Registry::from_repos_dir` exists but nothing calls it).
-- `[ ]` **Materialization does not reserve `.git` (confirmed).** `RESERVED` in
-  `crates/wheat-cli/src/materialization.rs` (and the matching list in
-  `workspace_files.rs`) blocks `.wheat`, `.wheat-git`, `storage` and
-  `repository.head`, but not `.git`. A repository could carry `.git/hooks/...` or
-  `.git/config` and plant something git runs later if the workspace is also a git
-  checkout. Less urgent because the workspace is a wheat repo, but cheap to block.
-  Check every path component, not only the first.
 - `[ ]` **Decoders trust untrusted lengths (partly confirmed).**
   - The BinSchema-generated decoders (`wheat-core` and `wheat-protocol`
     `generated.rs`) call `Vec::with_capacity(length)` with the length read from the
@@ -140,6 +128,16 @@ budget passes, but by only about 0.7 s.
   2026-09-26 the client sends a bearer token from `credential.helper`, so over plain
   `wheat://` to another machine the token travels in clear text. Once TLS works,
   consider refusing to send a token over plain `wheat://` to a non-loopback host.
+- `[ ]` **The repository registry is not pluggable (2026-09-26).** `Registry`
+  (`crates/wheat-server/src/registry.rs`) is a fixed struct, and `main.rs` serves one
+  repository. Access is pluggable now (`AccessProvider`), but an embedder such as
+  Gothab also needs to look repositories up itself, and the standalone server has no
+  way to serve several (`Registry::from_repos_dir` exists but nothing calls it).
+- `[ ]` **Capturing `.git` paths is not gated (2026-09-26).** Writing paths inside
+  `.git` now asks or needs `--allow-dot-git`, but `wheat add .git/config` captures
+  one without a word. In a workspace that is also a git checkout that could put
+  git's own files into the repository by accident. Decide whether capture should
+  ask the same way.
 - `[ ]` **The `.gitignore` fallback diagnostic points at a missing command.**
   `workspace_status.rs` tells users to run `wheat ignore import`, which does not
   exist (tracked in `wheat-local-tooling.md`).

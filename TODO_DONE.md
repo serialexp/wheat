@@ -17,6 +17,17 @@ Finished items, moved here from `TODO.md` under the same headings.
   `credential.helper` (`crates/wheat-cli/src/credential.rs`). Tests:
   `crates/wheat-server/tests/access_test.rs`, `cli_test.rs`,
   `crates/wheat-cli/tests/remote_auth.rs`. TLS is still open (see "Loose ends").
+- `[x]` **Materialization does not reserve `.git` (confirmed).** A repository could
+  carry `.git/hooks/...` or `.git/config` and plant something git runs later if the
+  workspace is also a git checkout. Done 2026-09-26, as a question rather than a
+  ban, because such files can be legitimate: before writing anything,
+  materialize, switch, refresh, restore, clone and import list every path with a
+  `.git` component (any letter case, any depth). A person at a terminal is asked;
+  anything else is refused with `dot_git_paths` (exit 2) unless `--allow-dot-git`
+  is given (`crates/wheat-cli/src/dot_git.rs`). A refused clone or import leaves the
+  workspace set up and says to run `wheat materialize --allow-dot-git`. The three
+  reserved-name lists are now one, `wheat_ignore::WORKSPACE_CONTROL_NAMES`. Tests:
+  `crates/wheat-cli/tests/dot_git.rs`. Capture is still open (see "Loose ends").
 
 ## Explicit history collapse, repack, and GC
 
