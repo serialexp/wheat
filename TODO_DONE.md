@@ -41,6 +41,23 @@ Finished items, moved here from `TODO.md` under the same headings.
   `crates/wheat-protocol/tests/forged_lengths.rs`. DeltaZstd and chunk limits are
   still open under the same heading in `TODO.md`.
 
+## Revise/compose cost at stack depth (2026-09-25)
+
+- `[x]` **`open` walks every view since the basis on each mutation (2026-09-26).**
+  `PersistedRepositoryMutator::open` checked the effective view with
+  `ViewLineageMapStore::is_descendant(basis, effective)`, a forward search over every
+  view created since the basis, so each `change new`/`add` was linear in the history
+  and building one was quadratic (4,000 revisions took 283 s). Done 2026-09-26: the
+  effective view's applications name the view each change was applied onto; in
+  canonical order they are the path from the basis, and `ViewLineageMapStore::follows_path`
+  checks each hop is a lineage edge, one lookup per change. The forward search stays
+  as a fallback. The `checkpoint_stack` bench's spread top revision went from 86 ms to
+  about 6.5 ms. Tests: `proving_ancestry_does_not_grow_with_the_history_under_the_basis`
+  and `a_mutation_refuses_an_effective_view_outside_the_basis_lineage`
+  (`crates/wheat-store/tests/repository_mutation.rs`),
+  `a_path_proves_descent_hop_by_hop_without_scanning_the_lineage`
+  (`crates/wheat-store/tests/view_lineage.rs`).
+
 ## Explicit history collapse, repack, and GC
 
 - `[x]` **`wheat change squash`.** Collapse one change's unpublished checkpoint

@@ -105,17 +105,16 @@ budget passes, but by only about 0.7 s.
   the release numbers are in.
 - `[ ]` **Move `WHEAT_IMPORT_PROFILE` (wheat-git) onto tracing spans**, so there is one
   profiler instead of two.
-- `[ ]` **`open` walks every view since the basis on each mutation (2026-09-26).**
-  `PersistedRepositoryMutator::open` checks the effective view with
-  `ViewLineageMapStore::is_descendant(basis, effective)`, a forward search from the basis
-  over every view created since. Every `change new`/`add` is therefore linear in the
-  views since the label basis, and building a history is quadratic. Found while building
-  the `git_export_notes` bench history (release, deferred durability): 4,000 revisions
-  took 283 s to build, about 70 ms per mutation by the end, almost all of it decoding
-  view-lineage nodes. The bench is held at 2,000 revisions because of it. A walk from
-  the effective view back to the basis (or a depth/ancestor index) would make the check
-  proportional to the stack, not the history. `descendant_frontiers` (status/refresh)
-  does the same forward walk.
+- `[ ]` **`descendant_frontiers` walks every view since the label basis (2026-09-26).**
+  Switch, refresh, clone, init and `frontier list` find frontiers with a forward walk
+  of the view lineage from the basis, so they are linear in the history since the
+  basis. The lineage only stores parent → children links. Mutations no longer do this
+  (see TODO_DONE.md); a fix here likely needs parent links or a frontier index stored
+  with the label (option B from the mutation fix, a format change).
+- `[ ]` **`checkpoint_stack` warm-up (2026-09-26).** A new store's revisions get
+  slower over the first ~400 (single change: 1.5 → 2.6 ms, deep: 4.2 → 6.5 ms), then
+  stay flat. The profile shows zstd decoding and malloc in the packed store; the cause
+  is not proven.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
