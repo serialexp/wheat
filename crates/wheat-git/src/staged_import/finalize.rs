@@ -402,6 +402,7 @@ where
                 ViewLabel {
                     view,
                     original_git_ref: Some(original_ref),
+                    annotation: None,
                 },
             )
         }))

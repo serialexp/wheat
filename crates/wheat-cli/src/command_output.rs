@@ -584,6 +584,9 @@ fn classify(error: &Error) -> Classification {
                 RepositoryRewriteError::StaleSelection => {
                     class("state", "stale_rewrite_selection", true, 3)
                 }
+                RepositoryRewriteError::MovesAnnotatedLabel(_) => {
+                    class("input", "moves_annotated_label", false, 2)
+                }
                 RepositoryRewriteError::InvalidBoundary
                 | RepositoryRewriteError::MissingMetadata
                 | RepositoryRewriteError::SemanticDrift

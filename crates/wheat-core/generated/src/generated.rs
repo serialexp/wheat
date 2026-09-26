@@ -4617,6 +4617,7 @@ pub struct ViewLabelManifestEntryV1 {
     pub name: std::string::String,
     pub view: ViewId,
     pub original_git_refs: Vec<std::string::String>,
+    pub annotation: Option<LabelAnnotationV1>,
 }
 
 impl ViewLabelManifestEntryV1 {
@@ -4639,6 +4640,12 @@ impl ViewLabelManifestEntryV1 {
             for b in item.as_bytes() {
                 encoder.write_byte(*b);
             }
+        }
+        if let Some(ref v) = self.annotation {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
         }
         Ok(())
     }
@@ -4663,10 +4670,62 @@ impl ViewLabelManifestEntryV1 {
                 .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
             original_git_refs.push(item);
         }
+        let has_value = decoder.read_uint8()? != 0;
+        let annotation = if has_value {
+            Some(LabelAnnotationV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
         Ok(Self {
             name,
             view,
             original_git_refs,
+            annotation,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelAnnotationV1 {
+    pub tagger: ActorV1,
+    pub tagged_at: TimestampV1,
+    pub message: std::string::String,
+}
+
+impl LabelAnnotationV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.tagger.encode_into(encoder)?;
+        self.tagged_at.encode_into(encoder)?;
+        encoder.write_u32_be(self.message.len() as u32);
+        let string_bytes: &[u8] = self.message.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let tagger = ActorV1::decode_with_decoder(decoder)?;
+        let tagged_at = TimestampV1::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let message = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            tagger,
+            tagged_at,
+            message,
         })
     }
 }

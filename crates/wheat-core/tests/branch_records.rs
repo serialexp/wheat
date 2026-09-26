@@ -13,6 +13,7 @@ fn manifest_is_order_independent_and_roundtrips() {
     let imported = ViewLabel {
         view: view(2),
         original_git_ref: Some("refs/heads/main".to_owned()),
+        annotation: None,
     };
     let left =
         ViewLabelManifestRecord::new([("z", ViewLabel::from(view(1))), ("main", imported.clone())])
@@ -46,6 +47,7 @@ fn manifest_rejects_duplicate_and_invalid_names() {
             ViewLabel {
                 view: view(1),
                 original_git_ref: Some("main".to_owned()),
+                annotation: None,
             },
         )]),
         Err(CanonicalObjectError::InvalidViewLabel(_))

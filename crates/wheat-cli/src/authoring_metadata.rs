@@ -455,6 +455,24 @@ fn unlock(_file: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
+/// Builds a label annotation: the configured actor tags it, at `tagged_at`
+/// (RFC3339) or now.
+pub(crate) fn annotation(
+    store_root: &Path,
+    message: String,
+    tagged_at: Option<&str>,
+) -> Result<wheat_core::LabelAnnotation> {
+    let annotation = wheat_core::LabelAnnotation {
+        tagger: actor(store_root)?,
+        tagged_at: parse_timestamp(tagged_at, Local::now().fixed_offset(), "tagged-at")?,
+        message,
+    };
+    annotation
+        .validate()
+        .map_err(|error| crate::command_output::CliFailure::invalid(error.to_string()))?;
+    Ok(annotation)
+}
+
 pub(crate) fn display_timestamp(value: Timestamp) -> Result<String> {
     let offset_seconds = i32::from(value.offset_minutes) * 60;
     let offset =

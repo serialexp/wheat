@@ -105,6 +105,7 @@ async fn squash_collapses_local_suffix_preserves_edits_and_publishes_with_one_ca
             ViewLabel {
                 view: effective,
                 original_git_ref: Some("refs/heads/main".into()),
+                annotation: None,
             },
         ),
         ("archive", base.into()),
@@ -181,10 +182,140 @@ async fn squash_collapses_local_suffix_preserves_edits_and_publishes_with_one_ca
         ViewLabel {
             view: prepared_resulting_view,
             original_git_ref: Some("refs/heads/main".into()),
+            annotation: None,
         }
     );
     assert_eq!(rewritten_labels.labels["archive"].view, base);
     reader.validate_complete(envelope.state).await.unwrap();
+}
+
+/// Squash of a two-revision change, with `tagged` labelled `tags/v1` and annotated.
+/// Returns the prepared outcome and the head before it.
+async fn squash_with_annotated_label(
+    tag_top: bool,
+) -> (
+    std::result::Result<Option<PreparedRepositoryRewrite>, RepositoryRewriteError>,
+    LocalPublicationStore,
+    RepositoryHead,
+    tempfile::TempDir,
+) {
+    let (dir, objects, content, heads, mut head, base) = fixture().await;
+    let change = ChangeId::new();
+    let first_edits = exact("file", None, b"one");
+    let first_edit = *first_edits.edits.keys().next().unwrap();
+    let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
+    let (prepared, first) = mutator
+        .create(
+            head,
+            base,
+            base,
+            ChangeProposal {
+                id: change,
+                metadata: Default::default(),
+                dependencies: BTreeSet::new(),
+                revision_metadata: Default::default(),
+                edits: first_edits,
+            },
+        )
+        .await
+        .unwrap();
+    head = mutator.publish(prepared).await.unwrap();
+    let mut second_edits = exact("file", None, b"two");
+    second_edits.transition.removed.insert(first_edit);
+    let (prepared, second) = mutator
+        .revise(
+            head,
+            base,
+            first.resulting_view,
+            change,
+            first.revision_id,
+            Default::default(),
+            second_edits,
+        )
+        .await
+        .unwrap();
+    head = mutator.publish(prepared).await.unwrap();
+    let effective = second.resulting_view;
+
+    let tagged = if tag_top { effective } else { base };
+    let reader = RepositoryReader::new(&objects, &content);
+    let current = reader.envelope(head.envelope).await.unwrap();
+    let labels = ViewLabelManifestRecord::new([
+        ("main", ViewLabel::from(effective)),
+        (
+            "tags/v1",
+            ViewLabel {
+                view: tagged,
+                original_git_ref: None,
+                annotation: Some(LabelAnnotation {
+                    tagger: Actor {
+                        name: "Bart".into(),
+                        email: "bart@example.com".into(),
+                    },
+                    tagged_at: Timestamp {
+                        seconds: 1_790_000_000,
+                        offset_minutes: 0,
+                    },
+                    message: "Release 1".into(),
+                }),
+            },
+        ),
+    ])
+    .unwrap();
+    let publisher = RepositoryPublisher::new(&objects, &content, &heads);
+    let labeled = publisher
+        .prepare_envelope(current.state, &labels)
+        .await
+        .unwrap();
+    head = publisher.publish_envelope(head, labeled).await.unwrap();
+
+    let request = SquashRewriteRequest {
+        expected_revisions: [(change, second.revision_id)].into(),
+        retained_predecessors: [(change, None)].into(),
+        revision_metadata: [(
+            change,
+            RevisionMetadata {
+                message: "squashed".into(),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        authority_roots: [base, effective].into(),
+        authority_view_sets: BTreeSet::new(),
+        authority_revision_sets: BTreeSet::new(),
+    };
+    let outcome = RepositoryRewriter::new(&objects, &content, &heads)
+        .prepare_squash(head, base, effective, request)
+        .await;
+    (outcome, heads, head, dir)
+}
+
+#[tokio::test]
+async fn squash_refuses_to_move_an_annotated_label() {
+    let (outcome, heads, head, _dir) = squash_with_annotated_label(true).await;
+    assert!(
+        matches!(
+            &outcome,
+            Err(RepositoryRewriteError::MovesAnnotatedLabel(name)) if name == "tags/v1"
+        ),
+        "a tag label on the squashed view must stop the squash"
+    );
+    assert_eq!(heads.read().unwrap(), head);
+}
+
+#[tokio::test]
+async fn squash_keeps_an_annotated_label_it_does_not_move() {
+    let (outcome, heads, _head, dir) = squash_with_annotated_label(false).await;
+    let prepared = outcome.unwrap().unwrap();
+    let published = finalize_repository_rewrite(&heads, prepared).unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(published.envelope).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    let tag = &labels.labels["tags/v1"];
+    assert!(tag.annotation.is_some());
+    assert_ne!(tag.view, labels.labels["main"].view);
 }
 
 #[tokio::test]

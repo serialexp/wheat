@@ -119,6 +119,10 @@ pub enum RepositoryRewriteError {
     MissingProducedView,
     #[error("authority root is not retained by the current repository")]
     UnknownAuthorityRoot,
+    /// An annotated label is a (possibly already pushed) Git tag, so its view must
+    /// never move. Delete the label first if the rewrite is really wanted.
+    #[error("rewrite would move annotated label {0}, which is published as a Git tag")]
+    MovesAnnotatedLabel(String),
 }
 
 type Result<T> = std::result::Result<T, RepositoryRewriteError>;
@@ -345,6 +349,19 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
         }
         view_mapping.insert(effective_view, resulting.id());
 
+        // Checked before any state is built: an annotated label may already be a
+        // pushed Git tag, and moving it would change the commit the tag names.
+        let old_envelope = reader.envelope(expected.envelope).await?;
+        let old_labels = reader.view_label_manifest(old_envelope.labels).await?;
+        if let Some((name, _)) = old_labels.labels.iter().find(|(_, label)| {
+            label.annotation.is_some()
+                && view_mapping
+                    .get(&label.view)
+                    .is_some_and(|mapped| *mapped != label.view)
+        }) {
+            return Err(RepositoryRewriteError::MovesAnnotatedLabel(name.clone()));
+        }
+
         // Authority references move with an exactly equivalent rewritten view. Keeping an old
         // label/workspace target as an authority root would defeat collapse by retaining the
         // replaced suffix solely because its reference had not been updated yet.
@@ -377,8 +394,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
             .await?;
         reader.validate_complete(state.id()).await?;
 
-        let old_envelope = reader.envelope(expected.envelope).await?;
-        let old_labels = reader.view_label_manifest(old_envelope.labels).await?;
         let labels =
             ViewLabelManifestRecord::new(old_labels.labels.into_iter().map(|(name, mut label)| {
                 label.view = view_mapping.get(&label.view).copied().unwrap_or(label.view);

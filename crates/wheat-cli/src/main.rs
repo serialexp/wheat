@@ -320,6 +320,13 @@ enum LabelCommand {
         /// Exact retained view; defaults to the workspace's selected view.
         #[arg(long)]
         view: Option<String>,
+        /// Annotate the label so `wheat push --tag` can publish it as an annotated
+        /// Git tag. The configured actor is the tagger. Name tag labels `tags/<tag>`.
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        /// Tag time (RFC3339) for an annotated label; defaults to now.
+        #[arg(long, requires = "message")]
+        tagged_at: Option<String>,
         /// Full repository head CAS guard: <generation>:<envelope>.
         #[arg(long, value_parser = label_service::parse_expected_head)]
         expected_head: Option<wheat_store::RepositoryHead>,
@@ -878,8 +885,19 @@ fn execute(cli: Cli) -> Result<Success> {
                 LabelCommand::Create {
                     name,
                     view,
+                    message,
+                    tagged_at,
                     expected_head,
                 } => {
+                    let annotation = message
+                        .map(|message| {
+                            authoring_metadata::annotation(
+                                &store_root,
+                                message,
+                                tagged_at.as_deref(),
+                            )
+                        })
+                        .transpose()?;
                     let view = match view {
                         Some(view) => ViewId::from_str(&view).context("invalid view ID")?,
                         None => context
@@ -891,7 +909,7 @@ fn execute(cli: Cli) -> Result<Success> {
                                 )
                             })?,
                     };
-                    label_service::create(&local, name, view, expected_head)
+                    label_service::create(&local, name, view, annotation, expected_head)
                 }
                 LabelCommand::Rename {
                     old,

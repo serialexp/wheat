@@ -34,6 +34,8 @@ pub enum CanonicalObjectError {
     InvalidDirectoryComponent(String),
     #[error("invalid view label {0:?}")]
     InvalidViewLabel(String),
+    #[error("invalid label annotation: {0}")]
+    InvalidLabelAnnotation(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +193,17 @@ pub fn decode_view_label_manifest_record(
                     digest_domain(&entry.view.digest).expect("validated digest"),
                 ),
                 original_git_ref: entry.original_git_refs.into_iter().next(),
+                annotation: entry.annotation.map(|annotation| crate::LabelAnnotation {
+                    tagger: Actor {
+                        name: annotation.tagger.name,
+                        email: annotation.tagger.email,
+                    },
+                    tagged_at: Timestamp {
+                        seconds: annotation.tagged_at.seconds,
+                        offset_minutes: annotation.tagged_at.offset_minutes,
+                    },
+                    message: annotation.message,
+                }),
             },
         )
     }))
@@ -1136,6 +1149,13 @@ pub(crate) fn view_label_manifest_record_bytes(record: &crate::ViewLabelManifest
                     name: name.clone(),
                     view: view_id(label.view),
                     original_git_refs: label.original_git_ref.iter().cloned().collect(),
+                    annotation: label.annotation.as_ref().map(|annotation| {
+                        wire::LabelAnnotationV1 {
+                            tagger: actor(&annotation.tagger),
+                            tagged_at: timestamp(annotation.tagged_at),
+                            message: annotation.message.clone(),
+                        }
+                    }),
                 })
                 .collect(),
         }
@@ -2129,6 +2149,7 @@ mod tests {
         let label = crate::ViewLabel {
             view,
             original_git_ref: None,
+            annotation: None,
         };
         let record = crate::ViewLabelManifestRecord::new([("main", label)]).unwrap();
         let bytes = record.canonical_bytes();
@@ -2153,6 +2174,78 @@ mod tests {
             refs.contains(&expected_oid),
             "should contain the view ObjectId; got {refs:?}"
         );
+    }
+
+    fn annotation(message: &str) -> crate::LabelAnnotation {
+        crate::LabelAnnotation {
+            tagger: Actor {
+                name: "Bart".into(),
+                email: "bart@example.com".into(),
+            },
+            tagged_at: Timestamp {
+                seconds: 1_790_000_000,
+                offset_minutes: 540,
+            },
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn label_annotations_round_trip_and_change_the_manifest_id() {
+        let view = crate::ViewId::from_digest([7u8; 32]);
+        let plain = crate::ViewLabel::from(view);
+        let tagged = crate::ViewLabel {
+            annotation: Some(annotation("Release 0.1.0\n\nFirst release.")),
+            ..plain.clone()
+        };
+        let record = crate::ViewLabelManifestRecord::new([
+            ("main", plain.clone()),
+            ("tags/v0.1.0", tagged.clone()),
+        ])
+        .unwrap();
+        let decoded = decode_view_label_manifest_record(&record.canonical_bytes()).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.labels["tags/v0.1.0"], tagged);
+        assert_eq!(decoded.labels["main"].annotation, None);
+
+        let untagged =
+            crate::ViewLabelManifestRecord::new([("main", plain.clone()), ("tags/v0.1.0", plain)])
+                .unwrap();
+        assert_ne!(untagged.id(), record.id());
+    }
+
+    #[test]
+    fn label_annotations_must_fit_a_git_tag() {
+        let view = crate::ViewId::from_digest([7u8; 32]);
+        let label = |annotation: crate::LabelAnnotation| crate::ViewLabel {
+            view,
+            original_git_ref: None,
+            annotation: Some(annotation),
+        };
+        let mut bad_tagger = annotation("Release");
+        bad_tagger.tagger.email = "<bart@example.com>".into();
+        let mut empty_name = annotation("Release");
+        empty_name.tagger.name.clear();
+        for invalid in [
+            annotation(""),
+            annotation(" \n"),
+            annotation("nul\0inside"),
+            annotation(&"x".repeat(crate::MAX_LABEL_ANNOTATION_MESSAGE_BYTES + 1)),
+            bad_tagger,
+            empty_name,
+        ] {
+            assert!(matches!(
+                crate::ViewLabelManifestRecord::new([("tags/v1", label(invalid))]),
+                Err(CanonicalObjectError::InvalidLabelAnnotation(_))
+            ));
+        }
+        crate::ViewLabelManifestRecord::new([(
+            "tags/v1",
+            label(annotation(
+                &"x".repeat(crate::MAX_LABEL_ANNOTATION_MESSAGE_BYTES),
+            )),
+        )])
+        .unwrap();
     }
 
     #[test]

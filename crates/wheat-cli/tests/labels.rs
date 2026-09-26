@@ -392,6 +392,117 @@ fn labels_enforce_the_repository_size_bound_on_create() {
 }
 
 #[test]
+fn annotated_labels_store_tagger_date_and_message_and_keep_them_on_rename() {
+    let (root, config) = setup();
+    let created = wheat(
+        root.path(),
+        config.path(),
+        &[
+            "--format=json",
+            "label",
+            "create",
+            "tags/v1",
+            "-m",
+            "Release 1\n\nFirst one.",
+            "--tagged-at",
+            "2026-09-26T12:00:00+09:00",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let annotation = serde_json::json!({
+        "tagger_name": "Label Test",
+        "tagger_email": "labels@example.invalid",
+        "tagged_at": "2026-09-26T12:00:00+09:00",
+        "message": "Release 1\n\nFirst one.",
+    });
+    assert_eq!(json(&created)["result"]["label"]["annotation"], annotation);
+
+    let renamed = wheat(
+        root.path(),
+        config.path(),
+        &["--format=json", "label", "rename", "tags/v1", "tags/v1.0"],
+    );
+    assert_eq!(json(&renamed)["result"]["label"]["annotation"], annotation);
+
+    let listed = json(&wheat(
+        root.path(),
+        config.path(),
+        &["--format=json", "labels"],
+    ));
+    let labels = listed["result"]["labels"].as_array().unwrap();
+    assert_eq!(labels[0]["name"], "main");
+    assert!(labels[0].get("annotation").is_none());
+    assert_eq!(labels[1]["name"], "tags/v1.0");
+    assert_eq!(labels[1]["annotation"], annotation);
+
+    let human = wheat(root.path(), config.path(), &["labels"]);
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains(
+            "tagged by Label Test <labels@example.invalid> at 2026-09-26T12:00:00+09:00: Release 1"
+        ),
+        "{human}"
+    );
+}
+
+#[test]
+fn annotated_label_input_is_checked() {
+    let (root, config) = setup();
+    let empty = wheat(
+        root.path(),
+        config.path(),
+        &["--format=json", "label", "create", "tags/v1", "-m", " "],
+    );
+    assert_eq!(empty.status.code(), Some(2));
+    assert_eq!(json(&empty)["error"]["code"], "invalid_input");
+
+    let bad_time = wheat(
+        root.path(),
+        config.path(),
+        &[
+            "--format=json",
+            "label",
+            "create",
+            "tags/v1",
+            "-m",
+            "Release",
+            "--tagged-at",
+            "yesterday",
+        ],
+    );
+    assert!(!bad_time.status.success());
+
+    let time_without_message = wheat(
+        root.path(),
+        config.path(),
+        &[
+            "--format=json",
+            "label",
+            "create",
+            "tags/v1",
+            "--tagged-at",
+            "2026-09-26T12:00:00Z",
+        ],
+    );
+    assert_eq!(time_without_message.status.code(), Some(2));
+    assert_eq!(
+        json(&time_without_message)["error"]["code"],
+        "invalid_arguments"
+    );
+
+    let listed = json(&wheat(
+        root.path(),
+        config.path(),
+        &["--format=json", "labels"],
+    ));
+    assert_eq!(listed["result"]["labels"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn label_command_parser_requires_structural_subcommands_and_full_head() {
     let (root, config) = setup();
     let missing = wheat(root.path(), config.path(), &["--format=json", "label"]);

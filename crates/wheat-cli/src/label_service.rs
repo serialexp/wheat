@@ -4,10 +4,13 @@ use std::{fmt::Write as _, str::FromStr};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use wheat_core::{RepositoryEnvelopeId, ViewId, ViewLabel, ViewLabelManifestRecord};
+use wheat_core::{
+    LabelAnnotation, RepositoryEnvelopeId, ViewId, ViewLabel, ViewLabelManifestRecord,
+};
 use wheat_store::{PublicationStore, RepositoryHead, RepositoryPublisher, RepositoryReader};
 
 use crate::{
+    authoring_metadata::display_timestamp,
     command_output::{CliFailure, Success},
     local::LocalRepository,
     runtime,
@@ -21,6 +24,41 @@ pub(crate) struct LabelEntry {
     pub view: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_git_ref: Option<String>,
+    /// Present when the label is published as an annotated Git tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<AnnotationDocument>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct AnnotationDocument {
+    pub tagger_name: String,
+    pub tagger_email: String,
+    pub tagged_at: String,
+    pub message: String,
+}
+
+impl LabelEntry {
+    fn new(name: String, label: &ViewLabel) -> Result<Self> {
+        Ok(Self {
+            name,
+            view: label.view.to_string(),
+            original_git_ref: label.original_git_ref.clone(),
+            annotation: label
+                .annotation
+                .as_ref()
+                .map(annotation_document)
+                .transpose()?,
+        })
+    }
+}
+
+fn annotation_document(annotation: &LabelAnnotation) -> Result<AnnotationDocument> {
+    Ok(AnnotationDocument {
+        tagger_name: annotation.tagger.name.clone(),
+        tagger_email: annotation.tagger.email.clone(),
+        tagged_at: display_timestamp(annotation.tagged_at)?,
+        message: annotation.message.clone(),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -66,15 +104,25 @@ pub(crate) fn list(repository: &LocalRepository) -> Result<Success> {
         if let Some(original) = &label.original_git_ref {
             write!(human, "\t{original}")?;
         }
+        if let Some(annotation) = &label.annotation {
+            let title = annotation.message.lines().next().unwrap_or_default();
+            write!(
+                human,
+                "\ttagged by {} <{}> at {}: {title}",
+                annotation.tagger_name, annotation.tagger_email, annotation.tagged_at
+            )?;
+        }
         human.push('\n');
     }
     Success::new("labels", &document, human)
 }
 
+/// Creates a label; with an `annotation` it can be pushed as an annotated Git tag.
 pub(crate) fn create(
     repository: &LocalRepository,
     name: String,
     view: ViewId,
+    annotation: Option<LabelAnnotation>,
     expected: Option<RepositoryHead>,
 ) -> Result<Success> {
     mutate(repository, expected, "label.create", move |labels| {
@@ -86,12 +134,13 @@ pub(crate) fn create(
                 "repository cannot contain more than {MAX_LABELS} labels"
             )));
         }
-        labels.insert(name.clone(), ViewLabel::from(view));
-        Ok(LabelEntry {
-            name,
-            view: view.to_string(),
-            original_git_ref: None,
-        })
+        let label = ViewLabel {
+            annotation,
+            ..ViewLabel::from(view)
+        };
+        let entry = LabelEntry::new(name.clone(), &label)?;
+        labels.insert(name, label);
+        Ok(entry)
     })
 }
 
@@ -108,11 +157,7 @@ pub(crate) fn rename(
         let label = labels
             .remove(&old)
             .ok_or_else(|| CliFailure::invalid(format!("label {old} does not exist")))?;
-        let entry = LabelEntry {
-            name: new.clone(),
-            view: label.view.to_string(),
-            original_git_ref: label.original_git_ref.clone(),
-        };
+        let entry = LabelEntry::new(new.clone(), &label)?;
         labels.insert(new, label);
         Ok(entry)
     })
@@ -127,11 +172,7 @@ pub(crate) fn delete(
         let label = labels
             .remove(&name)
             .ok_or_else(|| CliFailure::invalid(format!("label {name} does not exist")))?;
-        Ok(LabelEntry {
-            name,
-            view: label.view.to_string(),
-            original_git_ref: label.original_git_ref,
-        })
+        LabelEntry::new(name, &label)
     })
 }
 
@@ -147,13 +188,9 @@ async fn load(repository: &LocalRepository) -> Result<LabelList> {
     }
     let labels = manifest
         .labels
-        .into_iter()
-        .map(|(name, label)| LabelEntry {
-            name,
-            view: label.view.to_string(),
-            original_git_ref: label.original_git_ref,
-        })
-        .collect();
+        .iter()
+        .map(|(name, label)| LabelEntry::new(name.clone(), label))
+        .collect::<Result<_>>()?;
     Ok(LabelList {
         schema_version: 1,
         head: head.into(),

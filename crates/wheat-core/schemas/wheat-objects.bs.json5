@@ -518,6 +518,16 @@
         // Zero or one full source ref (for example `refs/heads/main`). Native
         // labels remain short (`main`); this field only records import provenance.
         { name: "original_git_refs", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" } },
+        // Present on a label that is published as an annotated Git tag. Stored
+        // so the tag object is the same wherever and whenever it is pushed.
+        { name: "annotation", type: "optional", value_type: "LabelAnnotationV1" },
+      ],
+    },
+    LabelAnnotationV1: {
+      sequence: [
+        { name: "tagger", type: "ActorV1" },
+        { name: "tagged_at", type: "TimestampV1" },
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
       ],
     },
     RepositoryEnvelopeV1: {
