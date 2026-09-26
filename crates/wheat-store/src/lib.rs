@@ -6,7 +6,6 @@
 mod application_map;
 mod batch;
 mod change_map;
-mod closure;
 mod commit_content;
 mod commit_writer;
 mod content_batch;
@@ -84,7 +83,6 @@ pub use batch::BatchObjectStore;
 pub use change_map::{
     ChangeMapCursor, ChangeMapDelta, ChangeMapDeltaLimits, ChangeMapError, ChangeMapStore,
 };
-pub use closure::collect_structural_closure;
 pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
 pub use content_set::{ContentSetCursor, ContentSetDelta, ContentSetStore};
 pub use durability::{Durability, sync_directory, sync_filesystem};

@@ -2,7 +2,8 @@
 
 use wheat_protocol::{
     CreditOutput, Digest256, ErrorOutput, ErrorScope, ErrorScopeConnectionOutput,
-    FetchCompleteOutput, FetchRequestOutput, ObjectBatchOutput, ObjectEntry, PublishRequestOutput,
+    FetchCompleteOutput, FetchPushEndOutput, FetchRequestOutput, ObjectBatchOutput,
+    ObjectChunkOutput, ObjectEntry, ObjectWantOutput, ObjectWantReplyOutput, PublishRequestOutput,
     PublishResultOutput, PublishResultStatus, PublishStatusOkOutput, RepositoryOpenOutput,
     ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus, SessionStatusOkOutput,
     Uuid128, WheatProtocolMessage, decode_message, encode_message,
@@ -39,12 +40,57 @@ fn fetch_request_round_trip() {
     let msg = WheatProtocolMessage::FetchRequest(FetchRequestOutput {
         message_type: 0x20,
         op_id: 42,
-        labels: vec!["main".to_string(), "develop".to_string()],
-        since_generation: 0,
+        want_envelope: Digest256 {
+            bytes: vec![0x5a; 32],
+        },
         since_envelope: zero_digest(),
     });
     let decoded = round_trip(msg.clone());
     assert_eq!(msg, decoded);
+}
+
+#[test]
+fn fetch_pull_messages_round_trip() {
+    let entry = ObjectEntry {
+        id: Digest256 {
+            bytes: vec![0x11; 32],
+        },
+        data: vec![9, 8, 7],
+    };
+    for msg in [
+        WheatProtocolMessage::FetchPushEnd(FetchPushEndOutput {
+            message_type: 0x24,
+            op_id: 1,
+            pushed_objects: 1 << 40,
+            incremental: true,
+        }),
+        WheatProtocolMessage::ObjectWant(ObjectWantOutput {
+            message_type: 0x22,
+            op_id: 1,
+            want_sequence: 3,
+            ids: vec![entry.id.clone(), zero_digest()],
+        }),
+        WheatProtocolMessage::ObjectWantReply(ObjectWantReplyOutput {
+            message_type: 0x25,
+            op_id: 1,
+            want_sequence: 3,
+            objects: vec![entry.clone()],
+        }),
+        WheatProtocolMessage::ObjectChunk(ObjectChunkOutput {
+            message_type: 0x26,
+            op_id: 1,
+            object_id: entry.id.clone(),
+            offset: 4 << 20,
+            data: vec![1; 16],
+            is_final: false,
+        }),
+        WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
+            message_type: 0x23,
+            op_id: 1,
+        }),
+    ] {
+        assert_eq!(round_trip(msg.clone()), msg);
+    }
 }
 
 #[test]

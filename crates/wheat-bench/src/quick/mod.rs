@@ -15,11 +15,13 @@ mod add_scale;
 mod checkpoint_stack;
 mod content_repack_plan;
 mod deep_stack;
+mod fetch_incremental;
 mod git_export_notes;
 mod history;
 mod import_resume_wide;
 mod packed_append;
 mod publish_content;
+mod server;
 mod sharded_manifest;
 mod transition_validate;
 mod workspace;
@@ -54,6 +56,7 @@ pub const CASES: &[&str] = &[
     git_export_notes::NAME,
     checkpoint_stack::NAME,
     publish_content::NAME,
+    fetch_incremental::NAME,
     import_resume_wide::NAME,
 ];
 
@@ -193,6 +196,7 @@ pub fn run_case(
         git_export_notes::NAME => git_export_notes::run(&context),
         checkpoint_stack::NAME => checkpoint_stack::run(&context),
         publish_content::NAME => publish_content::run(&context),
+        fetch_incremental::NAME => fetch_incremental::run(&context),
         import_resume_wide::NAME => import_resume_wide::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }

@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
-    ImmutableObjectStore, MerkleTreeStore, PublicationError, PublicationStore, RepositoryHead,
-    RepositoryReader, TransitionValidationOptions, TreeDiffLimits,
+    DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, PublicationError,
+    PublicationStore, RepositoryHead, RepositoryReader, StructuralDelta, StructuralDeltaError,
+    StructuralDeltaLimits, TransitionValidationOptions, TreeDiffLimits,
 };
 
 use crate::connection::ConnectionError;
@@ -81,116 +82,10 @@ pub async fn handle_publish(
     );
 
     // --- Object transfer phase ---
-    // Discover what's missing and request it. If everything's already present
-    // (e.g. retried publish with same envelope), skip straight to complete.
-    let envelope_oid: ObjectId = proposed_envelope_id.into();
-
-    // Use a persistent discovery tracker that remembers visited objects
-    // across rounds, so we only re-check previously-missing objects and
-    // their newly-discoverable children instead of re-walking from root.
-    let mut tracker = MissingObjectTracker::new(envelope_oid);
-    let mut objects_complete = false;
-    let missing = tracker.discover_missing(entry, proposed_envelope_id).await;
-    if missing.is_empty() {
-        // Server already has the full closure (retry of a prior attempt).
-        send(
-            ws,
-            &WheatProtocolMessage::ObjectsComplete(ObjectsCompleteOutput {
-                message_type: 0x42,
-                op_id,
-            }),
-        )
-        .await?;
-        objects_complete = true;
-    } else {
-        let batch_size = missing.len().min(MAX_WANT_IDS);
-        send(
-            ws,
-            &WheatProtocolMessage::ObjectsNeeded(ObjectsNeededOutput {
-                message_type: 0x41,
-                op_id,
-                ids: missing[..batch_size].to_vec(),
-            }),
-        )
-        .await?;
-    }
-
-    // Receive objects until we have the full closure.
-    while !objects_complete {
-        let msg = recv(ws).await?;
-        match msg {
-            WheatProtocolMessage::ObjectBatch(batch) => {
-                if batch.op_id != op_id {
-                    continue;
-                }
-                debug!(
-                    op_id,
-                    count = batch.objects.len(),
-                    sequence = batch.sequence,
-                    "publish: received ObjectBatch"
-                );
-
-                // Store each object, validating identity. Track which
-                // objects arrived so the tracker can re-check only those.
-                let mut received_ids = Vec::with_capacity(batch.objects.len());
-                for obj_entry in &batch.objects {
-                    let claimed_id = digest_to_object_id(&obj_entry.id)?;
-                    let actual_id = ObjectId::of_canonical_bytes(&obj_entry.data);
-                    if actual_id != claimed_id {
-                        send(
-                            ws,
-                            &publish_result(
-                                op_id,
-                                publish_rejected_status(),
-                                current_head.generation,
-                                current_head.envelope.as_bytes(),
-                                "object identity mismatch",
-                            ),
-                        )
-                        .await?;
-                        return Ok(None);
-                    }
-                    entry
-                        .objects
-                        .put_if_absent(claimed_id, &obj_entry.data)
-                        .await
-                        .map_err(|e| {
-                            ConnectionError::Internal(format!("failed to store object: {e}"))
-                        })?;
-                    received_ids.push(claimed_id);
-                }
-
-                // Re-check: only the previously-missing objects that were
-                // just uploaded and any new children they reference.
-                tracker.mark_received(&received_ids);
-                let missing = tracker.discover_missing(entry, proposed_envelope_id).await;
-                if missing.is_empty() {
-                    send(
-                        ws,
-                        &WheatProtocolMessage::ObjectsComplete(ObjectsCompleteOutput {
-                            message_type: 0x42,
-                            op_id,
-                        }),
-                    )
-                    .await?;
-                    objects_complete = true;
-                } else {
-                    let batch_size = missing.len().min(MAX_WANT_IDS);
-                    send(
-                        ws,
-                        &WheatProtocolMessage::ObjectsNeeded(ObjectsNeededOutput {
-                            message_type: 0x41,
-                            op_id,
-                            ids: missing[..batch_size].to_vec(),
-                        }),
-                    )
-                    .await?;
-                }
-            }
-            _ => {
-                warn!(op_id, "publish: unexpected message during object transfer");
-            }
-        }
+    if let Some(refusal) =
+        receive_objects(ws, entry, op_id, current_head, proposed_envelope_id).await?
+    {
+        return reject(ws, op_id, current_head, &refusal).await;
     }
 
     // --- Content transfer phase ---
@@ -230,83 +125,94 @@ pub async fn handle_publish(
         .existing_ids(&all_content_ids)
         .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
 
-    let mut requested: Vec<ContentId> = all_content_ids
+    let missing: Vec<ContentId> = all_content_ids
         .iter()
         .filter(|id| !existing.contains(id))
         .copied()
         .collect();
-    requested.truncate(MAX_WANT_IDS);
 
-    // Always send ContentNeeded — even with an empty list — so the client
-    // doesn't hang waiting for it. An empty list means no content upload needed.
-    send(
-        ws,
-        &WheatProtocolMessage::ContentNeeded(ContentNeededOutput {
-            message_type: 0x43,
-            op_id,
-            content_ids: requested
-                .iter()
-                .map(|id| Digest256 {
-                    bytes: id.as_bytes().to_vec(),
-                })
-                .collect(),
-        }),
-    )
-    .await?;
-
-    if !requested.is_empty() {
+    if !missing.is_empty() {
         // Diff the old and new trees to find which files changed, then use
         // the old ContentId as a delta base for each new ContentId. This
         // produces much smaller stored objects for typical edits.
         let base_map =
             compute_delta_base_map(&entry.objects, &reader, current_head, &envelope_record).await;
 
-        // Accept only the requested blobs, each once, and store them in
-        // batches as they arrive so the session never holds more than one
-        // batch plus the blob being reassembled.
-        let mut receiver = ContentReceiver::new(requested.iter().copied(), MAX_CONTENT_SIZE);
+        // Ask in rounds of at most MAX_WANT_IDS, one ContentNeeded each. In
+        // every round accept only the requested blobs, each once, and store
+        // them in batches as they arrive so the session never holds more
+        // than one batch plus the blob being reassembled.
         let mut pending = PendingContent::default();
-        loop {
-            let msg = recv(ws).await?;
-            let received = match msg {
-                WheatProtocolMessage::ContentUpload(upload) if upload.op_id == op_id => {
-                    let id = digest_to_content_id(&upload.content_id)?;
-                    if let Err(e) = receiver.accept_whole(id, upload.data.len()) {
-                        return reject(ws, op_id, current_head, &format!("{e}")).await;
+        for round in missing.chunks(MAX_WANT_IDS) {
+            send(
+                ws,
+                &WheatProtocolMessage::ContentNeeded(ContentNeededOutput {
+                    message_type: 0x43,
+                    op_id,
+                    content_ids: round
+                        .iter()
+                        .map(|id| Digest256 {
+                            bytes: id.as_bytes().to_vec(),
+                        })
+                        .collect(),
+                }),
+            )
+            .await?;
+            let mut receiver = TransferReceiver::new(round.iter().copied(), MAX_CONTENT_SIZE);
+            loop {
+                let msg = recv(ws).await?;
+                let received = match msg {
+                    WheatProtocolMessage::ContentUpload(upload) if upload.op_id == op_id => {
+                        let id = digest_to_content_id(&upload.content_id)?;
+                        if let Err(e) = receiver.accept_whole(id, upload.data.len()) {
+                            return reject(ws, op_id, current_head, &format!("{e}")).await;
+                        }
+                        Some((id, upload.data))
                     }
-                    Some((id, upload.data))
-                }
-                WheatProtocolMessage::ContentUploadChunk(chunk) if chunk.op_id == op_id => {
-                    let id = digest_to_content_id(&chunk.content_id)?;
-                    match receiver.accept_chunk(id, chunk.offset, chunk.data, chunk.is_final) {
-                        Ok(finished) => finished,
-                        Err(e) => return reject(ws, op_id, current_head, &format!("{e}")).await,
+                    WheatProtocolMessage::ContentUploadChunk(chunk) if chunk.op_id == op_id => {
+                        let id = digest_to_content_id(&chunk.content_id)?;
+                        match receiver.accept_chunk(id, chunk.offset, chunk.data, chunk.is_final) {
+                            Ok(finished) => finished,
+                            Err(e) => {
+                                return reject(ws, op_id, current_head, &format!("{e}")).await;
+                            }
+                        }
                     }
-                }
-                WheatProtocolMessage::ContentUploadComplete(cuc) if cuc.op_id == op_id => {
-                    debug!(op_id, "publish: content upload complete");
-                    if let Err(e) = receiver.finish() {
-                        return reject(ws, op_id, current_head, &format!("{e}")).await;
+                    WheatProtocolMessage::ContentUploadComplete(cuc) if cuc.op_id == op_id => {
+                        debug!(op_id, "publish: content upload round complete");
+                        if let Err(e) = receiver.finish() {
+                            return reject(ws, op_id, current_head, &format!("{e}")).await;
+                        }
+                        break;
                     }
-                    break;
-                }
-                _ => {
-                    warn!(op_id, "publish: unexpected message during content upload");
-                    None
-                }
-            };
-            if let Some((id, data)) = received {
-                if ContentId::of(&data) != id {
-                    return reject(ws, op_id, current_head, "content identity mismatch").await;
-                }
-                let base = base_map.get(&id).copied();
-                if pending.push(id, data, base) {
-                    pending.store(entry)?;
+                    _ => {
+                        warn!(op_id, "publish: unexpected message during content upload");
+                        None
+                    }
+                };
+                if let Some((id, data)) = received {
+                    if ContentId::of(&data) != id {
+                        return reject(ws, op_id, current_head, "content identity mismatch").await;
+                    }
+                    let base = base_map.get(&id).copied();
+                    if pending.push(id, data, base) {
+                        pending.store(entry)?;
+                    }
                 }
             }
         }
         pending.store(entry)?;
     }
+
+    // Nothing more is needed; the client may commit.
+    send(
+        ws,
+        &WheatProtocolMessage::ContentComplete(ContentCompleteOutput {
+            message_type: 0x4a,
+            op_id,
+        }),
+    )
+    .await?;
 
     // --- Commit phase ---
     loop {
@@ -440,7 +346,7 @@ async fn reject(
     current_head: &RepositoryHead,
     message: &str,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
-    info!(op_id, message, "publish: content upload refused");
+    info!(op_id, message, "publish: refused");
     send(
         ws,
         &publish_result(
@@ -489,174 +395,154 @@ impl PendingContent {
     }
 }
 
-/// Stateful tracker for the iterative missing-object discovery during
-/// publish. Remembers which objects have been visited and which were
-/// reported missing, so each round only needs to re-check the
-/// previously-missing objects (now received) and any new children they
-/// reference — not the entire BFS from root.
-struct MissingObjectTracker {
-    /// All ObjectIds that have been visited (present OR reported missing).
-    visited: std::collections::HashSet<ObjectId>,
-    /// ObjectIds reported as missing in the most recent round. These
-    /// become the starting frontier for the next round after the client
-    /// sends them.
-    last_missing: Vec<ObjectId>,
-    /// Whether this is the first call (must start from root).
-    initial: bool,
-    /// Root envelope ObjectId.
-    root: ObjectId,
-}
+/// Writers used to store one message's worth of uploaded objects.
+const OBJECT_WRITE_CONCURRENCY: usize = 8;
 
-impl MissingObjectTracker {
-    fn new(root: ObjectId) -> Self {
-        Self {
-            visited: std::collections::HashSet::new(),
-            last_missing: Vec::new(),
-            initial: true,
-            root,
-        }
-    }
-
-    /// Mark received ObjectIds so they move from "missing" to "pending
-    /// re-check" — their children need to be discovered.
-    fn mark_received(&mut self, ids: &[ObjectId]) {
-        // Remove these from visited so the next discover_missing call
-        // re-visits them and discovers their children.
-        for id in ids {
-            self.visited.remove(id);
-        }
-    }
-
-    /// Discover missing objects. On first call, walks from root. On
-    /// subsequent calls, only re-checks previously-missing objects
-    /// (which should now be present after the client sent them) and
-    /// discovers their children.
-    async fn discover_missing(
-        &mut self,
-        entry: &RepositoryEntry,
-        envelope_id: RepositoryEnvelopeId,
-    ) -> Vec<Digest256> {
-        let frontier = if self.initial {
-            self.initial = false;
-            vec![self.root]
-        } else {
-            // Start from the objects that were missing last round —
-            // they should now be present and we need to discover their
-            // children.
-            std::mem::take(&mut self.last_missing)
+/// Asks for the objects of `proposed` that the store lacks, until it has them all.
+///
+/// Walks from the current head to `proposed` ([`StructuralDelta`]). Each batch of
+/// objects the walk finds missing becomes one `ObjectsNeeded`, and the walk goes on
+/// only once every object of that batch has arrived. `ObjectsComplete` follows when
+/// the walk ends: the store then holds all of `proposed` that the current head does
+/// not already cover. Returns why the publish is refused, if it is.
+#[tracing::instrument(name = "publish_objects", level = "debug", skip_all)]
+async fn receive_objects(
+    ws: &mut WebSocketStream<TcpStream>,
+    entry: &RepositoryEntry,
+    op_id: u32,
+    current_head: &RepositoryHead,
+    proposed: RepositoryEnvelopeId,
+) -> Result<Option<String>, ConnectionError> {
+    let mut delta = StructuralDelta::new(
+        &entry.objects,
+        Some(current_head.envelope),
+        proposed,
+        StructuralDeltaLimits::default(),
+    );
+    let mut rounds = 0u32;
+    loop {
+        let step = match delta.next().await {
+            Ok(step) => step,
+            // Reading the store, or the current head's side of the walk, failed.
+            Err(
+                error @ (StructuralDeltaError::Store(_)
+                | StructuralDeltaError::Collection(_)
+                | StructuralDeltaError::OldLineage(_)),
+            ) => {
+                return Err(ConnectionError::Internal(format!(
+                    "publish walk failed: {error}"
+                )));
+            }
+            Err(error) => return Ok(Some(format!("the proposed envelope is invalid: {error}"))),
         };
-
-        let mut missing = Vec::new();
-        self.bfs_round(entry, frontier, &mut missing).await;
-
-        // Walk retained sets until convergence: each round may discover
-        // new trie-key ObjectIds that were missing in the previous round
-        // (because their trie nodes hadn't been uploaded yet).
-        while missing.len() < MAX_WANT_IDS {
-            let Ok(retained_ids) =
-                walk_retained_sets(&entry.objects, &entry.content, envelope_id).await
-            else {
-                break;
-            };
-
-            let mut new_frontier = Vec::new();
-            for oid in retained_ids {
-                if !self.visited.contains(&oid) {
-                    new_frontier.push(oid);
-                }
-            }
-
-            if new_frontier.is_empty() {
-                break;
-            }
-
-            self.bfs_round(entry, new_frontier, &mut missing).await;
+        let ids = match step {
+            None => break,
+            // Already in the store.
+            Some(DeltaStep::Object(_)) => continue,
+            Some(DeltaStep::Missing(ids)) => ids,
+        };
+        send(
+            ws,
+            &WheatProtocolMessage::ObjectsNeeded(ObjectsNeededOutput {
+                message_type: 0x41,
+                op_id,
+                ids: ids
+                    .iter()
+                    .map(|id| Digest256 {
+                        bytes: id.as_bytes().to_vec(),
+                    })
+                    .collect(),
+            }),
+        )
+        .await?;
+        if let Some(refusal) = receive_round(ws, entry, op_id, &ids).await? {
+            return Ok(Some(refusal));
         }
-
-        // Remember which objects are missing for the next round.
-        self.last_missing = missing
-            .iter()
-            .map(|d| ObjectId::from_digest(d.bytes.as_slice().try_into().unwrap()))
-            .collect();
-
-        missing
+        rounds += 1;
+        delta.resume();
     }
-
-    /// Run one BFS pass from the given frontier, appending missing
-    /// ObjectIds to `missing`. Updates `self.visited`.
-    async fn bfs_round(
-        &mut self,
-        entry: &RepositoryEntry,
-        mut frontier: Vec<ObjectId>,
-        missing: &mut Vec<Digest256>,
-    ) {
-        while let Some(oid) = frontier.pop() {
-            if !self.visited.insert(oid) {
-                continue;
-            }
-            if missing.len() >= MAX_WANT_IDS {
-                break;
-            }
-
-            match entry.objects.get(oid).await {
-                Ok(obj) => {
-                    if let Ok(children) =
-                        wheat_core::extract_object_references(&obj.canonical_bytes)
-                    {
-                        for child_id in children {
-                            if !self.visited.contains(&child_id) {
-                                frontier.push(child_id);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    missing.push(Digest256 {
-                        bytes: oid.as_bytes().to_vec(),
-                    });
-                }
-            }
-        }
-    }
+    debug!(op_id, rounds, stats = ?delta.stats(), "publish: objects complete");
+    send(
+        ws,
+        &WheatProtocolMessage::ObjectsComplete(ObjectsCompleteOutput {
+            message_type: 0x42,
+            op_id,
+        }),
+    )
+    .await?;
+    Ok(None)
 }
 
-/// Walk all retained sets and return the ObjectIds they contain as keys.
-async fn walk_retained_sets(
-    objects: &impl ImmutableObjectStore,
-    content: &wheat_store::ContentStore,
-    envelope_id: RepositoryEnvelopeId,
-) -> Result<Vec<ObjectId>, ConnectionError> {
-    let reader = RepositoryReader::new(objects, content);
-    let envelope = reader.envelope(envelope_id).await.map_err(|e| {
-        ConnectionError::Internal(format!("failed to read envelope for retained walk: {e}"))
-    })?;
-    let state = reader.state(envelope.state).await.map_err(|e| {
-        ConnectionError::Internal(format!("failed to read state for retained walk: {e}"))
-    })?;
-
-    let mut retained = Vec::new();
-    let store = wheat_store::RetainedSetStore::new(objects);
-
-    for root in [
-        state.retained_views,
-        state.retained_revisions,
-        state.retained_applications,
-        state.retained_changes,
-    ] {
-        let mut cursor = store
-            .cursor(root)
-            .await
-            .map_err(|e| ConnectionError::Internal(format!("retained set walk error: {e}")))?;
-        while let Some(oid) = cursor
-            .next()
-            .await
-            .map_err(|e| ConnectionError::Internal(format!("retained set cursor error: {e}")))?
-        {
-            retained.push(oid);
+/// Takes one round of uploads: each object of `ids` once, whole in an
+/// `ObjectBatch` or in `ObjectChunk`s, and nothing else. Returns why the round is
+/// refused, if it is.
+async fn receive_round(
+    ws: &mut WebSocketStream<TcpStream>,
+    entry: &RepositoryEntry,
+    op_id: u32,
+    ids: &[ObjectId],
+) -> Result<Option<String>, ConnectionError> {
+    let mut receiver = TransferReceiver::new(ids.iter().copied(), MAX_OBJECT_SIZE);
+    while !receiver.is_complete() {
+        match recv(ws).await? {
+            WheatProtocolMessage::ObjectBatch(batch) if batch.op_id == op_id => {
+                let mut objects = Vec::with_capacity(batch.objects.len());
+                for object in batch.objects {
+                    let id = digest_to_object_id(&object.id)?;
+                    if let Err(error) = receiver.accept_whole(id, object.data.len()) {
+                        return Ok(Some(error.to_string()));
+                    }
+                    if ObjectId::of_canonical_bytes(&object.data) != id {
+                        return Ok(Some(format!("object identity mismatch for {id}")));
+                    }
+                    objects.push((id, object.data));
+                }
+                if let Some(refusal) = store_objects(entry, &objects).await? {
+                    return Ok(Some(refusal));
+                }
+            }
+            WheatProtocolMessage::ObjectChunk(chunk) if chunk.op_id == op_id => {
+                let id = digest_to_object_id(&chunk.object_id)?;
+                let object =
+                    match receiver.accept_chunk(id, chunk.offset, chunk.data, chunk.is_final) {
+                        Ok(Some(object)) => object,
+                        Ok(None) => continue,
+                        Err(error) => return Ok(Some(error.to_string())),
+                    };
+                if ObjectId::of_canonical_bytes(&object.1) != id {
+                    return Ok(Some(format!("object identity mismatch for {id}")));
+                }
+                if let Some(refusal) = store_objects(entry, &[object]).await? {
+                    return Ok(Some(refusal));
+                }
+            }
+            _ => {
+                return Ok(Some(
+                    "only ObjectBatch and ObjectChunk may answer ObjectsNeeded".to_owned(),
+                ));
+            }
         }
     }
+    Ok(None)
+}
 
-    Ok(retained)
+/// Stores uploaded objects. Returns why they are refused when they are not valid
+/// Wheat objects.
+async fn store_objects(
+    entry: &RepositoryEntry,
+    objects: &[(ObjectId, Vec<u8>)],
+) -> Result<Option<String>, ConnectionError> {
+    match entry
+        .objects
+        .put_batch(objects, OBJECT_WRITE_CONCURRENCY)
+        .await
+    {
+        Ok(()) => Ok(None),
+        Err(error @ ObjectStoreError::InvalidFormat(_)) => Ok(Some(error.to_string())),
+        Err(error) => Err(ConnectionError::Internal(format!(
+            "failed to store objects: {error}"
+        ))),
+    }
 }
 
 /// Diff old and new Merkle trees to find `new_content → old_content` base

@@ -31,11 +31,14 @@ top of them.
   Tests: 6 retained-set delta tests, 4 transition validation tests, 1 bench.
 - [x] **Phase 1 — standalone wheat server.** `wheat-server` binary with
   WebSocket listener, per-connection session setup (ServerHello → ClientHello →
-  SessionEstablished), repository open with label manifest, iterative root-first
-  fetch (ObjectBatch → ObjectWant loop → FetchComplete), content fetch with
-  chunked streaming for large files, and publish with iterative BFS closure
-  discovery (`extract_object_references`), content transfer, bounded delta
-  validation, and CAS head advance. Registry supports single-repo (`--data-dir`)
+  SessionEstablished), repository open with label manifest, fetch (push of
+  the difference → FetchPushEnd → ObjectWant/ObjectWantReply → FetchComplete),
+  content fetch with chunked streaming for large files, and publish with
+  walk-based object rounds (`StructuralDelta`), content transfer, bounded delta
+  validation, and CAS head advance. (2026-09-26: fetch and publish's object
+  phase were reworked around `StructuralDelta`; before that, fetch sent the
+  whole structural closure every time and publish could move its head with
+  objects missing.) Registry supports single-repo (`--data-dir`)
   and multi-repo (`--repos`) modes. 3 integration tests (session setup, fetch,
   repo not found). Server helper `run_until()` supports in-process test use
   with port-0 binding and shutdown signaling.
@@ -54,19 +57,22 @@ top of them.
 - [x] **Phase 1 — CLI client commands.** `wheat clone`, `wheat fetch`, and
   `wheat publish` in `wheat-cli`, speaking the native protocol over WebSocket
   to a `wheat-server` instance. URL scheme: `wheat://host:port/owner/repo`
-  (TLS: `wheat+tls://`). Client protocol engine in `remote.rs` with iterative
-  root-first fetch (BFS + retained-set walk for radix-trie-key ObjectIds),
-  content fetch, and publish with ObjectsNeeded/ObjectBatch loop. Remote
-  tracking via `remote.json` (url, last_fetched_generation, last_fetched_envelope)
-  with divergence detection on fetch (refuses when local has unpublished work).
+  (TLS: `wheat+tls://`). Client protocol engine in `remote.rs`: fetch takes the
+  push and pulls the gaps with the same walk, content fetch stores blobs in
+  batches, and publish answers each ObjectsNeeded round with exactly the
+  objects asked for (chunked above 8 MiB). Remote tracking via `remote.json`
+  (url, last_fetched_generation, last_fetched_envelope) with divergence
+  detection on fetch: it refuses when the local head's envelope is not the one
+  last fetched or published. The local head counts its own generations.
 - [x] **Phase 1 — acceptance tests.** 3 end-to-end tests in
   `crates/wheat-server/tests/clone_fetch_publish_test.rs`: clone round-trip
   (validates complete structural closure via `validate_complete`), publish
   round-trip (clone → local change via `PersistedRepositoryMutator` → publish
   back → verify server head advanced), fetch after server advance (clone →
-  server-side change → fetch update → verify new content). All tests exercise
-  the full retained-set walk (RetainedSetStore cursor for views/revisions/
-  applications/changes) and BFS through retained objects' children.
+  server-side change → fetch update → verify new content). (2026-09-26: the
+  fetch rules are tested in `crates/wheat-server/tests/fetch_test.rs`, the
+  publish object rounds in `publish_test.rs`, and clone/fetch through the CLI in
+  `crates/wheat-cli/tests/remote_fetch.rs`.)
 
 - [x] **Phase 1 — packed segments on the object store.** `RemotePackedStore`
   in `wheat-store/src/remote_packed/` stores packed segments on S3-compatible
@@ -94,11 +100,11 @@ top of them.
 - [~] **Phase 2 — remote tracking.** Persist observed remote views locally
   (`wheat-remote` configuration, remote-view observations) without treating them
   as local authority. Enable incremental fetch (only transfer objects the client
-  is missing). (2026-09-25: `crates/wheat-cli/src/remote_config.rs` persists one
-  remote and its last observed head, and content fetch is incremental. There is
-  no named or multi-remote configuration, and structural fetch is not
-  incremental: `crates/wheat-server/src/fetch.rs` always sends the whole
-  structural closure and ignores `since_generation`.)
+  is missing). (2026-09-26: `crates/wheat-cli/src/remote_config.rs` persists one
+  remote and its last observed head, and both structural and content fetch are
+  incremental. There is no named or multi-remote configuration. The push still
+  sends whole objects; sending deltas against the objects the client has is
+  not started.)
 - [~] **Phase 1 — authentication.** Bearer token auth in `ClientHello`, TLS
   required, localhost-only default when no auth is configured. Standalone
   server refuses non-loopback binding without explicit auth config. Origin
@@ -271,57 +277,74 @@ Wheat objects are content-addressed: `ObjectId = blake3(canonical_bytes)`.
 The canonical bytes are the binschema-encoded form defined in the existing
 wheat object schema.
 
-#### Fetch: iterative root-first discovery
+#### Fetch: push the difference, then pull the gaps
 
-A fresh clone cannot compute the transitive closure of an envelope it does
-not have. The protocol uses **iterative root-first discovery**: the server
-sends the root object (the envelope), the client decodes it, discovers
-child references it is missing, requests those, decodes them, discovers
-more references, and so on until the closure is complete. Each round is a
-bounded batch.
+Both sides use one walk, `StructuralDelta` (`wheat-store`). It walks the
+closure of a new envelope next to the closure of an old one and yields every
+object of the new side that the old side does not already cover, reading
+only as far as the two differ. When an object it needs is not in the store,
+it parks that part of the walk and reports the missing IDs (at most 4,096 at a
+time); `resume()` goes on once they are there.
 
 ```text
 Client                          Server
   │                               │
-  ├─ FetchRequest ───────────────>│  labels: ["main"], since: (gen, env)
+  ├─ FetchRequest ───────────────>│  want_envelope, since_envelope
+  │                               │  (zeros: nothing fetched yet)
   │                               │
-  │<──── ObjectBatch ────────────┤  envelope + top-level objects
+  │<──── ObjectBatch ────────────┤  push: the walk from since to want,
+  │<──── ObjectChunk ────────────┤  streamed as it goes
+  │<──── FetchPushEnd ───────────┤  pushed_objects, incremental
   │                               │
-  │  (client decodes, discovers   │
-  │   missing child ObjectIds)    │
+  │  (client runs the same walk   │
+  │   over its own store)         │
   │                               │
-  ├─ ObjectWant ─────────────────>│  [missing_ids...] (bounded)
-  │<──── ObjectBatch ────────────┤  requested objects
-  │                               │
-  │  ... repeat until closure     │
-  │  ... is complete ...          │
+  ├─ ObjectWant ─────────────────>│  want_sequence, [missing_ids] (≤ 4096)
+  │<──── ObjectWantReply ────────┤  the front of the list that fits
+  │  ... one want at a time,      │
+  │  ... until the walk ends ...  │
   │                               │
   ├─ FetchComplete ──────────────>│
 ```
 
-For incremental fetch (client already has objects from a prior envelope),
-the `since` field carries the last-observed `{generation, envelope}`. The
-server can use this to compute the delta and send only new/changed
-structural objects. If the server does not support delta computation, it
-falls back to sending the full envelope and the client deduplicates
-locally (objects it already has are skipped on receipt).
+- **Push.** The server runs the walk on its own store from `since_envelope`
+  to `want_envelope` and sends what it yields. `want_envelope` may be any
+  envelope in the server's store; one it does not have is refused with an
+  `Error`. A `since_envelope` the server cannot use (unknown, or not an
+  envelope) makes it push the whole closure, and `FetchPushEnd` says
+  `incremental: false`.
+- **Pull.** The client runs the same walk over its own store, from its last
+  fetched envelope. Its store already holds that envelope's closure, so the
+  walk only finds gaps: objects the push skipped because the server paired
+  them differently, or objects lost on the way. Each gap batch is one
+  `ObjectWant`. The server answers each want with exactly one
+  `ObjectWantReply`, holding the wanted objects from the front of the list
+  that fit in one batch; an object too large for a batch comes first as
+  `ObjectChunk`s. The client asks again for the rest. An ID the server does
+  not have ends the fetch with an `Error`.
+- The client moves its head only after the structural walk and the content
+  fetch have both finished, so its store always holds the closure of its last
+  fetched envelope.
 
-This avoids the chicken-and-egg problem: the client never needs to walk
-a graph it doesn't have. The server sends roots, the client discovers
-what's missing, and the protocol converges in O(graph depth) rounds with
-bounded batches per round.
+The local head and the remote count their own generations. A fetch moves the
+local head to the remote envelope with the next local generation, and the
+client remembers the remote's generation and envelope in `remote.json`. The
+client has unpublished work when its head's envelope differs from the one it
+last fetched or published.
 
 #### Batched transfer rules
 
 - Each `ObjectBatch` is one WebSocket binary **message** (not frame —
   WebSocket messages may be fragmented into multiple frames by the
   transport; implementations work with reassembled messages).
-- Maximum batch size: 4096 objects or 8 MiB of encoded payload, whichever
-  is reached first.
-- The client validates `blake3(bytes) == id` on receipt for every object.
-  A mismatch is a fatal protocol error: the connection is closed with
-  an error code identifying the corrupt object. The client does not
-  silently retry or continue.
+- Maximum batch size: 256 objects or 8 MiB of object data, whichever is
+  reached first. Senders flush a batch before adding an object that would
+  overflow it.
+- An object over 8 MiB goes as `ObjectChunk`s of at most 4 MiB. No object is
+  over 1 GiB (`MAX_OBJECT_SIZE`).
+- The receiver validates `blake3(bytes) == id` on receipt for every object.
+  A mismatch is a fatal protocol error: the fetch fails, or the publish is
+  refused. Nobody silently retries or continues.
 
 #### Content transfer
 
@@ -337,8 +360,9 @@ Large content (multi-megabyte files) is streamed in bounded chunks rather
 than sent as a single message, to respect WebSocket message size limits
 and proxy constraints.
 
-Both directions follow the same receiving rules (`ContentReceiver` in
-`wheat-protocol`), because the sender is untrusted:
+Both directions follow the same receiving rules (`TransferReceiver` in
+`wheat-protocol`, which also takes chunked objects), because the sender is
+untrusted:
 
 - Only content that was asked for is accepted (the `ContentFetchRequest` batch
   on the client, the `ContentNeeded` list on the server), each blob once.
@@ -349,7 +373,8 @@ Both directions follow the same receiving rules (`ContentReceiver` in
   limit, whatever number of chunks it comes in.
 - The finished bytes must hash to the claimed ID.
 - On publish, `ContentUploadComplete` with a requested blob missing, or with a
-  chunked blob unfinished, is refused.
+  chunked blob unfinished, is refused. Each `ContentNeeded` round is checked on
+  its own: a blob from a later round is not accepted early.
 
 Any broken rule ends the transfer: the client fails the fetch, and the server
 answers with a rejected `PublishResult` and leaves the head where it was.
@@ -372,20 +397,24 @@ Client                          Server
   ├─ PublishRequest ─────────────>│  op_id, envelope_id,
   │                               │  expected_head: {generation, envelope}
   │                               │
-  │                               │  server stores envelope, discovers
-  │                               │  missing children iteratively
-  │<──── ObjectsNeeded ──────────┤  op_id, [missing_ids] (bounded)
+  │                               │  server walks from its head to the
+  │                               │  proposed envelope (StructuralDelta)
+  │<──── ObjectsNeeded ──────────┤  op_id, [missing_ids] (≤ 4096)
   │                               │
-  ├─ ObjectBatch ────────────────>│  op_id, [(id, bytes), ...]
-  │<──── ObjectsNeeded ──────────┤  op_id, [more missing_ids...]
-  ├─ ObjectBatch ────────────────>│  op_id, [(id, bytes), ...]
-  │                               │  ... repeat until server has
-  │                               │  ... the full closure ...
+  ├─ ObjectBatch / ObjectChunk ──>│  exactly those objects, each once
+  │                               │  (server resumes the walk once
+  │                               │   all of them have arrived)
+  │<──── ObjectsNeeded ──────────┤  op_id, [next missing_ids]
+  ├─ ObjectBatch / ObjectChunk ──>│
+  │                               │  ... repeat until the walk ends ...
   │<──── ObjectsComplete ────────┤  op_id (structural closure done)
   │                               │
-  │<──── ContentNeeded ──────────┤  op_id, [missing content_ids]
+  │<──── ContentNeeded ──────────┤  op_id, [missing content_ids] (bounded)
   ├─ ContentUpload ──────────────>│  op_id, (id, bytes) or chunks
-  ├─ ContentUploadComplete ──────>│  op_id (all content sent)
+  ├─ ContentUploadComplete ──────>│  op_id (this round's content sent)
+  │                               │  ... repeat until the server has
+  │                               │  ... every missing blob ...
+  │<──── ContentComplete ────────┤  op_id (content done)
   │                               │
   ├─ PublishCommit ──────────────>│  op_id (client confirms commit)
   │                               │
@@ -402,6 +431,15 @@ Client                          Server
   │                               │  new_head: {generation, envelope}
   │                               │
 ```
+
+The object phase uses the same walk as fetch, run by the server from its
+current head to the proposed envelope. Each batch of objects the walk finds
+missing is one `ObjectsNeeded` round. A round takes exactly the objects it
+asked for, whole or chunked, each once, and nothing else; anything else
+refuses the publish. So `ObjectsComplete` means the server holds everything
+of the proposed envelope that its head does not already cover. An object
+that is not a valid Wheat object, or a proposed envelope whose graph does not
+decode, refuses the publish too.
 
 Every publish operation carries a client-generated `op_id` for connection-
 scoped correlation and a `publish_key` (128-bit, client-generated, unique
@@ -606,25 +644,44 @@ ListLabelsResult
   labels: array<{ name: string, view_id: bytes[32] }, max=10000>
   next_cursor: bytes (max 256, empty = end)
 
-// --- Fetch (iterative root-first discovery) ---
+// --- Fetch (push the difference, then pull the gaps) ---
 
 FetchRequest
   op_id: u32
-  labels: array<string, max=64>              // which labels to fetch
-  since_generation: u64                       // 0 = full clone
-  since_envelope: bytes[32]
+  want_envelope: bytes[32]                    // any envelope in the store
+  since_envelope: bytes[32]                   // last fetched; zeros = clone
 
 ObjectBatch
   op_id: u32
   sequence: u32                               // batch ordering
-  objects: array<{ id: bytes[32], data: bytes (max 1 MiB) }, max=256>
-  // Aggregate encoded size must not exceed 8 MiB (enforced by sender,
-  // within the 16 MiB WebSocket message cap). Structural objects are
-  // typically under 1 KiB; the 1 MiB per-item max covers outliers.
+  objects: array<{ id: bytes[32], data: bytes }, max=256>
+  // At most 8 MiB of object data (enforced by sender, within the 16 MiB
+  // WebSocket message cap). Larger objects go as ObjectChunks.
+
+ObjectChunk                                   // one piece of a large object
+  op_id: u32
+  object_id: bytes[32]
+  offset: u64                                 // bytes of this id sent so far
+  data: bytes (max 4 MiB)
+  is_final: bool
+
+FetchPushEnd                                  // the push is over
+  op_id: u32
+  pushed_objects: u64
+  incremental: bool                           // false: since was not used
 
 ObjectWant
   op_id: u32
-  ids: array<bytes[32], max=4096>             // bounded per round
+  want_sequence: u32                          // counts from 0
+  ids: array<bytes[32], max=4096>
+
+ObjectWantReply                               // exactly one per want
+  op_id: u32
+  want_sequence: u32
+  objects: array<{ id: bytes[32], data: bytes }, max=256>
+  // The front of the want's list that fits one batch, at least one
+  // object; a first object too large for a batch comes before the
+  // reply as ObjectChunks.
 
 FetchComplete
   op_id: u32
@@ -667,15 +724,15 @@ PublishRequest
   expected_envelope: bytes[32]
   force: bool                                 // skip monotonicity check
 
-ObjectsNeeded
-  op_id: u32
-  ids: array<bytes[32], max=4096>
+ObjectsNeeded                                 // one round; answered with
+  op_id: u32                                  // exactly these objects, in
+  ids: array<bytes[32], max=4096>             // ObjectBatch / ObjectChunk
 
 ObjectsComplete                               // server has full closure
   op_id: u32
 
-ContentNeeded                                 // server lists missing content
-  op_id: u32
+ContentNeeded                                 // server lists missing content,
+  op_id: u32                                  // one round of at most 4096
   content_ids: array<bytes[32], max=4096>
 
 ContentUpload                                 // client pushes content bytes
@@ -690,7 +747,10 @@ ContentUploadChunk                            // client pushes large content
   data: bytes (max 4 MiB)
   final: bool
 
-ContentUploadComplete                         // all content uploaded
+ContentUploadComplete                         // this round's content uploaded
+  op_id: u32
+
+ContentComplete                               // server has all content; commit
   op_id: u32
 
 PublishCommit

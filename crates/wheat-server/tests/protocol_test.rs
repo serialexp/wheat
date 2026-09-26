@@ -1,43 +1,17 @@
 //! End-to-end protocol tests: start a server in-process, connect with a
 //! tokio-tungstenite client, and exercise the full protocol flow.
 
+mod support;
+
 use std::net::SocketAddr;
 
-use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-
-use wheat_core::{
-    ApplicationContext, ContentId, EditOperation, EditRecord, EditTransition, FileKind, FileValue,
-    ObjectId, Repository, RevisionEdits, Tree,
-};
+use wheat_core::{ApplicationContext, ObjectId, Repository, Tree};
 use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{ContentStore, LocalPublicationStore, PackedObjectStore, RepositoryPublisher};
 
-fn edit(path: &str, value: &[u8]) -> RevisionEdits {
-    let record = EditRecord::new(
-        path,
-        EditOperation::ExactFile {
-            expected: None,
-            replacement: Some(FileValue {
-                content: ContentId::of(value),
-                kind: FileKind::Regular,
-            }),
-        },
-    )
-    .unwrap();
-    let id = record.id();
-    RevisionEdits {
-        edits: [(id, record)].into(),
-        transition: EditTransition {
-            added: [id].into(),
-            ..EditTransition::default()
-        },
-    }
-}
+use support::{connect_and_handshake, edit, fetch_complete, fetch_request, recv_msg, send_msg};
 
 fn stores(root: &std::path::Path) -> (PackedObjectStore, ContentStore, LocalPublicationStore) {
     let objects = PackedObjectStore::open(root.join("storage")).unwrap();
@@ -69,66 +43,6 @@ async fn start_server(
 
     let bound = ready_rx.await.unwrap();
     (bound, shutdown_tx)
-}
-
-/// Connect to the server and perform the handshake. Returns the WebSocket
-/// stream after SessionEstablished.
-async fn connect_and_handshake(addr: SocketAddr) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
-    let url = format!("ws://{addr}");
-    let (mut ws, _) = connect_async(&url).await.unwrap();
-
-    // Receive ServerHello.
-    let server_hello = recv_msg(&mut ws).await;
-    assert!(
-        matches!(server_hello, WheatProtocolMessage::ServerHello(_)),
-        "expected ServerHello, got {server_hello:?}"
-    );
-
-    // Send ClientHello.
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::ClientHello(ClientHelloOutput {
-            message_type: 0x02,
-            selected_version: 1,
-            auth_token: vec![],
-            receive_window_bytes: 16 * 1024 * 1024,
-            receive_window_messages: 256,
-        }),
-    )
-    .await;
-
-    // Receive SessionEstablished.
-    let established = recv_msg(&mut ws).await;
-    match &established {
-        WheatProtocolMessage::SessionEstablished(se) => {
-            assert!(matches!(
-                se.status,
-                SessionEstablishedStatus::SessionStatusOk(_)
-            ));
-        }
-        other => panic!("expected SessionEstablished, got {other:?}"),
-    }
-
-    ws
-}
-
-async fn send_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, msg: &WheatProtocolMessage) {
-    let bytes = encode_message(msg).unwrap();
-    ws.send(Message::Binary(bytes.into())).await.unwrap();
-}
-
-async fn recv_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> WheatProtocolMessage {
-    loop {
-        let msg = ws.next().await.unwrap().unwrap();
-        match msg {
-            Message::Binary(bytes) => return decode_message(&bytes).unwrap(),
-            Message::Ping(data) => {
-                ws.send(Message::Pong(data)).await.unwrap();
-            }
-            Message::Pong(_) | Message::Frame(_) => {}
-            other => panic!("unexpected message: {other:?}"),
-        }
-    }
 }
 
 /// Build a repository with one change, publish it locally. Returns the
@@ -210,35 +124,27 @@ async fn fetch_objects() {
         other => panic!("expected RepositoryState, got {other:?}"),
     };
 
-    // Fetch.
+    // Fetch with no `since`: the server pushes the whole closure, then says how
+    // much it pushed.
     send_msg(
         &mut ws,
-        &WheatProtocolMessage::FetchRequest(FetchRequestOutput {
-            message_type: 0x20,
-            op_id: 1,
-            labels: vec!["main".to_string()],
-            since_generation: 0,
-            since_envelope: Digest256 { bytes: vec![0; 32] },
-        }),
+        &fetch_request(1, support::envelope_id(&head_envelope), None),
     )
     .await;
-
-    // Receive all ObjectBatch messages (the server sends the full closure).
-    // Collect all objects and verify the envelope is among them.
     let mut all_objects = Vec::new();
     loop {
-        let msg = recv_msg(&mut ws).await;
-        match msg {
+        match recv_msg(&mut ws).await {
             WheatProtocolMessage::ObjectBatch(ob) => {
                 assert_eq!(ob.op_id, 1);
                 all_objects.extend(ob.objects);
-                // The server sends in batches of MAX_OBJECT_BATCH_ITEMS.
-                // Keep receiving until a batch with fewer items (the last one).
-                if all_objects.len() < 256 {
-                    break;
-                }
             }
-            other => panic!("expected ObjectBatch, got {other:?}"),
+            WheatProtocolMessage::FetchPushEnd(end) => {
+                assert_eq!(end.op_id, 1);
+                assert_eq!(end.pushed_objects, all_objects.len() as u64);
+                assert!(!end.incremental);
+                break;
+            }
+            other => panic!("expected ObjectBatch or FetchPushEnd, got {other:?}"),
         }
     }
 
@@ -257,15 +163,7 @@ async fn fetch_objects() {
     let claimed_id = ObjectId::from_digest(envelope_obj.id.bytes.as_slice().try_into().unwrap());
     assert_eq!(actual_id, claimed_id, "object identity must match");
 
-    // Send FetchComplete.
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
-            message_type: 0x23,
-            op_id: 1,
-        }),
-    )
-    .await;
+    send_msg(&mut ws, &fetch_complete(1)).await;
 
     ws.close(None).await.ok();
     let _ = shutdown.send(());

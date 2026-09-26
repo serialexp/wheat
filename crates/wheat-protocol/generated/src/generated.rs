@@ -23,6 +23,9 @@ pub enum WheatProtocolMessage {
     ObjectBatch(ObjectBatchOutput),
     ObjectWant(ObjectWantOutput),
     FetchComplete(FetchCompleteOutput),
+    FetchPushEnd(FetchPushEndOutput),
+    ObjectWantReply(ObjectWantReplyOutput),
+    ObjectChunk(ObjectChunkOutput),
     ContentFetchRequest(ContentFetchRequestOutput),
     ContentBatch(ContentBatchOutput),
     ContentChunk(ContentChunkOutput),
@@ -37,6 +40,7 @@ pub enum WheatProtocolMessage {
     PublishCommit(PublishCommitOutput),
     PublishProgress(PublishProgressOutput),
     PublishResult(PublishResultOutput),
+    ContentComplete(ContentCompleteOutput),
     Credit(CreditOutput),
     Error(ErrorOutput),
 }
@@ -130,14 +134,7 @@ impl WheatProtocolMessage {
             WheatProtocolMessage::FetchRequest(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint16(v.labels.len() as u16, Endianness::BigEndian);
-                for item in &v.labels {
-                    encoder.write_uint16(item.len() as u16, Endianness::BigEndian);
-                    for b in item.as_bytes() {
-                        encoder.write_uint8(*b);
-                    }
-                }
-                encoder.write_uint64(v.since_generation, Endianness::BigEndian);
+                v.want_envelope.encode_into(encoder)?;
                 v.since_envelope.encode_into(encoder)?;
             }
             WheatProtocolMessage::ObjectBatch(v) => {
@@ -152,6 +149,7 @@ impl WheatProtocolMessage {
             WheatProtocolMessage::ObjectWant(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_uint32(v.want_sequence, Endianness::BigEndian);
                 encoder.write_uint16(v.ids.len() as u16, Endianness::BigEndian);
                 for item in &v.ids {
                     item.encode_into(encoder)?;
@@ -160,6 +158,32 @@ impl WheatProtocolMessage {
             WheatProtocolMessage::FetchComplete(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint32(v.op_id, Endianness::BigEndian);
+            }
+            WheatProtocolMessage::FetchPushEnd(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_uint64(v.pushed_objects, Endianness::BigEndian);
+                encoder.write_uint8(if v.incremental { 1 } else { 0 });
+            }
+            WheatProtocolMessage::ObjectWantReply(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_uint32(v.want_sequence, Endianness::BigEndian);
+                encoder.write_uint16(v.objects.len() as u16, Endianness::BigEndian);
+                for item in &v.objects {
+                    item.encode_into(encoder)?;
+                }
+            }
+            WheatProtocolMessage::ObjectChunk(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                v.object_id.encode_into(encoder)?;
+                encoder.write_uint64(v.offset, Endianness::BigEndian);
+                encoder.write_uint32(v.data.len() as u32, Endianness::BigEndian);
+                for item in &v.data {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint8(if v.is_final { 1 } else { 0 });
             }
             WheatProtocolMessage::ContentFetchRequest(v) => {
                 encoder.write_uint8(v.message_type);
@@ -280,6 +304,10 @@ impl WheatProtocolMessage {
                     encoder.write_uint8(b);
                 }
             }
+            WheatProtocolMessage::ContentComplete(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+            }
             WheatProtocolMessage::Credit(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint32(v.op_id, Endianness::BigEndian);
@@ -356,6 +384,18 @@ impl WheatProtocolMessage {
             Ok(WheatProtocolMessage::FetchComplete(
                 FetchCompleteOutput::decode_with_decoder(decoder)?,
             ))
+        } else if value == 0x24 {
+            Ok(WheatProtocolMessage::FetchPushEnd(
+                FetchPushEndOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x25 {
+            Ok(WheatProtocolMessage::ObjectWantReply(
+                ObjectWantReplyOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x26 {
+            Ok(WheatProtocolMessage::ObjectChunk(
+                ObjectChunkOutput::decode_with_decoder(decoder)?,
+            ))
         } else if value == 0x30 {
             Ok(WheatProtocolMessage::ContentFetchRequest(
                 ContentFetchRequestOutput::decode_with_decoder(decoder)?,
@@ -411,6 +451,10 @@ impl WheatProtocolMessage {
         } else if value == 0x49 {
             Ok(WheatProtocolMessage::PublishResult(
                 PublishResultOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x4a {
+            Ok(WheatProtocolMessage::ContentComplete(
+                ContentCompleteOutput::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x60 {
             Ok(WheatProtocolMessage::Credit(
@@ -1518,8 +1562,7 @@ impl From<ListLabelsResultInput> for ListLabelsResultOutput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchRequestInput {
     pub op_id: u32,
-    pub labels: Vec<std::string::String>,
-    pub since_generation: u64,
+    pub want_envelope: Digest256,
     pub since_envelope: Digest256,
 }
 
@@ -1527,8 +1570,7 @@ pub struct FetchRequestInput {
 pub struct FetchRequestOutput {
     pub message_type: u8,
     pub op_id: u32,
-    pub labels: Vec<std::string::String>,
-    pub since_generation: u64,
+    pub want_envelope: Digest256,
     pub since_envelope: Digest256,
 }
 
@@ -1544,14 +1586,7 @@ impl FetchRequestInput {
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(32);
         encoder.write_u32_be(self.op_id);
-        encoder.write_u16_be(self.labels.len() as u16);
-        for item in &self.labels {
-            encoder.write_u16_be(item.len() as u16);
-            for b in item.as_bytes() {
-                encoder.write_byte(*b);
-            }
-        }
-        encoder.write_u64_be(self.since_generation);
+        self.want_envelope.encode_into(encoder)?;
         self.since_envelope.encode_into(encoder)?;
         Ok(())
     }
@@ -1572,22 +1607,12 @@ impl FetchRequestOutput {
             )));
         }
         let op_id = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
-        for _ in 0..length {
-            let str_len = decoder.read_u16_be()? as usize;
-            let str_bytes = decoder.read_bytes_vec(str_len)?;
-            let item = std::string::String::from_utf8(str_bytes)
-                .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
-            labels.push(item);
-        }
-        let since_generation = decoder.read_u64_be()?;
+        let want_envelope = Digest256::decode_with_decoder(decoder)?;
         let since_envelope = Digest256::decode_with_decoder(decoder)?;
         Ok(Self {
             message_type,
             op_id,
-            labels,
-            since_generation,
+            want_envelope,
             since_envelope,
         })
     }
@@ -1603,8 +1628,7 @@ impl From<FetchRequestOutput> for FetchRequestInput {
     fn from(o: FetchRequestOutput) -> Self {
         Self {
             op_id: o.op_id,
-            labels: o.labels,
-            since_generation: o.since_generation,
+            want_envelope: o.want_envelope,
             since_envelope: o.since_envelope,
         }
     }
@@ -1615,8 +1639,7 @@ impl From<FetchRequestInput> for FetchRequestOutput {
         Self {
             message_type: 32u8,
             op_id: i.op_id,
-            labels: i.labels,
-            since_generation: i.since_generation,
+            want_envelope: i.want_envelope,
             since_envelope: i.since_envelope,
         }
     }
@@ -1719,6 +1742,7 @@ impl From<ObjectBatchInput> for ObjectBatchOutput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectWantInput {
     pub op_id: u32,
+    pub want_sequence: u32,
     pub ids: Vec<Digest256>,
 }
 
@@ -1726,6 +1750,7 @@ pub struct ObjectWantInput {
 pub struct ObjectWantOutput {
     pub message_type: u8,
     pub op_id: u32,
+    pub want_sequence: u32,
     pub ids: Vec<Digest256>,
 }
 
@@ -1741,6 +1766,7 @@ impl ObjectWantInput {
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(34);
         encoder.write_u32_be(self.op_id);
+        encoder.write_u32_be(self.want_sequence);
         encoder.write_u16_be(self.ids.len() as u16);
         for item in &self.ids {
             item.encode_into(encoder)?;
@@ -1764,6 +1790,7 @@ impl ObjectWantOutput {
             )));
         }
         let op_id = decoder.read_u32_be()?;
+        let want_sequence = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
         let mut ids = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
@@ -1773,6 +1800,7 @@ impl ObjectWantOutput {
         Ok(Self {
             message_type,
             op_id,
+            want_sequence,
             ids,
         })
     }
@@ -1788,6 +1816,7 @@ impl From<ObjectWantOutput> for ObjectWantInput {
     fn from(o: ObjectWantOutput) -> Self {
         Self {
             op_id: o.op_id,
+            want_sequence: o.want_sequence,
             ids: o.ids,
         }
     }
@@ -1798,6 +1827,7 @@ impl From<ObjectWantInput> for ObjectWantOutput {
         Self {
             message_type: 34u8,
             op_id: i.op_id,
+            want_sequence: i.want_sequence,
             ids: i.ids,
         }
     }
@@ -1869,6 +1899,290 @@ impl From<FetchCompleteInput> for FetchCompleteOutput {
         Self {
             message_type: 35u8,
             op_id: i.op_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchPushEndInput {
+    pub op_id: u32,
+    pub pushed_objects: u64,
+    pub incremental: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchPushEndOutput {
+    pub message_type: u8,
+    pub op_id: u32,
+    pub pushed_objects: u64,
+    pub incremental: bool,
+}
+
+pub type FetchPushEnd = FetchPushEndOutput;
+
+impl FetchPushEndInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(36);
+        encoder.write_u32_be(self.op_id);
+        encoder.write_u64_be(self.pushed_objects);
+        encoder.write_byte(if self.incremental { 1 } else { 0 });
+        Ok(())
+    }
+}
+
+impl FetchPushEndOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 36u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 36, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_u32_be()?;
+        let pushed_objects = decoder.read_u64_be()?;
+        let incremental = decoder.read_byte()? != 0;
+        Ok(Self {
+            message_type,
+            op_id,
+            pushed_objects,
+            incremental,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        FetchPushEndInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        FetchPushEndInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<FetchPushEndOutput> for FetchPushEndInput {
+    fn from(o: FetchPushEndOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            pushed_objects: o.pushed_objects,
+            incremental: o.incremental,
+        }
+    }
+}
+
+impl From<FetchPushEndInput> for FetchPushEndOutput {
+    fn from(i: FetchPushEndInput) -> Self {
+        Self {
+            message_type: 36u8,
+            op_id: i.op_id,
+            pushed_objects: i.pushed_objects,
+            incremental: i.incremental,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectWantReplyInput {
+    pub op_id: u32,
+    pub want_sequence: u32,
+    pub objects: Vec<ObjectEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectWantReplyOutput {
+    pub message_type: u8,
+    pub op_id: u32,
+    pub want_sequence: u32,
+    pub objects: Vec<ObjectEntry>,
+}
+
+pub type ObjectWantReply = ObjectWantReplyOutput;
+
+impl ObjectWantReplyInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(37);
+        encoder.write_u32_be(self.op_id);
+        encoder.write_u32_be(self.want_sequence);
+        encoder.write_u16_be(self.objects.len() as u16);
+        for item in &self.objects {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ObjectWantReplyOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 37u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 37, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_u32_be()?;
+        let want_sequence = decoder.read_u32_be()?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = ObjectEntry::decode_with_decoder(decoder)?;
+            objects.push(item);
+        }
+        Ok(Self {
+            message_type,
+            op_id,
+            want_sequence,
+            objects,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ObjectWantReplyInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ObjectWantReplyInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ObjectWantReplyOutput> for ObjectWantReplyInput {
+    fn from(o: ObjectWantReplyOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            want_sequence: o.want_sequence,
+            objects: o.objects,
+        }
+    }
+}
+
+impl From<ObjectWantReplyInput> for ObjectWantReplyOutput {
+    fn from(i: ObjectWantReplyInput) -> Self {
+        Self {
+            message_type: 37u8,
+            op_id: i.op_id,
+            want_sequence: i.want_sequence,
+            objects: i.objects,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectChunkInput {
+    pub op_id: u32,
+    pub object_id: Digest256,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub is_final: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectChunkOutput {
+    pub message_type: u8,
+    pub op_id: u32,
+    pub object_id: Digest256,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub is_final: bool,
+}
+
+pub type ObjectChunk = ObjectChunkOutput;
+
+impl ObjectChunkInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(38);
+        encoder.write_u32_be(self.op_id);
+        self.object_id.encode_into(encoder)?;
+        encoder.write_u64_be(self.offset);
+        encoder.write_u32_be(self.data.len() as u32);
+        for item in &self.data {
+            encoder.write_byte(*item);
+        }
+        encoder.write_byte(if self.is_final { 1 } else { 0 });
+        Ok(())
+    }
+}
+
+impl ObjectChunkOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 38u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 38, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_u32_be()?;
+        let object_id = Digest256::decode_with_decoder(decoder)?;
+        let offset = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let data = decoder.read_bytes_vec(length)?;
+        let is_final = decoder.read_byte()? != 0;
+        Ok(Self {
+            message_type,
+            op_id,
+            object_id,
+            offset,
+            data,
+            is_final,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ObjectChunkInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ObjectChunkInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ObjectChunkOutput> for ObjectChunkInput {
+    fn from(o: ObjectChunkOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            object_id: o.object_id,
+            offset: o.offset,
+            data: o.data,
+            is_final: o.is_final,
+        }
+    }
+}
+
+impl From<ObjectChunkInput> for ObjectChunkOutput {
+    fn from(i: ObjectChunkInput) -> Self {
+        Self {
+            message_type: 38u8,
+            op_id: i.op_id,
+            object_id: i.object_id,
+            offset: i.offset,
+            data: i.data,
+            is_final: i.is_final,
         }
     }
 }
@@ -2868,6 +3182,76 @@ impl From<ContentUploadCompleteInput> for ContentUploadCompleteOutput {
     fn from(i: ContentUploadCompleteInput) -> Self {
         Self {
             message_type: 70u8,
+            op_id: i.op_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentCompleteInput {
+    pub op_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentCompleteOutput {
+    pub message_type: u8,
+    pub op_id: u32,
+}
+
+pub type ContentComplete = ContentCompleteOutput;
+
+impl ContentCompleteInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(74);
+        encoder.write_u32_be(self.op_id);
+        Ok(())
+    }
+}
+
+impl ContentCompleteOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 74u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 74, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_u32_be()?;
+        Ok(Self {
+            message_type,
+            op_id,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentCompleteInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentCompleteInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentCompleteOutput> for ContentCompleteInput {
+    fn from(o: ContentCompleteOutput) -> Self {
+        Self { op_id: o.op_id }
+    }
+}
+
+impl From<ContentCompleteInput> for ContentCompleteOutput {
+    fn from(i: ContentCompleteInput) -> Self {
+        Self {
+            message_type: 74u8,
             op_id: i.op_id,
         }
     }

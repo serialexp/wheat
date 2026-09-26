@@ -333,12 +333,9 @@ async fn run_session(
                     send_forbidden(&mut ws, req.op_id, Access::Read, &repository).await?;
                     continue;
                 }
-                // Read head fresh for each fetch.
-                let head = entry
-                    .heads
-                    .read()
-                    .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
-                crate::fetch::handle_fetch(&mut ws, &entry, &head, req).await?;
+                // The client names the envelope it wants (the head it saw), so a
+                // publish in between does not change what it gets.
+                crate::fetch::handle_fetch(&mut ws, &entry, req).await?;
             }
             WheatProtocolMessage::ContentFetchRequest(req) => {
                 if repository_access(config, &principal, &repository)

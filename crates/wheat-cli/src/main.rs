@@ -11,12 +11,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
     ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditFailure, EditTransition,
-    FileKind, FileValue, RepositoryError, RevisionEdits, RevisionId, ViewId, guarded::Limits,
+    FileKind, FileValue, ObjectId, RepositoryError, RevisionEdits, RevisionId, ViewId,
+    guarded::Limits,
 };
 use wheat_store::{
-    ApplicationMapStore, BatchObjectStore, MerkleTreeStore, PersistedConflictResolution,
-    PersistedRepositoryMutator, PublicationStore, RepositoryReader, RevisionMapStore,
-    finalize_mutation_publication, prepare_mutation_publication,
+    ApplicationMapStore, BatchObjectStore, ImmutableObjectStore, MerkleTreeStore,
+    PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
+    RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
 mod active_changes;
 mod authoring_metadata;
@@ -2486,28 +2487,22 @@ fn native_clone(
     let heads = wheat_store::LocalPublicationStore::new(store_root.join("repository.head"));
 
     let rt = runtime()?;
-    let (remote_state, label_name) = rt.block_on(async {
+    let (remote_state, label_name, fetched, content_count) = rt.block_on(async {
         let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         // Fetch all structural objects.
-        let obj_count = remote::fetch_objects(
-            &mut session,
-            1,
-            &objects,
-            &content,
-            state.envelope,
-            0,
-            &[0u8; 32],
-        )
-        .await?;
+        let fetched =
+            remote::fetch_objects(&mut session, 1, &objects, state.envelope, None).await?;
 
         // Fetch all content.
         let content_count =
             remote::fetch_content(&mut session, 2, &objects, &content, state.envelope).await?;
 
         write_stderr(format_args!(
-            "fetched {obj_count} objects, {content_count} content blobs\n"
+            "fetched {} objects ({} pulled), {content_count} content blobs\n",
+            fetched.pushed + fetched.pulled,
+            fetched.pulled,
         ));
 
         remote::close(&mut session).await?;
@@ -2517,7 +2512,7 @@ fn native_clone(
             .first()
             .map(|(name, _)| name.clone())
             .unwrap_or_else(|| "main".to_string());
-        Ok::<_, anyhow::Error>((state, label))
+        Ok::<_, anyhow::Error>((state, label, fetched, content_count))
     })?;
     // Release the packed store's process lock; the workspace reopens the store below.
     drop(content);
@@ -2596,6 +2591,11 @@ fn native_clone(
             "url": arguments.url,
             "generation": head.generation,
             "envelope": head.envelope.to_string(),
+            "objects": fetched.pushed + fetched.pulled,
+            "pushed": fetched.pushed,
+            "pulled": fetched.pulled,
+            "wants": fetched.wants,
+            "content": content_count,
         }),
         human,
     )
@@ -2617,9 +2617,10 @@ fn native_fetch(
 
     let last_fetched = remote_cfg.last_fetched_head()?;
 
-    // Divergence check: if local head has advanced past last-fetched, the user
-    // has unpublished local work. Refuse unless --force.
-    if !arguments.force && local_head.generation > last_fetched.generation {
+    // Divergence check: a local head other than the last fetched or published one
+    // holds unpublished local work. Refuse unless --force. Generations can't tell:
+    // the local head and the remote count their own.
+    if !arguments.force && local_head.envelope != last_fetched.envelope {
         return Err(CliFailure::stale(
             "local repository has unpublished changes; run `wheat publish` first, or use `wheat fetch --force` to discard local divergence",
         ));
@@ -2627,25 +2628,24 @@ fn native_fetch(
 
     let token = credential::token_for(Some(&context.store_root), &parsed)?;
     let rt = runtime()?;
-    let (remote_state, obj_count, content_count) = rt.block_on(async {
+    let (remote_state, fetched, content_count) = rt.block_on(async {
         let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         if state.generation == last_fetched.generation && state.envelope == last_fetched.envelope {
             remote::close(&mut session).await?;
-            return Ok((state, 0, 0));
+            return Ok((state, remote::FetchedObjects::default(), 0));
         }
 
-        let obj_count = remote::fetch_objects(
-            &mut session,
-            1,
-            &local.objects,
-            &local.content,
-            state.envelope,
-            0,
-            &[0u8; 32],
-        )
-        .await?;
+        // The last fetch left its whole closure here, so the server only needs
+        // to send what that envelope lacks.
+        let since = last_fetched.envelope;
+        let since_object = ObjectId::from_digest(*since.as_bytes());
+        let since = (*since.as_bytes() != [0; 32]
+            && local.objects.exists_many(&[since_object]).await? == [true])
+        .then_some(since);
+        let fetched =
+            remote::fetch_objects(&mut session, 1, &local.objects, state.envelope, since).await?;
 
         let content_count = remote::fetch_content(
             &mut session,
@@ -2657,10 +2657,12 @@ fn native_fetch(
         .await?;
 
         remote::close(&mut session).await?;
-        Ok::<_, anyhow::Error>((state, obj_count, content_count))
+        Ok::<_, anyhow::Error>((state, fetched, content_count))
     })?;
 
-    if obj_count == 0 && content_count == 0 && remote_state.generation == last_fetched.generation {
+    if remote_state.generation == last_fetched.generation
+        && remote_state.envelope == last_fetched.envelope
+    {
         return Success::new(
             "fetch",
             json!({ "up_to_date": true, "generation": local_head.generation }),
@@ -2668,12 +2670,12 @@ fn native_fetch(
         );
     }
 
-    // Update local head to match remote.
+    // Move the local head to the remote's envelope, one local generation on
+    // however many generations the remote moved.
     let new_head = wheat_store::RepositoryHead {
-        generation: remote_state.generation,
+        generation: local_head.generation + 1,
         envelope: remote_state.envelope,
     };
-    // CAS the local head: expected = current local head, proposed = remote head.
     local
         .heads
         .compare_and_advance(local_head, new_head)
@@ -2681,12 +2683,24 @@ fn native_fetch(
 
     // Update remote config.
     let mut updated_cfg = remote_cfg;
-    updated_cfg.set_last_fetched(&new_head);
+    updated_cfg.set_last_fetched(&wheat_store::RepositoryHead {
+        generation: remote_state.generation,
+        envelope: remote_state.envelope,
+    });
     updated_cfg.write(&context.store_root)?;
 
     let human = format!(
-        "fetched {obj_count} objects, {content_count} content blobs\nupdated to generation {}, envelope {}\n",
-        new_head.generation, new_head.envelope,
+        "fetched {} objects ({} pulled in {} requests{}), {content_count} content blobs\nupdated to generation {}, envelope {}\n",
+        fetched.pushed + fetched.pulled,
+        fetched.pulled,
+        fetched.wants,
+        if fetched.incremental {
+            ", incremental"
+        } else {
+            ""
+        },
+        new_head.generation,
+        new_head.envelope,
     );
     Success::new(
         "fetch",
@@ -2694,7 +2708,11 @@ fn native_fetch(
             "up_to_date": false,
             "generation": new_head.generation,
             "envelope": new_head.envelope.to_string(),
-            "objects": obj_count,
+            "objects": fetched.pushed + fetched.pulled,
+            "pushed": fetched.pushed,
+            "pulled": fetched.pulled,
+            "wants": fetched.wants,
+            "incremental": fetched.incremental,
             "content": content_count,
         }),
         human,

@@ -1,10 +1,9 @@
 //! Client-side wheat native protocol engine.
 //!
 //! Connects to a wheat-server over WebSocket, performs session handshake,
-//! and implements the client half of fetch (iterative root-first discovery)
-//! and publish (object/content upload, commit).
-
-use std::collections::HashSet;
+//! and implements the client half of fetch (the server pushes what the client's
+//! last fetch lacks, the client pulls any gaps) and publish (object/content
+//! upload, commit).
 
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
@@ -15,7 +14,10 @@ use url::{Host, Url};
 
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, ViewId};
 use wheat_protocol::*;
-use wheat_store::{ContentStore, ImmutableObjectStore, RepositoryHead, RepositoryReader};
+use wheat_store::{
+    ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead, RepositoryReader,
+    StructuralDelta, StructuralDeltaLimits,
+};
 
 // ---------------------------------------------------------------------------
 // URL parsing
@@ -479,272 +481,201 @@ pub async fn open_repository(session: &mut WheatSession, name: &str) -> Result<R
 }
 
 // ---------------------------------------------------------------------------
-// Fetch — iterative root-first discovery
+// Fetch — the server pushes what `since` lacks, the client pulls any gaps
 // ---------------------------------------------------------------------------
 
-/// Fetch all structural objects from the server using iterative
-/// root-first discovery. Stores each object locally via `put_if_absent`.
+/// Writers used to store one batch of fetched objects.
+const FETCH_WRITE_CONCURRENCY: usize = 8;
+
+/// What one structural fetch transferred.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FetchedObjects {
+    /// Objects the server pushed.
+    pub pushed: u64,
+    /// Objects the client asked for afterwards.
+    pub pulled: u64,
+    /// `ObjectWant` round trips.
+    pub wants: u32,
+    /// Whether the server left out what `since` covers.
+    pub incremental: bool,
+}
+
+/// Fetch the structural objects of `want` into `objects`.
 ///
-/// After the initial BFS pass, walks the retained sets (views, revisions,
-/// applications, changes) to discover objects whose IDs are encoded as
-/// radix-trie keys rather than explicit node references. Those objects
-/// and their transitive children are then fetched in additional rounds.
-///
-/// Returns the total number of objects received.
+/// The server pushes the objects that `since` does not cover (everything when
+/// `since` is `None` or unknown to it). The client then runs the same walk over
+/// its own store ([`StructuralDelta`]) and asks for whatever is still missing, so
+/// it ends with the whole closure of `want` whatever the server pushed. `since`
+/// should be an envelope whose closure the local store holds; where it does not,
+/// the walk asks for more.
 pub async fn fetch_objects<O: ImmutableObjectStore>(
     session: &mut WheatSession,
     op_id: u32,
     objects: &O,
-    content: &ContentStore,
-    envelope_id: RepositoryEnvelopeId,
-    since_generation: u64,
-    since_envelope: &[u8; 32],
-) -> Result<usize> {
-    // Send FetchRequest.
+    want: RepositoryEnvelopeId,
+    since: Option<RepositoryEnvelopeId>,
+) -> Result<FetchedObjects> {
     send_msg(
         &mut session.ws,
         &WheatProtocolMessage::FetchRequest(FetchRequestOutput {
             message_type: 0x20,
             op_id,
-            labels: vec![],
-            since_generation,
-            since_envelope: Digest256 {
-                bytes: since_envelope.to_vec(),
-            },
+            want_envelope: envelope_id_to_digest(want),
+            since_envelope: since.map_or(Digest256 { bytes: vec![0; 32] }, envelope_id_to_digest),
         }),
     )
     .await?;
 
-    let mut total_received = 0usize;
-    let mut want_list: Vec<ObjectId> = Vec::new();
-    let mut known = HashSet::new();
-
+    let mut fetched = FetchedObjects::default();
+    let mut receiver = TransferReceiver::unrequested(MAX_OBJECT_SIZE);
     loop {
-        let msg = recv_msg(&mut session.ws).await?;
-        match msg {
-            WheatProtocolMessage::ObjectBatch(batch) => {
-                if batch.op_id != op_id {
-                    continue;
-                }
-
-                // Store each received object, validate identity, discover children.
-                for entry in &batch.objects {
-                    let claimed_id = digest_to_object_id(&entry.id)?;
-                    let actual_id = ObjectId::of_canonical_bytes(&entry.data);
-                    if actual_id != claimed_id {
-                        bail!("object identity mismatch: claimed {claimed_id}, actual {actual_id}");
-                    }
-
-                    objects.put_if_absent(claimed_id, &entry.data).await?;
-                    known.insert(claimed_id);
-                    total_received += 1;
-
-                    // Discover child references.
-                    if let Ok(children) = wheat_core::extract_object_references(&entry.data) {
-                        for child_id in children {
-                            if !known.contains(&child_id) {
-                                // Check if we already have it locally.
-                                match objects.get(child_id).await {
-                                    Ok(_) => {
-                                        known.insert(child_id);
-                                    }
-                                    Err(_) => {
-                                        want_list.push(child_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Deduplicate the want list against what we now know.
-                want_list.retain(|id| !known.contains(id));
-                let mut seen = HashSet::new();
-                want_list.retain(|id| seen.insert(*id));
-
-                // When the BFS exhausts explicit references, walk the
-                // retained sets to discover objects whose IDs are encoded
-                // as radix-trie keys (not extractable from individual nodes).
-                //
-                // Loop until convergence: each round may fetch objects whose
-                // children include new retained-set trie nodes. Once those
-                // nodes arrive, the next retained-set walk discovers additional
-                // trie-key ObjectIds. Repeat until no new objects are found.
-                if want_list.is_empty() {
-                    loop {
-                        let retained =
-                            discover_retained_objects(objects, content, envelope_id).await?;
-                        let mut found_new = false;
-
-                        // BFS through retained objects that are already present
-                        // to discover their children (revision maps, trees, etc.).
-                        let mut bfs_frontier: Vec<ObjectId> = Vec::new();
-                        for oid in retained {
-                            if !known.contains(&oid) {
-                                found_new = true;
-                                match objects.get(oid).await {
-                                    Ok(obj) => {
-                                        known.insert(oid);
-                                        if let Ok(children) = wheat_core::extract_object_references(
-                                            &obj.canonical_bytes,
-                                        ) {
-                                            for child_id in children {
-                                                if !known.contains(&child_id) {
-                                                    bfs_frontier.push(child_id);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        want_list.push(oid);
-                                    }
-                                }
-                            }
-                        }
-                        // Continue BFS with children of retained objects.
-                        while let Some(oid) = bfs_frontier.pop() {
-                            if known.contains(&oid) {
-                                continue;
-                            }
-                            match objects.get(oid).await {
-                                Ok(obj) => {
-                                    known.insert(oid);
-                                    if let Ok(children) =
-                                        wheat_core::extract_object_references(&obj.canonical_bytes)
-                                    {
-                                        for child_id in children {
-                                            if !known.contains(&child_id) {
-                                                bfs_frontier.push(child_id);
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    want_list.push(oid);
-                                }
-                            }
-                        }
-                        // Dedup.
-                        want_list.retain(|id| !known.contains(id));
-                        let mut seen2 = HashSet::new();
-                        want_list.retain(|id| seen2.insert(*id));
-
-                        // If no new retained objects were found AND no new
-                        // wants were generated, convergence is reached.
-                        if !found_new && want_list.is_empty() {
-                            break;
-                        }
-                        // If we have new wants, break out to fetch them.
-                        if !want_list.is_empty() {
-                            break;
-                        }
-                    }
-                }
-
-                if want_list.is_empty() {
-                    // We have the full closure. Send FetchComplete.
-                    send_msg(
-                        &mut session.ws,
-                        &WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
-                            message_type: 0x23,
-                            op_id,
-                        }),
-                    )
-                    .await?;
-                    break;
-                }
-
-                // Request missing children (bounded).
-                let batch_size = want_list.len().min(MAX_WANT_IDS);
-                let want_batch: Vec<Digest256> = want_list
-                    .drain(..batch_size)
-                    .map(object_id_to_digest)
-                    .collect();
-
-                send_msg(
-                    &mut session.ws,
-                    &WheatProtocolMessage::ObjectWant(ObjectWantOutput {
-                        message_type: 0x22,
-                        op_id,
-                        ids: want_batch,
-                    }),
-                )
-                .await?;
+        match recv_msg(&mut session.ws).await? {
+            WheatProtocolMessage::ObjectBatch(batch) if batch.op_id == op_id => {
+                fetched.pushed += store_whole(objects, &mut receiver, batch.objects).await?;
             }
-            WheatProtocolMessage::Error(e) => {
+            WheatProtocolMessage::ObjectChunk(chunk) if chunk.op_id == op_id => {
+                if store_chunk(objects, &mut receiver, chunk).await? {
+                    fetched.pushed += 1;
+                }
+            }
+            WheatProtocolMessage::FetchPushEnd(end) if end.op_id == op_id => {
+                receiver
+                    .finish()
+                    .context("server ended the push inside a chunked object")?;
+                if end.pushed_objects != fetched.pushed {
+                    bail!(
+                        "server says it pushed {} objects, but {} arrived",
+                        end.pushed_objects,
+                        fetched.pushed
+                    );
+                }
+                fetched.incremental = end.incremental;
+                break;
+            }
+            WheatProtocolMessage::Error(e) if e.op_id == op_id => {
                 bail!("server refused the fetch: {}", e.message);
             }
-            other => {
-                bail!("unexpected message during fetch: {other:?}");
-            }
+            other => bail!("unexpected message during fetch: {other:?}"),
         }
     }
 
-    Ok(total_received)
+    let mut delta = StructuralDelta::new(objects, since, want, StructuralDeltaLimits::default());
+    while let Some(step) = delta.next().await? {
+        let DeltaStep::Missing(ids) = step else {
+            continue;
+        };
+        fetched.pulled += pull(session, op_id, objects, fetched.wants, &ids).await?;
+        fetched.wants += 1;
+        delta.resume();
+    }
+
+    send_msg(
+        &mut session.ws,
+        &WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
+            message_type: 0x23,
+            op_id,
+        }),
+    )
+    .await?;
+    Ok(fetched)
 }
 
-/// Walk the retained sets in the repository state to discover all retained
-/// ObjectIds. These are encoded as radix-trie keys, not as explicit node
-/// references, so `extract_object_references` cannot discover them.
-async fn discover_retained_objects<O: ImmutableObjectStore>(
+/// Checks and stores objects that arrived whole. Returns how many.
+async fn store_whole<O: ImmutableObjectStore>(
     objects: &O,
-    content: &ContentStore,
-    envelope_id: RepositoryEnvelopeId,
-) -> Result<Vec<ObjectId>> {
-    let reader = RepositoryReader::new(objects, content);
-    let envelope = reader.envelope(envelope_id).await?;
-    let state = reader.state(envelope.state).await?;
-
-    let mut retained = Vec::new();
-
-    // Walk all four top-level retained sets. Best-effort: some trie nodes
-    // may not be locally present yet during incremental fetch. The
-    // convergence loop retries after more objects arrive.
-    let retained_store = wheat_store::RetainedSetStore::new(objects);
-    for root in [
-        state.retained_views,
-        state.retained_revisions,
-        state.retained_applications,
-        state.retained_changes,
-    ] {
-        if let Ok(mut cursor) = retained_store.cursor(root).await {
-            while let Ok(Some(oid)) = cursor.next().await {
-                retained.push(oid);
-            }
-        }
+    receiver: &mut TransferReceiver<ObjectId>,
+    entries: Vec<ObjectEntry>,
+) -> Result<u64> {
+    let mut batch = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let id = digest_to_object_id(&entry.id)?;
+        receiver
+            .accept_whole(id, entry.data.len())
+            .context("server sent objects that break the fetch rules")?;
+        check_object_id(id, &entry.data)?;
+        batch.push((id, entry.data));
     }
+    objects.put_batch(&batch, FETCH_WRITE_CONCURRENCY).await?;
+    Ok(batch.len() as u64)
+}
 
-    // Walk per-view lineage retained sets. The view lineage map stores,
-    // for each retained parent view, a RetainedSetId root listing that
-    // view's child views. These per-view retained sets also encode their
-    // member ViewIds as radix-trie keys, so they need the same cursor walk.
-    //
-    // Best-effort: some view lineage map nodes or per-view retained-set
-    // nodes may not have been fetched yet. Skip those — the convergence
-    // loop will retry after more objects arrive.
-    let lineage = wheat_store::ViewLineageMapStore::new(objects);
-    // Collect the retained view IDs first (they're already in `retained`).
-    let retained_view_ids: Vec<wheat_core::ViewId> = {
-        let mut ids = Vec::new();
-        // Re-walk; the cursor is consumed.
-        if let Ok(mut cursor) = retained_store.cursor(state.retained_views).await {
-            while let Ok(Some(oid)) = cursor.next().await {
-                ids.push(wheat_core::ViewId::from_digest(*oid.as_bytes()));
-            }
-        }
-        ids
+/// Takes one chunk; checks and stores the object after its last. Returns whether
+/// an object was finished.
+async fn store_chunk<O: ImmutableObjectStore>(
+    objects: &O,
+    receiver: &mut TransferReceiver<ObjectId>,
+    chunk: ObjectChunkOutput,
+) -> Result<bool> {
+    let id = digest_to_object_id(&chunk.object_id)?;
+    let Some((id, data)) = receiver
+        .accept_chunk(id, chunk.offset, chunk.data, chunk.is_final)
+        .context("server sent object chunks that break the fetch rules")?
+    else {
+        return Ok(false);
     };
-    for view_id in &retained_view_ids {
-        if let Ok(Some(children_root)) = lineage.get(state.view_lineage, *view_id).await
-            && let Ok(mut cursor) = retained_store.cursor(children_root).await
-        {
-            while let Ok(Some(oid)) = cursor.next().await {
-                retained.push(oid);
+    check_object_id(id, &data)?;
+    objects.put_if_absent(id, &data).await?;
+    Ok(true)
+}
+
+fn check_object_id(id: ObjectId, data: &[u8]) -> Result<()> {
+    let actual = ObjectId::of_canonical_bytes(data);
+    if actual != id {
+        bail!("object identity mismatch: claimed {id}, actual {actual}");
+    }
+    Ok(())
+}
+
+/// Sends one `ObjectWant` and stores its one reply. Returns how many objects
+/// arrived; the server may answer only the front of the list.
+async fn pull<O: ImmutableObjectStore>(
+    session: &mut WheatSession,
+    op_id: u32,
+    objects: &O,
+    want_sequence: u32,
+    ids: &[ObjectId],
+) -> Result<u64> {
+    send_msg(
+        &mut session.ws,
+        &WheatProtocolMessage::ObjectWant(ObjectWantOutput {
+            message_type: 0x22,
+            op_id,
+            want_sequence,
+            ids: ids.iter().copied().map(object_id_to_digest).collect(),
+        }),
+    )
+    .await?;
+    let mut receiver = TransferReceiver::new(ids.iter().copied(), MAX_OBJECT_SIZE);
+    let mut arrived = 0;
+    loop {
+        match recv_msg(&mut session.ws).await? {
+            WheatProtocolMessage::ObjectChunk(chunk) if chunk.op_id == op_id => {
+                if store_chunk(objects, &mut receiver, chunk).await? {
+                    arrived += 1;
+                }
             }
+            WheatProtocolMessage::ObjectWantReply(reply) if reply.op_id == op_id => {
+                if reply.want_sequence != want_sequence {
+                    bail!(
+                        "server answered want {} while want {want_sequence} was open",
+                        reply.want_sequence
+                    );
+                }
+                arrived += store_whole(objects, &mut receiver, reply.objects).await?;
+                receiver
+                    .finish_partial()
+                    .context("server ended a want reply inside a chunked object")?;
+                if arrived == 0 {
+                    bail!("server answered a want for {} objects with none", ids.len());
+                }
+                return Ok(arrived);
+            }
+            WheatProtocolMessage::Error(e) if e.op_id == op_id => {
+                bail!("server refused the fetch: {}", e.message);
+            }
+            other => bail!("unexpected message during fetch: {other:?}"),
         }
     }
-
-    Ok(retained)
 }
 
 /// Fetch content from the server for all ContentIds referenced by the
@@ -778,6 +709,7 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
     }
 
     let total = missing.len();
+    let mut pending = PendingContent::default();
 
     // Request content in batches.
     for batch in missing.chunks(MAX_WANT_IDS) {
@@ -797,7 +729,7 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
         // Receive ContentBatch / ContentChunk messages until every blob in
         // this batch has arrived. Only the requested blobs are accepted, each
         // once, chunk by chunk in order and no larger than the store takes.
-        let mut receiver = ContentReceiver::new(batch.iter().copied(), MAX_CONTENT_SIZE);
+        let mut receiver = TransferReceiver::new(batch.iter().copied(), MAX_CONTENT_SIZE);
 
         while !receiver.is_complete() {
             let msg = recv_msg(&mut session.ws).await?;
@@ -806,16 +738,12 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                     if cb.op_id != op_id {
                         continue;
                     }
-                    for entry in &cb.contents {
+                    for entry in cb.contents {
                         let id = digest_to_content_id(&entry.id)?;
                         receiver
                             .accept_whole(id, entry.data.len())
                             .context("server sent content that breaks the fetch rules")?;
-                        let actual = ContentId::of(&entry.data);
-                        if actual != id {
-                            bail!("content identity mismatch: claimed {id}, actual {actual}");
-                        }
-                        content.put(&entry.data)?;
+                        pending.push(content, id, entry.data)?;
                     }
                 }
                 WheatProtocolMessage::ContentChunk(chunk) => {
@@ -827,13 +755,7 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                         .accept_chunk(chunk_id, chunk.offset, chunk.data, chunk.is_final)
                         .context("server sent content that breaks the fetch rules")?;
                     if let Some((id, data)) = finished {
-                        let actual = ContentId::of(&data);
-                        if actual != id {
-                            bail!(
-                                "chunked content identity mismatch: claimed {id}, actual {actual}"
-                            );
-                        }
-                        content.put(&data)?;
+                        pending.push(content, id, data)?;
                     }
                 }
                 WheatProtocolMessage::Error(e) if e.op_id == op_id => {
@@ -845,8 +767,45 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
             }
         }
     }
+    pending.store(content)?;
 
     Ok(total)
+}
+
+/// Fetched blobs held until there are enough to store together.
+const PENDING_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Writers used to store fetched blobs. Each blob is synced on its own, so
+/// several writers let those waits overlap.
+const CONTENT_WRITE_CONCURRENCY: usize = 8;
+
+/// Fetched blobs waiting to be stored. Storing them in batches lets the store's
+/// writers work in parallel; the byte cap keeps a fetch from holding every blob
+/// in memory at once.
+#[derive(Default)]
+struct PendingContent {
+    items: Vec<(ContentId, Vec<u8>)>,
+    bytes: usize,
+}
+
+impl PendingContent {
+    /// Adds a blob, and stores the batch once it is full.
+    fn push(&mut self, content: &ContentStore, id: ContentId, data: Vec<u8>) -> Result<()> {
+        self.bytes += data.len();
+        self.items.push((id, data));
+        if self.bytes >= PENDING_CONTENT_BYTES {
+            self.store(content)?;
+        }
+        Ok(())
+    }
+
+    /// Stores every pending blob. The store checks that each matches its ID.
+    fn store(&mut self, content: &ContentStore) -> Result<()> {
+        self.bytes = 0;
+        content
+            .put_many(std::mem::take(&mut self.items), CONTENT_WRITE_CONCURRENCY)
+            .context("storing fetched content")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -884,65 +843,12 @@ pub async fn publish<O: ImmutableObjectStore>(
     .await?;
 
     // --- Object transfer phase ---
-    // The server tells us what it needs; we send it.
+    // The server asks in rounds; answer each with exactly the objects it names.
     loop {
         let msg = recv_msg(&mut session.ws).await?;
         match msg {
-            WheatProtocolMessage::ObjectsNeeded(on) => {
-                if on.op_id != op_id {
-                    continue;
-                }
-
-                let mut batch_objects = Vec::new();
-                let mut batch_size = 0usize;
-
-                for digest in &on.ids {
-                    let oid = digest_to_object_id(digest)?;
-                    match objects.get(oid).await {
-                        Ok(obj) => {
-                            batch_size += obj.canonical_bytes.len();
-                            batch_objects.push(ObjectEntry {
-                                id: digest.clone(),
-                                data: obj.canonical_bytes.to_vec(),
-                            });
-
-                            // Flush if batch is getting large.
-                            if batch_size >= MAX_OBJECT_BATCH_SIZE
-                                || batch_objects.len() >= MAX_OBJECT_BATCH_ITEMS
-                            {
-                                send_msg(
-                                    &mut session.ws,
-                                    &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
-                                        message_type: 0x21,
-                                        op_id,
-                                        sequence: 0,
-                                        objects: batch_objects,
-                                    }),
-                                )
-                                .await?;
-                                batch_objects = Vec::new();
-                                batch_size = 0;
-                            }
-                        }
-                        Err(e) => {
-                            bail!("server requested object {oid} which is not in local store: {e}");
-                        }
-                    }
-                }
-
-                // Send remaining.
-                if !batch_objects.is_empty() {
-                    send_msg(
-                        &mut session.ws,
-                        &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
-                            message_type: 0x21,
-                            op_id,
-                            sequence: 0,
-                            objects: batch_objects,
-                        }),
-                    )
-                    .await?;
-                }
+            WheatProtocolMessage::ObjectsNeeded(on) if on.op_id == op_id => {
+                upload_objects(session, op_id, objects, &on.ids).await?;
             }
             WheatProtocolMessage::ObjectsComplete(oc) if oc.op_id == op_id => {
                 break;
@@ -956,6 +862,7 @@ pub async fn publish<O: ImmutableObjectStore>(
     }
 
     // --- Content transfer phase ---
+    // The server asks in rounds; answer each, until it says it has everything.
     loop {
         let msg = recv_msg(&mut session.ws).await?;
         match msg {
@@ -966,7 +873,7 @@ pub async fn publish<O: ImmutableObjectStore>(
                     upload_content(session, op_id, digest, data).await?;
                 }
 
-                // Signal that all content has been uploaded.
+                // Signal that this round's content has been uploaded.
                 send_msg(
                     &mut session.ws,
                     &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
@@ -975,9 +882,8 @@ pub async fn publish<O: ImmutableObjectStore>(
                     }),
                 )
                 .await?;
-
-                break;
             }
+            WheatProtocolMessage::ContentComplete(cc) if cc.op_id == op_id => break,
             WheatProtocolMessage::PublishResult(pr) if pr.op_id == op_id => {
                 return decode_publish_result(pr);
             }
@@ -1009,6 +915,85 @@ pub async fn publish<O: ImmutableObjectStore>(
             _ => {}
         }
     }
+}
+
+/// Send the objects of one `ObjectsNeeded`: in `ObjectBatch`es that stay within
+/// the batch limits, and each object too large for a batch as `ObjectChunk`s.
+async fn upload_objects<O: ImmutableObjectStore>(
+    session: &mut WheatSession,
+    op_id: u32,
+    objects: &O,
+    ids: &[Digest256],
+) -> Result<()> {
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    for digest in ids {
+        let id = digest_to_object_id(digest)?;
+        let object = objects
+            .get(id)
+            .await
+            .with_context(|| format!("server asked for object {id}, which is not here"))?;
+        let data = object.canonical_bytes;
+        if data.len() > MAX_OBJECT_BATCH_SIZE {
+            for chunk in object_chunks(op_id, id, &data) {
+                send_msg(&mut session.ws, &chunk).await?;
+            }
+            continue;
+        }
+        // Send first, so a batch never grows past its limits.
+        if batch.len() == MAX_OBJECT_BATCH_ITEMS || batch_bytes + data.len() > MAX_OBJECT_BATCH_SIZE
+        {
+            send_object_batch(session, op_id, std::mem::take(&mut batch)).await?;
+            batch_bytes = 0;
+        }
+        batch_bytes += data.len();
+        batch.push(ObjectEntry {
+            id: digest.clone(),
+            data: data.to_vec(),
+        });
+    }
+    if !batch.is_empty() {
+        send_object_batch(session, op_id, batch).await?;
+    }
+    Ok(())
+}
+
+async fn send_object_batch(
+    session: &mut WheatSession,
+    op_id: u32,
+    objects: Vec<ObjectEntry>,
+) -> Result<()> {
+    send_msg(
+        &mut session.ws,
+        &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
+            message_type: 0x21,
+            op_id,
+            sequence: 0,
+            objects,
+        }),
+    )
+    .await
+}
+
+/// One object as `ObjectChunk` messages of at most `MAX_OBJECT_CHUNK_SIZE` bytes.
+fn object_chunks(
+    op_id: u32,
+    id: ObjectId,
+    data: &[u8],
+) -> impl Iterator<Item = WheatProtocolMessage> + '_ {
+    let mut offset = 0;
+    data.chunks(MAX_OBJECT_CHUNK_SIZE).map(move |piece| {
+        let start = offset;
+        offset += piece.len();
+        WheatProtocolMessage::ObjectChunk(ObjectChunkOutput {
+            message_type: 0x26,
+            op_id,
+            object_id: object_id_to_digest(id),
+            offset: start as u64,
+            data: piece.to_vec(),
+            is_final: offset == data.len(),
+        })
+    })
 }
 
 /// Send one requested blob: in one `ContentUpload` when it fits a chunk,
@@ -1089,4 +1074,40 @@ fn decode_publish_result(pr: PublishResultOutput) -> Result<PublishOutcome> {
 pub async fn close(session: &mut WheatSession) -> Result<()> {
     session.ws.close(None).await.ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn an_object_splits_into_chunks_the_receiver_puts_back_together() {
+        let data: Vec<u8> = (0..2 * MAX_OBJECT_CHUNK_SIZE + 7)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let id = ObjectId::of_canonical_bytes(&data);
+        let mut receiver = TransferReceiver::new([id], MAX_OBJECT_SIZE);
+        let mut chunks = 0;
+        let mut finished = None;
+        for message in object_chunks(9, id, &data) {
+            let WheatProtocolMessage::ObjectChunk(chunk) = message else {
+                panic!("expected ObjectChunk");
+            };
+            assert_eq!(chunk.op_id, 9);
+            assert!(chunk.data.len() <= MAX_OBJECT_CHUNK_SIZE);
+            assert!(encode_message(&WheatProtocolMessage::ObjectChunk(chunk.clone())).is_ok());
+            chunks += 1;
+            finished = receiver
+                .accept_chunk(
+                    digest_to_object_id(&chunk.object_id).unwrap(),
+                    chunk.offset,
+                    chunk.data,
+                    chunk.is_final,
+                )
+                .unwrap();
+        }
+        assert_eq!(chunks, 3);
+        assert_eq!(finished, Some((id, data)));
+        receiver.finish().unwrap();
+    }
 }

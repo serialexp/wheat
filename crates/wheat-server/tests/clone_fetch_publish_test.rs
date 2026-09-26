@@ -1,55 +1,26 @@
 //! End-to-end tests for clone, fetch, and publish over the wheat native protocol.
 //!
-//! Each test starts an in-process wheat-server, then uses the client-side
-//! protocol engine (reimplemented here as test helpers — the real client engine
-//! lives in wheat-cli, which is a binary crate and can't be depended upon).
+//! Each test starts an in-process wheat-server and talks to it with the small
+//! client in `support`.
 
-use std::collections::HashSet;
+mod support;
+
 use std::net::SocketAddr;
 
-use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-
-use wheat_core::{
-    ApplicationContext, ContentId, EditOperation, EditRecord, EditTransition, FileKind, FileValue,
-    ObjectId, Repository, RevisionEdits, Tree,
-};
+use wheat_core::{ApplicationContext, ContentId, Repository, Tree};
 use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
-    BatchObjectStore, ContentStore, ImmutableObjectStore, LocalPublicationStore, PackedObjectStore,
+    BatchObjectStore, ContentStore, LocalPublicationStore, PackedObjectStore,
     PersistedRepositoryMutator, PublicationStore, RepositoryHead, RepositoryPublisher,
     RepositoryReader, finalize_mutation_publication, prepare_mutation_publication,
 };
 
-// ---------------------------------------------------------------------------
-// Reusable helpers (same as protocol_test.rs)
-// ---------------------------------------------------------------------------
-
-fn edit(path: &str, value: &[u8]) -> RevisionEdits {
-    let record = EditRecord::new(
-        path,
-        EditOperation::ExactFile {
-            expected: None,
-            replacement: Some(FileValue {
-                content: ContentId::of(value),
-                kind: FileKind::Regular,
-            }),
-        },
-    )
-    .unwrap();
-    let id = record.id();
-    RevisionEdits {
-        edits: [(id, record)].into(),
-        transition: EditTransition {
-            added: [id].into(),
-            ..EditTransition::default()
-        },
-    }
-}
+use support::{
+    Upload, Ws, connect_and_handshake, edit, fetch_content, fetch_objects, open_repo, recv_msg,
+    request_publish, send_msg, upload_objects,
+};
 
 fn stores(root: &std::path::Path) -> (PackedObjectStore, ContentStore, LocalPublicationStore) {
     let objects = PackedObjectStore::open(root.join("storage")).unwrap();
@@ -127,333 +98,6 @@ async fn setup_repo(dir: &std::path::Path) -> Repository {
 }
 
 // ---------------------------------------------------------------------------
-// Client-side protocol helpers (thin wrappers for test use)
-// ---------------------------------------------------------------------------
-
-async fn send_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, msg: &WheatProtocolMessage) {
-    let bytes = encode_message(msg).unwrap();
-    ws.send(Message::Binary(bytes.into())).await.unwrap();
-}
-
-async fn recv_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> WheatProtocolMessage {
-    loop {
-        let msg = ws.next().await.unwrap().unwrap();
-        match msg {
-            Message::Binary(bytes) => return decode_message(&bytes).unwrap(),
-            Message::Ping(data) => {
-                ws.send(Message::Pong(data)).await.unwrap();
-            }
-            Message::Pong(_) | Message::Frame(_) => {}
-            other => panic!("unexpected message: {other:?}"),
-        }
-    }
-}
-
-async fn connect_and_handshake(addr: SocketAddr) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
-    let url = format!("ws://{addr}");
-    let (mut ws, _) = connect_async(&url).await.unwrap();
-
-    let server_hello = recv_msg(&mut ws).await;
-    assert!(matches!(server_hello, WheatProtocolMessage::ServerHello(_)));
-
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::ClientHello(ClientHelloOutput {
-            message_type: 0x02,
-            selected_version: 1,
-            auth_token: vec![],
-            receive_window_bytes: 16 * 1024 * 1024,
-            receive_window_messages: 256,
-        }),
-    )
-    .await;
-
-    let established = recv_msg(&mut ws).await;
-    assert!(matches!(
-        established,
-        WheatProtocolMessage::SessionEstablished(_)
-    ));
-
-    ws
-}
-
-async fn open_repo(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    name: &str,
-) -> (u64, Digest256) {
-    send_msg(
-        ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: name.to_string(),
-        }),
-    )
-    .await;
-
-    let msg = recv_msg(ws).await;
-    match msg {
-        WheatProtocolMessage::RepositoryState(rs) => (rs.head_generation, rs.head_envelope),
-        other => panic!("expected RepositoryState, got {other:?}"),
-    }
-}
-
-/// Client-side iterative root-first fetch. Returns total objects received.
-async fn client_fetch_objects(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    op_id: u32,
-    objects: &PackedObjectStore,
-    content: &ContentStore,
-    envelope_id: wheat_core::RepositoryEnvelopeId,
-) -> usize {
-    // Send FetchRequest.
-    send_msg(
-        ws,
-        &WheatProtocolMessage::FetchRequest(FetchRequestOutput {
-            message_type: 0x20,
-            op_id,
-            labels: vec![],
-            since_generation: 0,
-            since_envelope: Digest256 { bytes: vec![0; 32] },
-        }),
-    )
-    .await;
-
-    let mut total = 0;
-    let mut want_list: Vec<ObjectId> = Vec::new();
-    let mut known = HashSet::new();
-
-    loop {
-        let msg = recv_msg(ws).await;
-        match msg {
-            WheatProtocolMessage::ObjectBatch(batch) => {
-                assert_eq!(batch.op_id, op_id);
-
-                for entry in &batch.objects {
-                    let claimed_id =
-                        ObjectId::from_digest(entry.id.bytes.as_slice().try_into().unwrap());
-                    let actual_id = ObjectId::of_canonical_bytes(&entry.data);
-                    assert_eq!(actual_id, claimed_id, "object identity mismatch");
-
-                    objects
-                        .put_if_absent(claimed_id, &entry.data)
-                        .await
-                        .unwrap();
-                    known.insert(claimed_id);
-                    total += 1;
-
-                    if let Ok(children) = wheat_core::extract_object_references(&entry.data) {
-                        for child_id in children {
-                            if !known.contains(&child_id) {
-                                match objects.get(child_id).await {
-                                    Ok(_) => {
-                                        known.insert(child_id);
-                                    }
-                                    Err(_) => {
-                                        want_list.push(child_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                want_list.retain(|id| !known.contains(id));
-                let mut seen = HashSet::new();
-                want_list.retain(|id| seen.insert(*id));
-
-                // Walk retained sets until convergence. Each round may
-                // fetch objects whose children include new trie nodes;
-                // those nodes may encode additional trie-key ObjectIds.
-                if want_list.is_empty() {
-                    loop {
-                        let reader = RepositoryReader::new(objects, content);
-                        let env = reader.envelope(envelope_id).await.unwrap();
-                        let state = reader.state(env.state).await.unwrap();
-
-                        let retained_store = wheat_store::RetainedSetStore::new(objects);
-                        let mut bfs_frontier: Vec<ObjectId> = Vec::new();
-                        let mut found_new = false;
-                        for root in [
-                            state.retained_views,
-                            state.retained_revisions,
-                            state.retained_applications,
-                            state.retained_changes,
-                        ] {
-                            let mut cursor = retained_store.cursor(root).await.unwrap();
-                            while let Some(oid) = cursor.next().await.unwrap() {
-                                if !known.contains(&oid) {
-                                    found_new = true;
-                                    match objects.get(oid).await {
-                                        Ok(obj) => {
-                                            known.insert(oid);
-                                            if let Ok(children) =
-                                                wheat_core::extract_object_references(
-                                                    &obj.canonical_bytes,
-                                                )
-                                            {
-                                                for c in children {
-                                                    if !known.contains(&c) {
-                                                        bfs_frontier.push(c);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(_) => {
-                                            want_list.push(oid);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        while let Some(oid) = bfs_frontier.pop() {
-                            if known.contains(&oid) {
-                                continue;
-                            }
-                            match objects.get(oid).await {
-                                Ok(obj) => {
-                                    known.insert(oid);
-                                    if let Ok(children) =
-                                        wheat_core::extract_object_references(&obj.canonical_bytes)
-                                    {
-                                        for c in children {
-                                            if !known.contains(&c) {
-                                                bfs_frontier.push(c);
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    want_list.push(oid);
-                                }
-                            }
-                        }
-                        want_list.retain(|id| !known.contains(id));
-                        let mut seen2 = HashSet::new();
-                        want_list.retain(|id| seen2.insert(*id));
-
-                        if !found_new && want_list.is_empty() {
-                            break;
-                        }
-                        if !want_list.is_empty() {
-                            break;
-                        }
-                    }
-                }
-
-                if want_list.is_empty() {
-                    send_msg(
-                        ws,
-                        &WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
-                            message_type: 0x23,
-                            op_id,
-                        }),
-                    )
-                    .await;
-                    break;
-                }
-
-                let batch_size = want_list.len().min(MAX_WANT_IDS);
-                let want_batch: Vec<Digest256> = want_list
-                    .drain(..batch_size)
-                    .map(|id| Digest256 {
-                        bytes: id.as_bytes().to_vec(),
-                    })
-                    .collect();
-
-                send_msg(
-                    ws,
-                    &WheatProtocolMessage::ObjectWant(ObjectWantOutput {
-                        message_type: 0x22,
-                        op_id,
-                        ids: want_batch,
-                    }),
-                )
-                .await;
-            }
-            other => panic!("unexpected message during fetch: {other:?}"),
-        }
-    }
-
-    total
-}
-
-/// Client-side content fetch for all content referenced by the envelope.
-async fn client_fetch_content(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    op_id: u32,
-    objects: &PackedObjectStore,
-    content: &ContentStore,
-    envelope_id: &Digest256,
-) -> usize {
-    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        envelope_id.bytes.as_slice().try_into().unwrap(),
-    );
-    let reader = RepositoryReader::new(objects, content);
-    let envelope = reader.envelope(env_id).await.unwrap();
-    let state = reader.state(envelope.state).await.unwrap();
-    let manifest = reader.manifest(state.required_content).await.unwrap();
-
-    let content_set = wheat_store::ContentSetStore::new(objects);
-    let mut cursor = content_set.cursor(manifest.content).await.unwrap();
-    let mut missing = Vec::new();
-    while let Some(content_id) = cursor.next().await.unwrap() {
-        if !content.contains(content_id) {
-            missing.push(Digest256 {
-                bytes: content_id.as_bytes().to_vec(),
-            });
-        }
-    }
-
-    if missing.is_empty() {
-        return 0;
-    }
-
-    let total = missing.len();
-
-    send_msg(
-        ws,
-        &WheatProtocolMessage::ContentFetchRequest(ContentFetchRequestOutput {
-            message_type: 0x30,
-            op_id,
-            content_ids: missing,
-        }),
-    )
-    .await;
-
-    let mut received = 0;
-    while received < total {
-        let msg = recv_msg(ws).await;
-        match msg {
-            WheatProtocolMessage::ContentBatch(cb) => {
-                assert_eq!(cb.op_id, op_id);
-                for entry in &cb.contents {
-                    let id = ContentId::from_digest(entry.id.bytes.as_slice().try_into().unwrap());
-                    let actual = ContentId::of(&entry.data);
-                    assert_eq!(actual, id, "content identity mismatch");
-                    content.put(&entry.data).unwrap();
-                    received += 1;
-                }
-            }
-            WheatProtocolMessage::ContentChunk(chunk) => {
-                assert_eq!(chunk.op_id, op_id);
-                if chunk.is_final {
-                    let id = ContentId::from_digest(
-                        chunk.content_id.bytes.as_slice().try_into().unwrap(),
-                    );
-                    let actual = ContentId::of(&chunk.data);
-                    assert_eq!(actual, id, "chunked content identity mismatch");
-                    content.put(&chunk.data).unwrap();
-                    received += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    total
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -473,18 +117,16 @@ async fn clone_round_trip() {
     let (clone_objects, clone_content, clone_heads) = stores(&clone_path);
 
     let mut ws = connect_and_handshake(addr).await;
-    let (generation, envelope) = open_repo(&mut ws, "test/repo").await;
-    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        envelope.bytes.as_slice().try_into().unwrap(),
-    );
+    let (generation, env_id) = open_repo(&mut ws, "test/repo").await;
 
-    // Fetch all structural objects.
-    let obj_count = client_fetch_objects(&mut ws, 1, &clone_objects, &clone_content, env_id).await;
-    assert!(obj_count > 0, "should have fetched some objects");
+    // A clone gets everything in the push and has nothing left to ask for.
+    let fetched = fetch_objects(&mut ws, 1, &clone_objects, env_id, None).await;
+    assert!(fetched.pushed > 0, "should have fetched some objects");
+    assert_eq!((fetched.pulled, fetched.wants), (0, 0), "{fetched:?}");
+    assert!(!fetched.incremental);
 
     // Fetch content.
-    let content_count =
-        client_fetch_content(&mut ws, 2, &clone_objects, &clone_content, &envelope).await;
+    let content_count = fetch_content(&mut ws, 2, &clone_objects, &clone_content, env_id).await;
     assert_eq!(content_count, 1, "should have fetched greeting.txt content");
     let head = RepositoryHead {
         generation,
@@ -514,7 +156,7 @@ const PUBLISH_OP: u32 = 3;
 /// A publish driven up to its content phase: the server's `ContentNeeded`
 /// has arrived and nothing has been uploaded yet.
 struct ContentPhase {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: Ws,
     /// The content the server asked for.
     needed: Vec<Digest256>,
     /// The publishing clone's content store.
@@ -543,13 +185,10 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
     let (clone_objects, clone_content, clone_heads) = stores(&clone_path);
 
     let mut ws = connect_and_handshake(addr).await;
-    let (generation, envelope) = open_repo(&mut ws, "test/repo").await;
-    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        envelope.bytes.as_slice().try_into().unwrap(),
-    );
+    let (generation, env_id) = open_repo(&mut ws, "test/repo").await;
 
-    client_fetch_objects(&mut ws, 1, &clone_objects, &clone_content, env_id).await;
-    client_fetch_content(&mut ws, 2, &clone_objects, &clone_content, &envelope).await;
+    fetch_objects(&mut ws, 1, &clone_objects, env_id, None).await;
+    fetch_content(&mut ws, 2, &clone_objects, &clone_content, env_id).await;
 
     let head = RepositoryHead {
         generation,
@@ -641,57 +280,15 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
         "server should be at original generation"
     );
 
-    // Send PublishRequest.
-    let local_envelope = new_head.envelope;
-    send_msg(
+    request_publish(
         &mut ws,
-        &WheatProtocolMessage::PublishRequest(PublishRequestOutput {
-            message_type: 0x40,
-            op_id: 3,
-            publish_key: Uuid128 { bytes: vec![1; 16] },
-            envelope_id: Digest256 {
-                bytes: local_envelope.as_bytes().to_vec(),
-            },
-            expected_generation: server_gen,
-            expected_envelope: server_env.clone(),
-            force: false,
-        }),
+        PUBLISH_OP,
+        new_head.envelope,
+        (server_gen, server_env),
+        false,
     )
     .await;
-
-    // Drive the publish protocol: ObjectsNeeded/ObjectBatch loop.
-    loop {
-        let msg = recv_msg(&mut ws).await;
-        match msg {
-            WheatProtocolMessage::ObjectsNeeded(on) => {
-                assert_eq!(on.op_id, 3);
-                let mut batch_objects = Vec::new();
-                for digest in &on.ids {
-                    let oid = ObjectId::from_digest(digest.bytes.as_slice().try_into().unwrap());
-                    let obj = clone_objects.get(oid).await.unwrap();
-                    batch_objects.push(ObjectEntry {
-                        id: digest.clone(),
-                        data: obj.canonical_bytes.to_vec(),
-                    });
-                }
-                send_msg(
-                    &mut ws,
-                    &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
-                        message_type: 0x21,
-                        op_id: 3,
-                        sequence: 0,
-                        objects: batch_objects,
-                    }),
-                )
-                .await;
-            }
-            WheatProtocolMessage::ObjectsComplete(oc) => {
-                assert_eq!(oc.op_id, 3);
-                break;
-            }
-            other => panic!("unexpected during publish objects: {other:?}"),
-        }
-    }
+    upload_objects(&mut ws, PUBLISH_OP, &clone_objects, Upload::Whole).await;
 
     // Content phase.
     let needed = match recv_msg(&mut ws).await {
@@ -713,11 +310,7 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
     }
 }
 
-async fn upload_whole(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    digest: &Digest256,
-    data: Vec<u8>,
-) {
+async fn upload_whole(ws: &mut Ws, digest: &Digest256, data: Vec<u8>) {
     send_msg(
         ws,
         &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
@@ -730,13 +323,7 @@ async fn upload_whole(
     .await;
 }
 
-async fn upload_chunk(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    digest: &Digest256,
-    offset: u64,
-    data: &[u8],
-    is_final: bool,
-) {
+async fn upload_chunk(ws: &mut Ws, digest: &Digest256, offset: u64, data: &[u8], is_final: bool) {
     send_msg(
         ws,
         &WheatProtocolMessage::ContentUploadChunk(ContentUploadChunkOutput {
@@ -751,7 +338,7 @@ async fn upload_chunk(
     .await;
 }
 
-async fn upload_complete(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+async fn upload_complete(ws: &mut Ws) {
     send_msg(
         ws,
         &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
@@ -762,10 +349,13 @@ async fn upload_complete(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
     .await;
 }
 
-/// Ask the server to commit and return its answer.
-async fn commit_publish(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-) -> PublishResultOutput {
+/// Wait for the server to say it has all the content, then ask it to commit and
+/// return its answer.
+async fn commit_publish(ws: &mut Ws) -> PublishResultOutput {
+    match recv_msg(ws).await {
+        WheatProtocolMessage::ContentComplete(cc) => assert_eq!(cc.op_id, PUBLISH_OP),
+        other => panic!("expected ContentComplete, got {other:?}"),
+    }
     send_msg(
         ws,
         &WheatProtocolMessage::PublishCommit(PublishCommitOutput {
@@ -871,12 +461,9 @@ async fn publish_reassembles_chunked_content() {
     let clone_dir = tempfile::tempdir().unwrap();
     let (clone_objects, clone_content, _) = stores(clone_dir.path());
     let mut ws = connect_and_handshake(phase.addr).await;
-    let (_, envelope) = open_repo(&mut ws, "test/repo").await;
-    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        envelope.bytes.as_slice().try_into().unwrap(),
-    );
-    client_fetch_objects(&mut ws, 1, &clone_objects, &clone_content, env_id).await;
-    client_fetch_content(&mut ws, 2, &clone_objects, &clone_content, &envelope).await;
+    let (_, env_id) = open_repo(&mut ws, "test/repo").await;
+    fetch_objects(&mut ws, 1, &clone_objects, env_id, None).await;
+    fetch_content(&mut ws, 2, &clone_objects, &clone_content, env_id).await;
     assert_eq!(
         clone_content.get(ContentId::of(farewell)).unwrap(),
         farewell
@@ -956,11 +543,9 @@ async fn fetch_after_server_advance() {
     let (clone_objects, clone_content, clone_heads) = stores(&clone_path);
 
     let mut ws = connect_and_handshake(addr).await;
-    let (gen1, env1) = open_repo(&mut ws, "test/repo").await;
-    let env1_id =
-        wheat_core::RepositoryEnvelopeId::from_digest(env1.bytes.as_slice().try_into().unwrap());
-    client_fetch_objects(&mut ws, 1, &clone_objects, &clone_content, env1_id).await;
-    client_fetch_content(&mut ws, 2, &clone_objects, &clone_content, &env1).await;
+    let (gen1, env1_id) = open_repo(&mut ws, "test/repo").await;
+    fetch_objects(&mut ws, 1, &clone_objects, env1_id, None).await;
+    fetch_content(&mut ws, 2, &clone_objects, &clone_content, env1_id).await;
     let head1 = RepositoryHead {
         generation: gen1,
         envelope: env1_id,
@@ -1033,21 +618,34 @@ async fn fetch_after_server_advance() {
 
     // Now fetch the update.
     let mut ws = connect_and_handshake(addr).await;
-    let (gen2, env2) = open_repo(&mut ws, "test/repo").await;
-    let env2_id =
-        wheat_core::RepositoryEnvelopeId::from_digest(env2.bytes.as_slice().try_into().unwrap());
+    let (gen2, env2_id) = open_repo(&mut ws, "test/repo").await;
     assert!(gen2 > gen1, "server should have advanced");
 
-    let obj_count = client_fetch_objects(&mut ws, 3, &clone_objects, &clone_content, env2_id).await;
-    assert!(obj_count > 0, "should fetch new objects");
+    // Only what the first fetch lacks comes over, and nothing is left to ask for.
+    let fetched = fetch_objects(&mut ws, 3, &clone_objects, env2_id, Some(env1_id)).await;
+    assert!(fetched.incremental, "{fetched:?}");
+    assert!(fetched.pushed > 0, "should fetch new objects");
+    assert_eq!((fetched.pulled, fetched.wants), (0, 0), "{fetched:?}");
+    let reader = RepositoryReader::new(&clone_objects, &clone_content);
+    let state = reader.envelope(env2_id).await.unwrap().state;
 
-    let content_count =
-        client_fetch_content(&mut ws, 4, &clone_objects, &clone_content, &env2).await;
+    let content_count = fetch_content(&mut ws, 4, &clone_objects, &clone_content, env2_id).await;
     assert!(content_count > 0, "should fetch new content");
+    reader
+        .validate_complete(state)
+        .await
+        .expect("fetched state should be complete");
+
+    // A full fetch of the same envelope sends more.
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let (fresh_objects, _, _) = stores(fresh_dir.path());
+    let full = fetch_objects(&mut ws, 5, &fresh_objects, env2_id, None).await;
+    assert!(
+        fetched.pushed < full.pushed,
+        "incremental {fetched:?} vs full {full:?}"
+    );
 
     // Update clone head.
-    let env2_id =
-        wheat_core::RepositoryEnvelopeId::from_digest(env2.bytes.as_slice().try_into().unwrap());
     let head2 = RepositoryHead {
         generation: gen2,
         envelope: env2_id,

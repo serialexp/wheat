@@ -94,6 +94,51 @@ Finished items, moved here from `TODO.md` under the same headings.
   a file could not be imported at all. The result checks in `verify_mapping` and in
   `RepositoryVerifier::replay` (`repository_verify.rs`) looked up the deleted paths
   below the new file and failed with `FileInPath`; such a path is now read as absent.
+- `[x]` **Fetch always sends the whole repository (confirmed).** `handle_fetch`
+  (`crates/wheat-server/src/fetch.rs`) collected the structural closure of all history
+  in memory (`collect_structural_closure`), ignored `since_envelope`, and could build
+  batches over the 16 MiB message cap; the client sent `FetchComplete` while wants
+  were still in flight, so clones over about 512 objects came out incomplete. Done
+  2026-09-26: both ends run one walk, `StructuralDelta`
+  (`crates/wheat-store/src/structural_delta.rs`), that yields the objects of the new
+  envelope the old one does not cover. The server pushes the walk from the client's
+  last fetched envelope (`FetchPushEnd`), the client runs it over its own store and
+  pulls any gaps (`ObjectWant`, exactly one `ObjectWantReply` each), and objects over
+  8 MiB go as `ObjectChunk`s. `closure.rs` is gone. The client stores fetched blobs in
+  batches with 8 writers instead of one at a time (a 4,101-file clone: 141 s → 30 s
+  in debug). Tests: `crates/wheat-store` walk tests,
+  `crates/wheat-server/tests/fetch_test.rs`, `crates/wheat-cli/tests/remote_fetch.rs`.
+  Benchmark: `fetch_incremental` (one change after 10 and after 200 changes: 20 → 26
+  objects, 33 → 43 store reads; budget 150%). Sending deltas instead of whole objects
+  is still open (see "Loose ends").
+- `[x]` **Publish asked for at most 4,096 missing blobs, once (confirmed).** Done
+  2026-09-26: the server asks in rounds of at most 4,096 (`ContentNeeded`, answered by
+  one `ContentUploadComplete` each) and says `ContentComplete` when it has them all.
+  Test: `more_new_files_than_one_content_request_publish_and_clone` in
+  `crates/wheat-cli/tests/remote_large_content.rs`. Walking the whole manifest is still
+  open.
+- `[x]` **Publish could move the head with objects missing (found 2026-09-26).** The
+  server rediscovered missing objects after every `ObjectBatch` (racing the client's
+  other batches), dropped its frontier past 4,096 IDs, followed references with the
+  incomplete `extract_object_references`, and never checked completeness before
+  moving the head; a 4,101-file publish left the server's store invalid. Done
+  2026-09-26: the server runs `StructuralDelta` from its head to the proposed
+  envelope, sends each missing batch as one `ObjectsNeeded` round, accepts exactly
+  those objects (whole or as `ObjectChunk`s, each once, nothing else), and goes on only
+  when all have arrived. The client sends objects over 8 MiB in chunks. Tests:
+  `crates/wheat-server/tests/publish_test.rs` (a publish of more than one round leaves
+  the server complete; chunked objects; six refusals), and
+  `an_object_splits_into_chunks_the_receiver_puts_back_together` in
+  `crates/wheat-cli/src/remote.rs`.
+- `[x]` **Fetch treated local and remote generations as one (found 2026-09-26).** A
+  fetch set the local head's generation to the remote's, but the local head only moves
+  one generation at a time, so any fetch over more than one remote publish failed; and
+  after publishing two local changes at once, fetch said there was unpublished work.
+  Done 2026-09-26: the local head counts its own generations, a fetch moves it one
+  generation to the remote envelope, and unpublished work is a local head envelope
+  other than the one last fetched or published. Test:
+  `a_fetch_catches_up_on_several_publishes_and_knows_its_own` in
+  `crates/wheat-cli/tests/remote_fetch.rs`.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 

@@ -202,10 +202,12 @@ both lists.
 - [~] **Phase 3 — local synchronization.** Add persisted remote-view observations
   and incremental synchronization once the versioned native protocol exists;
   one-shot Git import remains a compatibility bootstrap, not native clone/pull.
-  (2026-09-25: `remote.json` persists the last observed remote head, and
-  `clone`/`fetch`/`publish` exist. Content fetch is incremental, but the server
-  ignores `since_generation` and resends the whole structural closure on every
-  fetch. There is no pull or integration.)
+  (2026-09-26: `remote.json` persists the last observed remote head, and
+  `clone`/`fetch`/`publish` exist. Fetch is incremental: the server pushes only
+  what the last fetched envelope lacks, and the client pulls any gaps. The local
+  head counts its own generations; unpublished work is a local head envelope
+  other than the last fetched or published one. There is no pull or
+  integration.)
 - [ ] **Phase 3 — concurrent multi-workspace authoring policy.** Durable workspace
   identity, shared-store creation/list/detach, operation locks, and content pins are
   implemented. Still define user-facing integration when two workspaces advance

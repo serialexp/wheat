@@ -61,11 +61,23 @@ impl Workspace {
     /// config, which must succeed, and measures it. For commands that make or use
     /// another workspace, such as `clone`.
     pub(crate) fn ok_in(&self, directory: &Path, arguments: &[&str]) -> Result<Captured> {
+        self.ok_in_stores(directory, &self.stores, arguments)
+    }
+
+    /// Like [`Self::ok_in`], but with the store home `stores`. Workspaces cloned from
+    /// one remote into one store home share a store, so separate clients of a server
+    /// need separate store homes.
+    pub(crate) fn ok_in_stores(
+        &self,
+        directory: &Path,
+        stores: &Path,
+        arguments: &[&str],
+    ) -> Result<Captured> {
         let mut command = Command::new(&self.wheat);
         crate::isolate(&mut command)
             .current_dir(directory)
             .args(arguments)
-            .env("WHEAT_STORE_HOME", &self.stores)
+            .env("WHEAT_STORE_HOME", stores)
             .env("XDG_CONFIG_HOME", &self.config);
         let captured = measure::run(&mut command, &self.scratch)?;
         captured.ensure_success(&format!("wheat {}", arguments.join(" ")))?;

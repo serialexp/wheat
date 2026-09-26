@@ -216,12 +216,11 @@ fn is_permission_denial(result: &PublishResultOutput) -> bool {
         && result.message.contains("permission denied")
 }
 
-fn fetch_request(op_id: u32) -> WheatProtocolMessage {
+fn fetch_request(op_id: u32, state: &RepositoryStateOutput) -> WheatProtocolMessage {
     WheatProtocolMessage::FetchRequest(FetchRequestOutput {
         message_type: 0x20,
         op_id,
-        labels: vec![],
-        since_generation: 0,
+        want_envelope: state.head_envelope.clone(),
         since_envelope: Digest256 { bytes: vec![0; 32] },
     })
 }
@@ -270,11 +269,18 @@ async fn read_access_can_fetch_but_not_publish() {
     let server = start(token_file()).await;
     let (mut ws, state) = open_ok(server.addr, b"reader-token").await;
 
-    send_msg(&mut ws, &fetch_request(1)).await;
+    send_msg(&mut ws, &fetch_request(1, &state)).await;
     assert!(matches!(
         recv_msg(&mut ws).await,
         WheatProtocolMessage::ObjectBatch(_)
     ));
+    loop {
+        match recv_msg(&mut ws).await {
+            WheatProtocolMessage::ObjectBatch(_) => {}
+            WheatProtocolMessage::FetchPushEnd(_) => break,
+            other => panic!("expected the push, got {other:?}"),
+        }
+    }
     send_msg(
         &mut ws,
         &WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
@@ -422,10 +428,10 @@ async fn revoked_access_stops_the_next_operation() {
         broken: false,
     });
     let server = start(ServerConfig::with_access(provider.clone(), vec![])).await;
-    let (mut ws, _state) = open_ok(server.addr, b"anything").await;
+    let (mut ws, state) = open_ok(server.addr, b"anything").await;
 
     provider.granted.store(false, Ordering::SeqCst);
-    send_msg(&mut ws, &fetch_request(3)).await;
+    send_msg(&mut ws, &fetch_request(3, &state)).await;
     match recv_msg(&mut ws).await {
         WheatProtocolMessage::Error(e) => {
             assert_eq!((e.op_id, e.code), (3, 403));

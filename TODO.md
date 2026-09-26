@@ -18,23 +18,26 @@ Security, most serious first:
 
 Performance, most serious first:
 
-- `[ ]` **Fetch always sends the whole repository (confirmed).** `handle_fetch`
-  (`crates/wheat-server/src/fetch.rs`) calls `collect_structural_closure`
-  (`crates/wheat-store/src/closure.rs`) over all history, ignores what the client
-  already has (`since_envelope`), and holds the closure in memory before sending.
 - `[ ]` **Publish walks the whole content manifest (confirmed).** `handle_publish`
-  (`publish.rs`, around lines 208–249) walks every content ID in the proposed
-  envelope, even for a one-line change. It also asks for at most `MAX_WANT_IDS`
-  (4,096) missing blobs, once; check whether publishes needing more than that fail
-  (possible correctness bug).
-- `[ ]` **About four fsyncs per file during materialization (scanner only).**
+  (`publish.rs`, the content phase) walks every content ID in the proposed envelope,
+  even for a one-line change. The client's `fetch_content` (`remote.rs`) does the
+  same on every fetch. Both could walk only the content-set difference from the old
+  head (as `StructuralDelta` does for objects). (The "at most 4,096 blobs, once" part
+  is done; see `TODO_DONE.md`.)
+- `[ ]` **About four fsyncs per file during materialization (confirmed).**
   `execute_materialization` syncs the staged file, the install-intent progress record,
-  the parent directory and the transaction for every file. Batch the intent records
-  and directory syncs.
+  the parent directory and the transaction for every file, one file at a time. Batch
+  the intent records and directory syncs. Measured 2026-09-26 (debug): cloning 4,101
+  small files spends about 30 s here at 5% CPU (stack traces of the fsyncs all point
+  into `materialization`); `wheat import` of the same files takes 31 s at 8% CPU with
+  about 16,000 fsyncs and 4,100 fdatasyncs, which is probably the same plus its
+  content writes (not traced). This is most of the time of
+  `more_new_files_than_one_content_request_publish_and_clone`.
 - `[ ]` **About four fsyncs per object when objects go in one by one (scanner only).**
   `apply_change_authoring` (`repository_mutation.rs`, around line 1045) and
-  `handle_publish` (around lines 150–158) call `put_if_absent` in a loop, so each
-  object is its own journaled active-segment commit. Use `put_batch`.
+  `RepositoryPublisher::prepare` (`repository_publication.rs`) call `put_if_absent` in
+  a loop, so each object is its own journaled active-segment commit. Use `put_batch`.
+  (Publish's object phase uses `put_batch` since 2026-09-26.)
 - `[ ]` **wheat-server does blocking disk work on async threads (scanner only).**
   Publication, packed-object and content stores are synchronous and called straight
   from Tokio tasks in `connection.rs`, `publish.rs` and `fetch.rs`. Move them onto
@@ -124,6 +127,30 @@ budget passes, but by only about 0.7 s.
   lines 173, 223) and `workspace.rs` in wheat-cli (around lines 130, 391). Check each
   with a directory → file change, then either fix them one by one or make
   `lookup_many` itself read such paths as absent.
+- `[ ]` **Snapshot export may skip retained-set members (2026-09-26, unchecked).**
+  `ClosureWalk::follow_radix_with_set_entries` (`crates/wheat-store/src/snapshot.rs`)
+  follows a set node's inline entries only when the node itself is `present` (the
+  same flag is passed for both). A retained or conflict set node with inline entries
+  but no own key would leave those members out, unless something else reaches them.
+  Write a test with such a node, then fix or explain.
+- `[ ]` **Fetch pushes whole objects, even when the client has the old version
+  (2026-09-26).** The push sends every object the walk finds in full. Some objects
+  grow with the repository and change with every view: a content-set snapshot is
+  about 3.3 MB per view at 100,000 files. Measured by the `fetch_incremental`
+  benchmark: one change pushes 6 KiB after 10 changes but 44 KiB after 200. Send
+  such objects as deltas against their aligned old counterpart, which the client
+  has. Then add a bytes budget to `fetch_incremental`.
+- `[ ]` **`extract_object_references` is incomplete and no longer used
+  (2026-09-26).** `crates/wheat-core/src/wire.rs` misses several references
+  (retained-set and conflict-set keys, predecessor and transition references,
+  `applied[].edit`), and its doc comment says wheat-server uses it for publish, which
+  is no longer true. Only its own tests call it now. Delete it, or fix it to follow
+  the same references as `StructuralDelta` (`crates/wheat-store/src/structural_delta.rs`).
+- `[ ]` **Server stores published to before 2026-09-26 may lack objects.** The old
+  publish could move the head with objects missing (it rediscovered after every
+  batch, dropped its frontier past 4,096 IDs, and never checked completeness).
+  Run `wheat --store <server store> validate` on existing server stores; a store
+  that fails needs its missing objects published again.
 - `[ ]` **A content fetch can hang the client (2026-09-26).** `handle_content_fetch`
   (`crates/wheat-server/src/fetch.rs`) only logs (`debug!`) a requested blob it cannot
   read and sends nothing for it; its second fallback path (after a non-`TooLarge`

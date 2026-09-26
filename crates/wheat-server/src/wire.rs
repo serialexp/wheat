@@ -72,6 +72,31 @@ pub async fn send_error(
     .await
 }
 
+/// Send an operation-scoped, non-retryable Error about one object.
+pub async fn send_object_error(
+    ws: &mut WebSocketStream<TcpStream>,
+    op_id: u32,
+    code: u16,
+    message: &str,
+    object: ObjectId,
+) -> Result<(), ConnectionError> {
+    send(
+        ws,
+        &WheatProtocolMessage::Error(ErrorOutput {
+            message_type: 0x70,
+            op_id,
+            code,
+            scope: operation_error_scope(),
+            retryable: false,
+            message: message.to_string(),
+            object_id: Digest256 {
+                bytes: object.as_bytes().to_vec(),
+            },
+        }),
+    )
+    .await
+}
+
 pub fn connection_error_scope() -> ErrorScope {
     ErrorScope::ErrorScopeConnection(ErrorScopeConnectionOutput { code: 0 })
 }

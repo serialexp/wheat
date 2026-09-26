@@ -8,16 +8,11 @@
 //! process, then a fresh clone downloads them. The server's peak during the publish
 //! must stay well below the bytes published.
 
-use std::{fs, io::Write, net::SocketAddr, path::PathBuf};
+use std::{fs, io::Write};
 
-use anyhow::{Context, Result, ensure};
-use serde_json::Value;
-use wheat_server::{
-    registry::Registry,
-    server::{ServerConfig, run_until},
-};
+use anyhow::{Result, ensure};
 
-use super::{CaseContext, CaseOutput, Recorder, workspace::Workspace};
+use super::{CaseContext, CaseOutput, Recorder, server::Server, workspace::Workspace};
 use crate::{measure::PhasePeak, path_text};
 
 pub(crate) const NAME: &str = "publish_content";
@@ -41,25 +36,11 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
 
     // The server serves the store of a freshly initialized workspace.
     let source = Workspace::new(context)?;
-    let store = workspace_store(source.root())?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let registry = Registry::single_named("bench/repo".to_owned(), &store)?;
-    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let server = runtime.spawn(run_until(
-        "127.0.0.1:0".parse()?,
-        registry,
-        ServerConfig::new(),
-        ready_tx,
-        shutdown_rx,
-    ));
-    let addr: SocketAddr = runtime.block_on(ready_rx).context("server did not start")?;
-    let url = format!("wheat://{addr}/bench/repo");
+    let server = Server::start(source.root())?;
+    let url = server.url();
 
     let writer = context.scratch.join("writer");
-    source.ok_in(&context.scratch, &["clone", &url, path_text(&writer)?])?;
+    source.ok_in(&context.scratch, &["clone", url, path_text(&writer)?])?;
     source.ok_in(&writer, &["change", "new", "--message", "large files"])?;
     let paths = (0..files)
         .map(|index| format!("data/f{index:03}.bin"))
@@ -78,7 +59,7 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     recorder.at_most("publish_server.peak_rss", SERVER_PEAK_BUDGET_BYTES, "bytes");
 
     let reader = context.scratch.join("reader");
-    let clone = source.ok_in(&context.scratch, &["clone", &url, path_text(&reader)?])?;
+    let clone = source.ok_in(&context.scratch, &["clone", url, path_text(&reader)?])?;
     recorder.peak_rss("clone_server", peak.take()?);
     recorder.timing("clone", clone.timing);
     recorder.at_most("clone.peak_rss", CLONE_PEAK_BUDGET_BYTES, "bytes");
@@ -92,18 +73,8 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         paths[last]
     );
 
-    let _ = shutdown.send(());
-    runtime.block_on(server)??;
+    server.stop()?;
     Ok(recorder.finish())
-}
-
-fn workspace_store(workspace: &std::path::Path) -> Result<PathBuf> {
-    let document: Value =
-        serde_json::from_slice(&fs::read(workspace.join(".wheat/workspace.json"))?)?;
-    let path = document["store"]["path"]
-        .as_str()
-        .context("workspace.json has no store path")?;
-    Ok(PathBuf::from(path))
 }
 
 fn write_noise(path: &std::path::Path, seed: usize, len: usize) -> Result<()> {

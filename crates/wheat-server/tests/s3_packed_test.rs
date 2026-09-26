@@ -4,18 +4,11 @@
 //! Run with:
 //!   cargo test -p wheat-server --test s3_packed_test -- --ignored --nocapture
 
-use std::collections::HashSet;
+mod support;
+
 use std::net::SocketAddr;
 
-use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-
-use wheat_core::{
-    ChangeProposal, ContentId, EditOperation, EditRecord, EditTransition, FileKind, FileValue,
-    ObjectId, Repository, RevisionEdits, Tree,
-};
+use wheat_core::{ChangeProposal, ContentId, Repository, RevisionEdits, Tree};
 use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
@@ -26,8 +19,13 @@ use wheat_store::{
     finalize_mutation_publication, prepare_mutation_publication,
 };
 
+use support::{
+    Upload, Ws, connect_and_handshake, edit, fetch_content, fetch_objects, open_repo, recv_msg,
+    request_publish, send_msg, upload_objects,
+};
+
 // ---------------------------------------------------------------------------
-// Helpers (same pattern as clone_fetch_publish_test.rs)
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn count_files_recursive(dir: &std::path::Path) -> usize {
@@ -49,28 +47,6 @@ fn count_files_recursive(dir: &std::path::Path) -> usize {
         }
     }
     count
-}
-
-fn edit(path: &str, value: &[u8]) -> RevisionEdits {
-    let record = EditRecord::new(
-        path,
-        EditOperation::ExactFile {
-            expected: None,
-            replacement: Some(FileValue {
-                content: ContentId::of(value),
-                kind: FileKind::Regular,
-            }),
-        },
-    )
-    .unwrap();
-    let id = record.id();
-    RevisionEdits {
-        edits: [(id, record)].into(),
-        transition: EditTransition {
-            added: [id].into(),
-            ..EditTransition::default()
-        },
-    }
 }
 
 /// Create a repository with `num_changes` changes, each published in two
@@ -260,324 +236,45 @@ async fn start_s3_server(
     (bound, shutdown_tx)
 }
 
-async fn send_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, msg: &WheatProtocolMessage) {
-    let bytes = encode_message(msg).unwrap();
-    ws.send(Message::Binary(bytes.into())).await.unwrap();
-}
-
-async fn recv_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> WheatProtocolMessage {
+/// Answer the server's `ContentNeeded` rounds for publish op 1 until it sends
+/// `ContentComplete`. Returns how many blobs went up.
+async fn upload_needed_content(ws: &mut Ws, content: &ContentStore) -> usize {
+    let mut sent = 0;
     loop {
-        let msg = ws.next().await.unwrap().unwrap();
-        match msg {
-            Message::Binary(bytes) => return decode_message(&bytes).unwrap(),
-            Message::Ping(data) => {
-                ws.send(Message::Pong(data)).await.unwrap();
-            }
-            Message::Pong(_) | Message::Frame(_) => {}
-            other => panic!("unexpected message: {other:?}"),
-        }
-    }
-}
-
-async fn connect_and_handshake(addr: SocketAddr) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
-    let url = format!("ws://{addr}");
-    let (mut ws, _) = connect_async(&url).await.unwrap();
-
-    let server_hello = recv_msg(&mut ws).await;
-    assert!(matches!(server_hello, WheatProtocolMessage::ServerHello(_)));
-
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::ClientHello(ClientHelloOutput {
-            message_type: 0x02,
-            selected_version: 1,
-            auth_token: vec![],
-            receive_window_bytes: 16 * 1024 * 1024,
-            receive_window_messages: 256,
-        }),
-    )
-    .await;
-
-    let established = recv_msg(&mut ws).await;
-    assert!(matches!(
-        established,
-        WheatProtocolMessage::SessionEstablished(_)
-    ));
-
-    ws
-}
-
-async fn open_repo(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    name: &str,
-) -> (u64, Digest256) {
-    send_msg(
-        ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: name.to_string(),
-        }),
-    )
-    .await;
-
-    let msg = recv_msg(ws).await;
-    match msg {
-        WheatProtocolMessage::RepositoryState(rs) => (rs.head_generation, rs.head_envelope),
-        other => panic!("expected RepositoryState, got {other:?}"),
-    }
-}
-
-/// Client-side iterative root-first fetch.
-async fn client_fetch_objects(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    op_id: u32,
-    objects: &LooseObjectStore,
-    content: &ContentStore,
-    envelope_id: wheat_core::RepositoryEnvelopeId,
-) -> usize {
-    send_msg(
-        ws,
-        &WheatProtocolMessage::FetchRequest(FetchRequestOutput {
-            message_type: 0x20,
-            op_id,
-            labels: vec![],
-            since_generation: 0,
-            since_envelope: Digest256 { bytes: vec![0; 32] },
-        }),
-    )
-    .await;
-
-    let mut total = 0;
-    let mut want_list: Vec<ObjectId> = Vec::new();
-    let mut known = HashSet::new();
-
-    loop {
-        let msg = recv_msg(ws).await;
-        match msg {
-            WheatProtocolMessage::ObjectBatch(batch) => {
-                assert_eq!(batch.op_id, op_id);
-
-                for entry in &batch.objects {
-                    let claimed_id =
-                        ObjectId::from_digest(entry.id.bytes.as_slice().try_into().unwrap());
-                    let actual_id = ObjectId::of_canonical_bytes(&entry.data);
-                    assert_eq!(actual_id, claimed_id, "object identity mismatch");
-
-                    objects
-                        .put_if_absent(claimed_id, &entry.data)
-                        .await
-                        .unwrap();
-                    known.insert(claimed_id);
-                    total += 1;
-
-                    if let Ok(children) = wheat_core::extract_object_references(&entry.data) {
-                        for child_id in children {
-                            if !known.contains(&child_id) {
-                                match objects.get(child_id).await {
-                                    Ok(_) => {
-                                        known.insert(child_id);
-                                    }
-                                    Err(_) => {
-                                        want_list.push(child_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                want_list.retain(|id| !known.contains(id));
-                let mut seen = HashSet::new();
-                want_list.retain(|id| seen.insert(*id));
-
-                // Walk retained sets until convergence.
-                if want_list.is_empty() {
-                    loop {
-                        let reader = RepositoryReader::new(objects, content);
-                        let env = reader.envelope(envelope_id).await.unwrap();
-                        let state = reader.state(env.state).await.unwrap();
-
-                        let retained_store = wheat_store::RetainedSetStore::new(objects);
-                        let mut bfs_frontier: Vec<ObjectId> = Vec::new();
-                        let mut found_new = false;
-                        for root in [
-                            state.retained_views,
-                            state.retained_revisions,
-                            state.retained_applications,
-                            state.retained_changes,
-                        ] {
-                            let mut cursor = retained_store.cursor(root).await.unwrap();
-                            while let Some(oid) = cursor.next().await.unwrap() {
-                                if !known.contains(&oid) {
-                                    found_new = true;
-                                    match objects.get(oid).await {
-                                        Ok(obj) => {
-                                            known.insert(oid);
-                                            if let Ok(children) =
-                                                wheat_core::extract_object_references(
-                                                    &obj.canonical_bytes,
-                                                )
-                                            {
-                                                for c in children {
-                                                    if !known.contains(&c) {
-                                                        bfs_frontier.push(c);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(_) => {
-                                            want_list.push(oid);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        while let Some(oid) = bfs_frontier.pop() {
-                            if known.contains(&oid) {
-                                continue;
-                            }
-                            match objects.get(oid).await {
-                                Ok(obj) => {
-                                    known.insert(oid);
-                                    if let Ok(children) =
-                                        wheat_core::extract_object_references(&obj.canonical_bytes)
-                                    {
-                                        for c in children {
-                                            if !known.contains(&c) {
-                                                bfs_frontier.push(c);
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    want_list.push(oid);
-                                }
-                            }
-                        }
-                        want_list.retain(|id| !known.contains(id));
-                        let mut seen2 = HashSet::new();
-                        want_list.retain(|id| seen2.insert(*id));
-
-                        if !found_new && want_list.is_empty() {
-                            break;
-                        }
-                        if !want_list.is_empty() {
-                            break;
-                        }
-                    }
-                }
-
-                if want_list.is_empty() {
+        match recv_msg(ws).await {
+            WheatProtocolMessage::ContentNeeded(cn) => {
+                assert_eq!(cn.op_id, 1);
+                for digest in &cn.content_ids {
+                    let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
+                    let data = content.get(id).unwrap();
                     send_msg(
                         ws,
-                        &WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
-                            message_type: 0x23,
-                            op_id,
+                        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
+                            message_type: 0x44,
+                            op_id: 1,
+                            content_id: digest.clone(),
+                            data,
                         }),
                     )
                     .await;
-                    break;
+                    sent += 1;
                 }
-
-                let batch_size = want_list.len().min(MAX_WANT_IDS);
-                let want_batch: Vec<Digest256> = want_list
-                    .drain(..batch_size)
-                    .map(|id| Digest256 {
-                        bytes: id.as_bytes().to_vec(),
-                    })
-                    .collect();
-
                 send_msg(
                     ws,
-                    &WheatProtocolMessage::ObjectWant(ObjectWantOutput {
-                        message_type: 0x22,
-                        op_id,
-                        ids: want_batch,
+                    &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
+                        message_type: 0x46,
+                        op_id: 1,
                     }),
                 )
                 .await;
             }
-            other => panic!("unexpected message during fetch: {other:?}"),
-        }
-    }
-
-    total
-}
-
-/// Client-side content fetch.
-async fn client_fetch_content(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    op_id: u32,
-    objects: &LooseObjectStore,
-    content: &ContentStore,
-    envelope_id: &Digest256,
-) -> usize {
-    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        envelope_id.bytes.as_slice().try_into().unwrap(),
-    );
-    let reader = RepositoryReader::new(objects, content);
-    let envelope = reader.envelope(env_id).await.unwrap();
-    let state = reader.state(envelope.state).await.unwrap();
-    let manifest = reader.manifest(state.required_content).await.unwrap();
-
-    let content_set = wheat_store::ContentSetStore::new(objects);
-    let mut cursor = content_set.cursor(manifest.content).await.unwrap();
-    let mut missing = Vec::new();
-    while let Some(content_id) = cursor.next().await.unwrap() {
-        if !content.contains(content_id) {
-            missing.push(Digest256 {
-                bytes: content_id.as_bytes().to_vec(),
-            });
-        }
-    }
-
-    if missing.is_empty() {
-        return 0;
-    }
-
-    let total = missing.len();
-
-    send_msg(
-        ws,
-        &WheatProtocolMessage::ContentFetchRequest(ContentFetchRequestOutput {
-            message_type: 0x30,
-            op_id,
-            content_ids: missing,
-        }),
-    )
-    .await;
-
-    let mut received = 0;
-    while received < total {
-        let msg = recv_msg(ws).await;
-        match msg {
-            WheatProtocolMessage::ContentBatch(cb) => {
-                assert_eq!(cb.op_id, op_id);
-                for entry in &cb.contents {
-                    let id = ContentId::from_digest(entry.id.bytes.as_slice().try_into().unwrap());
-                    let actual = ContentId::of(&entry.data);
-                    assert_eq!(actual, id, "content identity mismatch");
-                    content.put(&entry.data).unwrap();
-                    received += 1;
-                }
+            WheatProtocolMessage::ContentComplete(cc) => {
+                assert_eq!(cc.op_id, 1);
+                return sent;
             }
-            WheatProtocolMessage::ContentChunk(chunk) => {
-                assert_eq!(chunk.op_id, op_id);
-                if chunk.is_final {
-                    let id = ContentId::from_digest(
-                        chunk.content_id.bytes.as_slice().try_into().unwrap(),
-                    );
-                    let actual = ContentId::of(&chunk.data);
-                    assert_eq!(actual, id, "chunked content identity mismatch");
-                    content.put(&chunk.data).unwrap();
-                    received += 1;
-                }
-            }
-            _ => {}
+            other => panic!("expected ContentNeeded or ContentComplete, got {other:?}"),
         }
     }
-
-    total
 }
 
 // ---------------------------------------------------------------------------
@@ -656,91 +353,13 @@ async fn publish_clone_through_s3() {
 
     // Publish local repo to S3 server.
     let local_envelope = local_head.envelope;
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::PublishRequest(PublishRequestOutput {
-            message_type: 0x40,
-            op_id: 1,
-            publish_key: Uuid128 { bytes: vec![1; 16] },
-            envelope_id: Digest256 {
-                bytes: local_envelope.as_bytes().to_vec(),
-            },
-            expected_generation: server_gen,
-            expected_envelope: server_env.clone(),
-            force: false,
-        }),
-    )
-    .await;
-
-    // Drive the publish protocol: ObjectsNeeded/ObjectBatch loop.
-    let mut objects_sent = 0;
-    loop {
-        let msg = recv_msg(&mut ws).await;
-        match msg {
-            WheatProtocolMessage::ObjectsNeeded(on) => {
-                assert_eq!(on.op_id, 1);
-                let mut batch_objects = Vec::new();
-                for digest in &on.ids {
-                    let oid = ObjectId::from_digest(digest.bytes.as_slice().try_into().unwrap());
-                    let obj = local_objects.get(oid).await.unwrap();
-                    batch_objects.push(ObjectEntry {
-                        id: digest.clone(),
-                        data: obj.canonical_bytes.to_vec(),
-                    });
-                    objects_sent += 1;
-                }
-                send_msg(
-                    &mut ws,
-                    &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
-                        message_type: 0x21,
-                        op_id: 1,
-                        sequence: 0,
-                        objects: batch_objects,
-                    }),
-                )
-                .await;
-            }
-            WheatProtocolMessage::ObjectsComplete(oc) => {
-                assert_eq!(oc.op_id, 1);
-                break;
-            }
-            other => panic!("unexpected during publish objects: {other:?}"),
-        }
-    }
+    request_publish(&mut ws, 1, local_envelope, (server_gen, server_env), false).await;
+    let rounds = upload_objects(&mut ws, 1, &local_objects, Upload::Whole).await;
+    let objects_sent: usize = rounds.iter().sum();
     eprintln!("published {objects_sent} objects to S3 server");
 
     // Content phase.
-    let mut content_sent = 0;
-    let msg = recv_msg(&mut ws).await;
-    match msg {
-        WheatProtocolMessage::ContentNeeded(cn) => {
-            assert_eq!(cn.op_id, 1);
-            for digest in &cn.content_ids {
-                let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
-                let data = local_content.get(id).unwrap();
-                send_msg(
-                    &mut ws,
-                    &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                        message_type: 0x44,
-                        op_id: 1,
-                        content_id: digest.clone(),
-                        data,
-                    }),
-                )
-                .await;
-                content_sent += 1;
-            }
-            send_msg(
-                &mut ws,
-                &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
-                    message_type: 0x46,
-                    op_id: 1,
-                }),
-            )
-            .await;
-        }
-        other => panic!("expected ContentNeeded, got {other:?}"),
-    }
+    let content_sent = upload_needed_content(&mut ws, &local_content).await;
     eprintln!("published {content_sent} content blobs to S3 server");
 
     // Commit.
@@ -786,21 +405,18 @@ async fn publish_clone_through_s3() {
     let (clone_objects, clone_content, clone_heads) = local_stores(&clone_path);
 
     let mut ws = connect_and_handshake(addr).await;
-    let (clone_gen, clone_env) = open_repo(&mut ws, "bench/repo").await;
+    let (clone_gen, env_id) = open_repo(&mut ws, "bench/repo").await;
     assert_eq!(
         clone_gen, published_generation,
         "server should be at published generation"
     );
 
-    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        clone_env.bytes.as_slice().try_into().unwrap(),
-    );
-
     let clone_start = std::time::Instant::now();
 
-    let obj_count = client_fetch_objects(&mut ws, 2, &clone_objects, &clone_content, env_id).await;
-    let content_count =
-        client_fetch_content(&mut ws, 3, &clone_objects, &clone_content, &clone_env).await;
+    let fetched = fetch_objects(&mut ws, 2, &clone_objects, env_id, None).await;
+    assert_eq!(fetched.wants, 0, "a clone needs no wants: {fetched:?}");
+    let obj_count = fetched.pushed;
+    let content_count = fetch_content(&mut ws, 3, &clone_objects, &clone_content, env_id).await;
 
     let clone_elapsed = clone_start.elapsed();
 
@@ -899,86 +515,19 @@ async fn publish_clone_s3_benchmark() {
     let mut ws = connect_and_handshake(addr).await;
     let (server_gen, server_env) = open_repo(&mut ws, "bench/repo").await;
 
-    send_msg(
+    request_publish(
         &mut ws,
-        &WheatProtocolMessage::PublishRequest(PublishRequestOutput {
-            message_type: 0x40,
-            op_id: 1,
-            publish_key: Uuid128 { bytes: vec![1; 16] },
-            envelope_id: Digest256 {
-                bytes: local_head.envelope.as_bytes().to_vec(),
-            },
-            expected_generation: server_gen,
-            expected_envelope: server_env.clone(),
-            force: false,
-        }),
+        1,
+        local_head.envelope,
+        (server_gen, server_env),
+        false,
     )
     .await;
-
-    let mut objects_published = 0;
-    loop {
-        let msg = recv_msg(&mut ws).await;
-        match msg {
-            WheatProtocolMessage::ObjectsNeeded(on) => {
-                assert_eq!(on.op_id, 1);
-                let mut batch_objects = Vec::new();
-                for digest in &on.ids {
-                    let oid = ObjectId::from_digest(digest.bytes.as_slice().try_into().unwrap());
-                    let obj = local_objects.get(oid).await.unwrap();
-                    batch_objects.push(ObjectEntry {
-                        id: digest.clone(),
-                        data: obj.canonical_bytes.to_vec(),
-                    });
-                    objects_published += 1;
-                }
-                send_msg(
-                    &mut ws,
-                    &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
-                        message_type: 0x21,
-                        op_id: 1,
-                        sequence: 0,
-                        objects: batch_objects,
-                    }),
-                )
-                .await;
-            }
-            WheatProtocolMessage::ObjectsComplete(oc) if oc.op_id == 1 => break,
-            other => panic!("unexpected during publish objects: {other:?}"),
-        }
-    }
+    let rounds = upload_objects(&mut ws, 1, &local_objects, Upload::Whole).await;
+    let objects_published: usize = rounds.iter().sum();
 
     // Content phase.
-    let mut content_published = 0;
-    let msg = recv_msg(&mut ws).await;
-    match msg {
-        WheatProtocolMessage::ContentNeeded(cn) => {
-            assert_eq!(cn.op_id, 1);
-            for digest in &cn.content_ids {
-                let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
-                let data = local_content.get(id).unwrap();
-                send_msg(
-                    &mut ws,
-                    &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                        message_type: 0x44,
-                        op_id: 1,
-                        content_id: digest.clone(),
-                        data,
-                    }),
-                )
-                .await;
-                content_published += 1;
-            }
-            send_msg(
-                &mut ws,
-                &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
-                    message_type: 0x46,
-                    op_id: 1,
-                }),
-            )
-            .await;
-        }
-        other => panic!("expected ContentNeeded, got {other:?}"),
-    }
+    let content_published = upload_needed_content(&mut ws, &local_content).await;
 
     // Commit.
     send_msg(
@@ -1027,16 +576,13 @@ async fn publish_clone_s3_benchmark() {
     let clone_start = std::time::Instant::now();
 
     let mut ws = connect_and_handshake(addr).await;
-    let (clone_gen, clone_env) = open_repo(&mut ws, "bench/repo").await;
+    let (clone_gen, env_id) = open_repo(&mut ws, "bench/repo").await;
     assert_eq!(clone_gen, published_gen);
 
-    let env_id = wheat_core::RepositoryEnvelopeId::from_digest(
-        clone_env.bytes.as_slice().try_into().unwrap(),
-    );
-
-    let obj_count = client_fetch_objects(&mut ws, 2, &clone_objects, &clone_content, env_id).await;
-    let content_count =
-        client_fetch_content(&mut ws, 3, &clone_objects, &clone_content, &clone_env).await;
+    let fetched = fetch_objects(&mut ws, 2, &clone_objects, env_id, None).await;
+    assert_eq!(fetched.wants, 0, "a clone needs no wants: {fetched:?}");
+    let obj_count = fetched.pushed;
+    let content_count = fetch_content(&mut ws, 3, &clone_objects, &clone_content, env_id).await;
 
     let clone_elapsed = clone_start.elapsed();
 

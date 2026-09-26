@@ -38,11 +38,14 @@
         { type: "ListLabels",            when: "value == 0x12" },
         { type: "ListLabelsResult",      when: "value == 0x13" },
 
-        // Fetch (0x20–0x24)
+        // Fetch (0x20–0x26)
         { type: "FetchRequest",          when: "value == 0x20" },
         { type: "ObjectBatch",           when: "value == 0x21" },
         { type: "ObjectWant",            when: "value == 0x22" },
         { type: "FetchComplete",         when: "value == 0x23" },
+        { type: "FetchPushEnd",          when: "value == 0x24" },
+        { type: "ObjectWantReply",       when: "value == 0x25" },
+        { type: "ObjectChunk",           when: "value == 0x26" },
 
         // Content (0x30–0x34)
         { type: "ContentFetchRequest",   when: "value == 0x30" },
@@ -61,6 +64,7 @@
         { type: "PublishCommit",         when: "value == 0x47" },
         { type: "PublishProgress",       when: "value == 0x48" },
         { type: "PublishResult",         when: "value == 0x49" },
+        { type: "ContentComplete",       when: "value == 0x4a" },
 
         // Flow control (0x60)
         { type: "Credit",               when: "value == 0x60" },
@@ -225,22 +229,24 @@
     // Fetch messages
     // ─────────────────────────────────────────────────────────────────────
 
+    // A fetch has two phases. Push: the server sends the structural objects of
+    // want_envelope that since_envelope (the client's last fetched head, zeros for
+    // none) does not already cover, as ObjectBatch and ObjectChunk messages, then
+    // FetchPushEnd. Pull: the client checks what it has, sends one ObjectWant at a
+    // time for anything still missing, and gets exactly one ObjectWantReply for
+    // each. FetchComplete ends the fetch.
     FetchRequest: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x20 },
         { name: "op_id", type: "uint32" },
-        {
-          name: "labels",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "uint16",
-          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
-        },
-        { name: "since_generation", type: "uint64" },
+        { name: "want_envelope", type: "Digest256" },
         { name: "since_envelope", type: "Digest256" },
       ],
     },
 
+    // Whole objects, at most MAX_OBJECT_BATCH_ITEMS and MAX_OBJECT_BATCH_SIZE bytes
+    // of object data. An object larger than MAX_OBJECT_BATCH_SIZE goes as
+    // ObjectChunks instead.
     ObjectBatch: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x21 },
@@ -256,10 +262,14 @@
       ],
     },
 
+    // At most MAX_WANT_IDS objects the client still lacks. want_sequence counts the
+    // fetch's wants from 0. An ID the server does not have ends the fetch with an
+    // Error naming it.
     ObjectWant: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x22 },
         { name: "op_id", type: "uint32" },
+        { name: "want_sequence", type: "uint32" },
         {
           name: "ids",
           type: "array",
@@ -274,6 +284,51 @@
       sequence: [
         { name: "message_type", type: "uint8", const: 0x23 },
         { name: "op_id", type: "uint32" },
+      ],
+    },
+
+    // The push phase is over. incremental says whether the server left out what
+    // since_envelope covers (false when it did not know since_envelope).
+    FetchPushEnd: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x24 },
+        { name: "op_id", type: "uint32" },
+        { name: "pushed_objects", type: "uint64" },
+        { name: "incremental", type: "bool" },
+      ],
+    },
+
+    // The answer to one ObjectWant: the wanted objects from the front of its list
+    // that fit in one batch, in the want's order. When the first one is too large
+    // for a batch it comes before this reply as ObjectChunks, and the reply holds
+    // the ones after it that fit. Every reply answers at least one ID; the client
+    // asks again for the rest.
+    ObjectWantReply: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x25 },
+        { name: "op_id", type: "uint32" },
+        { name: "want_sequence", type: "uint32" },
+        {
+          name: "objects",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "ObjectEntry" },
+        },
+      ],
+    },
+
+    // One piece of an object larger than MAX_OBJECT_BATCH_SIZE, at most
+    // MAX_OBJECT_CHUNK_SIZE bytes. Pieces of one object come in order and are not
+    // mixed with pieces of another.
+    ObjectChunk: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x26 },
+        { name: "op_id", type: "uint32" },
+        { name: "object_id", type: "Digest256" },
+        { name: "offset", type: "uint64" },
+        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "is_final", type: "bool" },
       ],
     },
 
@@ -347,6 +402,11 @@
       ],
     },
 
+    // One round of a publish's object phase: at most MAX_WANT_IDS objects of the
+    // proposed envelope that the server lacks. The client answers with exactly
+    // those objects, each once, in ObjectBatch and ObjectChunk messages, and
+    // nothing else. The server asks for the next round only once all of them have
+    // arrived.
     ObjectsNeeded: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x41 },
@@ -361,6 +421,8 @@
       ],
     },
 
+    // The server has every object of the proposed envelope; the content phase
+    // follows.
     ObjectsComplete: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x42 },
@@ -368,6 +430,9 @@
       ],
     },
 
+    // The server asks for missing content in rounds of at most MAX_WANT_IDS. The
+    // client answers each round with the uploads and one ContentUploadComplete;
+    // ContentComplete then says nothing more is needed.
     ContentNeeded: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x43 },
@@ -405,6 +470,13 @@
     ContentUploadComplete: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x46 },
+        { name: "op_id", type: "uint32" },
+      ],
+    },
+
+    ContentComplete: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x4a },
         { name: "op_id", type: "uint32" },
       ],
     },
