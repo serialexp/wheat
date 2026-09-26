@@ -305,11 +305,7 @@ pub(crate) fn decode_payload(
             }
             let base_digest: [u8; 32] = stored[..base_ref_size].try_into().unwrap();
             let base_id = ContentId::from_digest(base_digest);
-            let compressed_patch = &stored[base_ref_size..];
-            // Decompress the patch. We don't know the exact decompressed size,
-            // so use the streaming decoder.
-            let patch = zstd::bulk::decompress(compressed_patch, HARD_LOGICAL_RECORD_BYTES)
-                .map_err(CodecError::Zstd)?;
+            let patch = decompress_delta_patch(&stored[base_ref_size..], logical_length)?;
             Ok(DecodedPayload::Delta { base_id, patch })
         }
         Codec::ZstdBlock => Err(CodecError::Format(
@@ -333,6 +329,9 @@ pub(crate) fn encode_delta_envelope(
 ) -> Result<Vec<u8>, CodecError> {
     if target_logical_length > HARD_LOGICAL_RECORD_BYTES {
         return Err(CodecError::HardLimit);
+    }
+    if patch.len() > target_logical_length {
+        return Err(CodecError::Format("delta patch exceeds its target length"));
     }
     let base_ref_size = crate::delta::BASE_REFERENCE_SIZE;
     let logical_length = target_logical_length as u64;
@@ -415,27 +414,34 @@ pub(crate) fn decode_segment_delta_patch(
             }
             Ok(stored)
         }
-        Codec::DeltaZstd => {
-            let frame_size = zstd::zstd_safe::find_frame_compressed_size(&stored)
-                .map_err(|_| CodecError::Format("malformed or truncated zstd delta frame"))?;
-            if frame_size != stored.len() {
-                return Err(CodecError::Format("trailing zstd delta frame bytes"));
-            }
-            let patch_length = zstd::zstd_safe::get_frame_content_size(&stored)
-                .map_err(|_| CodecError::Format("malformed zstd delta frame"))?
-                .ok_or(CodecError::Format("zstd delta frame omits content size"))?;
-            if patch_length > logical_length {
-                return Err(CodecError::Format("delta patch exceeds its target length"));
-            }
-            let patch =
-                zstd::bulk::decompress(&stored, patch_length as usize).map_err(CodecError::Zstd)?;
-            if patch.len() as u64 != patch_length {
-                return Err(CodecError::Format("zstd delta output length differs"));
-            }
-            Ok(patch)
-        }
+        Codec::DeltaZstd => decompress_delta_patch(&stored, logical_length),
         _ => Err(CodecError::Format("not a delta codec")),
     }
+}
+
+/// Decompresses one zstd frame holding a git delta patch. Writers only store
+/// patches no longer than their target, so the frame must declare its size and
+/// that size must not exceed `bound`, the target's logical length. The claim is
+/// checked before anything is reserved: `zstd::bulk::decompress` reserves its
+/// whole `capacity` up front.
+fn decompress_delta_patch(stored: &[u8], bound: u64) -> Result<Vec<u8>, CodecError> {
+    let frame_size = zstd::zstd_safe::find_frame_compressed_size(stored)
+        .map_err(|_| CodecError::Format("malformed or truncated zstd delta frame"))?;
+    if frame_size != stored.len() {
+        return Err(CodecError::Format("trailing zstd delta frame bytes"));
+    }
+    let patch_length = zstd::zstd_safe::get_frame_content_size(stored)
+        .map_err(|_| CodecError::Format("malformed zstd delta frame"))?
+        .ok_or(CodecError::Format("zstd delta frame omits content size"))?;
+    if patch_length > bound {
+        return Err(CodecError::Format("delta patch exceeds its target length"));
+    }
+    let patch_length = usize::try_from(patch_length).map_err(|_| CodecError::HardLimit)?;
+    let patch = zstd::bulk::decompress(stored, patch_length).map_err(CodecError::Zstd)?;
+    if patch.len() != patch_length {
+        return Err(CodecError::Format("zstd delta output length differs"));
+    }
+    Ok(patch)
 }
 
 pub(crate) fn encode_envelope(logical: &[u8]) -> Result<Vec<u8>, CodecError> {
@@ -625,6 +631,46 @@ mod tests {
         assert!(matches!(
             decode_block(&compressed, MAX_BLOCK_LOGICAL_BYTES + 1),
             Err(CodecError::ReadLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn delta_patches_are_bounded_by_their_target_before_decompressing() {
+        let base = ContentId::from_digest([7; 32]);
+        let patch = vec![b'p'; 8192];
+        let target = patch.len() as u64;
+        let with_base = |payload: &[u8]| [base.as_bytes().as_slice(), payload].concat();
+        let compressed = zstd::bulk::compress(&patch, ZSTD_LEVEL).unwrap();
+
+        let Ok(DecodedPayload::Delta {
+            base_id,
+            patch: decoded,
+        }) = decode_payload(Codec::DeltaZstd, with_base(&compressed), target, 0)
+        else {
+            panic!("a patch as long as its target decodes");
+        };
+        assert_eq!((base_id, decoded), (base, patch.clone()));
+
+        // A frame claiming more than the target is refused before it is inflated,
+        // and so is a frame that does not say how much it holds.
+        assert!(matches!(
+            decode_payload(Codec::DeltaZstd, with_base(&compressed), target - 1, 0),
+            Err(CodecError::Format("delta patch exceeds its target length"))
+        ));
+        let no_size = zstd::stream::encode_all(&patch[..], ZSTD_LEVEL).unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&no_size).unwrap(),
+            None
+        );
+        assert!(matches!(
+            decode_payload(Codec::DeltaZstd, with_base(&no_size), target, 0),
+            Err(CodecError::Format("zstd delta frame omits content size"))
+        ));
+
+        // Writers never store a patch the reader would refuse.
+        assert!(matches!(
+            encode_delta_envelope(patch.len() - 1, base, &patch),
+            Err(CodecError::Format("delta patch exceeds its target length"))
         ));
     }
 

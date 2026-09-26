@@ -38,8 +38,16 @@ Finished items, moved here from `TODO.md` under the same headings.
   `f48a34a` while the committed output came from `b99d34b` (a later commit on
   `main`); it now names the revision that produced the output. Tests:
   `crates/wheat-core/tests/forged_lengths.rs`,
-  `crates/wheat-protocol/tests/forged_lengths.rs`. DeltaZstd and chunk limits are
-  still open under the same heading in `TODO.md`.
+  `crates/wheat-protocol/tests/forged_lengths.rs`. Chunk limits are still open
+  under the same heading in `TODO.md`.
+- `[x]` **`DeltaZstd` decode reserved 1 GiB per patch (confirmed).**
+  `zstd::bulk::decompress(patch, HARD_LOGICAL_RECORD_BYTES)` reserves the whole
+  capacity up front, so a 16-deep delta chain could ask for 16 GiB. Done 2026-09-26:
+  both decode paths go through `decompress_delta_patch`, which needs one whole frame
+  that declares its size, refuses a size above the target length, and reserves only
+  that. The writer already kept patches shorter than their target; it now refuses a
+  longer one too. Test: `delta_patches_are_bounded_by_their_target_before_decompressing`
+  in `crates/wheat-store/src/codec.rs`.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 

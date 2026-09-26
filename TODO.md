@@ -12,12 +12,7 @@ are the scanner's word only and need checking before a fix.
 Security, most serious first:
 
 - `[ ]` **Decoders trust untrusted lengths (partly confirmed).** The generated
-  decoders are fixed (see `TODO_DONE.md`); two parts are left.
-  - `Codec::DeltaZstd` decode (`crates/wheat-store/src/codec.rs`, around line 311)
-    calls `zstd::bulk::decompress(patch, HARD_LOGICAL_RECORD_BYTES)`, which reserves
-    1 GiB per call; a 16-deep delta chain could ask for 16 GiB. Line seen, real memory
-    use not measured. `decode_segment_delta_patch` already uses the frame's content
-    size instead.
+  decoders and `DeltaZstd` are fixed (see `TODO_DONE.md`); one part is left.
   - Chunked downloads (`crates/wheat-cli/src/remote.rs`, `ContentChunk` loop) have no
     byte cap and ignore `chunk.offset`. Publish (`crates/wheat-server/src/publish.rs`)
     holds every uploaded blob in `content_batch` until `ContentUploadComplete`, with
