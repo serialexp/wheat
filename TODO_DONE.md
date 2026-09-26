@@ -69,6 +69,17 @@ Finished items, moved here from `TODO.md` under the same headings.
   `git status --ignored`). Done 2026-09-26: the dead branch is gone, with a comment
   saying why, and `symlink_to_directory_is_a_file_entry` in
   `crates/wheat-cli/tests/untracked_status.rs` pins the behaviour.
+- `[x]` **File descriptors leak on error (confirmed).** `cleanup_orphan_transactions`
+  and `ensure_progress_only` in `materialization.rs` `libc::dup`ed a descriptor and
+  closed it by hand after a `?` that could return first. Done 2026-09-26: all three
+  listings go through `read_open_directory`, whose duplicate is an `OwnedFd` from
+  `try_clone_to_owned` (also close-on-exec, which `dup` was not). Test:
+  `transaction_listing_closes_its_descriptor_on_error`.
+- `[x]` **Unchecked addition in delta apply (checked: not reachable).**
+  `written + size` could not overflow: `written` never passes the target length and
+  one instruction adds at most 16 MiB. Done 2026-09-26 anyway, to match the checks
+  around it: both use `checked_add`. Test: `instructions_cannot_write_past_the_result`
+  (nothing covered those two errors before).
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 

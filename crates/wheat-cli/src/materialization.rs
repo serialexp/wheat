@@ -13,7 +13,7 @@ use std::{
     ffi::{CString, OsStr},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd},
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -2379,16 +2379,10 @@ fn cleanup_orphan_transactions(root: &Path) -> Result<()> {
     let Some(transactions) = open_dir_at_optional(&control, TRANSACTIONS)? else {
         return Ok(());
     };
-    let duplicate = unsafe { libc::dup(transactions.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error()).context("duplicate transactions directory handle");
-    }
-    let path = format!("/proc/self/fd/{duplicate}");
-    let entries = fs::read_dir(path)?
+    let entries = read_open_directory(&transactions)
+        .context("list the transactions directory")?
         .take(MAX_ORPHAN_TRANSACTIONS + 1)
-        .collect::<io::Result<Vec<_>>>();
-    unsafe { libc::close(duplicate) };
-    let entries = entries?;
+        .collect::<io::Result<Vec<_>>>()?;
     ensure!(
         entries.len() <= MAX_ORPHAN_TRANSACTIONS,
         "too many orphan materialization transactions to inspect safely"
@@ -3024,45 +3018,40 @@ enum OrphanTransactionShape {
 }
 
 fn orphan_transaction_shape(directory: &File) -> Result<OrphanTransactionShape> {
-    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error()).context("duplicate transaction directory handle");
-    }
-    let path = format!("/proc/self/fd/{duplicate}");
-    let result = (|| {
-        let mut entries = fs::read_dir(path)?;
-        let first = entries.next().transpose()?;
-        let second = entries.next().transpose()?;
-        match (first, second) {
-            (None, None) => Ok(OrphanTransactionShape::Empty),
-            (Some(entry), None) if entry.file_name() == PROGRESS_NAME => {
-                Ok(OrphanTransactionShape::EmptyProgress)
-            }
-            _ => bail!("materialization transaction contains unexpected debris"),
+    let mut entries =
+        read_open_directory(directory).context("list a materialization transaction")?;
+    let first = entries.next().transpose()?;
+    let second = entries.next().transpose()?;
+    match (first, second) {
+        (None, None) => Ok(OrphanTransactionShape::Empty),
+        (Some(entry), None) if entry.file_name() == PROGRESS_NAME => {
+            Ok(OrphanTransactionShape::EmptyProgress)
         }
-    })();
-    unsafe { libc::close(duplicate) };
-    result
+        _ => bail!("materialization transaction contains unexpected debris"),
+    }
 }
 
 fn ensure_progress_only(directory: &File) -> Result<()> {
-    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error()).context("duplicate transaction directory handle");
-    }
-    let path = format!("/proc/self/fd/{duplicate}");
-    let mut entries = fs::read_dir(path)?;
+    let mut entries =
+        read_open_directory(directory).context("list a materialization transaction")?;
     let only = entries
         .next()
         .transpose()?
         .is_some_and(|entry| entry.file_name() == PROGRESS_NAME)
         && entries.next().is_none();
-    unsafe { libc::close(duplicate) };
     ensure!(
         only,
         "materialization transaction contains unexpected debris"
     );
     Ok(())
+}
+
+/// Lists a directory this process holds open, through `/proc/self/fd`. The
+/// duplicate descriptor is owned (and close-on-exec), so it is closed on every
+/// path, errors included.
+fn read_open_directory(directory: &File) -> io::Result<fs::ReadDir> {
+    let duplicate = directory.as_fd().try_clone_to_owned()?;
+    fs::read_dir(format!("/proc/self/fd/{}", duplicate.as_raw_fd()))
 }
 
 fn unlinkat_if_exists(directory: &File, name: &str, flags: libc::c_int) -> Result<()> {
@@ -3148,6 +3137,35 @@ mod tests {
             assert!(validate_path(path).is_err(), "{path:?}");
         }
         validate_path("src/main.rs").unwrap();
+    }
+
+    fn open_descriptors() -> usize {
+        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    }
+
+    /// Listing a transaction directory closes its duplicate descriptor even when the
+    /// listing fails. A regular file in place of the directory makes it fail.
+    #[test]
+    fn transaction_listing_closes_its_descriptor_on_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("not-a-directory");
+        std::fs::write(&path, b"").unwrap();
+        let file = File::open(&path).unwrap();
+
+        let before = open_descriptors();
+        for _ in 0..8 {
+            assert!(ensure_progress_only(&file).is_err());
+            assert!(orphan_transaction_shape(&file).is_err());
+        }
+        assert_eq!(open_descriptors(), before);
+
+        // And on success.
+        let transaction = File::open(directory.path()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(directory.path().join(PROGRESS_NAME), b"").unwrap();
+        let before = open_descriptors();
+        ensure_progress_only(&transaction).unwrap();
+        assert_eq!(open_descriptors(), before);
     }
 
     /// Sizing a regular file reads only stored length metadata: a delta whose base is

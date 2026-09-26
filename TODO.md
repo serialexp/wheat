@@ -11,13 +11,6 @@ are the scanner's word only and need checking before a fix.
 
 Security, most serious first:
 
-- `[ ]` **File descriptors leak on error (scanner only).**
-  `cleanup_orphan_transactions` and `ensure_progress_only` in `materialization.rs`
-  `libc::dup` a descriptor and close it by hand; an early `?` skips the close. Wrap it
-  in `OwnedFd` straight away.
-- `[ ]` **Unchecked addition in delta apply (scanner only).**
-  `crates/wheat-store/src/delta.rs` around lines 172 and 190 index
-  `written..written + size` without `checked_add`, unlike the `ofs` check just above.
 - `[ ]` **Non-Unix workspace reads follow symlinks (scanner only).** The
   `#[cfg(not(unix))]` path in `workspace_files.rs` (around line 825) checks
   `symlink_metadata` and then `File::open`s, which races and follows symlinks. Refuse

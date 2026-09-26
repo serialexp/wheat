@@ -129,7 +129,7 @@ fn apply_instructions(base: &[u8], target: &mut [u8], data: &[u8]) -> Result<(),
     }
 
     let mut i = 0;
-    let mut written = 0;
+    let mut written: usize = 0;
     while let Some(cmd) = data.get(i) {
         i += 1;
         match cmd {
@@ -168,8 +168,9 @@ fn apply_instructions(base: &[u8], target: &mut [u8], data: &[u8]) -> Result<(),
                 let src = base
                     .get(ofs..end)
                     .ok_or(DeltaError::Corrupt("delta copy range exceeds base size"))?;
-                let dst = target
-                    .get_mut(written..written + size)
+                let dst = written
+                    .checked_add(size)
+                    .and_then(|stop| target.get_mut(written..stop))
                     .ok_or(DeltaError::Corrupt("delta copy exceeds result size"))?;
                 dst.copy_from_slice(src);
                 written += size;
@@ -186,8 +187,9 @@ fn apply_instructions(base: &[u8], target: &mut [u8], data: &[u8]) -> Result<(),
                 let src = data
                     .get(i..end)
                     .ok_or(DeltaError::Corrupt("delta insert data is truncated"))?;
-                let dst = target
-                    .get_mut(written..written + size)
+                let dst = written
+                    .checked_add(size)
+                    .and_then(|stop| target.get_mut(written..stop))
                     .ok_or(DeltaError::Corrupt("delta insert exceeds result size"))?;
                 dst.copy_from_slice(src);
                 i = end;
@@ -253,6 +255,28 @@ mod tests {
             let wrong_base = b"wrong";
             assert!(apply_delta(wrong_base, &patch, target.len(), target.len()).is_err());
         }
+    }
+
+    #[test]
+    fn instructions_cannot_write_past_the_result() {
+        let base = b"abcdef";
+        let mut target = [0_u8; 4];
+        // Insert 3 literal bytes, then 2 more: the second insert passes the end.
+        let inserts = [3, b'x', b'y', b'z', 2, b'u', b'v'];
+        assert!(matches!(
+            apply_instructions(base, &mut target, &inserts),
+            Err(DeltaError::Corrupt("delta insert exceeds result size"))
+        ));
+        // Copy 3 bytes from offset 0, then 3 more: the second copy passes the end.
+        let copies = [0b1001_0001, 0, 3, 0b1001_0001, 3, 3];
+        assert!(matches!(
+            apply_instructions(base, &mut target, &copies),
+            Err(DeltaError::Corrupt("delta copy exceeds result size"))
+        ));
+        // Exactly filling the result is fine.
+        let exact = [0b1001_0001, 0, 3, 1, b'!'];
+        apply_instructions(base, &mut target, &exact).unwrap();
+        assert_eq!(&target, b"abc!");
     }
 
     #[test]
