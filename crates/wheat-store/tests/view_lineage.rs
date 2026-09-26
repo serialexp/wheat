@@ -194,6 +194,78 @@ async fn traversal_does_not_scan_unrelated_retained_history() {
 }
 
 #[tokio::test]
+async fn a_path_proves_descent_hop_by_hop_without_scanning_the_lineage() {
+    const SIBLINGS: u32 = 5_000;
+    let objects = CountingStore::new(ObjectStoreAdapter::new(
+        Arc::new(InMemory::new()),
+        "view-lineage-path",
+    ));
+    let lineage = ViewLineageMapStore::new(&objects);
+    let empty = lineage.empty_root().await.unwrap();
+    // 1 -> 2 -> 3 -> 4, and 1 and 2 each have thousands of other children, like a view
+    // that many checkpoints were composed onto.
+    let siblings = (0..SIBLINGS).flat_map(|index| {
+        [
+            (view(1), view(10_000 + index)),
+            (view(2), view(20_000 + index)),
+        ]
+    });
+    let root = lineage
+        .insert_edges(
+            empty,
+            siblings.chain([(view(1), view(2)), (view(2), view(3)), (view(3), view(4))]),
+        )
+        .await
+        .unwrap();
+
+    objects.reset_reads();
+    assert!(
+        lineage
+            .follows_path(root, &[view(1), view(2), view(3), view(4)])
+            .await
+            .unwrap()
+    );
+    let reads = objects.reads();
+    assert!(
+        reads < 60,
+        "a three-hop path read {reads} objects beside {SIBLINGS} siblings per view"
+    );
+
+    // Repeated views are hops of length zero; a one-view or empty path is trivially true.
+    assert!(
+        !lineage
+            .follows_path(root, &[view(1), view(1), view(2), view(2), view(4)])
+            .await
+            .unwrap(),
+        "2 -> 4 is not an edge, so this path is not proven"
+    );
+    assert!(
+        lineage
+            .follows_path(root, &[view(1), view(2), view(2), view(3)])
+            .await
+            .unwrap()
+    );
+    assert!(lineage.follows_path(root, &[view(7)]).await.unwrap());
+    assert!(lineage.follows_path(root, &[]).await.unwrap());
+
+    // A missing hop, a reversed hop, and a parent with no children are not proven, even
+    // where the ends are related by another path.
+    for path in [[view(1), view(3)], [view(2), view(1)], [view(4), view(5)]] {
+        assert!(
+            !lineage.follows_path(root, &path).await.unwrap(),
+            "{path:?} is not a lineage edge"
+        );
+    }
+    // The forward search, by contrast, reads every sibling on the way.
+    assert!(
+        lineage
+            .is_descendant(root, view(1), view(3), ViewLineageLimits::default())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn validates_complete_graph_and_monotonic_extensions() {
     let objects = CountingStore::new(ObjectStoreAdapter::new(
         Arc::new(InMemory::new()),

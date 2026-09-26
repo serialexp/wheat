@@ -13,6 +13,7 @@ use wheat_store::*;
 struct CountingStore {
     inner: LooseObjectStore,
     tree_reads: AtomicUsize,
+    lineage_reads: AtomicUsize,
     reads: AtomicUsize,
     writes: AtomicUsize,
     forbidden: Mutex<BTreeSet<ObjectId>>,
@@ -24,6 +25,7 @@ impl CountingStore {
         Self {
             inner,
             tree_reads: AtomicUsize::new(0),
+            lineage_reads: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             forbidden: Mutex::new(BTreeSet::new()),
@@ -33,6 +35,7 @@ impl CountingStore {
 
     fn reset(&self, forbidden: BTreeSet<ObjectId>) {
         self.tree_reads.store(0, Ordering::Relaxed);
+        self.lineage_reads.store(0, Ordering::Relaxed);
         self.reads.store(0, Ordering::Relaxed);
         self.writes.store(0, Ordering::Relaxed);
         self.forbidden_reads.store(0, Ordering::Relaxed);
@@ -53,8 +56,14 @@ impl ImmutableObjectStore for CountingStore {
             self.forbidden_reads.fetch_add(1, Ordering::Relaxed);
         }
         let object = self.inner.get(id).await?;
-        if object.kind == ObjectKind::Tree {
-            self.tree_reads.fetch_add(1, Ordering::Relaxed);
+        match object.kind {
+            ObjectKind::Tree => {
+                self.tree_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            ObjectKind::ViewLineageMapNode => {
+                self.lineage_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
         Ok(object)
     }
@@ -873,4 +882,177 @@ async fn frontier_create_and_tail_revision_reuse_a_long_persisted_prefix() {
     assert_eq!(objects.forbidden_reads.load(Ordering::Relaxed), 0);
     assert!(objects.tree_reads.load(Ordering::Relaxed) < 20);
     assert!(objects.writes.load(Ordering::Relaxed) < 100);
+}
+
+/// Where the next mutation goes, and the top change's latest revision and edit.
+struct Stack {
+    base: ViewId,
+    effective: ViewId,
+    head: RepositoryHead,
+    top: ChangeId,
+    revision: RevisionId,
+    edit: EditId,
+}
+
+/// Publishes `depth` changes one mutation at a time, each created on top and revised
+/// until it has `per_change` revisions, the way repeated `wheat add` calls build a stack
+/// change by change.
+async fn spread_history(
+    objects: &CountingStore,
+    content: &ContentStore,
+    heads: &LocalPublicationStore,
+    depth: usize,
+    per_change: usize,
+) -> Stack {
+    let repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    let mut head = RepositoryPublisher::new(objects, content, heads)
+        .initialize(&repository)
+        .await
+        .unwrap();
+    let mutator = PersistedRepositoryMutator::new(objects, content, heads);
+    let mut effective = base;
+    let mut below = None;
+    let mut stack = None;
+    for index in 0..depth {
+        let change = ChangeId::new();
+        let path = format!("file-{index}");
+        let bytes = format!("{index}-0").into_bytes();
+        content.put(&bytes).unwrap();
+        let edits = exact(&path, None, &bytes);
+        let mut edit = *edits.edits.keys().next().unwrap();
+        let (prepared, outcome) = mutator
+            .create(head, base, effective, proposal(change, below, edits))
+            .await
+            .unwrap();
+        head = mutator.publish(prepared).await.unwrap();
+        effective = outcome.resulting_view;
+        let mut revision_id = outcome.revision_id;
+        for checkpoint in 1..per_change {
+            let bytes = format!("{index}-{checkpoint}").into_bytes();
+            content.put(&bytes).unwrap();
+            let edits = revision(&path, None, &bytes, edit);
+            let next_edit = *edits.edits.keys().next().unwrap();
+            let (prepared, outcome) = mutator
+                .revise(
+                    head,
+                    base,
+                    effective,
+                    change,
+                    revision_id,
+                    RevisionMetadata::default(),
+                    edits,
+                )
+                .await
+                .unwrap();
+            head = mutator.publish(prepared).await.unwrap();
+            effective = outcome.resulting_view;
+            revision_id = outcome.revision_id;
+            edit = next_edit;
+        }
+        below = Some(change);
+        stack = Some(Stack {
+            base,
+            effective,
+            head,
+            top: change,
+            revision: revision_id,
+            edit,
+        });
+    }
+    stack.expect("depth is at least one")
+}
+
+/// Lineage-map reads for one more revision of the top change of a spread history.
+async fn lineage_reads_for_top_revision(depth: usize, per_change: usize) -> usize {
+    // Hundreds of publications: defer the syncs, which only cost time here.
+    let dir = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::with_durability(
+        dir.path().join("objects"),
+        Durability::Deferred,
+    ));
+    let content = ContentStore::with_durability(dir.path().join("content"), Durability::Deferred);
+    let heads =
+        LocalPublicationStore::with_durability(dir.path().join("head"), Durability::Deferred);
+    let stack = spread_history(&objects, &content, &heads, depth, per_change).await;
+    content.put(b"final").unwrap();
+    objects.reset(BTreeSet::new());
+    let (_prepared, _) = PersistedRepositoryMutator::new(&objects, &content, &heads)
+        .revise(
+            stack.head,
+            stack.base,
+            stack.effective,
+            stack.top,
+            stack.revision,
+            RevisionMetadata::default(),
+            revision(&format!("file-{}", depth - 1), None, b"final", stack.edit),
+        )
+        .await
+        .unwrap();
+    objects.lineage_reads.load(Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn proving_ancestry_does_not_grow_with_the_history_under_the_basis() {
+    // Same stack depth; the long history has 20 times as many revisions behind the top.
+    let short = lineage_reads_for_top_revision(6, 2).await;
+    let long = lineage_reads_for_top_revision(6, 40).await;
+    assert!(
+        long <= short + 12,
+        "a revision read {long} lineage-map nodes after a long history, {short} after a short one"
+    );
+}
+
+#[tokio::test]
+async fn a_mutation_refuses_an_effective_view_outside_the_basis_lineage() {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::new(dir.path().join("objects")));
+    let content = ContentStore::new(dir.path().join("content"));
+    let heads = LocalPublicationStore::new(dir.path().join("head"));
+    let stack = spread_history(&objects, &content, &heads, 2, 3).await;
+    let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
+
+    // A sibling branch straight off the base: retained, but not below the first stack.
+    content.put(b"sibling").unwrap();
+    let (prepared, sibling) = mutator
+        .create(
+            stack.head,
+            stack.base,
+            stack.base,
+            proposal(ChangeId::new(), [], exact("sibling", None, b"sibling")),
+        )
+        .await
+        .unwrap();
+    let head = mutator.publish(prepared).await.unwrap();
+
+    content.put(b"refused").unwrap();
+    for (basis, effective) in [
+        // The base is an ancestor of the stack, not a descendant.
+        (stack.effective, stack.base),
+        // Neither branch descends from the other.
+        (stack.effective, sibling.resulting_view),
+        (sibling.resulting_view, stack.effective),
+    ] {
+        let refused = mutator
+            .create(
+                head,
+                basis,
+                effective,
+                proposal(ChangeId::new(), [], exact("refused", None, b"refused")),
+            )
+            .await
+            .err();
+        assert!(
+            matches!(
+                refused,
+                Some(RepositoryMutationError::Publication(
+                    RepositoryPublicationError::InvalidReferences(
+                        "effective view does not descend from basis view"
+                    )
+                ))
+            ),
+            "basis {basis} and effective {effective}: {refused:?}"
+        );
+    }
+    assert_eq!(heads.read().unwrap(), head);
 }

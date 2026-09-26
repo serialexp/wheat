@@ -604,21 +604,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 .into());
             }
         }
-        if effective_view != basis_view
-            && !crate::ViewLineageMapStore::new(self.objects)
-                .is_descendant(
-                    state.view_lineage,
-                    basis_view,
-                    effective_view,
-                    crate::ViewLineageLimits::default(),
-                )
-                .await?
-        {
-            return Err(RepositoryPublicationError::InvalidReferences(
-                "effective view does not descend from basis view",
-            )
-            .into());
-        }
         let base = reader.view(basis_view).await?;
         let effective = reader.view(effective_view).await?;
         let mut revisions = BTreeMap::new();
@@ -653,7 +638,59 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             &active.revisions,
             &active.revisions.keys().copied().collect(),
         )?;
+        if effective_view != basis_view && !self.descends(&active, basis_view).await? {
+            return Err(RepositoryPublicationError::InvalidReferences(
+                "effective view does not descend from basis view",
+            )
+            .into());
+        }
         Ok(active)
+    }
+
+    /// Whether `active.effective` descends from `basis` in the view lineage.
+    ///
+    /// The effective view records, for each applied change, the view that change was
+    /// applied onto. In canonical order those views are the path the effective view was
+    /// composed along. When the basis is on that path and every later hop is a lineage
+    /// edge, descent is proven with one edge lookup per change, whatever the size of the
+    /// history. Anything else (say, a view reached another way) falls back to the forward
+    /// search, which is exact but visits the history under the basis.
+    #[tracing::instrument(level = "debug", skip_all, fields(changes = active.persisted_order.len()))]
+    async fn descends(&self, active: &Active, basis: ViewId) -> Result<bool> {
+        let lineage = crate::ViewLineageMapStore::new(self.objects);
+        let reader = RepositoryReader::new(self.objects, self.content);
+        let mut applications = BTreeMap::new();
+        let mut cursor = ApplicationMapStore::new(self.objects)
+            .cursor(active.effective.applications)
+            .await?;
+        while let Some((change, application)) = cursor.next().await? {
+            applications.insert(change, application);
+        }
+        let mut path = Vec::with_capacity(active.persisted_order.len() + 1);
+        for change in &active.persisted_order {
+            let Some(application) = applications.get(change) else {
+                path.clear();
+                break;
+            };
+            path.push(reader.application(*application).await?.target_view);
+        }
+        if let Some(start) = path.iter().position(|view| *view == basis) {
+            path.push(active.effective.id());
+            if lineage
+                .follows_path(active.state.view_lineage, &path[start..])
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(lineage
+            .is_descendant(
+                active.state.view_lineage,
+                basis,
+                active.effective.id(),
+                crate::ViewLineageLimits::default(),
+            )
+            .await?)
     }
 
     /// Authors every pending revision at its change's spot while composing all active changes.
