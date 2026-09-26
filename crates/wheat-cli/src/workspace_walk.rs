@@ -14,7 +14,6 @@ use wheat_ignore::stack::{IgnoreMatch, IgnoreStack};
 
 /// Configuration bounds for the workspace walk.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Wired in the next step (status integration).
 pub(crate) struct WalkLimits {
     pub max_entries: usize,
     pub max_directories: usize,
@@ -33,7 +32,6 @@ impl Default for WalkLimits {
 
 /// Classification of a physical workspace entry not in the tracked tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum UntrackedClassification {
     Untracked,
     Ignored,
@@ -41,7 +39,6 @@ pub(crate) enum UntrackedClassification {
 
 /// One untracked or ignored entry discovered during the workspace walk.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct UntrackedEntry {
     pub path: String,
     pub classification: UntrackedClassification,
@@ -50,11 +47,9 @@ pub(crate) struct UntrackedEntry {
 
 /// Result of a workspace-wide directory walk.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct WorkspaceWalkResult {
     pub untracked: Vec<UntrackedEntry>,
     pub gitignore_fallback_used: bool,
-    pub gitignore_fallback_paths: Vec<PathBuf>,
     pub truncated: bool,
 }
 
@@ -83,7 +78,6 @@ fn tracked_directory_prefixes(tracked_paths: &BTreeSet<String>) -> BTreeSet<Stri
 }
 
 /// Walk the workspace directory tree and classify untracked entries.
-#[allow(dead_code)]
 pub(crate) fn walk_workspace(
     workspace_root: &Path,
     tracked_paths: &BTreeSet<String>,
@@ -111,7 +105,6 @@ pub(crate) fn walk_workspace(
             state.untracked
         },
         gitignore_fallback_used: !ignore_stack.gitignore_fallbacks().is_empty(),
-        gitignore_fallback_paths: ignore_stack.gitignore_fallbacks().to_vec(),
         truncated: state.truncated,
     })
 }
@@ -181,26 +174,11 @@ fn walk_directory(
             Err(_) => continue,
         };
 
-        let is_dir = metadata.is_dir();
-        let is_symlink = metadata.is_symlink();
-
-        // Don't follow symlinks to directories.
-        if is_symlink && is_dir {
-            if !state.tracked_paths.contains(&relative_path) {
-                let classification = match ignore_stack.is_ignored(&relative_path, true) {
-                    IgnoreMatch::Ignored { .. } => UntrackedClassification::Ignored,
-                    _ => UntrackedClassification::Untracked,
-                };
-                state.untracked.push(UntrackedEntry {
-                    path: relative_path,
-                    classification,
-                    is_directory: true,
-                });
-            }
-            continue;
-        }
-
-        if is_dir {
+        // `symlink_metadata` does not follow links, so a symlink is never a
+        // directory here, whatever it points at: like Git, the walk lists it as
+        // one entry, matches it against ignore rules as a file (`dir/` rules
+        // do not apply), and does not descend through it.
+        if metadata.is_dir() {
             match ignore_stack.is_ignored(&relative_path, true) {
                 IgnoreMatch::Ignored { .. } => {
                     // Prune: don't descend into ignored directories.

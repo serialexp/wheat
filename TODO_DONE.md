@@ -62,6 +62,19 @@ Finished items, moved here from `TODO.md` under the same headings.
   `crates/wheat-cli/tests/remote_large_content.rs` (a 17 MiB file through `publish`
   and `clone`). Benchmark: `publish_content` (server peak 210 MiB for a 384 MiB
   publish, flat at twice the size; budget 256 MiB).
+- `[x]` **Directory symlinks get the wrong type (checked: not a bug).** The
+  `is_symlink && is_dir` branch in `workspace_walk.rs` could never run, but what runs
+  instead is right: like Git, a symlink to a directory is one file entry, is not
+  descended, and `dir/` ignore rules do not match it (checked against
+  `git status --ignored`). Done 2026-09-26: the dead branch is gone, with a comment
+  saying why, and `symlink_to_directory_is_a_file_entry` in
+  `crates/wheat-cli/tests/untracked_status.rs` pins the behaviour.
+
+## Loose ends found in the design-doc audit (2026-09-25)
+
+- `[x]` **Stale `#[allow(dead_code)]` markers in `workspace_walk.rs`.** Done
+  2026-09-26: removed. The one field they hid that nothing read,
+  `gitignore_fallback_paths`, is gone too; the ignore stack still has the paths.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 

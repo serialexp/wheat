@@ -445,6 +445,38 @@ fn symlink_to_directory_not_followed() {
     );
 }
 
+/// Like Git, a symlink is one file entry whatever it points at: a `dir/` rule
+/// does not match it, and a plain name rule does.
+#[test]
+fn symlink_to_directory_is_a_file_entry() {
+    let h = Harness::new();
+    h.init_from_git(&[("tracked.txt", "hello\n")]);
+
+    let real_dir = h.root.path().join("external");
+    fs::create_dir_all(&real_dir).unwrap();
+    symlink(&real_dir, h.workspace.join("linked")).unwrap();
+    symlink(&real_dir, h.workspace.join("named")).unwrap();
+    fs::write(h.workspace.join(".wheatignore"), "linked/\nnamed\n").unwrap();
+
+    let status = h.json_ok(&h.workspace, &["status"]);
+    let entry = |path: &str| {
+        status["result"]["untracked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == path)
+            .unwrap_or_else(|| panic!("no entry for {path} in {status}"))
+            .clone()
+    };
+
+    let linked = entry("linked");
+    assert_eq!(linked["ignored"], false, "a dir/ rule matched a symlink");
+    assert_eq!(linked["is_directory"], false);
+    let named = entry("named");
+    assert_eq!(named["ignored"], true, "a name rule missed a symlink");
+    assert_eq!(named["is_directory"], false);
+}
+
 #[test]
 fn builtin_wheat_directory_is_always_ignored() {
     let h = Harness::new();

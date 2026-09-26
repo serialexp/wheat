@@ -11,10 +11,6 @@ are the scanner's word only and need checking before a fix.
 
 Security, most serious first:
 
-- `[ ]` **Directory symlinks get the wrong type (scanner only).**
-  `crates/wheat-cli/src/workspace_walk.rs` around line 179 tests
-  `is_symlink && is_dir` on `symlink_metadata()`, which is never true for a symlink,
-  so that branch is dead and directory symlinks are classified as files.
 - `[ ]` **File descriptors leak on error (scanner only).**
   `cleanup_orphan_transactions` and `ensure_progress_only` in `materialization.rs`
   `libc::dup` a descriptor and close it by hand; an early `?` skips the close. Wrap it
@@ -126,9 +122,6 @@ budget passes, but by only about 0.7 s.
 - `[ ]` **The `.gitignore` fallback diagnostic points at a missing command.**
   `workspace_status.rs` tells users to run `wheat ignore import`, which does not
   exist (tracked in `wheat-local-tooling.md`).
-- `[ ]` **Stale `#[allow(dead_code)]` markers in `workspace_walk.rs`.** They say
-  "wired in the next step (status integration)", but `wheat status` already uses the
-  walk.
 - `[ ]` **The release-gate memory note lives under the gothab project.**
   `wheat-local-cli.md`'s release gate refers to
   `~/.claude/projects/-home-bart-Projects-gothab/memory/feedback_no_format_version_bumps.md`;
