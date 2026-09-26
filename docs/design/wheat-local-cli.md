@@ -159,8 +159,17 @@ both lists.
   new trailers. See "Rewrite semantics".
 - [x] **Git push commit messages come from the change.** (2026-09-26) See "Git
   compatibility workflow".
+- [x] **Annotated labels and `wheat push --tag`.** (2026-09-26) Labels can carry a
+  tagger, date and message; `push --tag` publishes them as create-only annotated Git
+  tags whose object IDs are the same on every push, guarded by remote-branch
+  reachability. Extended beyond the original plan: squash refuses to move an
+  annotated label. See "Git compatibility workflow".
 
 ### Outstanding
+- [ ] **Import keeps annotated tag data.** Import turns `refs/tags/X` into label
+  `tags/X` but drops the tag object's tagger, date and message, so pushing an
+  imported tag back needs the label re-created with `-m` and gives a different tag
+  object. Store them as the label's annotation so imported tags round-trip.
 - [ ] **Phase 2 — dependency and integration workflow.** Expose stack revision,
   dependency movement, joins, deterministic descendant reapplication, and durable
   conflict outcomes as Wheat operations rather than Git-shaped rebase state.
@@ -890,6 +899,32 @@ Composition is bounded by `ExportLimits::max_note_revisions` (checkpoint reads p
 export) and `max_message_bytes`. Exceeding either is a typed limit error, never a
 truncated message. A change missing from the state's change map is refused. The
 `git_export_notes` quick bench case tracks the cost.
+
+Tags (2026-09-26) come from annotated labels. `wheat label create tags/v1 -m
+<message> [--view V] [--tagged-at T]` stores the tagger (the configured actor), the
+date and the message on the label itself, in the label manifest. Rename keeps them,
+and squash refuses to move an annotated label to a new view
+(`moves_annotated_label`). `wheat push <git-url> --tag v1` then publishes label
+`tags/v1` as an annotated tag at `refs/tags/v1`. The tag object's ID must never
+change, so:
+
+- the commit is exported by one fixed rule: anchor on the newest imported commit
+  in the view's chain (so imported history keeps its original IDs), else export
+  fresh. Native commits read no clock, environment or Git config, so a fresh
+  projection, another machine or another remote gives the same commit;
+- the tag object holds only the commit, name, stored tagger, date and message (the
+  message gets a trailing newline), with no signature;
+- the remote's branch tips are fetched into `refs/wheat/remote-heads/` (at most
+  1,024 branches, else `too_many_remote_branches`). The tag is refused
+  (`tag_commit_not_on_remote_branch`) unless its commit is reachable from one of
+  them, so a tag can't point at a commit no branch has;
+- the push is create-only. The same tag object already on the remote is "up to
+  date"; a different one is refused (`tag_exists`). There is no force option.
+
+A tag push costs three Git processes (`ls-remote`, one fetch, one
+`for-each-ref --contains`) whatever the branch count. Import still turns a Git tag
+into a plain label and drops the tag object's tagger and message (see the
+Outstanding list).
 
 A configured compatibility remote may remove repetitive URL/ref arguments later,
 but configuration must identify it as a Git projection endpoint. Receiving

@@ -537,6 +537,10 @@ fn classify(error: &Error) -> Classification {
                 BridgeError::UnknownRemoteTip { .. } | BridgeError::Rejected(_) => {
                     class("state", "git_projection_rejected", true, 3)
                 }
+                BridgeError::TagCommitNotOnRemoteBranch { .. } => {
+                    class("state", "tag_commit_not_on_remote_branch", false, 3)
+                }
+                BridgeError::TagExists { .. } => class("state", "tag_exists", false, 3),
                 BridgeError::EmptyProjection => class("input", "empty_projection", false, 2),
                 BridgeError::Initialize { .. } | BridgeError::Lock { .. } => {
                     class("io", "git_projection_io", true, 8)
@@ -547,9 +551,13 @@ fn classify(error: &Error) -> Classification {
         if let Some(push) = cause.downcast_ref::<PushError>() {
             return match push {
                 PushError::InvalidDestination(_)
+                | PushError::InvalidTag(_)
                 | PushError::InvalidSource(_)
                 | PushError::InvalidProjection(_) => {
                     class("input", "invalid_git_projection", false, 2)
+                }
+                PushError::TooManyRemoteBranches { .. } => {
+                    class("limit", "too_many_remote_branches", false, 5)
                 }
                 PushError::Spawn { .. } | PushError::Capture { .. } => {
                     class("transport", "git_transport_failure", true, 8)

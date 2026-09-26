@@ -556,8 +556,12 @@ struct PushArgs {
     /// Git remote URL. It is passed to Git and never persisted by Wheat.
     remote: String,
     /// Full destination branch ref, for example refs/heads/main.
-    #[arg(long)]
-    to: String,
+    #[arg(long, required_unless_present = "tag")]
+    to: Option<String>,
+    /// Push annotated label tags/<TAG> as Git tag refs/tags/<TAG>. The tag is only
+    /// created, never moved, and its commit must already be on a remote branch.
+    #[arg(long, conflicts_with_all = ["to", "source", "force_with_lease"])]
+    tag: Option<String>,
     /// Advanced source override: label:<name> or an exact retained view ID.
     #[arg(long)]
     source: Option<PushSource>,
@@ -1538,6 +1542,15 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Publish(arguments) => {
             native_publish(&requested_workspace, cli.store.as_deref(), arguments)
         }
+        Command::Push(PushArgs {
+            remote,
+            tag: Some(tag),
+            ..
+        }) => push_tag(
+            &resolve_store_root(&requested_workspace, cli.store.as_deref())?,
+            &remote,
+            &tag,
+        ),
         Command::Push(mut arguments) => {
             let store_root = if arguments.source.is_none() {
                 let context = resolve_context(&requested_workspace, cli.store.as_deref()).map_err(
@@ -2001,6 +2014,10 @@ fn clone_remote_for_import(remote: &str) -> Result<tempfile::TempDir> {
 }
 
 fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
+    let destination = arguments
+        .to
+        .clone()
+        .context("push requires --to or --tag")?;
     let local = open(root)?;
     let _operation = rewrite_transaction::StoreOperationGuard::acquire(root, &local)?;
     let expected = local.heads.read()?;
@@ -2033,7 +2050,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         changes,
         &projection_path(root)?,
         &arguments.remote,
-        &arguments.to,
+        &destination,
         arguments.force_with_lease,
     ))?;
     let actual = local.heads.read()?;
@@ -2056,20 +2073,86 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
     let outcome = report.refs.first().context("git returned no ref status")?;
     let up_to_date = matches!(outcome.status, wheat_git::push::RefStatus::UpToDate);
     let human = if up_to_date {
-        format!("{} is already at {tip}\n", arguments.to)
+        format!("{destination} is already at {tip}\n")
     } else {
         format!(
-            "pushed {projected} commit{} (one per change) to {} at {tip}\n",
+            "pushed {projected} commit{} (one per change) to {destination} at {tip}\n",
             if projected == 1 { "" } else { "s" },
-            arguments.to
         )
     };
     Success::new(
         "push",
         json!({
-            "destination": arguments.to,
+            "destination": destination,
             "tip": tip.to_string(),
             "projected_commits": projected,
+            "up_to_date": up_to_date,
+        }),
+        human,
+    )
+}
+
+/// `wheat push --tag <tag>`: publish annotated label `tags/<tag>` as `refs/tags/<tag>`.
+fn push_tag(root: &std::path::Path, remote: &str, tag: &str) -> Result<Success> {
+    let label_name = format!("tags/{tag}");
+    let local = open(root)?;
+    let _operation = rewrite_transaction::StoreOperationGuard::acquire(root, &local)?;
+    let expected = local.heads.read()?;
+    let runtime = runtime()?;
+    let (base, label, changes) = runtime.block_on(async {
+        let reader = RepositoryReader::new(&local.objects, &local.content);
+        let envelope = reader.validate_envelope(expected.envelope).await?;
+        let state = reader.state(envelope.state).await?;
+        let label = reader
+            .view_label_manifest(envelope.labels)
+            .await?
+            .labels
+            .remove(&label_name)
+            .ok_or_else(|| {
+                CliFailure::invalid(format!(
+                    "unknown Wheat label {label_name}; create it with `wheat label create {label_name} -m <message>`"
+                ))
+            })?;
+        Ok::<_, anyhow::Error>((state.base_view, label, state.changes))
+    })?;
+    let annotation = label.annotation.as_ref().ok_or_else(|| {
+        CliFailure::invalid(format!(
+            "label {label_name} has no annotation, so it cannot be an annotated tag; delete it and run `wheat label create {label_name} -m <message>`"
+        ))
+    })?;
+    let prepared = runtime.block_on(wheat_git::bridge::prepare_tag_push(
+        &local.objects,
+        &local.content,
+        label.view,
+        base,
+        changes,
+        annotation,
+        &projection_path(root)?,
+        remote,
+        tag,
+    ))?;
+    if local.heads.read()? != expected {
+        return Err(CliFailure::stale(
+            "Wheat repository changed while preparing the Git tag; retry the push",
+        ));
+    }
+    let tag_ref = prepared.tag_ref.clone();
+    let tag_object = prepared.tag_object;
+    let commit = prepared.commit;
+    let up_to_date = wheat_git::bridge::publish_tag(prepared)?.is_none();
+    let human = if up_to_date {
+        format!("{tag_ref} is already tag {tag_object} for commit {commit}\n")
+    } else {
+        format!("pushed {tag_ref} as tag {tag_object} for commit {commit}\n")
+    };
+    Success::new(
+        "push",
+        json!({
+            "destination": tag_ref,
+            "tag": tag,
+            "label": label_name,
+            "tag_oid": tag_object.to_string(),
+            "commit_oid": commit.to_string(),
             "up_to_date": up_to_date,
         }),
         human,

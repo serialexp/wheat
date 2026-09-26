@@ -119,6 +119,10 @@ impl PushReport {
 pub enum PushError {
     #[error("destination must be a valid full refs/heads ref: {0}")]
     InvalidDestination(String),
+    #[error("tag must be a valid full refs/tags ref: {0}")]
+    InvalidTag(String),
+    #[error("remote has {count} branches, more than the {maximum} a tag push checks")]
+    TooManyRemoteBranches { count: usize, maximum: usize },
     #[error("source must be a valid full ref: {0}")]
     InvalidSource(String),
     #[error("projection repository is not a bare Git repository: {0}")]
@@ -180,6 +184,99 @@ pub fn observe_remote_ref(remote_url: &str, destination: &str) -> Result<RemoteS
     }
 
     Ok(observed.map_or(RemoteState::Absent, RemoteState::Present))
+}
+
+/// Most remote branches a tag push fetches to prove its commit is already published.
+pub const MAX_REMOTE_BRANCHES: usize = 1024;
+
+/// Where a tag push keeps the remote's branch tips, pruned to match on every fetch.
+pub const REMOTE_HEADS_PREFIX: &str = "refs/wheat/remote-heads/";
+
+/// Observe one tag and count the remote's branches in a single `ls-remote`, without
+/// adding or changing a configured remote. The tag's object ID is the tag object's,
+/// not the commit it names.
+pub fn observe_remote_tag(remote_url: &str, tag: &str) -> Result<RemoteState, PushError> {
+    validate_tag(tag)?;
+    let output = run_git(
+        Command::new("git")
+            .arg("ls-remote")
+            .arg("--refs")
+            .arg("--")
+            .arg(remote_url)
+            .arg("refs/heads/*")
+            .arg(tag),
+        "ls-remote",
+    )?;
+    require_success("ls-remote", &output)?;
+
+    let text = String::from_utf8_lossy(&output.stdout.bytes);
+    let mut observed = None;
+    let mut branches = 0_usize;
+    for line in text.lines() {
+        let Some((oid, name)) = line.split_once('\t') else {
+            return Err(PushError::InvalidRemoteOutput(
+                "ls-remote returned a non-tab-separated line".into(),
+            ));
+        };
+        let oid = RemoteOid::parse(oid)?;
+        if name == tag {
+            if observed.replace(oid).is_some() {
+                return Err(PushError::InvalidRemoteOutput(format!(
+                    "ls-remote returned {tag} more than once"
+                )));
+            }
+        } else if name.starts_with("refs/heads/") {
+            branches += 1;
+        }
+        // Patterns match ref name tails, so other refs ending the same way are ignored.
+    }
+    if branches > MAX_REMOTE_BRANCHES {
+        return Err(PushError::TooManyRemoteBranches {
+            count: branches,
+            maximum: MAX_REMOTE_BRANCHES,
+        });
+    }
+    Ok(observed.map_or(RemoteState::Absent, RemoteState::Present))
+}
+
+/// Mirror the remote's branch tips into [`REMOTE_HEADS_PREFIX`] with one pruning
+/// fetch, so a branch deleted on the remote no longer counts. Only objects the
+/// projection lacks are transferred.
+pub fn fetch_remote_heads(projection: &Path, remote_url: &str) -> Result<(), PushError> {
+    validate_projection(projection)?;
+    let output = run_git(
+        Command::new("git")
+            .arg("-C")
+            .arg(projection)
+            .arg("fetch")
+            .arg("--no-tags")
+            .arg("--no-write-fetch-head")
+            .arg("--prune")
+            .arg("--")
+            .arg(remote_url)
+            .arg(format!("+refs/heads/*:{REMOTE_HEADS_PREFIX}*")),
+        "fetch",
+    )?;
+    require_success("fetch", &output)
+}
+
+/// Whether `commit` is reachable from any branch tip last mirrored by
+/// [`fetch_remote_heads`], in one `for-each-ref --contains`.
+pub fn remote_heads_contain(projection: &Path, commit: gix::ObjectId) -> Result<bool, PushError> {
+    validate_projection(projection)?;
+    let output = run_git(
+        Command::new("git")
+            .arg("-C")
+            .arg(projection)
+            .arg("for-each-ref")
+            .arg("--count=1")
+            .arg("--format=%(refname)")
+            .arg(format!("--contains={commit}"))
+            .arg(REMOTE_HEADS_PREFIX),
+        "for-each-ref",
+    )?;
+    require_success("for-each-ref", &output)?;
+    Ok(!output.stdout.bytes.trim_ascii().is_empty())
 }
 
 /// Ensure an observed remote object is available in the bare projection repository.
@@ -380,9 +477,37 @@ pub fn push_ref(
     destination: &str,
     mode: PushMode,
 ) -> Result<PushReport, PushError> {
+    validate_destination(destination)?;
+    push_validated(projection, remote_url, source, destination, mode)
+}
+
+/// Create one tag on the remote from a local ref naming the tag object. The push is
+/// create-only: an existing remote tag is never moved.
+pub fn push_tag(
+    projection: &Path,
+    remote_url: &str,
+    source: &str,
+    tag: &str,
+) -> Result<PushReport, PushError> {
+    validate_tag(tag)?;
+    push_validated(
+        projection,
+        remote_url,
+        source,
+        tag,
+        PushMode::ForceWithLeaseAbsent,
+    )
+}
+
+fn push_validated(
+    projection: &Path,
+    remote_url: &str,
+    source: &str,
+    destination: &str,
+    mode: PushMode,
+) -> Result<PushReport, PushError> {
     validate_projection(projection)?;
     validate_source(source)?;
-    validate_destination(destination)?;
 
     let mut command = Command::new("git");
     command
@@ -440,6 +565,16 @@ fn validate_destination(reference: &str) -> Result<(), PushError> {
         return Err(PushError::InvalidDestination(reference.into()));
     }
     validate_ref_with_git(reference, true)
+}
+
+fn validate_tag(reference: &str) -> Result<(), PushError> {
+    if !reference.starts_with("refs/tags/")
+        || reference == "refs/tags/"
+        || validate_ref_with_git(reference, true).is_err()
+    {
+        return Err(PushError::InvalidTag(reference.into()));
+    }
+    Ok(())
 }
 
 fn validate_source(reference: &str) -> Result<(), PushError> {

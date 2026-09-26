@@ -7,11 +7,13 @@ use std::{
 use gix::bstr::ByteSlice;
 use wheat_core::{
     Actor, Change, ChangeId, ChangeMapId, ChangeMetadata, ChangeObjectId, ChangeProposal, Conflict,
-    EditId, EditOperation, EditRecord, EditTransition, FileKind, FileValue, Repository,
-    RevisionEdits, RevisionMetadata, RevisionOutcome, SourceProvenance, Timestamp, Tree, ViewId,
-    ViewRecord,
+    EditId, EditOperation, EditRecord, EditTransition, FileKind, FileValue, LabelAnnotation,
+    Repository, RevisionEdits, RevisionMetadata, RevisionOutcome, SourceProvenance, Timestamp,
+    Tree, ViewId, ViewRecord,
 };
-use wheat_git::export::{ExportError, ExportLimit, ExportOptions, export_revision_history};
+use wheat_git::export::{
+    ExportAnchor, ExportError, ExportLimit, ExportOptions, export_revision_history, write_tag,
+};
 use wheat_store::{
     ChangeMapStore, ConflictSetStore, ContentStore, ImmutableObjectStore, LocalPublicationStore,
     LooseObjectStore, PersistedCommit, PersistedCommitWriter, PersistedRepositoryMutator,
@@ -365,7 +367,7 @@ async fn reuses_imported_anchor_and_projects_only_its_suffix() {
         default_changes(&fixture, &[1, 2]).await,
         &git_repo,
         &ExportOptions {
-            anchor: Some(anchor),
+            anchor: ExportAnchor::Commit(anchor),
             ..Default::default()
         },
     )
@@ -378,6 +380,215 @@ async fn reuses_imported_anchor_and_projects_only_its_suffix() {
     assert!(!exported.projected[1].reused_anchor);
     let native_commit = git_repo.find_commit(exported.tip.unwrap()).unwrap();
     assert_eq!(native_commit.parent_ids().next().unwrap().detach(), anchor);
+
+    // The fixed tag rule finds the same anchor from the view alone, so it writes the
+    // same commits a branch push anchored on the remote tip wrote.
+    let changes = default_changes(&fixture, &[1, 2]).await;
+    let newest_imported = ExportOptions {
+        anchor: ExportAnchor::NewestImported,
+        ..Default::default()
+    };
+    let fixed = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        native.resulting_view,
+        base,
+        changes,
+        &git_repo,
+        &newest_imported,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fixed.projected, exported.projected);
+
+    // Without the imported commit present, the rule fails instead of silently
+    // writing a different history.
+    let (_empty_dir, empty) = bare();
+    assert!(matches!(
+        export_revision_history(
+            &fixture.objects,
+            &fixture.content,
+            native.resulting_view,
+            base,
+            changes,
+            &empty,
+            &newest_imported,
+        )
+        .await,
+        Err(ExportError::MissingAnchor(missing)) if missing == anchor
+    ));
+}
+
+#[tokio::test]
+async fn newest_imported_is_a_fresh_export_for_native_history() {
+    let fixture = Fixture::new();
+    let (base, _first, second) = two_revisions(&fixture).await;
+    let changes = default_changes(&fixture, &[1, 2]).await;
+    let (_plain_dir, plain_git) = bare();
+    let plain = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        second.resulting_view,
+        base,
+        changes,
+        &plain_git,
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    let (_fixed_dir, fixed_git) = bare();
+    let fixed = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        second.resulting_view,
+        base,
+        changes,
+        &fixed_git,
+        &ExportOptions {
+            anchor: ExportAnchor::NewestImported,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(fixed.projected, plain.projected);
+    assert!(fixed.projected.iter().all(|entry| !entry.reused_anchor));
+}
+
+/// A view's commit must be the same whether it is exported alone or as the parent of
+/// a later view, or a tag on it would not name the commit already on the branch.
+#[tokio::test]
+async fn an_earlier_view_exports_to_the_parent_commit_of_a_later_view() {
+    let fixture = Fixture::new();
+    let (base, first, second) = two_revisions(&fixture).await;
+    let changes = default_changes(&fixture, &[1, 2]).await;
+    let (_later_dir, later_git) = bare();
+    let later = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        second.resulting_view,
+        base,
+        changes,
+        &later_git,
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    let (_earlier_dir, earlier_git) = bare();
+    let earlier = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        first.resulting_view,
+        base,
+        changes,
+        &earlier_git,
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    let parent = later_git
+        .find_commit(later.tip.unwrap())
+        .unwrap()
+        .parent_ids()
+        .next()
+        .unwrap()
+        .detach();
+    assert_eq!(earlier.tip, Some(parent));
+    assert_eq!(earlier.projected[..], later.projected[..1]);
+}
+
+fn annotation(message: &str) -> LabelAnnotation {
+    LabelAnnotation {
+        tagger: Actor {
+            name: "Tia Tagger".into(),
+            email: "tia@example.com".into(),
+        },
+        tagged_at: Timestamp {
+            seconds: 1_790_000_000,
+            offset_minutes: -330,
+        },
+        message: message.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_tag_object_depends_only_on_commit_name_and_annotation() {
+    let fixture = Fixture::new();
+    let (base, _first, second) = two_revisions(&fixture).await;
+    let changes = default_changes(&fixture, &[1, 2]).await;
+    let mut tags = Vec::new();
+    let mut directories = Vec::new();
+    for _ in 0..2 {
+        let (directory, git_repo) = bare();
+        let export = export_revision_history(
+            &fixture.objects,
+            &fixture.content,
+            second.resulting_view,
+            base,
+            changes,
+            &git_repo,
+            &ExportOptions::default(),
+        )
+        .await
+        .unwrap();
+        let tag = write_tag(
+            &git_repo,
+            export.tip.unwrap(),
+            "v1.0",
+            &annotation("Release 1.0\n\nNotes."),
+        )
+        .unwrap();
+        git_repo
+            .reference(
+                "refs/tags/v1.0",
+                tag,
+                gix::refs::transaction::PreviousValue::MustNotExist,
+                "test",
+            )
+            .unwrap();
+        tags.push((tag, export.tip.unwrap()));
+        directories.push(directory);
+    }
+    assert_eq!(tags[0], tags[1]);
+
+    let path = directories[0].path();
+    git(path, &["fsck", "--full", "--strict", "--no-dangling"]);
+    assert_eq!(
+        git(path, &["rev-parse", "v1.0^{commit}"]),
+        tags[0].1.to_string()
+    );
+    assert_eq!(
+        git(path, &["cat-file", "tag", "v1.0"]),
+        format!(
+            "object {}\ntype commit\ntag v1.0\ntagger Tia Tagger <tia@example.com> 1790000000 -0530\n\nRelease 1.0\n\nNotes.",
+            tags[0].1
+        )
+    );
+
+    // Each stored field is part of the ID; a message without a final newline gets one.
+    let (_other_dir, other) = bare();
+    let commit = tags[0].1;
+    let base_tag = write_tag(&other, commit, "v1.0", &annotation("Release 1.0\n\nNotes.")).unwrap();
+    assert_eq!(base_tag, tags[0].0);
+    assert_eq!(
+        write_tag(
+            &other,
+            commit,
+            "v1.0",
+            &annotation("Release 1.0\n\nNotes.\n")
+        )
+        .unwrap(),
+        base_tag
+    );
+    let mut later = annotation("Release 1.0\n\nNotes.");
+    later.tagged_at.seconds += 1;
+    for different in [
+        write_tag(&other, commit, "v1.1", &annotation("Release 1.0\n\nNotes.")).unwrap(),
+        write_tag(&other, commit, "v1.0", &annotation("Release 1.0")).unwrap(),
+        write_tag(&other, commit, "v1.0", &later).unwrap(),
+    ] {
+        assert_ne!(different, base_tag);
+    }
 }
 
 #[tokio::test]
@@ -433,7 +644,7 @@ async fn rejects_a_projected_anchor_whose_tree_does_not_match_its_application() 
         changes,
         &git_repo,
         &ExportOptions {
-            anchor: Some(forged),
+            anchor: ExportAnchor::Commit(forged),
             projected_anchors: BTreeMap::from([(first.application_id, forged)]),
             ..Default::default()
         },

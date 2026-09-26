@@ -78,11 +78,25 @@ impl Default for ExportFallbackMetadata {
 pub struct ExportOptions {
     pub limits: ExportLimits,
     pub fallback: ExportFallbackMetadata,
-    /// An already-present Git commit to reuse. It must match either imported
-    /// provenance or a caller-supplied application mapping in the selected chain.
-    pub anchor: Option<gix::ObjectId>,
+    /// Which already-present Git commit, if any, stands in for the start of the chain.
+    pub anchor: ExportAnchor,
     /// Previously verified projection mappings held outside Wheat's canonical store.
     pub projected_anchors: BTreeMap<ApplicationId, gix::ObjectId>,
+}
+
+/// The Git commit an export reuses instead of writing the chain up to it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExportAnchor {
+    /// Write every application in the chain.
+    #[default]
+    None,
+    /// Reuse this commit. It must match either imported provenance or a
+    /// caller-supplied application mapping in the selected chain.
+    Commit(gix::ObjectId),
+    /// Reuse the original commit of the newest imported application in the chain,
+    /// or nothing when the chain has none. The result depends only on the view, not
+    /// on what a remote holds, which is what makes a tag's commit reproducible.
+    NewestImported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,7 +219,16 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
     ensure_clean(&reader, objects, base).await?;
     let chain = reconstruct_chain(&reader, objects, selected, base, options.limits).await?;
 
-    let anchor_index = if let Some(anchor) = options.anchor {
+    let anchor = match options.anchor {
+        ExportAnchor::None => None,
+        ExportAnchor::Commit(oid) => Some(oid),
+        ExportAnchor::NewestImported => chain
+            .iter()
+            .rev()
+            .find_map(|entry| imported_commit(&entry.revision).transpose())
+            .transpose()?,
+    };
+    let anchor_index = if let Some(anchor) = anchor {
         let anchor_commit = git
             .find_commit(anchor)
             .map_err(|_| ExportError::MissingAnchor(anchor))?;
@@ -245,13 +268,13 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
     };
 
     let mut output = ExportResult {
-        tip: options.anchor,
+        tip: anchor,
         applications: BTreeMap::new(),
         revisions: BTreeMap::new(),
         views: BTreeMap::new(),
         projected: Vec::new(),
     };
-    let mut parent = options.anchor;
+    let mut parent = anchor;
     let mut object_cache = ObjectCache::default();
     let mut messages = MessageBuilder::new(objects, changes, options.limits);
     let start = anchor_index.unwrap_or(usize::MAX);
@@ -263,7 +286,7 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
         // applications: they must still be projected as commits after it.
         let reused_anchor = anchor_index == Some(index);
         let oid = if reused_anchor {
-            options.anchor.expect("anchor index requires anchor")
+            anchor.expect("anchor index requires anchor")
         } else {
             let view = reader.view(entry.result).await?;
             let tree = write_tree(
@@ -447,6 +470,28 @@ async fn application_map_is_predecessor<O: ImmutableObjectStore>(
         right = result.next().await?;
     }
     Ok(true)
+}
+
+/// The original Git commit of an imported revision, or `None` for a native one.
+fn imported_commit(
+    revision: &wheat_core::RevisionRecord,
+) -> Result<Option<gix::ObjectId>, ExportError> {
+    let Some(provenance) = revision
+        .metadata
+        .provenance
+        .as_ref()
+        .filter(|p| p.system == "git-sha1")
+    else {
+        return Ok(None);
+    };
+    gix::hash::oid::try_from_bytes(&provenance.object_id)
+        .map(|oid| Some(oid.to_owned()))
+        .map_err(|_| {
+            ExportError::Git(format!(
+                "revision {} has a malformed git-sha1 provenance ID",
+                revision.id()
+            ))
+        })
 }
 
 fn provenance_matches(revision: &wheat_core::RevisionRecord, oid: gix::ObjectId) -> bool {
@@ -696,6 +741,33 @@ fn write_commit(
         encoding: None,
         message: BString::from(message),
         extra_headers: Vec::new(),
+    })
+    .map(|id| id.into())
+    .map_err(git_error)
+}
+
+/// Write the annotated tag object `name` for `commit` from a label's stored annotation.
+///
+/// Every byte comes from the annotation, the name and the commit: no clock, config or
+/// signing key is read, so the tag has the same ID wherever it is written. The message
+/// ends with a newline, as `git tag -a` writes it.
+pub fn write_tag(
+    git: &gix::Repository,
+    commit: gix::ObjectId,
+    name: &str,
+    annotation: &wheat_core::LabelAnnotation,
+) -> Result<gix::ObjectId, ExportError> {
+    let mut message = annotation.message.clone();
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
+    git.write_object(&gix::objs::Tag {
+        target: commit,
+        target_kind: gix::objs::Kind::Commit,
+        name: BString::from(name),
+        tagger: Some(signature(&annotation.tagger, annotation.tagged_at)),
+        message: BString::from(message),
+        signature: None,
     })
     .map(|id| id.into())
     .map_err(git_error)

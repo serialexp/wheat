@@ -6,18 +6,38 @@ use std::{
 };
 
 use thiserror::Error;
-use wheat_core::{ChangeMapId, ViewId};
+use wheat_core::{ChangeMapId, LabelAnnotation, ViewId};
 use wheat_store::{ContentStore, ImmutableObjectStore};
 
 use crate::{
-    export::{ExportError, ExportOptions, ExportResult, export_revision_history},
+    export::{
+        ExportAnchor, ExportError, ExportOptions, ExportResult, export_revision_history, write_tag,
+    },
     push::{
-        PushError, PushMode, PushReport, RemoteState, cache_observed_ref, is_ancestor,
-        observe_remote_ref, push_ref,
+        PushError, PushMode, PushReport, RemoteState, cache_observed_ref, fetch_remote_heads,
+        is_ancestor, observe_remote_ref, observe_remote_tag, push_ref, push_tag,
+        remote_heads_contain,
     },
 };
 
 pub const PROJECTION_REF: &str = "refs/wheat/push";
+/// Local refs naming prepared tag objects, one per tag name.
+pub const TAG_SOURCE_PREFIX: &str = "refs/wheat/tags/";
+
+/// An annotated tag ready to create on a remote, or already there.
+#[derive(Debug)]
+pub struct PreparedTagPush {
+    pub projection_path: PathBuf,
+    pub source_ref: String,
+    /// Full remote ref, `refs/tags/<name>`.
+    pub tag_ref: String,
+    pub tag_object: gix::ObjectId,
+    pub commit: gix::ObjectId,
+    /// The remote already has exactly this tag object.
+    pub up_to_date: bool,
+    remote_url: String,
+    _lock: ProjectionLock,
+}
 
 #[derive(Debug)]
 pub struct PreparedPush {
@@ -47,6 +67,16 @@ pub enum BridgeError {
     EmptyProjection,
     #[error("prepared Git push was rejected: {0}")]
     Rejected(String),
+    #[error(
+        "tag {tag} would point at commit {commit}, which is on no branch of the remote; push the branch first"
+    )]
+    TagCommitNotOnRemoteBranch { tag: String, commit: String },
+    #[error("remote already has {tag} as tag object {remote}, not {local}; tags are never moved")]
+    TagExists {
+        tag: String,
+        remote: String,
+        local: String,
+    },
 }
 
 /// Prepare a deterministic Git projection without changing the remote.
@@ -74,7 +104,7 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         ..ExportOptions::default()
     };
     if let RemoteState::Present(oid) = &remote_state {
-        options.anchor = Some(oid.object_id()?);
+        options.anchor = ExportAnchor::Commit(oid.object_id()?);
     }
 
     let export =
@@ -83,7 +113,7 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         {
             Ok(export) => export,
             Err(ExportError::UnmatchedAnchor(_)) | Err(ExportError::MissingAnchor(_)) => {
-                options.anchor = None;
+                options.anchor = ExportAnchor::None;
                 let complete = export_revision_history(
                     objects, content, selected, base, changes, &git, &options,
                 )
@@ -138,6 +168,111 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         force_with_lease,
         _lock: lock,
     })
+}
+
+/// Prepare annotated tag `name` for `selected` without changing the remote.
+///
+/// The commit comes from one fixed rule, [`ExportAnchor::NewestImported`], so it
+/// depends only on the view, and the tag object only on that commit, the name and the
+/// stored `annotation`: the same label gives the same object IDs on any machine, any
+/// time. The tag is refused unless its commit is already reachable from a branch on
+/// the remote, which catches any drift between this rule and how the branch was
+/// pushed. An existing remote tag is accepted only if it is this exact tag object.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_tag_push<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    selected: ViewId,
+    base: ViewId,
+    changes: ChangeMapId,
+    annotation: &LabelAnnotation,
+    projection_path: &Path,
+    remote_url: &str,
+    name: &str,
+) -> Result<PreparedTagPush, BridgeError> {
+    let tag_ref = format!("refs/tags/{name}");
+    let lock = ProjectionLock::acquire(projection_path)?;
+    let remote_state = observe_remote_tag(remote_url, &tag_ref)?;
+    let git = open_or_initialize_bare(projection_path)?;
+    fetch_remote_heads(projection_path, remote_url)?;
+
+    let options = ExportOptions {
+        anchor: ExportAnchor::NewestImported,
+        ..ExportOptions::default()
+    };
+    let not_on_branch = |commit: gix::ObjectId| BridgeError::TagCommitNotOnRemoteBranch {
+        tag: tag_ref.clone(),
+        commit: commit.to_string(),
+    };
+    let export =
+        match export_revision_history(objects, content, selected, base, changes, &git, &options)
+            .await
+        {
+            Ok(export) => export,
+            // The imported commit is on no fetched branch, or it would be here.
+            Err(ExportError::MissingAnchor(commit)) => return Err(not_on_branch(commit)),
+            Err(error) => return Err(error.into()),
+        };
+    let commit = export.tip.ok_or(BridgeError::EmptyProjection)?;
+    if !remote_heads_contain(projection_path, commit)? {
+        return Err(not_on_branch(commit));
+    }
+    let tag_object = write_tag(&git, commit, name, annotation)?;
+    let up_to_date = match &remote_state {
+        RemoteState::Absent => false,
+        RemoteState::Present(remote) if remote.object_id()? == tag_object => true,
+        RemoteState::Present(remote) => {
+            return Err(BridgeError::TagExists {
+                tag: tag_ref,
+                remote: remote.as_str().into(),
+                local: tag_object.to_string(),
+            });
+        }
+    };
+    let source_ref = format!("{TAG_SOURCE_PREFIX}{name}");
+    git.reference(
+        source_ref.as_str(),
+        tag_object,
+        gix::refs::transaction::PreviousValue::Any,
+        "prepare Wheat Git tag",
+    )
+    .map_err(|error| BridgeError::Initialize {
+        path: projection_path.into(),
+        message: error.to_string(),
+    })?;
+
+    Ok(PreparedTagPush {
+        projection_path: projection_path.into(),
+        source_ref,
+        tag_ref,
+        tag_object,
+        commit,
+        up_to_date,
+        remote_url: remote_url.into(),
+        _lock: lock,
+    })
+}
+
+/// Create a prepared tag on the remote. Returns `None` when it was already there.
+pub fn publish_tag(prepared: PreparedTagPush) -> Result<Option<PushReport>, BridgeError> {
+    if prepared.up_to_date {
+        return Ok(None);
+    }
+    let report = push_tag(
+        &prepared.projection_path,
+        &prepared.remote_url,
+        &prepared.source_ref,
+        &prepared.tag_ref,
+    )?;
+    if !report.accepted() {
+        let detail = report.stderr.to_string_lossy();
+        return Err(BridgeError::Rejected(if detail.is_empty() {
+            "git did not accept the tag".into()
+        } else {
+            detail
+        }));
+    }
+    Ok(Some(report))
 }
 
 /// Publish an already-prepared projection to its explicitly selected destination.
