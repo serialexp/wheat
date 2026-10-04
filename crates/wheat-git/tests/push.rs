@@ -180,6 +180,43 @@ fn fast_forward_push_succeeds() {
     );
 }
 
+#[test]
+fn a_push_that_never_reaches_the_ref_update_reports_gits_failure() {
+    // Stands in for a remote that refuses before ref negotiation (an HTTP 401
+    // with no credentials, an unreachable host): git prints no porcelain line
+    // and the only account of why is its exit status and stderr.
+    let fixture = Fixture::new();
+    fixture.snapshot_projection();
+    let missing = fixture.remote.with_file_name("missing.git");
+
+    let error = push_ref(
+        &fixture.projection,
+        missing.to_str().unwrap(),
+        "refs/heads/main",
+        "refs/heads/main",
+        PushMode::Normal,
+    )
+    .unwrap_err();
+    match &error {
+        PushError::GitFailed {
+            operation,
+            status,
+            stderr,
+        } => {
+            assert_eq!(*operation, "push");
+            assert!(status.is_some_and(|code| code != 0), "{status:?}");
+            assert!(stderr.contains("missing.git"), "{stderr}");
+        }
+        other => panic!("expected GitFailed, got {other:?}"),
+    }
+    let message = error.to_string();
+    assert!(
+        message.starts_with("git push failed (exit status "),
+        "{message}"
+    );
+    assert!(message.contains("missing.git"), "{message}");
+}
+
 fn divergent_fixture() -> (Fixture, RemoteState, String) {
     let fixture = Fixture::new();
     git(Some(&fixture.work), &["branch", "remote-line"]);

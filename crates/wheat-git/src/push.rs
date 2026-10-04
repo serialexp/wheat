@@ -138,7 +138,7 @@ pub enum PushError {
         operation: &'static str,
         message: String,
     },
-    #[error("git {operation} failed with status {status:?}: {stderr}")]
+    #[error("git {operation} failed ({}): {}", describe_exit(*.status), .stderr.trim())]
     GitFailed {
         operation: &'static str,
         status: Option<i32>,
@@ -146,6 +146,13 @@ pub enum PushError {
     },
     #[error("invalid remote output: {0}")]
     InvalidRemoteOutput(String),
+}
+
+fn describe_exit(status: Option<i32>) -> String {
+    match status {
+        Some(code) => format!("exit status {code}"),
+        None => "terminated by a signal".into(),
+    }
 }
 
 /// Observe exactly one branch without adding or changing a configured remote.
@@ -540,8 +547,19 @@ fn push_validated(
     }
     let refs = parse_porcelain(&output.stdout.bytes)?;
     if refs.len() != 1 || refs[0].source != source || refs[0].destination != destination {
+        // A rejected ref still gets a porcelain line, so a failed push without one
+        // never reached the ref update: authentication, an unreachable remote, a
+        // transport error. Git's stderr is the only account of why.
+        if !output.status.success() {
+            return Err(PushError::GitFailed {
+                operation: "push",
+                status: output.status.code(),
+                stderr: output.stderr.to_string_lossy(),
+            });
+        }
         return Err(PushError::InvalidRemoteOutput(format!(
-            "git push did not report exactly the requested ref update {source}:{destination}"
+            "git push did not report exactly the requested ref update {source}:{destination}; stderr: {}",
+            output.stderr.to_string_lossy().trim()
         )));
     }
     Ok(PushReport {
