@@ -14,11 +14,11 @@ thread_local! {
 }
 
 use serde::{Deserialize, Serialize};
-use wheat_core::{
-    ContentId, FileKind,
-    text_capture::{CaptureKind, StreamingCapture},
-};
+#[cfg(unix)]
+use wheat_core::text_capture::{CaptureKind, StreamingCapture};
+use wheat_core::{ContentId, FileKind};
 
+#[cfg(unix)]
 const STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 const RAW_PREIMAGE_DOMAIN: &[u8] = b"wheat-workspace-raw-preimage-v1\0";
 
@@ -796,135 +796,57 @@ mod platform {
     }
 }
 
+/// Workspace files are read only through no-follow, descriptor-relative opens, which
+/// exist here only for Unix. Elsewhere every read fails, so a path-based read that
+/// could race or follow a symlink cannot be switched on by accident.
 #[cfg(not(unix))]
 mod platform {
-    use std::{ffi::OsStr, fs, io::Read, path::Path};
+    use std::{ffi::OsStr, io, path::Path};
 
     use super::{
-        CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, RawPreimage,
-        STREAM_SCRATCH_BYTES, StreamingCapture, WorkspaceFileError, WorkspaceFileSnapshot,
-        raw_preimage,
+        CanonicalWorkspaceFile, FileKind, RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot,
     };
 
+    fn unsupported<T>() -> Result<T, WorkspaceFileError> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workspace files can only be read safely on Unix",
+        )
+        .into())
+    }
+
     pub(super) fn analyze(
-        root: &Path,
-        components: &[&OsStr],
-        limit: usize,
-        retain_limit: usize,
+        _root: &Path,
+        _components: &[&OsStr],
+        _limit: usize,
+        _retain_limit: usize,
     ) -> Result<Option<CanonicalWorkspaceFile>, WorkspaceFileError> {
-        let mut current = root.to_path_buf();
-        for component in &components[..components.len() - 1] {
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(WorkspaceFileError::IntermediateSymlink);
-                }
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Err(WorkspaceFileError::UnsupportedFileType),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        current.push(components.last().expect("validated nonempty path"));
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if !metadata.is_file() {
-            return Err(WorkspaceFileError::UnsupportedFileType);
-        }
-        if metadata.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
-            return Err(WorkspaceFileError::TooLarge { limit });
-        }
-        let mut file = fs::File::open(current)?;
-        let mut capture = StreamingCapture::new(retain_limit);
-        let mut scratch = [0_u8; STREAM_SCRATCH_BYTES];
-        let mut raw_bytes = 0usize;
-        loop {
-            let read = file.read(&mut scratch)?;
-            if read == 0 {
-                break;
-            }
-            raw_bytes = raw_bytes
-                .checked_add(read)
-                .ok_or(WorkspaceFileError::TooLarge { limit })?;
-            if raw_bytes > limit {
-                return Err(WorkspaceFileError::TooLarge { limit });
-            }
-            capture.update(&scratch[..read]);
-        }
-        let result = capture.finish();
-        Ok(Some(CanonicalWorkspaceFile {
-            kind: FileKind::Regular,
-            content: ContentId::from_digest(result.digest),
-            bytes: result.bytes,
-            read_bytes: raw_bytes,
-            text: result.kind == CaptureKind::Text,
-            retained_text: result.retained,
-        }))
+        unsupported()
     }
 
     pub(super) fn observe(
-        root: &Path,
-        components: &[&OsStr],
-        limit: usize,
+        _root: &Path,
+        _components: &[&OsStr],
+        _limit: usize,
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
-        Ok(read(root, components, limit)?
-            .map(|snapshot| raw_preimage(snapshot.kind, &snapshot.bytes)))
+        unsupported()
     }
 
     pub(super) fn authenticate(
-        root: &Path,
-        components: &[&OsStr],
-        expected: Option<(FileKind, &[u8])>,
-        limit: usize,
+        _root: &Path,
+        _components: &[&OsStr],
+        _expected: Option<(FileKind, &[u8])>,
+        _limit: usize,
     ) -> Result<bool, WorkspaceFileError> {
-        Ok(match (read(root, components, limit)?, expected) {
-            (None, None) => true,
-            (Some(actual), Some((kind, bytes))) => actual.kind == kind && actual.bytes == bytes,
-            _ => false,
-        })
+        unsupported()
     }
 
     pub(super) fn read(
-        root: &Path,
-        components: &[&OsStr],
-        limit: usize,
+        _root: &Path,
+        _components: &[&OsStr],
+        _limit: usize,
     ) -> Result<Option<WorkspaceFileSnapshot>, WorkspaceFileError> {
-        let mut current = root.to_path_buf();
-        for component in &components[..components.len() - 1] {
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(WorkspaceFileError::IntermediateSymlink);
-                }
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Err(WorkspaceFileError::UnsupportedFileType),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        current.push(components.last().expect("validated nonempty path"));
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if !metadata.is_file() {
-            return Err(WorkspaceFileError::UnsupportedFileType);
-        }
-        let mut bytes = Vec::new();
-        fs::File::open(current)?
-            .take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
-            return Err(WorkspaceFileError::TooLarge { limit });
-        }
-        Ok(Some(WorkspaceFileSnapshot {
-            kind: FileKind::Regular,
-            bytes,
-        }))
+        unsupported()
     }
 }
 
@@ -933,6 +855,27 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::*;
+
+    #[cfg(not(unix))]
+    #[test]
+    fn every_read_is_refused_off_unix() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"bytes").unwrap();
+        let path = Path::new("file");
+        let unsupported = |error: WorkspaceFileError| match error {
+            WorkspaceFileError::Io(error) => error.kind() == io::ErrorKind::Unsupported,
+            _ => false,
+        };
+        assert!(unsupported(
+            read_workspace_file(root.path(), path, 64).unwrap_err()
+        ));
+        assert!(unsupported(
+            analyze_workspace_file(root.path(), path, 64, 64).unwrap_err()
+        ));
+        assert!(unsupported(
+            observe_workspace_file(root.path(), path, 64).unwrap_err()
+        ));
+    }
 
     #[cfg(unix)]
     #[test]

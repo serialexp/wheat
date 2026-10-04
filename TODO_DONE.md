@@ -4,6 +4,14 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **Non-Unix workspace reads follow symlinks (scanner only).** The
+  `#[cfg(not(unix))]` path in `workspace_files.rs` checked `symlink_metadata` and then
+  `File::open`ed, which races and follows symlinks. Every wheat command already stops
+  with `unsupported_platform` off Linux, so the code could not run. Done 2026-10-05:
+  that `platform` module now fails every read with `io::ErrorKind::Unsupported`, so
+  it cannot be switched on by accident (test `every_read_is_refused_off_unix`, which
+  runs only off Unix). Not compiled for a non-Unix target here: the only installed
+  one, WASI, fails first in `signal-hook-registry`.
 - `[x]` **wheat-server has no authentication or access control (confirmed).**
   `run_session` (`crates/wheat-server/src/connection.rs`) never looked at
   `ClientHello.auth_token`, so any client that could connect could open, fetch,

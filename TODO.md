@@ -11,10 +11,12 @@ are the scanner's word only and need checking before a fix.
 
 Security, most serious first:
 
-- `[ ]` **Non-Unix workspace reads follow symlinks (scanner only).** The
-  `#[cfg(not(unix))]` path in `workspace_files.rs` (around line 825) checks
-  `symlink_metadata` and then `File::open`s, which races and follows symlinks. Refuse
-  non-Unix until it has a no-follow, descriptor-relative walk.
+- `[ ]` **Other non-Unix fallbacks check and then open, or do not lock (2026-10-05).**
+  `workspace_registry.rs` and `rewrite_transaction.rs` refuse a symlink with
+  `symlink_metadata` and then open by path (the same race the workspace reads had),
+  and their non-Unix `lock_exclusive` / `unlock` / `try_lock` (and
+  `authoring_metadata.rs`'s) do nothing. Unreachable today, like the workspace reads
+  were. Same choice: error module, delete, or leave.
 
 Performance, most serious first:
 
