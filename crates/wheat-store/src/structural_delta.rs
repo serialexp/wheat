@@ -58,9 +58,9 @@ use wheat_core::{
 use crate::{
     ImmutableObjectStore, ObjectKind, ObjectStoreError, RetainedSetStore, StoredObject,
     object_graph::{
-        self, ApplicationSite, ConflictSite, ContentSetSite, EnvelopeSite, LabelSite,
-        MalformedRadix, ManifestSite, RadixKind, RadixNode, RadixSite, Ref, RevisionSite,
-        StateSite, TreeSite, ViewSite,
+        self, ApplicationSite, ChangeSite, ConflictSite, ContentSetSite, EditSite, EnvelopeSite,
+        LabelSite, MalformedRadix, ManifestSite, RadixKind, RadixNode, RadixSite, Ref,
+        RevisionSite, StateSite, TreeSite, ViewSite,
     },
     sets::CollectionError,
 };
@@ -1278,19 +1278,11 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Entity::Revision => self.follow_revision(&stored).await?,
             Entity::Application => self.follow_application(&stored).await?,
             Entity::Conflict => self.follow_conflict(&stored)?,
-            Entity::Edit => {
-                let edit = decode(&stored, wheat_core::decode_edit_record)?;
-                object_graph::edit(&edit, |reference| match reference {
-                    Ref::Object(site, _) => match site {},
-                    Ref::Content(_) => Ok::<_, StructuralDeltaError>(()),
-                })?;
-            }
-            Entity::Change => {
-                let change = decode(&stored, wheat_core::decode_change)?;
-                object_graph::change(&change, |reference| match reference {
-                    Ref::Object(site, _) => match site {},
-                    Ref::Content(_) => Ok::<_, StructuralDeltaError>(()),
-                })?;
+            // Edits and changes refer to no objects, so they are not decoded. These
+            // stop compiling if either gains an object reference.
+            Entity::Edit | Entity::Change => {
+                const _: fn(EditSite) -> ! = |site| match site {};
+                const _: fn(ChangeSite) -> ! = |site| match site {};
             }
         }
         Ok(self.emit(stored))
