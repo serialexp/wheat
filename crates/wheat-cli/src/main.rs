@@ -68,7 +68,7 @@ use local::{content_store, initialize, open, projection_path, revision_with_edit
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
 
 #[derive(Debug, Parser)]
-#[command(name = "wheat", about = "Wheat source control prototype")]
+#[command(name = "wheat", version, about = "Wheat source control prototype")]
 struct Cli {
     /// Explicit canonical Wheat store. Workspace discovery is used when omitted.
     #[arg(long, global = true)]

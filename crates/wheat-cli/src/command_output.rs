@@ -255,6 +255,15 @@ pub(crate) fn requested_format(args: &[std::ffi::OsString]) -> OutputFormat {
 
 pub(crate) fn clap_error(format: OutputFormat, error: clap::Error) -> ExitCode {
     use clap::error::ErrorKind;
+    if error.kind() == ErrorKind::DisplayVersion && format == OutputFormat::Json {
+        let success = Success::new(
+            "version",
+            json!({ "version": env!("CARGO_PKG_VERSION") }),
+            Vec::new(),
+        )
+        .expect("version is JSON serializable");
+        return emit_success(format, &success);
+    }
     if matches!(
         error.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion

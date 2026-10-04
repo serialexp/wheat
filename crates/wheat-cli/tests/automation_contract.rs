@@ -224,3 +224,24 @@ fn json_help_is_a_terminal_success_document() {
     assert_eq!(help["command"], "help");
     assert!(help["result"]["text"].as_str().unwrap().contains("Usage:"));
 }
+
+#[test]
+fn version_prints_the_package_version() {
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let expected = env!("CARGO_PKG_VERSION");
+
+    let human = command(root.path(), config.path(), &["--version"]);
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        format!("wheat {expected}\n")
+    );
+
+    let json = command(root.path(), config.path(), &["--format=json", "--version"]);
+    assert!(json.status.success());
+    let json = document(&json);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["command"], "version");
+    assert_eq!(json["result"]["version"], expected);
+}
