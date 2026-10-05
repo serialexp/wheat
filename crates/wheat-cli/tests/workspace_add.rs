@@ -175,6 +175,35 @@ fn repeated_add_normalizes_against_retained_authored_base_and_supports_undo() {
 }
 
 #[test]
+fn appending_to_a_file_twice_in_one_change_keeps_both_lines() {
+    let (dir, change, first) = setup();
+    fs::write(dir.path().join("file"), "top\nbar\nbottom\nv1\n").unwrap();
+    let second = ok(
+        dir.path(),
+        &["add", "--change", &change, "--predecessor", &first, "file"],
+    );
+    fs::write(dir.path().join("file"), "top\nbar\nbottom\nv1\nv2\n").unwrap();
+    ok(
+        dir.path(),
+        &[
+            "add",
+            "--change",
+            &change,
+            "--predecessor",
+            &field(&second, "revision"),
+            "file",
+        ],
+    );
+    let status = ok(dir.path(), &["--format=json", "status"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["result"]["changes"],
+        serde_json::json!([]),
+        "{status}"
+    );
+}
+
+#[test]
 fn independent_guarded_components_have_exact_lineage_and_undo_has_none() {
     let dir = tempfile::tempdir().unwrap();
     ok(dir.path(), &["init"]);

@@ -460,7 +460,9 @@ fn project_boundary_a(
             break;
         }
         if p <= x.write_a.end {
-            return Some(if p == x.write_a.start {
+            // A right boundary at a pure insertion includes the inserted bytes, as a
+            // left boundary there does by stopping before the insertion.
+            return Some(if p == x.write_a.start && !x.write_a.is_empty() {
                 x.write_b.start
             } else {
                 x.write_b.end

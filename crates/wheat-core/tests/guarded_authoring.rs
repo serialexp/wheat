@@ -62,6 +62,85 @@ fn repeated_add_consolidates_against_authored_base_and_undo_removes_edit() {
 }
 
 #[test]
+fn appending_again_after_an_append_consolidates() {
+    let limits = Limits::default();
+    let first = normalize(b"f 0\n", &[], b"f 0\n", b"f 0\nv1\n", None, limits).unwrap();
+    assert_applies("f 0\n", &first, "f 0\nv1\n", limits);
+    let next = normalize(
+        b"f 0\n",
+        &first,
+        b"f 0\nv1\n",
+        b"f 0\nv1\nv2\n",
+        None,
+        limits,
+    )
+    .unwrap();
+    assert_applies("f 0\n", &next, "f 0\nv1\nv2\n", limits);
+}
+
+/// Every way to change one line of `lines`: insert `new` at each position, replace
+/// each line with it, or delete each line.
+fn one_line_changes(lines: &[String], new: &str) -> Vec<Vec<String>> {
+    let mut changed = Vec::new();
+    for at in 0..=lines.len() {
+        let mut next = lines.to_vec();
+        next.insert(at, new.to_owned());
+        changed.push(next);
+    }
+    for at in 0..lines.len() {
+        let mut replaced = lines.to_vec();
+        replaced[at] = new.to_owned();
+        changed.push(replaced);
+        let mut deleted = lines.to_vec();
+        deleted.remove(at);
+        changed.push(deleted);
+    }
+    changed
+}
+
+#[test]
+fn every_three_rounds_of_one_line_changes_normalize_exactly() {
+    let limits = Limits::default();
+    let authored: Vec<String> = ["a\n", "b\n", "c\n"].map(String::from).into();
+    let authored_text = authored.concat();
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for first in one_line_changes(&authored, "x\n") {
+        for second in one_line_changes(&first, "y\n") {
+            for third in one_line_changes(&second, "z\n") {
+                let mut edits = Vec::new();
+                let mut baseline = authored_text.clone();
+                for workspace in [first.concat(), second.concat(), third.concat()] {
+                    match normalize(
+                        authored_text.as_bytes(),
+                        &edits,
+                        baseline.as_bytes(),
+                        workspace.as_bytes(),
+                        None,
+                        limits,
+                    ) {
+                        Ok(next) => edits = next,
+                        Err(error) => {
+                            failures.push(format!("{baseline:?} -> {workspace:?}: {error:?}"));
+                            break;
+                        }
+                    }
+                    assert_applies(&authored_text, &edits, &workspace, limits);
+                    baseline = workspace;
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failed: {failures:#?}",
+        failures.len()
+    );
+    assert!(checked > 1_000);
+}
+
+#[test]
 fn unchanged_add_preserves_definitions_and_wrong_baseline_is_rejected() {
     let limits = Limits::default();
     let first = normalize(b"old\n", &[], b"old\n", b"new\n", None, limits).unwrap();
