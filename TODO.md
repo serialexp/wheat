@@ -27,10 +27,6 @@ Performance, most serious first:
   `repository_transition.rs` (step 5) calls `content.get` for each added content ID
   only to see that it exists; `contains` would do, unless the read is meant to check
   the bytes.
-- `[ ]` **A wall-clock assertion in a test (2026-10-05).**
-  `representative_scale_update_is_linear_enough_for_interactive_use`
-  (`crates/wheat-store/tests/content_set_policy.rs`) asserts the update takes under
-  10 s. Rule: assert something countable, or move it to a bench case.
 - `[ ]` **Every command syncs every ancestor of the store (2026-10-05).**
   `PackedCatalog::open_with_target` (`packed/catalog.rs`) calls
   `sync_created_ancestors` on each open, which syncs every directory from
@@ -39,10 +35,19 @@ Performance, most serious first:
 - `[ ]` **`wheat status` rewrites the workspace pin (2026-10-05).** Registry
   reconciliation writes and syncs `workspaces/<id>.json` (and its directory) on
   every command, including read-only ones. Write it only when it changes.
-- `[ ]` **wheat-server does blocking disk work on async threads (scanner only).**
-  Publication, packed-object and content stores are synchronous and called straight
-  from Tokio tasks in `connection.rs`, `publish.rs` and `fetch.rs`. Move them onto
-  `spawn_blocking` or give them async drivers.
+- `[ ]` **Materialization still syncs every staged file (2026-10-05).** After
+  batching, a switch replacing 20,000 files takes about 6.4 s, about 4 s of it the
+  staged files' own fsyncs (32 at a time). One `syncfs` per batch would replace
+  them, but it flushes the whole filesystem, so on a busy disk it may cost more.
+  Needs Bart's call; measure with bench `materialize_wide`.
+- `[ ]` **wheat-server does blocking disk work on async threads (confirmed
+  2026-10-05).** Publication, packed-object and content stores are synchronous and
+  called straight from Tokio tasks in `connection.rs`, `publish.rs` and `fetch.rs`
+  (about 20 sites); only the S3 store uses `block_in_place`. The CLI runs a
+  current-thread runtime, where `block_in_place` panics, so it cannot simply go
+  inside the shared stores. Options put to Bart: `block_in_place` at the server's
+  call sites; `spawn_blocking` inside the stores (a handoff per get); or each
+  handler's store work as one blocking job talking to the connection over channels.
 - `[ ]` **`wheat status` re-reads and re-hashes every file (scanner only).**
   `workspace_scan.rs` has no saved stat cache (mtime, ctime, size, inode, content ID),
   so every status reads all tracked files and their baselines, and fails once the

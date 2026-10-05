@@ -34,6 +34,14 @@ Finished items, moved here from `TODO.md` under the same headings.
   it was given (`wheat init`, bench fixtures); it now stores the closure with one
   `put_batch` (test `preparation_stores_the_closure_in_one_batch`). Two constant
   per-command costs found on the way are in `TODO.md`.
+- `[x]` **A wall-clock assertion in a test (2026-10-05).**
+  `representative_scale_update_is_linear_enough_for_interactive_use`
+  (`crates/wheat-store/tests/content_set_policy.rs`) asserted the update takes under
+  10 s. Done 2026-10-05: the merge is one pass over sorted members and edits, so
+  what could grow is store traffic. The test, now
+  `representative_scale_update_reads_and_writes_one_object`, counts it: one read and
+  one write for a 10,000-edit update of 100,000 members. No other test asserts on
+  wall time.
 - `[x]` **Non-Unix workspace reads follow symlinks (scanner only).** The
   `#[cfg(not(unix))]` path in `workspace_files.rs` checked `symlink_metadata` and then
   `File::open`ed, which races and follows symlinks. Every wheat command already stops

@@ -1,9 +1,14 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
+use async_trait::async_trait;
 use object_store::memory::InMemory;
-use wheat_core::{ContentId, ContentSetBlob, ContentSetId};
+use wheat_core::{ContentId, ContentSetBlob, ContentSetId, ObjectId};
 use wheat_store::{
     CollectionError, ContentSetStore, ImmutableObjectStore, ObjectStoreAdapter, ObjectStoreError,
+    StoredObject,
 };
 
 fn content_id(value: u64) -> ContentId {
@@ -261,12 +266,19 @@ async fn equivalent_batches_are_deterministic() {
 }
 
 #[tokio::test]
-async fn representative_scale_update_is_linear_enough_for_interactive_use() {
-    let objects = store("content-set-scale");
+async fn representative_scale_update_reads_and_writes_one_object() {
+    // The merge itself is one pass over the sorted members and edits; the store
+    // traffic must not grow with them either.
+    let objects = CountingStore {
+        inner: store("content-set-scale"),
+        gets: AtomicUsize::new(0),
+        puts: AtomicUsize::new(0),
+    };
     let sets = ContentSetStore::new(&objects);
     let members: Vec<_> = (0..100_000).map(content_id).collect();
     let root = sets.write_snapshot(&members).await.unwrap();
-    let started = Instant::now();
+    objects.gets.store(0, Ordering::Relaxed);
+    objects.puts.store(0, Ordering::Relaxed);
     let changed = sets
         .update_batch(
             root,
@@ -274,11 +286,42 @@ async fn representative_scale_update_is_linear_enough_for_interactive_use() {
         )
         .await
         .unwrap();
-    let elapsed = started.elapsed();
 
+    assert_eq!(objects.gets.load(Ordering::Relaxed), 1);
+    assert_eq!(objects.puts.load(Ordering::Relaxed), 1);
     assert_eq!(sets.resolve(changed).await.unwrap().len(), 90_000);
-    assert!(
-        elapsed.as_secs_f32() < 10.0,
-        "100k-member/10k-edit update took {elapsed:?}"
-    );
+}
+
+/// Counts the reads and writes that reach the store.
+struct CountingStore {
+    inner: ObjectStoreAdapter,
+    gets: AtomicUsize,
+    puts: AtomicUsize,
+}
+
+#[async_trait]
+impl ImmutableObjectStore for CountingStore {
+    async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+        self.puts.fetch_add(1, Ordering::Relaxed);
+        self.inner.put_if_absent(id, bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.puts.fetch_add(objects.len(), Ordering::Relaxed);
+        self.inner.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        self.inner.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.gets.fetch_add(ids.len(), Ordering::Relaxed);
+        self.inner.exists_many(ids).await
+    }
 }
