@@ -1,4 +1,4 @@
-use std::{fs, io::Write, os::unix::fs::MetadataExt};
+use std::{fs, io::Write};
 
 use rusqlite::{Connection, params};
 
@@ -341,6 +341,9 @@ fn deferred_many_tiny_batches_read_through_and_finalize_one_tail_on_close() {
 
 #[test]
 fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
     let root = tempfile::tempdir().unwrap();
     let values = [
         record(b"roll one"),
@@ -360,6 +363,7 @@ fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
         .unwrap()
         .unwrap()
         .path();
+    #[cfg(unix)]
     let first_pack_inode = fs::metadata(&first_pack).unwrap().ino();
     let first_pack_bytes = fs::read(&first_pack).unwrap();
     // Each following append rolls the preceding pack; the last remains mutable.
@@ -370,6 +374,7 @@ fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
         3
     );
     assert_eq!(head_snapshot(root.path()).segments.len(), 3);
+    #[cfg(unix)]
     assert_eq!(fs::metadata(&first_pack).unwrap().ino(), first_pack_inode);
     assert_eq!(fs::read(&first_pack).unwrap(), first_pack_bytes);
 }

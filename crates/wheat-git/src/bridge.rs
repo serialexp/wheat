@@ -362,18 +362,12 @@ impl ProjectionLock {
             path: lock_path.clone(),
             message: error.to_string(),
         })?;
-        let result = unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&file),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        };
-        if result != 0 {
-            let error = std::io::Error::last_os_error();
-            let message = if error.kind() == std::io::ErrorKind::WouldBlock {
-                "another Wheat Git projection is already in progress".into()
-            } else {
-                error.to_string()
+        if let Err(error) = file.try_lock() {
+            let message = match error {
+                std::fs::TryLockError::WouldBlock => {
+                    "another Wheat Git projection is already in progress".into()
+                }
+                std::fs::TryLockError::Error(error) => error.to_string(),
             };
             return Err(BridgeError::Lock {
                 path: lock_path,
@@ -386,7 +380,7 @@ impl ProjectionLock {
 
 impl Drop for ProjectionLock {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN) };
+        let _ = self.file.unlock();
     }
 }
 

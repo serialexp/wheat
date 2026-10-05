@@ -1,4 +1,4 @@
-use std::{fs::File, io, os::fd::AsRawFd, path::Path};
+use std::{fs::File, io, path::Path};
 
 /// Persistence policy for filesystem-backed stores.
 ///
@@ -30,8 +30,12 @@ impl Durability {
 
 /// Waits until every dirty write on the filesystem containing `path` is durable.
 ///
-/// This is the terminal dependency barrier used by isolated atomic imports.
+/// This is the terminal dependency barrier used by isolated atomic imports. Only
+/// Linux has `syncfs`; elsewhere this fails rather than sync less than it promises.
+#[cfg(target_os = "linux")]
 pub fn sync_filesystem(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
     let file = File::open(path)?;
     let result = unsafe { libc::syncfs(file.as_raw_fd()) };
     if result == 0 {
@@ -39,6 +43,14 @@ pub fn sync_filesystem(path: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sync_filesystem(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "syncing a whole filesystem needs Linux's syncfs",
+    ))
 }
 
 pub fn sync_directory(path: &Path) -> io::Result<()> {

@@ -1,7 +1,6 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
-    os::fd::AsRawFd,
     path::PathBuf,
 };
 
@@ -143,9 +142,9 @@ impl LocalPublicationStore {
             .create(true)
             .truncate(false)
             .open(&self.lock_path)?;
-        lock_exclusive(&lock)?;
+        lock.lock()?;
         let result = operation();
-        let unlock_result = unlock(&lock);
+        let unlock_result = lock.unlock();
         match (result, unlock_result) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), _) => Err(error),
@@ -182,13 +181,13 @@ impl LocalPublicationStore {
             .create(true)
             .truncate(false)
             .open(&self.lock_path)?;
-        lock_exclusive(&lock)?;
+        lock.lock()?;
         let result = match self.read_unlocked() {
             Ok(actual) if actual == expected => operation(),
             Ok(_) => Err(crate::RepackError::StaleAuthority),
             Err(error) => Err(crate::RepackError::Authority(error.to_string())),
         };
-        let unlock_result = unlock(&lock);
+        let unlock_result = lock.unlock();
         match (result, unlock_result) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), _) => Err(error),
@@ -256,23 +255,5 @@ impl PublicationStore for LocalPublicationStore {
             }
             self.write_unlocked(proposed)
         })
-    }
-}
-
-fn lock_exclusive(file: &File) -> Result<(), io::Error> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn unlock(file: &File) -> Result<(), io::Error> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
     }
 }

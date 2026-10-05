@@ -9,7 +9,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -2996,16 +2995,10 @@ fn digest32(value: Vec<u8>) -> Result<[u8; 32], CatalogError> {
 }
 
 fn try_lock_exclusive(file: &File) -> Result<(), CatalogError> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EWOULDBLOCK) || error.raw_os_error() == Some(libc::EAGAIN)
-    {
-        Err(CatalogError::Busy)
-    } else {
-        Err(CatalogError::Io(error))
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(CatalogError::Busy),
+        Err(std::fs::TryLockError::Error(error)) => Err(CatalogError::Io(error)),
     }
 }
 

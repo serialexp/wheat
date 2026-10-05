@@ -1,11 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    ffi::{CString, OsStr, OsString},
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-    },
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -24,7 +22,7 @@ use super::{
 
 const MARKER_NAME: &str = "import.marker";
 const MARKER: &[u8] = b"wheat-atomic-import-v1\n";
-const STAGE_SUFFIX: &[u8] = b".tmp";
+const STAGE_SUFFIX: &str = ".tmp";
 
 /// Stable coarse boundaries and bounded progress emitted by a traced atomic import.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,7 +179,7 @@ where
 
     let mut staging_name = stage_prefix.clone();
     staging_name.push(Uuid::new_v4().to_string());
-    staging_name.push(OsStr::from_bytes(STAGE_SUFFIX));
+    staging_name.push(STAGE_SUFFIX);
     let staging = parent.join(staging_name);
     fs::create_dir(&staging)?;
     let mut cleanup = StageCleanup::new(staging.clone());
@@ -384,24 +382,24 @@ fn private_lock_name(destination_name: &OsStr) -> OsString {
 
 fn write_stage_marker(staging: &Path) -> io::Result<()> {
     let marker_path = staging.join(MARKER_NAME);
-    let mut marker = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(marker_path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut marker = options.open(marker_path)?;
     marker.write_all(MARKER)?;
     marker.sync_all()?;
     sync_directory(staging)
 }
 
 fn remove_stale_stages(parent: &Path, prefix: &OsStr) -> io::Result<()> {
-    let prefix = prefix.as_bytes();
+    let prefix = prefix.as_encoded_bytes();
     let mut removed_any = false;
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
         let name = entry.file_name();
-        let name = name.as_bytes();
-        if !name.starts_with(prefix) || !name.ends_with(STAGE_SUFFIX) {
+        let name = name.as_encoded_bytes();
+        if !name.starts_with(prefix) || !name.ends_with(STAGE_SUFFIX.as_bytes()) {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -417,6 +415,14 @@ fn remove_stale_stages(parent: &Path, prefix: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+/// Off Unix a marker cannot be opened without following a symlink, so no
+/// directory counts as a stage and none is removed.
+#[cfg(not(unix))]
+fn has_exact_stage_marker(_candidate: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn has_exact_stage_marker(candidate: &Path) -> bool {
     let marker = match OpenOptions::new()
         .read(true)
@@ -450,18 +456,10 @@ impl DestinationLock {
             .read(true)
             .write(true)
             .open(&path)?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result == 0 {
-            Ok(Self { _file: file })
-        } else {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK)
-                || error.raw_os_error() == Some(libc::EAGAIN)
-            {
-                Err(AtomicImportError::AlreadyLocked(path))
-            } else {
-                Err(error.into())
-            }
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => Err(AtomicImportError::AlreadyLocked(path)),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
 }
@@ -488,7 +486,18 @@ impl Drop for StageCleanup {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "renaming without replacing needs Linux's renameat2",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
     let source = CString::new(source.as_os_str().as_bytes())?;
     let destination = CString::new(destination.as_os_str().as_bytes())?;
     let result = unsafe {

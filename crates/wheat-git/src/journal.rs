@@ -7,7 +7,6 @@ use std::{
     collections::HashSet,
     fs::{File, OpenOptions},
     io,
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
 
@@ -95,14 +94,12 @@ impl ImportJournal {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        if unsafe { libc::flock(ownership.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK)
-                || error.raw_os_error() == Some(libc::EAGAIN)
-            {
+        match ownership.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(JournalError::AlreadyOwned(lock_path));
             }
-            return Err(error.into());
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
 
         let connection = Connection::open(path)?;
