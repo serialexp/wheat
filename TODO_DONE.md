@@ -42,6 +42,12 @@ Finished items, moved here from `TODO.md` under the same headings.
   `representative_scale_update_reads_and_writes_one_object`, counts it: one read and
   one write for a 10,000-edit update of 100,000 members. No other test asserts on
   wall time.
+- `[x]` **`wheat status` rewrites the workspace pin (2026-10-05).** Registry
+  reconciliation wrote and synced `workspaces/<id>.json` and its directory on every
+  command, including read-only ones (about 4.6 ms on NVMe). Done 2026-10-05:
+  `WorkspaceRegistry::publish` leaves an identical pin alone and only syncs the
+  directory, which keeps an earlier rename durable if its sync was cut off (test
+  `publishing_an_unchanged_pin_leaves_the_document_alone`).
 - `[x]` **Non-Unix workspace reads follow symlinks (scanner only).** The
   `#[cfg(not(unix))]` path in `workspace_files.rs` checked `symlink_metadata` and then
   `File::open`ed, which races and follows symlinks. Every wheat command already stops

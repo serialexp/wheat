@@ -27,14 +27,17 @@ Performance, most serious first:
   `repository_transition.rs` (step 5) calls `content.get` for each added content ID
   only to see that it exists; `contains` would do, unless the read is meant to check
   the bytes.
-- `[ ]` **Every command syncs every ancestor of the store (2026-10-05).**
+- `[ ]` **Read-only commands still sync (2026-10-05).**
   `PackedCatalog::open_with_target` (`packed/catalog.rs`) calls
   `sync_created_ancestors` on each open, which syncs every directory from
-  `storage/packed` up to `/`, whether or not it created anything: 7 syncs per
-  command in a store under `/tmp/x`. Sync only what `create_dir_all` made.
-- `[ ]` **`wheat status` rewrites the workspace pin (2026-10-05).** Registry
-  reconciliation writes and syncs `workspaces/<id>.json` (and its directory) on
-  every command, including read-only ones. Write it only when it changes.
+  `storage/packed` up to `/`, whether or not it created anything. Measured on NVMe
+  ext4: the extra ancestors cost about 2 µs each; the first sync of a run costs
+  2–9 ms because it flushes the drive's cache of everything the system wrote
+  since the last flush (a bare `fsync` of an untouched directory does the same).
+  So `wheat status` pays one drive flush. Re-syncing on open also makes durable a
+  directory an earlier, interrupted open created, so dropping it for read-only
+  commands needs a decision: only sync what this open created, or sync only before
+  the first write.
 - `[ ]` **Materialization still syncs every staged file (2026-10-05).** After
   batching, a switch replacing 20,000 files takes about 6.4 s, about 4 s of it the
   staged files' own fsyncs (32 at a time). One `syncfs` per batch would replace

@@ -244,6 +244,12 @@ impl WorkspaceRegistry {
                     existing.workspace_path.display()
                 );
             }
+            if existing == *pin {
+                // Most commands publish the pin they read. Syncing the directory
+                // still makes an earlier rename durable if its sync was cut off.
+                open_directory_no_follow(&directory)?.sync_all()?;
+                return Ok(());
+            }
         }
         let mut bytes = serde_json::to_vec_pretty(pin)?;
         bytes.push(b'\n');
@@ -542,6 +548,33 @@ mod tests {
         registry.publish(&replacement).unwrap();
         assert_eq!(registry.read(workspace_id).unwrap(), replacement);
         assert_eq!(registry.enumerate().unwrap(), vec![replacement]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publishing_an_unchanged_pin_leaves_the_document_alone() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (root, registry, store_id) = registry();
+        let workspace_id = Uuid::now_v7();
+        let first = pin(store_id, workspace_id, 1);
+        registry.publish(&first).unwrap();
+        let path = root
+            .path()
+            .join(REGISTRY_DIRECTORY)
+            .join(document_name(workspace_id));
+        // A replacement is a new file renamed into place, so it has a new inode.
+        let inode = fs::metadata(&path).unwrap().ino();
+
+        registry.publish(&first).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+
+        let mut changed = pin(store_id, workspace_id, 7);
+        changed.registration_token = first.registration_token;
+        changed.workspace_path.clone_from(&first.workspace_path);
+        registry.publish(&changed).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(registry.read(workspace_id).unwrap(), changed);
     }
 
     #[test]
