@@ -48,6 +48,13 @@ Finished items, moved here from `TODO.md` under the same headings.
   `WorkspaceRegistry::publish` leaves an identical pin alone and only syncs the
   directory, which keeps an earlier rename durable if its sync was cut off (test
   `publishing_an_unchanged_pin_leaves_the_document_alone`).
+- `[x]` **`MerkleTreeStore::apply_edits` re-reads the node it just wrote (scanner
+  only).** `merkle_tree.rs` decoded the child node only to check whether it is
+  empty. Confirmed and done 2026-10-05: also, a new directory was written as an
+  empty node and read back before recursing. The recursion now works on decoded
+  nodes: each existing directory on an edited path is read once, nothing written is
+  read back, and directories left empty are never written. Test
+  `apply_edits_reads_each_existing_directory_once`.
 - `[x]` **Non-Unix workspace reads follow symlinks (scanner only).** The
   `#[cfg(not(unix))]` path in `workspace_files.rs` checked `symlink_metadata` and then
   `File::open`ed, which races and follows symlinks. Every wheat command already stops

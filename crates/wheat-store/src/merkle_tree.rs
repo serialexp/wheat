@@ -1192,7 +1192,18 @@ where
         if edits.is_empty() {
             return Ok(root);
         }
-        let mut root_node = self.read_node(root).await?;
+        let root_node = self.read_node(root).await?;
+        let root_node = self.edit_node(root_node, edits).await?;
+        self.write_node(&root_node).await
+    }
+
+    /// Applies `edits` to `node` and returns the result unwritten. Every changed
+    /// directory below it is written, except those left empty, which are dropped.
+    async fn edit_node(
+        &self,
+        mut node: DirectoryNode,
+        edits: &[TreeEdit],
+    ) -> Result<DirectoryNode, MerkleTreeError> {
         let mut grouped = BTreeMap::<String, Vec<TreeEdit>>::new();
         for edit in edits {
             let Some((first, rest)) = edit.path.split_first() else {
@@ -1212,31 +1223,29 @@ where
                 }
                 match edit.value {
                     Some(value) => {
-                        root_node.entries.insert(name, DirectoryEntry::File(value));
+                        node.entries.insert(name, DirectoryEntry::File(value));
                     }
                     None => {
-                        root_node.entries.remove(&name);
+                        node.entries.remove(&name);
                     }
                 }
                 continue;
             }
 
-            let child = match root_node.entries.get(&name) {
-                Some(DirectoryEntry::Directory(id)) => *id,
+            let child = match node.entries.get(&name) {
+                Some(DirectoryEntry::Directory(id)) => self.read_node(*id).await?,
                 Some(DirectoryEntry::File(_)) => return Err(MerkleTreeError::FileInPath(name)),
-                None => self.empty_root().await?,
+                None => DirectoryNode::default(),
             };
-            let child = Box::pin(self.apply_edits(child, &child_edits)).await?;
-            let child_node = self.read_node(child).await?;
-            if child_node.entries.is_empty() {
-                root_node.entries.remove(&name);
+            let child = Box::pin(self.edit_node(child, &child_edits)).await?;
+            if child.entries.is_empty() {
+                node.entries.remove(&name);
             } else {
-                root_node
-                    .entries
-                    .insert(name, DirectoryEntry::Directory(child));
+                let child = self.write_node(&child).await?;
+                node.entries.insert(name, DirectoryEntry::Directory(child));
             }
         }
-        self.write_node(&root_node).await
+        Ok(node)
     }
 
     /// Apply mixed deletions and insertions as one final-tree update.

@@ -495,6 +495,52 @@ async fn walk_files_accepts_exact_limits_and_rejects_one_over() {
 }
 
 #[tokio::test]
+async fn apply_edits_reads_each_existing_directory_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::new(directory.path()));
+    let trees = MerkleTreeStore::new(&objects);
+    let root = trees
+        .apply_edits(
+            trees.empty_root().await.unwrap(),
+            &[
+                edit(&["src", "deep", "a"], Some("a")),
+                edit(&["src", "deep", "b"], Some("b")),
+                edit(&["docs", "readme"], Some("docs")),
+            ],
+        )
+        .await
+        .unwrap();
+    // Only the root existed; the new directories are built in memory.
+    assert_eq!(objects.reads(), 1);
+
+    let before = objects.reads();
+    let edited = trees
+        .apply_edits(
+            root,
+            &[
+                edit(&["src", "deep", "a"], Some("a2")),
+                edit(&["src", "new", "c"], Some("c")),
+                edit(&["docs", "readme"], None),
+            ],
+        )
+        .await
+        .unwrap();
+    // The root, `src`, `src/deep` and `docs`; nothing written is read back.
+    assert_eq!(objects.reads() - before, 4);
+
+    let edited = trees.read_node(edited).await.unwrap();
+    assert!(!edited.entries.contains_key("docs"));
+    let DirectoryEntry::Directory(src) = edited.entries["src"] else {
+        panic!("src is a directory");
+    };
+    let src = trees.read_node(src).await.unwrap();
+    assert_eq!(
+        src.entries.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["deep", "new"]
+    );
+}
+
+#[tokio::test]
 async fn walk_path_distinguishes_kinds_is_lexical_and_confines_reads() {
     let directory = tempfile::tempdir().unwrap();
     let objects = LooseObjectStore::new(directory.path());

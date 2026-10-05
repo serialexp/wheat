@@ -62,9 +62,6 @@ Performance, most serious first:
   `staged_import.rs` (`verify_mapping`) and `workspace.rs` (around line 103) read
   edits with `reader.edit(id)` per edit. Use batch reads. (The per-path lookups in
   `verify_mapping` share one walk since 2026-09-26; check `workspace.rs`.)
-- `[ ]` **`MerkleTreeStore::apply_edits` re-reads the node it just wrote (scanner
-  only).** `merkle_tree.rs` around line 1230 decodes the child node only to check
-  whether it is empty. Return that from the recursive call instead.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 
