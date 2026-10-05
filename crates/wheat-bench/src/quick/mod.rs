@@ -16,9 +16,11 @@ mod checkpoint_stack;
 mod content_repack_plan;
 mod deep_stack;
 mod fetch_incremental;
+mod git;
 mod git_export_notes;
 mod history;
 mod import_resume_wide;
+mod materialize_wide;
 mod packed_append;
 mod publish_content;
 mod server;
@@ -60,6 +62,7 @@ pub const CASES: &[&str] = &[
     fetch_incremental::NAME,
     snapshot_export::NAME,
     import_resume_wide::NAME,
+    materialize_wide::NAME,
 ];
 
 /// How big the cases are.
@@ -201,6 +204,7 @@ pub fn run_case(
         fetch_incremental::NAME => fetch_incremental::run(&context),
         snapshot_export::NAME => snapshot_export::run(&context),
         import_resume_wide::NAME => import_resume_wide::run(&context),
+        materialize_wide::NAME => materialize_wide::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

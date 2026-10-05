@@ -25,22 +25,36 @@ pub(crate) struct Workspace {
 impl Workspace {
     /// Initializes a workspace in the case's scratch directory, with a fixed actor.
     pub(crate) fn new(context: &CaseContext) -> Result<Self> {
-        let root = context.scratch.join("workspace");
+        let workspace = Self::configure(context)?;
+        workspace.ok(&["init", path_text(&workspace.root)?])?;
+        Ok(workspace)
+    }
+
+    /// Imports the Git repository `source` into a workspace in the case's scratch
+    /// directory, with a fixed actor, and measures the import.
+    pub(crate) fn import(context: &CaseContext, source: &Path) -> Result<(Self, Captured)> {
+        let workspace = Self::configure(context)?;
+        let captured = workspace.ok_in(
+            &context.scratch,
+            &["import", path_text(source)?, path_text(&workspace.root)?],
+        )?;
+        Ok((workspace, captured))
+    }
+
+    fn configure(context: &CaseContext) -> Result<Self> {
         let config = context.scratch.join("config");
         fs::create_dir_all(config.join("wheat"))?;
         fs::write(
             config.join("wheat/config.json"),
             r#"{"format":"wheat-config","version":1,"actor":{"name":"Wheat Bench","email":"wheat-bench@example.invalid"}}"#,
         )?;
-        let workspace = Self {
+        Ok(Self {
             wheat: context.wheat.clone(),
             scratch: context.scratch.clone(),
             stores: context.scratch.join("stores"),
             config,
-            root,
-        };
-        workspace.ok(&["init", path_text(&workspace.root)?])?;
-        Ok(workspace)
+            root: context.scratch.join("workspace"),
+        })
     }
 
     /// Runs `wheat --workspace <root> <arguments>`, which must succeed, and measures it.

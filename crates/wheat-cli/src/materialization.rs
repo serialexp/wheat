@@ -55,9 +55,17 @@ pub(crate) const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 // ContentStore currently returns owned Vecs. A replacement needs old and new
 // bytes concurrently to authenticate both sides of an exchange; workspace,
 // staged, and displaced regular files are streamed through a fixed 64 KiB
-// scratch buffer and add no file-sized allocation. Thus peak owned file content
-// is exactly two bounded store buffers (one when content IDs are equal).
+// scratch buffer and add no file-sized allocation. A batch keeps its installs'
+// store buffers from staging until they are applied, and is closed before its
+// buffers would pass this bound, so peak owned file content stays within it.
 const MAX_OPERATION_RESIDENT_BYTES: u64 = 2 * MAX_FILE_BYTES as u64;
+/// The most installs staged, recorded and synced together. An abort looks for
+/// staged but unrecorded leaves only this far past the recorded intents.
+const MAX_BATCH_INSTALLS: usize = 256;
+/// Threads that write and sync a batch's staged files, so the filesystem can
+/// commit several syncs at once. Importing 4,096 small files on NVMe ext4 took
+/// 3.7 s with 8, 1.3 s with 32 and 1.3 s with 64 (2026-10-05).
+const STAGING_WORKERS: usize = 32;
 #[cfg(test)]
 static TEST_PEAK_OWNED_CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -1413,98 +1421,356 @@ fn roll_forward(
         }
     }
     checkpoint("structural-recheck-complete")?;
-    // Intent records are contiguous and each operation is fully settled before the
-    // next record. Only the final recorded operation can have been interrupted.
-    let resume_at = completed.saturating_sub(1);
-    for (index, install) in journal.installs.iter().enumerate().skip(resume_at) {
-        // Content residency is bounded to this operation. If old and new have the
-        // same content ID, retain one copy and share it between both descriptors.
-        let old_content = install
-            .old
-            .map(|value| repository.content.get(value.content))
-            .transpose()?;
-        let shared_content = install
-            .old
-            .zip(install.new)
-            .is_some_and(|(old, new)| old.content == new.content);
-        let new_content = if shared_content {
-            None
-        } else {
-            install
-                .new
-                .map(|value| repository.content.get(value.content))
-                .transpose()?
-        };
-        for bytes in [old_content.as_ref(), new_content.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            ensure!(
-                bytes.len() <= MAX_FILE_BYTES,
-                "materialized file exceeds byte limit"
-            );
-        }
-        let resident_bytes = old_content
-            .as_ref()
-            .map_or(0_u64, |bytes| bytes.len() as u64)
-            .checked_add(
-                new_content
-                    .as_ref()
-                    .map_or(0_u64, |bytes| bytes.len() as u64),
-            )
-            .context("materialization resident byte count overflow")?;
-        ensure!(
-            resident_bytes <= MAX_OPERATION_RESIDENT_BYTES,
-            "materialization operation exceeds resident byte limit"
-        );
-        #[cfg(test)]
-        TEST_PEAK_OWNED_CONTENT_BYTES.fetch_max(resident_bytes as usize, Ordering::Relaxed);
-        let old_bytes = old_content.as_deref();
-        let new_bytes = if shared_content {
-            old_bytes
-        } else {
-            new_content.as_deref()
-        };
-        let has_intent = index < completed;
-        if !has_intent {
-            prepare_install(root, tx, install, old_bytes, new_bytes, planner)?;
-            checkpoint("staged")?;
-            append_install_intent(progress, journal.transaction_id, index)?;
-            checkpoint("intent-persisted")?;
-            if install.empty_directory {
-                let (parent, name) = open_parent(root, &install.path)?;
-                checkpoint("before-empty-directory-removal")?;
-                match remove_directory_if_exists(&parent, name) {
-                    Ok(()) => {}
-                    Err(error) if is_directory_not_empty(&error) => {
-                        return Err(invalidated_install(
-                            install,
-                            format!(
-                                "refusing to replace nonempty workspace directory {:?}",
-                                install.path
-                            ),
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                }
-                parent.sync_all()?;
-                checkpoint("empty-directory-removed")?;
-            }
-        }
-        apply_or_recover_install(root, tx, install, old_bytes, new_bytes, planner)?;
-        checkpoint("installed")?;
+    // A batch's intents are recorded together, and its renames become durable only
+    // once the whole batch is applied, so any install of the last recorded batch
+    // may have been interrupted. Settle each of them again, one at a time.
+    let mut syncs = BatchSyncs::default();
+    if state.batch_start < completed {
+        let settled = (state.batch_start..completed).try_for_each(|index| {
+            let loaded = load_install(repository, index, &journal.installs[index])?;
+            #[cfg(test)]
+            TEST_PEAK_OWNED_CONTENT_BYTES
+                .fetch_max(loaded.resident_bytes as usize, Ordering::Relaxed);
+            apply_loaded(root, tx, &loaded, planner, &mut syncs)?;
+            checkpoint("installed")
+        });
+        syncs.flush(tx)?;
+        settled?;
+        checkpoint("batch-synced")?;
     }
-    Ok(false)
+    let mut batches = Batcher {
+        repository,
+        installs: &journal.installs,
+        next: completed,
+        carried: None,
+    };
+    loop {
+        let mut batch = batches.next_batch()?;
+        if batch.is_empty() {
+            return Ok(false);
+        }
+        let (prepared, failure) = stage_batch(root, tx, &batch, planner)?;
+        batch.truncate(prepared);
+        let Some(last) = batch.last() else {
+            return match failure {
+                Some(error) => Err(error),
+                None => Ok(false),
+            };
+        };
+        let end = last.index + 1;
+        checkpoint("staged")?;
+        append_install_intents(progress, journal.transaction_id, end)?;
+        checkpoint("intent-persisted")?;
+        let applied = batch
+            .iter()
+            .try_for_each(|loaded| apply_batched(root, tx, loaded, planner, &mut syncs));
+        // Renames already made stay durable even when a later install fails.
+        syncs.flush(tx)?;
+        applied?;
+        checkpoint("batch-synced")?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+    }
 }
 
-fn prepare_install(
+fn apply_batched<'a>(
     root: &Path,
     tx: &File,
-    install: &Install,
-    old_bytes: Option<&[u8]>,
-    new_bytes: Option<&[u8]>,
+    loaded: &LoadedInstall<'a>,
     planner: &PlannerContext,
+    syncs: &mut BatchSyncs<'a>,
 ) -> Result<()> {
+    let install = loaded.install;
+    if install.empty_directory {
+        let (parent, name) = open_parent(root, &install.path)?;
+        checkpoint("before-empty-directory-removal")?;
+        match remove_directory_if_exists(&parent, name) {
+            Ok(()) => {}
+            Err(error) if is_directory_not_empty(&error) => {
+                return Err(invalidated_install(
+                    install,
+                    format!(
+                        "refusing to replace nonempty workspace directory {:?}",
+                        install.path
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        parent.sync_all()?;
+        checkpoint("empty-directory-removed")?;
+    }
+    apply_loaded(root, tx, loaded, planner, syncs)?;
+    checkpoint("installed")
+}
+
+/// An install with its content, read from the store once for its whole batch.
+struct LoadedInstall<'a> {
+    index: usize,
+    install: &'a Install,
+    old: Option<Vec<u8>>,
+    /// `None` when the new content is the old content; see `new_bytes`.
+    new: Option<Vec<u8>>,
+    shared: bool,
+    resident_bytes: u64,
+}
+
+impl LoadedInstall<'_> {
+    fn old_bytes(&self) -> Option<&[u8]> {
+        self.old.as_deref()
+    }
+
+    fn new_bytes(&self) -> Option<&[u8]> {
+        if self.shared {
+            self.old.as_deref()
+        } else {
+            self.new.as_deref()
+        }
+    }
+}
+
+fn load_install<'a>(
+    repository: &LocalRepository,
+    index: usize,
+    install: &'a Install,
+) -> Result<LoadedInstall<'a>> {
+    // If old and new have the same content ID, retain one copy and share it
+    // between both descriptors.
+    let old = install
+        .old
+        .map(|value| repository.content.get(value.content))
+        .transpose()?;
+    let shared = install
+        .old
+        .zip(install.new)
+        .is_some_and(|(old, new)| old.content == new.content);
+    let new = if shared {
+        None
+    } else {
+        install
+            .new
+            .map(|value| repository.content.get(value.content))
+            .transpose()?
+    };
+    for bytes in [old.as_ref(), new.as_ref()].into_iter().flatten() {
+        ensure!(
+            bytes.len() <= MAX_FILE_BYTES,
+            "materialized file exceeds byte limit"
+        );
+    }
+    let resident_bytes = old
+        .as_ref()
+        .map_or(0_u64, |bytes| bytes.len() as u64)
+        .checked_add(new.as_ref().map_or(0_u64, |bytes| bytes.len() as u64))
+        .context("materialization resident byte count overflow")?;
+    ensure!(
+        resident_bytes <= MAX_OPERATION_RESIDENT_BYTES,
+        "materialization operation exceeds resident byte limit"
+    );
+    Ok(LoadedInstall {
+        index,
+        install,
+        old,
+        new,
+        shared,
+        resident_bytes,
+    })
+}
+
+/// Groups the unrecorded installs into batches. Installs in one batch must not
+/// depend on each other being applied first: no install's path is an ancestor of
+/// another's (a deleted file whose path becomes a directory, or a directory emptied
+/// to become a file). An empty-directory restore is alone in its batch, since its
+/// directory is removed after its intent.
+struct Batcher<'a> {
+    repository: &'a LocalRepository,
+    installs: &'a [Install],
+    next: usize,
+    /// An install loaded for a batch its content did not fit, which starts the
+    /// next batch.
+    carried: Option<LoadedInstall<'a>>,
+}
+
+impl<'a> Batcher<'a> {
+    /// The next batch, empty once every install is batched.
+    fn next_batch(&mut self) -> Result<Vec<LoadedInstall<'a>>> {
+        let mut batch = Vec::<LoadedInstall<'a>>::new();
+        let mut paths = HashSet::<&str>::new();
+        let mut ancestors = HashSet::<&str>::new();
+        let mut resident = 0_u64;
+        while batch.len() < MAX_BATCH_INSTALLS {
+            let index = self.next + batch.len();
+            let Some(install) = self.installs.get(index) else {
+                break;
+            };
+            if let Some(first) = batch.first()
+                && (install.empty_directory
+                    || first.install.empty_directory
+                    || ancestors.contains(install.path.as_str())
+                    || path_ancestors(&install.path).any(|ancestor| paths.contains(ancestor)))
+            {
+                break;
+            }
+            let loaded = match self.carried.take() {
+                Some(loaded) => loaded,
+                None => load_install(self.repository, index, install)?,
+            };
+            debug_assert_eq!(loaded.index, index);
+            if !batch.is_empty() && resident + loaded.resident_bytes > MAX_OPERATION_RESIDENT_BYTES
+            {
+                self.carried = Some(loaded);
+                break;
+            }
+            resident += loaded.resident_bytes;
+            paths.insert(install.path.as_str());
+            ancestors.extend(path_ancestors(&install.path));
+            batch.push(loaded);
+        }
+        #[cfg(test)]
+        TEST_PEAK_OWNED_CONTENT_BYTES.fetch_max(resident as usize, Ordering::Relaxed);
+        self.next += batch.len();
+        Ok(batch)
+    }
+}
+
+/// The proper ancestors of a relative path, nearest first.
+fn path_ancestors(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(path.rsplit_once('/').map(|(parent, _)| parent), |path| {
+        path.rsplit_once('/').map(|(parent, _)| parent)
+    })
+}
+
+/// Workspace directories whose renames a batch has not yet made durable. Each is
+/// synced once when the batch is applied, then the transaction directory.
+#[derive(Default)]
+struct BatchSyncs<'a> {
+    directories: HashMap<&'a str, File>,
+}
+
+impl<'a> BatchSyncs<'a> {
+    /// Remembers `parent`, the open parent directory of `path`.
+    fn defer(&mut self, path: &'a str, parent: File) {
+        let key = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        self.directories.entry(key).or_insert(parent);
+    }
+
+    #[tracing::instrument(name = "materialization_batch_sync", level = "debug", skip_all)]
+    fn flush(&mut self, tx: &File) -> Result<()> {
+        for (_, directory) in self.directories.drain() {
+            directory.sync_all()?;
+        }
+        tx.sync_all()?;
+        Ok(())
+    }
+}
+
+fn apply_loaded<'a>(
+    root: &Path,
+    tx: &File,
+    loaded: &LoadedInstall<'a>,
+    planner: &PlannerContext,
+    syncs: &mut BatchSyncs<'a>,
+) -> Result<()> {
+    apply_or_recover_install(
+        root,
+        tx,
+        loaded.install,
+        loaded.old_bytes(),
+        loaded.new_bytes(),
+        planner,
+        syncs,
+    )
+}
+
+/// A leaf to write into the transaction directory.
+struct StagedLeaf<'a> {
+    name: &'a str,
+    kind: FileKind,
+    bytes: &'a [u8],
+}
+
+/// Checks and prepares a batch's installs in order, writes the staged leaves that
+/// are missing, and makes them durable with one sync of the transaction directory.
+///
+/// An install that fails its check ends the batch there: the installs before it
+/// are still staged, and the failure is returned with their count so they can be
+/// recorded and applied first, as when installs went one at a time.
+#[tracing::instrument(name = "materialization_stage_batch", level = "debug", skip_all)]
+fn stage_batch(
+    root: &Path,
+    tx: &File,
+    batch: &[LoadedInstall<'_>],
+    planner: &PlannerContext,
+) -> Result<(usize, Option<anyhow::Error>)> {
+    let mut leaves = Vec::new();
+    let mut prepared = 0;
+    let mut failure = None;
+    let prepare = tracing::debug_span!("materialization_prepare").entered();
+    for loaded in batch {
+        match prepare_install(root, tx, loaded, planner) {
+            Ok(leaf) => leaves.extend(leaf),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+        prepared += 1;
+    }
+    drop(prepare);
+    if !leaves.is_empty() {
+        write_staged_leaves(tx, &leaves)?;
+        tx.sync_all()?;
+    }
+    Ok((prepared, failure))
+}
+
+/// Where a staged leaf is written before it is synced and renamed to its staged
+/// name. A staged name therefore only ever holds a complete, synced leaf, and a
+/// crash while staging leaves writing debris that never held workspace data.
+fn writing_name(staged: &str) -> String {
+    format!("writing-{staged}")
+}
+
+/// Writes `leaves` on up to `STAGING_WORKERS` threads, so the filesystem can
+/// commit their syncs together.
+#[tracing::instrument(name = "materialization_write_leaves", level = "debug", skip_all)]
+fn write_staged_leaves(tx: &File, leaves: &[StagedLeaf<'_>]) -> Result<()> {
+    let next = AtomicUsize::new(0);
+    let write = || -> Result<()> {
+        while let Some(leaf) = leaves.get(next.fetch_add(1, Ordering::Relaxed)) {
+            let writing = writing_name(leaf.name);
+            create_leaf_at(tx, &writing, leaf.kind, leaf.bytes)?;
+            rename_noreplace(tx, &writing, tx, leaf.name)?;
+        }
+        Ok(())
+    };
+    let helpers = STAGING_WORKERS.min(leaves.len()).saturating_sub(1);
+    std::thread::scope(|scope| {
+        let handles = (0..helpers).map(|_| scope.spawn(write)).collect::<Vec<_>>();
+        let mut result = write();
+        for handle in handles {
+            let helper = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            result = result.and(helper);
+        }
+        result
+    })
+}
+
+/// Checks that the workspace still holds the install's old value and prepares its
+/// parents. Returns the staged leaf to write, or `None` when an earlier run already
+/// staged it.
+fn prepare_install<'a>(
+    root: &Path,
+    tx: &File,
+    loaded: &'a LoadedInstall<'a>,
+    planner: &PlannerContext,
+) -> Result<Option<StagedLeaf<'a>>> {
+    let install = loaded.install;
+    let old_bytes = loaded.old_bytes();
+    let new_bytes = loaded.new_bytes();
     if !install.empty_directory {
         remove_replaced_directory(root, tx, install, planner)?;
     }
@@ -1524,41 +1790,42 @@ fn prepare_install(
         }
         bail!("workspace path {:?} changed after preflight", install.path);
     }
-    if leaf_exists(tx, &install.staged)? {
-        match (install.new, new_bytes, install.tombstone.as_deref()) {
-            (Some(value), Some(bytes), None) => ensure!(
-                authenticate_leaf_at_bytes(tx, &install.staged, value.kind, bytes)?,
-                "staged transaction leaf changed before intent"
-            ),
-            (None, None, Some(marker)) => ensure!(
-                authenticate_leaf_at_bytes(tx, &install.staged, FileKind::Regular, marker)?,
-                "staged deletion tombstone changed before intent"
-            ),
-            _ => bail!("invalid materialization operation"),
-        }
+    let leaf = match (install.new, new_bytes, install.tombstone.as_deref()) {
+        (Some(value), Some(bytes), None) => StagedLeaf {
+            name: &install.staged,
+            kind: value.kind,
+            bytes,
+        },
+        (None, None, Some(marker)) => StagedLeaf {
+            name: &install.staged,
+            kind: FileKind::Regular,
+            bytes: marker,
+        },
+        _ => bail!("invalid materialization operation"),
+    };
+    let missing = if leaf_exists(tx, leaf.name)? {
+        ensure!(
+            authenticate_leaf_at_bytes(tx, leaf.name, leaf.kind, leaf.bytes)?,
+            "staged transaction leaf changed before intent"
+        );
+        None
     } else {
-        match (install.new, new_bytes, install.tombstone.as_deref()) {
-            (Some(value), Some(bytes), None) => {
-                create_leaf_at(tx, &install.staged, value.kind, bytes)?;
-            }
-            (None, None, Some(marker)) => {
-                create_leaf_at(tx, &install.staged, FileKind::Regular, marker)?;
-            }
-            _ => bail!("invalid materialization operation"),
-        }
-        tx.sync_all()?;
-    }
+        // Debris from writing this leaf when a crash stopped an earlier run.
+        remove_file_if_exists(tx, &writing_name(leaf.name))?;
+        Some(leaf)
+    };
     ensure_parent_directories(root, &install.path)?;
-    Ok(())
+    Ok(missing)
 }
 
-fn apply_or_recover_install(
+fn apply_or_recover_install<'a>(
     root: &Path,
     tx: &File,
-    install: &Install,
+    install: &'a Install,
     old_bytes: Option<&[u8]>,
     new_bytes: Option<&[u8]>,
     planner: &PlannerContext,
+    syncs: &mut BatchSyncs<'a>,
 ) -> Result<()> {
     match (install.old, install.new) {
         (None, Some(new)) => {
@@ -1610,9 +1877,9 @@ fn apply_or_recover_install(
                 }
                 authenticate_exact_at_bytes(tx, &install.staged, new, new_bytes)?;
                 rename_noreplace(tx, &install.staged, &parent, name)?;
-                parent.sync_all()?;
-                tx.sync_all()?;
             }
+            // A rename an earlier run made in this boot may not be durable yet.
+            syncs.defer(&install.path, parent);
             ensure!(
                 authenticate_workspace_file(
                     root,
@@ -1633,8 +1900,6 @@ fn apply_or_recover_install(
             if workspace_is_old && staged_is_new {
                 checkpoint("before-exchange")?;
                 rename_exchange(tx, &install.staged, &parent, name)?;
-                parent.sync_all()?;
-                tx.sync_all()?;
                 checkpoint("exchanged")?;
                 if !authenticate_displaced_at(tx, &install.staged, install, old_bytes)? {
                     if authenticate_workspace_file(
@@ -1654,6 +1919,8 @@ fn apply_or_recover_install(
                             ),
                         ));
                     }
+                    parent.sync_all()?;
+                    tx.sync_all()?;
                     return Err(invalidated_install(
                         install,
                         format!(
@@ -1683,6 +1950,8 @@ fn apply_or_recover_install(
                     install.path
                 );
             }
+            // An exchange an earlier run made in this boot may not be durable yet.
+            syncs.defer(&install.path, parent);
         }
         (Some(_old), None) => {
             // A completed descendant deletion may already have removed its empty
@@ -1901,17 +2170,22 @@ fn open_progress_with(tx: &File, creation: sys::Creation) -> Result<File> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProgressState {
+    /// Installs with a recorded intent, always a prefix of the plan.
     intents: usize,
+    /// The first install of the last recorded batch.
+    batch_start: usize,
     complete: bool,
     aborted: bool,
 }
 
-fn append_install_intent(progress: &mut File, transaction_id: Uuid, index: usize) -> Result<()> {
+/// Records intents for a batch: every install before `end`. One record per batch
+/// means a crash can only tear the last record.
+fn append_install_intents(progress: &mut File, transaction_id: Uuid, end: usize) -> Result<()> {
     append_progress_record(
         progress,
         transaction_id,
         PROGRESS_OPCODE_INSTALL_INTENT,
-        index,
+        end,
     )
 }
 
@@ -1961,6 +2235,7 @@ fn read_progress(
     let mut valid = 0usize;
     let mut state = ProgressState {
         intents: 0,
+        batch_start: 0,
         complete: false,
         aborted: false,
     };
@@ -1979,7 +2254,10 @@ fn read_progress(
                 .context("materialization progress contains an invalid complete record");
         }
         match u16::from_le_bytes(record[6..8].try_into()?) {
-            PROGRESS_OPCODE_INSTALL_INTENT => state.intents += 1,
+            PROGRESS_OPCODE_INSTALL_INTENT => {
+                state.batch_start = state.intents;
+                state.intents = usize::try_from(u64::from_le_bytes(record[24..32].try_into()?))?;
+            }
             PROGRESS_OPCODE_COMPLETE => state.complete = true,
             PROGRESS_OPCODE_ABORTED => state.aborted = true,
             _ => unreachable!("validated progress opcode"),
@@ -2022,10 +2300,14 @@ fn validate_progress_record(
                 !state.complete && !state.aborted,
                 "install intent follows terminal record"
             );
-            ensure!(state.intents < installs, "too many install intents");
             ensure!(
-                index == state.intents,
+                index > state.intents,
                 "non-contiguous materialization progress"
+            );
+            ensure!(index <= installs, "too many install intents");
+            ensure!(
+                index - state.intents <= MAX_BATCH_INSTALLS,
+                "materialization batch exceeds install limit"
             );
         }
         PROGRESS_OPCODE_COMPLETE => {
@@ -2212,16 +2494,19 @@ fn cleanup_aborted(
     tx: &File,
     intents: usize,
 ) -> Result<()> {
-    // Operations are prepared sequentially immediately before their intent is
-    // appended. Consequently the intended prefix may have apply debris, and
-    // exactly the operation at `intents` may have only its authenticated staged
-    // target. Later operation names are never authorized by an abort record.
+    // A batch is staged in full before its intents are appended. Consequently the
+    // intended prefix may have apply debris, and the batch after it (at most
+    // `MAX_BATCH_INSTALLS` operations) may have authenticated staged targets and
+    // writing debris. Later operation names are never authorized by an abort record.
     for (index, install) in journal
         .installs
         .iter()
-        .take(intents.saturating_add(1))
+        .take(intents.saturating_add(MAX_BATCH_INSTALLS))
         .enumerate()
     {
+        if index >= intents {
+            remove_file_if_exists(tx, &writing_name(&install.staged))?;
+        }
         if leaf_exists(tx, &install.staged)? {
             let is_staged_target = match install.new {
                 Some(target) => {
@@ -2373,23 +2658,25 @@ fn cleanup_orphan_transactions(root: &Path) -> Result<()> {
                         length % PROGRESS_RECORD_BYTES == 0,
                         "orphan materialization transaction has torn progress"
                     );
-                    let records = length / PROGRESS_RECORD_BYTES;
-                    ensure!(records > 0, "orphan progress record count underflow");
                     progress.seek(SeekFrom::End(-(PROGRESS_RECORD_BYTES as i64)))?;
                     let mut terminal = [0_u8; PROGRESS_RECORD_BYTES];
                     progress.read_exact(&mut terminal)?;
                     let opcode = u16::from_le_bytes(terminal[6..8].try_into()?);
+                    let count = usize::try_from(u64::from_le_bytes(terminal[24..32].try_into()?))?;
                     let installs = match opcode {
-                        PROGRESS_OPCODE_COMPLETE => records - 1,
+                        PROGRESS_OPCODE_COMPLETE => count,
                         // The journal is gone, so its total install count is unavailable.
                         // One more than the authenticated intent prefix is a safe bound
                         // that validates the abort terminal without authorizing debris.
-                        PROGRESS_OPCODE_ABORTED => records,
+                        PROGRESS_OPCODE_ABORTED => count.saturating_add(1),
                         _ => bail!("orphan materialization transaction has no terminal record"),
                     };
                     let state = read_progress(&mut progress, id, installs)?;
+                    // Reading truncates a torn final record; a terminal record that
+                    // survives intact leaves the log at its full length.
                     ensure!(
-                        (state.complete || state.aborted) && state.intents + 1 == records,
+                        (state.complete || state.aborted)
+                            && usize::try_from(progress.metadata()?.len())? == length,
                         "orphan materialization transaction is not durably terminal"
                     );
                 }
@@ -2993,15 +3280,16 @@ mod tests {
         let tx = open_directory(root.path()).unwrap();
         let id = Uuid::now_v7();
         let mut progress = create_progress(&tx).unwrap();
-        append_install_intent(&mut progress, id, 0).unwrap();
-        append_install_intent(&mut progress, id, 1).unwrap();
+        append_install_intents(&mut progress, id, 2).unwrap();
+        append_install_intents(&mut progress, id, 5).unwrap();
         progress.write_all(b"torn").unwrap();
         progress.sync_data().unwrap();
 
         assert_eq!(
-            read_progress(&mut progress, id, 3).unwrap(),
+            read_progress(&mut progress, id, 6).unwrap(),
             ProgressState {
-                intents: 2,
+                intents: 5,
+                batch_start: 2,
                 complete: false,
                 aborted: false
             }
@@ -3018,8 +3306,8 @@ mod tests {
         let tx = open_directory(root.path()).unwrap();
         let id = Uuid::now_v7();
         let mut progress = create_progress(&tx).unwrap();
-        append_install_intent(&mut progress, id, 0).unwrap();
-        append_install_intent(&mut progress, id, 1).unwrap();
+        append_install_intents(&mut progress, id, 2).unwrap();
+        append_install_intents(&mut progress, id, 5).unwrap();
         let path = root.path().join(PROGRESS_NAME);
         let mut corruptor = fs::OpenOptions::new().write(true).open(path).unwrap();
         corruptor
@@ -3032,9 +3320,10 @@ mod tests {
         drop(corruptor);
 
         assert_eq!(
-            read_progress(&mut progress, id, 3).unwrap(),
+            read_progress(&mut progress, id, 6).unwrap(),
             ProgressState {
-                intents: 1,
+                intents: 2,
+                batch_start: 0,
                 complete: false,
                 aborted: false
             }
@@ -3268,12 +3557,13 @@ mod tests {
         let tx = open_directory(root.path()).unwrap();
         let id = Uuid::now_v7();
         let mut progress = create_progress(&tx).unwrap();
-        append_install_intent(&mut progress, id, 0).unwrap();
+        append_install_intents(&mut progress, id, 1).unwrap();
         append_completion(&mut progress, id, 2).unwrap();
         assert_eq!(
             read_progress(&mut progress, id, 2).unwrap(),
             ProgressState {
                 intents: 1,
+                batch_start: 0,
                 complete: false,
                 aborted: false
             }
@@ -3281,29 +3571,58 @@ mod tests {
 
         progress.set_len(PROGRESS_RECORD_BYTES as u64).unwrap();
         progress.seek(SeekFrom::End(0)).unwrap();
-        append_install_intent(&mut progress, id, 1).unwrap();
+        append_install_intents(&mut progress, id, 2).unwrap();
         append_completion(&mut progress, id, 2).unwrap();
-        assert_eq!(
-            read_progress(&mut progress, id, 2).unwrap(),
-            ProgressState {
-                intents: 2,
-                complete: true,
-                aborted: false
-            }
-        );
+        let complete = ProgressState {
+            intents: 2,
+            batch_start: 1,
+            complete: true,
+            aborted: false,
+        };
+        assert_eq!(read_progress(&mut progress, id, 2).unwrap(), complete);
         append_completion(&mut progress, id, 2).unwrap();
-        assert_eq!(
-            read_progress(&mut progress, id, 2).unwrap(),
-            ProgressState {
-                intents: 2,
-                complete: true,
-                aborted: false
-            }
-        );
+        assert_eq!(read_progress(&mut progress, id, 2).unwrap(), complete);
         assert_eq!(
             progress.metadata().unwrap().len(),
             u64::try_from(3 * PROGRESS_RECORD_BYTES).unwrap()
         );
+    }
+
+    #[test]
+    fn a_batch_record_must_move_forward_by_at_most_one_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let tx = open_directory(root.path()).unwrap();
+        let id = Uuid::now_v7();
+        let installs = 3 * MAX_BATCH_INSTALLS;
+        for ends in [
+            [MAX_BATCH_INSTALLS, MAX_BATCH_INSTALLS],
+            [MAX_BATCH_INSTALLS, MAX_BATCH_INSTALLS - 1],
+            [MAX_BATCH_INSTALLS, 2 * MAX_BATCH_INSTALLS + 1],
+            [MAX_BATCH_INSTALLS, installs + 1],
+        ] {
+            let mut progress = create_progress(&tx).unwrap();
+            for end in ends {
+                append_install_intents(&mut progress, id, end).unwrap();
+            }
+            // A bad final record reads as torn, so add a valid one after it.
+            append_completion(&mut progress, id, installs).unwrap();
+            assert!(
+                read_progress(&mut progress, id, installs).is_err(),
+                "{ends:?}"
+            );
+            drop(progress);
+            fs::remove_file(root.path().join(PROGRESS_NAME)).unwrap();
+        }
+        let mut progress = create_progress(&tx).unwrap();
+        append_install_intents(&mut progress, id, MAX_BATCH_INSTALLS + 1).unwrap();
+        append_completion(&mut progress, id, installs).unwrap();
+        assert!(read_progress(&mut progress, id, installs).is_err());
+    }
+
+    #[test]
+    fn path_ancestors_lists_proper_ancestors_nearest_first() {
+        assert_eq!(path_ancestors("a/b/c").collect::<Vec<_>>(), ["a/b", "a"]);
+        assert_eq!(path_ancestors("a").count(), 0);
     }
 
     #[test]
@@ -3331,8 +3650,8 @@ mod tests {
         let tx = open_directory(root.path()).unwrap();
         let id = Uuid::now_v7();
         let mut progress = create_progress(&tx).unwrap();
-        for index in 0..3 {
-            append_install_intent(&mut progress, id, index).unwrap();
+        for end in 1..=3 {
+            append_install_intents(&mut progress, id, end).unwrap();
         }
         drop(progress);
         let path = root.path().join(PROGRESS_NAME);

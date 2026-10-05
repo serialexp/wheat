@@ -471,8 +471,9 @@ fn edit_after_restore_intent_aborts_replacement_and_retains_completed_prefix() {
             "dir/a",
             "dir/b",
         ],
-        "intent-persisted",
-        2,
+        // Both intents are recorded in one batch; stop after the first is applied.
+        "installed",
+        1,
     );
     assert!(!interrupted.status.success());
     fs::write(workspace.join("dir/b"), b"concurrent b\n").unwrap();

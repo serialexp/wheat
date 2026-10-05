@@ -4,6 +4,25 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **About four fsyncs per file during materialization (confirmed).**
+  `execute_materialization` synced the staged file, the install-intent progress
+  record, the parent directory and the transaction for every file, one file at a
+  time: `wheat import` of 4,101 small files took about 30 s at 8% CPU with about
+  16,000 fsyncs. Done 2026-10-05: installs go in batches of up to 256 whose paths do
+  not depend on each other. A batch's staged files are written and synced on up to
+  32 threads, the batch gets one progress record ("intents up to N"), and each
+  workspace directory it touched is synced once after it is applied. Deletions keep
+  their own syncs. Staged files are first written under a `writing-` name and
+  renamed once synced, which also fixes a crash while staging leaving a half-written
+  file under its staged name that recovery then refused forever. Measured in
+  release on NVMe ext4: importing 4,096 files went from 30.1 s to 1.3 s; at 20,000
+  files `import` went from 145 s to 9.3 s and a switch replacing every file from
+  175 s to 6.4 s. Most of what is left is the staged files' own syncs. Tests:
+  `progress_storage_is_one_record_per_batch`,
+  `recovery_discards_half_written_staged_leaves`,
+  `a_batch_record_must_move_forward_by_at_most_one_batch`, and the existing
+  recovery and restore tests. Bench `materialize_wide` budgets `import` and both
+  switches.
 - `[x]` **Non-Unix workspace reads follow symlinks (scanner only).** The
   `#[cfg(not(unix))]` path in `workspace_files.rs` checked `symlink_metadata` and then
   `File::open`ed, which races and follows symlinks. Every wheat command already stops

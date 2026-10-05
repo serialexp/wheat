@@ -218,9 +218,64 @@ fn interrupted_initial_materialization_rolls_forward_without_overwriting() {
 }
 
 #[test]
-fn progress_storage_scales_linearly_with_file_count() {
+fn recovery_discards_half_written_staged_leaves() {
+    // A power cut while staging leaves partial files under their `writing-`
+    // names, next to leaves that finished. Recovery must stage those installs
+    // again instead of trusting them.
+    for (checkpoint, finished) in [("journal-created", 0), ("staged", 1)] {
+        let root = tempfile::tempdir().unwrap();
+        let stores = root.path().join("stores");
+        let source = source(root.path());
+        let workspace = root.path().join("workspace");
+        let failed = wheat(
+            &stores,
+            &[
+                "import",
+                source.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+            Some(checkpoint),
+        );
+        assert!(!failed.status.success(), "checkpoint {checkpoint}");
+
+        let transactions = workspace.join(".wheat/materialization-transactions");
+        let transaction = std::fs::read_dir(&transactions)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        for index in finished..2 {
+            let _ = std::fs::remove_file(transaction.join(format!("leaf-{index:08x}")));
+            std::fs::write(
+                transaction.join(format!("writing-leaf-{index:08x}")),
+                b"half-writ",
+            )
+            .unwrap();
+        }
+
+        let recovered = wheat(
+            &stores,
+            &["--workspace", workspace.to_str().unwrap(), "status"],
+            None,
+        );
+        assert!(
+            recovered.status.success(),
+            "checkpoint {checkpoint}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert_eq!(std::fs::read(workspace.join("a")).unwrap(), b"a\n");
+        assert_eq!(std::fs::read(workspace.join("nested/b")).unwrap(), b"b\n");
+        assert_eq!(std::fs::read_dir(&transactions).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn progress_storage_is_one_record_per_batch() {
     const FILES: usize = 1_000;
     const RECORD_BYTES: u64 = 36;
+    // Batches hold up to 256 installs, and these files' paths are independent.
+    const BATCHES: u64 = 4;
     let root = tempfile::tempdir().unwrap();
     let stores = root.path().join("stores");
     let source = source_with_files(root.path(), FILES);
@@ -247,7 +302,7 @@ fn progress_storage_scales_linearly_with_file_count() {
         std::fs::metadata(transaction.join("progress.log"))
             .unwrap()
             .len(),
-        u64::try_from(FILES).unwrap() * RECORD_BYTES
+        BATCHES * RECORD_BYTES
     );
     let plan_bytes = std::fs::metadata(workspace.join(".wheat/materialization.json"))
         .unwrap()
@@ -836,12 +891,19 @@ fn recovery_truncates_corrupt_final_full_width_progress_record() {
 
 #[test]
 fn interrupted_rematerialization_recovers_exchange_and_deletion() {
+    // The three installs share one batch: staged and recorded together, applied one
+    // by one, then synced together.
     for (checkpoint, occurrence) in [
         ("journal-created", 1),
-        ("intent-persisted", 2),
+        ("staged", 1),
+        ("intent-persisted", 1),
         ("exchanged", 1),
+        ("installed", 1),
         ("exchanged", 2),
+        ("installed", 2),
         ("deletion-unlinked", 1),
+        ("installed", 3),
+        ("batch-synced", 1),
         ("all-installed", 1),
     ] {
         let root = tempfile::tempdir().unwrap();

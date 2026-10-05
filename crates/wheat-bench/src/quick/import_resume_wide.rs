@@ -8,12 +8,12 @@
 //! commit adds `files` files, 1,000 per directory, and the next changes one; the call
 //! that stages the second commit re-checks the first, and must stay within its budget.
 
-use std::{fs, path::Path, process::Command, time::Instant};
+use std::{fs, path::Path, time::Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use wheat_git::stage_import;
 
-use super::{CaseContext, CaseOutput, Recorder, history::Scratch};
+use super::{CaseContext, CaseOutput, Recorder, git::git, history::Scratch};
 
 pub(crate) const NAME: &str = "import_resume_wide";
 /// Budget for the resume that re-checks the wide commit. Measured on 2026-09-26
@@ -90,25 +90,4 @@ fn build_git_history(root: &Path, files: usize) -> Result<()> {
 
 fn file_path(index: usize) -> String {
     format!("d{:03}/f{index:06}.txt", index / FILES_PER_DIRECTORY)
-}
-
-fn git(root: &Path, arguments: &[&str]) -> Result<()> {
-    let mut command = Command::new("git");
-    let output = crate::isolate(&mut command)
-        .current_dir(root)
-        .args(arguments)
-        .env("GIT_AUTHOR_NAME", "Wheat Bench")
-        .env("GIT_AUTHOR_EMAIL", "wheat-bench@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Wheat Bench")
-        .env("GIT_COMMITTER_EMAIL", "wheat-bench@example.invalid")
-        .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
-        .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
-        .output()
-        .with_context(|| format!("run git {arguments:?}"))?;
-    ensure!(
-        output.status.success(),
-        "git {arguments:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
 }

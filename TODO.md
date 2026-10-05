@@ -31,15 +31,6 @@ Performance, most serious first:
   `representative_scale_update_is_linear_enough_for_interactive_use`
   (`crates/wheat-store/tests/content_set_policy.rs`) asserts the update takes under
   10 s. Rule: assert something countable, or move it to a bench case.
-- `[ ]` **About four fsyncs per file during materialization (confirmed).**
-  `execute_materialization` syncs the staged file, the install-intent progress record,
-  the parent directory and the transaction for every file, one file at a time. Batch
-  the intent records and directory syncs. Measured 2026-09-26 (debug): cloning 4,101
-  small files spends about 30 s here at 5% CPU (stack traces of the fsyncs all point
-  into `materialization`); `wheat import` of the same files takes 31 s at 8% CPU with
-  about 16,000 fsyncs and 4,100 fdatasyncs, which is probably the same plus its
-  content writes (not traced). This is most of the time of
-  `more_new_files_than_one_content_request_publish_and_clone`.
 - `[ ]` **About four fsyncs per object when objects go in one by one (scanner only).**
   `apply_change_authoring` (`repository_mutation.rs`, around line 1045) and
   `RepositoryPublisher::prepare` (`repository_publication.rs`) call `put_if_absent` in
@@ -267,3 +258,15 @@ operation; repack is independently useful and may run without either squash or G
   `SegmentCatalogRecordV1` chain, while local stores now use only
   `PhysicalCatalogSnapshotV1`. Decide whether the remote store moves to
   snapshots too (one catalog format) and give the head a BinSchema record.
+- `[ ]` **Durable workspace and store files are JSON (2026-10-05).** Bart's rule:
+  temporary files may stay as they are, anything durable is BinSchema, and files
+  people are expected to read or edit outside the CLI get a written exception in the
+  BinSchema-only rule (`CLAUDE.md`, `crates/wheat-core/CLAUDE.md`). Durable JSON
+  today: `store.json` and `.wheat/workspace.json` (`workspace_metadata.rs`), the
+  registry pins `workspaces/<id>.json` (`workspace_registry.rs`), `remote.json`
+  (`remote_config.rs`), and the remote catalog head (item above). Temporary, so
+  fine: `materialization.json` and `progress.log` (`materialization.rs`),
+  `rewrite-transaction.json`. Human-edited, so an exception: `config.json`
+  (`authoring_metadata.rs`). Decide per file whether anyone reads it outside the
+  CLI (`remote.json` holds the URL), move the rest to BinSchema, and write the
+  exceptions into the rule.
