@@ -10,10 +10,9 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    ffi::{CString, OsStr},
+    ffi::OsStr,
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::fd::{AsFd, AsRawFd, FromRawFd},
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -33,6 +32,7 @@ use wheat_store::{
 use crate::{
     dot_git::DotGitGate,
     local::LocalRepository,
+    sys,
     workspace_files::{
         RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot, authenticate_preimage_at,
         authenticate_workspace_file, authenticate_workspace_preimage, observe_workspace_file,
@@ -368,36 +368,30 @@ pub(crate) struct WorkspaceLock {
 impl WorkspaceLock {
     #[tracing::instrument(name = "workspace_lock", level = "debug", skip_all)]
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
-        #[cfg(not(target_os = "linux"))]
-        bail!("Wheat workspace materialization is currently supported only on Linux");
-        #[cfg(target_os = "linux")]
-        {
-            let control = open_directory(&root.join(".wheat"))?;
-            let name = c_string("workspace.lock")?;
-            let fd = unsafe {
-                libc::openat(
-                    control.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    0o600,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error()).context("open Wheat workspace lock");
+        let control = open_directory(&root.join(".wheat"))?;
+        let file = sys::open_file_at(
+            &control,
+            "workspace.lock",
+            sys::OpenFile {
+                read: true,
+                write: true,
+                append: false,
+                creation: sys::Creation::IfMissing,
+                mode: 0o600,
+            },
+        )
+        .context("open Wheat workspace lock")?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                bail!("workspace is locked by another operation");
             }
-            let file = unsafe { File::from_raw_fd(fd) };
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    bail!("workspace is locked by another operation");
-                }
-                return Err(error.into());
-            }
-            Ok(Self {
-                lock: file,
-                control,
-            })
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
+        Ok(Self {
+            lock: file,
+            control,
+        })
     }
 
     pub(crate) fn control(&self) -> &File {
@@ -407,7 +401,7 @@ impl WorkspaceLock {
 
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+        let _ = self.lock.unlock();
     }
 }
 
@@ -1480,7 +1474,7 @@ fn roll_forward(
             if install.empty_directory {
                 let (parent, name) = open_parent(root, &install.path)?;
                 checkpoint("before-empty-directory-removal")?;
-                match unlinkat_if_exists(&parent, name, libc::AT_REMOVEDIR) {
+                match remove_directory_if_exists(&parent, name) {
                     Ok(()) => {}
                     Err(error) if is_directory_not_empty(&error) => {
                         return Err(invalidated_install(
@@ -1582,16 +1576,9 @@ fn apply_or_recover_install(
                                 ),
                             ));
                         }
-                        match unlinkat_if_exists(&parent, name, libc::AT_REMOVEDIR) {
+                        match remove_directory_if_exists(&parent, name) {
                             Ok(()) => parent.sync_all()?,
-                            Err(error)
-                                if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                                    matches!(
-                                        error.raw_os_error(),
-                                        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
-                                    )
-                                }) =>
-                            {
+                            Err(error) if is_directory_not_empty(&error) => {
                                 return Err(invalidated_install(
                                     install,
                                     format!(
@@ -1808,7 +1795,7 @@ fn apply_or_recover_install(
                         ),
                     ));
                 }
-                unlinkat_if_exists(tx, &removed, 0)?;
+                remove_file_if_exists(tx, &removed)?;
                 tx.sync_all()?;
             }
             remove_empty_owned_parents(root, &install.path, planner)?;
@@ -1885,30 +1872,26 @@ fn open_transaction(root: &Path, id: Uuid) -> Result<(File, File)> {
 }
 
 fn create_progress(tx: &File) -> Result<File> {
-    open_progress_with_flags(
-        tx,
-        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_APPEND,
-    )
+    open_progress_with(tx, sys::Creation::New)
 }
 
 fn open_progress(tx: &File) -> Result<File> {
-    open_progress_with_flags(tx, libc::O_RDWR | libc::O_APPEND)
+    open_progress_with(tx, sys::Creation::Existing)
 }
 
-fn open_progress_with_flags(tx: &File, flags: libc::c_int) -> Result<File> {
-    let name = c_string(PROGRESS_NAME)?;
-    let fd = unsafe {
-        libc::openat(
-            tx.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error()).context("open materialization progress log");
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+fn open_progress_with(tx: &File, creation: sys::Creation) -> Result<File> {
+    let file = sys::open_file_at(
+        tx,
+        PROGRESS_NAME,
+        sys::OpenFile {
+            read: true,
+            write: true,
+            append: true,
+            creation,
+            mode: 0o600,
+        },
+    )
+    .context("open materialization progress log")?;
     ensure!(
         file.metadata()?.is_file(),
         "materialization progress log is not a regular file"
@@ -2077,23 +2060,13 @@ fn journal_exists(root: &Path) -> Result<bool> {
 
 fn read_journal(root: &Path) -> Result<Option<Journal>> {
     let control = open_directory(&root.join(".wheat"))?;
-    let name = c_string(JOURNAL_NAME)?;
-    let fd = unsafe {
-        libc::openat(
-            control.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let file = match sys::open_file_at(&control, JOURNAL_NAME, sys::OpenFile::READ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("open materialization journal without following symlinks");
+        }
     };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(error).context("open materialization journal without following symlinks")
-        };
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
     ensure!(
         file.metadata()?.is_file(),
         "materialization journal is not a regular file"
@@ -2208,7 +2181,7 @@ fn write_journal(root: &Path, bytes: &[u8]) -> Result<()> {
         Ok(())
     })();
     if result.is_err() {
-        let _ = unlinkat_if_exists(&control, &temporary_name, 0);
+        let _ = remove_file_if_exists(&control, &temporary_name);
     }
     result
 }
@@ -2281,7 +2254,7 @@ fn cleanup_aborted(
                 "refusing to remove unauthenticated aborted restore debris for {:?}",
                 install.path
             );
-            unlinkat_if_exists(tx, &install.staged, 0)?;
+            remove_file_if_exists(tx, &install.staged)?;
             tx.sync_all()?;
             checkpoint("aborted-preimage-unlinked")?;
         }
@@ -2299,14 +2272,14 @@ fn cleanup_aborted(
                 "refusing to remove unauthenticated aborted deletion debris for {:?}",
                 install.path
             );
-            unlinkat_if_exists(tx, &removed, 0)?;
+            remove_file_if_exists(tx, &removed)?;
             tx.sync_all()?;
             checkpoint("aborted-removed-unlinked")?;
         }
     }
     ensure_progress_only(tx)?;
     let control = open_directory(&root.join(".wheat"))?;
-    unlinkat_if_exists(&control, JOURNAL_NAME, 0)?;
+    remove_file_if_exists(&control, JOURNAL_NAME)?;
     control.sync_all()?;
     checkpoint("aborted-journal-unlinked")?;
     cleanup_abandoned_transaction(root, journal.transaction_id, tx)
@@ -2340,7 +2313,7 @@ fn cleanup_committed(
                     "displaced preimage for {:?} changed",
                     install.path
                 );
-                unlinkat_if_exists(tx, &install.staged, 0)?;
+                remove_file_if_exists(tx, &install.staged)?;
                 checkpoint("staged-preimage-unlinked")?;
             }
             _ => {}
@@ -2349,22 +2322,18 @@ fn cleanup_committed(
     tx.sync_all()?;
     ensure_progress_only(tx)?;
     let control = open_directory(&root.join(".wheat"))?;
-    unlinkat_if_exists(&control, JOURNAL_NAME, 0)?;
+    remove_file_if_exists(&control, JOURNAL_NAME)?;
     checkpoint("journal-unlinked")?;
     control.sync_all()?;
     cleanup_abandoned_transaction(root, journal.transaction_id, tx)
 }
 
 fn cleanup_abandoned_transaction(root: &Path, transaction_id: Uuid, tx: &File) -> Result<()> {
-    unlinkat_if_exists(tx, PROGRESS_NAME, 0)?;
+    remove_file_if_exists(tx, PROGRESS_NAME)?;
     tx.sync_all()?;
     let control = open_directory(&root.join(".wheat"))?;
     let transactions = open_dir_at(&control, TRANSACTIONS)?;
-    unlinkat_if_exists(
-        &transactions,
-        &transaction_id.to_string(),
-        libc::AT_REMOVEDIR,
-    )?;
+    remove_directory_if_exists(&transactions, &transaction_id.to_string())?;
     transactions.sync_all()?;
     Ok(())
 }
@@ -2379,7 +2348,7 @@ fn cleanup_orphan_transactions(root: &Path) -> Result<()> {
     let Some(transactions) = open_dir_at_optional(&control, TRANSACTIONS)? else {
         return Ok(());
     };
-    let entries = read_open_directory(&transactions)
+    let entries = sys::read_open_directory(&transactions)
         .context("list the transactions directory")?
         .take(MAX_ORPHAN_TRANSACTIONS + 1)
         .collect::<io::Result<Vec<_>>>()?;
@@ -2496,8 +2465,10 @@ fn structural_inventory_invalidated(
 fn directory_is_empty(root: &Path, path: &str) -> Result<bool> {
     let (parent, name) = open_parent(root, path)?;
     let directory = open_dir_at(&parent, name)?;
-    let proc_path = Path::new("/proc/self/fd").join(directory.as_raw_fd().to_string());
-    Ok(fs::read_dir(proc_path)?.next().transpose()?.is_none())
+    Ok(sys::read_open_directory(&directory)?
+        .next()
+        .transpose()?
+        .is_none())
 }
 
 fn path_is_directory(root: &Path, path: &str) -> Result<bool> {
@@ -2522,34 +2493,13 @@ fn path_is_directory(root: &Path, path: &str) -> Result<bool> {
 }
 
 fn entry_is_directory(parent: &File, name: &str) -> Result<bool> {
-    let name = c_string(name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::NotFound {
-            Ok(false)
-        } else {
-            Err(error.into())
-        };
-    }
-    Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    Ok(sys::entry_kind_at(parent, name)? == Some(sys::EntryKind::Directory))
 }
 
 fn is_directory_not_empty(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<io::Error>().is_some_and(|error| {
-        matches!(
-            error.raw_os_error(),
-            Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
-        )
-    })
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(sys::is_directory_not_empty)
 }
 
 fn remove_replaced_directory(
@@ -2573,7 +2523,7 @@ fn remove_replaced_directory(
     // those leaves rather than deleting concurrent workspace data.
     let (parent, name) = open_parent(root, &install.path)?;
     checkpoint("before-replaced-directory-removal")?;
-    match unlinkat_if_exists(&parent, name, libc::AT_REMOVEDIR) {
+    match remove_directory_if_exists(&parent, name) {
         Ok(()) => parent.sync_all()?,
         Err(error) if is_directory_not_empty(&error) => {
             return Err(invalidated_install(
@@ -2608,18 +2558,9 @@ fn remove_empty_owned_parents(root: &Path, path: &str, planner: &PlannerContext)
             break;
         }
         let (directory, name) = open_parent(root, relative)?;
-        match unlinkat_if_exists(&directory, name, libc::AT_REMOVEDIR) {
+        match remove_directory_if_exists(&directory, name) {
             Ok(()) => directory.sync_all()?,
-            Err(error)
-                if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                    matches!(
-                        error.raw_os_error(),
-                        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
-                    )
-                }) =>
-            {
-                break;
-            }
+            Err(error) if is_directory_not_empty(&error) => break,
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("remove empty plan-owned directory {relative:?}"));
@@ -2656,89 +2597,40 @@ fn open_parent<'a>(root: &Path, path: &'a str) -> Result<(File, &'a str)> {
     Ok((directory, name))
 }
 
-#[cfg(target_os = "linux")]
 fn rename_noreplace(
     source: &File,
     source_name: &str,
     destination: &File,
     destination_name: &str,
 ) -> Result<()> {
-    let source_name = c_string(source_name)?;
-    let destination_name = c_string(destination_name)?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            source.as_raw_fd(),
-            source_name.as_ptr(),
-            destination.as_raw_fd(),
-            destination_name.as_ptr(),
-            1_u32,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error()).context("install without replacement");
-    }
-    Ok(())
+    sys::rename_at(
+        source,
+        source_name,
+        destination,
+        destination_name,
+        sys::Rename::NoReplace,
+    )
+    .context("install without replacement")
 }
 
-#[cfg(not(target_os = "linux"))]
-fn rename_noreplace(
-    _source: &File,
-    _source_name: &str,
-    _destination: &File,
-    _destination_name: &str,
-) -> Result<()> {
-    bail!("Wheat workspace materialization is currently supported only on Linux")
-}
-
-#[cfg(target_os = "linux")]
 fn rename_exchange(
     source: &File,
     source_name: &str,
     destination: &File,
     destination_name: &str,
 ) -> Result<()> {
-    let source_name = c_string(source_name)?;
-    let destination_name = c_string(destination_name)?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            source.as_raw_fd(),
-            source_name.as_ptr(),
-            destination.as_raw_fd(),
-            destination_name.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error()).context("exchange workspace leaf");
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn rename_exchange(
-    _source: &File,
-    _source_name: &str,
-    _destination: &File,
-    _destination_name: &str,
-) -> Result<()> {
-    bail!("Wheat workspace materialization is currently supported only on Linux")
+    sys::rename_at(
+        source,
+        source_name,
+        destination,
+        destination_name,
+        sys::Rename::Exchange,
+    )
+    .context("exchange workspace leaf")
 }
 
 fn open_directory(path: &Path) -> Result<File> {
-    let path = CString::new(path.as_os_str().as_encoded_bytes())?;
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error())
-            .context("open directory without following symlinks");
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    sys::open_directory(path).context("open directory without following symlinks")
 }
 
 fn open_dir_at(directory: &File, name: &str) -> Result<File> {
@@ -2746,33 +2638,18 @@ fn open_dir_at(directory: &File, name: &str) -> Result<File> {
 }
 
 fn open_dir_at_optional(directory: &File, name: &str) -> Result<Option<File>> {
-    let name = c_string(name)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(error).context("open child directory without following symlinks");
+    match sys::open_directory_at(directory, name) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("open child directory without following symlinks"),
     }
-    Ok(Some(unsafe { File::from_raw_fd(fd) }))
 }
 
-fn mkdirat_new(directory: &File, name: &str, mode: libc::mode_t) -> Result<()> {
-    let name = c_string(name)?;
-    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), mode) } != 0 {
-        return Err(io::Error::last_os_error()).context("create workspace directory");
-    }
-    Ok(())
+fn mkdirat_new(directory: &File, name: &str, mode: u32) -> Result<()> {
+    sys::make_directory_at(directory, name, mode).context("create workspace directory")
 }
 
-fn mkdirat_if_missing(directory: &File, name: &str, mode: libc::mode_t) -> Result<()> {
+fn mkdirat_if_missing(directory: &File, name: &str, mode: u32) -> Result<()> {
     match mkdirat_new(directory, name, mode) {
         Ok(()) => directory.sync_all().map_err(Into::into),
         Err(error)
@@ -2787,20 +2664,15 @@ fn mkdirat_if_missing(directory: &File, name: &str, mode: libc::mode_t) -> Resul
     }
 }
 
-fn create_regular_at(directory: &File, name: &str, mode: libc::mode_t) -> Result<File> {
-    let name = c_string(name)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode,
-        )
+fn create_regular_at(directory: &File, name: &str, mode: u32) -> Result<File> {
+    let how = sys::OpenFile {
+        read: false,
+        write: true,
+        append: false,
+        creation: sys::Creation::New,
+        mode,
     };
-    if fd < 0 {
-        return Err(io::Error::last_os_error()).context("create private materialization file");
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    sys::open_file_at(directory, name, how).context("create private materialization file")
 }
 
 fn create_leaf_at(directory: &File, name: &str, kind: FileKind, bytes: &[u8]) -> Result<()> {
@@ -2816,13 +2688,7 @@ fn create_leaf_at(directory: &File, name: &str, kind: FileKind, bytes: &[u8]) ->
             file.sync_all()?;
         }
         FileKind::Symlink => {
-            let name = c_string(name)?;
-            let target = CString::new(bytes)?;
-            if unsafe { libc::symlinkat(target.as_ptr(), directory.as_raw_fd(), name.as_ptr()) }
-                != 0
-            {
-                return Err(io::Error::last_os_error()).context("stage symlink");
-            }
+            sys::symlink_at(bytes, directory, name).context("stage symlink")?;
         }
     }
     Ok(())
@@ -2838,59 +2704,25 @@ fn authenticate_leaf_at_bytes(
         expected.len() <= MAX_FILE_BYTES,
         "materialized file exceeds byte limit"
     );
-    let name = c_string(name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error()).context("stat staged materialization leaf");
-    }
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+    let entry = leaf_kind_at(directory, name)?;
+    if entry == sys::EntryKind::Symlink {
         if kind != FileKind::Symlink || expected.len() > 4_095 {
             return Ok(false);
         }
         let mut bytes = [0_u8; 4_096];
-        let read = unsafe {
-            libc::readlinkat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        if read < 0 {
-            return Err(io::Error::last_os_error()).context("read staged symlink");
-        }
-        return Ok(&bytes[..usize::try_from(read)?] == expected);
+        let read = sys::read_link_at(directory, name, &mut bytes).context("read staged symlink")?;
+        return Ok(&bytes[..read] == expected);
     }
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || kind == FileKind::Symlink {
+    if entry != sys::EntryKind::Regular || kind == FileKind::Symlink {
         return Ok(false);
     }
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error()).context("open staged file");
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut file =
+        sys::open_file_at(directory, name, sys::OpenFile::READ).context("open staged file")?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() != expected.len() as u64 {
         return Ok(false);
     }
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt as _;
-    let actual_kind = if metadata.mode() & 0o111 != 0 {
+    let actual_kind = if sys::is_executable(&metadata) {
         FileKind::Executable
     } else {
         FileKind::Regular
@@ -2917,34 +2749,10 @@ fn authenticate_leaf_at_bytes(
 }
 
 fn read_leaf_at(directory: &File, name: &str, limit: usize) -> Result<WorkspaceFileSnapshot> {
-    let name = c_string(name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error()).context("stat staged materialization leaf");
-    }
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+    let entry = leaf_kind_at(directory, name)?;
+    if entry == sys::EntryKind::Symlink {
         let mut bytes = vec![0_u8; limit.saturating_add(1)];
-        let read = unsafe {
-            libc::readlinkat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        if read < 0 {
-            return Err(io::Error::last_os_error()).context("read staged symlink");
-        }
-        let read = usize::try_from(read)?;
+        let read = sys::read_link_at(directory, name, &mut bytes).context("read staged symlink")?;
         ensure!(read <= limit, "materialized symlink exceeds byte limit");
         bytes.truncate(read);
         return Ok(WorkspaceFileSnapshot {
@@ -2953,20 +2761,11 @@ fn read_leaf_at(directory: &File, name: &str, limit: usize) -> Result<WorkspaceF
         });
     }
     ensure!(
-        stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+        entry == sys::EntryKind::Regular,
         "staged target is not a regular file or symlink"
     );
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error()).context("open staged file");
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file =
+        sys::open_file_at(directory, name, sys::OpenFile::READ).context("open staged file")?;
     let metadata = file.metadata()?;
     ensure!(
         metadata.is_file(),
@@ -2980,9 +2779,7 @@ fn read_leaf_at(directory: &File, name: &str, limit: usize) -> Result<WorkspaceF
     file.take(u64::try_from(limit)?.saturating_add(1))
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= limit, "materialized file exceeds byte limit");
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt as _;
-    let kind = if metadata.mode() & 0o111 != 0 {
+    let kind = if sys::is_executable(&metadata) {
         FileKind::Executable
     } else {
         FileKind::Regular
@@ -2990,26 +2787,15 @@ fn read_leaf_at(directory: &File, name: &str, limit: usize) -> Result<WorkspaceF
     Ok(WorkspaceFileSnapshot { kind, bytes })
 }
 
+/// What a staged leaf is. A missing leaf is an error.
+fn leaf_kind_at(directory: &File, name: &str) -> Result<sys::EntryKind> {
+    sys::entry_kind_at(directory, name)
+        .and_then(|entry| entry.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)))
+        .context("stat staged materialization leaf")
+}
+
 fn leaf_exists(directory: &File, name: &str) -> Result<bool> {
-    let name = c_string(name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } == 0
-    {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if error.kind() == io::ErrorKind::NotFound {
-        Ok(false)
-    } else {
-        Err(error.into())
-    }
+    Ok(sys::entry_kind_at(directory, name)?.is_some())
 }
 
 enum OrphanTransactionShape {
@@ -3019,7 +2805,7 @@ enum OrphanTransactionShape {
 
 fn orphan_transaction_shape(directory: &File) -> Result<OrphanTransactionShape> {
     let mut entries =
-        read_open_directory(directory).context("list a materialization transaction")?;
+        sys::read_open_directory(directory).context("list a materialization transaction")?;
     let first = entries.next().transpose()?;
     let second = entries.next().transpose()?;
     match (first, second) {
@@ -3033,7 +2819,7 @@ fn orphan_transaction_shape(directory: &File) -> Result<OrphanTransactionShape> 
 
 fn ensure_progress_only(directory: &File) -> Result<()> {
     let mut entries =
-        read_open_directory(directory).context("list a materialization transaction")?;
+        sys::read_open_directory(directory).context("list a materialization transaction")?;
     let only = entries
         .next()
         .transpose()?
@@ -3046,27 +2832,19 @@ fn ensure_progress_only(directory: &File) -> Result<()> {
     Ok(())
 }
 
-/// Lists a directory this process holds open, through `/proc/self/fd`. The
-/// duplicate descriptor is owned (and close-on-exec), so it is closed on every
-/// path, errors included.
-fn read_open_directory(directory: &File) -> io::Result<fs::ReadDir> {
-    let duplicate = directory.as_fd().try_clone_to_owned()?;
-    fs::read_dir(format!("/proc/self/fd/{}", duplicate.as_raw_fd()))
+fn remove_file_if_exists(directory: &File, name: &str) -> Result<()> {
+    ignore_not_found(sys::remove_file_at(directory, name))
 }
 
-fn unlinkat_if_exists(directory: &File, name: &str, flags: libc::c_int) -> Result<()> {
-    let name = c_string(name)?;
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error.into());
-        }
+fn remove_directory_if_exists(directory: &File, name: &str) -> Result<()> {
+    ignore_not_found(sys::remove_directory_at(directory, name))
+}
+
+fn ignore_not_found(result: io::Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
     }
-    Ok(())
-}
-
-fn c_string(value: &str) -> Result<CString> {
-    Ok(CString::new(value.as_bytes())?)
 }
 
 fn checkpoint(name: &str) -> Result<()> {
@@ -3104,11 +2882,8 @@ fn checkpoint(name: &str) -> Result<()> {
     }
     let mode = std::env::var(TEST_CHECKPOINT_MODE_ENV);
     match mode.as_deref() {
-        Ok("exit") => unsafe { libc::_exit(86) },
-        Ok("sigkill") => unsafe {
-            libc::kill(libc::getpid(), libc::SIGKILL);
-            libc::_exit(87);
-        },
+        Ok("exit") => sys::exit_immediately(86),
+        Ok("sigkill") => sys::kill_self(),
         Ok(other) => bail!("invalid checkpoint failure mode {other:?}"),
         Err(std::env::VarError::NotPresent) => {
             bail!("injected materialization interruption after {name}")

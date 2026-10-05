@@ -170,24 +170,10 @@ pub(crate) fn required_temporary_bytes(estimate: u64) -> Result<u64> {
 }
 
 pub(crate) fn available_bytes(path: &Path) -> Result<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let path = CString::new(path.as_os_str().as_bytes())
-        .context("Wheat store path contains an interior NUL byte")?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is a valid NUL-terminated C string and `stats` points to writable storage.
-    let status = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
-    if status != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("cannot measure available space for the Wheat store");
-    }
-    // SAFETY: a successful `statvfs` call initialized the output structure.
-    let stats = unsafe { stats.assume_init() };
-    stats
-        .f_bavail
-        .checked_mul(stats.f_frsize)
-        .ok_or_else(|| CliFailure::limit("available filesystem capacity overflowed u64"))
+    let available = crate::sys::available_bytes(path)
+        .context("cannot measure available space for the Wheat store")?;
+    u64::try_from(available)
+        .map_err(|_| CliFailure::limit("available filesystem capacity overflowed u64"))
 }
 
 pub(crate) struct RepackIo<'a> {

@@ -12,6 +12,18 @@ Finished items, moved here from `TODO.md` under the same headings.
   it cannot be switched on by accident (test `every_read_is_refused_off_unix`, which
   runs only off Unix). Not compiled for a non-Unix target here: the only installed
   one, WASI, fails first in `signal-hook-registry`.
+- `[x]` **Other non-Unix fallbacks check and then open, or do not lock (2026-10-05).**
+  `workspace_registry.rs` and `rewrite_transaction.rs` refused a symlink with
+  `symlink_metadata` and then opened by path, and their non-Unix `lock_exclusive` /
+  `unlock` / `try_lock` (and `authoring_metadata.rs`'s) did nothing. Done 2026-10-05:
+  wheat-cli's operating-system calls now live in one module, `sys.rs`, whose Linux
+  half makes the no-follow, descriptor-relative calls and whose other half fails
+  every one with `io::ErrorKind::Unsupported`. The registry, rewrite and
+  materialization code call it with no `cfg` of their own, and every lock uses std's
+  `File::lock` / `try_lock`, which work everywhere. The store and git crates got
+  the same treatment, and the whole workspace now builds for `x86_64-pc-windows-gnu`
+  (`just check-windows`, warnings fail). Tests: `sys::tests` (Linux behaviour, plus
+  `every_call_is_refused_off_linux`, which runs only off Linux).
 - `[x]` **Publish walks the whole content manifest (confirmed).** `handle_publish`
   (`publish.rs`, the content phase) looked up every content ID of the proposed
   envelope, even for a one-line change, and the client's `fetch_content`

@@ -11,13 +11,6 @@ are the scanner's word only and need checking before a fix.
 
 Security, most serious first:
 
-- `[ ]` **Other non-Unix fallbacks check and then open, or do not lock (2026-10-05).**
-  `workspace_registry.rs` and `rewrite_transaction.rs` refuse a symlink with
-  `symlink_metadata` and then open by path (the same race the workspace reads had),
-  and their non-Unix `lock_exclusive` / `unlock` / `try_lock` (and
-  `authoring_metadata.rs`'s) do nothing. Unreachable today, like the workspace reads
-  were. Same choice: error module, delete, or leave.
-
 Performance, most serious first:
 
 - `[ ]` **Content manifests are full snapshots, so comparing two still reads both
@@ -109,6 +102,14 @@ budget passes, but by only about 0.7 s.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[ ]` **Workspace reads keep their own libc module (2026-10-05).** wheat-cli's
+  other operating-system calls now go through `sys.rs`, but `workspace_files.rs` still
+  has a `#[cfg(unix)] mod platform` that calls `openat`, `fstatat` and `readlinkat`
+  on raw descriptors, beside a non-Unix twin that refuses everything. Moving it onto
+  `sys` (open, describe and read-link at a directory) would leave one place for
+  platform code. `discovery.rs` (the device that stops discovery at a mount) and
+  `store_analyze.rs` (allocated bytes) also keep small `cfg(unix)` branches, whose
+  non-Unix halves guess instead of failing.
 - `[ ]` **`wheat+tls://` URLs parse but cannot connect.** `crates/wheat-cli/src/remote.rs`
   accepts the scheme, but `tokio-tungstenite` is built with only the `connect`
   feature (no rustls/native-tls), in both wheat-cli and wheat-server. Since

@@ -1,10 +1,4 @@
-use std::{
-    ffi::CString,
-    fmt::Write as _,
-    fs,
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
-    path::{Path, PathBuf},
-};
+use std::{fmt::Write as _, fs, path::Path};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
@@ -13,6 +7,7 @@ use crate::{
     command_output::Success,
     discovery::{canonical_store_path, discover_workspace},
     materialization::WorkspaceLock,
+    sys::{self, EntryKind},
     workspace_metadata::{StoreMetadata, WorkspaceMetadata},
     workspace_registry::WorkspaceRegistry,
 };
@@ -148,8 +143,7 @@ pub(crate) fn unregister(workspace: &Path, explicit_store: Option<&Path>) -> Res
 }
 
 fn ensure_control_directory_owned(control: &fs::File) -> Result<()> {
-    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", control.as_raw_fd()));
-    for entry in fs::read_dir(&proc_path)? {
+    for entry in sys::read_open_directory(control)? {
         let entry = entry?;
         let name = entry.file_name().into_string().map_err(|_| {
             anyhow::anyhow!("workspace control directory contains a non-UTF-8 name")
@@ -157,23 +151,25 @@ fn ensure_control_directory_owned(control: &fs::File) -> Result<()> {
         if !OWNED_CONTROL_ENTRIES.contains(&name.as_str()) {
             bail!("workspace control directory contains unknown entry {name}");
         }
-        let entry_metadata = fs::symlink_metadata(entry.path())?;
+        let kind = sys::entry_kind_at(control, &name)?
+            .with_context(|| format!("workspace control entry {name} disappeared"))?;
         ensure!(
-            !entry_metadata.file_type().is_symlink(),
+            kind != EntryKind::Symlink,
             "workspace control entry {name} is a symlink"
         );
         if name == "materialization-transactions" {
             ensure!(
-                entry_metadata.is_dir(),
+                kind == EntryKind::Directory,
                 "materialization transaction path is not a directory"
             );
+            let transactions = sys::open_directory_at(control, &name)?;
             ensure!(
-                fs::read_dir(entry.path())?.next().is_none(),
+                sys::read_open_directory(&transactions)?.next().is_none(),
                 "workspace has materialization transaction debris; recover it before unregistering"
             );
         } else {
             ensure!(
-                entry_metadata.is_file(),
+                kind == EntryKind::Regular,
                 "workspace control entry {name} is not a file"
             );
         }
@@ -194,8 +190,7 @@ fn remove_control_directory(root: &Path, control: &fs::File) -> Result<()> {
     // occurred and removing by path could detach an unrelated replacement.
     let current = fs::File::open(root.join(".wheat"))?;
     ensure!(
-        current.metadata()?.ino() == control.metadata()?.ino()
-            && current.metadata()?.dev() == control.metadata()?.dev(),
+        sys::same_file(&current.metadata()?, &control.metadata()?),
         "workspace control directory changed during unregister"
     );
     fs::remove_dir(root.join(".wheat"))?;
@@ -204,16 +199,13 @@ fn remove_control_directory(root: &Path, control: &fs::File) -> Result<()> {
 }
 
 fn unlink_control_entry(control: &fs::File, name: &str, directory: bool) -> Result<()> {
-    let name = CString::new(name)?;
-    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
-    let result = unsafe { libc::unlinkat(control.as_raw_fd(), name.as_ptr(), flags) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::NotFound {
-        Ok(())
+    let result = if directory {
+        sys::remove_directory_at(control, name)
     } else {
-        Err(error.into())
+        sys::remove_file_at(control, name)
+    };
+    match result {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
     }
 }

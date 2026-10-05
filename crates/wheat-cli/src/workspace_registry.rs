@@ -5,7 +5,7 @@
 
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
@@ -14,6 +14,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wheat_core::{ChangeId, RepositoryEnvelopeId, TreeId, ViewId};
+
+use crate::sys;
 
 const REGISTRY_FORMAT: &str = "wheat-workspace-pin";
 const REGISTRY_VERSION: u32 = 1;
@@ -373,7 +375,7 @@ impl WorkspaceRegistry {
         let path = self.store_root.join(REGISTRY_LOCK);
         let file = open_lock_no_follow(&path)
             .with_context(|| format!("open workspace registry lock {}", path.display()))?;
-        lock_exclusive(&file)
+        file.lock()
             .with_context(|| format!("lock workspace registry {}", path.display()))?;
         Ok(RegistryLock(file))
     }
@@ -405,7 +407,7 @@ struct RegistryLock(File);
 
 impl Drop for RegistryLock {
     fn drop(&mut self) {
-        let _ = unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -467,107 +469,16 @@ fn workspace_id_from_name(name: &str) -> Result<Uuid> {
     Ok(workspace_id)
 }
 
-#[cfg(unix)]
 fn open_lock_no_follow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    sys::open_file(path, sys::OpenFile::LOCK)
 }
 
-#[cfg(not(unix))]
-fn open_lock_no_follow(path: &Path) -> io::Result<File> {
-    refuse_symlink(path, true)?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-}
-
-#[cfg(unix)]
 fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    sys::open_file(path, sys::OpenFile::READ)
 }
 
-#[cfg(not(unix))]
-fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    refuse_symlink(path, false)?;
-    File::open(path)
-}
-
-#[cfg(unix)]
 fn open_directory_no_follow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_directory_no_follow(path: &Path) -> io::Result<File> {
-    refuse_symlink(path, false)?;
-    let file = File::open(path)?;
-    if file.metadata()?.is_dir() {
-        Ok(file)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::NotADirectory,
-            "not a directory",
-        ))
-    }
-}
-
-#[cfg(not(unix))]
-fn refuse_symlink(path: &Path, allow_missing: bool) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "symbolic links are not permitted",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(unix)]
-fn lock_exclusive(file: &File) -> io::Result<()> {
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(file), libc::LOCK_EX) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_exclusive(_file: &File) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn unlock(file: &File) -> io::Result<()> {
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(file), libc::LOCK_UN) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn unlock(_file: &File) -> io::Result<()> {
-    Ok(())
+    sys::open_directory(path)
 }
 
 #[cfg(test)]

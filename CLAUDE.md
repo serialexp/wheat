@@ -16,6 +16,9 @@ structs, no version bumps.
 ## Building and testing
 
 - `just check`, `just clippy`, `just fmt-check`, `just test` (nextest plus doctests).
+- `just check-windows`: everything must build for Windows, though workspace file
+  operations only run on Linux. New operating-system calls in wheat-cli go through
+  `crates/wheat-cli/src/sys.rs`, not `libc` or `cfg` at the call site.
 - Use `cargo nextest`, not plain `cargo test`: several suites rely on each test having
   its own process.
 - Build with `-j 2` / `--build-jobs 2` on Bart's machine.

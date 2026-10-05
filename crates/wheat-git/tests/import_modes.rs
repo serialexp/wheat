@@ -1,7 +1,6 @@
-use std::{
-    os::unix::fs::symlink,
-    path::{Path, PathBuf},
-};
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+use std::path::{Path, PathBuf};
 
 use wheat_git::{
     AtomicImportError, StagedImportError, atomic_import, finalize_import, stage_import,
@@ -485,6 +484,9 @@ async fn atomic_import_rejects_a_file_above_the_in_memory_import_bound() {
     assert!(!destination.exists());
 }
 
+// Stale stages are recognised by a marker opened without following symlinks,
+// which only Unix builds do.
+#[cfg(unix)]
 #[tokio::test]
 async fn atomic_import_removes_only_marker_authenticated_stale_stages_for_its_destination() {
     let git = fixture();

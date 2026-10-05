@@ -6,7 +6,7 @@
 
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
@@ -19,6 +19,7 @@ use wheat_store::{PublicationStore, RepositoryHead};
 use crate::{
     local::LocalRepository,
     materialization::WorkspaceLock,
+    sys,
     workspace_metadata::{SerializedHead, WorkspaceMetadata},
     workspace_registry::{WorkspacePin, WorkspaceRegistry},
     workspace_registry_service,
@@ -472,7 +473,8 @@ impl<'a> RewriteGuard<'a> {
     fn acquire(store_root: &'a Path) -> Result<Self> {
         let lock_path = store_root.join(LOCK_FILE);
         let file = open_lock_no_follow(&lock_path)?;
-        try_lock(&file).with_context(|| "store rewrite is locked by another operation")?;
+        file.try_lock()
+            .with_context(|| "store rewrite is locked by another operation")?;
         Ok(Self {
             store_root,
             _store_lock: file,
@@ -527,68 +529,12 @@ impl<'a> RewriteGuard<'a> {
     }
 }
 
-#[cfg(unix)]
 fn open_lock_no_follow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    sys::open_file(path, sys::OpenFile::LOCK)
 }
 
-#[cfg(not(unix))]
-fn open_lock_no_follow(path: &Path) -> io::Result<File> {
-    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "symbolic links are not permitted",
-        ));
-    }
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-}
-
-#[cfg(unix)]
 fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "symbolic links are not permitted",
-        ));
-    }
-    File::open(path)
-}
-
-#[cfg(unix)]
-fn try_lock(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn try_lock(_file: &File) -> io::Result<()> {
-    Ok(())
+    sys::open_file(path, sys::OpenFile::READ)
 }
 
 #[cfg(test)]

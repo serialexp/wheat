@@ -3,7 +3,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -424,6 +424,8 @@ fn has_exact_stage_marker(_candidate: &Path) -> bool {
 
 #[cfg(unix)]
 fn has_exact_stage_marker(candidate: &Path) -> bool {
+    use std::io::Read as _;
+
     let marker = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)

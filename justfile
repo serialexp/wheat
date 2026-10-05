@@ -7,6 +7,12 @@ default:
 check:
     cargo check --workspace --all-targets
 
+# Type-check every crate and target for Windows, where workspace file operations
+# refuse to run but everything must still build. Needs `rustup target add
+# x86_64-pc-windows-gnu` and a MinGW C compiler (`gcc-mingw-w64-x86-64`).
+check-windows:
+    RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+
 # Lint every crate and target; warnings fail.
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings

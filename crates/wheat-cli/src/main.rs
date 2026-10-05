@@ -48,6 +48,7 @@ mod squash;
 mod squash_attribution;
 mod store_analyze;
 mod store_lookup;
+mod sys;
 mod workspace;
 mod workspace_clone;
 mod workspace_diff;

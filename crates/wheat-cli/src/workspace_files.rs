@@ -2,9 +2,7 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-#[cfg(unix)]
-use std::{ffi::OsStr, fs::File};
-use std::{fmt, io, path::Path};
+use std::{ffi::OsStr, fmt, fs::File, io, path::Path};
 
 #[cfg(test)]
 thread_local! {
@@ -49,6 +47,10 @@ pub(crate) struct CanonicalWorkspaceFile {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "only the Unix reads find these problems")
+)]
 pub(crate) enum WorkspaceFileError {
     InvalidPath,
     IntermediateSymlink,
@@ -156,7 +158,6 @@ pub(crate) fn authenticate_workspace_preimage(
 /// Authenticate a leaf relative to an already-open directory descriptor.
 /// Regular contents are streamed through fixed scratch; symlink targets are
 /// bounded to the maximum portable target size used by materialization.
-#[cfg(unix)]
 pub(crate) fn authenticate_preimage_at(
     directory: &File,
     name: &OsStr,
@@ -801,7 +802,7 @@ mod platform {
 /// could race or follow a symlink cannot be switched on by accident.
 #[cfg(not(unix))]
 mod platform {
-    use std::{ffi::OsStr, io, path::Path};
+    use std::{ffi::OsStr, fs::File, io, path::Path};
 
     use super::{
         CanonicalWorkspaceFile, FileKind, RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot,
@@ -846,6 +847,14 @@ mod platform {
         _components: &[&OsStr],
         _limit: usize,
     ) -> Result<Option<WorkspaceFileSnapshot>, WorkspaceFileError> {
+        unsupported()
+    }
+
+    pub(super) fn observe_at(
+        _directory: &File,
+        _name: &OsStr,
+        _limit: usize,
+    ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
         unsupported()
     }
 }

@@ -1,7 +1,5 @@
 //! Native authoring identity, metadata, and typed configuration.
 
-#[cfg(unix)]
-use std::os::fd::AsRawFd as _;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -152,7 +150,7 @@ pub(crate) fn set(
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    lock_exclusive(&lock)?;
+    lock.lock()?;
     let mut config = read_optional(&path)?.unwrap_or_default();
     match key {
         ConfigKey::ActorName => config.actor.name = Some(value.to_owned()),
@@ -178,7 +176,7 @@ pub(crate) fn set(
         }
     }
     let result = write_config(&path, &config);
-    let unlock = unlock(&lock);
+    let unlock = lock.unlock();
     result.and_then(|()| unlock.map_err(Into::into))
 }
 
@@ -424,34 +422,6 @@ fn write_config(path: &Path, config: &Config) -> Result<()> {
         .map_err(|error| error.error)
         .with_context(|| format!("publish Wheat config {}", path.display()))?;
     fs::File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn lock_exclusive(file: &fs::File) -> io::Result<()> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_exclusive(_file: &fs::File) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn unlock(file: &fs::File) -> io::Result<()> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn unlock(_file: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
