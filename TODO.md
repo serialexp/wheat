@@ -58,10 +58,13 @@ Performance, most serious first:
 - `[ ]` **Uploads go one file per message (scanner only).** `publish_to_remote`
   (`remote.rs`, around line 950) sends each blob as its own `ContentUpload`. Add a
   batched upload message and stream large blobs to disk on the server.
-- `[ ]` **One-by-one edit reads in import and authoring (scanner only).**
-  `staged_import.rs` (`verify_mapping`) and `workspace.rs` (around line 103) read
-  edits with `reader.edit(id)` per edit. Use batch reads. (The per-path lookups in
-  `verify_mapping` share one walk since 2026-09-26; check `workspace.rs`.)
+- `[ ]` **Re-adding 20,000 files to one change takes 5.4 s (2026-10-05).** Release,
+  NVMe, `wheat add` of 20,000 modified files to a change that already edits them
+  all (`WHEAT_TRACE_SUMMARY=1`): `persist_edits` 1.6 s, the first
+  `apply_revision`'s `content_commit` 1.2 s, `capture_path` 0.7 s with six
+  `content_get`s per path, and each `apply_edits` reads every content blob again
+  (60,000 `content_get`s, twice). Bench `add_scale` adds its second round to a new
+  change, so it doesn't measure this.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 

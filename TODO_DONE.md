@@ -55,6 +55,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   nodes: each existing directory on an edited path is read once, nothing written is
   read back, and directories left empty are never written. Test
   `apply_edits_reads_each_existing_directory_once`.
+- `[x]` **One-by-one edit reads in import and authoring (scanner only).**
+  `staged_import.rs` (`verify_mapping`) and `workspace.rs` read edits with
+  `reader.edit(id)` per edit. Checked 2026-10-05: each edit is its own object, so
+  this is one read per edit, linear, and the local packed store has no faster way
+  to read many. Re-adding 20,000 files to one change spends about 0.1 s on it (plus
+  85 ms in `load_edits`) out of 5.4 s; the rest is a new `TODO.md` item. Found on
+  the way: adding to a file twice in one change failed with `VerificationFailed`
+  when the second add was next to the first's insertion (fixed in `fix(core)`,
+  e13ee2f).
 - `[x]` **Non-Unix workspace reads follow symlinks (scanner only).** The
   `#[cfg(not(unix))]` path in `workspace_files.rs` checked `symlink_metadata` and then
   `File::open`ed, which races and follows symlinks. Every wheat command already stops
