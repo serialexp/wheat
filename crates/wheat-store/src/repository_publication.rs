@@ -6,6 +6,10 @@ use crate::{
     PublicationStore, RepositoryHead,
 };
 
+/// Concurrent writes when [`RepositoryPublisher::prepare`] stores a closure, for
+/// backends that write objects one by one.
+const PREPARE_WRITE_CONCURRENCY: usize = 16;
+
 #[derive(Debug, Error)]
 pub enum RepositoryPublicationError {
     #[error("immutable object publication failed")]
@@ -62,9 +66,14 @@ where
     ) -> Result<RepositoryClosure, RepositoryPublicationError> {
         repository.validate()?;
         let closure = repository.canonical_closure();
-        for object in &closure.objects {
-            self.objects.put_if_absent(object.id, &object.bytes).await?;
-        }
+        let objects = closure
+            .objects
+            .iter()
+            .map(|object| (object.id, object.bytes.clone()))
+            .collect::<Vec<_>>();
+        self.objects
+            .put_batch(&objects, PREPARE_WRITE_CONCURRENCY)
+            .await?;
         self.verify_closure(&closure).await?;
         Ok(closure)
     }

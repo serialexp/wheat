@@ -23,6 +23,17 @@ Finished items, moved here from `TODO.md` under the same headings.
   `a_batch_record_must_move_forward_by_at_most_one_batch`, and the existing
   recovery and restore tests. Bench `materialize_wide` budgets `import` and both
   switches.
+- `[x]` **About four fsyncs per object when objects go in one by one (scanner only).**
+  `apply_change_authoring` (`repository_mutation.rs`) and
+  `RepositoryPublisher::prepare` (`repository_publication.rs`) call `put_if_absent` in
+  a loop, so each object would be its own journaled active-segment commit. Checked
+  2026-10-05: not real for the mutator. Every CLI caller (`add`, `change new`,
+  `squash`, conflict resolution) hands it a `BatchObjectStore`, and `wheat add`
+  makes 55 syncs for 1 file and for 20 (three packed-store commits, plus the head,
+  the workspace pin and workspace metadata). `prepare` wrote straight to the store
+  it was given (`wheat init`, bench fixtures); it now stores the closure with one
+  `put_batch` (test `preparation_stores_the_closure_in_one_batch`). Two constant
+  per-command costs found on the way are in `TODO.md`.
 - `[x]` **Non-Unix workspace reads follow symlinks (scanner only).** The
   `#[cfg(not(unix))]` path in `workspace_files.rs` checked `symlink_metadata` and then
   `File::open`ed, which races and follows symlinks. Every wheat command already stops

@@ -1,13 +1,18 @@
-use std::{fs, str::FromStr};
+use std::{
+    fs,
+    str::FromStr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
+use async_trait::async_trait;
 use wheat_core::{
     ApplicationContext, ChangeId, ContentId, EditOperation, EditRecord, EditTransition, FileKind,
-    FileValue, Repository, RevisionEdits, Tree,
+    FileValue, ObjectId, Repository, RevisionEdits, Tree,
 };
 use wheat_store::{
     ContentStore, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore, ObjectKind,
-    PublicationError, PublicationStore, RepositoryPublicationError, RepositoryPublisher,
-    RepositoryReader,
+    ObjectStoreError, PublicationError, PublicationStore, RepositoryPublicationError,
+    RepositoryPublisher, RepositoryReader, StoredObject,
 };
 
 fn edit(path: &str, value: &[u8]) -> RevisionEdits {
@@ -218,6 +223,70 @@ async fn repeated_preparation_and_initialization_are_idempotent_across_reopen() 
     let reopened = RepositoryPublisher::new(&reopened_objects, &reopened_content, &reopened_heads);
     assert_eq!(reopened.initialize(&repository).await.unwrap(), first);
     assert_eq!(reopened_heads.read().unwrap(), first);
+}
+
+/// Counts how objects reach the store.
+struct CountingStore {
+    inner: LooseObjectStore,
+    single_puts: AtomicUsize,
+    batches: AtomicUsize,
+}
+
+#[async_trait]
+impl ImmutableObjectStore for CountingStore {
+    async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+        self.single_puts.fetch_add(1, Ordering::Relaxed);
+        self.inner.put_if_absent(id, bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.inner.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.inner.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.inner.exists_many(ids).await
+    }
+}
+
+#[tokio::test]
+async fn preparation_stores_the_closure_in_one_batch() {
+    // A packed store commits each put on its own, with several syncs.
+    let directory = tempfile::tempdir().unwrap();
+    let (inner, content, heads) = stores(directory.path());
+    let objects = CountingStore {
+        inner,
+        single_puts: AtomicUsize::new(0),
+        batches: AtomicUsize::new(0),
+    };
+    content.put(b"value").unwrap();
+    let mut repository = Repository::new(Tree::new());
+    let basis = repository.base_view().id;
+    repository
+        .create_change(
+            basis,
+            basis,
+            [],
+            edit("file", b"value"),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+
+    let closure = RepositoryPublisher::new(&objects, &content, &heads)
+        .prepare(&repository)
+        .await
+        .unwrap();
+    assert!(closure.objects.len() >= 6);
+    assert_eq!(objects.single_puts.load(Ordering::Relaxed), 0);
+    assert_eq!(objects.batches.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

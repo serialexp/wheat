@@ -31,11 +31,14 @@ Performance, most serious first:
   `representative_scale_update_is_linear_enough_for_interactive_use`
   (`crates/wheat-store/tests/content_set_policy.rs`) asserts the update takes under
   10 s. Rule: assert something countable, or move it to a bench case.
-- `[ ]` **About four fsyncs per object when objects go in one by one (scanner only).**
-  `apply_change_authoring` (`repository_mutation.rs`, around line 1045) and
-  `RepositoryPublisher::prepare` (`repository_publication.rs`) call `put_if_absent` in
-  a loop, so each object is its own journaled active-segment commit. Use `put_batch`.
-  (Publish's object phase uses `put_batch` since 2026-09-26.)
+- `[ ]` **Every command syncs every ancestor of the store (2026-10-05).**
+  `PackedCatalog::open_with_target` (`packed/catalog.rs`) calls
+  `sync_created_ancestors` on each open, which syncs every directory from
+  `storage/packed` up to `/`, whether or not it created anything: 7 syncs per
+  command in a store under `/tmp/x`. Sync only what `create_dir_all` made.
+- `[ ]` **`wheat status` rewrites the workspace pin (2026-10-05).** Registry
+  reconciliation writes and syncs `workspaces/<id>.json` (and its directory) on
+  every command, including read-only ones. Write it only when it changes.
 - `[ ]` **wheat-server does blocking disk work on async threads (scanner only).**
   Publication, packed-object and content stores are synchronous and called straight
   from Tokio tasks in `connection.rs`, `publish.rs` and `fetch.rs`. Move them onto
