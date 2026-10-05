@@ -2497,7 +2497,9 @@ fn native_clone(
 
         // Fetch all content.
         let content_count =
-            remote::fetch_content(&mut session, 2, &objects, &content, state.envelope).await?;
+            remote::fetch_content(&mut session, 2, &objects, &content, state.envelope, None)
+                .await?
+                .fetched;
 
         write_stderr(format_args!(
             "fetched {} objects ({} pulled), {content_count} content blobs\n",
@@ -2628,17 +2630,21 @@ fn native_fetch(
 
     let token = credential::token_for(Some(&context.store_root), &parsed)?;
     let rt = runtime()?;
-    let (remote_state, fetched, content_count) = rt.block_on(async {
+    let (remote_state, fetched, content) = rt.block_on(async {
         let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         if state.generation == last_fetched.generation && state.envelope == last_fetched.envelope {
             remote::close(&mut session).await?;
-            return Ok((state, remote::FetchedObjects::default(), 0));
+            return Ok((
+                state,
+                remote::FetchedObjects::default(),
+                remote::FetchedContent::default(),
+            ));
         }
 
-        // The last fetch left its whole closure here, so the server only needs
-        // to send what that envelope lacks.
+        // The last fetch left its whole closure and content here, so only what
+        // that envelope lacks needs to come.
         let since = last_fetched.envelope;
         let since_object = ObjectId::from_digest(*since.as_bytes());
         let since = (*since.as_bytes() != [0; 32]
@@ -2647,17 +2653,18 @@ fn native_fetch(
         let fetched =
             remote::fetch_objects(&mut session, 1, &local.objects, state.envelope, since).await?;
 
-        let content_count = remote::fetch_content(
+        let content = remote::fetch_content(
             &mut session,
             2,
             &local.objects,
             &local.content,
             state.envelope,
+            since,
         )
         .await?;
 
         remote::close(&mut session).await?;
-        Ok::<_, anyhow::Error>((state, fetched, content_count))
+        Ok::<_, anyhow::Error>((state, fetched, content))
     })?;
 
     if remote_state.generation == last_fetched.generation
@@ -2690,7 +2697,7 @@ fn native_fetch(
     updated_cfg.write(&context.store_root)?;
 
     let human = format!(
-        "fetched {} objects ({} pulled in {} requests{}), {content_count} content blobs\nupdated to generation {}, envelope {}\n",
+        "fetched {} objects ({} pulled in {} requests{}), {} content blobs\nupdated to generation {}, envelope {}\n",
         fetched.pushed + fetched.pulled,
         fetched.pulled,
         fetched.wants,
@@ -2699,6 +2706,7 @@ fn native_fetch(
         } else {
             ""
         },
+        content.fetched,
         new_head.generation,
         new_head.envelope,
     );
@@ -2713,7 +2721,8 @@ fn native_fetch(
             "pulled": fetched.pulled,
             "wants": fetched.wants,
             "incremental": fetched.incremental,
-            "content": content_count,
+            "content": content.fetched,
+            "content_checked": content.checked,
         }),
         human,
     )

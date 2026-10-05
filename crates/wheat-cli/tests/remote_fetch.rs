@@ -98,6 +98,8 @@ fn a_clone_needs_no_wants_and_a_fetch_brings_only_the_change() {
     assert_eq!(fetched["incremental"], true, "{fetched}");
     assert_eq!(fetched["pulled"], 0, "{fetched}");
     assert_eq!(fetched["content"], 1, "{fetched}");
+    // Only the content the last fetch lacked is looked up, not all 61 files.
+    assert_eq!(fetched["content_checked"], 1, "{fetched}");
     let fetch_objects = fetched["objects"].as_u64().unwrap();
     assert!(
         fetch_objects * 10 < clone_objects,
@@ -167,6 +169,7 @@ fn a_fetch_catches_up_on_several_publishes_and_knows_its_own() {
     assert_eq!(fetched["up_to_date"], false, "{fetched}");
     assert_eq!(fetched["incremental"], true, "{fetched}");
     assert_eq!(fetched["content"], 3, "{fetched}");
+    assert_eq!(fetched["content_checked"], 3, "{fetched}");
     ok(&reader, &reader_stores, &config, &["validate"]);
 
     // A local change the remote doesn't have still stops a fetch.

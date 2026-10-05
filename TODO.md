@@ -20,12 +20,24 @@ Security, most serious first:
 
 Performance, most serious first:
 
-- `[ ]` **Publish walks the whole content manifest (confirmed).** `handle_publish`
-  (`publish.rs`, the content phase) walks every content ID in the proposed envelope,
-  even for a one-line change. The client's `fetch_content` (`remote.rs`) does the
-  same on every fetch. Both could walk only the content-set difference from the old
-  head (as `StructuralDelta` does for objects). (The "at most 4,096 blobs, once" part
-  is done; see `TODO_DONE.md`.)
+- `[ ]` **Content manifests are full snapshots, so comparing two still reads both
+  (2026-10-05).** Publish and fetch now look up only the content the old head lacks,
+  but finding it decodes both manifests' snapshots (about 3.3 MB each at 100,000
+  files) and merges them. Canonical manifests may not be deltas
+  (`ContentSetStore::update_batch`), so a cheaper comparison needs a different shape,
+  such as a radix set.
+- `[ ]` **`existing_ids` lists the whole S3 bucket even for a few IDs (scanner
+  only, 2026-10-05).** `ContentStore::existing_ids` (`content_store.rs`) uses
+  `list_ids` whenever the backend has it, so a publish of one file lists every blob.
+  Choose per-item checks below some count.
+- `[ ]` **Transition validation reads every added blob in full (2026-10-05).**
+  `repository_transition.rs` (step 5) calls `content.get` for each added content ID
+  only to see that it exists; `contains` would do, unless the read is meant to check
+  the bytes.
+- `[ ]` **A wall-clock assertion in a test (2026-10-05).**
+  `representative_scale_update_is_linear_enough_for_interactive_use`
+  (`crates/wheat-store/tests/content_set_policy.rs`) asserts the update takes under
+  10 s. Rule: assert something countable, or move it to a bench case.
 - `[ ]` **About four fsyncs per file during materialization (confirmed).**
   `execute_materialization` syncs the staged file, the install-intent progress record,
   the parent directory and the transaction for every file, one file at a time. Batch

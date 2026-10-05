@@ -5,9 +5,9 @@
 //! ([`StructuralDelta`]) and pushes only what that walk finds. A writer publishes
 //! `changes` one-file changes to a server in this process. A reader that cloned after
 //! `early` changes fetches one more, and so does a reader that cloned after all of
-//! them: neither the push nor the walk's store reads for that one change may grow
-//! with the history. The early reader then catches up on everything in between, and
-//! its store must validate.
+//! them: neither the push, the walk's store reads, nor the content IDs the client
+//! looks up for that one change may grow with the history. The early reader then
+//! catches up on everything in between, and its store must validate.
 
 use std::path::PathBuf;
 
@@ -23,7 +23,9 @@ use crate::{measure::Timing, path_text};
 
 pub(crate) const NAME: &str = "fetch_incremental";
 /// Budget for one change late in the history, as a percentage of the same for one
-/// change early: the objects pushed and the walk's store reads. Measured on
+/// change early: the objects pushed, the walk's store reads, and the content IDs
+/// the client looks up (only the new ones since 2026-10-05; before, every file of
+/// the head). Measured on
 /// 2026-09-26 (release) for changes 11 and 201: 20 → 26 objects and 33 → 43 reads,
 /// 130%, as the history's collections grow deeper. A walk that grew with the history
 /// itself would be near 2,000%. The bytes pushed grow faster (6 → 44 KiB); they are
@@ -112,6 +114,11 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
             reads(walked) / per,
             "count",
         );
+        recorder.value(
+            &format!("{step}.content_checked_per_change"),
+            number(&fetched.result, "content_checked")? / per,
+            "count",
+        );
     }
     recorder.value(
         "one_change.pushed_growth",
@@ -123,8 +130,21 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         percent(reads(&walk_late), reads(&walk_early)),
         "percent",
     );
+    recorder.value(
+        "one_change.content_checked_growth",
+        percent(
+            number(&fetch_late.result, "content_checked")?,
+            number(&fetch_early.result, "content_checked")?,
+        ),
+        "percent",
+    );
     recorder.at_most(
         "one_change.pushed_growth",
+        ONE_CHANGE_GROWTH_BUDGET_PERCENT,
+        "percent",
+    );
+    recorder.at_most(
+        "one_change.content_checked_growth",
         ONE_CHANGE_GROWTH_BUDGET_PERCENT,
         "percent",
     );

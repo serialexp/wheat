@@ -119,6 +119,46 @@ async fn removals_and_duplicate_edits_are_last_write_wins() {
 }
 
 #[tokio::test]
+async fn added_lists_only_new_members_across_snapshots_and_deltas() {
+    let objects = store("content-set-added");
+    let sets = ContentSetStore::new(&objects);
+    let old = sets
+        .write_snapshot(&(0..1_000).map(content_id).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let new = sets
+        .update_batch_compressing(
+            old,
+            [
+                (content_id(3), false),
+                (content_id(5_000), true),
+                (content_id(1_500), true),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        blob(&objects, new).await.unwrap(),
+        ContentSetBlob::Delta { .. }
+    ));
+
+    assert_eq!(
+        sets.added(old, new).await.unwrap(),
+        [content_id(1_500), content_id(5_000)]
+    );
+    assert_eq!(sets.added(new, old).await.unwrap(), [content_id(3)]);
+    assert!(sets.added(new, new).await.unwrap().is_empty());
+
+    // More additions than `delta`'s change limit.
+    let empty = sets.empty_root().await.unwrap();
+    let large = sets
+        .write_snapshot(&(0..300_000).map(content_id).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(sets.added(empty, large).await.unwrap().len(), 300_000);
+}
+
+#[tokio::test]
 async fn large_replacement_falls_back_to_smaller_snapshot() {
     let objects = store("content-set-replacement");
     let sets = ContentSetStore::new(&objects);

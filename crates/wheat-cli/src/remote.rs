@@ -678,34 +678,52 @@ async fn pull<O: ImmutableObjectStore>(
     }
 }
 
-/// Fetch content from the server for all ContentIds referenced by the
-/// repository's content manifest. Stores each content blob locally.
+/// What one content fetch transferred.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FetchedContent {
+    /// Content IDs looked up in the local store.
+    pub checked: usize,
+    /// Blobs fetched from the server.
+    pub fetched: usize,
+}
+
+/// Fetch the content that `envelope_id`'s content manifest requires and the local
+/// store lacks.
 ///
-/// Returns the number of content blobs fetched.
+/// With `since`, only content that `since`'s manifest lacks is looked up: the
+/// client keeps an envelope as `since` only once all its content is stored.
 pub async fn fetch_content<O: ImmutableObjectStore>(
     session: &mut WheatSession,
     op_id: u32,
     objects: &O,
     content: &ContentStore,
     envelope_id: RepositoryEnvelopeId,
-) -> Result<usize> {
+    since: Option<RepositoryEnvelopeId>,
+) -> Result<FetchedContent> {
     let reader = RepositoryReader::new(objects, content);
-    let envelope = reader.envelope(envelope_id).await?;
-    let state = reader.state(envelope.state).await?;
-    let manifest = reader.manifest(state.required_content).await?;
-
-    // Walk the content set to find all ContentIds.
+    let required = async |envelope_id| -> Result<_> {
+        let envelope = reader.envelope(envelope_id).await?;
+        let state = reader.state(envelope.state).await?;
+        Ok(reader.manifest(state.required_content).await?.content)
+    };
+    let new = required(envelope_id).await?;
     let content_set = wheat_store::ContentSetStore::new(objects);
-    let mut cursor = content_set.cursor(manifest.content).await?;
-    let mut missing = Vec::new();
-    while let Some(content_id) = cursor.next().await? {
-        if !content.contains(content_id) {
-            missing.push(content_id);
-        }
-    }
+    let candidates = match since {
+        Some(since) => content_set.added(required(since).await?, new).await?,
+        None => content_set.resolve(new).await?,
+    };
+    let missing = candidates
+        .iter()
+        .copied()
+        .filter(|id| !content.contains(*id))
+        .collect::<Vec<_>>();
+    let checked = candidates.len();
 
     if missing.is_empty() {
-        return Ok(0);
+        return Ok(FetchedContent {
+            checked,
+            fetched: 0,
+        });
     }
 
     let total = missing.len();
@@ -769,7 +787,10 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
     }
     pending.store(content)?;
 
-    Ok(total)
+    Ok(FetchedContent {
+        checked,
+        fetched: total,
+    })
 }
 
 /// Fetched blobs held until there are enough to store together.

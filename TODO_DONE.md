@@ -12,6 +12,18 @@ Finished items, moved here from `TODO.md` under the same headings.
   it cannot be switched on by accident (test `every_read_is_refused_off_unix`, which
   runs only off Unix). Not compiled for a non-Unix target here: the only installed
   one, WASI, fails first in `signal-hook-registry`.
+- `[x]` **Publish walks the whole content manifest (confirmed).** `handle_publish`
+  (`publish.rs`, the content phase) looked up every content ID of the proposed
+  envelope, even for a one-line change, and the client's `fetch_content`
+  (`remote.rs`) did the same on every fetch. Done 2026-10-05: both look up only
+  `ContentSetStore::added(old, new)`, the content the old head (the server's current
+  head; the client's last fetched envelope) lacks. That relies on a head being kept
+  only once all its content is stored, as transition validation already did. Tests:
+  `content_is_asked_for_only_where_the_head_lacks_it` (`publish_test.rs`, fails on
+  the old code), `content_checked` in `remote_fetch.rs`,
+  `added_lists_only_new_members_across_snapshots_and_deltas`. Bench
+  `fetch_incremental` records `content_checked` and budgets its growth. Finding the
+  difference still decodes both snapshots (see `TODO.md`).
 - `[x]` **wheat-server has no authentication or access control (confirmed).**
   `run_session` (`crates/wheat-server/src/connection.rs`) never looked at
   `ClientHello.auth_token`, so any client that could connect could open, fetch,

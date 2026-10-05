@@ -287,6 +287,29 @@ impl<'a, S: ImmutableObjectStore> ContentSetStore<'a, S> {
         })?;
         Ok(result)
     }
+
+    /// The members of `new` that `old` lacks, in order. Unlike [`Self::delta`] there
+    /// is no change limit: both sets are already bounded by
+    /// [`CONTENT_SET_MAX_MEMBERS`].
+    pub async fn added(
+        &self,
+        old: ContentSetId,
+        new: ContentSetId,
+    ) -> Result<Vec<ContentId>, CollectionError> {
+        if old == new {
+            return Ok(Vec::new());
+        }
+        let old = self.resolve(old).await?;
+        let new = self.resolve(new).await?;
+        let mut added = Vec::new();
+        let Ok(()) = walk_difference::<std::convert::Infallible>(&old, &new, |id, is_added| {
+            if is_added {
+                added.push(id);
+            }
+            Ok(())
+        });
+        Ok(added)
+    }
 }
 
 fn normalize_edits(edits: impl IntoIterator<Item = (ContentId, bool)>) -> Vec<(ContentId, bool)> {

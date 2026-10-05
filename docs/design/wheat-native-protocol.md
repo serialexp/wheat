@@ -441,6 +441,11 @@ of the proposed envelope that its head does not already cover. An object
 that is not a valid Wheat object, or a proposed envelope whose graph does not
 decode, refuses the publish too.
 
+The content phase looks only at content the proposed envelope's manifest has
+and the current head's lacks: a head is accepted only once all its content is
+stored, so the rest is there already. A fetch does the same against the
+envelope the client last fetched.
+
 Every publish operation carries a client-generated `op_id` for connection-
 scoped correlation and a `publish_key` (128-bit, client-generated, unique
 per principal + repository) for cross-session idempotency. If the CAS

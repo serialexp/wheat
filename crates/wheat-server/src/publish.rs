@@ -102,30 +102,34 @@ pub async fn handle_publish(
         .manifest(state.required_content)
         .await
         .map_err(|e| ConnectionError::Internal(format!("failed to read content manifest: {e}")))?;
-
-    // Walk the content set to collect all content IDs, then bulk-check
-    // which ones already exist. For S3 backends this does one LIST call
-    // instead of one GET per item.
-    let content_set = wheat_store::ContentSetStore::new(&entry.objects);
-    let mut cursor = content_set
-        .cursor(manifest.content)
+    let current_envelope = reader
+        .envelope(current_head.envelope)
         .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to walk content set: {e}")))?;
-    let mut all_content_ids = Vec::new();
-    while let Some(content_id) = cursor
-        .next()
+        .map_err(|e| ConnectionError::Internal(format!("failed to read current envelope: {e}")))?;
+    let current_state = reader
+        .state(current_envelope.state)
         .await
-        .map_err(|e| ConnectionError::Internal(format!("content set walk error: {e}")))?
-    {
-        all_content_ids.push(content_id);
-    }
+        .map_err(|e| ConnectionError::Internal(format!("failed to read current state: {e}")))?;
+    let current_manifest = reader
+        .manifest(current_state.required_content)
+        .await
+        .map_err(|e| {
+            ConnectionError::Internal(format!("failed to read current content manifest: {e}"))
+        })?;
 
+    // A head is only accepted once all its content is stored, so only content the
+    // current head lacks can be missing (transition validation relies on the same).
+    // Bulk-check those: for S3 backends this does one LIST call instead of one GET
+    // per item.
+    let candidates = wheat_store::ContentSetStore::new(&entry.objects)
+        .added(current_manifest.content, manifest.content)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to compare content sets: {e}")))?;
     let existing = entry
         .content
-        .existing_ids(&all_content_ids)
+        .existing_ids(&candidates)
         .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
-
-    let missing: Vec<ContentId> = all_content_ids
+    let missing: Vec<ContentId> = candidates
         .iter()
         .filter(|id| !existing.contains(id))
         .copied()
@@ -136,7 +140,7 @@ pub async fn handle_publish(
         // the old ContentId as a delta base for each new ContentId. This
         // produces much smaller stored objects for typical edits.
         let base_map =
-            compute_delta_base_map(&entry.objects, &reader, current_head, &envelope_record).await;
+            compute_delta_base_map(&entry.objects, &reader, &current_state, &state).await;
 
         // Ask in rounds of at most MAX_WANT_IDS, one ContentNeeded each. In
         // every round accept only the requested blobs, each once, and store
@@ -242,18 +246,13 @@ pub async fn handle_publish(
     )
     .await?;
 
-    let expected_envelope = reader
-        .envelope(current_head.envelope)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read current envelope: {e}")))?;
-
     let validation_options = TransitionValidationOptions {
         allow_non_monotonic: force,
     };
 
     if let Err(e) = reader
         .validate_transition_with_options(
-            expected_envelope.state,
+            current_envelope.state,
             envelope_record.state,
             validation_options,
         )
@@ -555,28 +554,13 @@ async fn store_objects(
 async fn compute_delta_base_map(
     objects: &Box<dyn ImmutableObjectStore>,
     reader: &RepositoryReader<'_, Box<dyn ImmutableObjectStore>>,
-    current_head: &RepositoryHead,
-    proposed_envelope: &wheat_core::RepositoryEnvelopeRecord,
+    old_state: &wheat_core::RepositoryStateRecord,
+    new_state: &wheat_core::RepositoryStateRecord,
 ) -> HashMap<ContentId, ContentId> {
     let mut base_map = HashMap::new();
 
-    // Read old tree.
-    let old_envelope = match reader.envelope(current_head.envelope).await {
-        Ok(e) => e,
-        Err(_) => return base_map,
-    };
-    let old_state = match reader.state(old_envelope.state).await {
-        Ok(s) => s,
-        Err(_) => return base_map,
-    };
     let old_view = match reader.view(old_state.base_view).await {
         Ok(v) => v,
-        Err(_) => return base_map,
-    };
-
-    // Read new tree.
-    let new_state = match reader.state(proposed_envelope.state).await {
-        Ok(s) => s,
         Err(_) => return base_map,
     };
     let new_view = match reader.view(new_state.base_view).await {

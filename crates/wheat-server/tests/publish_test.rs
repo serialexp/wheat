@@ -7,7 +7,7 @@ mod support;
 use std::net::SocketAddr;
 
 use wheat_core::{
-    ApplicationContext, ObjectId, Repository, RepositoryEnvelopeId, Tree, ViewId,
+    ApplicationContext, ContentId, ObjectId, Repository, RepositoryEnvelopeId, Tree, ViewId,
     ViewLabelManifestRecord,
 };
 use wheat_protocol::*;
@@ -197,16 +197,21 @@ fn files_in_own_directories(count: usize) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// Answers the content phase, however many rounds it takes, and commits.
-async fn upload_content_and_commit(ws: &mut Ws, content: &ContentStore) -> PublishResultOutput {
+/// Answers the content phase, however many rounds it takes, and commits. Returns
+/// the result and the blobs the server asked for.
+async fn upload_content_and_commit(
+    ws: &mut Ws,
+    content: &ContentStore,
+) -> (PublishResultOutput, Vec<ContentId>) {
+    let mut asked = Vec::new();
     loop {
         match recv_msg(ws).await {
             WheatProtocolMessage::ContentNeeded(needed) => {
                 assert_eq!(needed.op_id, OP);
                 assert!(needed.content_ids.len() <= MAX_WANT_IDS);
                 for id in needed.content_ids {
-                    let blob =
-                        wheat_core::ContentId::from_digest(id.bytes.as_slice().try_into().unwrap());
+                    let blob = ContentId::from_digest(id.bytes.as_slice().try_into().unwrap());
+                    asked.push(blob);
                     let data = content.get(blob).unwrap();
                     send_msg(
                         ws,
@@ -246,7 +251,7 @@ async fn upload_content_and_commit(ws: &mut Ws, content: &ContentStore) -> Publi
     loop {
         match recv_msg(ws).await {
             WheatProtocolMessage::PublishProgress(_) => continue,
-            WheatProtocolMessage::PublishResult(result) => return result,
+            WheatProtocolMessage::PublishResult(result) => return (result, asked),
             other => panic!("expected PublishResult, got {other:?}"),
         }
     }
@@ -315,9 +320,29 @@ async fn a_publish_larger_than_one_round_leaves_the_server_complete() {
     assert!(sent > MAX_WANT_IDS, "{rounds:?}");
     assert!(rounds.contains(&MAX_WANT_IDS), "{rounds:?}");
 
-    let result = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
     assert_published(&result, proposed);
     publishing.assert_server_complete(proposed).await;
+}
+
+/// A head is accepted only once all its content is stored, so a publish asks only
+/// about content the current head lacks, not about every file of the new head.
+#[tokio::test]
+async fn content_is_asked_for_only_where_the_head_lacks_it() {
+    let mut publishing = Publishing::start().await;
+    // Lose the head's one blob behind the server's back: a content phase that
+    // looked at every file would ask for it again.
+    std::fs::remove_file(publishing.server_content.path(ContentId::of(b"read me"))).unwrap();
+    let notes = b"notes".to_vec();
+    let proposed = publishing
+        .propose(&[("notes.txt".to_owned(), notes.clone())])
+        .await;
+    let mut ws = publishing.request(proposed).await;
+
+    upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    assert_published(&result, proposed);
+    assert_eq!(asked, [ContentId::of(&notes)]);
 }
 
 #[tokio::test]
@@ -331,7 +356,7 @@ async fn objects_sent_in_chunks_are_put_back_together() {
     let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Chunked).await;
     assert!(!rounds.is_empty());
 
-    let result = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
     assert_published(&result, proposed);
     publishing.assert_server_complete(proposed).await;
 }
