@@ -23,6 +23,8 @@ pub enum ChangeMapError {
     DeltaNodeLimitExceeded { limit: usize },
     #[error("change-map delta queues more than {limit} pending subtrees")]
     DeltaPendingLimitExceeded { limit: usize },
+    #[error("{} changes have a different change object on each side", .0.len())]
+    DivergentEntries(Vec<ChangeId>),
 }
 
 impl From<radix::Error> for ChangeMapError {
@@ -182,6 +184,39 @@ impl<'a, S: ImmutableObjectStore> ChangeMapStore<'a, S> {
         value: ChangeObjectId,
     ) -> Result<ChangeMapId, ChangeMapError> {
         Ok(self.inner.update_batch(root, [(key, Some(value))]).await?)
+    }
+    /// Every entry of `left` and of `right`. A change that maps to a different object
+    /// on each side is [`ChangeMapError::DivergentEntries`]: one change identity never
+    /// names two change objects.
+    ///
+    /// Subtrees the roots share are skipped by identity, so the cost follows how much
+    /// the maps differ.
+    pub async fn union(
+        &self,
+        left: ChangeMapId,
+        right: ChangeMapId,
+    ) -> Result<ChangeMapId, ChangeMapError> {
+        if left == right {
+            return Ok(left);
+        }
+        let entries = self
+            .inner
+            .paired_diff(left, right, radix::DiffLimits::unbounded())
+            .await
+            .map_err(|error| ChangeMapError::from(error.into_unbounded()))?;
+        let mut added = Vec::new();
+        let mut divergent = Vec::new();
+        for entry in entries {
+            match entry {
+                radix::DiffEntry::Added(change, object) => added.push((change, Some(object))),
+                radix::DiffEntry::Changed(change, ..) => divergent.push(change),
+                radix::DiffEntry::Removed(..) => {}
+            }
+        }
+        if !divergent.is_empty() {
+            return Err(ChangeMapError::DivergentEntries(divergent));
+        }
+        Ok(self.inner.update_batch(left, added).await?)
     }
     pub async fn contains_node(&self, id: ChangeMapId) -> Result<bool, ChangeMapError> {
         Ok(self.inner.contains_node(id).await?)

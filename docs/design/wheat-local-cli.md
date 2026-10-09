@@ -204,8 +204,9 @@ both lists.
   `clone`/`fetch`/`publish` exist. Fetch is incremental: the server pushes only
   what the last fetched envelope lacks, and the client pulls any gaps. The local
   head counts its own generations; unpublished work is a local head envelope
-  other than the last fetched or published one. There is no pull or
-  integration.)
+  other than the last fetched or published one. 2026-10-09: a fetch keeps
+  unpublished work, joining both states and merging labels three ways against
+  the last fetch; `--force` drops it. There is no integrate or pull yet.)
 - [ ] **Phase 3 — concurrent multi-workspace authoring policy.** Durable workspace
   identity, shared-store creation/list/detach, operation locks, and content pins are
   implemented. Still define user-facing integration when two workspaces advance

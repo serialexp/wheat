@@ -599,7 +599,8 @@ struct NativeFetchArgs {
     /// Override the remote URL (wheat://host:port/owner/repo).
     #[arg(long)]
     remote: Option<String>,
-    /// Force fetch even if local has diverged from last-fetched state.
+    /// Take the remote's history and labels as they are, dropping local work the
+    /// remote lacks instead of keeping it alongside.
     #[arg(long)]
     force: bool,
 }
@@ -2662,18 +2663,9 @@ fn native_fetch(
 
     let last_fetched = remote_cfg.last_fetched_head()?;
 
-    // Divergence check: a local head other than the last fetched or published one
-    // holds unpublished local work. Refuse unless --force. Generations can't tell:
-    // the local head and the remote count their own.
-    if !arguments.force && local_head.envelope != last_fetched.envelope {
-        return Err(CliFailure::stale(
-            "local repository has unpublished changes; run `wheat publish` first, or use `wheat fetch --force` to discard local divergence",
-        ));
-    }
-
     let token = credential::token_for(Some(&context.store_root), &parsed)?;
     let rt = runtime()?;
-    let (remote_state, fetched, content) = rt.block_on(async {
+    let (remote_state, since, fetched, content) = rt.block_on(async {
         let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
@@ -2681,6 +2673,7 @@ fn native_fetch(
             remote::close(&mut session).await?;
             return Ok((
                 state,
+                None,
                 remote::FetchedObjects::default(),
                 remote::FetchedContent::default(),
             ));
@@ -2707,12 +2700,31 @@ fn native_fetch(
         .await?;
 
         remote::close(&mut session).await?;
-        Ok::<_, anyhow::Error>((state, fetched, content))
+        Ok::<_, anyhow::Error>((state, since, fetched, content))
     })?;
 
-    if remote_state.generation == last_fetched.generation
-        && remote_state.envelope == last_fetched.envelope
-    {
+    let remote_moved = remote_state.generation != last_fetched.generation
+        || remote_state.envelope != last_fetched.envelope;
+    // A local head other than the last fetched or published one holds work the
+    // remote lacks. It is kept: the new head joins it with the remote's history,
+    // and labels merge against the last fetch. --force takes the remote as it is.
+    let kept_local = !arguments.force && local_head.envelope != last_fetched.envelope;
+    let envelope = if arguments.force {
+        remote_state.envelope
+    } else if !remote_moved {
+        local_head.envelope
+    } else {
+        rt.block_on(
+            RepositoryReader::new(&local.objects, &local.content).union_envelopes(
+                since,
+                local_head.envelope,
+                remote_state.envelope,
+            ),
+        )
+        .map_err(union_failure)?
+    };
+
+    if !remote_moved && envelope == local_head.envelope {
         return Success::new(
             "fetch",
             json!({ "up_to_date": true, "generation": local_head.generation }),
@@ -2720,27 +2732,32 @@ fn native_fetch(
         );
     }
 
-    // Move the local head to the remote's envelope, one local generation on
-    // however many generations the remote moved.
-    let new_head = wheat_store::RepositoryHead {
-        generation: local_head.generation + 1,
-        envelope: remote_state.envelope,
+    // One local generation on however many generations the remote moved.
+    let new_head = if envelope == local_head.envelope {
+        local_head
+    } else {
+        let new_head = wheat_store::RepositoryHead {
+            generation: local_head.generation + 1,
+            envelope,
+        };
+        local
+            .heads
+            .compare_and_advance(local_head, new_head)
+            .map_err(|e| anyhow::anyhow!("failed to update local head: {e}"))?;
+        new_head
     };
-    local
-        .heads
-        .compare_and_advance(local_head, new_head)
-        .map_err(|e| anyhow::anyhow!("failed to update local head: {e}"))?;
 
-    // Update remote config.
-    let mut updated_cfg = remote_cfg;
-    updated_cfg.set_last_fetched(&wheat_store::RepositoryHead {
-        generation: remote_state.generation,
-        envelope: remote_state.envelope,
-    });
-    updated_cfg.write(&context.store_root)?;
+    if remote_moved {
+        let mut updated_cfg = remote_cfg;
+        updated_cfg.set_last_fetched(&wheat_store::RepositoryHead {
+            generation: remote_state.generation,
+            envelope: remote_state.envelope,
+        });
+        updated_cfg.write(&context.store_root)?;
+    }
 
     let human = format!(
-        "fetched {} objects ({} pulled in {} requests{}), {} content blobs\nupdated to generation {}, envelope {}\n",
+        "fetched {} objects ({} pulled in {} requests{}), {} content blobs\n{}updated to generation {}, envelope {}\n",
         fetched.pushed + fetched.pulled,
         fetched.pulled,
         fetched.wants,
@@ -2750,6 +2767,11 @@ fn native_fetch(
             ""
         },
         content.fetched,
+        if kept_local {
+            "kept the local work the remote lacks\n"
+        } else {
+            ""
+        },
         new_head.generation,
         new_head.envelope,
     );
@@ -2757,6 +2779,7 @@ fn native_fetch(
         "fetch",
         json!({
             "up_to_date": false,
+            "kept_local": kept_local,
             "generation": new_head.generation,
             "envelope": new_head.envelope.to_string(),
             "objects": fetched.pushed + fetched.pulled,
@@ -2769,6 +2792,21 @@ fn native_fetch(
         }),
         human,
     )
+}
+
+/// A fetch that cannot keep the local work beside the remote's is a conflict the user
+/// settles; anything else is a failure to read or write the store.
+fn union_failure(error: wheat_store::RepositoryUnionError) -> anyhow::Error {
+    use wheat_store::RepositoryUnionError as Union;
+    match error {
+        Union::DivergentLabels(_) => CliFailure::conflict(format!(
+            "{error}; move them to agree, or use `wheat fetch --force` to take the remote's"
+        )),
+        Union::DivergentChanges(_) | Union::DifferentBaseView { .. } => CliFailure::conflict(
+            format!("{error}; use `wheat fetch --force` to take the remote's history"),
+        ),
+        other => anyhow::Error::new(other).context("joining the local and remote histories"),
+    }
 }
 
 fn native_publish(

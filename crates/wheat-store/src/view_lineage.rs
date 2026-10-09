@@ -316,6 +316,39 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
         Ok(self.inner.update_batch(root, edits).await?)
     }
 
+    /// Every edge of `left` and of `right`. A parent with children on both sides gets
+    /// the union of its two child sets.
+    ///
+    /// Subtrees the roots share are skipped by identity, so two lineages that grew
+    /// apart from a common one cost the edges they differ by, not the whole history.
+    #[tracing::instrument(name = "view_lineage_union", level = "debug", skip_all)]
+    pub async fn union(
+        &self,
+        left: ViewLineageMapId,
+        right: ViewLineageMapId,
+    ) -> Result<ViewLineageMapId, ViewLineageError> {
+        if left == right {
+            return Ok(left);
+        }
+        let entries = self
+            .inner
+            .paired_diff(left, right, radix::DiffLimits::unbounded())
+            .await
+            .map_err(|error| ViewLineageError::from(error.into_unbounded()))?;
+        let mut edits = Vec::new();
+        for entry in entries {
+            match entry {
+                radix::DiffEntry::Added(parent, children) => edits.push((parent, Some(children))),
+                radix::DiffEntry::Changed(parent, left_children, right_children) => {
+                    let children = self.retained.union(left_children, right_children).await?;
+                    edits.push((parent, Some(children)));
+                }
+                radix::DiffEntry::Removed(..) => {}
+            }
+        }
+        Ok(self.inner.update_batch(left, edits).await?)
+    }
+
     /// Authenticates the complete map and all referenced child sets.
     pub async fn validate(
         &self,

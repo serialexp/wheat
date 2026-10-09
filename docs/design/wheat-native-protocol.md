@@ -61,9 +61,10 @@ top of them.
   push and pulls the gaps with the same walk, content fetch stores blobs in
   batches, and publish answers each ObjectsNeeded round with exactly the
   objects asked for (chunked above 8 MiB). Remote tracking via `remote.json`
-  (url, last_fetched_generation, last_fetched_envelope) with divergence
-  detection on fetch: it refuses when the local head's envelope is not the one
-  last fetched or published. The local head counts its own generations.
+  (url, last_fetched_generation, last_fetched_envelope). A fetch with local
+  work the remote lacks keeps it: the new local head is the union of both
+  states, with labels merged three ways against the last fetched envelope
+  (2026-10-09). The local head counts its own generations.
 - [x] **Phase 1 — acceptance tests.** 3 end-to-end tests in
   `crates/wheat-server/tests/clone_fetch_publish_test.rs`: clone round-trip
   (validates complete structural closure via `validate_complete`), publish
@@ -327,10 +328,21 @@ Client                          Server
   fetched envelope.
 
 The local head and the remote count their own generations. A fetch moves the
-local head to the remote envelope with the next local generation, and the
-client remembers the remote's generation and envelope in `remote.json`. The
-client has unpublished work when its head's envelope differs from the one it
-last fetched or published.
+local head on by one local generation, and the client remembers the remote's
+generation and envelope in `remote.json`. The client has unpublished work when
+its head's envelope differs from the one it last fetched or published.
+
+Without unpublished work, the new local head is the remote envelope. With it,
+the client keeps both: the new head's state is the union of the local and the
+remote state, and its labels merge three ways against the last fetched
+envelope's labels. A label one side left alone takes the other side's value;
+a label both sides moved differently stops the fetch and is named. A change
+recorded with a different change object on each side, or states from
+different base views, stop it too. Every part of a state only grows, so the
+union is a valid successor of the remote head and publishes as one. Each part
+is joined by comparing the two roots, skipping the subtrees they share, so the
+cost follows how far the sides moved apart. `wheat fetch --force` drops the
+local work and takes the remote envelope as it is.
 
 #### Batched transfer rules
 

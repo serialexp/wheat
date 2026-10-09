@@ -145,7 +145,16 @@ budget passes, but by only about 0.7 s.
   stays short. Snapshot's `ClosureWalk` caps visits at twice `max_objects`
   (`LimitExceeded("closure visits")`); the fetch walk needs a similar cap. Check
   first which maps a client can fill with chosen keys (change IDs are UUIDs the
-  client picks).
+  client picks). 2026-10-09: the fetch union (`crates/wheat-store/src/repository_union.rs`)
+  diffs the remote's change map, lineage and retained sets against the local ones
+  with `DiffLimits::unbounded()`, so a server could do the same to a client; a
+  visit cap there too.
+- `[ ]` **JSON output of `status` and `conflicts` gives IDs as byte arrays
+  (2026-10-09).** `WorkspaceStatus` (`crates/wheat-cli/src/workspace_status.rs`) and
+  `ConflictEntry` (`conflict_inspection.rs`) serialize `ViewId`, `ChangeId` and the
+  other IDs with their derived `Serialize`, so `--format json` prints 32 numbers
+  where the human output and every other document print the hex ID.
+  `frontier list` had the same problem and now uses `command_output::display_id`.
 - `[ ]` **`one_step_forward_yields_little_more_than_the_difference` fails about one
   run in twelve (2026-09-26).** `crates/wheat-store/tests/structural_delta.rs`, step 5
   (revising `a` under `b` and `c`): the walk yields one old `RevisionMapNode`. Likely

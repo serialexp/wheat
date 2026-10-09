@@ -171,9 +171,136 @@ fn a_fetch_catches_up_on_several_publishes_and_knows_its_own() {
     assert_eq!(fetched["content"], 3, "{fetched}");
     assert_eq!(fetched["content_checked"], 3, "{fetched}");
     ok(&reader, &reader_stores, &config, &["validate"]);
+}
 
-    // A local change the remote doesn't have still stops a fetch.
-    add_change(&reader, &reader_stores, &config, "d");
+fn frontiers(workspace: &Path, stores: &Path, config: &Path) -> Vec<String> {
+    let listed = ok_json(workspace, stores, config, &["frontier", "list"]);
+    let mut frontiers: Vec<String> = listed["frontiers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{listed}"))
+        .iter()
+        .map(|view| {
+            view.as_str()
+                .unwrap_or_else(|| panic!("{listed}"))
+                .to_owned()
+        })
+        .collect();
+    frontiers.sort();
+    frontiers
+}
+
+/// Work on both sides: a fetch keeps the local change beside the remote's, the result
+/// publishes as a successor of the remote, and the other side fetches it back.
+#[test]
+fn a_fetch_keeps_local_work_beside_the_remotes() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server = serve(root, &config);
+    let clone = |name: &str| {
+        let stores = root.join(format!("{name}-stores"));
+        let workspace = root.join(name);
+        ok(
+            root,
+            &stores,
+            &config,
+            &["clone", &server.url, workspace.to_str().unwrap()],
+        );
+        (workspace, stores)
+    };
+    let (writer, writer_stores) = clone("writer");
+    let (reader, reader_stores) = clone("reader");
+
+    add_change(&writer, &writer_stores, &config, "remote");
+    ok(&writer, &writer_stores, &config, &["publish"]);
+    add_change(&reader, &reader_stores, &config, "local");
+    let local_only = frontiers(&reader, &reader_stores, &config);
+    assert_eq!(local_only.len(), 1, "{local_only:?}");
+
+    let fetched = ok_json(&reader, &reader_stores, &config, &["fetch"]);
+    assert_eq!(fetched["up_to_date"], false, "{fetched}");
+    assert_eq!(fetched["kept_local"], true, "{fetched}");
+    ok(&reader, &reader_stores, &config, &["validate"]);
+    let joined = frontiers(&reader, &reader_stores, &config);
+    assert_eq!(joined.len(), 2, "{joined:?}");
+    assert!(joined.contains(&local_only[0]), "{joined:?}");
+
+    // Fetching again changes nothing, and the joined history publishes.
+    let again = ok_json(&reader, &reader_stores, &config, &["fetch"]);
+    assert_eq!(again["up_to_date"], true, "{again}");
+    ok(&reader, &reader_stores, &config, &["publish"]);
+
+    let back = ok_json(&writer, &writer_stores, &config, &["fetch"]);
+    assert_eq!(back["kept_local"], false, "{back}");
+    ok(&writer, &writer_stores, &config, &["validate"]);
+    assert_eq!(frontiers(&writer, &writer_stores, &config), joined);
+}
+
+/// `--force` drops the local work and takes the remote as it is.
+#[test]
+fn a_forced_fetch_drops_local_work() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server = serve(root, &config);
+    let stores = root.join("stores");
+    let workspace = root.join("workspace");
+    ok(
+        root,
+        &stores,
+        &config,
+        &["clone", &server.url, workspace.to_str().unwrap()],
+    );
+    let published = frontiers(&workspace, &stores, &config);
+
+    add_change(&workspace, &stores, &config, "dropped");
+    assert_ne!(frontiers(&workspace, &stores, &config), published);
+    let forced = ok_json(&workspace, &stores, &config, &["fetch", "--force"]);
+    assert_eq!(forced["kept_local"], false, "{forced}");
+    assert_eq!(frontiers(&workspace, &stores, &config), published);
+}
+
+/// A label moved differently on each side stops the fetch and names it.
+#[test]
+fn a_label_moved_on_both_sides_stops_the_fetch() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server = serve(root, &config);
+    let clone = |name: &str| {
+        let stores = root.join(format!("{name}-stores"));
+        let workspace = root.join(name);
+        ok(
+            root,
+            &stores,
+            &config,
+            &["clone", &server.url, workspace.to_str().unwrap()],
+        );
+        (workspace, stores)
+    };
+    let (writer, writer_stores) = clone("writer");
+    let (reader, reader_stores) = clone("reader");
+    let label_tip = |workspace: &Path, stores: &Path, name: &str| {
+        add_change(workspace, stores, &config, name);
+        let tip = frontiers(workspace, stores, &config).pop().unwrap();
+        ok(
+            workspace,
+            stores,
+            &config,
+            &["label", "create", "shared", "--view", &tip],
+        );
+    };
+    label_tip(&writer, &writer_stores, "remote");
+    ok(&writer, &writer_stores, &config, &["publish"]);
+    label_tip(&reader, &reader_stores, "local");
+
     let refused = fails(&reader, &reader_stores, &config, &["fetch"]);
-    assert!(refused.contains("unpublished changes"), "{refused}");
+    assert!(
+        refused.contains("labels were moved differently"),
+        "{refused}"
+    );
+    assert!(refused.contains("shared"), "{refused}");
 }

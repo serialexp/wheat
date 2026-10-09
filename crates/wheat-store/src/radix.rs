@@ -30,6 +30,21 @@ impl From<Error> for DiffError {
     }
 }
 
+impl DiffError {
+    /// The storage error behind a diff run with [`DiffLimits::unbounded`], which
+    /// cannot exceed a limit.
+    pub(crate) fn into_unbounded(self) -> Error {
+        match self {
+            Self::Radix(error) => error,
+            Self::ChangeLimitExceeded { .. }
+            | Self::NodeLimitExceeded { .. }
+            | Self::PendingLimitExceeded { .. } => {
+                unreachable!("an unbounded diff exceeded a limit")
+            }
+        }
+    }
+}
+
 impl From<ObjectStoreError> for Error {
     fn from(value: ObjectStoreError) -> Self {
         Self::Store(value)
@@ -145,6 +160,17 @@ impl Default for DiffLimits {
             // A radix node has at most 256 children; leave room for several
             // divergent levels while still bounding adversarial inputs.
             max_pending: 4_096,
+        }
+    }
+}
+
+impl DiffLimits {
+    /// No limits, for callers whose inputs are already authenticated local roots.
+    pub(crate) const fn unbounded() -> Self {
+        Self {
+            max_changes: usize::MAX,
+            max_nodes: usize::MAX,
+            max_pending: usize::MAX,
         }
     }
 }
@@ -1492,28 +1518,25 @@ where
     }
 
     /// Authentically merges two radix roots and emits the unique canonical union shape.
+    /// A key present on both sides keeps the value in `left`.
+    ///
+    /// Only the subtrees where the roots differ are read, and only the entries `right`
+    /// adds are written, so two roots that grew apart from shared history cost what
+    /// they differ by rather than what they hold.
     pub(crate) async fn union(&self, left: C::Id, right: C::Id) -> Result<C::Id, Error> {
         if left == right {
             return Ok(left);
         }
-        let mut entries = BTreeMap::new();
-        let mut left_cursor = self.cursor(left).await?;
-        while let Some((key, value)) = left_cursor.next().await? {
-            entries.insert(key, value);
-        }
-        let mut changed = false;
-        let mut right_cursor = self.cursor(right).await?;
-        while let Some((key, value)) = right_cursor.next().await? {
-            if let std::collections::btree_map::Entry::Vacant(entry) = entries.entry(key) {
-                entry.insert(value);
-                changed = true;
-            }
-        }
-        if !changed {
-            return Ok(left);
-        }
-        let entries = entries.into_iter().collect::<Vec<_>>();
-        self.build_subtree(0, &entries).await
+        let added = self
+            .paired_diff(left, right, DiffLimits::unbounded())
+            .await
+            .map_err(DiffError::into_unbounded)?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                DiffEntry::Added(key, value) => Some((key, Some(value))),
+                DiffEntry::Changed(..) | DiffEntry::Removed(..) => None,
+            });
+        self.update_batch(left, added).await
     }
 
     fn build_subtree<'b>(

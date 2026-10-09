@@ -262,8 +262,8 @@ macro_rules! set_api {
             }
             /// Returns the authenticated structural union of two roots.
             ///
-            /// Equal and disjoint subtrees are reused directly; only divergent ancestors are
-            /// emitted, so memory is bounded by the radix depth and fanout.
+            /// Equal subtrees are skipped by identity and only the keys `other` adds are
+            /// written, so time and memory follow how much the roots differ.
             pub async fn union(&self, root: $id, other: $id) -> Result<$id, CollectionError> {
                 Ok(self.inner.union(root, other).await?)
             }
