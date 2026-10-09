@@ -23,6 +23,35 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
 const FORMAT: &str = "wheat-command-result";
 const VERSION: u32 = 1;
 
+/// Serializes an identity as the hex string it displays as, for JSON documents.
+pub(crate) fn display_id<T: fmt::Display, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.collect_str(value)
+}
+
+pub(crate) fn display_optional_id<T: fmt::Display, S: serde::Serializer>(
+    value: &Option<T>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.collect_str(value),
+        None => serializer.serialize_none(),
+    }
+}
+
+pub(crate) fn display_ids<T: fmt::Display, S: serde::Serializer>(
+    values: &[T],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum OutputFormat {
     #[default]

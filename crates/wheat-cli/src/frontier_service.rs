@@ -7,7 +7,10 @@ use wheat_store::{
     PublicationStore, RepositoryHead, RepositoryReader, ViewLineageLimits, ViewLineageMapStore,
 };
 
-use crate::{command_output::CliFailure, local::LocalRepository};
+use crate::{
+    command_output::{CliFailure, display_id, display_ids},
+    local::LocalRepository,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedFrontier {
@@ -27,7 +30,9 @@ impl ResolvedFrontier {
 pub(crate) struct FrontierList {
     pub schema_version: u32,
     pub label: String,
+    #[serde(serialize_with = "display_id")]
     pub basis: ViewId,
+    #[serde(serialize_with = "display_ids")]
     pub frontiers: Vec<ViewId>,
 }
 

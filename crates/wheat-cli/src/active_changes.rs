@@ -8,7 +8,10 @@ use wheat_store::{
     RepositoryPublicationError, RepositoryReader, RevisionMapStore,
 };
 
-use crate::{command_output::CliFailure, local::LocalRepository};
+use crate::{
+    command_output::{CliFailure, display_id, display_ids, display_optional_id},
+    local::LocalRepository,
+};
 
 const MAX_ACTIVE_CHANGES: usize = 250_000;
 const MAX_TITLE_BYTES: usize = 1024 * 1024;
@@ -62,34 +65,6 @@ pub(crate) fn render_human(document: &ActiveChanges) -> Result<Vec<u8>> {
         }
     }
     Ok(output.into_bytes())
-}
-
-fn display_id<T: std::fmt::Display, S: serde::Serializer>(
-    value: &T,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    serializer.collect_str(value)
-}
-
-fn display_optional_id<T: std::fmt::Display, S: serde::Serializer>(
-    value: &Option<T>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    match value {
-        Some(value) => serializer.collect_str(value),
-        None => serializer.serialize_none(),
-    }
-}
-
-fn display_ids<T: std::fmt::Display, S: serde::Serializer>(
-    values: &[T],
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    values
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .serialize(serializer)
 }
 
 #[tracing::instrument(name = "active_changes", level = "debug", skip_all)]
