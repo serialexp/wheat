@@ -187,11 +187,9 @@ both lists.
   trust, and `wheat hook` management commands.
 - [ ] **Phase 2 — repository discovery and local configuration.** Discovery walks
   ancestors to `.wheat` and is already implemented. Remaining: editor/pager
-  integration, aliases, compatibility remotes, and `wheat ignore import`
-  convenience command. (2026-09-25: `core.editor`, `core.pager`,
-  `core.default_label`, and `core.default_format` can be set, but no command
-  reads them yet. The `.gitignore` fallback diagnostic already tells users to run
-  the missing `wheat ignore import`.)
+  integration, aliases, and compatibility remotes. (2026-09-25: `core.editor`,
+  `core.pager`, `core.default_label`, and `core.default_format` can be set, but no
+  command reads them yet. 2026-10-09: `wheat ignore import` exists.)
 - [~] **Phase 3 — client/protocol boundary.** Introduce `wheat-client` and
   `wheat-protocol`, move local workspace operations behind the client contract,
   and remove the CLI's direct dependence on production store capabilities before

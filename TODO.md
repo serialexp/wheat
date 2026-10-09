@@ -128,9 +128,6 @@ budget passes, but by only about 0.7 s.
   one without a word. In a workspace that is also a git checkout that could put
   git's own files into the repository by accident. Decide whether capture should
   ask the same way.
-- `[ ]` **The `.gitignore` fallback diagnostic points at a missing command.**
-  `workspace_status.rs` tells users to run `wheat ignore import`, which does not
-  exist (tracked in `wheat-local-tooling.md`).
 - `[ ]` **The release-gate memory note lives under the gothab project.**
   `wheat-local-cli.md`'s release gate refers to
   `~/.claude/projects/-home-bart-Projects-gothab/memory/feedback_no_format_version_bumps.md`;

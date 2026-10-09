@@ -30,6 +30,7 @@ mod discovery;
 mod dot_git;
 mod edit_move;
 mod frontier_service;
+mod ignore_import;
 mod import_trace;
 mod inspection;
 mod label_service;
@@ -119,6 +120,9 @@ enum Command {
     /// Read or write typed Wheat configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Manage ignore rules.
+    #[command(subcommand)]
+    Ignore(IgnoreCommand),
     /// Inspect immutable edit definitions and lineage.
     Edits {
         #[arg(long)]
@@ -204,6 +208,14 @@ enum FrontierCommand {
         #[arg(long)]
         label: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum IgnoreCommand {
+    /// Copy each `.gitignore` Wheat falls back to into a sibling `.wheatignore`,
+    /// without Git's own files (`.git`, `.gitmodules`, `.gitattributes`). Existing
+    /// `.wheatignore` files are left alone, and the new ones are not added to a change.
+    Import,
 }
 
 #[derive(Debug, Args)]
@@ -659,6 +671,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Conflicts => "conflicts",
         Command::Diff(_) => "diff",
         Command::Config(ConfigCommand::Set { .. }) => "config.set",
+        Command::Ignore(IgnoreCommand::Import) => "ignore.import",
         Command::Edits { .. } => "edits",
         Command::Add(_) => "add",
         Command::Cat { .. } => "cat",
@@ -839,6 +852,35 @@ fn execute(cli: Cli) -> Result<Success> {
             // retained independently while the inspector reopens the same store.
             drop(local);
             log_inspection::inspect(&context.store_root, workspace.effective_view(), format)
+        }
+        Command::Ignore(IgnoreCommand::Import) => {
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+            let imported = ignore_import::import(&context.root, &local, &context.workspace)?;
+            let mut human = String::new();
+            for path in &imported.written {
+                writeln!(human, "wrote {path}")?;
+            }
+            for skipped in &imported.skipped {
+                writeln!(human, "skipped {}: {}", skipped.path, skipped.reason)?;
+            }
+            if imported.truncated {
+                writeln!(
+                    human,
+                    "the workspace walk hit its limits; some .gitignore files may remain"
+                )?;
+            }
+            if imported.written.is_empty() {
+                writeln!(human, "no .gitignore needed importing")?;
+            } else {
+                writeln!(
+                    human,
+                    "add the new .wheatignore files to a change to keep them"
+                )?;
+            }
+            Success::new("ignore.import", &imported, human)
         }
         Command::Changes => {
             let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;

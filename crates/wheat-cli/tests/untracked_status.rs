@@ -242,6 +242,60 @@ fn gitignore_fallback_with_diagnostic() {
 }
 
 #[test]
+fn ignore_import_makes_the_fallback_rules_explicit() {
+    let h = Harness::new();
+    h.init_from_git(&[("tracked.txt", "hello\n"), ("sub/kept.txt", "kept\n")]);
+
+    fs::write(
+        h.workspace.join(".gitignore"),
+        "*.log\n.git/\n/.gitmodules\n",
+    )
+    .unwrap();
+    fs::write(h.workspace.join("sub/.gitignore"), "*.tmp\n").unwrap();
+    // An ignored directory is never entered, so its .gitignore is not read.
+    fs::create_dir(h.workspace.join("pruned.log")).unwrap();
+    fs::write(h.workspace.join("pruned.log/.gitignore"), "x\n").unwrap();
+    // A directory with its own .wheatignore keeps it.
+    fs::create_dir(h.workspace.join("own")).unwrap();
+    fs::write(h.workspace.join("own/.gitignore"), "*.bak\n").unwrap();
+    fs::write(h.workspace.join("own/.wheatignore"), "*.own\n").unwrap();
+    fs::write(h.workspace.join("debug.log"), "debug\n").unwrap();
+    fs::write(h.workspace.join("sub/scratch.tmp"), "tmp\n").unwrap();
+    let before = h.json_ok(&h.workspace, &["status"]);
+
+    let imported = h.json_ok(&h.workspace, &["ignore", "import"]);
+    let written = imported["result"]["written"].as_array().unwrap();
+    assert_eq!(
+        written,
+        &[Value::from(".wheatignore"), Value::from("sub/.wheatignore")],
+        "{imported}"
+    );
+    assert_eq!(
+        fs::read_to_string(h.workspace.join(".wheatignore")).unwrap(),
+        "*.log\n"
+    );
+    assert_eq!(
+        fs::read_to_string(h.workspace.join("sub/.wheatignore")).unwrap(),
+        "*.tmp\n"
+    );
+    assert_eq!(
+        fs::read_to_string(h.workspace.join("own/.wheatignore")).unwrap(),
+        "*.own\n"
+    );
+    assert!(!h.workspace.join("pruned.log/.wheatignore").exists());
+
+    // The same paths are ignored, now without the fallback.
+    let stderr = h.stderr(&h.workspace, &["status"]);
+    assert!(!stderr.contains("wheat ignore import"), "{stderr}");
+    let after = h.json_ok(&h.workspace, &["status"]);
+    assert_eq!(ignored_paths(&after), ignored_paths(&before));
+
+    // Nothing is left to import.
+    let again = h.json_ok(&h.workspace, &["ignore", "import"]);
+    assert_eq!(again["result"]["written"], Value::Array(Vec::new()));
+}
+
+#[test]
 fn wheatignore_replaces_gitignore_in_same_directory() {
     let h = Harness::new();
     h.init_from_git(&[("tracked.txt", "hello\n")]);

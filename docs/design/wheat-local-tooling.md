@@ -42,8 +42,13 @@ land; move whole sections to "done" once everything inside them is checked.
   silence the message. A `.wheatignore` in the same directory fully replaces its
   sibling `.gitignore` — they are not merged. (Tests:
   `untracked_status::gitignore_fallback_with_diagnostic`,
-  `wheatignore_replaces_gitignore_in_same_directory`. The suggested
-  `wheat ignore import` command does not exist yet; see Outstanding.)
+  `wheatignore_replaces_gitignore_in_same_directory`.)
+- [x] **Phase 1 — `wheat ignore import`.** (2026-10-09) Copies each `.gitignore`
+  the fallback reads (found by the same walk as `status`) to a sibling
+  `.wheatignore`, dropping patterns that name `.git`, `.gitmodules` or
+  `.gitattributes`. It never replaces an existing `.wheatignore`, skips symlinked
+  or non-UTF-8 `.gitignore` files, and does not capture the new files. (Test:
+  `untracked_status::ignore_import_makes_the_fallback_rules_explicit`.)
 - [x] **Phase 1 — workspace-wide status with ignore rules.** Extend `wheat status`
   to traverse untracked workspace paths, classify them as untracked or ignored, and
   bound the scan. This is the first consumer of the ignore engine and gates
@@ -71,8 +76,6 @@ land; move whole sections to "done" once everything inside them is checked.
   directory, and depth limits with a truncation diagnostic, but the number of
   loaded ignore files and patterns is not bounded, and no test covers truncation
   (acceptance criterion 9).
-- [ ] **Phase 1 — `wheat ignore import`.** The `.gitignore` fallback diagnostic
-  tells the user to run this command, but it does not exist yet.
 - [ ] **Phase 2 — `add --all` follow-ups.** Add `--include-untracked` (the help
   text currently says to name untracked paths explicitly instead), and display or
   emit the capture plan before mutation in interactive flows.

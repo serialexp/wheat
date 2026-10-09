@@ -234,6 +234,9 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **The `.gitignore` fallback diagnostic points at a missing command.** Done
+  2026-10-09: `wheat ignore import` (`crates/wheat-cli/src/ignore_import.rs`), see
+  `wheat-local-tooling.md`.
 - `[x]` **Other `lookup_many` callers may fail when a directory became a file.** Done
   2026-10-09. Checking it with the CLI found that a directory and a file could not
   trade places in one revision at all:
