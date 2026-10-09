@@ -122,7 +122,7 @@ impl CliFailure {
 pub(crate) struct Success {
     pub(crate) command: &'static str,
     pub(crate) result: Value,
-    human: Vec<u8>,
+    pub(crate) human: Vec<u8>,
 }
 
 impl Success {

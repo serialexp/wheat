@@ -273,3 +273,71 @@ fn integrate_takes_only_frontiers_of_the_label() {
         "{refused}"
     );
 }
+
+/// With nothing local, a pull brings the remote's work into the workspace.
+#[test]
+fn pull_brings_the_remote_work_into_the_workspace() {
+    let (sides, _server) = sides();
+    let (writer, writer_stores) = &sides.writer;
+    let (reader, reader_stores) = &sides.reader;
+    change(&sides.writer, &sides.config, "remote.txt", "remote");
+    ok(writer, writer_stores, &sides.config, &["publish"]);
+
+    let pulled = ok_json(reader, reader_stores, &sides.config, &["pull"]);
+
+    assert_eq!(pulled["fetch"]["kept_local"], false, "{pulled}");
+    assert_eq!(
+        fs::read_to_string(reader.join("remote.txt")).unwrap(),
+        "remote"
+    );
+    let status = ok_json(reader, reader_stores, &sides.config, &["status"]);
+    assert_eq!(status["changes"].as_array().unwrap().len(), 0, "{status}");
+}
+
+/// With local work, a pull fetches, joins both sides and switches to the result.
+#[test]
+fn pull_joins_the_remote_work_with_the_local_work() {
+    let (sides, _server) = sides();
+    let (writer, writer_stores) = &sides.writer;
+    let (reader, reader_stores) = &sides.reader;
+    change(&sides.writer, &sides.config, "remote.txt", "remote");
+    ok(writer, writer_stores, &sides.config, &["publish"]);
+    change(&sides.reader, &sides.config, "local.txt", "local");
+
+    let pulled = ok_json(reader, reader_stores, &sides.config, &["pull"]);
+
+    assert_eq!(pulled["fetch"]["kept_local"], true, "{pulled}");
+    assert_eq!(pulled["integrate"]["integrated"], true, "{pulled}");
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 1);
+    assert_eq!(
+        fs::read_to_string(reader.join("remote.txt")).unwrap(),
+        "remote"
+    );
+    assert_eq!(
+        fs::read_to_string(reader.join("local.txt")).unwrap(),
+        "local"
+    );
+    ok(reader, reader_stores, &sides.config, &["publish"]);
+}
+
+/// A pull whose integrate is refused keeps the fetch and says what to run next.
+#[test]
+fn a_refused_integrate_keeps_the_pulled_fetch() {
+    let (sides, _server) = sides();
+    let (writer, writer_stores) = &sides.writer;
+    let (reader, reader_stores) = &sides.reader;
+    change(&sides.writer, &sides.config, "remote.txt", "remote");
+    ok(writer, writer_stores, &sides.config, &["publish"]);
+    change(&sides.reader, &sides.config, "local.txt", "local");
+    ok(reader, reader_stores, &sides.config, &["materialize"]);
+    fs::write(reader.join("local.txt"), "edited").unwrap();
+
+    let refused = fails(reader, reader_stores, &sides.config, &["pull"]);
+
+    assert!(refused.contains("the fetch is kept"), "{refused}");
+    assert!(
+        refused.contains("uncaptured tracked workspace edits"),
+        "{refused}"
+    );
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 2);
+}

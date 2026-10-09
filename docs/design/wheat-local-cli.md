@@ -209,7 +209,7 @@ both lists.
   other than the last fetched or published one. 2026-10-09: a fetch keeps
   unpublished work, joining both states and merging labels three ways against
   the last fetch; `--force` drops it. `wheat integrate` then joins the
-  frontiers. There is no pull yet.)
+  frontiers, and `wheat pull` does both.)
 - [ ] **Phase 3 — concurrent multi-workspace authoring policy.** Durable workspace
   identity, shared-store creation/list/detach, operation locks, and content pins are
   implemented. Still define user-facing integration when two workspaces advance
@@ -463,7 +463,13 @@ wheat materialize [--source <view-or-label>] [DIRECTORY] [--allow-dot-git]
 wheat restore [PATH ...] [--allow-dot-git]  # restore from the pinned workspace view
 wheat switch <label> [--frontier <view>] [--allow-dot-git]  # label activation plus safe materialization
 wheat integrate [--frontier <view> ...] [--allow-dot-git]  # join the active label's frontiers, then switch
+wheat pull [--remote <url>] [--allow-dot-git]  # fetch, then integrate
 ```
+
+`wheat pull` is `wheat fetch` followed by `wheat integrate`. With one frontier
+left after the fetch there is nothing to join, and the workspace moves to it as
+`wheat refresh` would. If the integrate step is refused, the fetch stays and the
+error says to run `wheat integrate` once the cause is settled.
 
 `wheat integrate` (2026-10-09) joins the active label's descendant frontiers, or
 the chosen ones, into one view: the label's view with every change the frontiers

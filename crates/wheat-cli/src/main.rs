@@ -160,6 +160,9 @@ enum Command {
     Clone(NativeCloneArgs),
     /// Fetch updates from a wheat-server via the native protocol.
     Fetch(NativeFetchArgs),
+    /// Fetch, then join the active label's frontiers and switch the workspace to the
+    /// result: `wheat fetch` followed by `wheat integrate`.
+    Pull(NativePullArgs),
     /// Publish local state to a wheat-server via the native protocol.
     Publish(NativePublishArgs),
 }
@@ -620,6 +623,15 @@ struct NativeFetchArgs {
 }
 
 #[derive(Debug, Args)]
+struct NativePullArgs {
+    /// Override the remote URL (wheat://host:port/owner/repo).
+    #[arg(long)]
+    remote: Option<String>,
+    #[command(flatten)]
+    dot_git: DotGitArgs,
+}
+
+#[derive(Debug, Args)]
 struct NativePublishArgs {
     /// Override the remote URL (wheat://host:port/owner/repo).
     #[arg(long)]
@@ -704,6 +716,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Push(_) => "push",
         Command::Clone(_) => "clone",
         Command::Fetch(_) => "fetch",
+        Command::Pull(_) => "pull",
         Command::Publish(_) => "publish",
     }
 }
@@ -1612,6 +1625,15 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Fetch(arguments) => {
             native_fetch(&requested_workspace, cli.store.as_deref(), arguments)
+        }
+        Command::Pull(arguments) => {
+            let dot_git = arguments.dot_git.gate(format);
+            native_pull(
+                &requested_workspace,
+                cli.store.as_deref(),
+                arguments.remote,
+                dot_git,
+            )
         }
         Command::Publish(arguments) => {
             native_publish(&requested_workspace, cli.store.as_deref(), arguments)
@@ -2951,6 +2973,46 @@ fn native_fetch(
             "content": content.fetched,
             "content_checked": content.checked,
         }),
+        human,
+    )
+}
+
+/// `wheat fetch`, then `wheat integrate`. With one frontier left there is nothing to
+/// join, so the workspace moves to it as `wheat refresh` would.
+fn native_pull(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    remote: Option<String>,
+    dot_git: dot_git::DotGitGate,
+) -> Result<Success> {
+    let fetched = native_fetch(
+        workspace,
+        explicit_store,
+        NativeFetchArgs {
+            remote,
+            force: false,
+        },
+    )?;
+    let after_fetch = |error: anyhow::Error| {
+        error.context(
+            "the fetch is kept, but the workspace was not updated; \
+             settle this, then run `wheat integrate`",
+        )
+    };
+    let mut integrated =
+        integrate_workspace(workspace, explicit_store, &[], dot_git).map_err(after_fetch)?;
+    if integrated.result["integrated"] == false {
+        let label = resolve_context(workspace, explicit_store)?
+            .workspace
+            .active_label;
+        integrated = switch_workspace(workspace, explicit_store, label, None, "pull", dot_git)
+            .map_err(after_fetch)?;
+    }
+    let mut human = fetched.human;
+    human.extend_from_slice(&integrated.human);
+    Success::raw(
+        "pull",
+        json!({ "fetch": fetched.result, "integrate": integrated.result }),
         human,
     )
 }
