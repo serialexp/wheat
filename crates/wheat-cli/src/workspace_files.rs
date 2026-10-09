@@ -54,8 +54,18 @@ pub(crate) struct CanonicalWorkspaceFile {
 pub(crate) enum WorkspaceFileError {
     InvalidPath,
     IntermediateSymlink,
+    /// An ancestor of the path is a file or another non-directory, so the path
+    /// itself cannot exist. Capture reads it as deleted (see
+    /// [`absent_where_shape_changed`]); materialization, which must not replace
+    /// that ancestor unasked, treats it like an unsupported leaf.
+    AncestorNotDirectory,
+    /// The path is a directory. Only the reads capture uses tell this apart from
+    /// [`Self::UnsupportedFileType`]; capture reads it as the file deleted.
+    LeafIsDirectory,
     UnsupportedFileType,
-    TooLarge { limit: usize },
+    TooLarge {
+        limit: usize,
+    },
     Io(io::Error),
 }
 
@@ -68,6 +78,10 @@ impl fmt::Display for WorkspaceFileError {
             Self::IntermediateSymlink => {
                 f.write_str("workspace path has a symlink as an intermediate component")
             }
+            Self::AncestorNotDirectory => {
+                f.write_str("workspace path has a non-directory as an intermediate component")
+            }
+            Self::LeafIsDirectory => f.write_str("workspace path is a directory"),
             Self::UnsupportedFileType => {
                 f.write_str("workspace path is not a regular file or symlink")
             }
@@ -105,6 +119,20 @@ pub(crate) fn read_workspace_file(
 ) -> Result<Option<WorkspaceFileSnapshot>, WorkspaceFileError> {
     let components = validate_path(path)?;
     platform::read(root, &components, byte_limit)
+}
+
+/// Read a tracked path whose shape changed as absent, for capture and status: a
+/// tracked directory replaced by a file deletes every path that was below it, and
+/// a tracked file replaced by a directory deletes the file.
+pub(crate) fn absent_where_shape_changed<T>(
+    read: Result<Option<T>, WorkspaceFileError>,
+) -> Result<Option<T>, WorkspaceFileError> {
+    match read {
+        Err(WorkspaceFileError::AncestorNotDirectory | WorkspaceFileError::LeafIsDirectory) => {
+            Ok(None)
+        }
+        other => other,
+    }
 }
 
 /// Analyze one descriptor-relative workspace leaf with fixed read scratch.
@@ -269,7 +297,7 @@ mod platform {
                     {
                         Err(WorkspaceFileError::IntermediateSymlink)
                     }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::UnsupportedFileType),
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
                     _ => Err(error.into()),
                 };
             }
@@ -316,8 +344,10 @@ mod platform {
                 retained_text: None,
             }));
         }
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(WorkspaceFileError::UnsupportedFileType);
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {}
+            libc::S_IFDIR => return Err(WorkspaceFileError::LeafIsDirectory),
+            _ => return Err(WorkspaceFileError::UnsupportedFileType),
         }
         let fd = unsafe {
             libc::openat(
@@ -398,7 +428,7 @@ mod platform {
                     {
                         Err(WorkspaceFileError::IntermediateSymlink)
                     }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::UnsupportedFileType),
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
                     _ => Err(error.into()),
                 };
             }
@@ -555,7 +585,7 @@ mod platform {
                     {
                         Err(WorkspaceFileError::IntermediateSymlink)
                     }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::UnsupportedFileType),
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
                     _ => Err(error.into()),
                 };
             }
@@ -665,7 +695,7 @@ mod platform {
                     {
                         Err(WorkspaceFileError::IntermediateSymlink)
                     }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::UnsupportedFileType),
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
                     _ => Err(error.into()),
                 };
             }
@@ -700,6 +730,7 @@ mod platform {
                 }))
             }
             libc::S_IFREG => open_regular(directory.as_raw_fd(), &name, limit).map(Some),
+            libc::S_IFDIR => Err(WorkspaceFileError::LeafIsDirectory),
             _ => Err(WorkspaceFileError::UnsupportedFileType),
         }
     }
@@ -1135,8 +1166,22 @@ mod tests {
         fs::create_dir(root.path().join("directory")).unwrap();
         assert!(matches!(
             read_workspace_file(root.path(), Path::new("directory"), 10),
-            Err(WorkspaceFileError::UnsupportedFileType)
+            Err(WorkspaceFileError::LeafIsDirectory)
         ));
+        fs::write(root.path().join("file"), b"x").unwrap();
+        assert!(matches!(
+            read_workspace_file(root.path(), Path::new("file/child"), 10),
+            Err(WorkspaceFileError::AncestorNotDirectory)
+        ));
+        // Capture reads both as the file deleted.
+        for path in ["directory", "file/child"] {
+            assert_eq!(
+                absent_where_shape_changed(read_workspace_file(root.path(), Path::new(path), 10))
+                    .unwrap(),
+                None,
+                "{path}"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -556,9 +556,7 @@ where
                 (DirectoryEntry::File(content), true) => return Ok(Some(*content)),
                 (DirectoryEntry::Directory(_), true) => return Ok(None),
                 (DirectoryEntry::Directory(child), false) => node = self.read_node(*child).await?,
-                (DirectoryEntry::File(_), false) => {
-                    return Err(MerkleTreeError::FileInPath(component.clone()));
-                }
+                (DirectoryEntry::File(_), false) => return Ok(None),
             }
         }
         Ok(None)
@@ -566,8 +564,10 @@ where
 
     /// Looks up many file paths with one shared traversal (see [`Self::path_shapes`]).
     ///
-    /// Results follow `paths`; like [`Self::lookup`], a missing path or a directory yields
-    /// `None`, and a file in place of an ancestor directory is [`MerkleTreeError::FileInPath`].
+    /// Results follow `paths`; like [`Self::lookup`], a missing path, a directory, and a
+    /// path below a file all yield `None`: none of them is a file. Callers compare the
+    /// file at a path across trees, and a directory that became a file (or the reverse)
+    /// must read as files deleted or created, not as an error.
     #[tracing::instrument(name = "tree_lookup_many", level = "debug", skip_all, fields(paths = paths.len()))]
     pub async fn lookup_many(
         &self,
@@ -575,17 +575,15 @@ where
         paths: &[&str],
     ) -> Result<Vec<Option<FileValue>>, MerkleTreeError> {
         let shapes = self.path_shapes(root, paths).await?;
-        paths
-            .iter()
-            .zip(shapes)
-            .map(|(path, shape)| match shape {
-                TreePathShape::File(value) => Ok(Some(value)),
-                TreePathShape::Absent | TreePathShape::Directory => Ok(None),
-                TreePathShape::BelowFile { depth } => Err(MerkleTreeError::FileInPath(
-                    path.split('/').nth(depth).unwrap_or_default().to_owned(),
-                )),
+        Ok(shapes
+            .into_iter()
+            .map(|shape| match shape {
+                TreePathShape::File(value) => Some(value),
+                TreePathShape::Absent
+                | TreePathShape::Directory
+                | TreePathShape::BelowFile { .. } => None,
             })
-            .collect()
+            .collect())
     }
 
     /// Classifies many paths with one shared traversal.

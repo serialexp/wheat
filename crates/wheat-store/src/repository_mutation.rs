@@ -928,7 +928,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 });
             }
         }
-        let tree = trees.apply_edits(target.tree, &tree_edits).await?;
+        // A final-tree update, so a directory that becomes a file (or the reverse)
+        // in one revision works: its removals and its new entry land together.
+        let tree = trees.apply_final_edits(target.tree, &tree_edits).await?;
         let mut applied = BTreeMap::new();
         let mut failed = BTreeMap::new();
         for (id, outcome) in output.outcomes {

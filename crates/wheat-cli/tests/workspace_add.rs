@@ -461,6 +461,50 @@ fn add_holds_the_workspace_operation_lock_across_capture_and_publication() {
 }
 
 #[test]
+fn a_directory_and_a_file_trade_places_in_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    ok(root, &["init"]);
+    ok(root, &["change", "new", "-m", "shapes"]);
+    fs::create_dir(root.join("dir")).unwrap();
+    fs::write(root.join("dir/x"), "x\n").unwrap();
+    fs::write(root.join("dir/y"), "y\n").unwrap();
+    fs::write(root.join("node"), "leaf\n").unwrap();
+    ok(root, &["add", "dir/x", "dir/y", "node"]);
+
+    ok(root, &["change", "new", "-m", "trade"]);
+    fs::remove_dir_all(root.join("dir")).unwrap();
+    fs::write(root.join("dir"), "now a file\n").unwrap();
+    fs::remove_file(root.join("node")).unwrap();
+    fs::create_dir(root.join("node")).unwrap();
+    fs::write(root.join("node/child"), "child\n").unwrap();
+
+    // Paths below a file, and a file replaced by a directory, read as deleted.
+    let status = String::from_utf8(ok(root, &["status"]).stdout).unwrap();
+    for deleted in ["deleted dir/x", "deleted dir/y", "deleted node"] {
+        assert!(status.lines().any(|line| line == deleted), "{status}");
+    }
+
+    let added = String::from_utf8(
+        ok(
+            root,
+            &["add", "dir", "dir/x", "dir/y", "node", "node/child"],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert!(!added.contains("diverged"), "{added}");
+    assert!(!added.contains("materialize"), "{added}");
+
+    let status = String::from_utf8(ok(root, &["status"]).stdout).unwrap();
+    assert!(status.contains("tracked changes: 0"), "{status}");
+    assert!(!status.contains("untracked"), "{status}");
+    ok(root, &["validate"]);
+    let shown = |path: &str| String::from_utf8(ok(root, &["diff", "--", path]).stdout).unwrap();
+    assert!(shown("dir").is_empty() && shown("node/child").is_empty());
+}
+
+#[test]
 fn explicit_guard_ranges_use_canonical_lf_byte_offsets() {
     let dir = tempfile::tempdir().unwrap();
     ok(dir.path(), &["init"]);

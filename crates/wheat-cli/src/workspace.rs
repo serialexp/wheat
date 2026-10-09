@@ -23,7 +23,7 @@ use wheat_store::{
 use crate::{
     command_output::CliFailure,
     edit_move::{FileBytes, PathPlacement, describe, place_path},
-    workspace_files::read_workspace_file,
+    workspace_files::{absent_where_shape_changed, read_workspace_file},
 };
 
 /// The revisions one `add` publishes: the destination change, plus every later change that
@@ -159,12 +159,16 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore, P: Publicatio
         // change's spot when later changes also edit it.
         let file = match placements.get(path) {
             Some(placement) => placement.below.clone(),
-            None => read_workspace_file(root, Path::new(path), limits.max_input_bytes)
-                .with_context(|| format!("cannot read workspace path {path:?}"))?
-                .map(|snapshot| FileBytes {
-                    kind: snapshot.kind,
-                    bytes: canonical_workspace(&snapshot),
-                }),
+            None => absent_where_shape_changed(read_workspace_file(
+                root,
+                Path::new(path),
+                limits.max_input_bytes,
+            ))
+            .with_context(|| format!("cannot read workspace path {path:?}"))?
+            .map(|snapshot| FileBytes {
+                kind: snapshot.kind,
+                bytes: canonical_workspace(&snapshot),
+            }),
         };
         let a = authored_values[path.as_str()];
         let b = baseline_values[path.as_str()];
@@ -421,12 +425,16 @@ async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
     let sorted = histories.keys().map(String::as_str).collect::<Vec<_>>();
     let mut files = BTreeMap::new();
     for path in &sorted {
-        let file = read_workspace_file(root, Path::new(path), limits.max_input_bytes)
-            .with_context(|| format!("cannot read workspace path {path:?}"))?
-            .map(|snapshot| FileBytes {
-                kind: snapshot.kind,
-                bytes: canonical_workspace(&snapshot),
-            });
+        let file = absent_where_shape_changed(read_workspace_file(
+            root,
+            Path::new(path),
+            limits.max_input_bytes,
+        ))
+        .with_context(|| format!("cannot read workspace path {path:?}"))?
+        .map(|snapshot| FileBytes {
+            kind: snapshot.kind,
+            bytes: canonical_workspace(&snapshot),
+        });
         files.insert(*path, file);
     }
     let mut reauthored = BTreeSet::new();

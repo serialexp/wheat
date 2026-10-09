@@ -130,6 +130,7 @@ pub(crate) fn workspace_holds(
         Ok(matches) => Ok(matches),
         Err(
             WorkspaceFileError::IntermediateSymlink
+            | WorkspaceFileError::AncestorNotDirectory
             | WorkspaceFileError::UnsupportedFileType
             | WorkspaceFileError::TooLarge { .. },
         ) => Ok(false),
@@ -143,6 +144,7 @@ pub(crate) fn path_is_absent(root: &Path, path: &str) -> Result<bool> {
         Ok(Some(_))
         | Err(
             WorkspaceFileError::UnsupportedFileType
+            | WorkspaceFileError::AncestorNotDirectory
             | WorkspaceFileError::TooLarge { .. }
             | WorkspaceFileError::IntermediateSymlink,
         ) => Ok(false),
@@ -624,7 +626,10 @@ pub(crate) async fn restore(
                     ),
                 });
             }
-            Ok(None) | Err(crate::workspace_files::WorkspaceFileError::UnsupportedFileType) => {}
+            Ok(None)
+            | Err(
+                WorkspaceFileError::UnsupportedFileType | WorkspaceFileError::AncestorNotDirectory,
+            ) => {}
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("observe restore structure {selector:?}"));
@@ -1246,6 +1251,7 @@ fn authenticate_install_preimage(
                 Ok(matches) => Ok(matches),
                 Err(
                     WorkspaceFileError::IntermediateSymlink
+                    | WorkspaceFileError::AncestorNotDirectory
                     | WorkspaceFileError::UnsupportedFileType
                     | WorkspaceFileError::TooLarge { .. },
                 ) => Ok(false),

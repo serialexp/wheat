@@ -662,6 +662,8 @@ fn classify(error: &Error) -> Classification {
             return match workspace {
                 WorkspaceFileError::InvalidPath
                 | WorkspaceFileError::IntermediateSymlink
+                | WorkspaceFileError::AncestorNotDirectory
+                | WorkspaceFileError::LeafIsDirectory
                 | WorkspaceFileError::UnsupportedFileType => {
                     class("input", "invalid_workspace_path", false, 2)
                 }

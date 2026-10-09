@@ -1,0 +1,28 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261009-022703
+# add_scale	{"files":20000}
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	d8b293af8b30
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+add_scale.total.wall	10.956683638	s
+add_scale.total.peak_rss	134594560	bytes
+add_scale.add_new.wall	2.353039476	s
+add_scale.add_new.peak_rss	85348352	bytes
+add_scale.status_new.wall	0.187401973	s
+add_scale.status_new.peak_rss	24178688	bytes
+add_scale.add_modified.wall	5.600839012	s
+add_scale.add_modified.peak_rss	134594560	bytes
+add_scale.status_modified.wall	0.279972517	s
+add_scale.status_modified.peak_rss	34066432	bytes
+add_scale.validate.wall	1.75166496	s
+add_scale.validate.peak_rss	107315200	bytes
+run.total_time	10.956975938	s
+process.peak_rss	134594560	bytes
+suite.cases	1	count
+suite.case_failures	0	count

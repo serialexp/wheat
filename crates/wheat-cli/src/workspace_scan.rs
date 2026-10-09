@@ -10,7 +10,8 @@ use wheat_store::{
 };
 
 use crate::{
-    local::LocalRepository, workspace_files::analyze_workspace_file,
+    local::LocalRepository,
+    workspace_files::{absent_where_shape_changed, analyze_workspace_file},
     workspace_metadata::WorkspaceMetadata,
 };
 
@@ -161,12 +162,12 @@ pub(crate) fn scan_locked(
             Err(error) => return Err(error.into()),
         };
         let workspace_limit = read_budget.next_limit(MAX_WORKSPACE_FILE_BYTES)?;
-        let observed = analyze_workspace_file(
+        let observed = absent_where_shape_changed(analyze_workspace_file(
             workspace_root,
             Path::new(&file.path),
             workspace_limit,
             max_inline_text_bytes,
-        )
+        ))
         .with_context(|| format!("inspect tracked workspace path {}", file.path))?;
         let Some(observed) = observed else {
             let baseline_text = inline_text(baseline.text, baseline_bytes, max_inline_text_bytes);

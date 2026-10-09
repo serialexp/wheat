@@ -234,6 +234,22 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **Other `lookup_many` callers may fail when a directory became a file.** Done
+  2026-10-09. Checking it with the CLI found that a directory and a file could not
+  trade places in one revision at all:
+  - the workspace reader failed on `dir/x` once `dir` was a file, and on `node` once
+    it was a directory, so `status`, `diff` and `add` all errored. Capture and
+    status now read both as the file deleted (`absent_where_shape_changed`);
+    materialization still refuses them as before;
+  - edit application used `apply_edits`, which refuses an edit set touching both
+    `dir` and `dir/x`; it now uses `apply_final_edits` (as import does);
+  - capture settlement left every shape change to `materialize` and reported the
+    paths as diverged; it now records them when the workspace already has the new
+    shape, falling back to the old behaviour if the pin still holds files the
+    capture did not name.
+  `lookup` and `lookup_many` read a path below a file as `None`. Test
+  `a_directory_and_a_file_trade_places_in_one_revision` in `workspace_add.rs`. Bench
+  `add_scale` unchanged (results `20261009-022703` and `20261009-022720`).
 - `[x]` **A content fetch can hang the client.** Done 2026-10-09:
   `handle_content_fetch` reads the requested blobs together and, if that fails,
   one at a time; a blob over 4 MiB goes as `ContentChunk`s on either path, and one

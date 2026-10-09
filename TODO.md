@@ -135,15 +135,10 @@ budget passes, but by only about 0.7 s.
   `wheat-local-cli.md`'s release gate refers to
   `~/.claude/projects/-home-bart-Projects-gothab/memory/feedback_no_format_version_bumps.md`;
   agents working in this repo don't load it (the rule is in `CLAUDE.md` here anyway).
-- `[ ]` **Other `lookup_many` callers may fail when a directory became a file
-  (2026-09-26).** `MerkleTreeStore::lookup_many` (and `lookup`) return `FileInPath`
-  for a path below a file. Import verification hit this for paths deleted when a
-  directory turned into a file (fixed there by reading such a path as absent). Other
-  callers compare before and after trees the same way and may fail the same way:
-  `repository_mutation.rs` (around lines 317, 884, 1028), `provenance.rs` (around
-  lines 173, 223) and `workspace.rs` in wheat-cli (around lines 130, 391). Check each
-  with a directory → file change, then either fix them one by one or make
-  `lookup_many` itself read such paths as absent.
+- `[ ]` **`status` lists an untracked directory and every file in it (2026-10-09).**
+  A new `newdir/a` shows as `untracked newdir/` and `untracked newdir/a`, and the
+  header counts both as "untracked files: 2". Options: collapse to the directory
+  as git does, list only files, or keep both and count only files.
 - `[ ]` **The fetch walk has no cap on repeated radix subtrees (2026-09-26).** A
   radix node's ID does not include its key path, so one node can sit under several
   edges, and a crafted map can repeat that at every level: a few nodes, walked 2^depth

@@ -30,11 +30,15 @@ use std::{
 use anyhow::Result;
 use wheat_core::{ApplicationResultRecord, ChangeId, FileValue, TreeId, ViewId};
 use wheat_store::{
-    ApplicationMapStore, ContentStore, ImmutableObjectStore, MerkleTreeStore, RepositoryHead,
-    RepositoryReader, TreeEdit, TreePathShape,
+    ApplicationMapStore, ContentStore, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
+    RepositoryHead, RepositoryReader, TreeEdit, TreePathShape,
 };
 
-use crate::{materialization::workspace_holds, workspace_metadata::MaterializedState};
+use crate::{
+    materialization::workspace_holds,
+    workspace_files::{WorkspaceFileError, absent_where_shape_changed, read_workspace_file},
+    workspace_metadata::MaterializedState,
+};
 
 /// The settled pin and what it could not account for.
 #[derive(Debug)]
@@ -70,12 +74,12 @@ async fn captured_change_tree<O: ImmutableObjectStore>(
 
 /// The shape of one path in a pinned tree.
 #[derive(Clone, Copy)]
-enum PathShape {
-    /// The path and every ancestor directory may hold a leaf.
-    Leaf(Option<FileValue>),
-    /// The path is a directory or crosses a file; settling it would be a shape
-    /// transition that only materialization may perform.
-    Obstructed,
+struct PathShape {
+    /// The file at the path, if there is one.
+    leaf: Option<FileValue>,
+    /// The path is a directory or crosses a file, so a leaf there means a shape
+    /// transition: a directory became a file, or a file a directory.
+    obstructed: bool,
 }
 
 /// Classifies `paths` (sorted and unique) in one traversal of `root`; a lookup per path
@@ -90,11 +94,43 @@ async fn path_shapes<'p, O: ImmutableObjectStore>(
         .iter()
         .copied()
         .zip(shapes.into_iter().map(|shape| match shape {
-            TreePathShape::Absent => PathShape::Leaf(None),
-            TreePathShape::File(value) => PathShape::Leaf(Some(value)),
-            TreePathShape::Directory | TreePathShape::BelowFile { .. } => PathShape::Obstructed,
+            TreePathShape::Absent => PathShape {
+                leaf: None,
+                obstructed: false,
+            },
+            TreePathShape::File(value) => PathShape {
+                leaf: Some(value),
+                obstructed: false,
+            },
+            TreePathShape::Directory | TreePathShape::BelowFile { .. } => PathShape {
+                leaf: None,
+                obstructed: true,
+            },
         }))
         .collect())
+}
+
+/// Whether the workspace holds exactly `value` at `path`. No value is held where
+/// nothing is, where a directory is, and below a file: the captured revision read
+/// all of those as the file deleted.
+fn workspace_holds_leaf(
+    root: &Path,
+    content: &ContentStore,
+    path: &str,
+    value: Option<FileValue>,
+) -> Result<bool> {
+    if value.is_some() {
+        return workspace_holds(root, content, path, value);
+    }
+    match absent_where_shape_changed(read_workspace_file(root, Path::new(path), 0)) {
+        Ok(observed) => Ok(observed.is_none()),
+        Err(
+            WorkspaceFileError::IntermediateSymlink
+            | WorkspaceFileError::UnsupportedFileType
+            | WorkspaceFileError::TooLarge { .. },
+        ) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Compute the pin that reflects `captured` workspace paths after the revision that
@@ -127,32 +163,31 @@ pub(crate) async fn settle<O: ImmutableObjectStore>(
     let currents = path_shapes(&trees, pinned.tree, &sorted).await?;
 
     let mut edits = Vec::new();
+    // Paths whose edit changes a file into a directory or back, in either tree. The
+    // pin can take them only together with every removal they need.
+    let mut transitions = BTreeSet::new();
     let mut diverged = Vec::new();
     // Diverged leaves the workspace still holds, with their pinned value; they are settled
     // at the captured change's own value below.
     let mut unsettled = Vec::new();
     for path in captured {
-        let (target, current) = match (targets[path.as_str()], currents[path.as_str()]) {
-            (PathShape::Leaf(target), PathShape::Leaf(current)) => (target, current),
-            // Neither tree holds a leaf here, so the capture recorded nothing the pin
-            // lacks at this path.
-            (PathShape::Obstructed, PathShape::Obstructed) => continue,
-            _ => {
-                diverged.push(path.clone());
-                continue;
-            }
-        };
-        if workspace_holds(root, content, path, target)? {
-            if target != current {
+        let (target, current) = (targets[path.as_str()], currents[path.as_str()]);
+        if workspace_holds_leaf(root, content, path, target.leaf)? {
+            if target.leaf != current.leaf {
+                if target.obstructed || current.obstructed {
+                    transitions.insert(path.as_str());
+                }
                 edits.push(TreeEdit {
                     path: path.split('/').map(str::to_owned).collect(),
-                    value: target,
+                    value: target.leaf,
                 });
             }
             continue;
         }
         diverged.push(path.clone());
-        unsettled.push((path.as_str(), current));
+        if !current.obstructed {
+            unsettled.push((path.as_str(), current.leaf));
+        }
     }
 
     // The captured change's tree is resolved only when a path diverged.
@@ -166,19 +201,33 @@ pub(crate) async fn settle<O: ImmutableObjectStore>(
         paths.sort_unstable();
         let captured_values = path_shapes(&trees, change_tree, &paths).await?;
         for (path, current) in unsettled {
-            let PathShape::Leaf(captured_value) = captured_values[path] else {
+            let captured_value = captured_values[path];
+            if captured_value.obstructed {
                 continue;
-            };
-            if captured_value != current && workspace_holds(root, content, path, captured_value)? {
+            }
+            if captured_value.leaf != current
+                && workspace_holds(root, content, path, captured_value.leaf)?
+            {
                 edits.push(TreeEdit {
                     path: path.split('/').map(str::to_owned).collect(),
-                    value: captured_value,
+                    value: captured_value.leaf,
                 });
             }
         }
     }
 
-    let settled_tree = trees.apply_final_edits(pinned.tree, &edits).await?;
+    let settled_tree = match trees.apply_final_edits(pinned.tree, &edits).await {
+        Ok(tree) => tree,
+        // The pin still holds something the transition would bury, such as a file
+        // the capture did not name below a directory that is now a file. Leave the
+        // transition to materialization.
+        Err(MerkleTreeError::FileInPath(_)) if !transitions.is_empty() => {
+            edits.retain(|edit| !transitions.contains(edit.path.join("/").as_str()));
+            diverged.extend(transitions.iter().map(|path| (*path).to_owned()));
+            trees.apply_final_edits(pinned.tree, &edits).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
     if settled_tree == target_tree {
         return Ok(Settlement {
             materialized: MaterializedState {

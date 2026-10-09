@@ -1063,10 +1063,18 @@ async fn lookup_many_matches_lookup_and_reads_each_directory_once() {
     }
     assert_eq!(many.iter().filter(|value| value.is_some()).count(), 503);
 
-    assert!(matches!(
-        trees.lookup_many(root, &["top/below"]).await,
-        Err(MerkleTreeError::FileInPath(component)) if component == "top"
-    ));
+    // A path below a file is not a file either.
+    assert_eq!(
+        trees.lookup_many(root, &["top/below"]).await.unwrap(),
+        [None]
+    );
+    assert_eq!(
+        trees
+            .lookup(root, &["top".into(), "below".into()])
+            .await
+            .unwrap(),
+        None
+    );
     assert!(matches!(
         trees.lookup_many(root, &[""]).await,
         Err(MerkleTreeError::EmptyPath)
