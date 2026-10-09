@@ -9,7 +9,8 @@ use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use url::{Host, Url};
 
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, ViewId};
@@ -378,7 +379,11 @@ fn content_id_to_digest(id: ContentId) -> Digest256 {
 /// `token` (empty for none) as the bearer token.
 pub async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
     let ws_url = url.ws_url.as_str();
-    let (mut ws, _) = connect_async(ws_url)
+    // Refuse an oversized message while it arrives, not after it is in memory.
+    let limits = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE));
+    let (mut ws, _) = connect_async_with_config(ws_url, Some(limits), false)
         .await
         .with_context(|| format!("failed to connect to {ws_url}"))?;
 
@@ -1130,5 +1135,47 @@ mod upload_tests {
         assert_eq!(chunks, 3);
         assert_eq!(finished, Some((id, data)));
         receiver.finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn a_message_over_the_limit_is_refused_before_it_ends() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = parse_wheat_url(&format!(
+            "wheat://{}/owner/repo",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        // A server that starts an unfinished binary message: a first fragment as
+        // large as a message may be, then a one-byte continuation, then nothing.
+        // Each frame is within the frame limit; only a message limit at
+        // MAX_MESSAGE_SIZE refuses the message now.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let stream = ws.get_mut();
+            let mut frames = vec![0x02, 127];
+            frames.extend_from_slice(&(MAX_MESSAGE_SIZE as u64).to_be_bytes());
+            frames.resize(frames.len() + MAX_MESSAGE_SIZE, 0);
+            frames.extend_from_slice(&[0x00, 1, 0]);
+            stream.write_all(&frames).await.unwrap();
+            stream.flush().await.unwrap();
+            // Keep the connection open, so only the limit can end the read.
+            std::future::pending::<()>().await;
+        });
+
+        // A generous bound: this asserts the client stops waiting, not how fast.
+        let connected =
+            tokio::time::timeout(std::time::Duration::from_secs(30), connect(&url, b"")).await;
+        server.abort();
+        let Ok(connected) = connected else {
+            panic!("the client kept waiting for the rest of the message");
+        };
+        assert!(connected.is_err(), "the oversized message was accepted");
     }
 }

@@ -199,3 +199,54 @@ async fn repo_not_found() {
     ws.close(None).await.ok();
     let _ = shutdown.send(());
 }
+
+#[tokio::test]
+async fn a_message_over_the_limit_is_refused_before_it_ends() {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio_tungstenite::MaybeTlsStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _repo = setup_repo(dir.path()).await;
+    let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv_msg(&mut ws).await,
+        WheatProtocolMessage::ServerHello(_)
+    ));
+
+    // An unfinished binary message: a first fragment as large as a message may
+    // be, then a one-byte continuation, then nothing. Each frame is within the
+    // frame limit; only a message limit at MAX_MESSAGE_SIZE refuses the message
+    // now, where a larger one waits for its last fragment. The zero mask leaves
+    // the payload as written.
+    let MaybeTlsStream::Plain(stream) = ws.get_mut() else {
+        panic!("expected a plain connection");
+    };
+    let mut frames = vec![0x02, 0x80 | 127];
+    frames.extend_from_slice(&(MAX_MESSAGE_SIZE as u64).to_be_bytes());
+    frames.extend_from_slice(&[0; 4]);
+    frames.resize(frames.len() + MAX_MESSAGE_SIZE, 0);
+    frames.extend_from_slice(&[0x00, 0x80 | 1, 0, 0, 0, 0, 0]);
+    stream.write_all(&frames).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // A generous bound: this asserts the server stops waiting, not how fast.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match ws.next().await {
+                None
+                | Some(Err(_))
+                | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                    return;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the server kept waiting for the payload");
+    let _ = shutdown.send(());
+}

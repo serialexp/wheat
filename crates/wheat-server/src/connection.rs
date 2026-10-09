@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{StatusCode, header::ORIGIN};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
 use wheat_protocol::*;
@@ -43,7 +44,11 @@ pub async fn handle_connection(
     #[allow(clippy::result_large_err)] // The error type is fixed by tungstenite's callback.
     let check_origin =
         |request: &Request, response: Response| check_origin(request, response, allowed_origins);
-    let ws = match accept_hdr_async(stream, check_origin).await {
+    // Refuse an oversized message while it arrives, not after it is in memory.
+    let limits = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE));
+    let ws = match accept_hdr_async_with_config(stream, check_origin, Some(limits)).await {
         Ok(ws) => ws,
         Err(e) => {
             warn!(peer = %peer, error = %e, "WebSocket handshake failed");
