@@ -234,6 +234,23 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **A content fetch can hang the client.** Done 2026-10-09:
+  `handle_content_fetch` reads the requested blobs together and, if that fails,
+  one at a time; a blob over 4 MiB goes as `ContentChunk`s on either path, and one
+  it cannot read ends the operation with an `Error` (404 when missing, 500
+  otherwise) naming the blob. Tests in `crates/wheat-server/tests/fetch_test.rs`.
+- `[x]` **WebSocket messages up to 64 MiB are read before the 16 MiB check.** Done
+  2026-10-09: server and client set `max_message_size` and `max_frame_size` to
+  `MAX_MESSAGE_SIZE`. The frame limit already was 16 MiB, so the gap was a message
+  of several frames. Tests send a 16 MiB fragment plus one more byte and check the
+  receiver gives up without waiting for the end (`protocol_test.rs`, and
+  `remote::connect_tests` in wheat-cli); both waited before the fix.
+- `[x]` **A failed seal after publish leaks its message.** Done 2026-10-09, along
+  with a worse problem in the same place: the server moved the head first and
+  sealed after, so on a store that buffers objects (the S3 packed store) a failed
+  seal or a crash left the head naming objects that were never stored. The seal now
+  runs before the head moves, and a failure is a publish error with the head left
+  alone. Test `a_publish_whose_objects_cannot_be_sealed_leaves_the_head_alone`.
 - `[x]` **Stale `#[allow(dead_code)]` markers in `workspace_walk.rs`.** Done
   2026-09-26: removed. The one field they hid that nothing read,
   `gitignore_fallback_paths`, is gone too; the ignore stack still has the paths.

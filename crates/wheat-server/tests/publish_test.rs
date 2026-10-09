@@ -15,7 +15,7 @@ use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
     ContentStore, Durability, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
-    RepositoryPublisher, RepositoryReader,
+    ObjectStoreError, RepositoryPublisher, RepositoryReader, StoredObject,
 };
 
 use support::{
@@ -54,8 +54,35 @@ fn scratch_content(dir: &tempfile::TempDir) -> ContentStore {
     ContentStore::with_durability(dir.path().join("content"), Durability::Deferred)
 }
 
+/// The server's store, whose seal fails: it stands for a store that buffers
+/// objects and cannot make them durable.
+struct SealFails(LooseObjectStore);
+
+#[async_trait::async_trait]
+impl ImmutableObjectStore for SealFails {
+    async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+        self.0.put_if_absent(id, bytes).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.0.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.0.exists_many(ids).await
+    }
+
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        Err(ObjectStoreError::Backend("upload refused".into()))
+    }
+}
+
 impl Publishing {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    async fn start_with(seal_fails: bool) -> Self {
         let server_dir = tempfile::tempdir().unwrap();
         let server_objects = scratch_store(&server_dir);
         let server_content = scratch_content(&server_dir);
@@ -88,9 +115,14 @@ impl Publishing {
             .await
             .unwrap();
 
+        let served: Box<dyn ImmutableObjectStore> = if seal_fails {
+            Box::new(SealFails(server_objects.clone()))
+        } else {
+            Box::new(server_objects.clone())
+        };
         let registry = Registry::single_with_stores(
             REPO.to_string(),
-            Box::new(server_objects.clone()),
+            served,
             server_content.clone(),
             server_heads,
         );
@@ -303,6 +335,24 @@ async fn send_whole(ws: &mut Ws, objects: Vec<(ObjectId, Vec<u8>)>) {
         })
         .collect();
     send_msg(ws, &object_batch(OP, entries)).await;
+}
+
+#[tokio::test]
+async fn a_publish_whose_objects_cannot_be_sealed_leaves_the_head_alone() {
+    let mut publishing = Publishing::start_with(true).await;
+    let proposed = publishing.propose(&files_in_own_directories(3)).await;
+    let mut ws = publishing.request(proposed).await;
+
+    upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    assert!(
+        matches!(result.status, PublishResultStatus::PublishStatusError(_)),
+        "the publish should fail, got {:?}: {}",
+        result.status,
+        result.message
+    );
+    assert_eq!(result.new_envelope.bytes, publishing.base.1.as_bytes());
+    publishing.assert_head_unchanged().await;
 }
 
 #[tokio::test]

@@ -170,17 +170,6 @@ budget passes, but by only about 0.7 s.
   benchmark: one change pushes 6 KiB after 10 changes but 44 KiB after 200. Send
   such objects as deltas against their aligned old counterpart, which the client
   has. Then add a bytes budget to `fetch_incremental`.
-- `[ ]` **A content fetch can hang the client (2026-09-26).** `handle_content_fetch`
-  (`crates/wheat-server/src/fetch.rs`) only logs (`debug!`) a requested blob it cannot
-  read and sends nothing for it; its second fallback path (after a non-`TooLarge`
-  bulk error) also drops blobs over 4 MiB instead of chunking them. The client waits
-  for every requested blob, so it waits forever. The server should send an `Error`
-  for the operation.
-- `[ ]` **WebSocket messages up to 64 MiB are read before the 16 MiB check
-  (2026-09-26).** Neither `accept_hdr_async` (server) nor `connect_async` (client)
-  sets a `WebSocketConfig`, so tungstenite's default 64 MiB message limit applies and
-  `decode_message` refuses the excess only after it has been read into memory. Set
-  `max_message_size` to `MAX_MESSAGE_SIZE` on both ends.
 - `[ ]` **Uploaded content is hashed four or five times on the server (2026-09-26).**
   Publish checks each blob's ID, then `put_many_with_bases`, `ContentStore::put_many`,
   the packed `put_many` and the loose writer hash it again; the packed `put_many` also
@@ -190,9 +179,6 @@ budget passes, but by only about 0.7 s.
   files over 16 MiB (`DEFAULT_MAX_INPUT_BYTES`), Git import takes up to 64 MiB
   (`MAX_IMPORT_FILE_BYTES`), materialization up to 256 MiB, and the store and protocol
   up to 1 GiB. Decide which limit a file should have.
-- `[ ]` **A failed seal after publish leaks its message (2026-09-26).** `handle_publish`
-  turns a `seal` error into `ConnectionError::Protocol(Box::leak(...))`, leaking the
-  formatted string each time. Use `ConnectionError::Internal`.
 
 ## Benchmarks (2026-09-25)
 

@@ -273,6 +273,24 @@ pub async fn handle_publish(
         return Ok(None);
     }
 
+    // Seal any buffered objects into a durable batch (e.g. a packed segment
+    // uploaded to S3) before the head can name them. No-op for local stores.
+    if let Err(e) = entry.objects.seal().await {
+        warn!(op_id, error = %e, "publish: seal failed");
+        send(
+            ws,
+            &publish_result(
+                op_id,
+                publish_error_status(),
+                current_head.generation,
+                current_head.envelope.as_bytes(),
+                &format!("storing the published objects failed: {e}"),
+            ),
+        )
+        .await?;
+        return Ok(None);
+    }
+
     // CAS the head.
     let new_generation = current_head.generation + 1;
     let proposed_head = RepositoryHead {
@@ -285,13 +303,6 @@ pub async fn handle_publish(
         .compare_and_advance(*current_head, proposed_head)
     {
         Ok(()) => {
-            // Seal any buffered objects into a durable batch (e.g. a packed
-            // segment uploaded to S3). No-op for local stores.
-            entry.objects.seal().await.map_err(|e| {
-                ConnectionError::Protocol(Box::leak(
-                    format!("seal after commit failed: {e}").into_boxed_str(),
-                ))
-            })?;
             info!(op_id, generation = new_generation, "publish: committed");
             send(
                 ws,
