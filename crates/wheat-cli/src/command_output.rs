@@ -468,7 +468,7 @@ fn unwrap_mutation<'a>(
         RepositoryMutationError::Stale { .. }
         | RepositoryMutationError::FrontierDependencies
         | RepositoryMutationError::NoFrontiers
-        | RepositoryMutationError::DivergentRevisions(_)
+        | RepositoryMutationError::RevisionsDoNotCombine { .. }
         | RepositoryMutationError::FrontierRevisesBasis(_) => cause,
     }
 }

@@ -149,6 +149,16 @@ budget passes, but by only about 0.7 s.
   diffs the remote's change map, lineage and retained sets against the local ones
   with `DiffLimits::unbounded()`, so a server could do the same to a client; a
   visit cap there too.
+- `[ ]` **`wheat integrate` refuses a frontier that revises its label's view
+  (2026-10-09).** `crates/wheat-store/src/repository_integration.rs` composes what the
+  frontiers add onto the label's view, so a change the view already holds cannot take
+  a frontier's newer revision (`FrontierRevisesBasis`). Composing from the repository
+  base view instead would read the whole history. Options: compose from the nearest
+  view on the label's path that lacks the change, or refuse as now.
+- `[ ]` **Combined revisions carry no subsumption evidence (2026-10-09).** When
+  integrate combines revisions of one change, the new revision's transition has no
+  `subsumed` or `resolutions` entries, even where the combined revisions recorded
+  them. Check whether `later_edits` / path history need them carried over.
 - `[ ]` **JSON output of `status` and `conflicts` gives IDs as byte arrays
   (2026-10-09).** `WorkspaceStatus` (`crates/wheat-cli/src/workspace_status.rs`) and
   `ConflictEntry` (`conflict_inspection.rs`) serialize `ViewId`, `ChangeId` and the

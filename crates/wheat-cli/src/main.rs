@@ -2069,6 +2069,12 @@ fn integrate_workspace(
         frontiers.len(),
         outcome.composed.len()
     );
+    for (change, revision) in &outcome.combined {
+        writeln!(
+            human,
+            "combined the revisions of {change} into revision {revision}"
+        )?;
+    }
     for change in &outcome.conflicted {
         writeln!(human, "conflicted {change}")?;
     }
@@ -2084,6 +2090,7 @@ fn integrate_workspace(
             "view": view.to_string(),
             "frontiers": frontiers.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "composed": ids(&outcome.composed),
+            "combined": outcome.combined.keys().map(ToString::to_string).collect::<Vec<_>>(),
             "conflicted": ids(&outcome.conflicted),
         }),
         human,
@@ -2095,7 +2102,7 @@ fn integrate_workspace(
 fn integration_failure(error: wheat_store::RepositoryMutationError) -> anyhow::Error {
     use wheat_store::RepositoryMutationError as Mutation;
     match error {
-        Mutation::DivergentRevisions(_) | Mutation::FrontierRevisesBasis(_) => {
+        Mutation::RevisionsDoNotCombine { .. } | Mutation::FrontierRevisesBasis(_) => {
             CliFailure::conflict(error.to_string())
         }
         other => anyhow::Error::new(other),

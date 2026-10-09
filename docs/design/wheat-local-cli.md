@@ -173,8 +173,8 @@ both lists.
 - [~] **Phase 2 — dependency and integration workflow.** Expose stack revision,
   dependency movement, joins, deterministic descendant reapplication, and durable
   conflict outcomes as Wheat operations rather than Git-shaped rebase state.
-  (2026-10-09: `wheat integrate` joins frontiers; frontiers with different
-  revisions of one change are still refused.)
+  (2026-10-09: `wheat integrate` joins frontiers, combining revisions of one
+  change that went their own ways.)
 - [~] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
   capture all non-ignored modified and deleted tracked paths. Untracked files
   require `--include-untracked` or explicit path arguments. Depends on the
@@ -473,8 +473,20 @@ composition. Every joined frontier gets a lineage edge to the new view, so it is
 the label's one frontier, and the workspace switches to it. Uncaptured tracked
 edits block it like a switch. If the switch itself is refused (an untracked file
 in the way, or `.git` paths), the joined view is kept and the error names the
-`wheat switch` that finishes it. Frontiers holding different revisions of one
-change, or revising a change the label's view already holds, are refused for now.
+`wheat switch` that finishes it. Frontiers revising a change the label's view
+already holds are refused for now.
+
+Frontiers may hold different revisions of one change, as when both sides of a
+fetch revised it. A revision another one descends from is superseded by it.
+Revisions that went their own ways from a common predecessor are combined by date
+(Bart, 2026-10-09: "Order them by date and see if the changes in the revisions
+still apply on top of one another"): the earliest by commit time, with each later
+one's edit changes since the common predecessor laid on top, becomes a new
+revision whose predecessor is the earliest and whose metadata is the latest's.
+When one of them already holds the combined edits, it is used as it is. Like any
+authored revision the combination must apply cleanly where it lands; if it does
+not, integration is refused and names the change. The combination carries no
+subsumption or resolution evidence from the revisions it combines.
 
 Names are provisional; the safety, immutable-label, and explicit-frontier
 semantics are not.

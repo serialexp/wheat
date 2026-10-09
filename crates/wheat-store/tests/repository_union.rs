@@ -65,9 +65,19 @@ struct Stores {
     dir: tempfile::TempDir,
     objects: CountingStore<LooseObjectStore>,
     content: ContentStore,
+    /// Change ids come from a counter, so the maps keyed by them have the same shape on
+    /// every run. Like UUIDv7 ids they grow with creation order, which is the canonical
+    /// order of changes without dependencies.
+    changes: AtomicUsize,
 }
 
 impl Stores {
+    fn next_change(&self) -> ChangeId {
+        let count = self.changes.fetch_add(1, Ordering::Relaxed) as u128 + 1;
+        let tail = count.wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835) >> 48;
+        ChangeId::from_bytes(((count << 80) | tail).to_be_bytes())
+    }
+
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let objects = CountingStore {
@@ -82,6 +92,7 @@ impl Stores {
             dir,
             objects,
             content,
+            changes: AtomicUsize::new(0),
         }
     }
 
@@ -111,7 +122,7 @@ impl Stores {
     fn change(&self, repository: &mut Repository, on: ViewId, path: &str) -> (ChangeId, ViewId) {
         let bytes = format!("{path} contents");
         self.put(bytes.as_bytes());
-        let change = ChangeId::new();
+        let change = self.next_change();
         let outcome = repository
             .create_change_with_id(
                 on,

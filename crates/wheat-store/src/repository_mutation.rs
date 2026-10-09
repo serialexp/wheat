@@ -48,11 +48,10 @@ pub enum RepositoryMutationError {
     #[error("integration needs at least one frontier")]
     NoFrontiers,
     #[error(
-        "the frontiers hold different revisions of {}: {}",
-        if .0.len() == 1 { "a change".to_owned() } else { format!("{} changes", .0.len()) },
-        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        "the revisions of change {change} the frontiers hold do not apply on top of one \
+         another: {reason}"
     )]
-    DivergentRevisions(Vec<ChangeId>),
+    RevisionsDoNotCombine { change: ChangeId, reason: String },
     #[error(
         "a frontier revises or drops changes its basis already holds: {}",
         .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
@@ -139,7 +138,7 @@ pub(crate) struct AppliedEdits {
 impl AppliedEdits {
     /// The clean resulting tree, or [`RepositoryError::InvalidEdits`] naming each edit
     /// that failed and why.
-    fn clean_tree(&self, edits: &BTreeMap<EditId, EditRecord>) -> Result<TreeId> {
+    pub(crate) fn clean_tree(&self, edits: &BTreeMap<EditId, EditRecord>) -> Result<TreeId> {
         match self.application.result {
             ApplicationResultRecord::Clean { tree } => Ok(tree),
             ApplicationResultRecord::Conflicted { .. } => Err(RepositoryError::InvalidEdits(
@@ -1087,7 +1086,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(id)
     }
     #[tracing::instrument(level = "debug", skip_all, fields(edits = edits.len()))]
-    async fn persist_edits(
+    pub(crate) async fn persist_edits(
         &self,
         edits: &BTreeMap<EditId, EditRecord>,
         fresh: &mut Fresh,

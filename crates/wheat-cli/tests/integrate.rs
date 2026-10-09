@@ -125,6 +125,60 @@ fn integrate_joins_the_fetched_work_with_the_local_work() {
     assert_eq!(frontier_count(&sides.writer, &sides.config), 1);
 }
 
+/// Both sides add a file to the same published change. Integration combines the two
+/// revisions into one that holds both files.
+#[test]
+fn both_sides_revising_one_change_combine() {
+    let (sides, _server) = sides();
+    let config = &sides.config;
+    let (writer, writer_stores) = &sides.writer;
+    let (reader, reader_stores) = &sides.reader;
+    let created = ok_json(
+        writer,
+        writer_stores,
+        config,
+        &["change", "new", "--message", "shared"],
+    );
+    let change = created["change"].as_str().unwrap().to_owned();
+    ok(writer, writer_stores, config, &["publish"]);
+    ok(reader, reader_stores, config, &["fetch"]);
+    ok(reader, reader_stores, config, &["refresh"]);
+    ok(
+        reader,
+        reader_stores,
+        config,
+        &["change", "select", &change],
+    );
+
+    fs::write(writer.join("writer.txt"), "writer").unwrap();
+    ok(writer, writer_stores, config, &["add", "writer.txt"]);
+    ok(writer, writer_stores, config, &["publish"]);
+    fs::write(reader.join("reader.txt"), "reader").unwrap();
+    ok(reader, reader_stores, config, &["add", "reader.txt"]);
+    ok(reader, reader_stores, config, &["fetch"]);
+    assert_eq!(frontier_count(&sides.reader, config), 2);
+
+    let joined = ok_json(reader, reader_stores, config, &["integrate"]);
+
+    assert_eq!(joined["composed"], serde_json::json!([change]), "{joined}");
+    assert_eq!(joined["combined"], serde_json::json!([change]), "{joined}");
+    assert_eq!(
+        joined["conflicted"].as_array().unwrap().len(),
+        0,
+        "{joined}"
+    );
+    assert_eq!(
+        fs::read_to_string(reader.join("writer.txt")).unwrap(),
+        "writer"
+    );
+    assert_eq!(
+        fs::read_to_string(reader.join("reader.txt")).unwrap(),
+        "reader"
+    );
+    ok(reader, reader_stores, config, &["validate"]);
+    ok(reader, reader_stores, config, &["publish"]);
+}
+
 #[test]
 fn work_on_one_path_joins_with_a_conflict_to_resolve() {
     let (sides, _server) = diverged([("same.txt", "remote"), ("same.txt", "local")]);

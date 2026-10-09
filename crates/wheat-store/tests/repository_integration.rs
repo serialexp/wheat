@@ -58,9 +58,18 @@ struct Fixture {
     content: ContentStore,
     heads: LocalPublicationStore,
     base: ViewId,
+    /// Change ids come from a counter, so the maps keyed by them have the same shape on
+    /// every run. Like UUIDv7 ids they grow with creation order.
+    changes: AtomicUsize,
 }
 
 impl Fixture {
+    fn next_change(&self) -> ChangeId {
+        let count = self.changes.fetch_add(1, Ordering::Relaxed) as u128 + 1;
+        let tail = count.wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835) >> 48;
+        ChangeId::from_bytes(((count << 80) | tail).to_be_bytes())
+    }
+
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let objects = CountingStore {
@@ -84,6 +93,7 @@ impl Fixture {
             content,
             heads,
             base,
+            changes: AtomicUsize::new(0),
         }
     }
 
@@ -109,7 +119,7 @@ impl Fixture {
         bytes: &[u8],
     ) -> (ChangeId, ViewId) {
         self.content.put(bytes).unwrap();
-        let change = ChangeId::new();
+        let change = self.next_change();
         let (prepared, outcome) = self
             .mutator()
             .create_on_frontier(
@@ -231,15 +241,24 @@ async fn two_sides_writing_one_path_join_with_a_durable_conflict() {
     assert_eq!(fixture.frontiers(base).await, [outcome.resulting_view]);
 }
 
-/// Revises `change`, whose current revision is `predecessor`, in the view `effective`.
+/// How a revision changes its predecessor's edits.
+enum Revision<'a> {
+    /// Replaces the predecessor's edits with one writing these bytes to `a`.
+    Replace(&'a [u8]),
+    /// Keeps the predecessor's edits and adds one writing `path`.
+    Add(&'a str),
+}
+
+/// Revises `change` at its revision in `effective`, committed at `committed_at`, and
+/// returns the view that makes.
 async fn revise(
     fixture: &Fixture,
     basis: ViewId,
     effective: ViewId,
     change: ChangeId,
-    bytes: &[u8],
+    revision: Revision<'_>,
+    committed_at: i64,
 ) -> ViewId {
-    fixture.content.put(bytes).unwrap();
     let view = fixture.reader().view(effective).await.unwrap();
     let predecessor = RevisionMapStore::new(&fixture.objects)
         .get(view.revisions, change)
@@ -247,9 +266,33 @@ async fn revise(
         .unwrap()
         .unwrap();
     let old = fixture.reader().revision(predecessor).await.unwrap();
-    let old_edit = *old.edits.iter().next().unwrap();
-    let mut edits = exact("a", None, bytes);
-    edits.transition.removed.insert(old_edit);
+    let edits = match revision {
+        Revision::Replace(bytes) => {
+            fixture.content.put(bytes).unwrap();
+            let mut edits = exact("a", None, bytes);
+            edits.transition.removed.extend(old.edits.iter().copied());
+            edits
+        }
+        Revision::Add(path) => {
+            fixture.content.put(path.as_bytes()).unwrap();
+            let mut edits = exact(path, None, path.as_bytes());
+            for id in &old.edits {
+                edits
+                    .edits
+                    .insert(*id, fixture.reader().edit(*id).await.unwrap());
+                edits.transition.preserved.insert(*id);
+            }
+            edits
+        }
+    };
+    let metadata = RevisionMetadata {
+        committed_at: Timestamp {
+            seconds: committed_at,
+            offset_minutes: 0,
+        },
+        message: format!("committed at {committed_at}"),
+        ..RevisionMetadata::default()
+    };
     let (prepared, outcome) = fixture
         .mutator()
         .revise(
@@ -258,7 +301,7 @@ async fn revise(
             effective,
             change,
             predecessor,
-            RevisionMetadata::default(),
+            metadata,
             edits,
         )
         .await
@@ -267,21 +310,89 @@ async fn revise(
     outcome.resulting_view
 }
 
+async fn revision_in(fixture: &Fixture, view: ViewId, change: ChangeId) -> RevisionRecord {
+    let view = fixture.reader().view(view).await.unwrap();
+    let revision = RevisionMapStore::new(&fixture.objects)
+        .get(view.revisions, change)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.reader().revision(revision).await.unwrap()
+}
+
 #[tokio::test]
-async fn frontiers_with_different_revisions_of_a_change_are_refused() {
+async fn a_revision_another_one_follows_is_superseded() {
     let fixture = Fixture::new().await;
     let base = fixture.base;
     let (a, first) = fixture.create(base, base, "a", b"a1").await;
     let (_, beside) = fixture.create(base, first, "b", b"b").await;
-    let revised = revise(&fixture, base, first, a, b"a2").await;
+    let revised = revise(&fixture, base, first, a, Revision::Replace(b"a2"), 1).await;
 
-    let error = fixture
-        .integrate(base, &[beside, revised])
+    let outcome = fixture.integrate(base, &[beside, revised]).await.unwrap();
+
+    assert!(outcome.combined.is_empty());
+    assert!(outcome.conflicted.is_empty());
+    let joined = outcome.resulting_view;
+    assert_eq!(fixture.file(joined, "a").await, Some(ContentId::of(b"a2")));
+    assert_eq!(fixture.file(joined, "b").await, Some(ContentId::of(b"b")));
+}
+
+/// Two revisions that each add to the same predecessor become one revision with both
+/// additions, following the earlier one and described by the later one.
+#[tokio::test]
+async fn revisions_that_went_their_own_ways_combine_by_date() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (a, first) = fixture.create(base, base, "a", b"a1").await;
+    let later = revise(&fixture, base, first, a, Revision::Add("x"), 200).await;
+    let earlier = revise(&fixture, base, first, a, Revision::Add("y"), 100).await;
+    let earlier_revision = RevisionMapStore::new(&fixture.objects)
+        .get(fixture.reader().view(earlier).await.unwrap().revisions, a)
         .await
-        .unwrap_err();
+        .unwrap()
+        .unwrap();
+
+    let outcome = fixture.integrate(base, &[later, earlier]).await.unwrap();
+
+    assert_eq!(outcome.combined.keys().collect::<Vec<_>>(), [&a]);
+    assert!(outcome.conflicted.is_empty());
+    let joined = outcome.resulting_view;
+    for (path, bytes) in [("a", b"a1".as_slice()), ("x", b"x"), ("y", b"y")] {
+        assert_eq!(fixture.file(joined, path).await, Some(ContentId::of(bytes)));
+    }
+    let combined = revision_in(&fixture, joined, a).await;
+    assert_eq!(combined.predecessor, Some(earlier_revision));
+    assert_eq!(combined.metadata.message, "committed at 200");
+    assert_eq!(combined.edits.len(), 3);
+    assert_eq!(combined.transition.added.len(), 1);
+    assert_eq!(combined.transition.preserved.len(), 2);
+    let reader = fixture.reader();
+    reader
+        .validate_complete(
+            reader
+                .envelope(fixture.head().envelope)
+                .await
+                .unwrap()
+                .state,
+        )
+        .await
+        .unwrap();
+}
+
+/// Each side replaced the change's file with its own: the later replacement no longer
+/// applies on top of the earlier one, and integration says which change.
+#[tokio::test]
+async fn revisions_that_do_not_combine_are_refused() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (a, first) = fixture.create(base, base, "a", b"a1").await;
+    let left = revise(&fixture, base, first, a, Revision::Replace(b"left"), 1).await;
+    let right = revise(&fixture, base, first, a, Revision::Replace(b"right"), 2).await;
+
+    let error = fixture.integrate(base, &[left, right]).await.unwrap_err();
 
     assert!(
-        matches!(&error, RepositoryMutationError::DivergentRevisions(changes) if changes == &[a]),
+        matches!(&error, RepositoryMutationError::RevisionsDoNotCombine { change, .. } if *change == a),
         "{error}"
     );
 }
@@ -291,7 +402,7 @@ async fn a_frontier_that_revises_its_basis_is_refused() {
     let fixture = Fixture::new().await;
     let base = fixture.base;
     let (a, first) = fixture.create(base, base, "a", b"a1").await;
-    let revised = revise(&fixture, base, first, a, b"a2").await;
+    let revised = revise(&fixture, base, first, a, Revision::Replace(b"a2"), 1).await;
 
     let error = fixture.integrate(first, &[revised]).await.unwrap_err();
 
@@ -306,7 +417,7 @@ async fn a_frontier_that_revises_its_basis_is_refused() {
 #[tokio::test]
 async fn integration_reads_what_the_frontiers_add() {
     let mut reads = Vec::new();
-    for history in [8, 80] {
+    for history in [24, 192] {
         let fixture = Fixture::new().await;
         let mut basis = fixture.base;
         for index in 0..history {
