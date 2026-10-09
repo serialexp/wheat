@@ -441,3 +441,58 @@ async fn a_wanted_object_too_large_for_a_batch_comes_in_chunks() {
     }
     send_msg(&mut ws, &fetch_complete(1)).await;
 }
+
+fn content_fetch(op_id: u32, ids: &[ContentId]) -> WheatProtocolMessage {
+    WheatProtocolMessage::ContentFetchRequest(ContentFetchRequestOutput {
+        message_type: 0x30,
+        op_id,
+        content_ids: ids
+            .iter()
+            .map(|id| support::digest(id.as_bytes()))
+            .collect(),
+    })
+}
+
+#[tokio::test]
+async fn a_blob_the_server_cannot_read_ends_the_content_fetch() {
+    let served = serve_history(3).await;
+    let present = served.content.put(b"present").unwrap();
+    let missing = ContentId::of(b"never stored");
+    let mut ws = served.session().await;
+
+    send_msg(&mut ws, &content_fetch(1, &[present, missing])).await;
+    let error = loop {
+        match recv_msg(&mut ws).await {
+            WheatProtocolMessage::ContentBatch(batch) => assert_eq!(batch.op_id, 1),
+            other => break expect_error(other, 1, 404),
+        }
+    };
+    assert_eq!(error.object_id.bytes, missing.as_bytes());
+}
+
+#[tokio::test]
+async fn a_large_blob_beside_a_missing_one_still_comes_in_chunks() {
+    let served = serve_history(3).await;
+    let bytes: Vec<u8> = (0..MAX_CONTENT_CHUNK_SIZE + 1000)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let large = served.content.put(&bytes).unwrap();
+    let missing = ContentId::of(b"never stored");
+    let mut ws = served.session().await;
+
+    send_msg(&mut ws, &content_fetch(1, &[large, missing])).await;
+    let mut assembled = Vec::new();
+    let error = loop {
+        match recv_msg(&mut ws).await {
+            WheatProtocolMessage::ContentChunk(chunk) => {
+                assert_eq!(chunk.content_id.bytes, large.as_bytes());
+                assert_eq!(chunk.offset, assembled.len() as u64);
+                assembled.extend_from_slice(&chunk.data);
+                assert_eq!(chunk.is_final, assembled.len() == bytes.len());
+            }
+            other => break expect_error(other, 1, 404),
+        }
+    };
+    assert_eq!(assembled, bytes);
+    assert_eq!(error.object_id.bytes, missing.as_bytes());
+}
