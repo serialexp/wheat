@@ -465,9 +465,11 @@ fn unwrap_mutation<'a>(
         RepositoryMutationError::Trees(inner) => inner,
         RepositoryMutationError::Objects(inner) => inner,
         RepositoryMutationError::Commit(inner) => inner,
-        RepositoryMutationError::Stale { .. } | RepositoryMutationError::FrontierDependencies => {
-            cause
-        }
+        RepositoryMutationError::Stale { .. }
+        | RepositoryMutationError::FrontierDependencies
+        | RepositoryMutationError::NoFrontiers
+        | RepositoryMutationError::DivergentRevisions(_)
+        | RepositoryMutationError::FrontierRevisesBasis(_) => cause,
     }
 }
 

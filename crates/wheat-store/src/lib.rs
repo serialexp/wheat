@@ -53,6 +53,8 @@ mod publication;
 mod radix;
 mod repository_envelope;
 mod repository_hydration;
+mod repository_integration;
+pub use repository_integration::IntegrationOutcome;
 mod repository_mutation;
 mod repository_publication;
 mod repository_reader;

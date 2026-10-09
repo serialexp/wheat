@@ -95,6 +95,10 @@ enum Command {
     Switch(FrontierSelectionArgs),
     /// Refresh the active label binding and descendant-frontier selection.
     Refresh(RefreshArgs),
+    /// Join the active label's descendant frontiers into one view and switch to it.
+    /// Each change keeps its revision; one that no longer applies cleanly is
+    /// recorded as a conflict to resolve.
+    Integrate(IntegrateArgs),
     /// Inspect descendant frontiers of a native label.
     #[command(subcommand)]
     Frontier(FrontierCommand),
@@ -187,6 +191,16 @@ struct FrontierSelectionArgs {
     /// Exact descendant frontier view. Required when more than one exists.
     #[arg(long)]
     frontier: Option<String>,
+    #[command(flatten)]
+    dot_git: DotGitArgs,
+}
+
+#[derive(Debug, Args)]
+struct IntegrateArgs {
+    /// A descendant frontier of the active label to join; repeat for several.
+    /// Defaults to all of them.
+    #[arg(long = "frontier")]
+    frontiers: Vec<String>,
     #[command(flatten)]
     dot_git: DotGitArgs,
 }
@@ -659,6 +673,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Materialize(_) => "materialize",
         Command::Switch(_) => "switch",
         Command::Refresh(_) => "refresh",
+        Command::Integrate(_) => "integrate",
         Command::Frontier(FrontierCommand::List { .. }) => "frontier.list",
         Command::Restore(_) => "restore",
         Command::Status => "status",
@@ -719,6 +734,20 @@ fn execute(cli: Cli) -> Result<Success> {
             "switch",
             arguments.dot_git.gate(format),
         ),
+        Command::Integrate(arguments) => {
+            let dot_git = arguments.dot_git.gate(format);
+            let frontiers = arguments
+                .frontiers
+                .into_iter()
+                .map(|value| ViewId::from_str(&value).context("invalid frontier view ID"))
+                .collect::<Result<Vec<_>>>()?;
+            integrate_workspace(
+                &requested_workspace,
+                cli.store.as_deref(),
+                &frontiers,
+                dot_git,
+            )
+        }
         Command::Refresh(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             switch_workspace(
@@ -1948,6 +1977,131 @@ fn switch_workspace(
     )
 }
 
+/// Join the active label's descendant frontiers, or the chosen ones, into one view and
+/// materialize it as the workspace's frontier.
+fn integrate_workspace(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    chosen: &[ViewId],
+    dot_git: dot_git::DotGitGate,
+) -> Result<Success> {
+    let mut context = resolve_context(workspace, explicit_store)?;
+    let repository = open(&context.store_root)?;
+    let _operation =
+        rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
+    let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
+    context.workspace = WorkspaceMetadata::read(&context.root)?;
+    let runtime = runtime()?;
+    runtime.block_on(materialization::recover_locked(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+    ))?;
+    selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
+    ensure_workspace_clean_locked(&context.root, &repository, &context.workspace)?;
+
+    let label = context.workspace.active_label.clone();
+    let listed = runtime.block_on(frontier_service::list(&repository, &label))?;
+    let frontiers = if chosen.is_empty() {
+        listed.frontiers.clone()
+    } else {
+        for view in chosen {
+            if !listed.frontiers.contains(view) {
+                return Err(CliFailure::invalid(format!(
+                    "view {view} is not a descendant frontier of label {label}"
+                )));
+            }
+        }
+        let mut chosen = chosen.to_vec();
+        chosen.sort();
+        chosen.dedup();
+        chosen
+    };
+    if frontiers.len() < 2 {
+        return Success::new(
+            "integrate",
+            json!({ "integrated": false, "label": label }),
+            format!("label {label} has nothing to integrate\n"),
+        );
+    }
+
+    let expected = repository.heads.read()?;
+    let objects = BatchObjectStore::new(&repository.objects, 1024, 8 * 1024 * 1024);
+    let mutator = PersistedRepositoryMutator::new(&objects, &repository.content, &repository.heads);
+    let (prepared, outcome) = runtime
+        .block_on(mutator.integrate(expected, listed.basis, &frontiers))
+        .map_err(integration_failure)?;
+    let publication = runtime.block_on(prepare_mutation_publication(
+        &objects,
+        &repository.content,
+        &repository.heads,
+        expected,
+        prepared,
+    ))?;
+    runtime.block_on(objects.flush())?;
+    let head = finalize_mutation_publication(&repository.heads, publication)?;
+
+    let view = outcome.resulting_view;
+    let tree = runtime
+        .block_on(RepositoryReader::new(&repository.objects, &repository.content).view(view))?
+        .tree;
+    let materialized = runtime.block_on(materialization::materialize_locked(
+        &context.root,
+        &repository,
+        &mut context.workspace,
+        head,
+        label.clone(),
+        listed.basis,
+        (view != listed.basis).then_some(view),
+        tree,
+        dot_git,
+    ));
+    if let Err(error) = materialized {
+        // The joined view is recorded; only the workspace still shows the old one.
+        return Err(error.context(format!(
+            "the frontiers were joined into view {view}, but the workspace was not \
+             switched to it; run `wheat switch {label} --frontier {view}`"
+        )));
+    }
+
+    let mut human = format!(
+        "joined {} frontiers of label {label} into view {view}\ncomposed {} changes\n",
+        frontiers.len(),
+        outcome.composed.len()
+    );
+    for change in &outcome.conflicted {
+        writeln!(human, "conflicted {change}")?;
+    }
+    if !outcome.conflicted.is_empty() {
+        writeln!(human, "see `wheat conflicts` to resolve them")?;
+    }
+    let ids = |ids: &[ChangeId]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+    Success::new(
+        "integrate",
+        json!({
+            "integrated": true,
+            "label": label,
+            "view": view.to_string(),
+            "frontiers": frontiers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "composed": ids(&outcome.composed),
+            "conflicted": ids(&outcome.conflicted),
+        }),
+        human,
+    )
+}
+
+/// Frontiers that cannot be joined yet are a conflict the user settles; anything else
+/// is a failure to read or write the store.
+fn integration_failure(error: wheat_store::RepositoryMutationError) -> anyhow::Error {
+    use wheat_store::RepositoryMutationError as Mutation;
+    match error {
+        Mutation::DivergentRevisions(_) | Mutation::FrontierRevisesBasis(_) => {
+            CliFailure::conflict(error.to_string())
+        }
+        other => anyhow::Error::new(other),
+    }
+}
+
 /// Fill a freshly created workspace (init, import, clone).
 fn materialize_resolved(
     workspace: &Path,
@@ -2003,7 +2157,7 @@ fn ensure_workspace_clean_locked(
     )?;
     if !scan.changes.is_empty() {
         return Err(CliFailure::invalid(
-            "uncaptured tracked workspace edits block switch or refresh",
+            "uncaptured tracked workspace edits block switch, refresh or integrate",
         ));
     }
     Ok(())

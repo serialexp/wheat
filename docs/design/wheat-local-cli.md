@@ -170,9 +170,11 @@ both lists.
   `tags/X` but drops the tag object's tagger, date and message, so pushing an
   imported tag back needs the label re-created with `-m` and gives a different tag
   object. Store them as the label's annotation so imported tags round-trip.
-- [ ] **Phase 2 — dependency and integration workflow.** Expose stack revision,
+- [~] **Phase 2 — dependency and integration workflow.** Expose stack revision,
   dependency movement, joins, deterministic descendant reapplication, and durable
   conflict outcomes as Wheat operations rather than Git-shaped rebase state.
+  (2026-10-09: `wheat integrate` joins frontiers; frontiers with different
+  revisions of one change are still refused.)
 - [~] **Phase 2 — workspace-wide capture.** Extend `wheat add` with `--all` to
   capture all non-ignored modified and deleted tracked paths. Untracked files
   require `--include-untracked` or explicit path arguments. Depends on the
@@ -206,7 +208,8 @@ both lists.
   head counts its own generations; unpublished work is a local head envelope
   other than the last fetched or published one. 2026-10-09: a fetch keeps
   unpublished work, joining both states and merging labels three ways against
-  the last fetch; `--force` drops it. There is no integrate or pull yet.)
+  the last fetch; `--force` drops it. `wheat integrate` then joins the
+  frontiers. There is no pull yet.)
 - [ ] **Phase 3 — concurrent multi-workspace authoring policy.** Durable workspace
   identity, shared-store creation/list/detach, operation locks, and content pins are
   implemented. Still define user-facing integration when two workspaces advance
@@ -459,7 +462,19 @@ Initial commands may be:
 wheat materialize [--source <view-or-label>] [DIRECTORY] [--allow-dot-git]
 wheat restore [PATH ...] [--allow-dot-git]  # restore from the pinned workspace view
 wheat switch <label> [--frontier <view>] [--allow-dot-git]  # label activation plus safe materialization
+wheat integrate [--frontier <view> ...] [--allow-dot-git]  # join the active label's frontiers, then switch
 ```
+
+`wheat integrate` (2026-10-09) joins the active label's descendant frontiers, or
+the chosen ones, into one view: the label's view with every change the frontiers
+add composed onto it in canonical order, each at the revision it already has. A
+change that no longer applies cleanly is recorded as a durable conflict, as in any
+composition. Every joined frontier gets a lineage edge to the new view, so it is
+the label's one frontier, and the workspace switches to it. Uncaptured tracked
+edits block it like a switch. If the switch itself is refused (an untracked file
+in the way, or `.git` paths), the joined view is kept and the error names the
+`wheat switch` that finishes it. Frontiers holding different revisions of one
+change, or revising a change the label's view already holds, are refused for now.
 
 Names are provisional; the safety, immutable-label, and explicit-frontier
 semantics are not.

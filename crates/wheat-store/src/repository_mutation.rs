@@ -45,6 +45,19 @@ pub enum RepositoryMutationError {
     },
     #[error("frontier creation requires a proposal with no explicit dependencies")]
     FrontierDependencies,
+    #[error("integration needs at least one frontier")]
+    NoFrontiers,
+    #[error(
+        "the frontiers hold different revisions of {}: {}",
+        if .0.len() == 1 { "a change".to_owned() } else { format!("{} changes", .0.len()) },
+        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    DivergentRevisions(Vec<ChangeId>),
+    #[error(
+        "a frontier revises or drops changes its basis already holds: {}",
+        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    FrontierRevisesBasis(Vec<ChangeId>),
 }
 
 type Result<T> = std::result::Result<T, RepositoryMutationError>;
@@ -81,7 +94,7 @@ impl PreparedRepositoryMutation {
 pub struct PersistedRepositoryMutator<'a, O, P> {
     pub(crate) objects: &'a O,
     pub(crate) content: &'a ContentStore,
-    publications: &'a P,
+    pub(crate) publications: &'a P,
 }
 
 /// A conflict-resolution intent over the paths whose edits failed in one exact application.
@@ -787,7 +800,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
 
     /// Applies one change's revision onto `view` and records the resulting view.
     #[tracing::instrument(level = "debug", skip_all, fields(change = %change))]
-    async fn apply_step(
+    pub(crate) async fn apply_step(
         &self,
         view: ViewRecord,
         change: ChangeId,
@@ -1175,7 +1188,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     }
 
     #[tracing::instrument(name = "finish_mutation", level = "debug", skip_all)]
-    async fn finish(
+    pub(crate) async fn finish(
         &self,
         expected: RepositoryHead,
         old: RepositoryStateRecord,
@@ -1343,7 +1356,7 @@ fn topological(
 }
 
 /// Canonical order of `selected`: dependencies first, ties broken by the lowest change id.
-fn topological_by<'a>(
+pub(crate) fn topological_by<'a>(
     selected: &BTreeSet<ChangeId>,
     dependencies_of: impl Fn(&ChangeId) -> Option<&'a BTreeSet<ChangeId>>,
 ) -> Result<Vec<ChangeId>> {
