@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wheat: version control for many hands at once</title>
+<meta name="description" content="Wheat gives every agent its own workspace and a stable change. Work commits privately, revises in place, and integrates only when you ask. Conflicts are kept as data, not raised as errors.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;1,8..60,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#f5f0e4;color:#2b2519;-webkit-font-smoothing:antialiased}
+a{color:#8a5e14;text-decoration:underline;text-underline-offset:3px}
+a:hover{color:#2b2519}
+*{box-sizing:border-box}
+</style>
+</head>
+<body>
+
+<div style="font-family:'Source Serif 4',Georgia,serif;background:#f5f0e4;color:#2b2519;min-height:100vh">
+
+  <header style="position:sticky;top:0;z-index:5;background:#f5f0e4;border-bottom:1px solid #d9cfb9">
+    <div style="max-width:1200px;margin:0 auto;padding:16px 32px;display:flex;align-items:center;gap:32px;flex-wrap:wrap">
+      <div style="display:flex;align-items:baseline;gap:10px">
+        <span style="font-size:26px;font-weight:600;letter-spacing:-0.02em">wheat</span>
+        <span style="font:12px 'IBM Plex Mono',monospace;color:#6b604c">prototype</span>
+      </div>
+      <nav style="display:flex;gap:24px;flex-wrap:wrap;font-size:16px;margin-left:auto">
+        <a href="#why" style="color:#2b2519;text-decoration:none">Why</a>
+        <a href="#concepts" style="color:#2b2519;text-decoration:none">In parallel</a>
+        <a href="#git" style="color:#2b2519;text-decoration:none">Git</a>
+        <a href="#bench" style="color:#2b2519;text-decoration:none">Benchmarks</a>
+        <a href="https://github.com/serialexp/wheat" style="color:#2b2519;text-decoration:none">Source</a>
+      </nav>
+      <a href="#install" style="font:500 14px 'IBM Plex Mono',monospace;background:#2b2519;color:#f5f0e4;padding:10px 16px;text-decoration:none;border-radius:2px">Install</a>
+    </div>
+  </header>
+
+  <!-- HERO -->
+  <section style="max-width:1200px;margin:0 auto;padding:88px 32px 72px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:56px;align-items:center">
+    <div style="display:flex;flex-direction:column;gap:28px">
+      <div style="font:500 13px 'IBM Plex Mono',monospace;color:#8a5e14;letter-spacing:0.04em;text-transform:uppercase">Distributed version control</div>
+      <h1 style="margin:0;font-size:clamp(44px,6vw,76px);line-height:1.02;font-weight:500;letter-spacing:-0.025em;text-wrap:balance">Version control for many hands at once.</h1>
+      <p style="margin:0;font-size:21px;line-height:1.5;color:#4a4232;max-width:34em;text-wrap:pretty">Wheat gives every agent its own workspace and a stable change. Work commits privately, revises in place, and integrates only when you ask. Conflicts are kept as data, not raised as errors.</p>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+        <a href="#install" style="font:500 15px 'IBM Plex Mono',monospace;background:#c08a2e;color:#2b2519;padding:14px 22px;text-decoration:none;border-radius:2px">Install the CLI</a>
+        <a href="#why" style="font-size:17px;color:#2b2519">See it next to git</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- COMPARISON -->
+  <section id="why" style="background:#ece4d2;border-top:1px solid #d9cfb9;border-bottom:1px solid #d9cfb9">
+    <div style="max-width:1200px;margin:0 auto;padding:88px 32px;display:flex;flex-direction:column;gap:48px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:40px">
+        <h2 style="margin:0;font-size:clamp(34px,4vw,48px);line-height:1.08;font-weight:500;letter-spacing:-0.02em;text-wrap:balance">Three agents, one repository, one afternoon.</h2>
+        <p style="margin:0;font-size:19px;line-height:1.6;color:#4a4232;text-wrap:pretty">In git, each agent builds its own isolation from worktrees, branches and an index. Whenever main moves, someone rebases, and whoever hits the conflict has to stop. In Wheat, isolation is the default: each agent starts from one exact view, owns one stable change and commits privately. Integration is a separate step, and any conflicts it finds are recorded rather than blocking anyone.</p>
+      </div>
+
+      <div style="overflow-x:auto;background:#f5f0e4;border:1px solid #d9cfb9;border-radius:2px">
+        <div style="min-width:880px;padding:28px;display:flex;flex-direction:column;gap:28px;font-family:'IBM Plex Mono',monospace;font-size:12px;line-height:1.35">
+          <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px;color:#6b604c">
+            <div></div><div>start</div><div>work</div><div>commit</div><div>main moves</div><div>integrate</div><div>publish</div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <div style="font:600 15px 'Source Serif 4',serif;margin-bottom:6px">git</div>
+            <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px;align-items:stretch">
+              <div style="color:#6b604c;padding:8px 0">agent 1</div>
+              <div style="grid-column:2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">worktree add ../a</div>
+              <div style="grid-column:3;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">edit</div>
+              <div style="grid-column:4;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">commit on a</div>
+              <div style="grid-column:5;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">merge → main</div>
+            </div>
+            <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px">
+              <div style="color:#6b604c;padding:8px 0">agent 2</div>
+              <div style="grid-column:2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">worktree add ../b</div>
+              <div style="grid-column:3;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">edit</div>
+              <div style="grid-column:4;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">commit on b</div>
+              <div style="grid-column:5;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">rebase onto main</div>
+              <div style="grid-column:6 / span 2;padding:8px 10px;background:#2b2519;color:#f5f0e4">CONFLICT · agent stops, resolves by hand, re-tests</div>
+            </div>
+            <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px">
+              <div style="color:#6b604c;padding:8px 0">agent 3</div>
+              <div style="grid-column:2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">worktree add ../c</div>
+              <div style="grid-column:3 / span 2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">edit</div>
+              <div style="grid-column:5;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">rebase again</div>
+              <div style="grid-column:6;padding:8px 10px;background:#2b2519;color:#f5f0e4">CONFLICT · stops</div>
+              <div style="grid-column:7;padding:8px 10px;border:1px dashed #b5a888;color:#6b604c">waiting on 2</div>
+            </div>
+            <div style="font:15px/1.4 'Source Serif 4',serif;color:#4a4232;margin-top:8px">Two of three agents stopped. What blocked them was the order the others finished in.</div>
+          </div>
+
+          <div style="height:1px;background:#d9cfb9"></div>
+
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <div style="font:600 15px 'Source Serif 4',serif;margin-bottom:6px">wheat</div>
+            <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px">
+              <div style="color:#6b604c;padding:8px 0">agent 1</div>
+              <div style="grid-column:2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">change A · base M</div>
+              <div style="grid-column:3;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">edit</div>
+              <div style="grid-column:4;padding:8px 10px;background:#e8cf96">A1</div>
+              <div style="grid-column:5;padding:8px 10px;background:#e8cf96">A2 · same change</div>
+            </div>
+            <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px">
+              <div style="color:#6b604c;padding:8px 0">agent 2</div>
+              <div style="grid-column:2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">change B · base M</div>
+              <div style="grid-column:3;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">edit</div>
+              <div style="grid-column:4;padding:8px 10px;background:#e8cf96">B1</div>
+              <div style="grid-column:5;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">keeps working</div>
+            </div>
+            <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px">
+              <div style="color:#6b604c;padding:8px 0">agent 3</div>
+              <div style="grid-column:2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">change C · base M</div>
+              <div style="grid-column:3 / span 2;padding:8px 10px;border:1px solid #d9cfb9;background:#fffaf0">edit</div>
+              <div style="grid-column:5;padding:8px 10px;background:#e8cf96">C1</div>
+            </div>
+            <div style="display:grid;grid-template-columns:110px repeat(6,minmax(0,1fr));gap:6px">
+              <div style="color:#6b604c;padding:8px 0">you</div>
+              <div style="grid-column:6;padding:8px 10px;background:#c08a2e;color:#2b2519">compose A2 B1 C1 → 1 conflict stored</div>
+              <div style="grid-column:7;padding:8px 10px;background:#c08a2e;color:#2b2519">publish main</div>
+            </div>
+            <div style="font:15px/1.4 'Source Serif 4',serif;color:#4a4232;margin-top:8px">No agent stopped. When main moved, nobody had to act. The overlap was found once, recorded, and resolved by one person.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SIMULTANEOUS -->
+  <section id="concepts" style="max-width:1200px;margin:0 auto;padding:96px 32px;display:flex;flex-direction:column;gap:48px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:40px;align-items:end">
+      <h2 style="margin:0;font-size:clamp(34px,4vw,48px);line-height:1.08;font-weight:500;letter-spacing:-0.02em;text-wrap:balance">Three directories. One repository. The same second.</h2>
+      <p style="margin:0;font-size:19px;line-height:1.6;color:#4a4232;text-wrap:pretty">Each agent works in its own directory, and all three are attached to the same Wheat repository. They commit at the same moment. Nobody takes a lock, nobody waits on an index, and no commit overwrites another. Each commit lands as its own change.</p>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px">
+      <div style="display:flex;flex-direction:column;background:#2b2519;color:#efe6d3;border-radius:2px;min-width:0">
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:12px 18px;border-bottom:1px solid #4a4232;font:12px 'IBM Plex Mono',monospace;color:#b5a888">
+          <span>agent-1</span><span>~/src/app-1</span>
+        </div>
+        <div style="padding:18px;font:13.5px/1.85 'IBM Plex Mono',monospace;overflow-x:auto;white-space:pre">$ wheat change new -m "parse config"
+<span style="color:#b5a888"># edits config.rs</span>
+$ wheat add --all
+<span style="color:#e8cf96">committed A@1  14:02:07.204</span></div>
+      </div>
+      <div style="display:flex;flex-direction:column;background:#2b2519;color:#efe6d3;border-radius:2px;min-width:0">
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:12px 18px;border-bottom:1px solid #4a4232;font:12px 'IBM Plex Mono',monospace;color:#b5a888">
+          <span>agent-2</span><span>~/src/app-2</span>
+        </div>
+        <div style="padding:18px;font:13.5px/1.85 'IBM Plex Mono',monospace;overflow-x:auto;white-space:pre">$ wheat change new -m "default port"
+<span style="color:#b5a888"># edits server.rs</span>
+$ wheat add --all
+<span style="color:#e8cf96">committed B@1  14:02:07.206</span></div>
+      </div>
+      <div style="display:flex;flex-direction:column;background:#2b2519;color:#efe6d3;border-radius:2px;min-width:0">
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:12px 18px;border-bottom:1px solid #4a4232;font:12px 'IBM Plex Mono',monospace;color:#b5a888">
+          <span>agent-3</span><span>~/src/app-3</span>
+        </div>
+        <div style="padding:18px;font:13.5px/1.85 'IBM Plex Mono',monospace;overflow-x:auto;white-space:pre">$ wheat change new -m "retry on 503"
+<span style="color:#b5a888"># edits client.rs</span>
+$ wheat add --all
+<span style="color:#e8cf96">committed C@1  14:02:07.211</span></div>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:0;border-top:1px solid #2b2519">
+      <div style="display:grid;grid-template-columns:minmax(140px,0.6fr) minmax(0,2fr);gap:24px;padding:18px 0;border-bottom:1px solid #d9cfb9;align-items:baseline">
+        <div style="font:500 13px 'IBM Plex Mono',monospace;color:#6b604c">the repository</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;font:13px 'IBM Plex Mono',monospace">
+          <span style="padding:6px 10px;background:#e8cf96;border-radius:2px">A@1 parse config</span>
+          <span style="padding:6px 10px;background:#e8cf96;border-radius:2px">B@1 default port</span>
+          <span style="padding:6px 10px;background:#e8cf96;border-radius:2px">C@1 retry on 503</span>
+          <span style="padding:6px 10px;border:1px solid #d9cfb9;border-radius:2px;color:#6b604c">main unchanged</span>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(140px,0.6fr) minmax(0,2fr);gap:24px;padding:18px 0;border-bottom:1px solid #d9cfb9;align-items:baseline">
+        <div style="font:500 13px 'IBM Plex Mono',monospace;color:#6b604c">in git</div>
+        <div style="font-size:17px;line-height:1.55;color:#4a4232;text-wrap:pretty">In one checkout, three agents would share an index and race on <span style="font-family:'IBM Plex Mono',monospace;font-size:15px">index.lock</span>. With three worktrees they'd be on three branches, and each one would have to be rebased before it could land.</div>
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(140px,0.6fr) minmax(0,2fr);gap:24px;padding:18px 0;border-bottom:1px solid #d9cfb9;align-items:baseline">
+        <div style="font:500 13px 'IBM Plex Mono',monospace;color:#6b604c">what you type</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;font:13px 'IBM Plex Mono',monospace">
+          <span style="padding:6px 10px;background:#ece4d2;border-radius:2px">wheat change new</span>
+          <span style="padding:6px 10px;background:#ece4d2;border-radius:2px">wheat add</span>
+          <span style="padding:6px 10px;background:#ece4d2;border-radius:2px">wheat log</span>
+          <span style="padding:6px 10px;background:#ece4d2;border-radius:2px">wheat conflicts</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- GIT INTEROP -->
+  <section id="git" style="background:#ece4d2;border-top:1px solid #d9cfb9;border-bottom:1px solid #d9cfb9">
+    <div style="max-width:1200px;margin:0 auto;padding:96px 32px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:56px;align-items:start">
+      <div style="display:flex;flex-direction:column;gap:20px">
+        <h2 style="margin:0;font-size:clamp(34px,4vw,48px);line-height:1.08;font-weight:500;letter-spacing:-0.02em">Bring your history. Keep your remote.</h2>
+        <p style="margin:0;font-size:19px;line-height:1.6;color:#4a4232;text-wrap:pretty">Wheat doesn't depend on git, but git is always reachable. Import an existing repository into a new Wheat store, work in changes and revisions, then convert that history back into commits and push it to any git branch. Your CI, reviewers and forge don't need to change.</p>
+        <p style="margin:0;font-size:17px;line-height:1.6;color:#6b604c">Workspaces follow your existing <span style="font-family:'IBM Plex Mono',monospace;font-size:15px">.gitignore</span> rules.</p>
+      </div>
+      <div style="background:#2b2519;color:#efe6d3;border-radius:2px;padding:28px;font:14px/1.9 'IBM Plex Mono',monospace;overflow-x:auto">
+        <div style="color:#b5a888"># import a local git repository</div>
+        <div>wheat import ~/src/my-repo</div>
+        <div style="height:14px"></div>
+        <div style="color:#b5a888"># work natively…</div>
+        <div>wheat change new -m "parse config"</div>
+        <div>wheat add --all -m "handle empty sections"</div>
+        <div style="height:14px"></div>
+        <div style="color:#b5a888"># project history back to git</div>
+        <div>wheat push ../my-repo.git --to refs/heads/main</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BENCHMARKS -->
+  <section id="bench" style="max-width:1200px;margin:0 auto;padding:96px 32px;display:flex;flex-direction:column;gap:48px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:40px;align-items:end">
+      <h2 style="margin:0;font-size:clamp(34px,4vw,48px);line-height:1.08;font-weight:500;letter-spacing:-0.02em">We treat performance as correctness.</h2>
+      <p style="margin:0;font-size:19px;line-height:1.6;color:#4a4232;text-wrap:pretty">Any work that grows with repository size comes with a benchmark and a budget. The numbers below come from release builds, and every result is committed to the repo.</p>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));border-top:1px solid #2b2519">
+      <div style="padding:28px 24px 28px 0;border-bottom:1px solid #d9cfb9;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:44px;line-height:1;font-weight:500;letter-spacing:-0.02em">1.17 s</div>
+        <div style="font-size:17px;line-height:1.45;color:#2b2519;text-wrap:pretty">Reapply 500 changes after an edit placed beneath them, 50 of which touch a 1 MB file</div>
+        <div style="font:12px 'IBM Plex Mono',monospace;color:#6b604c">deep_stack</div>
+      </div>
+      <div style="padding:28px 24px 28px 0;border-bottom:1px solid #d9cfb9;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:44px;line-height:1;font-weight:500;letter-spacing:-0.02em">≤ 5.5 s</div>
+        <div style="font-size:17px;line-height:1.45;color:#2b2519;text-wrap:pretty">wheat add across 20,000 files</div>
+        <div style="font:12px 'IBM Plex Mono',monospace;color:#6b604c">add_scale</div>
+      </div>
+      <div style="padding:28px 24px 28px 0;border-bottom:1px solid #d9cfb9;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:44px;line-height:1;font-weight:500;letter-spacing:-0.02em">194,543</div>
+        <div style="font-size:17px;line-height:1.45;color:#2b2519;text-wrap:pretty">Files in the largest TypeScript repository commit, captured as a single revision</div>
+        <div style="font:12px 'IBM Plex Mono',monospace;color:#6b604c">max revision edits</div>
+      </div>
+      <div style="padding:28px 24px 28px 0;border-bottom:1px solid #d9cfb9;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:44px;line-height:1;font-weight:500;letter-spacing:-0.02em">8.3 s</div>
+        <div style="font-size:17px;line-height:1.45;color:#2b2519;text-wrap:pretty">Repack planning at one million content IDs, using 157 MiB</div>
+        <div style="font:12px 'IBM Plex Mono',monospace;color:#6b604c">content repack</div>
+      </div>
+    </div>
+    <div style="font:13px 'IBM Plex Mono',monospace;color:#6b604c">Measured on one machine, 2026-09. Run the benchmarks yourself with: just bench</div>
+  </section>
+
+  <!-- INSTALL -->
+  <section id="install" style="background:#2b2519;color:#f5f0e4">
+    <div style="max-width:1200px;margin:0 auto;padding:96px 32px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:56px;align-items:start">
+      <div style="display:flex;flex-direction:column;gap:20px">
+        <h2 style="margin:0;font-size:clamp(38px,5vw,60px);line-height:1.04;font-weight:500;letter-spacing:-0.025em">Install the CLI.</h2>
+        <p style="margin:0;font-size:19px;line-height:1.6;color:#d9cfb9;text-wrap:pretty">Wheat is written in Rust and is built from source. It installs a single <span style="font-family:'IBM Plex Mono',monospace;font-size:16px">wheat</span> binary into <span style="font-family:'IBM Plex Mono',monospace;font-size:16px">~/.cargo/bin</span>.</p>
+        <p style="margin:0;font-size:17px;line-height:1.6;color:#b5a888">The design docs explain the model in depth: <a href="https://github.com/serialexp/wheat/tree/main/docs/design" style="color:#e8cf96">docs/design</a>.</p>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:20px">
+        <div style="border:1px solid #4a4232;border-radius:2px">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid #4a4232;font:12px 'IBM Plex Mono',monospace;color:#b5a888">
+            <span>install</span>
+            <button id="copy-install" type="button" style="font:500 12px 'IBM Plex Mono',monospace;background:#c08a2e;color:#2b2519;border:0;padding:6px 12px;border-radius:2px;cursor:pointer">copy</button>
+          </div>
+          <div id="install-commands" style="padding:20px;font:14px/1.9 'IBM Plex Mono',monospace;overflow-x:auto;white-space:pre">git clone https://github.com/serialexp/wheat
+cd wheat &amp;&amp; just install</div>
+        </div>
+        <div style="border:1px solid #4a4232;border-radius:2px">
+          <div style="padding:12px 20px;border-bottom:1px solid #4a4232;font:12px 'IBM Plex Mono',monospace;color:#b5a888">first five minutes</div>
+          <div style="padding:20px;font:14px/1.9 'IBM Plex Mono',monospace;overflow-x:auto;display:flex;flex-direction:column">
+            <div>wheat init</div>
+            <div>wheat change new -m "first change"</div>
+            <div style="color:#b5a888"># edit files</div>
+            <div>wheat add --all -m "revise it"</div>
+            <div>wheat log</div>
+            <div>wheat conflicts</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer style="max-width:1200px;margin:0 auto;padding:40px 32px;display:flex;gap:24px;flex-wrap:wrap;align-items:baseline;font-size:15px;color:#6b604c">
+    <span style="font-size:20px;font-weight:600;color:#2b2519">wheat</span>
+    <span>An early, working prototype of source control beyond git.</span>
+    <span style="margin-left:auto;display:flex;gap:20px">
+      <a href="https://github.com/serialexp/wheat">Source</a>
+      <a href="https://github.com/serialexp/wheat/tree/main/docs/design">Design docs</a>
+    </span>
+  </footer>
+
+</div>
+
+<script>
+  const copyButton = document.getElementById("copy-install");
+  copyButton.addEventListener("click", () => {
+    navigator.clipboard?.writeText(document.getElementById("install-commands").textContent);
+    copyButton.textContent = "copied";
+    setTimeout(() => { copyButton.textContent = "copy"; }, 1600);
+  });
+</script>
+</body>
+</html>

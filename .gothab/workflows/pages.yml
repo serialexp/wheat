@@ -1,0 +1,27 @@
+name: Deploy Pages
+
+# Publishes `site/` to Gothab Pages. The repository is synced from GitHub, and a sync
+# does not trigger workflows, so this runs on dispatch only.
+#
+# The site is served at wheat.gothab.io: that hostname is the custom domain in the
+# repository's Pages settings, and *.gothab.io already points at Gothab.
+
+on:
+  workflow_dispatch:
+
+# `contents: read` for the checkout, `pages: write` for the deployment upload.
+permissions:
+  contents: read
+  pages: write
+
+jobs:
+  deploy:
+    # Pages uploads need a polling-mode runner.
+    runs-on: default
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Deploy Pages
+        uses: actions/deploy-pages@v1
+        with:
+          path: site
