@@ -1,0 +1,27 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261015-063823
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# deep_stack	{"big_file_bytes":1122000,"big_file_lines":11000,"changes":500}
+# dirty	true
+# release	true
+# rev	755112269a29
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+deep_stack.total.wall	66.071808476	s
+deep_stack.total.peak_rss	118366208	bytes
+deep_stack.setup.wall	47.891983436	s
+deep_stack.reapply.wall	0.772543555	s
+deep_stack.reapply.peak_rss	34029568	bytes
+deep_stack.fitting.wall	1.383442189	s
+deep_stack.fitting.peak_rss	39006208	bytes
+deep_stack.fitting_overhead	0.6108986339999999	s
+deep_stack.moving.wall	1.289514433	s
+deep_stack.moving.peak_rss	42835968	bytes
+deep_stack.moving_overhead	0.5169708779999999	s
+run.total_time	66.072136304	s
+process.peak_rss	118366208	bytes
+suite.cases	1	count
+suite.case_failures	0	count

@@ -345,6 +345,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   (`crates/wheat-store/tests/repository_mutation.rs`),
   `a_path_proves_descent_hop_by_hop_without_scanning_the_lineage`
   (`crates/wheat-store/tests/view_lineage.rs`).
+- `[x]` **The four retained-set updates in `finish_mutation` cost about 0.85 s.**
+  `radix::Store::update_batch` applied a batch one edit at a time, with a lookup and a
+  full root-path rewrite per edit, so a batch of ~500 keys wrote ~500 roots. Its
+  batched path was bypassed because it couldn't update the old node when a prefix
+  split. Done 2026-10-15 (7551122): one pass per batch, each changed node written
+  once. Contract: `a_batch_writes_each_changed_node_once`
+  (`crates/wheat-store/tests/collection_builder_parity.rs`). `deep_stack` release
+  run: `bench/results/wheat-quick/20261015-063823-755112269a29.tsv`. The previous
+  run is 0581f94, so the comparison spans other commits too.
 
 ## Explicit history collapse, repack, and GC
 

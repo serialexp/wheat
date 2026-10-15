@@ -103,9 +103,6 @@ budget passes, but by only about 0.7 s.
   about 0.64 s. Build them in one pass per composition instead.
 - `[ ]` **Batch `ViewLineageMapStore::insert_edges`.** One edge per parent means 503
   separate child-set `radix_update`s, about 0.6 s, in `finish_mutation`.
-- `[ ]` **The four retained-set updates in `finish_mutation` cost about 0.85 s.**
-  They are batched already; add spans inside `radix::Store::update_batch` to see why
-  a batch of ~500 keys costs about 200 ms.
 - `[ ]` **Why a single small `radix_update` costs about 0.6 ms.** Look inside it once
   the release numbers are in.
 - `[ ]` **Move `WHEAT_IMPORT_PROFILE` (wheat-git) onto tracing spans**, so there is one
