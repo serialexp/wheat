@@ -74,8 +74,10 @@ pub(crate) struct Node<I, V> {
 
 /// Checks a node's shape at key byte `position`, for keys of `key_len` bytes: the
 /// prefix stays within the key, children and inline entries end exactly at full
-/// depth, a value only sits on a terminal node at full depth, and an interior node
-/// branches at least twice (only an empty root may be bare).
+/// depth, a value only sits on a terminal root at full depth (a single entry below
+/// the root is inlined in its parent), and an interior node branches at least twice
+/// (only an empty root may be bare). With the edge checks done at decoding, this
+/// leaves one encoding per set of entries.
 pub(crate) fn validate_node_at<I, V>(
     node: &Node<I, V>,
     position: usize,
@@ -98,8 +100,8 @@ pub(crate) fn validate_node_at<I, V>(
     }
     let total_branches = node.children.len() + node.entries.len();
     if node.value.is_some() {
-        // Terminal: at full key depth, no children or entries.
-        if end != key_len || total_branches != 0 {
+        // Terminal: the root, at full key depth, no children or entries.
+        if position != 0 || end != key_len || total_branches != 0 {
             return Err(Error::InvalidTerminalNode);
         }
     } else if total_branches == 1
@@ -136,7 +138,19 @@ impl<'a, S, C> Clone for Store<'a, S, C> {
 }
 
 type BuildFuture<'a, I> = Pin<Box<dyn Future<Output = Result<I, Error>> + Send + 'a>>;
-type UpdateFuture<'a, I> = Pin<Box<dyn Future<Output = Result<Option<I>, Error>> + Send + 'a>>;
+type UpdateFuture<'a, I, V> =
+    Pin<Box<dyn Future<Output = Result<Updated<I, V>, Error>> + Send + 'a>>;
+
+/// What [`Store::update_node`] made of a subtree. At the root it is always `Node`.
+enum Updated<I, V> {
+    /// The subtree's node; the original one when nothing changed.
+    Node(I),
+    /// A single entry is left: its key bytes from the subtree's position on. The
+    /// parent inlines it, because a canonical child holds at least two entries.
+    Leaf(Vec<u8>, V),
+    /// No entries are left.
+    Pruned,
+}
 type Frame<C> = (
     Node<<C as Collection>::Id, <C as Collection>::Value>,
     usize,
@@ -604,27 +618,62 @@ where
                     .await?;
                 continue;
             }
-            current = self
-                .update_node(Some(current), node, 0, std::slice::from_ref(edit))
+            current = match self
+                .update_node(current, node, 0, std::slice::from_ref(edit))
                 .await?
-                .expect("root is never pruned");
+            {
+                Updated::Node(id) => id,
+                Updated::Leaf(..) | Updated::Pruned => {
+                    unreachable!("update_node writes the root itself")
+                }
+            };
         }
         Ok(current)
     }
 
+    /// A single entry left at `position`: the root holds it as a terminal node, any
+    /// other subtree hands it to its parent to inline, so nothing non-canonical is
+    /// written.
+    async fn leaf(
+        &self,
+        position: usize,
+        rest: Vec<u8>,
+        value: C::Value,
+    ) -> Result<Updated<C::Id, C::Value>, Error> {
+        if position != 0 {
+            return Ok(Updated::Leaf(rest, value));
+        }
+        Ok(Updated::Node(
+            self.write(Node {
+                prefix: rest,
+                value: Some(value),
+                children: Vec::new(),
+                entries: Vec::new(),
+            })
+            .await?,
+        ))
+    }
+
+    /// No entries left at `position`: the root becomes the empty root.
+    async fn pruned(&self, position: usize) -> Result<Updated<C::Id, C::Value>, Error> {
+        if position != 0 {
+            return Ok(Updated::Pruned);
+        }
+        Ok(Updated::Node(self.empty_root().await?))
+    }
+
     /// Recursively update a node with a batch of edits, producing canonical
-    /// inline-entry structure.  Returns `None` when the node is pruned (all
-    /// entries removed from a non-root subtree).
+    /// inline-entry structure.
     fn update_node<'b>(
         &'b self,
-        original: Option<C::Id>,
+        original: C::Id,
         node: Node<C::Id, C::Value>,
         position: usize,
         edits: &'b [(C::Key, Option<C::Value>)],
-    ) -> UpdateFuture<'b, C::Id> {
+    ) -> UpdateFuture<'b, C::Id, C::Value> {
         Box::pin(async move {
             if edits.is_empty() {
-                return Ok(original);
+                return Ok(Updated::Node(original));
             }
             let common = edits
                 .iter()
@@ -641,7 +690,7 @@ where
             // ── Prefix diverges: split this node ──────────────────────────
             if common < node.prefix.len() {
                 if edits.iter().all(|(_, value)| value.is_none()) {
-                    return Ok(original);
+                    return Ok(Updated::Node(original));
                 }
                 let split = position + common;
                 let old_edge = node.prefix[common];
@@ -698,18 +747,11 @@ where
                     start = group_end;
                 }
 
-                let total = new_children.len() + new_entries.len();
-                if total <= 1 && position > 0 {
-                    // After adding edits, if we still have only the old node
-                    // (all edits were deletions of non-existent keys), nothing
-                    // changed.
-                    if total == 1 && new_entries.is_empty() && new_children[0].0 == old_edge {
-                        return Ok(original);
-                    }
-                }
+                // At least one edit inserts, so the old node and the inserted
+                // entries make two or more branches.
                 new_children.sort_by_key(|&(e, _)| e);
                 new_entries.sort_by(|a, b| a.0.cmp(&b.0));
-                return Ok(Some(
+                return Ok(Updated::Node(
                     self.write(Node {
                         prefix: node.prefix[..common].to_vec(),
                         value: None,
@@ -725,20 +767,11 @@ where
             if end == C::Key::LEN {
                 let value = edits[edits.len() - 1].1;
                 if value == node.value {
-                    return Ok(original);
+                    return Ok(Updated::Node(original));
                 }
                 return match value {
-                    Some(value) => Ok(Some(
-                        self.write(Node {
-                            prefix: node.prefix,
-                            value: Some(value),
-                            children: Vec::new(),
-                            entries: Vec::new(),
-                        })
-                        .await?,
-                    )),
-                    None if position == 0 => Ok(Some(self.empty_root().await?)),
-                    None => Ok(None),
+                    Some(value) => self.leaf(position, node.prefix, value).await,
+                    None => self.pruned(position).await,
                 };
             }
 
@@ -814,41 +847,31 @@ where
                     // Edit targets an existing child — recurse.
                     let old_id = children[child_idx].1;
                     let child_node = self.read_at(old_id, end + 1).await?;
-                    let replacement = self
-                        .update_node(Some(old_id), child_node, end + 1, &edits[start..group_end])
-                        .await?;
-                    if replacement != Some(old_id) {
-                        changed = true;
-                        match replacement {
-                            Some(new_id) => {
-                                // Check if the child is now a single bare leaf
-                                // that should be promoted to an inline entry.
-                                let updated = self.read_at(new_id, end + 1).await?;
-                                if let Some(leaf_value) = updated.value {
-                                    if updated.children.is_empty()
-                                        && updated.entries.is_empty()
-                                        && end + 1 + updated.prefix.len() == C::Key::LEN
-                                    {
-                                        // Promote to inline entry.
-                                        children.remove(child_idx);
-                                        let mut suffix =
-                                            Vec::with_capacity(1 + updated.prefix.len());
-                                        suffix.push(edge);
-                                        suffix.extend_from_slice(&updated.prefix);
-                                        let ins_pos = entries
-                                            .binary_search_by(|(s, _)| s.as_slice().cmp(&suffix))
-                                            .unwrap_err();
-                                        entries.insert(ins_pos, (suffix, leaf_value));
-                                    } else {
-                                        children[child_idx].1 = new_id;
-                                    }
-                                } else {
-                                    children[child_idx].1 = new_id;
-                                }
+                    match self
+                        .update_node(old_id, child_node, end + 1, &edits[start..group_end])
+                        .await?
+                    {
+                        Updated::Node(new_id) => {
+                            if new_id != old_id {
+                                changed = true;
+                                children[child_idx].1 = new_id;
                             }
-                            None => {
-                                children.remove(child_idx);
-                            }
+                        }
+                        Updated::Leaf(rest, value) => {
+                            // One entry left below this edge: inline it.
+                            changed = true;
+                            children.remove(child_idx);
+                            let mut suffix = Vec::with_capacity(1 + rest.len());
+                            suffix.push(edge);
+                            suffix.extend_from_slice(&rest);
+                            let ins_pos = entries
+                                .binary_search_by(|(s, _)| s.as_slice().cmp(&suffix))
+                                .unwrap_err();
+                            entries.insert(ins_pos, (suffix, value));
+                        }
+                        Updated::Pruned => {
+                            changed = true;
+                            children.remove(child_idx);
                         }
                     }
                 } else {
@@ -877,17 +900,13 @@ where
                 start = group_end;
             }
             if !changed {
-                return Ok(original);
+                return Ok(Updated::Node(original));
             }
             let total_branches = children.len() + entries.len();
             if total_branches == 0 {
-                return if position == 0 {
-                    Ok(Some(self.empty_root().await?))
-                } else {
-                    Ok(None)
-                };
+                return self.pruned(position).await;
             }
-            if total_branches == 1 && node.value.is_none() {
+            if total_branches == 1 {
                 // Collapse: merge the single remaining branch into this node.
                 if let Some((edge, child_id)) = children.first().copied() {
                     let child = self.read_at(child_id, end + 1).await?;
@@ -895,7 +914,7 @@ where
                     prefix.reserve(1 + child.prefix.len());
                     prefix.push(edge);
                     prefix.extend_from_slice(&child.prefix);
-                    return Ok(Some(
+                    return Ok(Updated::Node(
                         self.write(Node {
                             prefix,
                             value: child.value,
@@ -904,23 +923,14 @@ where
                         })
                         .await?,
                     ));
-                } else {
-                    // Single remaining entry: collapse into a terminal node.
-                    let (suffix, value) = entries.into_iter().next().unwrap();
-                    let mut prefix = node.prefix;
-                    prefix.extend_from_slice(&suffix);
-                    return Ok(Some(
-                        self.write(Node {
-                            prefix,
-                            value: Some(value),
-                            children: Vec::new(),
-                            entries: Vec::new(),
-                        })
-                        .await?,
-                    ));
                 }
+                // Single remaining entry: this subtree is now one entry.
+                let (suffix, value) = entries.into_iter().next().unwrap();
+                let mut rest = node.prefix;
+                rest.extend_from_slice(&suffix);
+                return self.leaf(position, rest, value).await;
             }
-            Ok(Some(
+            Ok(Updated::Node(
                 self.write(Node {
                     prefix: node.prefix,
                     value: node.value,

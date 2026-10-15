@@ -80,8 +80,8 @@ rely on them:
   canonical encoding (I9).
 - **I9 Canonical collections.** Every radix node (maps, sets, content maps) has the
   layout the builder produces for its entries (`collection_builders.rs`), so equal
-  logical contents have equal IDs. Today `radix.rs:79` accepts an inline entry or a
-  terminal child for the same entry, so two encodings of one view can coexist.
+  logical contents have equal IDs. `radix.rs:79` used to accept an inline entry or a
+  terminal child for the same entry, so two encodings of one view could coexist.
 - **I4 Changes.** The change map is a bijection between logical ChangeIds and
   retained change objects.
 - **I5 Revisions.** Each revision's transition partitions its edits against its
@@ -243,13 +243,16 @@ part of an already validated object, never because they happen to be in the stor
 - edit records: decoded when replayed;
 - the lineage map, change map and content maps: `paired_diff` against `old`'s.
 
-Every radix node decoded on a new path is checked to have the canonical layout for
-its entries (I9), a local check per node. The check lives in the validators
-(incremental and full), not in object-store decoding (review 3, item 5): the radix
-updater writes a temporary terminal node during deletion and promotes it into an
-inline entry afterwards (`radix.rs:824-840,908-919`), so a decode-time check would
-break ordinary updates. Such a temporary node is never referenced by a retained
-structure, so the validators don't see it. Parity tests: for every radix family
+Every radix node is checked to have the canonical layout for its entries (I9), a
+local check per node. It sits in the position-aware read (`radix::validate_node_at`,
+used by every radix read and by `object_graph`), so both validators get it without
+extra work. Each radix node on a new path is read anyway. A
+value on a non-root node is refused, and the edge rules are checked when the node is
+decoded. Review 3, item 5 found that the updater wrote a temporary terminal child
+during deletion, then read it back and inlined it. Bart chose to fix the updater
+instead of moving the check out of the read: `update_node` now hands a lone remaining
+entry to its parent (`Updated::Leaf`) and writes nothing non-canonical. Parity tests
+(`collection_builder_parity.rs`): for every radix family
 (revision and application maps, retained sets, lineage map and child sets, change
 map, conflict sets, content maps), random insert/delete sequences through the
 updater give the same root as building the final entries from scratch.
@@ -483,8 +486,8 @@ content it needs anyway; close or keep per Bart.
 
 ## Order of work
 
-1. Canonical radix encoding (I9): builder rule, the per-node check in the
-   validators, updater/builder parity tests, full validation.
+1. Canonical radix encoding (I9): the per-node check on every radix read, an updater
+   that writes nothing non-canonical, updater/builder parity tests. Done.
 2. Content maps: format, store, every user (including core, hydration, transfer,
    Git accumulator), full validation; tests (behaviour unchanged, manifests now cost
    the diff).
