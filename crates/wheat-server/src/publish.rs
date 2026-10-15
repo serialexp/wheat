@@ -2,7 +2,7 @@
 
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, debug_span, info, warn};
 
 use std::collections::HashMap;
 
@@ -26,6 +26,7 @@ use crate::wire::{
 const _: () = assert!(MAX_CONTENT_SIZE == wheat_store::HARD_LOGICAL_RECORD_BYTES);
 
 /// Handle a publish request. Returns the new head if publication succeeded.
+#[tracing::instrument(name = "publish", level = "debug", skip_all)]
 pub async fn handle_publish(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &RepositoryEntry,
@@ -90,10 +91,6 @@ pub async fn handle_publish(
         .state(envelope_record.state)
         .await
         .map_err(|e| ConnectionError::Internal(format!("failed to read proposed state: {e}")))?;
-    let manifest = reader
-        .manifest(state.required_content)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read content manifest: {e}")))?;
     let current_envelope = reader
         .envelope(current_head.envelope)
         .await
@@ -102,19 +99,13 @@ pub async fn handle_publish(
         .state(current_envelope.state)
         .await
         .map_err(|e| ConnectionError::Internal(format!("failed to read current state: {e}")))?;
-    let current_manifest = reader
-        .manifest(current_state.required_content)
-        .await
-        .map_err(|e| {
-            ConnectionError::Internal(format!("failed to read current content manifest: {e}"))
-        })?;
 
     // A head is only accepted once all its content is stored, so only content the
     // current head lacks can be missing (transition validation relies on the same).
     // Bulk-check those: for S3 backends this does one LIST call instead of one GET
     // per item.
     let candidates = wheat_store::ContentSetStore::new(&staged)
-        .added(current_manifest.content, manifest.content)
+        .added(current_state.required_content, state.required_content)
         .await
         .map_err(|e| ConnectionError::Internal(format!("failed to compare content sets: {e}")))?;
     let existing = entry
@@ -272,7 +263,11 @@ async fn commit(
     proposed: RepositoryEnvelopeId,
     force: bool,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
-    let _turn = entry.commit.lock().await;
+    let _turn = entry
+        .commit
+        .lock()
+        .instrument(debug_span!("publish_commit_wait"))
+        .await;
     let internal = |what: &str, e: &dyn std::fmt::Display| {
         ConnectionError::Internal(format!("publish: {what}: {e}"))
     };
@@ -294,6 +289,7 @@ async fn commit(
         } else {
             match reader
                 .union_envelopes(Some(expected.envelope), proposed, head.envelope)
+                .instrument(debug_span!("publish_join"))
                 .await
             {
                 Ok(joined) => joined,
@@ -309,21 +305,27 @@ async fn commit(
             }
         };
 
-        let from = reader
-            .envelope(head.envelope)
-            .await
-            .map_err(|e| internal("read the current envelope", &e))?;
-        let to = reader
-            .envelope(joined)
-            .await
-            .map_err(|e| internal("read the joined envelope", &e))?;
-        let options = TransitionValidationOptions {
-            allow_non_monotonic: force,
-        };
-        if let Err(e) = reader
-            .validate_transition_with_options(from.state, to.state, options)
-            .await
-        {
+        let validated = async {
+            let from = reader
+                .envelope(head.envelope)
+                .await
+                .map_err(|e| internal("read the current envelope", &e))?;
+            let to = reader
+                .envelope(joined)
+                .await
+                .map_err(|e| internal("read the joined envelope", &e))?;
+            let options = TransitionValidationOptions {
+                allow_non_monotonic: force,
+            };
+            Ok::<_, ConnectionError>(
+                reader
+                    .validate_transition_with_options(from.state, to.state, options)
+                    .await,
+            )
+        }
+        .instrument(debug_span!("publish_validate"))
+        .await?;
+        if let Err(e) = validated {
             info!(op_id, error = %e, "publish: validation failed");
             return reject(ws, op_id, &head, &format!("validation failed: {e}")).await;
         }
@@ -331,10 +333,12 @@ async fn commit(
         // Store the staged objects, then seal any buffered objects into a durable
         // batch (e.g. a packed segment uploaded to S3) before the head can name
         // them. Sealing is a no-op for local stores.
-        let stored = match staged.flush().await {
-            Ok(()) => entry.objects.seal().await,
-            Err(e) => Err(e),
-        };
+        let stored = async {
+            staged.flush().await?;
+            entry.objects.seal().await
+        }
+        .instrument(debug_span!("publish_store"))
+        .await;
         if let Err(e) = stored {
             warn!(op_id, error = %e, "publish: seal failed");
             let message = format!("storing the published objects failed: {e}");
@@ -356,7 +360,9 @@ async fn commit(
             generation: head.generation + 1,
             envelope: joined,
         };
-        match entry.heads.compare_and_advance(head, new_head) {
+        let advanced =
+            debug_span!("publish_cas").in_scope(|| entry.heads.compare_and_advance(head, new_head));
+        match advanced {
             Ok(()) => {
                 info!(
                     op_id,

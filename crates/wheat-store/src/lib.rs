@@ -17,8 +17,8 @@ pub use content_generation::{
     content_generation_shard_manifest_path, content_generation_shard_pack_path,
     read_content_generation, read_content_generation_index,
 };
+mod content_map;
 mod content_repack;
-mod content_set;
 pub use content_repack::{
     ContentGenerationTarget, ContentHistoryPair, ContentRepackAnalysis, ContentRepackError,
     ContentRepackInput, ContentRepackLimits, ContentRepackPlan, GenerationQualifiedEnvelope,
@@ -89,7 +89,9 @@ pub use change_map::{
     ChangeMapCursor, ChangeMapDelta, ChangeMapDeltaLimits, ChangeMapError, ChangeMapStore,
 };
 pub use commit_writer::{CommitWriterError, PersistedCommit, PersistedCommitWriter};
-pub use content_set::{ContentSetCursor, ContentSetDelta, ContentSetStore};
+pub use content_map::{
+    ContentMapCursor, ContentMapDelta, ContentMapDeltaLimits, ContentMapError, ContentMapStore,
+};
 pub use durability::{Durability, sync_directory, sync_filesystem};
 pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
@@ -121,8 +123,9 @@ pub use revision_map::{
     RevisionMapCursor, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore,
 };
 pub use sets::{
-    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetDeltaLimits, RetainedSetCursor,
-    RetainedSetDelta, RetainedSetDeltaLimits, RetainedSetStore,
+    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetDelta,
+    ContentSetDeltaLimits, ContentSetStore, RetainedSetCursor, RetainedSetDelta,
+    RetainedSetDeltaLimits, RetainedSetStore,
 };
 pub use view_lineage::{
     ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,

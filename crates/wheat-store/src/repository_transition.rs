@@ -147,22 +147,21 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         }
 
         // 5. Delta the content set — verify new content entries exist.
-        let baseline_content = self.manifest(baseline.required_content).await?.content;
-        let proposed_content = self.manifest(proposed.required_content).await?.content;
-        if baseline_content != proposed_content {
-            let content_sets = ContentSetStore::new(self.objects);
-            let delta = content_sets
-                .delta(baseline_content, proposed_content, Default::default())
+        if baseline.required_content != proposed.required_content {
+            let delta = ContentSetStore::new(self.objects)
+                .delta(
+                    baseline.required_content,
+                    proposed.required_content,
+                    Default::default(),
+                )
                 .await?;
-            for entry in &delta {
+            for entry in delta {
                 match entry {
                     crate::sets::ContentSetDelta::Added(content_id) => {
-                        match self.content.get(*content_id) {
+                        match self.content.get(content_id) {
                             Ok(_) => {}
                             Err(ContentStoreError::Missing(_)) => {
-                                return Err(RepositoryPublicationError::MissingContent(
-                                    *content_id,
-                                ));
+                                return Err(RepositoryPublicationError::MissingContent(content_id));
                             }
                             Err(error) => return Err(error.into()),
                         }

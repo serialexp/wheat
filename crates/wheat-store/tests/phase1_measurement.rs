@@ -48,13 +48,12 @@ fn wire_tag_name(bytes: &[u8]) -> &'static str {
         0x0401 => "Application",
         0x0501 => "Conflict",
         0x0601 => "View",
-        0x0701 => "ContentManifest",
+        0x0701 => "ContentMapNode",
         0x0801 => "RepositoryState",
         0x0901 => "RevisionMapNode",
         0x0a01 => "ApplicationMapNode",
         0x0b01 => "ConflictSetNode",
-        0x0c02 => "ContentSetSnapshot",
-        0x0c03 => "ContentSetDelta",
+        0x0c01 => "ContentSetNode",
         0x0d01 => "RetainedSetNode",
         0x0e01 => "ViewLabelManifest",
         0x0f01 => "Envelope",
@@ -74,11 +73,13 @@ fn is_trie_node(name: &str) -> bool {
             | "ConflictSetNode"
             | "ApplicationMapNode"
             | "ViewLineageMapNode"
+            | "ContentMapNode"
+            | "ContentSetNode"
     )
 }
 
-fn is_content_set_blob(name: &str) -> bool {
-    matches!(name, "ContentSetSnapshot" | "ContentSetDelta")
+fn is_content_collection_node(name: &str) -> bool {
+    matches!(name, "ContentMapNode" | "ContentSetNode")
 }
 
 #[test]
@@ -181,21 +182,21 @@ fn measure_50_change_repository_closure() {
         non_trie_bytes as f64 / total_bytes as f64 * 100.0
     );
 
-    let content_blob_count: usize = by_kind
+    let content_node_count: usize = by_kind
         .iter()
-        .filter(|(k, _)| is_content_set_blob(k))
+        .filter(|(k, _)| is_content_collection_node(k))
         .map(|(_, (c, _))| c)
         .sum();
-    let content_blob_bytes: usize = by_kind
+    let content_node_bytes: usize = by_kind
         .iter()
-        .filter(|(k, _)| is_content_set_blob(k))
+        .filter(|(k, _)| is_content_collection_node(k))
         .map(|(_, (_, b))| b)
         .sum();
     println!(
-        "  Content set blobs: {:>3} objects, {:>8} bytes ({:.1}%)",
-        content_blob_count,
-        content_blob_bytes,
-        content_blob_bytes as f64 / total_bytes as f64 * 100.0
+        "  Content map/set nodes: {:>3} objects, {:>8} bytes ({:.1}%)",
+        content_node_count,
+        content_node_bytes,
+        content_node_bytes as f64 / total_bytes as f64 * 100.0
     );
 
     // Per-object overhead estimate: ~60 bytes index entry per object in a segment.

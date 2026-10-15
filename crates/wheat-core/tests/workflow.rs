@@ -428,7 +428,10 @@ fn conflicted_view_is_self_describing_and_queryable() {
     let view = repository.view(effective).unwrap();
     assert_eq!(view.unresolved_conflicts.len(), 1);
     assert_eq!(view.applications.len(), 2);
-    assert!(view.required_content.contains(&value(&io, "a2").content));
+    assert!(
+        view.required_content
+            .contains_key(&value(&io, "a2").content)
+    );
     assert_eq!(repository.conflicts_in_view(view.id).unwrap().count(), 1);
     assert_eq!(
         repository.conflicts_for_change(view.id, b).unwrap().count(),

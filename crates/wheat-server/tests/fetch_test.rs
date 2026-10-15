@@ -395,13 +395,17 @@ async fn a_want_the_server_does_not_have_is_refused() {
 #[tokio::test]
 async fn a_wanted_object_too_large_for_a_batch_comes_in_chunks() {
     let served = serve_history(3).await;
-    // A content-set snapshot is the one kind of structural object that grows
-    // past a batch.
-    let mut members: Vec<ContentId> = (0u32..280_000)
-        .map(|i| ContentId::of(&i.to_le_bytes()))
-        .collect();
-    members.sort();
-    let bytes = wheat_core::content_set_snapshot_bytes(&members);
+    // A directory holding a quarter million files is a structural object that
+    // grows past a batch.
+    let directory = wheat_core::DirectoryNode::new((0u32..250_000).map(|i| {
+        let file = wheat_core::FileValue {
+            content: ContentId::of(&i.to_le_bytes()),
+            kind: wheat_core::FileKind::Regular,
+        };
+        (format!("file-{i}"), wheat_core::DirectoryEntry::File(file))
+    }))
+    .unwrap();
+    let bytes = directory.canonical_bytes();
     assert!(bytes.len() > MAX_OBJECT_BATCH_SIZE);
     let large = ObjectId::of_canonical_bytes(&bytes);
     served.objects.put_if_absent(large, &bytes).await.unwrap();

@@ -12,18 +12,19 @@
 
 use wheat_core::{
     ApplicationRecord, ApplicationResultRecord, CanonicalObjectError, Change, Conflict, ContentId,
-    ContentManifestRecord, ContentSetBlob, DirectoryEntry, DirectoryNode, EditFailure,
-    EditOperation, EditRecord, ObjectId, RepositoryEnvelopeRecord, RepositoryStateRecord,
-    RevisionRecord, ViewLabelManifestRecord, ViewRecord,
+    DirectoryEntry, DirectoryNode, EditFailure, EditOperation, EditRecord, ObjectId,
+    RepositoryEnvelopeRecord, RepositoryStateRecord, RevisionRecord, ViewLabelManifestRecord,
+    ViewRecord,
 };
 
 use crate::{
     ObjectKind, StoredObject,
     application_map::ApplicationCollection,
     change_map::ChangeCollection,
+    content_map::ContentMapCollection,
     radix::{self, Collection, Key as _, Node},
     revision_map::RevisionCollection,
-    sets::{ConflictCollection, RetainedCollection},
+    sets::{ConflictCollection, ContentCollection, RetainedCollection},
     view_lineage::ViewLineageCollection,
 };
 
@@ -131,48 +132,6 @@ pub(crate) fn view<E>(
         f(Ref::Object(site, id))?;
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ManifestSite {
-    ContentSet,
-}
-
-pub(crate) fn manifest<E>(
-    record: &ContentManifestRecord,
-    mut f: impl FnMut(Ref<ManifestSite>) -> Result<(), E>,
-) -> Result<(), E> {
-    f(Ref::Object(ManifestSite::ContentSet, record.content.into()))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentSetSite {
-    /// The set a delta applies to.
-    Base,
-}
-
-/// Decodes a content set if it can refer to anything, which only a delta does. A
-/// snapshot is not decoded: at 100,000 files it is about 3.3 MB.
-pub(crate) fn decode_content_set(
-    stored: &StoredObject,
-) -> Result<Option<ContentSetBlob>, CanonicalObjectError> {
-    if stored.kind == ObjectKind::ContentSetDelta {
-        wheat_core::decode_content_set_blob(&stored.canonical_bytes).map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
-/// A content set's members are not listed: walks gather content from the trees and
-/// edits that use it.
-pub(crate) fn content_set<E>(
-    blob: &ContentSetBlob,
-    mut f: impl FnMut(Ref<ContentSetSite>) -> Result<(), E>,
-) -> Result<(), E> {
-    match blob {
-        ContentSetBlob::Snapshot(_) => Ok(()),
-        ContentSetBlob::Delta { base, .. } => f(Ref::Object(ContentSetSite::Base, (*base).into())),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,6 +339,10 @@ pub(crate) enum RadixKind {
     ChangeMap,
     /// Parent view → the root of the set of its children.
     ViewLineage,
+    /// A view's blobs → the number of tree entries naming each.
+    ContentMap,
+    /// The state's aggregate: every blob a retained tree, edit or conflict names.
+    ContentSet,
 }
 
 impl RadixKind {
@@ -391,6 +354,8 @@ impl RadixKind {
             Self::ApplicationMap => ObjectKind::ApplicationMapNode,
             Self::ChangeMap => ObjectKind::ChangeMapNode,
             Self::ViewLineage => ObjectKind::ViewLineageMapNode,
+            Self::ContentMap => ObjectKind::ContentMapNode,
+            Self::ContentSet => ObjectKind::ContentSetNode,
         }
     }
 
@@ -402,6 +367,8 @@ impl RadixKind {
             Self::ApplicationMap => <ApplicationCollection as Collection>::Key::LEN,
             Self::ChangeMap => <ChangeCollection as Collection>::Key::LEN,
             Self::ViewLineage => <ViewLineageCollection as Collection>::Key::LEN,
+            Self::ContentMap => <ContentMapCollection as Collection>::Key::LEN,
+            Self::ContentSet => <ContentCollection as Collection>::Key::LEN,
         }
     }
 
@@ -413,6 +380,8 @@ impl RadixKind {
             Self::ApplicationMap => uniform::<ApplicationCollection>(bytes),
             Self::ChangeMap => uniform::<ChangeCollection>(bytes),
             Self::ViewLineage => uniform::<ViewLineageCollection>(bytes),
+            Self::ContentMap => uniform::<ContentMapCollection>(bytes),
+            Self::ContentSet => uniform::<ContentCollection>(bytes),
         }
     }
 
@@ -421,6 +390,13 @@ impl RadixKind {
     fn members_are_keys(self) -> bool {
         matches!(self, Self::RetainedSet | Self::ConflictSet)
     }
+
+    /// Whether keys refer to anything. A content collection's keys are blobs, which
+    /// walks gather from the trees, edits and conflicts that name them, so only its
+    /// children are listed.
+    fn keys_are_references(self) -> bool {
+        !matches!(self, Self::ContentMap | Self::ContentSet)
+    }
 }
 
 /// A radix value as an object reference, if it is one.
@@ -428,6 +404,12 @@ trait RadixValue {
     fn object(self) -> Option<ObjectId>;
 }
 impl RadixValue for () {
+    fn object(self) -> Option<ObjectId> {
+        None
+    }
+}
+/// A content map's count.
+impl RadixValue for u32 {
     fn object(self) -> Option<ObjectId> {
         None
     }
@@ -509,7 +491,7 @@ pub(crate) fn radix<E: From<MalformedRadix>>(
                 .enumerate()
                 .map(|(index, (suffix, value))| (Some(index), suffix.as_slice(), *value)),
         );
-    for (entry, suffix, value) in keys {
+    for (entry, suffix, value) in keys.filter(|_| kind.keys_are_references()) {
         let target = if kind.members_are_keys() {
             ObjectId::from_digest(full_key([above, &node.prefix, suffix]).ok_or_else(malformed)?)
         } else {
@@ -581,8 +563,9 @@ where
             |reference| {
                 f(match reference {
                     Ref::Object(site, id) => match site {
-                        StateSite::BaseView | StateSite::RequiredContent => Reference::Object(id),
-                        StateSite::Changes
+                        StateSite::BaseView => Reference::Object(id),
+                        StateSite::RequiredContent
+                        | StateSite::Changes
                         | StateSite::ViewLineage
                         | StateSite::RetainedChanges
                         | StateSite::RetainedViews
@@ -596,24 +579,15 @@ where
         ObjectKind::View => view(&wheat_core::decode_view_record(bytes)?, |reference| {
             f(match reference {
                 Ref::Object(site, id) => match site {
-                    ViewSite::Tree | ViewSite::RequiredContent => Reference::Object(id),
-                    ViewSite::Revisions
+                    ViewSite::Tree => Reference::Object(id),
+                    ViewSite::RequiredContent
+                    | ViewSite::Revisions
                     | ViewSite::Applications
                     | ViewSite::UnresolvedConflicts => Reference::RadixRoot(id),
                 },
                 Ref::Content(id) => Reference::Content(id),
             })
         }),
-        ObjectKind::ContentManifest => manifest(
-            &wheat_core::decode_content_manifest_record(bytes)?,
-            |reference| f(plain(reference)),
-        ),
-        ObjectKind::ContentSetSnapshot | ObjectKind::ContentSetDelta => {
-            match decode_content_set(stored)? {
-                Some(blob) => content_set(&blob, |reference| f(plain(reference))),
-                None => Ok(()),
-            }
-        }
         ObjectKind::Tree => tree(&wheat_core::decode_directory_node(bytes)?, |reference| {
             f(plain(reference))
         }),
@@ -645,6 +619,8 @@ where
         ObjectKind::ViewLineageMapNode => {
             follow_radix(RadixKind::ViewLineage, stored, radix_path, f)
         }
+        ObjectKind::ContentMapNode => follow_radix(RadixKind::ContentMap, stored, radix_path, f),
+        ObjectKind::ContentSetNode => follow_radix(RadixKind::ContentSet, stored, radix_path, f),
     }
 }
 

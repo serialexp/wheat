@@ -112,6 +112,31 @@ proptest! {
             );
             assert_eq!(root, built);
 
+            // Counts start at 1; a removal is a count of 0.
+            let maps = ContentMapStore::new(&objects);
+            let mut root = maps.empty_root().await.unwrap();
+            for batch in &batches {
+                root = maps
+                    .update_batch(
+                        root,
+                        batch.iter().map(|(index, value)| {
+                            (
+                                ContentId::from_digest(key(*index)),
+                                Some(value.map_or(0, |value| u32::from(value) + 1)),
+                            )
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let built = build_content_map(
+                expected.iter().map(|(index, value)| {
+                    (ContentId::from_digest(key(*index)), u32::from(*value) + 1)
+                }),
+                |_| {},
+            );
+            assert_eq!(root, built);
+
             macro_rules! check_set {
                 ($build:ident, $store:ident, $key:ident) => {{
                     let sets = $store::new(&objects);
@@ -135,6 +160,7 @@ proptest! {
                 }};
             }
             check_set!(build_conflict_set, ConflictSetStore, ConflictId);
+            check_set!(build_content_set, ContentSetStore, ContentId);
             check_set!(build_retained_set, RetainedSetStore, ObjectId);
         });
     }
@@ -395,7 +421,6 @@ async fn pure_builders_match_incremental_store_roots() {
         }};
     }
     check_set!(build_conflict_set, ConflictSetStore, ConflictId);
-    // ContentSetStore uses flat sorted blobs rather than a radix trie, so it
-    // has no incremental-vs-builder parity to check here.
+    check_set!(build_content_set, ContentSetStore, ContentId);
     check_set!(build_retained_set, RetainedSetStore, ObjectId);
 }

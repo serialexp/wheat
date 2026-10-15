@@ -115,7 +115,7 @@ fn closure_emits_standalone_definitions_and_retains_fragments() {
 }
 
 #[test]
-fn empty_repository_closure_contains_root_state_view_tree_and_manifest() {
+fn empty_repository_closure_contains_root_state_view_tree_and_content_roots() {
     let repository = Repository::new(Tree::new());
     let closure = repository.canonical_closure();
     let kinds = closure
@@ -124,14 +124,16 @@ fn empty_repository_closure_contains_root_state_view_tree_and_manifest() {
         .map(|object| validate_canonical_object(&object.bytes).unwrap())
         .collect::<Vec<_>>();
 
-    // Four semantic objects, four empty view collections, the empty change
-    // lookup, an empty view-lineage map, an empty retained root, and one
-    // compressed retained leaf naming the base view.
+    // Three semantic objects, four empty view collections (the content map among
+    // them), the empty aggregate content set, the empty change lookup, an empty
+    // view-lineage map, an empty retained root, and one compressed retained leaf
+    // naming the base view.
     assert_eq!(closure.objects.len(), 12);
     assert!(kinds.contains(&CanonicalObjectKind::RepositoryState));
     assert!(kinds.contains(&CanonicalObjectKind::View));
     assert!(kinds.contains(&CanonicalObjectKind::Tree));
-    assert!(kinds.contains(&CanonicalObjectKind::ContentManifest));
+    assert!(kinds.contains(&CanonicalObjectKind::ContentMapNode));
+    assert!(kinds.contains(&CanonicalObjectKind::ContentSetNode));
     assert!(closure.required_content.is_empty());
 }
 

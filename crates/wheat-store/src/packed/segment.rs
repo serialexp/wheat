@@ -1080,6 +1080,30 @@ fn read_range(file: &mut File, offset: u64, length: u64) -> Result<Vec<u8>, Segm
     Ok(bytes)
 }
 
+/// The canonical root node of a content map holding `count` seeded blobs: a
+/// large metadata record whose neighbours (one blob fewer) delta well against it.
+#[cfg(test)]
+pub(crate) fn test_content_map_root(count: usize) -> ([u8; 32], Vec<u8>) {
+    let mut objects = Vec::new();
+    let root = wheat_core::build_content_map(
+        (0..count).map(|index| (ContentId::of(format!("member {index}").as_bytes()), 1)),
+        |object| objects.push(object),
+    );
+    let root = ObjectId::from(root);
+    let bytes = objects
+        .into_iter()
+        .find(|object| object.id == root)
+        .expect("the builder emits its root")
+        .bytes;
+    (*root.as_bytes(), bytes)
+}
+
+/// The segment kind code of [`test_content_map_root`] records.
+#[cfg(test)]
+pub(crate) fn test_content_map_kind() -> u16 {
+    SegmentIndexEntry::canonical_kind_code(wheat_core::CanonicalObjectKind::ContentMapNode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,24 +1615,10 @@ mod tests {
             .sum()
     }
 
-    /// Canonical content-set snapshot with members `0..count` (by seed).
-    fn content_set(count: usize) -> ([u8; 32], Vec<u8>) {
-        let mut members = (0..count)
-            .map(|index| ContentId::of(format!("member {index}").as_bytes()))
-            .collect::<Vec<_>>();
-        members.sort_unstable();
-        let bytes = wheat_core::content_set_snapshot_bytes(&members);
-        (*ObjectId::of_canonical_bytes(&bytes).as_bytes(), bytes)
-    }
-
-    fn content_set_kind() -> u16 {
-        SegmentIndexEntry::canonical_kind_code(wheat_core::CanonicalObjectKind::ContentSetSnapshot)
-    }
-
     fn metadata_record(digest: [u8; 32], bytes: &[u8]) -> SegmentRecord<'_> {
         SegmentRecord {
             namespace: METADATA_NAMESPACE,
-            kind: content_set_kind(),
+            kind: test_content_map_kind(),
             digest,
             bytes,
         }
@@ -1622,7 +1632,7 @@ mod tests {
     /// sealed segment and every record pushed, tip first.
     fn delta_chain(tip_members: usize, links: usize) -> (SealedSegment, Vec<Record>) {
         let records = (0..=links)
-            .map(|link| content_set(tip_members - link))
+            .map(|link| test_content_map_root(tip_members - link))
             .collect::<Vec<_>>();
         // The sealed temp file must outlive this helper, like `build`'s.
         let mut builder = SegmentBuilder::new(std::env::temp_dir()).unwrap();
@@ -1633,7 +1643,7 @@ mod tests {
             let prepared =
                 prepare_delta_record(metadata_record(*target, target_bytes), *base, base_bytes)
                     .unwrap()
-                    .expect("adjacent sets delta well");
+                    .expect("adjacent maps delta well");
             assert!(prepared.physical.codec.is_delta());
             builder.push_delta(prepared).unwrap();
         }
@@ -1668,8 +1678,8 @@ mod tests {
     #[test]
     fn builder_rejects_foreign_bases_and_chains_past_the_depth_limit() {
         let directory = tempfile::tempdir().unwrap();
-        let (base, base_bytes) = content_set(50);
-        let (target, target_bytes) = content_set(49);
+        let (base, base_bytes) = test_content_map_root(50);
+        let (target, target_bytes) = test_content_map_root(49);
         let mut builder = SegmentBuilder::new(directory.path()).unwrap();
         let prepared =
             prepare_delta_record(metadata_record(target, &target_bytes), base, &base_bytes)
@@ -1693,7 +1703,7 @@ mod tests {
 
         let links = usize::from(SEGMENT_MAX_DELTA_DEPTH) + 1;
         let records = (0..=links)
-            .map(|link| content_set(300 - link))
+            .map(|link| test_content_map_root(300 - link))
             .collect::<Vec<_>>();
         let mut builder = SegmentBuilder::new(directory.path()).unwrap();
         builder

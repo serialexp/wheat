@@ -200,6 +200,19 @@ move to the new store. Updating a view's map costs the tree diff, not a manifest
 rewrite (`commit_content.rs:54-69` scans the whole tree today). This also closes the
 TODO.md item "Content manifests are full snapshots".
 
+Storage, measured 2026-10-15 by replaying Gothab's 1,905 first-parent commits into a
+32-byte-key radix set (loose bytes, before repack):
+
+| encoding | total | per view (p50 / p90 / p99) |
+| --- | --- | --- |
+| flat snapshots (today) | 218.5 MiB | ~117 KiB avg |
+| radix, per-edit updater (before 7551122) | 377.1 MiB | 72 / 446 / 1,996 KiB |
+| radix, batched updater | 32.1 MiB + ~1.9 MiB counts | 11 / 31 / 94 KiB |
+
+651c01b moved away from radix content sets because of the 348 MiB they cost. That was
+the per-edit updater writing a new root for every key of a batch, and 7551122 fixed
+it.
+
 Paths that need explicit changes beyond the store users (review 2, item 8):
 
 - `wheat-core`: view construction and hydration hold `required_content` as a
@@ -490,7 +503,10 @@ content it needs anyway; close or keep per Bart.
    that writes nothing non-canonical, updater/builder parity tests. Done.
 2. Content maps: format, store, every user (including core, hydration, transfer,
    Git accumulator), full validation; tests (behaviour unchanged, manifests now cost
-   the diff).
+   the diff). Done. Full validation checks the base view's map against its tree and
+   every other view's map against its first lineage parent's by the tree diff,
+   falling back to a full comparison when a diff is too large. Import's resume
+   authenticates each content-map node once rather than each view's whole map.
 3. Revision `combines` and `generation` with every traversal; `join_revisions`
    always authoring one combined revision; view `size`, `last`, `weight`; the weight rule in full
    validation.

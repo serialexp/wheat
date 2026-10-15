@@ -1,8 +1,8 @@
 use thiserror::Error;
 use wheat_core::{
-    ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ObjectId,
-    RetainedSetChild, RetainedSetId, RetainedSetNode, decode_conflict_set_node,
-    decode_retained_set_node,
+    ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentSetChild,
+    ContentSetId, ContentSetNode, ObjectId, RetainedSetChild, RetainedSetId, RetainedSetNode,
+    decode_conflict_set_node, decode_content_set_node, decode_retained_set_node,
 };
 
 use crate::{ImmutableObjectStore, ObjectKind, ObjectStoreError, radix};
@@ -14,7 +14,14 @@ pub enum RetainedSetDelta {
     Removed(ObjectId),
 }
 
-/// Bounds for a read-only content-manifest comparison.
+/// One authenticated membership difference between two content sets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentSetDelta {
+    Added(ContentId),
+    Removed(ContentId),
+}
+
+/// Bounds for a read-only content-set comparison.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContentSetDeltaLimits {
     pub max_changes: usize,
@@ -70,14 +77,6 @@ pub enum CollectionError {
     DeltaNodeLimitExceeded { limit: usize },
     #[error("set delta queues more than {limit} pending subtrees")]
     DeltaPendingLimitExceeded { limit: usize },
-    #[error("content-set delta chain exceeds the maximum depth of {limit}")]
-    ContentSetChainTooDeep { limit: usize },
-    #[error("content-set delta adds and removes the same member")]
-    InvalidContentSetDelta,
-    #[error("content set has more than {limit} members")]
-    ContentSetMemberLimitExceeded { limit: usize },
-    #[error("content-set object exceeds the encoded byte limit of {limit}")]
-    ContentSetByteLimitExceeded { limit: usize },
 }
 impl From<radix::Error> for CollectionError {
     fn from(e: radix::Error) -> Self {
@@ -173,8 +172,15 @@ set_collection!(
     ConflictSetNode,
     decode_conflict_set_node
 );
-// ContentCollection (the radix-trie bridge) has been removed. Content sets
-// are now stored as flat sorted snapshot/delta blobs — see ContentSetStore above.
+set_collection!(
+    ContentCollection,
+    ContentSetId,
+    ContentId,
+    ContentSetNode,
+    ContentSetChild,
+    ContentSetNode,
+    decode_content_set_node
+);
 set_collection!(
     RetainedCollection,
     RetainedSetId,
@@ -301,9 +307,67 @@ set_api!(
     ConflictSetNode
 );
 
-// Keep this private-module path available to existing in-crate consumers while
-// the public API is re-exported directly from `content_set` in `lib.rs`.
-pub(crate) use crate::content_set::ContentSetDelta;
+set_api!(
+    ContentSetStore,
+    ContentSetCursor,
+    ContentCollection,
+    ContentSetId,
+    ContentId,
+    ContentSetNode
+);
+
+impl<S: ImmutableObjectStore> ContentSetStore<'_, S> {
+    /// Compare two content sets without writing derived collection nodes.
+    ///
+    /// Equal immutable subtrees are pruned by identity; divergent nodes are read
+    /// and structurally validated at their contextual radix positions.
+    pub async fn delta(
+        &self,
+        old: ContentSetId,
+        new: ContentSetId,
+        limits: ContentSetDeltaLimits,
+    ) -> Result<Vec<ContentSetDelta>, CollectionError> {
+        Ok(self
+            .inner
+            .paired_diff(
+                old,
+                new,
+                radix::DiffLimits {
+                    max_changes: limits.max_changes,
+                    max_nodes: limits.max_nodes,
+                    max_pending: limits.max_pending,
+                },
+            )
+            .await?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                radix::DiffEntry::Added(id, ()) => Some(ContentSetDelta::Added(id)),
+                radix::DiffEntry::Removed(id, ()) => Some(ContentSetDelta::Removed(id)),
+                radix::DiffEntry::Changed(_, (), ()) => None,
+            })
+            .collect())
+    }
+
+    /// The members of `new` that `old` lacks, in order. Unlike [`Self::delta`] there
+    /// is no change limit: callers want every added blob (publish and fetch want
+    /// lists), and shared subtrees are still skipped by identity.
+    pub async fn added(
+        &self,
+        old: ContentSetId,
+        new: ContentSetId,
+    ) -> Result<Vec<ContentId>, CollectionError> {
+        Ok(self
+            .inner
+            .paired_diff(old, new, radix::DiffLimits::unbounded())
+            .await?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                radix::DiffEntry::Added(id, ()) => Some(id),
+                radix::DiffEntry::Removed(..) | radix::DiffEntry::Changed(..) => None,
+            })
+            .collect())
+    }
+}
 
 set_api!(
     RetainedSetStore,

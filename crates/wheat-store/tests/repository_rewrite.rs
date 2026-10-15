@@ -513,6 +513,9 @@ async fn rewrite_preserves_a_preexisting_conflicted_descendant_application() {
         .await
         .unwrap();
     assert!(after_conflicts.next().await.unwrap().is_some());
+    // The rewritten aggregate keeps what the retained applications' result trees and
+    // conflict evidence name.
+    reader.validate_complete(prepared.state()).await.unwrap();
 }
 
 #[tokio::test]

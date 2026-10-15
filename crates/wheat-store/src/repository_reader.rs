@@ -55,13 +55,6 @@ impl<'a, O: ImmutableObjectStore> RepositoryReader<'a, O> {
         decode_repository_envelope_record
     );
     read_record!(
-        manifest,
-        ContentManifestId,
-        ContentManifestRecord,
-        ContentManifest,
-        decode_content_manifest_record
-    );
-    read_record!(
         revision,
         RevisionId,
         RevisionRecord,

@@ -4,11 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use wheat_core::{
-    ApplicationResultRecord, ContentSetBlob, DirectoryEntry, EditOperation, ObjectId,
-    decode_application_record, decode_content_manifest_record, decode_content_set_blob,
-    decode_directory_node, decode_edit_record, decode_repository_envelope_record,
-    decode_repository_state_record, decode_retained_set_node, decode_revision_record,
-    decode_view_label_manifest_record, decode_view_record,
+    ApplicationResultRecord, DirectoryEntry, EditOperation, ObjectId, decode_application_record,
+    decode_content_set_node, decode_directory_node, decode_edit_record,
+    decode_repository_envelope_record, decode_repository_state_record, decode_retained_set_node,
+    decode_revision_record, decode_view_label_manifest_record, decode_view_record,
 };
 use wheat_store::packed_segment_reader::{self, AuthenticatedSegment, read_loose_envelope};
 
@@ -137,10 +136,10 @@ pub(super) fn classify(store_root: &Path) -> Result<ContentRoles> {
     let revisions = collect_retained(&mut source, *state.retained_revisions.as_bytes())?;
     let applications = collect_retained(&mut source, *state.retained_applications.as_bytes())?;
 
-    let mut roles = ContentRoles::default();
-    let manifest =
-        decode_content_manifest_record(&source.read(*state.required_content.as_bytes())?)?;
-    roles.required = collect_content_set(&mut source, *manifest.content.as_bytes())?;
+    let mut roles = ContentRoles {
+        required: collect_content_set(&mut source, *state.required_content.as_bytes())?,
+        ..ContentRoles::default()
+    };
     let mut trees = HashSet::new();
     for view in views {
         let view = decode_view_record(&source.read(view)?)?;
@@ -220,7 +219,33 @@ pub(super) fn classify(store_root: &Path) -> Result<ContentRoles> {
     Ok(roles)
 }
 
+/// One radix set node: its prefix, whether a key ends at it, its inline key suffixes
+/// and its children.
+type SetNode = (Vec<u8>, bool, Vec<Vec<u8>>, Vec<(u8, [u8; 32])>);
+
 fn collect_retained(source: &mut ObjectSource, root: [u8; 32]) -> Result<HashSet<[u8; 32]>> {
+    collect_set(source, root, |bytes| {
+        let node = decode_retained_set_node(bytes)?;
+        let children = node.children.iter();
+        let children = children.map(|child| (child.edge, *child.child.as_bytes()));
+        Ok((node.prefix, node.present, node.entries, children.collect()))
+    })
+}
+
+fn collect_content_set(source: &mut ObjectSource, root: [u8; 32]) -> Result<HashSet<[u8; 32]>> {
+    collect_set(source, root, |bytes| {
+        let node = decode_content_set_node(bytes)?;
+        let children = node.children.iter();
+        let children = children.map(|child| (child.edge, *child.child.as_bytes()));
+        Ok((node.prefix, node.present, node.entries, children.collect()))
+    })
+}
+
+fn collect_set(
+    source: &mut ObjectSource,
+    root: [u8; 32],
+    decode: impl Fn(&[u8]) -> Result<SetNode>,
+) -> Result<HashSet<[u8; 32]>> {
     let mut pending = vec![(root, Vec::new())];
     let mut seen = HashSet::new();
     let mut values = HashSet::new();
@@ -228,51 +253,29 @@ fn collect_retained(source: &mut ObjectSource, root: [u8; 32]) -> Result<HashSet
         if !seen.insert(id) {
             continue;
         }
-        let node = decode_retained_set_node(&source.read(id)?)?;
-        path.extend_from_slice(&node.prefix);
-        if node.present {
+        let (prefix, present, entries, children) = decode(&source.read(id)?)?;
+        path.extend_from_slice(&prefix);
+        if present {
             if path.len() != 32 {
-                bail!("retained-set member has invalid length")
+                bail!("set member has invalid length")
             }
             values.insert(path.as_slice().try_into().expect("length checked"));
         }
-        for suffix in node.entries {
+        for suffix in entries {
             let mut value = path.clone();
             value.extend_from_slice(&suffix);
             if value.len() != 32 {
-                bail!("retained-set member has invalid length")
+                bail!("set member has invalid length")
             }
             values.insert(value.as_slice().try_into().expect("length checked"));
         }
-        for child in node.children {
+        for (edge, child) in children {
             let mut child_path = path.clone();
-            child_path.push(child.edge);
-            pending.push((*child.child.as_bytes(), child_path));
+            child_path.push(edge);
+            pending.push((child, child_path));
         }
     }
     Ok(values)
-}
-
-fn collect_content_set(source: &mut ObjectSource, root: [u8; 32]) -> Result<HashSet<[u8; 32]>> {
-    let bytes = source.read(root)?;
-    match decode_content_set_blob(&bytes) {
-        Ok(ContentSetBlob::Snapshot(members)) => {
-            Ok(members.into_iter().map(|id| *id.as_bytes()).collect())
-        }
-        Ok(ContentSetBlob::Delta {
-            base,
-            added,
-            removed,
-        }) => {
-            let mut values = collect_content_set(source, *base.as_bytes())?;
-            values.extend(added.into_iter().map(|id| *id.as_bytes()));
-            for id in removed {
-                values.remove(id.as_bytes());
-            }
-            Ok(values)
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn decode_head(bytes: &[u8]) -> Result<[u8; 32]> {

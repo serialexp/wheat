@@ -5,7 +5,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use object_store::memory::InMemory;
-use wheat_core::{ContentId, ContentSetId, ObjectId};
+use wheat_core::{ContentId, ObjectId};
 use wheat_store::{
     ContentSetStore, ImmutableObjectStore, ObjectStoreAdapter, ObjectStoreError, StoredObject,
 };
@@ -103,24 +103,4 @@ async fn failed_batch_keeps_old_root_readable_and_retry_is_deterministic() {
         .await
         .unwrap();
     assert_eq!(retried, fresh);
-}
-
-#[tokio::test]
-async fn resolve_rejects_missing_base_in_delta_chain() {
-    let objects = InstrumentedStore::new();
-    let sets = ContentSetStore::new(&objects);
-
-    // Write a delta blob referencing a non-existent base.
-    let fake_base = ContentSetId::from_digest([99; 32]);
-    let a = ContentId::from_digest([1; 32]);
-    let delta_bytes = wheat_core::content_set_delta_bytes(fake_base, &[a], &[]);
-    let delta_id = ContentSetId::of_canonical_bytes(&delta_bytes);
-    objects
-        .put_if_absent(delta_id.into(), &delta_bytes)
-        .await
-        .unwrap();
-
-    // Resolving the delta chain should fail because the base is missing.
-    assert!(sets.resolve(delta_id).await.is_err());
-    assert!(sets.contains(delta_id, a).await.is_err());
 }

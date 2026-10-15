@@ -1,23 +1,6 @@
 use crate::{
-    CanonicalObject, ContentId, ContentManifestRecord, ObjectId, RepositoryState,
-    RepositoryStateRecord, RepositoryView, ViewRecord,
+    CanonicalObject, ObjectId, RepositoryState, RepositoryStateRecord, RepositoryView, ViewRecord,
 };
-use std::collections::BTreeSet;
-
-pub fn build_content_manifest_record(
-    content: &BTreeSet<ContentId>,
-    sink: &mut impl FnMut(CanonicalObject),
-) -> ContentManifestRecord {
-    // Build a flat sorted snapshot blob instead of a radix trie.
-    let members: Vec<ContentId> = content.iter().copied().collect();
-    let bytes = crate::content_set_snapshot_bytes(&members);
-    let id = crate::ContentSetId::of_canonical_bytes(&bytes);
-    sink(CanonicalObject {
-        id: id.into(),
-        bytes,
-    });
-    ContentManifestRecord { content: id }
-}
 
 pub fn build_view_record(
     view: &RepositoryView,
@@ -29,12 +12,12 @@ pub fn build_view_record(
         crate::build_application_map(view.applications.iter().map(|(k, v)| (*k, *v)), &mut *sink);
     let unresolved_conflicts =
         crate::build_conflict_set(view.unresolved_conflicts.iter().copied(), &mut *sink);
-    let manifest = build_content_manifest_record(&view.required_content, sink);
-    let required_content = manifest.id();
-    sink(CanonicalObject {
-        id: required_content.into(),
-        bytes: manifest.canonical_bytes(),
-    });
+    let required_content = crate::build_content_map(
+        view.required_content
+            .iter()
+            .map(|(content, count)| (*content, *count)),
+        sink,
+    );
     ViewRecord {
         tree: crate::wire::tree_id(&view.tree),
         revisions,

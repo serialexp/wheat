@@ -461,6 +461,7 @@ fn unwrap_mutation<'a>(
         RepositoryMutationError::Changes(inner) => inner,
         RepositoryMutationError::Applications(inner) => inner,
         RepositoryMutationError::Collections(inner) => inner,
+        RepositoryMutationError::ContentMap(inner) => inner,
         RepositoryMutationError::ViewLineage(inner) => inner,
         RepositoryMutationError::Trees(inner) => inner,
         RepositoryMutationError::Objects(inner) => inner,

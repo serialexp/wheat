@@ -6,8 +6,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplicationId, ChangeId, ConflictId, ContentId, ContentManifestId, EditId, EditRecord,
-    RevisionId, ViewId,
+    ApplicationId, ChangeId, ConflictId, ContentId, ContentSetId, EditId, EditRecord, RevisionId,
+    ViewId,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -529,7 +529,8 @@ pub struct RepositoryView {
     pub frontier: BTreeMap<ChangeId, RevisionId>,
     pub applications: BTreeMap<ChangeId, ApplicationId>,
     pub unresolved_conflicts: BTreeSet<ConflictId>,
-    pub required_content: BTreeSet<ContentId>,
+    /// Each blob the tree names, with the number of tree entries naming it.
+    pub required_content: BTreeMap<ContentId, u32>,
 }
 
 impl RepositoryView {
@@ -545,10 +546,10 @@ impl RepositoryView {
         applications: BTreeMap<ChangeId, ApplicationId>,
         unresolved_conflicts: BTreeSet<ConflictId>,
     ) -> Self {
-        let required_content = tree
-            .values()
-            .map(|value| value.content)
-            .collect::<BTreeSet<_>>();
+        let mut required_content = BTreeMap::new();
+        for value in tree.values() {
+            *required_content.entry(value.content).or_insert(0) += 1;
+        }
         let mut view = Self {
             id: ViewId::from_digest([0; 32]),
             tree,
@@ -573,7 +574,7 @@ pub struct RepositoryState {
     pub base_view: ViewId,
     pub change_objects: BTreeMap<ChangeId, crate::ChangeObjectId>,
     pub view_lineage: crate::ViewLineageMapId,
-    pub required_content: ContentManifestId,
+    pub required_content: ContentSetId,
     pub retained_changes: BTreeSet<crate::ChangeObjectId>,
     pub retained_views: BTreeSet<ViewId>,
     pub retained_revisions: BTreeSet<RevisionId>,

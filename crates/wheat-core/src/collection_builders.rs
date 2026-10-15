@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     ApplicationId, ApplicationMapChild, ApplicationMapId, ApplicationMapNode, CanonicalObject,
     ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ConflictId,
-    ConflictSetChild, ConflictSetId, ConflictSetNode, ObjectId, RetainedSetChild, RetainedSetId,
-    RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapId, RevisionMapNode, ViewId,
-    ViewLineageMapChild, ViewLineageMapId, ViewLineageMapNode,
+    ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentMapChild, ContentMapId,
+    ContentMapNode, ContentSetChild, ContentSetId, ContentSetNode, ObjectId, RetainedSetChild,
+    RetainedSetId, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapId, RevisionMapNode,
+    ViewId, ViewLineageMapChild, ViewLineageMapId, ViewLineageMapNode,
 };
 
 trait RadixShape {
@@ -200,6 +201,37 @@ impl RadixShape for ApplicationShape {
     }
 }
 
+struct ContentMapShape;
+impl RadixShape for ContentMapShape {
+    type Key = ContentId;
+    type Value = u32;
+    type Id = ContentMapId;
+
+    fn key_bytes(key: &Self::Key) -> &[u8] {
+        key.as_bytes()
+    }
+
+    fn node(
+        prefix: Vec<u8>,
+        value: Option<Self::Value>,
+        children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
+    ) -> (Self::Id, Vec<u8>) {
+        let node = ContentMapNode::new(
+            prefix,
+            value,
+            children
+                .into_iter()
+                .map(|(edge, child)| ContentMapChild { edge, child })
+                .collect(),
+            entries,
+        )
+        .expect("builder produces a valid content-map node");
+        let bytes = node.canonical_bytes();
+        (ContentMapId::of_canonical_bytes(&bytes), bytes)
+    }
+}
+
 struct ViewLineageShape;
 impl RadixShape for ViewLineageShape {
     type Key = ViewId;
@@ -275,6 +307,13 @@ set_shape!(
     ConflictSetId,
     ConflictSetNode,
     ConflictSetChild
+);
+set_shape!(
+    ContentSetShape,
+    ContentId,
+    ContentSetId,
+    ContentSetNode,
+    ContentSetChild
 );
 set_shape!(
     RetainedShape,
@@ -372,4 +411,19 @@ macro_rules! set_builder {
 }
 
 set_builder!(build_conflict_set, ConflictId, ConflictSetId, ConflictShape);
+set_builder!(build_content_set, ContentId, ContentSetId, ContentSetShape);
+
+/// Builds a canonical content map: each blob with the number of tree entries naming
+/// it. Counts must be at least 1; a key given twice keeps its last count.
+pub fn build_content_map(
+    entries: impl IntoIterator<Item = (ContentId, u32)>,
+    emit: impl FnMut(CanonicalObject),
+) -> ContentMapId {
+    let entries = entries
+        .into_iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    build_sorted::<ContentMapShape, _>(entries, emit)
+}
 set_builder!(build_retained_set, ObjectId, RetainedSetId, RetainedShape);

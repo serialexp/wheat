@@ -3,11 +3,14 @@ use std::{future::Future, pin::Pin};
 use rusqlite::{Connection, Transaction, params};
 use thiserror::Error;
 use wheat_core::{
-    ContentId, ContentSetId, ObjectId, RetainedSetChild, RetainedSetId, RetainedSetNode,
+    ContentId, ContentMapId, ContentSetChild, ContentSetId, ContentSetNode, ObjectId,
+    RetainedSetChild, RetainedSetId, RetainedSetNode,
 };
-use wheat_store::{CollectionError, ContentSetStore, ImmutableObjectStore, RetainedSetStore};
+use wheat_store::{
+    CollectionError, ContentMapError, ContentMapStore, ContentSetStore, ImmutableObjectStore,
+    RetainedSetStore,
+};
 
-const CHUNK: usize = 1024;
 type BuildFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ContentAccumulatorError>> + 'a>>;
 
 #[derive(Debug, Error)]
@@ -16,6 +19,8 @@ pub enum ContentAccumulatorError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Collection(#[from] CollectionError),
+    #[error(transparent)]
+    ContentMap(#[from] ContentMapError),
     #[error("content-set value occurs before terminal depth")]
     NonterminalValue,
 }
@@ -35,7 +40,6 @@ impl ContentAccumulator {
         connection.execute_batch(
             "PRAGMA temp_store = FILE;
              PRAGMA cache_size = -8192;
-             CREATE TABLE content_manifest_roots (id BLOB PRIMARY KEY) WITHOUT ROWID;
              CREATE TABLE content_ids (id BLOB PRIMARY KEY) WITHOUT ROWID;
              CREATE TABLE retained_changes (id BLOB PRIMARY KEY) WITHOUT ROWID;
              CREATE TABLE retained_views (id BLOB PRIMARY KEY) WITHOUT ROWID;
@@ -55,7 +59,7 @@ impl ContentAccumulator {
         id: ObjectId,
     ) -> Result<(), ContentAccumulatorError> {
         transaction
-            .prepare_cached(table.insert_sql())?
+            .prepare_cached(Table::Retained(table).insert_sql())?
             .execute(params![id.as_bytes().as_slice()])?;
         Ok(())
     }
@@ -65,124 +69,32 @@ impl ContentAccumulator {
         id: ContentId,
     ) -> Result<(), ContentAccumulatorError> {
         transaction
-            .prepare_cached("INSERT OR IGNORE INTO content_ids (id) VALUES (?1)")?
+            .prepare_cached(Table::Content.insert_sql())?
             .execute(params![id.as_bytes().as_slice()])?;
         Ok(())
     }
 
-    /// Records a per-view manifest root. Its authenticated contents are merged structurally at
-    /// the end rather than enumerated into SQLite.
-    pub(crate) fn insert_manifest(
+    /// Records the blobs a view's content map names that its composition parent's does
+    /// not. Every view's parent is retained too, so starting from the empty base view
+    /// this covers every blob any view names, while each view costs only what its
+    /// commit changed rather than a read of its whole map.
+    pub(crate) async fn insert_view_content<S: ImmutableObjectStore>(
         transaction: &Transaction<'_>,
-        root: ContentSetId,
+        maps: &ContentMapStore<'_, S>,
+        parent: ContentMapId,
+        view: ContentMapId,
     ) -> Result<(), ContentAccumulatorError> {
-        transaction
-            .prepare_cached("INSERT OR IGNORE INTO content_manifest_roots (id) VALUES (?1)")?
-            .execute(params![root.as_bytes().as_slice()])?;
+        for content in maps.added(parent, view).await? {
+            Self::insert_content(transaction, content)?;
+        }
         Ok(())
     }
 
     pub(crate) async fn build_content<S: ImmutableObjectStore>(
-        &mut self,
+        &self,
         store: &ContentSetStore<'_, S>,
     ) -> Result<ContentSetId, ContentAccumulatorError> {
-        // Read every authenticated input manifest once into the existing disk-backed unique
-        // inventory. Building once from its sorted order avoids materializing an intermediate
-        // radix after every manifest while keeping memory independent of repository size.
-        let mut after_manifest = None;
-        let mut chunk = Vec::with_capacity(CHUNK);
-        loop {
-            let manifests = self.manifest_root_chunk(after_manifest.as_ref())?;
-            if manifests.is_empty() {
-                break;
-            }
-            after_manifest = manifests.last().map(|id| *id.as_bytes());
-            for manifest in manifests {
-                self.collect_manifest(store, manifest, &mut chunk).await?;
-            }
-        }
-
-        // With flat sorted blobs, collect all unique ContentIds from SQLite
-        // and write one snapshot.
-        let members = self.collect_all_content_ids()?;
-        if members.is_empty() {
-            return Ok(store.empty_root().await?);
-        }
-        Ok(store.write_snapshot(&members).await?)
-    }
-
-    async fn collect_manifest<S: ImmutableObjectStore>(
-        &mut self,
-        store: &ContentSetStore<'_, S>,
-        root: ContentSetId,
-        chunk: &mut Vec<ContentId>,
-    ) -> Result<(), ContentAccumulatorError> {
-        // With flat sorted blobs, resolving the chain gives us the full sorted
-        // membership directly — no radix tree traversal needed.
-        let members = store.resolve(root).await?;
-        for id in members {
-            chunk.push(id);
-            if chunk.len() == CHUNK {
-                self.flush_content_chunk(chunk)?;
-            }
-        }
-        if !chunk.is_empty() {
-            self.flush_content_chunk(chunk)?;
-        }
-        Ok(())
-    }
-
-    fn flush_content_chunk(
-        &mut self,
-        chunk: &mut Vec<ContentId>,
-    ) -> Result<(), ContentAccumulatorError> {
-        let transaction = self.connection.transaction()?;
-        for id in chunk.drain(..) {
-            Self::insert_content(&transaction, id)?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// Collect all unique ContentIds from SQLite in sorted order.
-    fn collect_all_content_ids(&self) -> Result<Vec<ContentId>, ContentAccumulatorError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id FROM content_ids ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
-            let bytes: Vec<u8> = row.get(0)?;
-            let digest: [u8; 32] = bytes.try_into().map_err(|_| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    32,
-                    rusqlite::types::Type::Blob,
-                    "invalid digest length".into(),
-                )
-            })?;
-            Ok(ContentId::from_digest(digest))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    fn manifest_root_chunk(
-        &self,
-        after: Option<&[u8; 32]>,
-    ) -> Result<Vec<ContentSetId>, ContentAccumulatorError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id FROM content_manifest_roots WHERE (?1 IS NULL OR id > ?1) \
-             ORDER BY id LIMIT 1024",
-        )?;
-        let rows = statement.query_map(params![after.map(|id| id.as_slice())], |row| {
-            let bytes: Vec<u8> = row.get(0)?;
-            let digest: [u8; 32] = bytes.try_into().map_err(|_| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    32,
-                    rusqlite::types::Type::Blob,
-                    "invalid digest length".into(),
-                )
-            })?;
-            Ok(ContentSetId::from_digest(digest))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.build_set(store, Table::Content).await
     }
 
     pub(crate) async fn build_retained<S: ImmutableObjectStore>(
@@ -190,60 +102,64 @@ impl ContentAccumulator {
         store: &RetainedSetStore<'_, S>,
         table: RetainedTable,
     ) -> Result<RetainedSetId, ContentAccumulatorError> {
-        let Some((first, last)) = self.retained_bounds(table)? else {
-            return Ok(store.empty_root().await?);
-        };
-        self.build_retained_range(store, table, first, last, 0)
-            .await
+        self.build_set(store, Table::Retained(table)).await
     }
 
-    fn build_retained_range<'a, S: ImmutableObjectStore>(
+    async fn build_set<St: SortedSet>(
+        &self,
+        store: &St,
+        table: Table,
+    ) -> Result<St::Id, ContentAccumulatorError> {
+        let Some((first, last)) = self.bounds(table)? else {
+            return store.empty().await;
+        };
+        self.build_range(store, table, first, last, 0).await
+    }
+
+    fn build_range<'a, St: SortedSet>(
         &'a self,
-        store: &'a RetainedSetStore<'a, S>,
-        table: RetainedTable,
+        store: &'a St,
+        table: Table,
         first: ObjectId,
         last: ObjectId,
         depth: usize,
-    ) -> BuildFuture<'a, RetainedSetId> {
+    ) -> BuildFuture<'a, St::Id> {
         Box::pin(async move {
             if first == last {
-                let node =
-                    RetainedSetNode::new(first.as_bytes()[depth..].to_vec(), true, vec![], vec![])
-                        .expect("sorted builder emits a canonical retained leaf");
-                store.write_node(node).await.map_err(Into::into)
+                store
+                    .write(first.as_bytes()[depth..].to_vec(), true, vec![], vec![])
+                    .await
             } else {
                 let common = common_prefix(&first.as_bytes()[depth..], &last.as_bytes()[depth..]);
                 let end = depth + common;
                 let mut children = Vec::new();
                 let mut inline_entries = Vec::new();
-                for (edge, child_first, child_last) in
-                    self.retained_groups(table, first, last, end)?
-                {
+                for (edge, child_first, child_last) in self.groups(table, first, last, end)? {
                     if child_first == child_last {
                         // Single-entry group: inline instead of creating a child.
                         inline_entries.push(child_first.as_bytes()[end..].to_vec());
                     } else {
                         let child = self
-                            .build_retained_range(store, table, child_first, child_last, end + 1)
+                            .build_range(store, table, child_first, child_last, end + 1)
                             .await?;
-                        children.push(RetainedSetChild { edge, child });
+                        children.push((edge, child));
                     }
                 }
-                let node = RetainedSetNode::new(
-                    first.as_bytes()[depth..end].to_vec(),
-                    false,
-                    children,
-                    inline_entries,
-                )
-                .expect("sorted builder emits a canonical retained branch");
-                store.write_node(node).await.map_err(Into::into)
+                store
+                    .write(
+                        first.as_bytes()[depth..end].to_vec(),
+                        false,
+                        children,
+                        inline_entries,
+                    )
+                    .await
             }
         })
     }
 
-    fn retained_bounds(
+    fn bounds(
         &self,
-        table: RetainedTable,
+        table: Table,
     ) -> Result<Option<(ObjectId, ObjectId)>, ContentAccumulatorError> {
         let sql = format!(
             "SELECT (SELECT id FROM {} ORDER BY id LIMIT 1), \
@@ -267,9 +183,9 @@ impl ContentAccumulator {
         }
     }
 
-    fn retained_groups(
+    fn groups(
         &self,
-        table: RetainedTable,
+        table: Table,
         first: ObjectId,
         last: ObjectId,
         byte: usize,
@@ -308,6 +224,64 @@ impl ContentAccumulator {
     }
 }
 
+/// A radix set of 32-byte keys that the accumulator builds from one sorted table.
+trait SortedSet {
+    type Id: Copy;
+    async fn empty(&self) -> Result<Self::Id, ContentAccumulatorError>;
+    /// Writes one canonical node, as the sorted builder lays it out.
+    async fn write(
+        &self,
+        prefix: Vec<u8>,
+        present: bool,
+        children: Vec<(u8, Self::Id)>,
+        entries: Vec<Vec<u8>>,
+    ) -> Result<Self::Id, ContentAccumulatorError>;
+}
+
+impl<S: ImmutableObjectStore> SortedSet for RetainedSetStore<'_, S> {
+    type Id = RetainedSetId;
+    async fn empty(&self) -> Result<RetainedSetId, ContentAccumulatorError> {
+        Ok(self.empty_root().await?)
+    }
+    async fn write(
+        &self,
+        prefix: Vec<u8>,
+        present: bool,
+        children: Vec<(u8, RetainedSetId)>,
+        entries: Vec<Vec<u8>>,
+    ) -> Result<RetainedSetId, ContentAccumulatorError> {
+        let children = children
+            .into_iter()
+            .map(|(edge, child)| RetainedSetChild { edge, child })
+            .collect();
+        let node = RetainedSetNode::new(prefix, present, children, entries)
+            .expect("sorted builder emits a canonical retained node");
+        Ok(self.write_node(node).await?)
+    }
+}
+
+impl<S: ImmutableObjectStore> SortedSet for ContentSetStore<'_, S> {
+    type Id = ContentSetId;
+    async fn empty(&self) -> Result<ContentSetId, ContentAccumulatorError> {
+        Ok(self.empty_root().await?)
+    }
+    async fn write(
+        &self,
+        prefix: Vec<u8>,
+        present: bool,
+        children: Vec<(u8, ContentSetId)>,
+        entries: Vec<Vec<u8>>,
+    ) -> Result<ContentSetId, ContentAccumulatorError> {
+        let children = children
+            .into_iter()
+            .map(|(edge, child)| ContentSetChild { edge, child })
+            .collect();
+        let node = ContentSetNode::new(prefix, present, children, entries)
+            .expect("sorted builder emits a canonical content-set node");
+        Ok(self.write_node(node).await?)
+    }
+}
+
 fn decode_digest(bytes: Vec<u8>) -> Result<[u8; 32], rusqlite::Error> {
     bytes.try_into().map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -333,22 +307,39 @@ pub(crate) enum RetainedTable {
     Applications,
 }
 
-impl RetainedTable {
+/// The accumulator's sorted, unique key tables.
+#[derive(Clone, Copy)]
+enum Table {
+    Retained(RetainedTable),
+    Content,
+}
+
+impl Table {
     fn name(self) -> &'static str {
         match self {
-            Self::Changes => "retained_changes",
-            Self::Views => "retained_views",
-            Self::Revisions => "retained_revisions",
-            Self::Applications => "retained_applications",
+            Self::Retained(RetainedTable::Changes) => "retained_changes",
+            Self::Retained(RetainedTable::Views) => "retained_views",
+            Self::Retained(RetainedTable::Revisions) => "retained_revisions",
+            Self::Retained(RetainedTable::Applications) => "retained_applications",
+            Self::Content => "content_ids",
         }
     }
 
     fn insert_sql(self) -> &'static str {
         match self {
-            Self::Changes => "INSERT OR IGNORE INTO retained_changes (id) VALUES (?1)",
-            Self::Views => "INSERT OR IGNORE INTO retained_views (id) VALUES (?1)",
-            Self::Revisions => "INSERT OR IGNORE INTO retained_revisions (id) VALUES (?1)",
-            Self::Applications => "INSERT OR IGNORE INTO retained_applications (id) VALUES (?1)",
+            Self::Retained(RetainedTable::Changes) => {
+                "INSERT OR IGNORE INTO retained_changes (id) VALUES (?1)"
+            }
+            Self::Retained(RetainedTable::Views) => {
+                "INSERT OR IGNORE INTO retained_views (id) VALUES (?1)"
+            }
+            Self::Retained(RetainedTable::Revisions) => {
+                "INSERT OR IGNORE INTO retained_revisions (id) VALUES (?1)"
+            }
+            Self::Retained(RetainedTable::Applications) => {
+                "INSERT OR IGNORE INTO retained_applications (id) VALUES (?1)"
+            }
+            Self::Content => "INSERT OR IGNORE INTO content_ids (id) VALUES (?1)",
         }
     }
 }
@@ -368,18 +359,15 @@ mod tests {
 
     struct CountingStore {
         inner: ObjectStoreAdapter,
-        content_reads: AtomicUsize,
+        content_map_reads: AtomicUsize,
     }
 
     #[async_trait]
     impl ImmutableObjectStore for CountingStore {
         async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
             let object = self.inner.get(id).await?;
-            if matches!(
-                object.kind,
-                ObjectKind::ContentSetSnapshot | ObjectKind::ContentSetDelta
-            ) {
-                self.content_reads.fetch_add(1, Ordering::Relaxed);
+            if object.kind == ObjectKind::ContentMapNode {
+                self.content_map_reads.fetch_add(1, Ordering::Relaxed);
             }
             Ok(object)
         }
@@ -393,87 +381,78 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn content_build_merges_many_overlapping_roots_in_one_canonical_pass() {
-        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "multi-root-content");
-        let sets = ContentSetStore::new(&objects);
-        let empty = sets.empty_root().await.unwrap();
-        let common = ContentId::from_digest([7; 32]);
-        let mut accumulator = ContentAccumulator::new().unwrap();
-
-        for index in 0..40_u8 {
-            let mut bytes = [index; 32];
-            bytes[31] = index.wrapping_mul(17);
-            let unique = ContentId::from_digest(bytes);
-            let root = sets
-                .update_batch(empty, [(common, true), (unique, true)])
-                .await
-                .unwrap();
-            let transaction = accumulator.begin_page().unwrap();
-            ContentAccumulator::insert_manifest(&transaction, root).unwrap();
-            transaction.commit().unwrap();
-        }
-        let historical = ContentId::from_digest([0xfe; 32]);
-        let transaction = accumulator.begin_page().unwrap();
-        ContentAccumulator::insert_content(&transaction, historical).unwrap();
-        transaction.commit().unwrap();
-
-        let actual = accumulator.build_content(&sets).await.unwrap();
-        let mut expected_entries = vec![(common, true), (historical, true)];
-        for index in 0..40_u8 {
-            let mut bytes = [index; 32];
-            bytes[31] = index.wrapping_mul(17);
-            expected_entries.push((ContentId::from_digest(bytes), true));
-        }
-        let expected = sets.update_batch(empty, expected_entries).await.unwrap();
-        assert_eq!(actual, expected);
+    fn content(index: u32) -> ContentId {
+        ContentId::of(&index.to_le_bytes())
     }
 
     #[tokio::test]
-    async fn each_manifest_content_set_is_read_once() {
-        const MANIFESTS: usize = 40;
-        let objects = CountingStore {
-            inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), "shared-manifests"),
-            content_reads: AtomicUsize::new(0),
-        };
+    async fn content_build_matches_the_canonical_builder() {
+        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "content-build");
         let sets = ContentSetStore::new(&objects);
-        let empty = sets.empty_root().await.unwrap();
-        let common = (0..512_u16)
-            .map(|index| {
-                let mut bytes = [0_u8; 32];
-                bytes[0] = 7;
-                bytes[30..].copy_from_slice(&index.to_be_bytes());
-                ContentId::from_digest(bytes)
-            })
-            .collect::<Vec<_>>();
-        let base = sets
-            .update_batch(empty, common.iter().copied().map(|id| (id, true)))
+        for count in [0_u32, 1, 2, 300] {
+            let mut accumulator = ContentAccumulator::new().unwrap();
+            let transaction = accumulator.begin_page().unwrap();
+            for index in 0..count {
+                ContentAccumulator::insert_content(&transaction, content(index)).unwrap();
+                // Duplicates are ignored.
+                ContentAccumulator::insert_content(&transaction, content(index)).unwrap();
+            }
+            transaction.commit().unwrap();
+            let actual = accumulator.build_content(&sets).await.unwrap();
+            let expected = wheat_core::build_content_set((0..count).map(content), |_| {});
+            assert_eq!(actual, expected, "{count} blobs");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_view_reads_only_what_its_commit_changed() {
+        const VIEWS: u32 = 40;
+        let objects = CountingStore {
+            inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), "view-content"),
+            content_map_reads: AtomicUsize::new(0),
+        };
+        let maps = ContentMapStore::new(&objects);
+        let empty = maps.empty_root().await.unwrap();
+        let base = maps
+            .update_batch(empty, (0..512).map(|index| (content(index), Some(1))))
             .await
             .unwrap();
-        let mut accumulator = ContentAccumulator::new().unwrap();
-        for index in 0..MANIFESTS as u8 {
-            let mut bytes = [index; 32];
-            bytes[0] = index.wrapping_add(32);
-            let root = sets
-                .insert(base, ContentId::from_digest(bytes))
+        let mut views = Vec::new();
+        for index in 0..VIEWS {
+            let view = maps
+                .update_batch(base, [(content(10_000 + index), Some(1))])
                 .await
                 .unwrap();
-            let transaction = accumulator.begin_page().unwrap();
-            ContentAccumulator::insert_manifest(&transaction, root).unwrap();
-            transaction.commit().unwrap();
+            views.push(view);
         }
-        objects.content_reads.store(0, Ordering::Relaxed);
+        let mut accumulator = ContentAccumulator::new().unwrap();
+        let transaction = accumulator.begin_page().unwrap();
+        ContentAccumulator::insert_view_content(&transaction, &maps, empty, base)
+            .await
+            .unwrap();
+        objects.content_map_reads.store(0, Ordering::Relaxed);
+        for view in views {
+            ContentAccumulator::insert_view_content(&transaction, &maps, base, view)
+                .await
+                .unwrap();
+        }
+        let reads = objects.content_map_reads.load(Ordering::Relaxed);
+        transaction.commit().unwrap();
 
+        let sets = ContentSetStore::new(&objects);
         let actual = accumulator.build_content(&sets).await.unwrap();
-        let reads = objects.content_reads.load(Ordering::Relaxed);
-        for id in common {
-            assert!(sets.contains(actual, id).await.unwrap());
-        }
-        // Each manifest's content set is read once; a shared delta base may
-        // add one more read, but never one per manifest.
+        let expected = wheat_core::build_content_set(
+            (0..512)
+                .chain((0..VIEWS).map(|index| 10_000 + index))
+                .map(content),
+            |_| {},
+        );
+        assert_eq!(actual, expected);
+        // A diff reads the two roots and the one child on each side that changed; a
+        // whole map of 512 blobs is over a hundred nodes.
         assert!(
-            reads <= MANIFESTS + 1,
-            "content sets must be read once per manifest: {reads} reads for {MANIFESTS} manifests"
+            reads <= VIEWS as usize * 4,
+            "{reads} content-map reads for {VIEWS} one-blob views"
         );
     }
 }

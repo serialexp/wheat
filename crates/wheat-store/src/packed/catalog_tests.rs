@@ -3,7 +3,10 @@ use std::{fs, io::Write};
 use rusqlite::{Connection, params};
 
 use super::catalog::*;
-use super::segment::{CONTENT_NAMESPACE, MAX_SEGMENT_TAIL_BYTES, SegmentError, SegmentRecord};
+use super::segment::{
+    CONTENT_NAMESPACE, MAX_SEGMENT_TAIL_BYTES, SegmentError, SegmentRecord, test_content_map_kind,
+    test_content_map_root,
+};
 
 const LOCATOR_FILE: &str = "catalog-locator.sqlite3";
 
@@ -1140,28 +1143,16 @@ fn threshold_seal_publishes_once_repoints_one_source_and_bounds_counts() {
     );
 }
 
-/// `count` canonical content sets, newest (largest) first; set `k + 1` is set
-/// `k` minus one member, so each older set is a small delta of its successor.
-fn content_set_history(count: usize) -> Vec<([u8; 32], Vec<u8>)> {
+/// `count` canonical content-map roots, newest (largest) first; map `k + 1` is
+/// map `k` minus one blob, so each older root is a small delta of its successor.
+fn content_map_history(count: usize) -> Vec<([u8; 32], Vec<u8>)> {
     (0..count)
-        .map(|age| {
-            let mut members = (0..200 - age)
-                .map(|index| wheat_core::ContentId::of(format!("member {index}").as_bytes()))
-                .collect::<Vec<_>>();
-            members.sort_unstable();
-            let bytes = wheat_core::content_set_snapshot_bytes(&members);
-            (
-                *wheat_core::ObjectId::of_canonical_bytes(&bytes).as_bytes(),
-                bytes,
-            )
-        })
+        .map(|age| test_content_map_root(200 - age))
         .collect()
 }
 
 fn metadata_records(history: &[([u8; 32], Vec<u8>)]) -> Vec<SegmentRecord<'_>> {
-    let kind = wheat_core::SegmentIndexEntry::canonical_kind_code(
-        wheat_core::CanonicalObjectKind::ContentSetSnapshot,
-    );
+    let kind = test_content_map_kind();
     history
         .iter()
         .map(|(digest, bytes)| SegmentRecord {
@@ -1173,7 +1164,7 @@ fn metadata_records(history: &[([u8; 32], Vec<u8>)]) -> Vec<SegmentRecord<'_>> {
         .collect()
 }
 
-/// Every older set deltas against the next newer one.
+/// Every older root deltas against the next newer one.
 fn history_bases(
     history: &[([u8; 32], Vec<u8>)],
 ) -> std::collections::BTreeMap<[u8; 32], [u8; 32]> {
@@ -1228,7 +1219,7 @@ fn assert_history(store: &mut PackedCatalog, history: &[([u8; 32], Vec<u8>)]) {
 
 #[test]
 fn a_full_segment_cuts_the_chain_and_stores_the_next_record_whole() {
-    let history = content_set_history(12);
+    let history = content_map_history(12);
     let bases = history_bases(&history);
 
     let uncut_root = tempfile::tempdir().unwrap();
@@ -1238,11 +1229,16 @@ fn a_full_segment_cuts_the_chain_and_stores_the_next_record_whole() {
     assert_eq!(whole_chain.delta_records, 11);
     assert_eq!(whole_chain.max_delta_depth, 11);
 
-    // Room for one whole set and a delta or two (each patch here is a few
-    // dozen bytes): the chain must be cut, and each cut costs one delta.
+    // Room for the stored tip plus one segment's framing bytes, a few dozen-byte
+    // deltas: the chain must be cut, and each cut costs one delta. The roots
+    // compress, so the target comes from storing the tip alone.
+    let tip_root = tempfile::tempdir().unwrap();
+    let mut tip_only = metadata_catalog(tip_root.path(), &history[..1]);
+    let target = repack_history(&mut tip_only, &history_bases(&history[..1]), 1 << 20)
+        .unwrap()
+        .physical_bytes_after;
     let root = tempfile::tempdir().unwrap();
     let mut store = metadata_catalog(root.path(), &history);
-    let target = history[0].1.len() as u64 + 48;
     let report = repack_history(&mut store, &bases, target).unwrap();
     assert!(report.segments_after > 1, "{report:?}");
     assert_eq!(
@@ -1262,7 +1258,7 @@ fn a_full_segment_cuts_the_chain_and_stores_the_next_record_whole() {
 
 #[test]
 fn interrupted_delta_repack_recovers_old_or_new_authority() {
-    let history = content_set_history(6);
+    let history = content_map_history(6);
     let bases = history_bases(&history);
     for failpoint in [RepackFailpoint::AfterIntent, RepackFailpoint::AfterHead] {
         let root = tempfile::tempdir().unwrap();

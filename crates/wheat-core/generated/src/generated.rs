@@ -18,13 +18,12 @@ pub enum WheatObject {
     ApplicationV1(ApplicationV1Output),
     ConflictV1(ConflictV1Output),
     ViewV1(ViewV1Output),
-    ContentManifestV1(ContentManifestV1Output),
+    ContentMapNodeV1(ContentMapNodeV1Output),
     RepositoryStateV1(RepositoryStateV1Output),
     RevisionMapNodeV1(RevisionMapNodeV1Output),
     ApplicationMapNodeV1(ApplicationMapNodeV1Output),
     ConflictSetNodeV1(ConflictSetNodeV1Output),
-    ContentSetSnapshotV1(ContentSetSnapshotV1Output),
-    ContentSetDeltaV1(ContentSetDeltaV1Output),
+    ContentSetNodeV1(ContentSetNodeV1Output),
     RetainedSetNodeV1(RetainedSetNodeV1Output),
     ViewLabelManifestV1(ViewLabelManifestV1Output),
     RepositoryEnvelopeV1(RepositoryEnvelopeV1Output),
@@ -100,9 +99,24 @@ impl WheatObject {
                 v.unresolved_conflicts.encode_into(encoder)?;
                 v.required_content.encode_into(encoder)?;
             }
-            WheatObject::ContentManifestV1(v) => {
+            WheatObject::ContentMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                v.content.encode_into(encoder)?;
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint32(v.value.len() as u32, Endianness::BigEndian);
+                for item in &v.value {
+                    encoder.write_uint32(*item, Endianness::BigEndian);
+                }
+                encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
+                for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
             }
             WheatObject::RepositoryStateV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -169,22 +183,19 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
             }
-            WheatObject::ContentSetSnapshotV1(v) => {
+            WheatObject::ContentSetNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                encoder.write_uint32(v.members.len() as u32, Endianness::BigEndian);
-                for item in &v.members {
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint8(if v.present { 1 } else { 0 });
+                encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
+                for item in &v.children {
                     item.encode_into(encoder)?;
                 }
-            }
-            WheatObject::ContentSetDeltaV1(v) => {
-                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
-                v.base.encode_into(encoder)?;
-                encoder.write_uint32(v.added.len() as u32, Endianness::BigEndian);
-                for item in &v.added {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint32(v.removed.len() as u32, Endianness::BigEndian);
-                for item in &v.removed {
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
                     item.encode_into(encoder)?;
                 }
             }
@@ -300,8 +311,8 @@ impl WheatObject {
                 decoder,
             )?))
         } else if value == 0x0701 {
-            Ok(WheatObject::ContentManifestV1(
-                ContentManifestV1Output::decode_with_decoder(decoder)?,
+            Ok(WheatObject::ContentMapNodeV1(
+                ContentMapNodeV1Output::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x0801 {
             Ok(WheatObject::RepositoryStateV1(
@@ -319,13 +330,9 @@ impl WheatObject {
             Ok(WheatObject::ConflictSetNodeV1(
                 ConflictSetNodeV1Output::decode_with_decoder(decoder)?,
             ))
-        } else if value == 0x0c02 {
-            Ok(WheatObject::ContentSetSnapshotV1(
-                ContentSetSnapshotV1Output::decode_with_decoder(decoder)?,
-            ))
-        } else if value == 0x0c03 {
-            Ok(WheatObject::ContentSetDeltaV1(
-                ContentSetDeltaV1Output::decode_with_decoder(decoder)?,
+        } else if value == 0x0c01 {
+            Ok(WheatObject::ContentSetNodeV1(
+                ContentSetNodeV1Output::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x0d01 {
             Ok(WheatObject::RetainedSetNodeV1(
@@ -676,11 +683,11 @@ impl ViewId {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContentManifestId {
+pub struct ContentMapId {
     pub digest: Digest256,
 }
 
-impl ContentManifestId {
+impl ContentMapId {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3010,7 +3017,7 @@ pub struct ViewV1Input {
     pub revisions: RevisionMapId,
     pub applications: ApplicationMapId,
     pub unresolved_conflicts: ConflictSetId,
-    pub required_content: ContentManifestId,
+    pub required_content: ContentMapId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3020,7 +3027,7 @@ pub struct ViewV1Output {
     pub revisions: RevisionMapId,
     pub applications: ApplicationMapId,
     pub unresolved_conflicts: ConflictSetId,
-    pub required_content: ContentManifestId,
+    pub required_content: ContentMapId,
 }
 
 pub type ViewV1 = ViewV1Output;
@@ -3061,7 +3068,7 @@ impl ViewV1Output {
         let revisions = RevisionMapId::decode_with_decoder(decoder)?;
         let applications = ApplicationMapId::decode_with_decoder(decoder)?;
         let unresolved_conflicts = ConflictSetId::decode_with_decoder(decoder)?;
-        let required_content = ContentManifestId::decode_with_decoder(decoder)?;
+        let required_content = ContentMapId::decode_with_decoder(decoder)?;
         Ok(Self {
             wire_tag,
             tree,
@@ -3105,19 +3112,25 @@ impl From<ViewV1Input> for ViewV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContentManifestV1Input {
-    pub content: ContentSetId,
+pub struct ContentMapNodeV1Input {
+    pub prefix: Vec<u8>,
+    pub value: Vec<u32>,
+    pub children: Vec<ContentMapChildV1>,
+    pub entries: Vec<ContentMapEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContentManifestV1Output {
+pub struct ContentMapNodeV1Output {
     pub wire_tag: u16,
-    pub content: ContentSetId,
+    pub prefix: Vec<u8>,
+    pub value: Vec<u32>,
+    pub children: Vec<ContentMapChildV1>,
+    pub entries: Vec<ContentMapEntryV1>,
 }
 
-pub type ContentManifestV1 = ContentManifestV1Output;
+pub type ContentMapNodeV1 = ContentMapNodeV1Output;
 
-impl ContentManifestV1Input {
+impl ContentMapNodeV1Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3126,12 +3139,27 @@ impl ContentManifestV1Input {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_u16_be(1793);
-        self.content.encode_into(encoder)?;
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.value.len() as u32);
+        for item in &self.value {
+            encoder.write_u32_be(*item);
+        }
+        encoder.write_u32_be(self.children.len() as u32);
+        for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
+            item.encode_into(encoder)?;
+        }
         Ok(())
     }
 }
 
-impl ContentManifestV1Output {
+impl ContentMapNodeV1Output {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
         Self::decode_with_decoder(&mut decoder)
@@ -3145,29 +3173,128 @@ impl ContentManifestV1Output {
                 wire_tag
             )));
         }
-        let content = ContentSetId::decode_with_decoder(decoder)?;
-        Ok(Self { wire_tag, content })
+        let length = decoder.read_u32_be()? as usize;
+        let prefix = decoder.read_bytes_vec(length)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut value = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = decoder.read_u32_be()?;
+            value.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = ContentMapChildV1::decode_with_decoder(decoder)?;
+            children.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = ContentMapEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            prefix,
+            value,
+            children,
+            entries,
+        })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
-        ContentManifestV1Input::from(self.clone()).encode()
+        ContentMapNodeV1Input::from(self.clone()).encode()
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ContentManifestV1Input::from(self.clone()).encode_into(encoder)
+        ContentMapNodeV1Input::from(self.clone()).encode_into(encoder)
     }
 }
 
-impl From<ContentManifestV1Output> for ContentManifestV1Input {
-    fn from(o: ContentManifestV1Output) -> Self {
-        Self { content: o.content }
+impl From<ContentMapNodeV1Output> for ContentMapNodeV1Input {
+    fn from(o: ContentMapNodeV1Output) -> Self {
+        Self {
+            prefix: o.prefix,
+            value: o.value,
+            children: o.children,
+            entries: o.entries,
+        }
     }
 }
 
-impl From<ContentManifestV1Input> for ContentManifestV1Output {
-    fn from(i: ContentManifestV1Input) -> Self {
+impl From<ContentMapNodeV1Input> for ContentMapNodeV1Output {
+    fn from(i: ContentMapNodeV1Input) -> Self {
         Self {
             wire_tag: 1793u16,
-            content: i.content,
+            prefix: i.prefix,
+            value: i.value,
+            children: i.children,
+            entries: i.entries,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentMapChildV1 {
+    pub edge: u8,
+    pub child: ContentMapId,
+}
+
+impl ContentMapChildV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.edge);
+        self.child.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edge = decoder.read_byte()?;
+        let child = ContentMapId::decode_with_decoder(decoder)?;
+        Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentMapEntryV1 {
+    pub suffix: Vec<u8>,
+    pub value: u32,
+}
+
+impl ContentMapEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.suffix.len() as u32);
+        for item in &self.suffix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.value);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let suffix = decoder.read_bytes_vec(length)?;
+        let value = decoder.read_u32_be()?;
+        Ok(Self { suffix, value })
     }
 }
 
@@ -4064,19 +4191,25 @@ impl ConflictSetChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContentSetSnapshotV1Input {
-    pub members: Vec<ContentId>,
+pub struct ContentSetNodeV1Input {
+    pub prefix: Vec<u8>,
+    pub present: bool,
+    pub children: Vec<ContentSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContentSetSnapshotV1Output {
+pub struct ContentSetNodeV1Output {
     pub wire_tag: u16,
-    pub members: Vec<ContentId>,
+    pub prefix: Vec<u8>,
+    pub present: bool,
+    pub children: Vec<ContentSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
 }
 
-pub type ContentSetSnapshotV1 = ContentSetSnapshotV1Output;
+pub type ContentSetNodeV1 = ContentSetNodeV1Output;
 
-impl ContentSetSnapshotV1Input {
+impl ContentSetNodeV1Input {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4084,16 +4217,25 @@ impl ContentSetSnapshotV1Input {
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u16_be(3074);
-        encoder.write_u32_be(self.members.len() as u32);
-        for item in &self.members {
+        encoder.write_u16_be(3073);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_byte(if self.present { 1 } else { 0 });
+        encoder.write_u32_be(self.children.len() as u32);
+        for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
             item.encode_into(encoder)?;
         }
         Ok(())
     }
 }
 
-impl ContentSetSnapshotV1Output {
+impl ContentSetNodeV1Output {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
         Self::decode_with_decoder(&mut decoder)
@@ -4101,142 +4243,94 @@ impl ContentSetSnapshotV1Output {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let wire_tag = decoder.read_u16_be()?;
-        if wire_tag != 3074u16 {
+        if wire_tag != 3073u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 3074, got {}",
+                "expected 3073, got {}",
                 wire_tag
             )));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut members = Vec::with_capacity(decoder.capacity_hint(length));
-        for _ in 0..length {
-            let item = ContentId::decode_with_decoder(decoder)?;
-            members.push(item);
-        }
-        Ok(Self { wire_tag, members })
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        ContentSetSnapshotV1Input::from(self.clone()).encode()
-    }
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ContentSetSnapshotV1Input::from(self.clone()).encode_into(encoder)
-    }
-}
-
-impl From<ContentSetSnapshotV1Output> for ContentSetSnapshotV1Input {
-    fn from(o: ContentSetSnapshotV1Output) -> Self {
-        Self { members: o.members }
-    }
-}
-
-impl From<ContentSetSnapshotV1Input> for ContentSetSnapshotV1Output {
-    fn from(i: ContentSetSnapshotV1Input) -> Self {
-        Self {
-            wire_tag: 3074u16,
-            members: i.members,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentSetDeltaV1Input {
-    pub base: ContentSetId,
-    pub added: Vec<ContentId>,
-    pub removed: Vec<ContentId>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentSetDeltaV1Output {
-    pub wire_tag: u16,
-    pub base: ContentSetId,
-    pub added: Vec<ContentId>,
-    pub removed: Vec<ContentId>,
-}
-
-pub type ContentSetDeltaV1 = ContentSetDeltaV1Output;
-
-impl ContentSetDeltaV1Input {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u16_be(3075);
-        self.base.encode_into(encoder)?;
-        encoder.write_u32_be(self.added.len() as u32);
-        for item in &self.added {
-            item.encode_into(encoder)?;
-        }
-        encoder.write_u32_be(self.removed.len() as u32);
-        for item in &self.removed {
-            item.encode_into(encoder)?;
-        }
-        Ok(())
-    }
-}
-
-impl ContentSetDeltaV1Output {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let wire_tag = decoder.read_u16_be()?;
-        if wire_tag != 3075u16 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 3075, got {}",
-                wire_tag
-            )));
-        }
-        let base = ContentSetId::decode_with_decoder(decoder)?;
+        let prefix = decoder.read_bytes_vec(length)?;
+        let present = decoder.read_byte()? != 0;
         let length = decoder.read_u32_be()? as usize;
-        let mut added = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
-            let item = ContentId::decode_with_decoder(decoder)?;
-            added.push(item);
+            let item = ContentSetChildV1::decode_with_decoder(decoder)?;
+            children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut removed = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
-            let item = ContentId::decode_with_decoder(decoder)?;
-            removed.push(item);
+            let item = SetEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
         }
         Ok(Self {
             wire_tag,
-            base,
-            added,
-            removed,
+            prefix,
+            present,
+            children,
+            entries,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
-        ContentSetDeltaV1Input::from(self.clone()).encode()
+        ContentSetNodeV1Input::from(self.clone()).encode()
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ContentSetDeltaV1Input::from(self.clone()).encode_into(encoder)
+        ContentSetNodeV1Input::from(self.clone()).encode_into(encoder)
     }
 }
 
-impl From<ContentSetDeltaV1Output> for ContentSetDeltaV1Input {
-    fn from(o: ContentSetDeltaV1Output) -> Self {
+impl From<ContentSetNodeV1Output> for ContentSetNodeV1Input {
+    fn from(o: ContentSetNodeV1Output) -> Self {
         Self {
-            base: o.base,
-            added: o.added,
-            removed: o.removed,
+            prefix: o.prefix,
+            present: o.present,
+            children: o.children,
+            entries: o.entries,
         }
     }
 }
 
-impl From<ContentSetDeltaV1Input> for ContentSetDeltaV1Output {
-    fn from(i: ContentSetDeltaV1Input) -> Self {
+impl From<ContentSetNodeV1Input> for ContentSetNodeV1Output {
+    fn from(i: ContentSetNodeV1Input) -> Self {
         Self {
-            wire_tag: 3075u16,
-            base: i.base,
-            added: i.added,
-            removed: i.removed,
+            wire_tag: 3073u16,
+            prefix: i.prefix,
+            present: i.present,
+            children: i.children,
+            entries: i.entries,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentSetChildV1 {
+    pub edge: u8,
+    pub child: ContentSetId,
+}
+
+impl ContentSetChildV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.edge);
+        self.child.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edge = decoder.read_byte()?;
+        let child = ContentSetId::decode_with_decoder(decoder)?;
+        Ok(Self { edge, child })
     }
 }
 
@@ -4421,7 +4515,7 @@ pub struct RepositoryStateV1Input {
     pub base_view: ViewId,
     pub changes: ChangeMapId,
     pub view_lineage: ViewLineageMapId,
-    pub required_content: ContentManifestId,
+    pub required_content: ContentSetId,
     pub retained_changes: RetainedSetId,
     pub retained_views: RetainedSetId,
     pub retained_revisions: RetainedSetId,
@@ -4434,7 +4528,7 @@ pub struct RepositoryStateV1Output {
     pub base_view: ViewId,
     pub changes: ChangeMapId,
     pub view_lineage: ViewLineageMapId,
-    pub required_content: ContentManifestId,
+    pub required_content: ContentSetId,
     pub retained_changes: RetainedSetId,
     pub retained_views: RetainedSetId,
     pub retained_revisions: RetainedSetId,
@@ -4481,7 +4575,7 @@ impl RepositoryStateV1Output {
         let base_view = ViewId::decode_with_decoder(decoder)?;
         let changes = ChangeMapId::decode_with_decoder(decoder)?;
         let view_lineage = ViewLineageMapId::decode_with_decoder(decoder)?;
-        let required_content = ContentManifestId::decode_with_decoder(decoder)?;
+        let required_content = ContentSetId::decode_with_decoder(decoder)?;
         let retained_changes = RetainedSetId::decode_with_decoder(decoder)?;
         let retained_views = RetainedSetId::decode_with_decoder(decoder)?;
         let retained_revisions = RetainedSetId::decode_with_decoder(decoder)?;

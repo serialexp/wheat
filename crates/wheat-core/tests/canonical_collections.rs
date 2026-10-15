@@ -55,6 +55,35 @@ fn view_lineage_nodes_roundtrip_and_enforce_terminal_rules() {
 }
 
 #[test]
+fn content_map_nodes_roundtrip_and_refuse_zero_counts() {
+    let terminal = ContentMapNode::new(vec![7; 32], Some(2), vec![], vec![]).unwrap();
+    let bytes = terminal.canonical_bytes();
+    assert_eq!(decode_content_map_node(&bytes).unwrap(), terminal);
+    assert_eq!(&bytes[..2], &[7, 1]);
+    assert!(decode_content_set_node(&bytes).is_err());
+    let edge = ContentMapChild {
+        edge: 3,
+        child: terminal.id(),
+    };
+    assert!(ContentMapNode::new(vec![0; 32], None, vec![edge], vec![]).is_err());
+    assert!(ContentMapNode::new(vec![], None, vec![edge, edge], vec![]).is_err());
+
+    // A blob no tree entry names is absent, never stored with a count of 0.
+    assert!(ContentMapNode::new(vec![7; 32], Some(0), vec![], vec![]).is_err());
+    let entries = |second: u32| vec![(vec![0; 32], 1), (vec![1; 32], second)];
+    assert!(ContentMapNode::new(vec![], None, vec![], entries(0)).is_err());
+    // The same refusal on the read side: the last four bytes are the second
+    // entry's count.
+    let mut zeroed = ContentMapNode::new(vec![], None, vec![], entries(1))
+        .unwrap()
+        .canonical_bytes();
+    let length = zeroed.len();
+    assert_eq!(zeroed[length - 4..], 1u32.to_be_bytes());
+    zeroed[length - 4..].fill(0);
+    assert!(decode_content_map_node(&zeroed).is_err());
+}
+
+#[test]
 fn view_lineage_builder_groups_edges_and_emits_child_sets() {
     let parent = ViewId::from_digest([1; 32]);
     let first = ViewId::from_digest([2; 32]);
@@ -114,6 +143,13 @@ set_rules!(
     ConflictSetChild,
     decode_conflict_set_node,
     11
+);
+set_rules!(
+    content_set_rules,
+    ContentSetNode,
+    ContentSetChild,
+    decode_content_set_node,
+    12
 );
 set_rules!(
     retained_set_rules,

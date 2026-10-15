@@ -19,7 +19,7 @@ use wheat_store::packed_segment_reader::open_segment;
 const SAMPLES: usize = 400;
 const DEPTHS: &[u8] = &[0, 1, 4, 8, 12, 16];
 const KINDS: &[ObjectKind] = &[
-    ObjectKind::ContentSetSnapshot,
+    ObjectKind::ContentMapNode,
     ObjectKind::Tree,
     ObjectKind::RevisionMapNode,
 ];

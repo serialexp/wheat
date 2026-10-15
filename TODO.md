@@ -32,12 +32,6 @@ Security, most serious first:
 
 Performance, most serious first:
 
-- `[ ]` **Content manifests are full snapshots, so comparing two still reads both
-  (2026-10-05).** Publish and fetch now look up only the content the old head lacks,
-  but finding it decodes both manifests' snapshots (about 3.3 MB each at 100,000
-  files) and merges them. Canonical manifests may not be deltas
-  (`ContentSetStore::update_batch`), so a cheaper comparison needs a different shape,
-  such as a radix set.
 - `[ ]` **`existing_ids` lists the whole S3 bucket even for a few IDs (scanner
   only, 2026-10-05).** `ContentStore::existing_ids` (`content_store.rs`) uses
   `list_ids` whenever the backend has it, so a publish of one file lists every blob.

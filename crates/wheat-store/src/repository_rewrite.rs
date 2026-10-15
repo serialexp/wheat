@@ -572,6 +572,24 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
             content_trees.insert(revision.resulting_tree);
             loaded_revisions.push(revision);
         }
+        // Application results and conflict evidence name content too, and validation
+        // requires it in the aggregate like core's canonical closure does.
+        for application_id in &applications {
+            match reader.application(*application_id).await?.result {
+                ApplicationResultRecord::Clean { tree } => {
+                    content_trees.insert(tree);
+                }
+                ApplicationResultRecord::Conflicted {
+                    partial_tree,
+                    conflict,
+                } => {
+                    content_trees.insert(partial_tree);
+                    for evidence in reader.conflict(conflict).await?.edits.values() {
+                        content_ids.extend(evidence.target.map(|value| value.content));
+                    }
+                }
+            }
+        }
         for tree in content_trees {
             let mut cursor = trees
                 .content_cursor(tree, TreeContentWalkLimits::default())
@@ -602,17 +620,11 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
                 }
             }
         }
-        let content_root = content_sets
+        let required_content = content_sets
             .update_batch(
                 content_sets.empty_root().await?,
                 content_ids.into_iter().map(|id| (id, true)),
             )
-            .await?;
-        let manifest = ContentManifestRecord {
-            content: content_root,
-        };
-        self.objects
-            .put_if_absent(manifest.id().into(), &manifest.canonical_bytes())
             .await?;
 
         let lineage = ViewLineageMapStore::new(self.objects);
@@ -642,7 +654,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
             base_view: old.base_view,
             changes: old.changes,
             view_lineage,
-            required_content: manifest.id(),
+            required_content,
             retained_changes,
             retained_views,
             retained_revisions,

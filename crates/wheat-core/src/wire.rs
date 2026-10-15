@@ -6,11 +6,11 @@ use wheat_binschema::generated as wire;
 use crate::{
     Actor, Application, ApplicationMapChild, ApplicationMapNode, ApplicationResult, Change,
     ChangeId, ChangeMapChild, ChangeMapNode, ChangeMetadata, ChangeRevision, Conflict,
-    ConflictSetChild, ConflictSetNode, ContentId, ContentManifestId, DirectoryEntry, DirectoryNode,
-    EditOperation, EditRecord, FileKind, FileValue, RepositoryState, RepositoryView,
-    RetainedSetChild, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapNode,
-    RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId, ViewLineageMapChild,
-    ViewLineageMapNode,
+    ConflictSetChild, ConflictSetNode, ContentId, ContentMapChild, ContentMapId, ContentMapNode,
+    ContentSetChild, ContentSetId, ContentSetNode, DirectoryEntry, DirectoryNode, EditOperation,
+    EditRecord, FileKind, FileValue, RepositoryState, RepositoryView, RetainedSetChild,
+    RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapNode, RevisionMetadata,
+    SourceProvenance, Timestamp, Tree, TreeId, ViewLineageMapChild, ViewLineageMapNode,
 };
 
 const BLAKE3_256: u8 = 1;
@@ -47,7 +47,7 @@ pub enum CanonicalObjectKind {
     Application,
     Conflict,
     View,
-    ContentManifest,
+    ContentMapNode,
     RepositoryState,
     ViewLabelManifest,
     RepositoryEnvelope,
@@ -55,8 +55,7 @@ pub enum CanonicalObjectKind {
     ChangeMapNode,
     ApplicationMapNode,
     ConflictSetNode,
-    ContentSetSnapshot,
-    ContentSetDelta,
+    ContentSetNode,
     RetainedSetNode,
     ViewLineageMapNode,
 }
@@ -128,24 +127,7 @@ pub fn decode_view_record(bytes: &[u8]) -> Result<crate::ViewRecord, CanonicalOb
         unresolved_conflicts: crate::ConflictSetId::from_digest(digest_domain(
             &v.unresolved_conflicts.digest,
         )?),
-        required_content: ContentManifestId::from_digest(digest_domain(
-            &v.required_content.digest,
-        )?),
-    })
-}
-
-pub fn decode_content_manifest_record(
-    bytes: &[u8],
-) -> Result<crate::ContentManifestRecord, CanonicalObjectError> {
-    let object = decode_validated(bytes)?;
-    let wire::WheatObject::ContentManifestV1(v) = object else {
-        return Err(CanonicalObjectError::WrongKind {
-            expected: CanonicalObjectKind::ContentManifest,
-            actual: object_kind(&object),
-        });
-    };
-    Ok(crate::ContentManifestRecord {
-        content: crate::ContentSetId::from_digest(digest_domain(&v.content.digest)?),
+        required_content: ContentMapId::from_digest(digest_domain(&v.required_content.digest)?),
     })
 }
 
@@ -165,9 +147,7 @@ pub fn decode_repository_state_record(
         base_view: crate::ViewId::from_digest(digest_domain(&v.base_view.digest)?),
         changes: crate::ChangeMapId::from_digest(digest_domain(&v.changes.digest)?),
         view_lineage: crate::ViewLineageMapId::from_digest(digest_domain(&v.view_lineage.digest)?),
-        required_content: ContentManifestId::from_digest(digest_domain(
-            &v.required_content.digest,
-        )?),
+        required_content: ContentSetId::from_digest(digest_domain(&v.required_content.digest)?),
         retained_changes: retained(&v.retained_changes)?,
         retained_views: retained(&v.retained_views)?,
         retained_revisions: retained(&v.retained_revisions)?,
@@ -474,6 +454,14 @@ decode_set_node!(
     crate::ConflictSetId
 );
 decode_set_node!(
+    decode_content_set_node,
+    ContentSetNodeV1,
+    ContentSetNode,
+    ContentSetNode,
+    ContentSetChild,
+    ContentSetId
+);
+decode_set_node!(
     decode_retained_set_node,
     RetainedSetNodeV1,
     RetainedSetNode,
@@ -481,6 +469,35 @@ decode_set_node!(
     RetainedSetChild,
     crate::RetainedSetId
 );
+
+pub fn decode_content_map_node(bytes: &[u8]) -> Result<ContentMapNode, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::ContentMapNodeV1(node) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::ContentMapNode,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(ContentMapNode {
+        prefix: node.prefix,
+        value: node.value.first().copied(),
+        children: node
+            .children
+            .into_iter()
+            .map(|child| ContentMapChild {
+                edge: child.edge,
+                child: ContentMapId::from_digest(
+                    digest_domain(&child.child.digest).expect("validated digest"),
+                ),
+            })
+            .collect(),
+        entries: node
+            .entries
+            .into_iter()
+            .map(|entry| (entry.suffix, entry.value))
+            .collect(),
+    })
+}
 
 pub fn decode_view_lineage_map_node(
     bytes: &[u8],
@@ -661,6 +678,40 @@ pub(crate) fn validate_conflict_set_node(
         "conflict set node",
     )
 }
+/// A content map holds counts of at least 1: a blob no tree entry names is absent.
+pub(crate) fn validate_content_map_node(node: &ContentMapNode) -> Result<(), CanonicalObjectError> {
+    if node.value == Some(0) || node.entries.iter().any(|(_, count)| *count == 0) {
+        return Err(CanonicalObjectError::InvalidCollection("content map node"));
+    }
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|(suffix, _)| suffix.first().copied())
+        .collect();
+    validate_radix_node(
+        &node.prefix,
+        node.value.is_some(),
+        &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
+        32,
+        "content map node",
+    )
+}
+pub(crate) fn validate_content_set_node(node: &ContentSetNode) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|suffix| suffix.first().copied())
+        .collect();
+    validate_radix_node(
+        &node.prefix,
+        node.present,
+        &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
+        32,
+        "content set node",
+    )
+}
 pub(crate) fn validate_retained_set_node(
     node: &RetainedSetNode,
 ) -> Result<(), CanonicalObjectError> {
@@ -735,6 +786,33 @@ pub(crate) fn application_map_node_bytes(node: &ApplicationMapNode) -> Vec<u8> {
     ))
 }
 
+pub(crate) fn content_map_node_bytes(node: &ContentMapNode) -> Vec<u8> {
+    validate_content_map_node(node).expect("content map node violates canonical invariants");
+    encode(wire::WheatObject::ContentMapNodeV1(
+        wire::ContentMapNodeV1Input {
+            prefix: node.prefix.clone(),
+            value: node.value.into_iter().collect(),
+            children: node
+                .children
+                .iter()
+                .map(|c| wire::ContentMapChildV1 {
+                    edge: c.edge,
+                    child: content_map_id(c.child),
+                })
+                .collect(),
+            entries: node
+                .entries
+                .iter()
+                .map(|(suffix, value)| wire::ContentMapEntryV1 {
+                    suffix: suffix.clone(),
+                    value: *value,
+                })
+                .collect(),
+        }
+        .into(),
+    ))
+}
+
 macro_rules! set_node_bytes {
     ($function:ident, $validate:ident, $variant:ident, $input:ident, $wire_child:ident, $id_fn:ident, $node:ty) => {
         pub(crate) fn $function(node: &$node) -> Vec<u8> {
@@ -772,6 +850,15 @@ set_node_bytes!(
     ConflictSetChildV1,
     conflict_set_id,
     ConflictSetNode
+);
+set_node_bytes!(
+    content_set_node_bytes,
+    validate_content_set_node,
+    ContentSetNodeV1,
+    ContentSetNodeV1Input,
+    ContentSetChildV1,
+    content_set_id,
+    ContentSetNode
 );
 set_node_bytes!(
     retained_set_node_bytes,
@@ -875,106 +962,6 @@ pub(crate) fn tree_objects(tree: &Tree) -> Vec<(TreeId, Vec<u8>)> {
     let mut objects = Vec::new();
     emit(root, &mut objects);
     objects
-}
-
-pub(crate) fn content_manifest_record_bytes(record: &crate::ContentManifestRecord) -> Vec<u8> {
-    encode(wire::WheatObject::ContentManifestV1(
-        wire::ContentManifestV1Input {
-            content: content_set_id(record.content),
-        }
-        .into(),
-    ))
-}
-
-/// Encode a flat sorted content set snapshot as canonical bytes.
-pub fn content_set_snapshot_bytes(members: &[ContentId]) -> Vec<u8> {
-    encode(wire::WheatObject::ContentSetSnapshotV1(
-        wire::ContentSetSnapshotV1Input {
-            members: members.iter().map(|id| content_id(*id)).collect(),
-        }
-        .into(),
-    ))
-}
-
-/// Encode a content set delta as canonical bytes.
-pub fn content_set_delta_bytes(
-    base: crate::ContentSetId,
-    added: &[ContentId],
-    removed: &[ContentId],
-) -> Vec<u8> {
-    encode(wire::WheatObject::ContentSetDeltaV1(
-        wire::ContentSetDeltaV1Input {
-            base: content_set_id(base),
-            added: added.iter().map(|id| content_id(*id)).collect(),
-            removed: removed.iter().map(|id| content_id(*id)).collect(),
-        }
-        .into(),
-    ))
-}
-
-/// The resolved members or delta chain step from a content set blob.
-pub enum ContentSetBlob {
-    /// Full snapshot — sorted array of content IDs.
-    Snapshot(Vec<ContentId>),
-    /// Delta referencing a base content set.
-    Delta {
-        base: crate::ContentSetId,
-        added: Vec<ContentId>,
-        removed: Vec<ContentId>,
-    },
-}
-
-/// Decode a content set blob (snapshot or delta).
-///
-/// Returns `Err` if the bytes don't decode as any content set type.
-pub fn decode_content_set_blob(bytes: &[u8]) -> Result<ContentSetBlob, CanonicalObjectError> {
-    let object = decode_validated(bytes)?;
-    match object {
-        wire::WheatObject::ContentSetSnapshotV1(snapshot) => {
-            let members = snapshot
-                .members
-                .iter()
-                .map(content_id_domain)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ContentSetBlob::Snapshot(members))
-        }
-        wire::WheatObject::ContentSetDeltaV1(delta) => {
-            let base = crate::ContentSetId::from_digest(digest_domain(&delta.base.digest)?);
-            let added = delta
-                .added
-                .iter()
-                .map(content_id_domain)
-                .collect::<Result<Vec<_>, _>>()?;
-            let removed = delta
-                .removed
-                .iter()
-                .map(content_id_domain)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ContentSetBlob::Delta {
-                base,
-                added,
-                removed,
-            })
-        }
-        _ => Err(CanonicalObjectError::WrongKind {
-            expected: CanonicalObjectKind::ContentSetSnapshot,
-            actual: object_kind(&object),
-        }),
-    }
-}
-
-pub(crate) fn content_manifest_bytes(content: &BTreeSet<ContentId>) -> Vec<u8> {
-    // Build a flat snapshot instead of a radix trie for the content set.
-    let members: Vec<ContentId> = content.iter().copied().collect();
-    let snapshot_bytes = content_set_snapshot_bytes(&members);
-    let content_id = crate::ContentSetId::of_canonical_bytes(&snapshot_bytes);
-    content_manifest_record_bytes(&crate::ContentManifestRecord {
-        content: content_id,
-    })
-}
-
-pub(crate) fn content_manifest_id(content: &BTreeSet<ContentId>) -> ContentManifestId {
-    ContentManifestId::of_canonical_bytes(&content_manifest_bytes(content))
 }
 
 pub(crate) fn change_bytes(change: &Change) -> Vec<u8> {
@@ -1181,7 +1168,7 @@ pub(crate) fn repository_state_record_bytes(record: &crate::RepositoryStateRecor
             base_view: view_id(record.base_view),
             changes: change_map_id(record.changes),
             view_lineage: view_lineage_map_id(record.view_lineage),
-            required_content: content_manifest_id_wire(record.required_content),
+            required_content: content_set_id(record.required_content),
             retained_changes: retained_set_id(record.retained_changes),
             retained_views: retained_set_id(record.retained_views),
             retained_revisions: retained_set_id(record.retained_revisions),
@@ -1202,7 +1189,7 @@ pub(crate) fn view_record_bytes(record: &crate::ViewRecord) -> Vec<u8> {
             revisions: revision_map_id(record.revisions),
             applications: application_map_id(record.applications),
             unresolved_conflicts: conflict_set_id(record.unresolved_conflicts),
-            required_content: content_manifest_id_wire(record.required_content),
+            required_content: content_map_id(record.required_content),
         }
         .into(),
     ))
@@ -1385,7 +1372,31 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             }
         }
         wire::WheatObject::ViewV1(_) => {}
-        wire::WheatObject::ContentManifestV1(_) => {}
+        wire::WheatObject::ContentMapNodeV1(node) => {
+            if node.value.len() > 1 {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "content map must have at most one value",
+                ));
+            }
+            if node.value.contains(&0) || node.entries.iter().any(|entry| entry.value == 0) {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "content map counts are at least 1",
+                ));
+            }
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
+            validate_radix_node(
+                &node.prefix,
+                !node.value.is_empty(),
+                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
+                32,
+                "content map node",
+            )?;
+        }
         wire::WheatObject::RevisionMapNodeV1(node) => {
             if node.value.len() > 1 {
                 return Err(CanonicalObjectError::InvalidCollection(
@@ -1461,38 +1472,20 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "conflict set node",
             )?;
         }
-        wire::WheatObject::ContentSetSnapshotV1(snapshot) => {
-            validate_sorted_unique_by(
-                &snapshot.members,
-                |id| id.digest.bytes.as_slice(),
-                "content set snapshot members",
-            )?;
-        }
-        wire::WheatObject::ContentSetDeltaV1(delta) => {
-            digest_domain(&delta.base.digest)?;
-            validate_sorted_unique_by(
-                &delta.added,
-                |id| id.digest.bytes.as_slice(),
-                "content set delta added",
-            )?;
-            validate_sorted_unique_by(
-                &delta.removed,
-                |id| id.digest.bytes.as_slice(),
-                "content set delta removed",
-            )?;
-            // added and removed must be disjoint
-            let added_set: std::collections::BTreeSet<_> = delta
-                .added
+        wire::WheatObject::ContentSetNodeV1(node) => {
+            let efb: Vec<u8> = node
+                .entries
                 .iter()
-                .map(|id| id.digest.bytes.as_slice())
+                .filter_map(|e| e.suffix.first().copied())
                 .collect();
-            for id in &delta.removed {
-                if added_set.contains(id.digest.bytes.as_slice()) {
-                    return Err(CanonicalObjectError::InvalidCollection(
-                        "content set delta has overlapping added and removed entries",
-                    ));
-                }
-            }
+            validate_radix_node(
+                &node.prefix,
+                node.present,
+                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
+                32,
+                "content set node",
+            )?;
         }
         wire::WheatObject::RetainedSetNodeV1(node) => {
             let efb: Vec<u8> = node
@@ -1558,7 +1551,7 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ApplicationV1(_) => CanonicalObjectKind::Application,
         wire::WheatObject::ConflictV1(_) => CanonicalObjectKind::Conflict,
         wire::WheatObject::ViewV1(_) => CanonicalObjectKind::View,
-        wire::WheatObject::ContentManifestV1(_) => CanonicalObjectKind::ContentManifest,
+        wire::WheatObject::ContentMapNodeV1(_) => CanonicalObjectKind::ContentMapNode,
         wire::WheatObject::RepositoryStateV1(_) => CanonicalObjectKind::RepositoryState,
         wire::WheatObject::ViewLabelManifestV1(_) => CanonicalObjectKind::ViewLabelManifest,
         wire::WheatObject::RepositoryEnvelopeV1(_) => CanonicalObjectKind::RepositoryEnvelope,
@@ -1566,8 +1559,7 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ChangeMapNodeV1(_) => CanonicalObjectKind::ChangeMapNode,
         wire::WheatObject::ApplicationMapNodeV1(_) => CanonicalObjectKind::ApplicationMapNode,
         wire::WheatObject::ConflictSetNodeV1(_) => CanonicalObjectKind::ConflictSetNode,
-        wire::WheatObject::ContentSetSnapshotV1(_) => CanonicalObjectKind::ContentSetSnapshot,
-        wire::WheatObject::ContentSetDeltaV1(_) => CanonicalObjectKind::ContentSetDelta,
+        wire::WheatObject::ContentSetNodeV1(_) => CanonicalObjectKind::ContentSetNode,
         wire::WheatObject::RetainedSetNodeV1(_) => CanonicalObjectKind::RetainedSetNode,
         wire::WheatObject::ViewLineageMapNodeV1(_) => CanonicalObjectKind::ViewLineageMapNode,
     }
@@ -1865,7 +1857,7 @@ wire_digest_id!(
     ApplicationMapId
 );
 wire_digest_id!(conflict_set_id, crate::ConflictSetId, ConflictSetId);
-wire_digest_id!(content_set_id, crate::ContentSetId, ContentSetId);
+wire_digest_id!(content_set_id, ContentSetId, ContentSetId);
 wire_digest_id!(retained_set_id, crate::RetainedSetId, RetainedSetId);
 wire_digest_id!(
     view_lineage_map_id,
@@ -1886,11 +1878,7 @@ wire_digest_id!(
     crate::ViewLabelManifestId,
     ViewLabelManifestId
 );
-wire_digest_id!(
-    content_manifest_id_wire,
-    ContentManifestId,
-    ContentManifestId
-);
+wire_digest_id!(content_map_id, ContentMapId, ContentMapId);
 
 fn digest(bytes: &[u8; 32]) -> wire::Digest256 {
     wire::Digest256 {

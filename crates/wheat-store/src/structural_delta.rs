@@ -58,9 +58,9 @@ use wheat_core::{
 use crate::{
     ImmutableObjectStore, ObjectKind, ObjectStoreError, RetainedSetStore, StoredObject,
     object_graph::{
-        self, ApplicationSite, ChangeSite, ConflictSite, ContentSetSite, EditSite, EnvelopeSite,
-        LabelSite, MalformedRadix, ManifestSite, RadixKind, RadixNode, RadixSite, Ref,
-        RevisionSite, StateSite, TreeSite, ViewSite,
+        self, ApplicationSite, ChangeSite, ConflictSite, EditSite, EnvelopeSite, LabelSite,
+        MalformedRadix, RadixKind, RadixNode, RadixSite, Ref, RevisionSite, StateSite, TreeSite,
+        ViewSite,
     },
     sets::CollectionError,
 };
@@ -170,6 +170,10 @@ enum Role {
     RevisionMap,
     ApplicationMap,
     ConflictSet,
+    /// A view's content map.
+    ViewContent,
+    /// The state's aggregate content set.
+    AggregateContent,
 }
 
 impl Role {
@@ -185,6 +189,8 @@ impl Role {
             Self::RevisionMap => RadixKind::RevisionMap,
             Self::ApplicationMap => RadixKind::ApplicationMap,
             Self::ConflictSet => RadixKind::ConflictSet,
+            Self::ViewContent => RadixKind::ContentMap,
+            Self::AggregateContent => RadixKind::ContentSet,
         }
     }
 
@@ -196,7 +202,7 @@ impl Role {
     fn state_level(self) -> bool {
         !matches!(
             self,
-            Self::RevisionMap | Self::ApplicationMap | Self::ConflictSet
+            Self::RevisionMap | Self::ApplicationMap | Self::ConflictSet | Self::ViewContent
         )
     }
 
@@ -342,16 +348,6 @@ enum Task {
     Labels {
         id: ObjectId,
     },
-    Manifest {
-        id: ObjectId,
-        old: Option<ObjectId>,
-        state_level: bool,
-    },
-    ContentSet {
-        id: ObjectId,
-        old: Option<ObjectId>,
-        state_level: bool,
-    },
     Tree {
         id: ObjectId,
         old: Option<ObjectId>,
@@ -378,8 +374,6 @@ impl Task {
             Self::Envelope { id, .. }
             | Self::State { id, .. }
             | Self::Labels { id }
-            | Self::Manifest { id, .. }
-            | Self::ContentSet { id, .. }
             | Self::Tree { id, .. }
             | Self::Radix { id, .. }
             | Self::Entity { id, .. } => *id,
@@ -389,9 +383,6 @@ impl Task {
     fn stage(&self) -> Stage {
         let state_level = match self {
             Self::Envelope { .. } | Self::State { .. } | Self::Labels { .. } => true,
-            Self::Manifest { state_level, .. } | Self::ContentSet { state_level, .. } => {
-                *state_level
-            }
             Self::Radix { role, .. } => role.state_level(),
             Self::Tree { .. } => false,
             Self::Entity { entity, .. } => return Stage::for_entity(*entity),
@@ -447,7 +438,6 @@ pub struct StructuralDelta<'a, S> {
     radix_walked: HashSet<(ObjectId, Role, KeyPath)>,
     old_state: Option<OldState>,
     retained_cache: HashMap<(usize, ObjectId), bool>,
-    old_content_chains: HashMap<ObjectId, Arc<[ObjectId]>>,
     /// New view → the old view it pairs with.
     counterparts: HashMap<ViewId, Option<ViewId>>,
     old_views: HashMap<ViewId, Option<wheat_core::ViewRecord>>,
@@ -479,7 +469,6 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             radix_walked: HashSet::new(),
             old_state: None,
             retained_cache: HashMap::new(),
-            old_content_chains: HashMap::new(),
             counterparts: HashMap::new(),
             old_views: HashMap::new(),
             old_edits: HashSet::new(),
@@ -647,8 +636,6 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Task::Envelope { .. } => self.run_envelope(task).await,
             Task::State { .. } => self.run_state(task).await,
             Task::Labels { .. } => self.run_labels(task).await,
-            Task::Manifest { .. } => self.run_manifest(task).await,
-            Task::ContentSet { .. } => self.run_content_set(task).await,
             Task::Tree { .. } => self.run_tree(task).await,
             Task::Radix { .. } => self.run_radix(task).await,
             Task::Entity { .. } => self.run_entity(task).await,
@@ -733,17 +720,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                     }
                     return self.push_entity(id, Entity::View, false);
                 }
-                StateSite::RequiredContent => {
-                    let old = old_field(|state| state.required_content.into());
-                    return self.push_paired(
-                        Task::Manifest {
-                            id,
-                            old,
-                            state_level: true,
-                        },
-                        old,
-                    );
-                }
+                StateSite::RequiredContent => (
+                    Role::AggregateContent,
+                    old_field(|state| state.required_content.into()),
+                ),
                 StateSite::RetainedViews => (
                     Role::RetainedViews,
                     old_field(|state| state.retained_views.into()),
@@ -807,105 +787,6 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Ref::Content(_) => Ok(()),
         })?;
         Ok(self.emit(stored))
-    }
-
-    async fn run_manifest(&mut self, task: Task) -> Result<Option<StoredObject>> {
-        let Task::Manifest {
-            old, state_level, ..
-        } = task
-        else {
-            unreachable!()
-        };
-        let Some(stored) = self
-            .read_new(&task, "content manifest", &[ObjectKind::ContentManifest])
-            .await?
-        else {
-            return Ok(None);
-        };
-        let record = decode(&stored, wheat_core::decode_content_manifest_record)?;
-        let old = match self.read_old(old, ObjectKind::ContentManifest).await? {
-            Some(old) => Some(ObjectId::from(
-                decode(&old, wheat_core::decode_content_manifest_record)?.content,
-            )),
-            None => None,
-        };
-        object_graph::manifest(&record, |reference| match reference {
-            Ref::Object(ManifestSite::ContentSet, id) => self.push_paired(
-                Task::ContentSet {
-                    id,
-                    old,
-                    state_level,
-                },
-                old,
-            ),
-            Ref::Content(_) => Ok(()),
-        })?;
-        Ok(self.emit(stored))
-    }
-
-    async fn run_content_set(&mut self, task: Task) -> Result<Option<StoredObject>> {
-        let Task::ContentSet {
-            old, state_level, ..
-        } = task
-        else {
-            unreachable!()
-        };
-        if self.emitted.contains(&task.id()) {
-            self.stats.pruned_emitted += 1;
-            return Ok(None);
-        }
-        let Some(stored) = self
-            .read_new(
-                &task,
-                "content set",
-                &[ObjectKind::ContentSetSnapshot, ObjectKind::ContentSetDelta],
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        if let Some(base) = content_set_base(&stored)? {
-            if old == Some(base) || self.old_content_chain(old).await?.contains(&base) {
-                self.stats.pruned_aligned += 1;
-            } else {
-                self.push_paired(
-                    Task::ContentSet {
-                        id: base,
-                        old,
-                        state_level,
-                    },
-                    old,
-                )?;
-            }
-        }
-        Ok(self.emit(stored))
-    }
-
-    /// The old content set and the delta bases below it. Cached, because many new
-    /// views usually pair with the same old one, and finding out that a set is a
-    /// snapshot means reading all of it.
-    async fn old_content_chain(&mut self, old: Option<ObjectId>) -> Result<Arc<[ObjectId]>> {
-        let Some(old) = old else {
-            return Ok(Arc::from([]));
-        };
-        if let Some(chain) = self.old_content_chains.get(&old) {
-            return Ok(Arc::clone(chain));
-        }
-        let mut chain = Vec::new();
-        let mut next = Some(old);
-        while let Some(id) = next {
-            if chain.len() > crate::content_set::CONTENT_SET_CHAIN_DEPTH {
-                break;
-            }
-            chain.push(id);
-            next = None;
-            if let Some(stored) = self.read_old(Some(id), ObjectKind::ContentSetDelta).await? {
-                next = content_set_base(&stored)?;
-            }
-        }
-        let chain: Arc<[ObjectId]> = chain.into();
-        self.old_content_chains.insert(old, Arc::clone(&chain));
-        Ok(chain)
     }
 
     async fn run_tree(&mut self, task: Task) -> Result<Option<StoredObject>> {
@@ -1127,6 +1008,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Role::ChangeMap => self.push_entity(target, Entity::Change, false),
             Role::RevisionMap => self.push_entity(target, Entity::Revision, false),
             Role::ApplicationMap => self.push_entity(target, Entity::Application, false),
+            // Content keys are blobs, which object_graph does not list as references.
+            Role::ViewContent | Role::AggregateContent => {
+                unreachable!("content collection keys are not references")
+            }
         }
     }
 
@@ -1322,17 +1207,12 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                     old_field(|old| old.unresolved_conflicts.into()),
                     None,
                 ),
-                ViewSite::RequiredContent => {
-                    let old = old_field(|old| old.required_content.into());
-                    self.push_paired(
-                        Task::Manifest {
-                            id,
-                            old,
-                            state_level: false,
-                        },
-                        old,
-                    )
-                }
+                ViewSite::RequiredContent => self.push_radix_root(
+                    id,
+                    Role::ViewContent,
+                    old_field(|old| old.required_content.into()),
+                    None,
+                ),
             }
         })
     }
@@ -1413,26 +1293,6 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
 }
 
 /// The set a content-set delta applies to; `None` for a snapshot.
-fn content_set_base(stored: &StoredObject) -> Result<Option<ObjectId>> {
-    let blob = object_graph::decode_content_set(stored).map_err(|source| {
-        StructuralDeltaError::Decode {
-            id: stored.id,
-            source,
-        }
-    })?;
-    let mut base = None;
-    if let Some(blob) = blob {
-        object_graph::content_set(&blob, |reference| {
-            match reference {
-                Ref::Object(ContentSetSite::Base, id) => base = Some(id),
-                Ref::Content(_) => {}
-            }
-            Ok::<_, StructuralDeltaError>(())
-        })?;
-    }
-    Ok(base)
-}
-
 fn decode<T>(
     stored: &StoredObject,
     decoder: impl FnOnce(&[u8]) -> std::result::Result<T, CanonicalObjectError>,

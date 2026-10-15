@@ -10,7 +10,7 @@ use std::path::Path;
 
 use remote_support::{fails, git, ok, ok_json, serve, write_config};
 
-const COMMITS: usize = 60;
+const COMMITS: usize = 80;
 
 /// Commits `COMMITS` changes to a Git repository under `root`, one file each, and
 /// returns it.

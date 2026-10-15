@@ -31,29 +31,20 @@ CREATE TABLE verified_tree_auth (
     height INTEGER NOT NULL
 ) WITHOUT ROWID;
 
--- Semantic receipts remain context-specific: aggregate membership and a view's
--- visible manifest are independent of structural tree authentication.
+-- Semantic receipts remain context-specific: aggregate membership is
+-- independent of structural tree authentication.
 CREATE TABLE verified_tree_semantics (
     tree_id BLOB NOT NULL,
     aggregate_id BLOB NOT NULL,
-    visible_id BLOB NOT NULL,
-    PRIMARY KEY (tree_id, aggregate_id, visible_id)
+    PRIMARY KEY (tree_id, aggregate_id)
 ) WITHOUT ROWID;
 
--- Current DFS path's file-content multiplicities. This keeps branch state
--- disk-backed and bounded without cloning whole trees for sibling views.
+-- One tree's file-content multiplicities, compared against its view's content
+-- map when a lineage edge cannot be checked by diff. Disk-backed so a large tree
+-- stays bounded in memory.
 CREATE TABLE tree_content_counts (
     content_id BLOB PRIMARY KEY NOT NULL,
     count INTEGER NOT NULL CHECK (count > 0)
-) WITHOUT ROWID;
-
--- Before-images for one unresolved branch. Unlike SQLite savepoints, this
--- journal restores only count state and never rolls back authenticated receipts.
-CREATE TABLE tree_content_undo (
-    mark_id INTEGER NOT NULL,
-    content_id BLOB NOT NULL,
-    prior_count INTEGER NOT NULL CHECK (prior_count >= 0),
-    PRIMARY KEY (mark_id, content_id)
 ) WITHOUT ROWID;
 -- A radix node can be reused under different incoming prefixes. Receipts must
 -- name that reconstructed prefix as well as the external validation context.

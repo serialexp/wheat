@@ -406,23 +406,16 @@ impl Repository {
         for view in self.views.values() {
             insert_tree_object(&mut objects, &view.tree);
             insert_canonical_object(&mut objects, view.id.into(), view.canonical_bytes());
-            required_content.extend(view.required_content.iter().copied());
+            required_content.extend(view.required_content.keys().copied());
             crate::build_view_record(view, &mut |object: CanonicalObject| {
                 insert_canonical_object(&mut objects, object.id, object.bytes);
             });
-            let manifest_bytes = crate::wire::content_manifest_bytes(&view.required_content);
-            let manifest_id = crate::wire::content_manifest_id(&view.required_content);
-            insert_canonical_object(&mut objects, manifest_id.into(), manifest_bytes);
         }
-        crate::build_content_manifest_record(&required_content, &mut |object: CanonicalObject| {
-            insert_canonical_object(&mut objects, object.id, object.bytes);
-        });
-        let aggregate_manifest_bytes = crate::wire::content_manifest_bytes(&required_content);
-        let aggregate_manifest_id = crate::wire::content_manifest_id(&required_content);
-        insert_canonical_object(
-            &mut objects,
-            aggregate_manifest_id.into(),
-            aggregate_manifest_bytes,
+        let aggregate = crate::build_content_set(
+            required_content.iter().copied(),
+            &mut |object: CanonicalObject| {
+                insert_canonical_object(&mut objects, object.id, object.bytes);
+            },
         );
 
         let view_lineage = crate::build_view_lineage_map(
@@ -436,7 +429,7 @@ impl Repository {
             base_view: self.base_view,
             change_objects,
             view_lineage,
-            required_content: aggregate_manifest_id,
+            required_content: aggregate,
             retained_changes,
             retained_views: self.views.keys().copied().collect(),
             retained_revisions: self.revisions.keys().copied().collect(),

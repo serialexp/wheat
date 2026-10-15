@@ -140,7 +140,10 @@ fn every_semantic_record_roundtrips_canonical_bytes() {
             CanonicalObjectKind::View => {
                 decode_view_record(&object.bytes).unwrap().canonical_bytes()
             }
-            CanonicalObjectKind::ContentManifest => decode_content_manifest_record(&object.bytes)
+            CanonicalObjectKind::ContentMapNode => decode_content_map_node(&object.bytes)
+                .unwrap()
+                .canonical_bytes(),
+            CanonicalObjectKind::ContentSetNode => decode_content_set_node(&object.bytes)
                 .unwrap()
                 .canonical_bytes(),
             CanonicalObjectKind::RepositoryState => decode_repository_state_record(&object.bytes)

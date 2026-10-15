@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use wheat_core::{
     CanonicalObjectError, ContentId, DirectoryEntry, ObjectId, RepositoryStateId, ViewId,
-    decode_application_map_node, decode_content_manifest_record, decode_directory_node,
+    decode_application_map_node, decode_content_map_node, decode_directory_node,
     decode_repository_state_record, decode_revision_map_node, decode_view_record,
 };
 
@@ -107,13 +107,14 @@ struct ViewRoots {
     tree: Digest,
     revisions: Digest,
     applications: Digest,
-    content_set: Digest,
+    content: Digest,
 }
 
 #[derive(Clone, Copy)]
 enum MapKind {
     Revision,
     Application,
+    Content,
 }
 
 struct Proposals {
@@ -262,9 +263,14 @@ pub(crate) async fn plan_history_deltas<S: ImmutableObjectStore>(
             newer.applications,
         )
         .await?;
-        if older.content_set != newer.content_set {
-            proposals.propose(older.content_set, newer.content_set)?;
-        }
+        pair_maps(
+            store,
+            &mut proposals,
+            MapKind::Content,
+            older.content,
+            newer.content,
+        )
+        .await?;
     }
     stats.proposals = proposals.bases.len() as u64;
     stats.conflicts = proposals
@@ -310,13 +316,11 @@ async fn view_roots<S: ImmutableObjectStore>(
     id: ViewId,
 ) -> Result<ViewRoots, HistoryPlanError> {
     let view = decode_view_record(&read(store, *id.as_bytes()).await?)?;
-    let manifest =
-        decode_content_manifest_record(&read(store, *view.required_content.as_bytes()).await?)?;
     Ok(ViewRoots {
         tree: *view.tree.as_bytes(),
         revisions: *view.revisions.as_bytes(),
         applications: *view.applications.as_bytes(),
-        content_set: *manifest.content.as_bytes(),
+        content: *view.required_content.as_bytes(),
     })
 }
 
@@ -340,6 +344,11 @@ async fn map_children<S: ImmutableObjectStore>(
             .map(|child| (child.edge, *child.child.as_bytes()))
             .collect(),
         MapKind::Application => decode_application_map_node(&bytes)?
+            .children
+            .into_iter()
+            .map(|child| (child.edge, *child.child.as_bytes()))
+            .collect(),
+        MapKind::Content => decode_content_map_node(&bytes)?
             .children
             .into_iter()
             .map(|child| (child.edge, *child.child.as_bytes()))
@@ -406,8 +415,8 @@ async fn pair_maps<S: ImmutableObjectStore>(
     Ok(())
 }
 
-/// Every pairable object reachable from a view (its directories, both maps'
-/// radix nodes, and its content set) into `into`, and its files' content into
+/// Every pairable object reachable from a view (its directories and its three
+/// maps' radix nodes) into `into`, and its files' content into
 /// `content`'s tips. A directory already in `into` was walked by an earlier
 /// view, so shared subtrees are read once.
 async fn reachable_from_view<S: ImmutableObjectStore>(
@@ -431,6 +440,7 @@ async fn reachable_from_view<S: ImmutableObjectStore>(
     for (kind, root) in [
         (MapKind::Revision, view.revisions),
         (MapKind::Application, view.applications),
+        (MapKind::Content, view.content),
     ] {
         let mut nodes = vec![root];
         while let Some(node) = nodes.pop() {
@@ -439,7 +449,6 @@ async fn reachable_from_view<S: ImmutableObjectStore>(
             }
         }
     }
-    into.insert(view.content_set);
     Ok(())
 }
 
@@ -615,11 +624,8 @@ mod tests {
         // Older roots delta against the next view's roots.
         assert_eq!(plan.bases.get(&base.tree), Some(&first.tree));
         assert_eq!(plan.bases.get(&first.tree), Some(&second.tree));
-        assert_eq!(plan.bases.get(&base.content_set), Some(&first.content_set));
-        assert_eq!(
-            plan.bases.get(&first.content_set),
-            Some(&second.content_set)
-        );
+        assert_eq!(plan.bases.get(&base.content), Some(&first.content));
+        assert_eq!(plan.bases.get(&first.content), Some(&second.content));
         // The tip view stays whole.
         let (tip, _) = fixture.tips(&[second_view]).await;
         assert!(plan.bases.keys().all(|target| !tip.contains(target)));
@@ -638,7 +644,7 @@ mod tests {
         assert_eq!(plan.stats.single_parent_edges, 2);
         assert!(plan.stats.conflicts > 0, "{:?}", plan.stats);
         assert!(!plan.bases.contains_key(&base.tree));
-        assert!(!plan.bases.contains_key(&base.content_set));
+        assert!(!plan.bases.contains_key(&base.content));
         // Both children are tips, so nothing they reach is a target.
         let (tips, _) = fixture.tips(&[left, right]).await;
         assert!(plan.bases.keys().all(|target| !tips.contains(target)));

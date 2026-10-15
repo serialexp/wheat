@@ -1,7 +1,7 @@
 //! Explicit reference-model hydration. Unlike lazy reads, this intentionally
 //! loads retained history into memory and is not the streaming-import path.
 use crate::{
-    ApplicationMapStore, ConflictSetStore, ContentSetStore, ImmutableObjectStore, MerkleTreeStore,
+    ApplicationMapStore, ConflictSetStore, ContentMapStore, ImmutableObjectStore, MerkleTreeStore,
     RepositoryPublicationError, RepositoryReader, RetainedSetStore, RevisionMapStore,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,13 +85,12 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             while let Some(id) = conflicts.next().await? {
                 unresolved_conflicts.insert(id);
             }
-            let mut required_content = BTreeSet::new();
-            let content_root = self.manifest(record.required_content).await?.content;
-            let mut contents = ContentSetStore::new(self.objects)
-                .cursor(content_root)
+            let mut required_content = BTreeMap::new();
+            let mut contents = ContentMapStore::new(self.objects)
+                .cursor(record.required_content)
                 .await?;
-            while let Some(id) = contents.next().await? {
-                required_content.insert(id);
+            while let Some((id, count)) = contents.next().await? {
+                required_content.insert(id, count);
             }
             views.push(RepositoryView {
                 id,

@@ -33,11 +33,12 @@ pub use branch_records::{
 };
 pub use collection::{
     ApplicationMapChild, ApplicationMapNode, ChangeMapChild, ChangeMapNode, ConflictSetChild,
-    ConflictSetNode, RetainedSetChild, RetainedSetNode, ViewLineageMapChild, ViewLineageMapNode,
+    ConflictSetNode, ContentMapChild, ContentMapNode, ContentSetChild, ContentSetNode,
+    RetainedSetChild, RetainedSetNode, ViewLineageMapChild, ViewLineageMapNode,
 };
 pub use collection_builders::{
-    build_application_map, build_change_map, build_conflict_set, build_retained_set,
-    build_revision_map, build_view_lineage_map,
+    build_application_map, build_change_map, build_conflict_set, build_content_map,
+    build_content_set, build_retained_set, build_revision_map, build_view_lineage_map,
 };
 pub use content_generation_wire::{
     CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationWireEntry, ContentGenerationWireError,
@@ -50,10 +51,9 @@ pub use edit_records::{EditOperation, EditRecord, decode_edit_record};
 pub use hydration::{hydrate_application, hydrate_revision};
 pub use id::{
     ApplicationId, ApplicationMapId, ChangeId, ChangeMapId, ChangeObjectId, ConflictId,
-    ConflictSetId, ContentId, ContentManifestId, ContentSetId, EditId, ObjectId,
-    ParseContentIdError, ParseDigestIdError, RepositoryEnvelopeId, RepositoryStateId,
-    RetainedSetId, RevisionId, RevisionMapId, TreeId, ViewId, ViewLabelManifestId,
-    ViewLineageMapId,
+    ConflictSetId, ContentId, ContentMapId, ContentSetId, EditId, ObjectId, ParseContentIdError,
+    ParseDigestIdError, RepositoryEnvelopeId, RepositoryStateId, RetainedSetId, RevisionId,
+    RevisionMapId, TreeId, ViewId, ViewLabelManifestId, ViewLineageMapId,
 };
 pub use model::{
     Actor, Application, ApplicationResult, AppliedEditEvidence, ByteRange, CanonicalObject, Change,
@@ -63,14 +63,12 @@ pub use model::{
     RepositoryView, RevisionEdits, RevisionMapChild, RevisionMapNode, RevisionMetadata,
     SourceProvenance, Timestamp, Tree,
 };
-pub use persisted::{ContentManifestRecord, RepositoryStateRecord, ViewRecord};
+pub use persisted::{RepositoryStateRecord, ViewRecord};
 pub use repository::{
     ChangeProposal, Repository, RepositoryError, RepositoryParts, RevisionOutcome, RevisionRequest,
     RevisionsOutcome, TargetPolicyResult,
 };
-pub use root_builders::{
-    build_content_manifest_record, build_repository_state_record, build_view_record,
-};
+pub use root_builders::{build_repository_state_record, build_view_record};
 pub use segment_records::{
     MAX_PHYSICAL_CATALOG_SEGMENTS, PhysicalCatalogSnapshot, PhysicalContentGeneration,
     PhysicalSegmentDescriptor, SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_FOOTER_ENCODED_SIZE,
@@ -88,9 +86,8 @@ pub use semantic_records::{
     decode_change, decode_conflict, decode_revision_record,
 };
 pub use wire::{
-    CanonicalObjectError, CanonicalObjectKind, ContentSetBlob, content_set_delta_bytes,
-    content_set_snapshot_bytes, decode_application_map_node, decode_change_map_node,
-    decode_conflict_set_node, decode_content_manifest_record, decode_content_set_blob,
+    CanonicalObjectError, CanonicalObjectKind, decode_application_map_node, decode_change_map_node,
+    decode_conflict_set_node, decode_content_map_node, decode_content_set_node,
     decode_directory_node, decode_repository_envelope_record, decode_repository_state_record,
     decode_retained_set_node, decode_revision_map_node, decode_view_label_manifest_record,
     decode_view_lineage_map_node, decode_view_record, validate_canonical_object,

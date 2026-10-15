@@ -5,16 +5,15 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use wheat_core::{
     ApplicationId, ApplicationRecord, ApplicationResultRecord, AppliedEditEvidence, ByteRange,
-    CanonicalObjectError, Change, ChangeId, ChangeObjectId, ChangeProposal, ContentIo,
-    ContentManifestRecord, EditId, RevisionId, RevisionRecord, Tree, ViewId, ViewRecord,
-    decode_view_record,
+    CanonicalObjectError, Change, ChangeId, ChangeObjectId, ChangeProposal, ContentIo, EditId,
+    RevisionId, RevisionRecord, Tree, ViewId, ViewRecord, decode_view_record,
     edit_application::{ApplicationError, ApplicationLimits, ApplicationOutcome, apply_edits},
 };
 
 use crate::{
-    ApplicationMapError, ApplicationMapStore, CollectionError, ConflictSetStore, ContentSetStore,
-    ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
-    ObjectKind, ObjectStoreError, RevisionMapError, RevisionMapStore, TreeEdit,
+    ApplicationMapError, ApplicationMapStore, CollectionError, ConflictSetStore, ContentMapError,
+    ContentMapStore, ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError,
+    MerkleTreeStore, ObjectKind, ObjectStoreError, RevisionMapError, RevisionMapStore, TreeEdit,
     merkle_tree::TreePathShape,
 };
 
@@ -40,6 +39,8 @@ pub enum CommitWriterError {
     Applications(#[from] ApplicationMapError),
     #[error("set operation failed")]
     Sets(#[from] CollectionError),
+    #[error("content map operation failed")]
+    ContentMap(#[from] ContentMapError),
     #[error("canonical object is invalid")]
     Canonical(#[from] CanonicalObjectError),
     #[error("proposal has more than one dependency")]
@@ -94,16 +95,13 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         let revisions = RevisionMapStore::new(self.objects).empty_root().await?;
         let applications = ApplicationMapStore::new(self.objects).empty_root().await?;
         let unresolved_conflicts = ConflictSetStore::new(self.objects).empty_root().await?;
-        let content = ContentSetStore::new(self.objects).empty_root().await?;
-        let manifest = ContentManifestRecord { content };
-        self.put(manifest.id().into(), &manifest.canonical_bytes())
-            .await?;
+        let required_content = ContentMapStore::new(self.objects).empty_root().await?;
         let view = ViewRecord {
             tree,
             revisions,
             applications,
             unresolved_conflicts,
-            required_content: manifest.id(),
+            required_content,
         };
         self.put(view.id().into(), &view.canonical_bytes()).await?;
         Ok(view.id())
@@ -279,28 +277,23 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         let application_root = ApplicationMapStore::new(self.objects)
             .insert(parent_record.applications, proposal.id, application_id)
             .await?;
-        // A view manifest is the visible resulting tree only.  Edit definitions and evidence
-        // retain their historical blobs through repository finalization, not through this root.
-        let content_root = crate::commit_content::update_content(
+        // A view's content map is the visible resulting tree only.  Edit definitions and
+        // evidence retain their historical blobs through repository finalization, not through
+        // this root.
+        let required_content = crate::commit_content::update_content(
             self.objects,
             parent_record.required_content,
-            resulting_tree,
             paths
                 .keys()
                 .map(|path| (target.get(path).copied(), output.tree.get(path).copied())),
         )
         .await?;
-        let manifest = ContentManifestRecord {
-            content: content_root,
-        };
-        self.put(manifest.id().into(), &manifest.canonical_bytes())
-            .await?;
         let view = ViewRecord {
             tree: resulting_tree,
             revisions: revision_root,
             applications: application_root,
             unresolved_conflicts: parent_record.unresolved_conflicts,
-            required_content: manifest.id(),
+            required_content,
         };
         let resulting_view = view.id();
         self.put(resulting_view.into(), &view.canonical_bytes())

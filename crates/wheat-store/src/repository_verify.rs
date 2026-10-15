@@ -9,16 +9,13 @@ use async_trait::async_trait;
 use lru::LruCache;
 
 use crate::{
-    ApplicationMapStore, ConflictSetStore, ContentSetStore, ContentStoreError,
-    ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryPublicationError,
-    RepositoryReader, RetainedSetStore, StoredObject, TreeDiffLimits,
+    ApplicationMapStore, ConflictSetStore, ContentMapDelta, ContentMapError, ContentMapStore,
+    ContentSetStore, ContentStoreError, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError,
+    RepositoryPublicationError, RepositoryReader, RetainedSetStore, StoredObject, TreeDiffLimits,
     application_map::ApplicationCollection,
     radix::{ContextWalkStep, DiffLimits, PairedContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
-    sets::ContentSetDelta,
-    verification_scratch::{
-        RadixReceiptKind, TreeCountMark, VerificationScratch, VerificationScratchError,
-    },
+    verification_scratch::{RadixReceiptKind, VerificationScratch},
 };
 use wheat_core::*;
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
@@ -35,7 +32,6 @@ pub enum RepositoryValidationPhase {
     VerifyContent,
     VerifyChanges,
     VerifyLineage,
-    VerifyViewContentSets,
     VerifyViewTrees,
     VerifyViewRevisionMaps,
     VerifyViewApplicationMaps,
@@ -51,7 +47,6 @@ impl RepositoryValidationPhase {
             Self::VerifyContent => "verify_content",
             Self::VerifyChanges => "verify_changes",
             Self::VerifyLineage => "verify_lineage",
-            Self::VerifyViewContentSets => "verify_view_content_sets",
             Self::VerifyViewTrees => "verify_view_trees",
             Self::VerifyViewRevisionMaps => "verify_view_revision_maps",
             Self::VerifyViewApplicationMaps => "verify_view_application_maps",
@@ -78,12 +73,12 @@ fn tree_delta_limit(error: &crate::MerkleTreeError) -> bool {
     )
 }
 
-fn content_delta_limit(error: &crate::CollectionError) -> bool {
+fn content_delta_limit(error: &ContentMapError) -> bool {
     matches!(
         error,
-        crate::CollectionError::DeltaChangeLimitExceeded { .. }
-            | crate::CollectionError::DeltaNodeLimitExceeded { .. }
-            | crate::CollectionError::DeltaPendingLimitExceeded { .. }
+        ContentMapError::DeltaChangeLimitExceeded { .. }
+            | ContentMapError::DeltaNodeLimitExceeded { .. }
+            | ContentMapError::DeltaPendingLimitExceeded { .. }
     )
 }
 
@@ -187,18 +182,13 @@ struct LineageGraph {
     children_by_parent: BTreeMap<ViewId, Vec<ViewId>>,
 }
 
-#[allow(clippy::large_enum_variant)] // DFS frames carry the current decoded view; no per-frame allocation.
-enum ViewTreeFrame {
-    Children {
-        view_id: ViewId,
-        view: ViewRecord,
-        visible: ContentSetId,
-        depth: usize,
-        next_child: usize,
-    },
-    Exit {
-        rollback: Option<TreeCountMark>,
-    },
+/// A view whose tree and content map are proven equal, and the next of its lineage
+/// children to check against it.
+struct ViewTreeFrame {
+    view_id: ViewId,
+    view: ViewRecord,
+    depth: usize,
+    next_child: usize,
 }
 
 impl<O, F> Verifier<'_, '_, O, F>
@@ -294,56 +284,25 @@ where
         Ok(())
     }
 
-    async fn tree(
-        &self,
-        root: TreeId,
-        aggregate: ContentSetId,
-        visible: Option<ContentSetId>,
-    ) -> Result<()> {
+    /// Every file of the tree names content in the aggregate.
+    async fn tree(&self, root: TreeId, aggregate: ContentSetId) -> Result<()> {
         self.authenticate_tree(root).await?;
-        if self
-            .scratch
-            .tree_semantics_verified(root, aggregate, visible)?
-        {
+        if self.scratch.tree_semantics_verified(root, aggregate)? {
             return Ok(());
         }
         let trees = MerkleTreeStore::new(self.reader.objects);
-        // Resolved once, on the first file: a membership query resolves the whole set, so
-        // one per file would make this walk quadratic in the view's size.
-        let mut visible_members: Option<Vec<ContentId>> = None;
         let mut stack = vec![(root, trees.read_node(root).await?.entries.into_values())];
         while let Some((node, frame)) = stack.last_mut() {
             match frame.next() {
                 None => {
-                    // Only memoize a subtree after every descendant passed in
-                    // this exact aggregate/visible-manifest context.
-                    self.scratch
-                        .record_tree_semantics(*node, aggregate, visible)?;
+                    // Only memoize a subtree after every descendant passed against
+                    // this exact aggregate.
+                    self.scratch.record_tree_semantics(*node, aggregate)?;
                     stack.pop();
                 }
-                Some(DirectoryEntry::File(value)) => {
-                    self.required(value.content)?;
-                    if let Some(visible) = visible {
-                        if visible_members.is_none() {
-                            visible_members = Some(
-                                ContentSetStore::new(self.reader.objects)
-                                    .resolve(visible)
-                                    .await?,
-                            );
-                        }
-                        if visible_members
-                            .as_deref()
-                            .is_some_and(|members| members.binary_search(&value.content).is_err())
-                        {
-                            return Err(invalid("visible file absent from view manifest"));
-                        }
-                    }
-                }
+                Some(DirectoryEntry::File(value)) => self.required(value.content)?,
                 Some(DirectoryEntry::Directory(id)) => {
-                    if !self
-                        .scratch
-                        .tree_semantics_verified(id, aggregate, visible)?
-                    {
+                    if !self.scratch.tree_semantics_verified(id, aggregate)? {
                         stack.push((id, trees.read_node(id).await?.entries.into_values()));
                     }
                 }
@@ -352,15 +311,90 @@ where
         Ok(())
     }
 
-    async fn seed_tree_content_counts(&self, root: TreeId) -> Result<()> {
-        self.scratch.replace_tree_content_counts()?;
+    /// The view's content map counts exactly the tree entries naming each blob (I7).
+    /// Reads the whole tree and map: the fallback when an edge can't be checked by diff.
+    async fn content_map_matches_tree(&self, tree: TreeId, map: ContentMapId) -> Result<()> {
+        self.scratch.clear_tree_content_counts()?;
         let trees = MerkleTreeStore::new(self.reader.objects);
-        let mut contents = trees.content_cursor(root, Default::default()).await?;
+        let mut contents = trees.content_cursor(tree, Default::default()).await?;
         while let Some(file) = contents.next().await? {
-            self.required(file.content)?;
             self.scratch.adjust_tree_content_count(file.content, 1)?;
         }
+        let mut entries = ContentMapStore::new(self.reader.objects)
+            .cursor(map)
+            .await?;
+        let mut count = 0u64;
+        while let Some((content, named)) = entries.next().await? {
+            if self.scratch.tree_content_count(content)? != u64::from(named) {
+                return Err(invalid("view content map differs from its tree"));
+            }
+            count += 1;
+        }
+        if count != self.scratch.tree_content_entries()? {
+            return Err(invalid("view content map differs from its tree"));
+        }
         Ok(())
+    }
+
+    /// Checks a lineage edge whose parent map is already proven equal to the parent's
+    /// tree: the child's map must differ from the parent's by exactly the tree diff, so
+    /// it equals the child's tree too. Returns false when a diff exceeds its limits and
+    /// the edge needs [`Self::content_map_matches_tree`] instead.
+    async fn content_map_follows_tree_diff(
+        &self,
+        parent: &ViewRecord,
+        child: &ViewRecord,
+    ) -> Result<bool> {
+        let mut net = BTreeMap::<ContentId, i64>::new();
+        let mut diff = MerkleTreeStore::new(self.reader.objects).diff_cursor(
+            parent.tree,
+            child.tree,
+            TreeDiffLimits::default(),
+        );
+        loop {
+            let change = match diff.next().await {
+                Ok(Some(change)) => change,
+                Ok(None) => break,
+                Err(error) if tree_delta_limit(&error) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(old) = change.old {
+                *net.entry(old.content).or_default() -= 1;
+            }
+            if let Some(new) = change.new {
+                self.required(new.content)?;
+                *net.entry(new.content).or_default() += 1;
+            }
+        }
+        net.retain(|_, change| *change != 0);
+        let changes = match ContentMapStore::new(self.reader.objects)
+            .delta(
+                parent.required_content,
+                child.required_content,
+                Default::default(),
+            )
+            .await
+        {
+            Ok(changes) => changes,
+            Err(error) if content_delta_limit(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if changes.len() != net.len() {
+            return Err(invalid("view content map differs from its tree"));
+        }
+        for change in changes {
+            let (content, change) = match change {
+                ContentMapDelta::Added { content, count } => (content, i64::from(count)),
+                ContentMapDelta::Changed { content, old, new } => {
+                    (content, i64::from(new) - i64::from(old))
+                }
+                ContentMapDelta::Removed { content, count } => (content, -i64::from(count)),
+            };
+            if net.get(&content) != Some(&change) {
+                return Err(invalid("view content map differs from its tree"));
+            }
+        }
+        Ok(true)
     }
 
     async fn verify_view_trees_by_lineage_delta(
@@ -369,178 +403,64 @@ where
         aggregate: ContentSetId,
         graph: &LineageGraph,
     ) -> Result<()> {
+        // The base is checked in full; each other view is checked once, against the
+        // first lineage parent that reaches it, so by induction from the base every
+        // view's content map equals its tree's content.
         let base = self.reader.view(state.base_view).await?;
-        let base_visible = self.reader.manifest(base.required_content).await?.content;
-        self.tree(base.tree, aggregate, Some(base_visible)).await?;
-        self.seed_tree_content_counts(base.tree).await?;
+        self.tree(base.tree, aggregate).await?;
+        self.content_map_matches_tree(base.tree, base.required_content)
+            .await?;
 
-        let trees = MerkleTreeStore::new(self.reader.objects);
-        let contents = ContentSetStore::new(self.reader.objects);
         let mut completed = BTreeSet::from([state.base_view]);
-        let mut stack = vec![ViewTreeFrame::Children {
+        let mut stack = vec![ViewTreeFrame {
             view_id: state.base_view,
             view: base,
-            visible: base_visible,
             depth: 0,
             next_child: 0,
         }];
-        while let Some(frame) = stack.pop() {
-            match frame {
-                ViewTreeFrame::Exit { rollback } => {
-                    if let Some(mark) = rollback {
-                        self.scratch.restore_tree_content_mark(mark)?;
-                    }
-                }
-                ViewTreeFrame::Children {
-                    view_id,
-                    view,
-                    visible,
-                    depth,
-                    next_child,
-                } => {
-                    let children = graph
-                        .children_by_parent
-                        .get(&view_id)
-                        .map_or(&[][..], Vec::as_slice);
-                    if next_child == children.len() {
-                        continue;
-                    }
-                    stack.push(ViewTreeFrame::Children {
-                        view_id,
-                        view,
-                        visible,
-                        depth,
-                        next_child: next_child + 1,
-                    });
-                    let child_id = children[next_child];
-                    if !completed.insert(child_id) {
-                        continue;
-                    }
-                    let child = self.reader.view(child_id).await?;
-                    let child_visible = self.reader.manifest(child.required_content).await?.content;
-                    self.authenticate_tree(child.tree).await?;
-                    let child_depth = depth.checked_add(1).ok_or_else(|| {
-                        invalid("view lineage traversal depth exceeds verification limit")
-                    })?;
-                    let mut rollback = (next_child + 1 < children.len())
-                        .then(|| self.scratch.begin_tree_content_mark())
-                        .transpose()?;
-
-                    let mut diff =
-                        trees.diff_cursor(view.tree, child.tree, TreeDiffLimits::default());
-                    let mut added = BTreeSet::new();
-                    let mut fallback = false;
-                    loop {
-                        let change = match diff.next().await {
-                            Ok(change) => change,
-                            Err(error) if tree_delta_limit(&error) => {
-                                fallback = true;
-                                break;
-                            }
-                            Err(error) => return Err(error.into()),
-                        };
-                        let Some(change) = change else {
-                            break;
-                        };
-                        if let Some(old) = change.old {
-                            match self.scratch.adjust_tree_content_count(old.content, -1) {
-                                Ok(()) => {}
-                                Err(VerificationScratchError::TreeContentCountUnderflow {
-                                    ..
-                                }) => {
-                                    fallback = true;
-                                    break;
-                                }
-                                Err(error) => return Err(error.into()),
-                            }
-                        }
-                        if let Some(new) = change.new {
-                            self.required(new.content)?;
-                            self.scratch.adjust_tree_content_count(new.content, 1)?;
-                            added.insert(new.content);
-                        }
-                    }
-                    if fallback {
-                        // A counter inconsistency cannot weaken the proof. Restore the
-                        // parent state and use the complete existing semantic walk for
-                        // this edge, then seed its exact child state for descendants.
-                        if let Some(mark) = rollback.take() {
-                            self.scratch.restore_tree_content_mark(mark)?;
-                            rollback = Some(self.scratch.begin_tree_content_mark()?);
-                        } else {
-                            self.seed_tree_content_counts(view.tree).await?;
-                        }
-                        self.tree(child.tree, aggregate, Some(child_visible))
-                            .await?;
-                        self.seed_tree_content_counts(child.tree).await?;
-                    } else {
-                        let manifest_delta = contents
-                            .delta(visible, child_visible, Default::default())
-                            .await;
-                        match manifest_delta {
-                            Ok(changes) => {
-                                for change in changes {
-                                    if let ContentSetDelta::Removed(content) = change
-                                        && self.scratch.tree_content_count(content)? != 0
-                                    {
-                                        return Err(invalid(
-                                            "visible file absent from view manifest",
-                                        ));
-                                    }
-                                }
-                                // One resolution serves every added file; a membership
-                                // query per file would resolve the whole set each time.
-                                if !added.is_empty() {
-                                    let members = contents.resolve(child_visible).await?;
-                                    if added
-                                        .iter()
-                                        .any(|content| members.binary_search(content).is_err())
-                                    {
-                                        return Err(invalid(
-                                            "visible file absent from view manifest",
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(error) if content_delta_limit(&error) => {
-                                if let Some(mark) = rollback.take() {
-                                    self.scratch.restore_tree_content_mark(mark)?;
-                                    rollback = Some(self.scratch.begin_tree_content_mark()?);
-                                } else {
-                                    self.seed_tree_content_counts(view.tree).await?;
-                                }
-                                self.tree(child.tree, aggregate, Some(child_visible))
-                                    .await?;
-                                self.seed_tree_content_counts(child.tree).await?;
-                            }
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    stack.push(ViewTreeFrame::Exit { rollback });
-                    stack.push(ViewTreeFrame::Children {
-                        view_id: child_id,
-                        view: child,
-                        visible: child_visible,
-                        depth: child_depth,
-                        next_child: 0,
-                    });
-                }
+        while let Some(ViewTreeFrame {
+            view_id,
+            view,
+            depth,
+            next_child,
+        }) = stack.pop()
+        {
+            let children = graph
+                .children_by_parent
+                .get(&view_id)
+                .map_or(&[][..], Vec::as_slice);
+            if next_child == children.len() {
+                continue;
             }
+            stack.push(ViewTreeFrame {
+                view_id,
+                view,
+                depth,
+                next_child: next_child + 1,
+            });
+            let child_id = children[next_child];
+            if !completed.insert(child_id) {
+                continue;
+            }
+            let child = self.reader.view(child_id).await?;
+            self.authenticate_tree(child.tree).await?;
+            let child_depth = depth.checked_add(1).ok_or_else(|| {
+                invalid("view lineage traversal depth exceeds verification limit")
+            })?;
+            if !self.content_map_follows_tree_diff(&view, &child).await? {
+                self.tree(child.tree, aggregate).await?;
+                self.content_map_matches_tree(child.tree, child.required_content)
+                    .await?;
+            }
+            stack.push(ViewTreeFrame {
+                view_id: child_id,
+                view: child,
+                depth: child_depth,
+                next_child: 0,
+            });
         }
         if completed != graph.retained {
             return Err(invalid("retained view is unreachable from base lineage"));
-        }
-        Ok(())
-    }
-
-    async fn visible_set(&self, root: ContentSetId, _aggregate: ContentSetId) -> Result<()> {
-        // With flat sorted blobs, resolve the content set and verify each member
-        // exists in the aggregate content index.
-        let members = ContentSetStore::new(self.reader.objects)
-            .resolve(root)
-            .await?;
-        for content in members {
-            self.required(content)?;
         }
         Ok(())
     }
@@ -941,7 +861,7 @@ where
     async fn validate(&mut self, id: RepositoryStateId) -> Result<()> {
         (self.observer)(RepositoryValidationPhase::LoadState);
         let state = self.reader.state(id).await?;
-        let aggregate = self.reader.manifest(state.required_content).await?.content;
+        let aggregate = state.required_content;
 
         // Authenticate each retained inventory once and use exact disk-backed
         (self.observer)(RepositoryValidationPhase::IndexRetained);
@@ -1016,16 +936,6 @@ where
             .await
             .map_err(|_| invalid("invalid view lineage"))?;
         let lineage = self.verify_lineage_semantics(&state).await?;
-        (self.observer)(RepositoryValidationPhase::VerifyViewContentSets);
-        let mut cursor = retained.cursor(state.retained_views).await?;
-        while let Some(id) = cursor.next().await? {
-            let view = self
-                .reader
-                .view(ViewId::from_digest(*id.as_bytes()))
-                .await?;
-            let visible = self.reader.manifest(view.required_content).await?.content;
-            self.visible_set(visible, aggregate).await?;
-        }
         (self.observer)(RepositoryValidationPhase::VerifyViewTrees);
         self.verify_view_trees_by_lineage_delta(&state, aggregate, &lineage)
             .await?;
@@ -1086,7 +996,7 @@ where
                     return Err(invalid("predecessor belongs to another change"));
                 }
             }
-            self.tree(revision.resulting_tree, aggregate, None).await?;
+            self.tree(revision.resulting_tree, aggregate).await?;
             let transition = &revision.transition;
             if !transition.preserved.is_disjoint(&transition.added)
                 || transition
@@ -1191,14 +1101,14 @@ where
             let target = self.reader.view(app.target_view).await?;
             let (result_root, claimed_conflict) = match app.result {
                 ApplicationResultRecord::Clean { tree } => {
-                    self.tree(tree, aggregate, None).await?;
+                    self.tree(tree, aggregate).await?;
                     (tree, None)
                 }
                 ApplicationResultRecord::Conflicted {
                     partial_tree,
                     conflict,
                 } => {
-                    self.tree(partial_tree, aggregate, None).await?;
+                    self.tree(partial_tree, aggregate).await?;
                     let conflict_record = self.reader.conflict(conflict).await?;
                     if conflict_record.base_view != app.target_view {
                         return Err(invalid("application conflict target mismatch"));
@@ -1431,6 +1341,169 @@ mod untouched_tests {
         verify(&objects, directory, target, &["shape", "shape/nested"])
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod content_map_tests {
+    use super::*;
+    use crate::LooseObjectStore;
+
+    fn blob(byte: u8) -> ContentId {
+        ContentId::from_digest([byte; 32])
+    }
+
+    async fn tree(objects: &LooseObjectStore, files: &[(&str, u8)]) -> TreeId {
+        MerkleTreeStore::new(objects)
+            .write_node(&DirectoryNode {
+                entries: files
+                    .iter()
+                    .map(|(name, byte)| {
+                        let file = FileValue {
+                            content: blob(*byte),
+                            kind: FileKind::Regular,
+                        };
+                        ((*name).to_owned(), DirectoryEntry::File(file))
+                    })
+                    .collect(),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn map(objects: &LooseObjectStore, counts: &[(u8, i64)]) -> ContentMapId {
+        let maps = ContentMapStore::new(objects);
+        maps.adjust(
+            maps.empty_root().await.unwrap(),
+            counts.iter().map(|(byte, count)| (blob(*byte), *count)),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn view(tree: TreeId, required_content: ContentMapId) -> ViewRecord {
+        ViewRecord {
+            tree,
+            revisions: RevisionMapId::from_digest([0; 32]),
+            applications: ApplicationMapId::from_digest([0; 32]),
+            unresolved_conflicts: ConflictSetId::from_digest([0; 32]),
+            required_content,
+        }
+    }
+
+    /// Runs `check` with a verifier whose aggregate holds blobs 1 to 9.
+    async fn with_verifier<T>(
+        objects: &LooseObjectStore,
+        check: impl AsyncFnOnce(&Verifier<'_, '_, LooseObjectStore, fn(RepositoryValidationPhase)>) -> T,
+    ) -> T {
+        let directory = tempfile::tempdir().unwrap();
+        let content = crate::ContentStore::new(directory.path());
+        let reader = RepositoryReader::new(objects, &content);
+        let verifier = Verifier {
+            reader: &reader,
+            scratch: VerificationScratch::new().unwrap(),
+            observer: (|_| {}) as fn(RepositoryValidationPhase),
+        };
+        for byte in 1..=9 {
+            verifier.scratch.insert_content(blob(byte)).unwrap();
+        }
+        check(&verifier).await
+    }
+
+    /// The full comparison, the fallback for an edge too large to diff: every count
+    /// must match, and the map may name nothing the tree does not.
+    #[tokio::test]
+    async fn a_map_must_count_exactly_the_tree_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::new(dir.path());
+        let files = tree(&objects, &[("a", 1), ("b", 1), ("c", 2)]).await;
+        let exact = map(&objects, &[(1, 2), (2, 1)]).await;
+        let undercounted = map(&objects, &[(1, 1), (2, 1)]).await;
+        let extra = map(&objects, &[(1, 2), (2, 1), (3, 1)]).await;
+        let missing = map(&objects, &[(1, 2)]).await;
+        with_verifier(&objects, async |verifier| {
+            verifier
+                .content_map_matches_tree(files, exact)
+                .await
+                .unwrap();
+            for forged in [undercounted, extra, missing] {
+                assert!(
+                    verifier
+                        .content_map_matches_tree(files, forged)
+                        .await
+                        .is_err()
+                );
+            }
+            // Earlier counts do not leak into the next comparison.
+            verifier
+                .content_map_matches_tree(files, exact)
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
+    /// The incremental check: a child map must differ from its parent's by exactly
+    /// the net count changes of the tree diff.
+    #[tokio::test]
+    async fn a_child_map_must_follow_the_tree_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::new(dir.path());
+        let parent = view(
+            tree(&objects, &[("a", 1), ("b", 1)]).await,
+            map(&objects, &[(1, 2)]).await,
+        );
+        // `b` now names blob 2, and new file `c` names blob 1.
+        let child_tree = tree(&objects, &[("a", 1), ("b", 2), ("c", 1)]).await;
+        let exact = map(&objects, &[(1, 2), (2, 1)]).await;
+        let forged = [
+            map(&objects, &[(1, 1), (2, 1)]).await,
+            map(&objects, &[(1, 2), (2, 2)]).await,
+            map(&objects, &[(1, 2), (2, 1), (3, 1)]).await,
+            map(&objects, &[(1, 2)]).await,
+        ];
+        with_verifier(&objects, async |verifier| {
+            assert!(
+                verifier
+                    .content_map_follows_tree_diff(&parent, &view(child_tree, exact))
+                    .await
+                    .unwrap()
+            );
+            for forged in forged {
+                assert!(
+                    verifier
+                        .content_map_follows_tree_diff(&parent, &view(child_tree, forged))
+                        .await
+                        .is_err()
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A blob a child gains must be in the aggregate, even when its map is right.
+    #[tokio::test]
+    async fn a_gained_blob_must_be_in_the_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::new(dir.path());
+        let parent = view(
+            tree(&objects, &[("a", 1)]).await,
+            map(&objects, &[(1, 1)]).await,
+        );
+        let child = view(
+            tree(&objects, &[("a", 1), ("b", 42)]).await,
+            map(&objects, &[(1, 1), (42, 1)]).await,
+        );
+        with_verifier(&objects, async |verifier| {
+            assert!(
+                verifier
+                    .content_map_follows_tree_diff(&parent, &child)
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
     }
 }
 

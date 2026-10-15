@@ -709,10 +709,10 @@ pub struct FetchedContent {
     pub fetched: usize,
 }
 
-/// Fetch the content that `envelope_id`'s content manifest requires and the local
-/// store lacks.
+/// Fetch the content that `envelope_id`'s aggregate content set requires and the
+/// local store lacks.
 ///
-/// With `since`, only content that `since`'s manifest lacks is looked up: the
+/// With `since`, only content that `since`'s set lacks is looked up: the
 /// client keeps an envelope as `since` only once all its content is stored.
 pub async fn fetch_content<O: ImmutableObjectStore>(
     session: &mut WheatSession,
@@ -726,13 +726,20 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
     let required = async |envelope_id| -> Result<_> {
         let envelope = reader.envelope(envelope_id).await?;
         let state = reader.state(envelope.state).await?;
-        Ok(reader.manifest(state.required_content).await?.content)
+        Ok(state.required_content)
     };
     let new = required(envelope_id).await?;
     let content_set = wheat_store::ContentSetStore::new(objects);
     let candidates = match since {
         Some(since) => content_set.added(required(since).await?, new).await?,
-        None => content_set.resolve(new).await?,
+        None => {
+            let mut all = Vec::new();
+            let mut cursor = content_set.cursor(new).await?;
+            while let Some(id) = cursor.next().await? {
+                all.push(id);
+            }
+            all
+        }
     };
     let missing = candidates
         .iter()

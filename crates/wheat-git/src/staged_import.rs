@@ -14,7 +14,7 @@ use wheat_core::{
     edit_application::{ApplicationLimits, ApplicationOutcome, apply_edits},
 };
 use wheat_store::{
-    ApplicationMapStore, CommitWriterError, ConflictSetStore, ContentSetStore, ContentStore,
+    ApplicationMapStore, CommitWriterError, ConflictSetStore, ContentMapStore, ContentStore,
     ContentStoreError, ImmutableObjectStore, MerkleTreeStore, PersistedCommitWriter,
     RepositoryReader, RevisionMapStore, TreePathShape,
 };
@@ -196,7 +196,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     let cached = cache::CachedObjects::new(objects, CACHE_ENTRIES, CACHE_BYTES);
     let mut receipts = ProofReceipts::new(PROOF_RECEIPTS);
     let mut verified_completed = HashSet::new();
-    let mut tree_work = Vec::new();
+    let mut proof_work = ProofWork::default();
 
     // A crash after recording preparation but before promotion leaves mappings that
     // are hints only. Reauthenticate their completed frontier and then the prepared
@@ -217,7 +217,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
                 oid,
                 &mut receipts,
                 &mut verified_completed,
-                &mut tree_work,
+                &mut proof_work,
             )
             .await
             .is_err()
@@ -230,7 +230,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
                     *native,
                     &mut receipts,
                     true,
-                    &mut tree_work,
+                    &mut proof_work,
                 )
                 .await
                 .is_err()
@@ -268,7 +268,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
             &work.oid,
             &mut receipts,
             &mut verified_completed,
-            &mut tree_work,
+            &mut proof_work,
         )
         .await?;
         let oid = gix::ObjectId::from_bytes_or_panic(&work.oid);
@@ -374,6 +374,39 @@ async fn authenticate_tree_once<O: ImmutableObjectStore>(
     Ok(())
 }
 
+/// Authenticates each content-map node once per invocation, at the key position it
+/// is reached at. A view's map shares every subtree its commit did not change with
+/// its parent's, so this costs the nodes views differ in, not views × map size.
+async fn authenticate_content_map_once<O: ImmutableObjectStore>(
+    maps: &ContentMapStore<'_, O>,
+    root: wheat_core::ContentMapId,
+    receipts: &mut ProofReceipts,
+    pending: &mut Vec<(wheat_core::ContentMapId, usize, bool)>,
+) -> Result<(), wheat_store::ContentMapError> {
+    pending.clear();
+    pending.push((root, 0, false));
+    while let Some((node_id, position, visited)) = pending.pop() {
+        let object_id = node_id.into();
+        if receipts.contains_at(1, position, object_id) {
+            continue;
+        }
+        if visited {
+            // Record only after every descendant has authenticated successfully.
+            receipts.record_at(1, position, object_id);
+            continue;
+        }
+        let node = maps.read_node_at(node_id, position).await?;
+        pending.push((node_id, position, true));
+        let below = position + node.prefix.len() + 1;
+        pending.extend(
+            node.children
+                .iter()
+                .map(|child| (child.child, below, false)),
+        );
+    }
+    Ok(())
+}
+
 async fn verify_durable_mapping<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
@@ -418,7 +451,7 @@ async fn authenticate_completed_parents<O: ImmutableObjectStore>(
     oid: &[u8],
     receipts: &mut ProofReceipts,
     verified: &mut HashSet<Vec<u8>>,
-    tree_work: &mut Vec<(wheat_core::TreeId, bool)>,
+    work: &mut ProofWork,
 ) -> Result<(), StagedImportError> {
     for parent in journal.parents(oid)? {
         if verified.contains(&parent) {
@@ -434,7 +467,7 @@ async fn authenticate_completed_parents<O: ImmutableObjectStore>(
             ));
         };
         verify_mapping(
-            objects, content, journal, empty, &parent, native, receipts, false, tree_work,
+            objects, content, journal, empty, &parent, native, receipts, false, work,
         )
         .await?;
         verified.insert(parent);
@@ -536,7 +569,9 @@ fn push(out: &mut Vec<u8>, bytes: &[u8]) {
 /// by a later invocation.
 struct ProofReceipts {
     max: usize,
-    successful: HashSet<(u8, ObjectId)>,
+    /// Kind, key position (radix nodes are validated relative to it; 0 for
+    /// everything else), and object.
+    successful: HashSet<(u8, usize, ObjectId)>,
 }
 
 impl ProofReceipts {
@@ -548,16 +583,32 @@ impl ProofReceipts {
     }
 
     fn contains(&self, kind: u8, root: ObjectId) -> bool {
-        self.successful.contains(&(kind, root))
+        self.contains_at(kind, 0, root)
     }
 
     fn record(&mut self, kind: u8, root: ObjectId) {
+        self.record_at(kind, 0, root);
+    }
+
+    fn contains_at(&self, kind: u8, position: usize, id: ObjectId) -> bool {
+        self.successful.contains(&(kind, position, id))
+    }
+
+    fn record_at(&mut self, kind: u8, position: usize, id: ObjectId) {
         // Bounded proof memoization is an optimization only; when full, repeat
         // verification rather than retaining unbounded state.
         if self.successful.len() < self.max {
-            self.successful.insert((kind, root));
+            self.successful.insert((kind, position, id));
         }
     }
+}
+
+/// Reusable traversal stacks for one invocation's proofs.
+#[derive(Default)]
+struct ProofWork {
+    trees: Vec<(wheat_core::TreeId, bool)>,
+    /// Content-map nodes with the key position each is reached at.
+    content_maps: Vec<(wheat_core::ContentMapId, usize, bool)>,
 }
 
 async fn verify_mapping<O: ImmutableObjectStore>(
@@ -569,7 +620,7 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     n: NativeResult,
     receipts: &mut ProofReceipts,
     allow_prepared_parent: bool,
-    tree_work: &mut Vec<(wheat_core::TreeId, bool)>,
+    work: &mut ProofWork,
 ) -> Result<(), StagedImportError> {
     let bad = |why: &str| StagedImportError::InvalidMapping(hex(oid), why.to_owned());
     if n.change_id != ChangeId::from_import_identity(NAMESPACE, oid) {
@@ -637,19 +688,19 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     // Authenticate every tree node, but only once per invocation. Persistent
     // path-copying shares unchanged subtrees across views; postorder receipts make
     // verification proportional to the union of nodes rather than snapshots × tree.
-    let required_content = reader
-        .manifest(view.required_content)
-        .await
-        .map_err(|e| bad(&e.to_string()))?
-        .content;
-    authenticate_tree_once(&MerkleTreeStore::new(objects), tree, receipts, tree_work)
-        .await
-        .map_err(|error| bad(&error.to_string()))?;
-    authenticate_set_once(
-        &ContentSetStore::new(objects),
-        required_content,
+    authenticate_tree_once(
+        &MerkleTreeStore::new(objects),
+        tree,
         receipts,
-        1,
+        &mut work.trees,
+    )
+    .await
+    .map_err(|error| bad(&error.to_string()))?;
+    authenticate_content_map_once(
+        &ContentMapStore::new(objects),
+        view.required_content,
+        receipts,
+        &mut work.content_maps,
     )
     .await
     .map_err(|error| bad(&error.to_string()))?;
@@ -783,19 +834,6 @@ trait SetAuthentication<I> {
     async fn authenticate(&self, root: I) -> Result<(), wheat_store::CollectionError>;
 }
 
-impl<S: ImmutableObjectStore> SetAuthentication<wheat_core::ContentSetId>
-    for ContentSetStore<'_, S>
-{
-    async fn authenticate(
-        &self,
-        root: wheat_core::ContentSetId,
-    ) -> Result<(), wheat_store::CollectionError> {
-        let mut cursor = self.cursor(root).await?;
-        while cursor.next().await?.is_some() {}
-        Ok(())
-    }
-}
-
 impl<S: ImmutableObjectStore> SetAuthentication<wheat_core::ConflictSetId>
     for ConflictSetStore<'_, S>
 {
@@ -826,5 +864,118 @@ fn convert_import_error(e: crate::ImportError) -> StagedImportError {
     match e {
         crate::ImportError::InvalidUtf8(x) => StagedImportError::InvalidUtf8(x),
         other => StagedImportError::Git(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use object_store::memory::InMemory;
+    use wheat_core::ContentId;
+    use wheat_store::{ObjectKind, ObjectStoreAdapter, ObjectStoreError, StoredObject};
+
+    use super::*;
+
+    struct CountingStore {
+        inner: ObjectStoreAdapter,
+        content_map_reads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ImmutableObjectStore for CountingStore {
+        async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+            let object = self.inner.get(id).await?;
+            if object.kind == ObjectKind::ContentMapNode {
+                self.content_map_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(object)
+        }
+
+        async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+            self.inner.put_if_absent(id, bytes).await
+        }
+
+        async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+            self.inner.exists_many(ids).await
+        }
+    }
+
+    fn content(index: u32) -> ContentId {
+        ContentId::of(&index.to_le_bytes())
+    }
+
+    fn counting(name: &str) -> CountingStore {
+        CountingStore {
+            inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), name),
+            content_map_reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// A second map sharing all but one path with an authenticated one reads only that
+    /// path's nodes.
+    #[tokio::test]
+    async fn content_map_nodes_are_authenticated_once() {
+        let objects = counting("shared-map");
+        let maps = ContentMapStore::new(&objects);
+        let base = maps
+            .adjust(
+                maps.empty_root().await.unwrap(),
+                (0..512).map(|index| (content(index), 1)),
+            )
+            .await
+            .unwrap();
+        let next = maps.adjust(base, [(content(10_000), 1)]).await.unwrap();
+        let mut receipts = ProofReceipts::new(PROOF_RECEIPTS);
+        let mut pending = Vec::new();
+
+        objects.content_map_reads.store(0, Ordering::Relaxed);
+        authenticate_content_map_once(&maps, base, &mut receipts, &mut pending)
+            .await
+            .unwrap();
+        let whole = objects.content_map_reads.load(Ordering::Relaxed);
+        assert!(whole > 100, "{whole} nodes in a 512-blob map");
+
+        objects.content_map_reads.store(0, Ordering::Relaxed);
+        authenticate_content_map_once(&maps, next, &mut receipts, &mut pending)
+            .await
+            .unwrap();
+        authenticate_content_map_once(&maps, base, &mut receipts, &mut pending)
+            .await
+            .unwrap();
+        let changed = objects.content_map_reads.load(Ordering::Relaxed);
+        // The new root and at most the one child holding the new blob.
+        assert!(changed <= 2, "{changed} nodes read for a one-blob change");
+    }
+
+    /// A map with an unreadable node fails and earns no receipt, so it fails again.
+    #[tokio::test]
+    async fn a_failed_content_map_earns_no_receipt() {
+        let objects = counting("broken-map");
+        let mut nodes = Vec::new();
+        let root =
+            wheat_core::build_content_map((0..512).map(|index| (content(index), 1)), |node| {
+                nodes.push(node)
+            });
+        // Store every node but one child.
+        let root_id = ObjectId::from(root);
+        let missing = nodes.iter().find(|node| node.id != root_id).unwrap().id;
+        for node in nodes.iter().filter(|node| node.id != missing) {
+            objects.put_if_absent(node.id, &node.bytes).await.unwrap();
+        }
+        let maps = ContentMapStore::new(&objects);
+        let mut receipts = ProofReceipts::new(PROOF_RECEIPTS);
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            assert!(
+                authenticate_content_map_once(&maps, root, &mut receipts, &mut pending)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(!receipts.contains_at(1, 0, root_id));
     }
 }

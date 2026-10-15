@@ -437,10 +437,9 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
     let reader = RepositoryReader::new(objects, content);
     let envelope = reader.envelope(envelope).await.unwrap();
     let state = reader.state(envelope.state).await.unwrap();
-    let manifest = reader.manifest(state.required_content).await.unwrap();
 
     let content_set = wheat_store::ContentSetStore::new(objects);
-    let mut cursor = content_set.cursor(manifest.content).await.unwrap();
+    let mut cursor = content_set.cursor(state.required_content).await.unwrap();
     let mut missing = Vec::new();
     while let Some(content_id) = cursor.next().await.unwrap() {
         if !content.contains(content_id) {

@@ -211,7 +211,6 @@ fn import_trace_is_bounded_jsonl_and_keeps_command_output_separate() {
             "verify_content",
             "verify_changes",
             "verify_lineage",
-            "verify_view_content_sets",
             "verify_view_trees",
             "verify_view_revision_maps",
             "verify_view_application_maps",

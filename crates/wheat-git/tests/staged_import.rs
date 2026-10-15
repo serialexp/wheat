@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use wheat_core::{EditOperation, ObjectId, RevisionId, ViewId};
 use wheat_git::{DEFAULT_STAGE_COMMITS, import_repository, stage_import};
 use wheat_store::{
-    ContentStore, ImmutableObjectStore, LooseObjectStore, ObjectStoreError, PackedObjectStore,
-    RepositoryReader, RetainedSetStore, StoredObject,
+    ContentStore, ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError,
+    PackedObjectStore, RepositoryReader, RetainedSetStore, StoredObject,
 };
 
 const RESUME_READ_BUDGET: usize = 192;
@@ -35,6 +35,17 @@ struct BlockedGetStore {
 struct CountingGetStore {
     inner: LooseObjectStore,
     gets: AtomicUsize,
+    content_map_nodes: AtomicUsize,
+}
+
+impl CountingGetStore {
+    fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: LooseObjectStore::new(path),
+            gets: AtomicUsize::new(0),
+            content_map_nodes: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl ObservedStore {
@@ -109,7 +120,11 @@ impl ImmutableObjectStore for CountingGetStore {
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
-        self.inner.get(id).await
+        let object = self.inner.get(id).await?;
+        if object.kind == ObjectKind::ContentMapNode {
+            self.content_map_nodes.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(object)
     }
 
     async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
@@ -634,6 +649,99 @@ async fn resume_promotes_fully_durable_prepared_mappings_idempotently() {
     assert_eq!(repeated, staged);
 }
 
+/// Finalization gathers every view's content into the aggregate by diffing each view's
+/// map against its composition parent's: about one whole map for the root commit plus
+/// a few nodes per later commit, not a whole map per commit. The history branches and
+/// merges, and finalization visits commits in object-ID order, so nothing follows
+/// history order.
+#[tokio::test]
+async fn finalization_reads_each_views_content_change_not_its_whole_map() {
+    use wheat_git::{FinalizePhase, finalize_import_with_observer};
+    use wheat_store::LocalPublicationStore;
+
+    const WIDE: usize = 512;
+    const PER_BRANCH: usize = 10;
+    let source = tempfile::tempdir().unwrap();
+    let source = source.path();
+    git(source, &["init", "-b", "main"]);
+    for index in 0..WIDE {
+        std::fs::write(source.join(format!("f{index}")), format!("file {index}\n")).unwrap();
+    }
+    git(source, &["add", "."]);
+    git(source, &["commit", "-m", "wide"]);
+    git(source, &["branch", "feature"]);
+    for (branch, offset) in [("main", 0), ("feature", PER_BRANCH)] {
+        git(source, &["checkout", branch]);
+        for index in offset..offset + PER_BRANCH {
+            std::fs::write(
+                source.join(format!("f{index}")),
+                format!("changed {index}\n"),
+            )
+            .unwrap();
+            git(source, &["commit", "-am", "change"]);
+        }
+    }
+    git(source, &["checkout", "main"]);
+    git(source, &["merge", "--no-ff", "feature", "-m", "merge"]);
+    let commits = 1 + 2 * PER_BRANCH + 1;
+
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("import.sqlite");
+    let objects = CountingGetStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let staged = stage_import(source, &journal_path, &objects, &content, None)
+        .await
+        .unwrap();
+    assert!(staged.complete);
+    assert_eq!(staged.completed_commits, commits);
+
+    // The size of one whole map: the nodes a cursor over the merged view reads.
+    let tip = staged.branches["refs/heads/main"].native.unwrap().view_id;
+    let reader = RepositoryReader::new(&objects, &content);
+    let tip_content = reader.view(tip).await.unwrap().required_content;
+    objects.content_map_nodes.store(0, Ordering::SeqCst);
+    let mut cursor = wheat_store::ContentMapStore::new(&objects)
+        .cursor(tip_content)
+        .await
+        .unwrap();
+    while cursor.next().await.unwrap().is_some() {}
+    let whole_map = objects.content_map_nodes.load(Ordering::SeqCst);
+    assert!(whole_map > 100, "{whole_map} nodes in a {WIDE}-blob map");
+
+    // Content-map reads between the start of accumulation and the next phase.
+    let heads = LocalPublicationStore::new(dir.path().join("repository.head"));
+    let mut accumulation = None;
+    finalize_import_with_observer(
+        source,
+        &journal_path,
+        &objects,
+        &content,
+        &heads,
+        "refs/heads/main",
+        |phase| {
+            let reads = objects.content_map_nodes.load(Ordering::SeqCst);
+            match phase {
+                FinalizePhase::JournalAuthenticationAccumulation => accumulation = Some(reads),
+                FinalizePhase::AggregateSetConstruction => {
+                    accumulation = accumulation.map(|start| reads - start);
+                }
+                _ => {}
+            }
+        },
+    )
+    .await
+    .unwrap();
+    let reads = accumulation.unwrap();
+    // The root commit's diff from the empty map reads the whole map; a commit changing
+    // one blob reads the two roots and a child or two on each side; the merge brings in
+    // ten changed blobs at once.
+    let budget = whole_map + 6 * commits + 2 * PER_BRANCH;
+    assert!(
+        reads <= budget,
+        "finalization read {reads} content-map nodes for {commits} commits over a {whole_map}-node map; budget {budget}"
+    );
+}
+
 #[tokio::test]
 async fn default_stage_budget_leaves_large_history_incomplete_then_resumes() {
     let git = tempfile::tempdir().unwrap();
@@ -666,10 +774,7 @@ async fn bounded_resume_does_not_reauthenticate_the_completed_prefix() {
     let git = linear_fixture(DEFAULT_STAGE_COMMITS + 1);
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("import.sqlite");
-    let objects = CountingGetStore {
-        inner: LooseObjectStore::new(dir.path().join("objects")),
-        gets: AtomicUsize::new(0),
-    };
+    let objects = CountingGetStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
 
     let first = stage_import(git.path(), &journal, &objects, &content, None)

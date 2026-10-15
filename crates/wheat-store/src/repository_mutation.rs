@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
-use tracing::Instrument;
 use wheat_core::*;
 
 use crate::{
@@ -30,6 +29,8 @@ pub enum RepositoryMutationError {
     Applications(#[from] crate::ApplicationMapError),
     #[error(transparent)]
     Collections(#[from] crate::CollectionError),
+    #[error(transparent)]
+    ContentMap(#[from] crate::ContentMapError),
     #[error(transparent)]
     ViewLineage(#[from] crate::ViewLineageError),
     #[error(transparent)]
@@ -822,7 +823,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             ApplicationResultRecord::Clean { .. } => view.unresolved_conflicts,
         };
         let content = self
-            .update_visible_manifest(view.required_content, edits, tree, &view, fresh)
+            .update_visible_content(view.required_content, edits, tree, &view, fresh)
             .await?;
         let parent = view.id();
         let next = ViewRecord {
@@ -1018,14 +1019,14 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn update_visible_manifest(
+    async fn update_visible_content(
         &self,
-        old: ContentManifestId,
+        old: ContentMapId,
         edits: &BTreeMap<EditId, EditRecord>,
         new_tree: TreeId,
         old_view: &ViewRecord,
         fresh: &mut Fresh,
-    ) -> Result<ContentManifestId> {
+    ) -> Result<ContentMapId> {
         let trees = MerkleTreeStore::new(self.objects);
         let paths = edit_paths(edits);
         let befores = trees.lookup_many(old_view.tree, &paths).await?;
@@ -1039,17 +1040,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 touched.push((before, after));
             }
         }
-        // A content identity may remain visible at another path. The shared updater
-        // authenticates the resulting tree before removing such a candidate instead
-        // of treating one touched path as a global reference count.
-        let root =
-            crate::commit_content::update_content(self.objects, old, new_tree, touched).await?;
-        let manifest = ContentManifestRecord { content: root };
-        self.objects
-            .put_if_absent(manifest.id().into(), &manifest.canonical_bytes())
-            .await?;
-        fresh.objects += 1;
-        Ok(manifest.id())
+        // The map counts the tree entries naming each blob, so a blob still named at an
+        // untouched path keeps a positive count after its touched path changes.
+        Ok(crate::commit_content::update_content(self.objects, old, touched).await?)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -1218,20 +1211,11 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 fresh.applications.iter().map(|id| ((*id).into(), true)),
             )
             .await?;
-        let sets = ContentSetStore::new(self.objects);
-        let old_manifest = RepositoryReader::new(self.objects, self.content)
-            .manifest(old.required_content)
-            .instrument(tracing::debug_span!("read_manifest"))
-            .await?;
-        let content = sets
+        let required_content = ContentSetStore::new(self.objects)
             .update_batch(
-                old_manifest.content,
+                old.required_content,
                 fresh.content.iter().map(|id| (*id, true)),
             )
-            .await?;
-        let manifest = ContentManifestRecord { content };
-        self.objects
-            .put_if_absent(manifest.id().into(), &manifest.canonical_bytes())
             .await?;
         let view_lineage = crate::ViewLineageMapStore::new(self.objects)
             .insert_edges(old.view_lineage, fresh.view_edges.iter().copied())
@@ -1240,7 +1224,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             base_view: old.base_view,
             changes: old.changes,
             view_lineage,
-            required_content: manifest.id(),
+            required_content,
             retained_changes,
             retained_views,
             retained_revisions,
@@ -1253,7 +1237,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             expected,
             state: state.id(),
             resulting_view,
-            objects: fresh.objects + 2,
+            objects: fresh.objects + 1,
             content: fresh.content.len(),
             _sealed: (),
         })

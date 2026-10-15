@@ -4,6 +4,16 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **Content manifests are full snapshots, so comparing two still reads both
+  (2026-10-05).** Publish and fetch now look up only the content the old head lacks,
+  but finding it decodes both manifests' snapshots (about 3.3 MB each at 100,000
+  files) and merges them. Canonical manifests may not be deltas
+  (`ContentSetStore::update_batch`), so a cheaper comparison needs a different shape,
+  such as a radix set. Done 2026-10-15: the aggregate is a radix content set again,
+  so publish and fetch diff two of them and skip every shared subtree, and each
+  view's content is a radix content map a commit adjusts by its tree diff. See
+  `docs/design/wheat-incremental-validation.md`, step 2.
+
 - `[x]` **About four fsyncs per file during materialization (confirmed).**
   `execute_materialization` synced the staged file, the install-intent progress
   record, the parent directory and the transaction for every file, one file at a

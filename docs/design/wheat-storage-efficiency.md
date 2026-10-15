@@ -2,7 +2,7 @@
 
 Status: partial — Phases 0–2 and local Phase 4a landed; Phase 3, remote maintenance, and Phase 4b outstanding
 Owner: bart
-Last updated: 2026-09-25
+Last updated: 2026-10-15
 
 ## Implementation status
 
@@ -41,6 +41,16 @@ external review.
   commit_content, commit_writer, repository_mutation, content_accumulator,
   repository_verify (visible_set), repository_hydration,
   repository_transition, canonical_closure, snapshot walker, staged_import.
+  *Superseded by content maps (below).* The 348 MiB came from the per-edit radix
+  updater writing a new root for every key of a batch; 7551122 fixed that.
+- [x] **Content maps.** Each view's `required_content` is a radix map
+  (`ContentMapNodeV1`) from blob to the number of tree entries naming it, and the
+  state's aggregate is a radix `ContentSetNodeV1` set again. A commit adjusts its
+  map by the tree diff instead of rewriting a snapshot, and validation checks each
+  map against its lineage parent's by diff. Replaying Gothab's 1,905 first-parent
+  commits: 32.1 MiB plus ~1.9 MiB of counts, against 218.5 MiB for the flat
+  snapshots (loose bytes, before repack). Snapshots, deltas, `ContentManifestV1`
+  and the chain policy are gone. See `wheat-incremental-validation.md`.
 
 - [x] **Phase 2 — segment-level block compression.** Small metadata
   records (<1024 bytes) are grouped into ~64 KB blocks and compressed
@@ -63,8 +73,8 @@ external review.
   new generation, and a canonical second run is a true no-op. Loose stores and
   shared remote backends are refused rather than silently migrated or swept.
 - [x] **Phase 4a+ — metadata history deltas.** Repack now stores older
-  metadata (per-view ContentSetSnapshots, Trees, RevisionMap and
-  ApplicationMap nodes) as git-delta patches against the newer version of the
+  metadata (Trees, and ContentMap, RevisionMap and ApplicationMap nodes) as
+  git-delta patches against the newer version of the
   same object along the view lineage, inside segments. Loose metadata is
   absorbed into segments and its files are retired after the new head commits.
   See [Metadata history deltas](#metadata-history-deltas).
@@ -509,16 +519,16 @@ publishes, or as a background task.
 
 ### Metadata history deltas
 
-Most of a fresh import's metadata is near-duplicate: each view has its own
-ContentSetSnapshot (one full ~180 KiB snapshot per commit on Gothab), and each
-commit rewrites the Trees and map nodes on its changed paths. Repack pairs
-each object with its successor along the view lineage, using the same rule
-as content:
+Most of a fresh import's metadata is near-duplicate: each commit rewrites the
+Trees and map nodes on its changed paths, its content map's among them. (Before
+content maps, each view also had its own ContentSetSnapshot, one full ~180 KiB
+snapshot per commit on Gothab.) Repack pairs each object with its successor
+along the view lineage, using the same rule as content:
 
 - **Pairing.** For each lineage edge whose child has exactly one parent:
-  the parent's and child's ContentSetSnapshots; Trees at the same directory
-  path (a paired walk that only descends where IDs differ); RevisionMap and
-  ApplicationMap nodes at the same key position.
+  Trees at the same directory path (a paired walk that only descends where IDs
+  differ); ContentMap, RevisionMap and ApplicationMap nodes at the same key
+  position.
 - **Reverse deltas.** The newer object is the base and the older one is the
   delta. Tips stay whole. An object that two different newer objects claim, or
   that sits on a cycle, stays whole (cycles keep their smallest member whole).
@@ -647,8 +657,8 @@ GC uses the complete authority set for the backend's sharing scope:
   envelope plus declared workspace, snapshot, archive, and other pins;
 - a shared remote structural store marks the union of every head in its fork
   network;
-- a globally deduplicated content store marks the union of content manifests and
-  explicit content pins across every sharing domain.
+- a globally deduplicated content store marks the union of aggregate content sets
+  and explicit content pins across every sharing domain.
 
 A client must not sweep a shared remote backend from one repository's closure.
 Remote collection is server-authoritative. Workspace roots must be durably

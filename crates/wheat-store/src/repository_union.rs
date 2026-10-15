@@ -4,16 +4,15 @@
 //! Every part of a repository state only grows, so the union of two states holds both
 //! sides' history and is a valid successor of each. Each part is joined by comparing
 //! the two roots, which skips the subtrees they share: the cost follows how far the
-//! sides moved apart, not how much history they hold. The content manifest is the
-//! exception; it is one flat set, rewritten whole the way every mutation rewrites it.
+//! sides moved apart, not how much history they hold.
 //!
 //! Labels live outside the state. They are joined three ways against the manifest
 //! both sides started from.
 
 use thiserror::Error;
 use wheat_core::{
-    ChangeId, ContentManifestRecord, RepositoryEnvelopeId, RepositoryEnvelopeRecord,
-    RepositoryStateId, RepositoryStateRecord, ViewId, ViewLabelManifestRecord,
+    ChangeId, RepositoryEnvelopeId, RepositoryEnvelopeRecord, RepositoryStateId,
+    RepositoryStateRecord, ViewId, ViewLabelManifestRecord,
 };
 
 use crate::{
@@ -136,20 +135,9 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             .union(here.retained_applications, there.retained_applications)
             .await?;
 
-        let required_content = if here.required_content == there.required_content {
-            here.required_content
-        } else {
-            let here_content = self.manifest(here.required_content).await?.content;
-            let there_content = self.manifest(there.required_content).await?.content;
-            let content = ContentSetStore::new(self.objects)
-                .union(here_content, there_content)
-                .await?;
-            let manifest = ContentManifestRecord { content };
-            self.objects
-                .put_if_absent(manifest.id().into(), &manifest.canonical_bytes())
-                .await?;
-            manifest.id()
-        };
+        let required_content = ContentSetStore::new(self.objects)
+            .union(here.required_content, there.required_content)
+            .await?;
 
         let state = RepositoryStateRecord {
             base_view: here.base_view,

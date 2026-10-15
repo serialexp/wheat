@@ -99,7 +99,7 @@ digest_id!(TreeId);
 digest_id!(ApplicationId);
 digest_id!(ConflictId);
 digest_id!(ViewId);
-digest_id!(ContentManifestId);
+digest_id!(ContentMapId);
 digest_id!(RepositoryStateId);
 digest_id!(ViewLabelManifestId);
 digest_id!(RepositoryEnvelopeId);
@@ -131,7 +131,7 @@ object_id_from!(
     ApplicationId,
     ConflictId,
     ViewId,
-    ContentManifestId,
+    ContentMapId,
     RepositoryStateId,
     ViewLabelManifestId,
     RepositoryEnvelopeId,

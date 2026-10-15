@@ -29,6 +29,8 @@ pub enum RepositoryPublicationError {
     #[error(transparent)]
     Collection(#[from] crate::CollectionError),
     #[error(transparent)]
+    ContentMap(#[from] crate::ContentMapError),
+    #[error(transparent)]
     Revisions(#[from] crate::RevisionMapError),
     #[error(transparent)]
     Changes(#[from] crate::ChangeMapError),

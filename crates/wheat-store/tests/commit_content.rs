@@ -27,7 +27,7 @@ impl ImmutableObjectStore for Counting {
     async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
         if matches!(
             validate_canonical_object(bytes)?,
-            CanonicalObjectKind::ContentSetSnapshot | CanonicalObjectKind::ContentSetDelta
+            CanonicalObjectKind::ContentMapNode | CanonicalObjectKind::ContentSetNode
         ) {
             self.sets.fetch_add(1, Ordering::SeqCst);
         }
@@ -124,9 +124,11 @@ async fn noop_and_addition_do_not_walk_unchanged_subtrees_or_rebuild_content_set
         .await
         .unwrap();
     assert!(objects.trees.load(Ordering::SeqCst) < 8);
+    // One new blob rewrites the content map's path to it: a root and at most
+    // one child for 65 keys.
     assert!(
-        objects.sets.load(Ordering::SeqCst) < 40,
-        "content-set rebuilding must remain bounded independently of key width"
+        objects.sets.load(Ordering::SeqCst) <= 2,
+        "a commit writes only the content-map nodes on its blobs' paths"
     );
 }
 
@@ -176,7 +178,7 @@ async fn many_deletions_scan_the_resulting_tree_once() {
 }
 
 #[tokio::test]
-async fn deleting_one_of_two_shared_visible_blobs_keeps_the_manifest_entry() {
+async fn deleting_one_of_two_shared_visible_blobs_keeps_the_content_map_entry() {
     let dir = tempfile::tempdir().unwrap();
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
@@ -217,13 +219,41 @@ async fn deleting_one_of_two_shared_visible_blobs_keeps_the_manifest_entry() {
         .await
         .unwrap();
     let reader = RepositoryReader::new(&objects, &content);
+    let seed_view_content = reader
+        .view(seed.resulting_view)
+        .await
+        .unwrap()
+        .required_content;
     let view = reader.view(result.resulting_view).await.unwrap();
-    let manifest = reader.manifest(view.required_content).await.unwrap();
-    assert!(
-        ContentSetStore::new(&objects)
-            .contains(manifest.content, shared)
-            .await
-            .unwrap(),
+    let maps = ContentMapStore::new(&objects);
+    assert_eq!(
+        maps.get(seed_view_content, shared).await.unwrap(),
+        Some(2),
+        "two paths name the shared blob"
+    );
+    assert_eq!(
+        maps.get(view.required_content, shared).await.unwrap(),
+        Some(1),
         "the unchanged second path still visibly references the shared blob"
     );
+
+    // Deleting the second path too drops the entry rather than storing a zero.
+    let last = EditRecord::new(
+        "b",
+        EditOperation::ExactFile {
+            expected: Some(value),
+            replacement: None,
+        },
+    )
+    .unwrap();
+    let gone = writer
+        .write(
+            result.resulting_view,
+            proposal(3, Some(result.change_id), vec![last]),
+        )
+        .await
+        .unwrap();
+    let view = reader.view(gone.resulting_view).await.unwrap();
+    assert_eq!(maps.get(view.required_content, shared).await.unwrap(), None);
+    assert_eq!(view.required_content, maps.empty_root().await.unwrap());
 }

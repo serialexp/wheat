@@ -155,16 +155,12 @@ async fn multiple_guarded_edits_on_one_path_apply_and_record_original_target() {
     let reader = RepositoryReader::new(&objects, &content);
     let application = reader.application(result.application_id).await.unwrap();
     let view = reader.view(result.resulting_view).await.unwrap();
-    let closure = reader
-        .manifest(view.required_content)
-        .await
-        .unwrap()
-        .content;
-    assert!(
-        ContentSetStore::new(&objects)
-            .contains(closure, ContentId::of(b"ALPHA BETA"))
+    assert_eq!(
+        ContentMapStore::new(&objects)
+            .get(view.required_content, ContentId::of(b"ALPHA BETA"))
             .await
-            .unwrap()
+            .unwrap(),
+        Some(1)
     );
     for bytes in [
         b"alpha beta".as_slice(),
@@ -175,12 +171,13 @@ async fn multiple_guarded_edits_on_one_path_apply_and_record_original_target() {
         b"beta",
         b"BETA",
     ] {
-        assert!(
-            !ContentSetStore::new(&objects)
-                .contains(closure, ContentId::of(bytes))
+        assert_eq!(
+            ContentMapStore::new(&objects)
+                .get(view.required_content, ContentId::of(bytes))
                 .await
                 .unwrap(),
-            "view manifest retained historical fragment {:?}",
+            None,
+            "view content map retained historical fragment {:?}",
             String::from_utf8_lossy(bytes)
         );
     }

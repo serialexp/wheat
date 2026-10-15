@@ -26,13 +26,12 @@
         { type: "ApplicationV1", when: "value == 0x0401" },
         { type: "ConflictV1", when: "value == 0x0501" },
         { type: "ViewV1", when: "value == 0x0601" },
-        { type: "ContentManifestV1", when: "value == 0x0701" },
+        { type: "ContentMapNodeV1", when: "value == 0x0701" },
         { type: "RepositoryStateV1", when: "value == 0x0801" },
         { type: "RevisionMapNodeV1", when: "value == 0x0901" },
         { type: "ApplicationMapNodeV1", when: "value == 0x0a01" },
         { type: "ConflictSetNodeV1", when: "value == 0x0b01" },
-        { type: "ContentSetSnapshotV1", when: "value == 0x0c02" },
-        { type: "ContentSetDeltaV1", when: "value == 0x0c03" },
+        { type: "ContentSetNodeV1", when: "value == 0x0c01" },
         { type: "RetainedSetNodeV1", when: "value == 0x0d01" },
         { type: "ViewLabelManifestV1", when: "value == 0x0e01" },
         { type: "RepositoryEnvelopeV1", when: "value == 0x0f01" },
@@ -70,7 +69,7 @@
     ApplicationId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ConflictId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewId: { sequence: [{ name: "digest", type: "Digest256" }] },
-    ContentManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ContentMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RevisionMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ChangeMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ApplicationMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
@@ -313,14 +312,31 @@
         { name: "revisions", type: "RevisionMapId" },
         { name: "applications", type: "ApplicationMapId" },
         { name: "unresolved_conflicts", type: "ConflictSetId" },
-        { name: "required_content", type: "ContentManifestId" },
+        // The blobs the tree names, each with the number of tree entries naming it.
+        { name: "required_content", type: "ContentMapId" },
       ],
     },
 
-    ContentManifestV1: {
+    // Radix map from a ContentId's 32 digest bytes to a count of at least 1.
+    ContentMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0701 },
-        { name: "content", type: "ContentSetId" },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint32" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentMapEntryV1" } },
+      ],
+    },
+    ContentMapChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ContentMapId" },
+      ],
+    },
+    ContentMapEntryV1: {
+      sequence: [
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "value", type: "uint32" },
       ],
     },
 
@@ -450,21 +466,20 @@
       ],
     },
 
-    // Flat sorted blob of ContentId members — a full snapshot of content set membership.
-    ContentSetSnapshotV1: {
+    // Radix set of ContentId digests: every blob a repository state needs.
+    ContentSetNodeV1: {
       sequence: [
-        { name: "wire_tag", type: "uint16", const: 0x0c02 },
-        { name: "members", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentId" } },
+        { name: "wire_tag", type: "uint16", const: 0x0c01 },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "present", type: "bool" },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
       ],
     },
-
-    // Delta blob referencing a base ContentSetId, plus sorted arrays of added/removed members.
-    ContentSetDeltaV1: {
+    ContentSetChildV1: {
       sequence: [
-        { name: "wire_tag", type: "uint16", const: 0x0c03 },
-        { name: "base", type: "ContentSetId" },
-        { name: "added", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentId" } },
-        { name: "removed", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentId" } },
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ContentSetId" },
       ],
     },
 
@@ -497,7 +512,8 @@
         { name: "base_view", type: "ViewId" },
         { name: "changes", type: "ChangeMapId" },
         { name: "view_lineage", type: "ViewLineageMapId" },
-        { name: "required_content", type: "ContentManifestId" },
+        // Every blob a retained tree, edit or conflict names.
+        { name: "required_content", type: "ContentSetId" },
         { name: "retained_changes", type: "RetainedSetId" },
         { name: "retained_views", type: "RetainedSetId" },
         { name: "retained_revisions", type: "RetainedSetId" },

@@ -141,16 +141,16 @@ fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
     );
 
     assert_eq!(
-        SegmentIndexEntry::canonical_kind(19),
-        Some(CanonicalObjectKind::ContentSetSnapshot)
+        SegmentIndexEntry::canonical_kind(7),
+        Some(CanonicalObjectKind::ContentMapNode)
     );
     assert_eq!(
-        SegmentIndexEntry::canonical_kind(20),
-        Some(CanonicalObjectKind::ContentSetDelta)
+        SegmentIndexEntry::canonical_kind(12),
+        Some(CanonicalObjectKind::ContentSetNode)
     );
 
-    // 12 is a gap in the assigned kind codes.
-    for kind in [0, 12, 21, u16::MAX] {
+    // 19 and 20 were the removed content-set snapshot and delta kinds.
+    for kind in [0, 19, 20, 21, u16::MAX] {
         let invalid = SegmentIndexPage {
             entries: vec![SegmentIndexEntry {
                 namespace: SEGMENT_NAMESPACE_METADATA,

@@ -8,13 +8,14 @@ use content_accumulator::{ContentAccumulator, ContentAccumulatorError, RetainedT
 
 use thiserror::Error;
 use wheat_core::{
-    ApplicationRecord, Change, ChangeObjectId, ContentId, ContentManifestRecord, EditOperation,
-    EditRecord, ObjectId, RepositoryStateRecord, ViewLabel, ViewLabelManifestRecord,
+    ApplicationRecord, Change, ChangeObjectId, ContentId, EditOperation, EditRecord, ObjectId,
+    RepositoryStateRecord, ViewLabel, ViewLabelManifestRecord,
 };
 use wheat_store::{
-    CollectionError, CommitWriterError, ContentSetStore, ContentStore, ImmutableObjectStore,
-    ObjectKind, ObjectStoreError, PublicationStore, RepositoryHead, RepositoryPublicationError,
-    RepositoryPublisher, RepositoryReader, RetainedSetStore, ViewLineageMapStore,
+    CollectionError, CommitWriterError, ContentMapStore, ContentSetStore, ContentStore,
+    ImmutableObjectStore, ObjectKind, ObjectStoreError, PublicationStore, RepositoryHead,
+    RepositoryPublicationError, RepositoryPublisher, RepositoryReader, RetainedSetStore,
+    ViewLineageMapStore,
 };
 
 use crate::{
@@ -231,6 +232,7 @@ where
     let reader = RepositoryReader::new(objects, content);
     let retained = RetainedSetStore::new(objects);
     let content_sets = ContentSetStore::new(objects);
+    let content_maps = ContentMapStore::new(objects);
     let mut accumulator = ContentAccumulator::new()?;
     {
         let transaction = accumulator.begin_page()?;
@@ -299,14 +301,21 @@ where
                 .view(native.view_id)
                 .await
                 .map_err(|e| bad(e.to_string()))?;
-            let manifest = reader
-                .manifest(view.required_content)
+            // Diffing against the composition parent's map rather than reading the whole
+            // map keeps this proportional to what the commit changed. Commits arrive in
+            // object-ID order, not history order, so consecutive pages share nothing.
+            let parent = reader
+                .view(application.target_view)
                 .await
                 .map_err(|e| bad(e.to_string()))?;
-            // Per-view manifests are already authenticated radix roots. Retain the root and
-            // merge it structurally during finalization instead of enumerating every blob.
-            ContentAccumulator::insert_manifest(&transaction, manifest.content)
-                .map_err(|e| bad(e.to_string()))?;
+            ContentAccumulator::insert_view_content(
+                &transaction,
+                &content_maps,
+                parent.required_content,
+                view.required_content,
+            )
+            .await
+            .map_err(|e| bad(e.to_string()))?;
             collect_historical_content(&transaction, &reader, &revision.edits, &application)
                 .await
                 .map_err(|e| bad(e.to_string()))?;
@@ -364,15 +373,6 @@ where
             8,
         )
         .await?;
-    let aggregate_manifest = ContentManifestRecord {
-        content: all_content,
-    };
-    objects
-        .put_if_absent(
-            aggregate_manifest.id().into(),
-            &aggregate_manifest.canonical_bytes(),
-        )
-        .await?;
     let lineage = ViewLineageMapStore::new(objects);
     let view_lineage = lineage.empty_root().await?;
     let view_lineage = lineage.insert_edges(view_lineage, view_edges).await?;
@@ -380,7 +380,7 @@ where
         base_view: empty,
         changes,
         view_lineage,
-        required_content: aggregate_manifest.id(),
+        required_content: all_content,
         retained_changes,
         retained_views,
         retained_revisions,
@@ -422,7 +422,7 @@ where
 
 /// Adds blobs referenced by historical revision records to the repository aggregate only.
 ///
-/// Per-view manifests deliberately contain only their visible trees; definitions and applied
+/// Per-view content maps deliberately contain only their visible trees; definitions and applied
 /// evidence remain durable through the repository state's aggregate content root.
 async fn collect_historical_content<O: ImmutableObjectStore>(
     transaction: &rusqlite::Transaction<'_>,

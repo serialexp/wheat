@@ -31,8 +31,8 @@ const ZSTD_LEVEL: i32 = 3;
 const DELTA_BASE_REFERENCE_BYTES: u64 = (wheat_core::SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE
     - wheat_core::SEGMENT_INDEX_ENTRY_ENCODED_SIZE) as u64;
 
-// Trees, radix/map nodes, and the materialized/delta content-set snapshots.
-const EXPERIMENT_KINDS: &[u16] = &[1, 9, 10, 11, 12, 13, 17, 18, 19, 20];
+// Trees and radix/map nodes, the content maps and content sets among them.
+const EXPERIMENT_KINDS: &[u16] = &[1, 7, 9, 10, 11, 12, 13, 17, 18];
 
 struct Record {
     kind: u16,
@@ -103,14 +103,14 @@ struct CurrentPhysical {
 fn kind_name(kind: u16) -> &'static str {
     match kind {
         1 => "Tree",
+        7 => "ContentMapNode",
         9 => "RevisionMapNode",
         10 => "ApplicationMapNode",
         11 => "ConflictSetNode",
+        12 => "ContentSetNode",
         13 => "RetainedSetNode",
         17 => "ChangeMapNode",
         18 => "ViewLineageMapNode",
-        19 => "ContentSetSnapshot",
-        20 => "ContentSetDelta",
         _ => "unexpected",
     }
 }
@@ -553,8 +553,8 @@ fn measure_actual_metadata_compression() {
 // every parent -> child edge whose child has exactly one parent, the parent's
 // object at a position is a reverse-delta target and the child's object at the
 // same position is its base (newer is whole, older is the delta). Positions:
-// same directory path (Tree), same per-view content set, and same radix edge
-// path (RevisionMapNode / ApplicationMapNode). Objects claimed by two different
+// same directory path (Tree) and same radix edge path (ContentMapNode /
+// RevisionMapNode / ApplicationMapNode). Objects claimed by two different
 // bases, objects on a cycle, and objects reachable from tip views stay whole.
 // Chains stop at depth 16, and a delta is kept only when smaller than whole.
 // The segment cut then lays chains out base-first into bounded segments and
@@ -713,16 +713,15 @@ fn history_kind_code(kind: wheat_core::CanonicalObjectKind) -> u16 {
     use wheat_core::CanonicalObjectKind as K;
     match kind {
         K::Tree => 1,
+        K::ContentMapNode => 7,
         K::RevisionMapNode => 9,
         K::ApplicationMapNode => 10,
-        K::ContentSetSnapshot => 19,
-        K::ContentSetDelta => 20,
         _ => 0,
     }
 }
 
 fn history_is_paired_kind(code: u16) -> bool {
-    matches!(code, 1 | 9 | 10 | 19 | 20)
+    matches!(code, 1 | 7 | 9 | 10)
 }
 
 fn decode_repository_head(bytes: &[u8]) -> Digest {
@@ -800,19 +799,16 @@ struct HistoryView {
     tree: Digest,
     revisions: Digest,
     applications: Digest,
-    content_set: Digest,
+    content: Digest,
 }
 
 fn history_view(source: &mut HistorySource, id: Digest) -> HistoryView {
     let view = wheat_core::decode_view_record(&source.read(id)).expect("view decodes");
-    let manifest =
-        wheat_core::decode_content_manifest_record(&source.read(*view.required_content.as_bytes()))
-            .expect("content manifest decodes");
     HistoryView {
         tree: *view.tree.as_bytes(),
         revisions: *view.revisions.as_bytes(),
         applications: *view.applications.as_bytes(),
-        content_set: *manifest.content.as_bytes(),
+        content: *view.required_content.as_bytes(),
     }
 }
 
@@ -848,6 +844,12 @@ impl HistoryProposals {
 /// Radix map children keyed by edge byte, for the two map kinds we pair.
 fn map_children(code: u16, bytes: &[u8]) -> BTreeMap<u8, Digest> {
     match code {
+        7 => wheat_core::decode_content_map_node(bytes)
+            .expect("content map node decodes")
+            .children
+            .into_iter()
+            .map(|child| (child.edge, *child.child.as_bytes()))
+            .collect(),
         9 => wheat_core::decode_revision_map_node(bytes)
             .expect("revision map node decodes")
             .children
@@ -923,8 +925,8 @@ fn pair_map(
     }
 }
 
-/// Every paired-kind object reachable from a view: all directories, all map
-/// nodes, and the content set.
+/// Every paired-kind object reachable from a view: all directories and all map
+/// nodes, the content map's among them.
 fn reachable_paired(source: &mut HistorySource, view: HistoryView, into: &mut BTreeSet<Digest>) {
     let mut trees = vec![view.tree];
     while let Some(tree) = trees.pop() {
@@ -932,7 +934,11 @@ fn reachable_paired(source: &mut HistorySource, view: HistoryView, into: &mut BT
             trees.extend(directory_children(&source.read(tree)).into_values());
         }
     }
-    for (code, root) in [(9, view.revisions), (10, view.applications)] {
+    for (code, root) in [
+        (7, view.content),
+        (9, view.revisions),
+        (10, view.applications),
+    ] {
         let mut nodes = vec![root];
         while let Some(node) = nodes.pop() {
             if into.insert(node) {
@@ -940,7 +946,6 @@ fn reachable_paired(source: &mut HistorySource, view: HistoryView, into: &mut BT
             }
         }
     }
-    into.insert(view.content_set);
 }
 
 fn whole_cost(bytes: &[u8]) -> u64 {
@@ -1054,9 +1059,7 @@ fn measure_history_metadata_deltas() {
             older.applications,
             newer.applications,
         );
-        if older.content_set != newer.content_set {
-            proposals.propose(older.content_set, newer.content_set);
-        }
+        pair_map(&mut source, &mut proposals, 7, older.content, newer.content);
     }
     let mut tips = BTreeSet::new();
     let tip_views = views
