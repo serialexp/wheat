@@ -17,6 +17,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
+use tracing::debug_span;
 use wheat_core::{
     PhysicalCatalogSnapshot, PhysicalContentGeneration, PhysicalSegmentDescriptor, SegmentId,
     SegmentIndexEntry, SegmentRecordError, decode_physical_catalog_snapshot,
@@ -708,28 +709,36 @@ impl PackedCatalog {
         // state behind even when it returns an error. Keep this instance closed
         // to writes until the entire authority + derived-index protocol completes.
         self.poisoned = true;
-        write_active_journal(&self.root, &journal, self.durability)?;
-        let result = self.active.commit_append(prepared)?;
-        #[cfg(test)]
-        if self.append_failpoint == Some(AppendFailpoint::MutationApplied) {
-            return Err(CatalogError::Corrupt("test failure after active mutation"));
-        }
-        self.active.sync(self.durability)?;
-        write_active_head(&self.root, result.state, self.durability)?;
+        debug_span!("packed_append_journal")
+            .in_scope(|| write_active_journal(&self.root, &journal, self.durability))?;
+        let result = debug_span!("packed_append_segment").in_scope(|| {
+            let result = self.active.commit_append(prepared)?;
+            #[cfg(test)]
+            if self.append_failpoint == Some(AppendFailpoint::MutationApplied) {
+                return Err(CatalogError::Corrupt("test failure after active mutation"));
+            }
+            self.active.sync(self.durability)?;
+            Ok::<_, CatalogError>(result)
+        })?;
+        debug_span!("packed_append_head")
+            .in_scope(|| write_active_head(&self.root, result.state, self.durability))?;
         #[cfg(test)]
         if self.append_failpoint == Some(AppendFailpoint::HeadPublished) {
             return Err(CatalogError::Corrupt("test failure after active head"));
         }
-        remove_durable_file(
-            &self.root,
-            &self.root.join(ACTIVE_JOURNAL_FILE),
-            self.durability,
-        )?;
+        debug_span!("packed_append_journal_remove").in_scope(|| {
+            remove_durable_file(
+                &self.root,
+                &self.root.join(ACTIVE_JOURNAL_FILE),
+                self.durability,
+            )
+        })?;
         #[cfg(test)]
         if self.append_failpoint == Some(AppendFailpoint::JournalRemoved) {
             return Err(CatalogError::Corrupt("test failure after journal removal"));
         }
-        self.index_active_entries_and_checkpoint(&result.added_entries)?;
+        debug_span!("packed_append_index")
+            .in_scope(|| self.index_active_entries_and_checkpoint(&result.added_entries))?;
         self.poisoned = false;
         Ok(())
     }
