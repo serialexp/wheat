@@ -24,7 +24,9 @@ const MIB: usize = 1024 * 1024;
 /// does not grow with the publish.
 const SERVER_PEAK_BUDGET_BYTES: f64 = 256.0 * MIB as f64;
 /// Budget for the downloading client's peak. Measured on 2026-09-26 (release):
-/// 186 MiB, and 154 MiB for twice the files.
+/// 186 MiB, and 154 MiB for twice the files. Batched checkout (a88d542) then held up
+/// to 512 MiB of file content per batch, and the clone peaked at 430–513 MB; with
+/// batches bounded to 64 MiB it peaked at 98 MiB on 2026-10-15.
 const CLONE_PEAK_BUDGET_BYTES: f64 = 256.0 * MIB as f64;
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {

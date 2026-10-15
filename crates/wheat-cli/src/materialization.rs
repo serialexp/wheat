@@ -55,13 +55,20 @@ pub(crate) const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 // ContentStore currently returns owned Vecs. A replacement needs old and new
 // bytes concurrently to authenticate both sides of an exchange; workspace,
 // staged, and displaced regular files are streamed through a fixed 64 KiB
-// scratch buffer and add no file-sized allocation. A batch keeps its installs'
-// store buffers from staging until they are applied, and is closed before its
-// buffers would pass this bound, so peak owned file content stays within it.
+// scratch buffer and add no file-sized allocation. This bounds one install's
+// owned file content.
 const MAX_OPERATION_RESIDENT_BYTES: u64 = 2 * MAX_FILE_BYTES as u64;
 /// The most installs staged, recorded and synced together. An abort looks for
 /// staged but unrecorded leaves only this far past the recorded intents.
 const MAX_BATCH_INSTALLS: usize = 256;
+/// A batch keeps its installs' store buffers from staging until they are applied,
+/// and is closed before its buffers would pass this bound; an install larger than
+/// it is a batch of its own. The install that closed a batch stays loaded for the
+/// next one, so peak owned file content is at most this plus one install. When this
+/// was `MAX_OPERATION_RESIDENT_BYTES`, cloning 32 files of 12 MiB held all 384 MiB
+/// at once (peak RSS 430–513 MB); with 64 MiB it peaks at 98 MiB (2026-10-15,
+/// publish_content).
+const MAX_BATCH_RESIDENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Threads that write and sync a batch's staged files, so the filesystem can
 /// commit several syncs at once. Importing 4,096 small files on NVMe ext4 took
 /// 3.7 s with 8, 1.3 s with 32 and 1.3 s with 64 (2026-10-05).
@@ -1623,8 +1630,7 @@ impl<'a> Batcher<'a> {
                 None => load_install(self.repository, index, install)?,
             };
             debug_assert_eq!(loaded.index, index);
-            if !batch.is_empty() && resident + loaded.resident_bytes > MAX_OPERATION_RESIDENT_BYTES
-            {
+            if !batch.is_empty() && resident + loaded.resident_bytes > MAX_BATCH_RESIDENT_BYTES {
                 self.carried = Some(loaded);
                 break;
             }
@@ -3555,6 +3561,74 @@ mod tests {
         TEST_PEAK_OWNED_CONTENT_BYTES.fetch_max(resident, Ordering::Relaxed);
         assert_eq!(TEST_PEAK_OWNED_CONTENT_BYTES.load(Ordering::Relaxed), 46);
         assert!(resident as u64 <= MAX_OPERATION_RESIDENT_BYTES);
+    }
+
+    #[test]
+    fn batches_of_large_files_hold_at_most_the_batch_bound() {
+        const FILE_BYTES: usize = 12 * 1024 * 1024;
+        const BIG_BYTES: usize = 80 * 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let objects = wheat_store::PackedObjectStore::open(root.path().join("storage")).unwrap();
+        let content = objects.content_store();
+        let repository = LocalRepository {
+            store_id: Uuid::nil(),
+            objects,
+            content,
+            heads: wheat_store::LocalPublicationStore::new(root.path().join("repository.head")),
+        };
+        // Twelve 12 MiB files with one file over the bound in the middle.
+        let sizes = (0..12)
+            .map(|index| if index == 6 { BIG_BYTES } else { FILE_BYTES })
+            .collect::<Vec<_>>();
+        let installs = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &size)| {
+                let bytes = vec![u8::try_from(index).unwrap(); size];
+                Install {
+                    path: format!("data/f{index:02}.bin"),
+                    old: None,
+                    new: Some(FileValue {
+                        content: repository.content.put(&bytes).unwrap(),
+                        kind: FileKind::Regular,
+                    }),
+                    observed: None,
+                    restore_consent: false,
+                    empty_directory: false,
+                    staged: format!("staged-{index:02}"),
+                    tombstone: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut batcher = Batcher {
+            repository: &repository,
+            installs: &installs,
+            next: 0,
+            carried: None,
+        };
+        let mut batches = Vec::new();
+        loop {
+            let batch = batcher.next_batch().unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            let resident = batch
+                .iter()
+                .map(|loaded| loaded.resident_bytes)
+                .sum::<u64>();
+            assert!(
+                batch.len() == 1 || resident <= MAX_BATCH_RESIDENT_BYTES,
+                "a batch of {} installs holds {resident} bytes",
+                batch.len()
+            );
+            batches.push(batch.iter().map(|loaded| loaded.index).collect::<Vec<_>>());
+        }
+        // Five 12 MiB files fit in 64 MiB; the 80 MiB file goes alone.
+        assert_eq!(
+            batches,
+            [vec![0, 1, 2, 3, 4], vec![5], vec![6], vec![7, 8, 9, 10, 11]]
+        );
     }
 
     #[test]
