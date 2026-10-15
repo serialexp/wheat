@@ -14,6 +14,7 @@
 mod add_scale;
 mod checkpoint_stack;
 mod content_repack_plan;
+mod cpus;
 mod deep_stack;
 mod fetch_incremental;
 mod git;
@@ -23,6 +24,7 @@ mod import_resume_wide;
 mod materialize_wide;
 mod packed_append;
 mod publish_content;
+mod publish_contention;
 mod server;
 mod sharded_manifest;
 mod snapshot_export;
@@ -63,6 +65,7 @@ pub const CASES: &[&str] = &[
     snapshot_export::NAME,
     import_resume_wide::NAME,
     materialize_wide::NAME,
+    publish_contention::NAME,
 ];
 
 /// How big the cases are.
@@ -205,6 +208,7 @@ pub fn run_case(
         snapshot_export::NAME => snapshot_export::run(&context),
         import_resume_wide::NAME => import_resume_wide::run(&context),
         materialize_wide::NAME => materialize_wide::run(&context),
+        publish_contention::NAME => publish_contention::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

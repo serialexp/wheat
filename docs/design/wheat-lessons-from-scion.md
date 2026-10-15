@@ -22,12 +22,24 @@ land and move completed bullets from Outstanding to Done.
 - [x] **Decision — lazy granularity (2026-10-15).** Content only. Every client keeps
   the full structural closure.
 
+- [x] **Publish contention benchmark.** `wheat-bench` case `publish_contention`:
+  1 to 16 writers of unrelated changes against one server pinned to its own cores.
+  First run (2026-10-15): 1.6 to 1.8 accepted publishes per second at 1 to 4
+  writers, 0.7 at 16, with 7.7 attempts per publish and one change needing 281. The
+  server was at most 2% busy; per-batch fsyncs and fetch-and-retry dominate (see
+  "Measured contention").
+
 ### Outstanding
 
-- [ ] **Publish contention benchmark.** A `wheat-bench` case with N concurrent
-  publishers of unrelated changes against one server, counting stale answers and
-  retries per accepted publish. Smoke size in `just test`, contract rule once the
-  reconciliation below lands.
+- [ ] **Publish contention budget.** Contract rules on `publish_contention`: at least
+  10 accepted publishes per second with 8 writers, and one attempt per publish at
+  every writer count.
+- [ ] **One durable commit per publish and per fetch.** The server stages a
+  publish's uploaded objects and commits them once before the head CAS; a fetch
+  commits once before the local head moves.
+- [ ] **Client pushes the difference up front.** The client runs the server's walk
+  from the last fetched head and sends the result, so a publish takes one round trip
+  instead of one per tree level.
 - [ ] **Server-side publish reconciliation.** On a stale expected head, the server
   merges the proposed state into its current head with the same rules `wheat fetch`
   uses, and refuses only real collisions.
@@ -201,6 +213,30 @@ The join reuses the existing cost model: it compares the two roots and skips the
 subtrees they share, so cost follows how far the states have drifted, not
 repository size. The `publish_key` idempotency rules stay: a retry with the same key
 returns the original receipt, including a reconciled one.
+
+### Measured contention (2026-10-15)
+
+`publish_contention` at full size, server on two physical cores, writers on the
+other ten:
+
+| writers | accepted/s | attempts per publish | worst change | p95 latency | server busy |
+|---|---|---|---|---|---|
+| 1 | 1.59 | 1.0 | 1 | 0.75 s | 1.5% |
+| 2 | 1.80 | 1.5 | 21 | 0.74 s | 0.9% |
+| 4 | 1.63 | 2.5 | 61 | 1.08 s | 0.7% |
+| 8 | 1.21 | 4.5 | 139 | 1.32 s | 1.8% |
+| 16 | 0.70 | 7.7 | 281 | 3.63 s | 1.5% |
+
+The head CAS is not what is slow; the cost around it is. A publish into a
+100-change repository took 0.35 s, of which 0.22 s was 99 fsyncs on the server: the
+server walks the proposed state one tree level at a time, asks for 1 to 6 objects per
+round, and commits each received batch durably (about 9 fsyncs per batch). A fetch
+that keeps local work did 111 fsyncs, 0.24 s of 0.29 s, in its radix updates. Every
+refusal costs such a fetch and another publish, and with nothing ordering the
+writers an unlucky one keeps losing.
+
+Hence the order of work: one durable commit per operation, then server
+reconciliation, then a client-side push of the difference to cut round trips.
 
 ### Alternative: per-label heads
 

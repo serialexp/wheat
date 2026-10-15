@@ -87,15 +87,25 @@ impl Workspace {
         stores: &Path,
         arguments: &[&str],
     ) -> Result<Captured> {
+        let captured = self.run_in_stores(directory, stores, arguments)?;
+        captured.ensure_success(&format!("wheat {}", arguments.join(" ")))?;
+        Ok(captured)
+    }
+
+    /// Like [`Self::ok_in_stores`], but the command may fail; the caller looks at how.
+    pub(crate) fn run_in_stores(
+        &self,
+        directory: &Path,
+        stores: &Path,
+        arguments: &[&str],
+    ) -> Result<Captured> {
         let mut command = Command::new(&self.wheat);
         crate::isolate(&mut command)
             .current_dir(directory)
             .args(arguments)
             .env("WHEAT_STORE_HOME", stores)
             .env("XDG_CONFIG_HOME", &self.config);
-        let captured = measure::run(&mut command, &self.scratch)?;
-        captured.ensure_success(&format!("wheat {}", arguments.join(" ")))?;
-        Ok(captured)
+        measure::run(&mut command, &self.scratch)
     }
 
     /// The directory the workspace was initialized in.

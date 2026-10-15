@@ -14,6 +14,8 @@ use wheat_server::{
     server::{ServerConfig, run_until},
 };
 
+use super::cpus::CpuSet;
+
 /// Serves one workspace's store as `bench/repo` until [`Server::stop`].
 pub(crate) struct Server {
     runtime: Runtime,
@@ -26,10 +28,30 @@ pub(crate) struct Server {
 impl Server {
     /// Serves the store of the workspace at `workspace`.
     pub(crate) fn start(workspace: &Path) -> Result<Self> {
-        let store = workspace_store(workspace)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
+        Self::start_in(runtime, workspace)
+    }
+
+    /// Like [`Self::start`], but every server thread runs on `cpus`, with one worker
+    /// thread per CPU.
+    pub(crate) fn start_pinned(workspace: &Path, cpus: &CpuSet) -> Result<Self> {
+        let pinned = cpus.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(cpus.len())
+            .on_thread_start(move || {
+                pinned
+                    .pin_current_thread()
+                    .expect("pin a server thread to its CPUs");
+            })
+            .enable_all()
+            .build()?;
+        Self::start_in(runtime, workspace)
+    }
+
+    fn start_in(runtime: Runtime, workspace: &Path) -> Result<Self> {
+        let store = workspace_store(workspace)?;
         let registry = Registry::single_named("bench/repo".to_owned(), &store)?;
         let (shutdown, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
