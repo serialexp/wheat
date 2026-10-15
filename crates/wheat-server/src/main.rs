@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 use wheat_server::access::{MAX_AUTH_TOKEN_BYTES, token_hash_hex};
 use wheat_server::config::FileConfig;
@@ -78,11 +79,14 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    // `WHEAT_TRACE` / `WHEAT_TRACE_SUMMARY` record spans beside the log, and report
+    // when the server is stopped with Ctrl-C.
+    let (_span_trace, span_layer) = wheat_trace::SpanTrace::from_env().unzip();
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(log_filter))
+        .with(span_layer)
         .init();
 
     let cli = Cli::parse();
@@ -118,7 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    run(cli.listen, registry, server_config).await?;
+    tokio::select! {
+        served = run(cli.listen, registry, server_config) => served?,
+        stopped = tokio::signal::ctrl_c() => {
+            stopped?;
+            tracing::info!("interrupted; stopping");
+        }
+    }
     Ok(())
 }
 

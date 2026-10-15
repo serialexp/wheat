@@ -1,9 +1,6 @@
 //! Runs each measured corpus phase as its own `wheat` process.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
@@ -46,8 +43,8 @@ impl Session {
         arguments: &[&str],
     ) -> Result<BoundedOutput> {
         eprintln!("profile phase {name}: starting");
-        let mut command = Command::new(&self.wheat);
-        crate::isolate(&mut command)
+        let mut command = crate::wheat_command(&self.wheat);
+        command
             .args(arguments)
             .current_dir(current_dir)
             .env("WHEAT_STORE_HOME", &self.store_home)

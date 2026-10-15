@@ -147,6 +147,13 @@ impl fmt::Debug for PackedObjectStore {
 }
 
 impl PackedEngine {
+    /// Takes the catalog lock, which every packed read and append goes through.
+    /// `packed_catalog_wait` spans show how long callers queue for it. `None` when a
+    /// holder panicked.
+    fn lock_catalog(&self) -> Option<MutexGuard<'_, PackedCatalog>> {
+        tracing::debug_span!("packed_catalog_wait").in_scope(|| self.catalog.lock().ok())
+    }
+
     /// Runs `lookup` against the published content generation's reader, or returns
     /// `None` when no generation is published. The catalog lock is held throughout so a
     /// repack on this handle cannot retire the generation's pack mid-lookup.
@@ -155,7 +162,7 @@ impl PackedEngine {
         id: ContentId,
         lookup: impl FnOnce(&mut GenerationReader) -> Result<Option<T>, ContentStoreError>,
     ) -> Result<Option<T>, ContentStoreError> {
-        let catalog = self.catalog.lock().map_err(|_| {
+        let catalog = self.lock_catalog().ok_or_else(|| {
             ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned"))
         })?;
         let generation = catalog.content_generation();
@@ -611,9 +618,8 @@ impl PackedObjectStore {
 
     fn catalog(&self) -> Result<MutexGuard<'_, PackedCatalog>, ObjectStoreError> {
         self.engine
-            .catalog
-            .lock()
-            .map_err(|_| ObjectStoreError::Backend("packed catalog mutex poisoned".into()))
+            .lock_catalog()
+            .ok_or_else(|| ObjectStoreError::Backend("packed catalog mutex poisoned".into()))
     }
 }
 
@@ -1286,9 +1292,8 @@ impl ContentBackend for PackedEngine {
                     bytes,
                 })
                 .collect::<Vec<_>>();
-            self.catalog
-                .lock()
-                .map_err(|_| {
+            self.lock_catalog()
+                .ok_or_else(|| {
                     ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned"))
                 })?
                 .put_records(&records)

@@ -67,6 +67,17 @@ pub fn isolate(command: &mut Command) -> &mut Command {
         .env("GIT_TERMINAL_PROMPT", "0")
 }
 
+/// A measured `wheat` command, isolated like [`isolate`]. It never records spans: a
+/// case runs hundreds of them, which would all write the same `WHEAT_TRACE` file. The
+/// `case` process that runs them records its own, which covers an in-process server.
+pub fn wheat_command(wheat: &Path) -> Command {
+    let mut command = Command::new(wheat);
+    isolate(&mut command)
+        .env_remove("WHEAT_TRACE")
+        .env_remove("WHEAT_TRACE_SUMMARY");
+    command
+}
+
 /// Where a finished report goes.
 pub struct Destination {
     /// The canonical report JSON, for `actions/profile`.

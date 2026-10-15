@@ -24,7 +24,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.28", features = ["connect"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }
@@ -32,6 +31,7 @@ wheat-ignore = { path = "../wheat-ignore" }
 wheat-git = { path = "../wheat-git" }
 wheat-protocol = { path = "../wheat-protocol" }
 wheat-store = { path = "../wheat-store" }
+wheat-trace = { path = "../wheat-trace" }
 
 [dev-dependencies]
 wheat-server = { path = "../wheat-server" }

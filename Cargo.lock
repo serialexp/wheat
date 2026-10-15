@@ -4027,6 +4027,7 @@ dependencies = [
  "wheat-git",
  "wheat-server",
  "wheat-store",
+ "wheat-trace",
 ]
 
 [[package]]
@@ -4063,7 +4064,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
  "wheat-core",
@@ -4072,6 +4072,7 @@ dependencies = [
  "wheat-protocol",
  "wheat-server",
  "wheat-store",
+ "wheat-trace",
 ]
 
 [[package]]
@@ -4153,6 +4154,7 @@ dependencies = [
  "wheat-core",
  "wheat-protocol",
  "wheat-store",
+ "wheat-trace",
 ]
 
 [[package]]
@@ -4179,6 +4181,17 @@ dependencies = [
  "tracing",
  "wheat-core",
  "zstd",
+]
+
+[[package]]
+name = "wheat-trace"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

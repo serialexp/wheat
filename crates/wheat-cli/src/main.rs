@@ -44,7 +44,6 @@ mod repack;
 mod repository_diff;
 mod rewrite_transaction;
 mod selection_recovery;
-mod span_trace;
 mod squash;
 mod squash_attribution;
 mod store_analyze;
@@ -661,7 +660,7 @@ struct ResolveArgs {
 
 fn main() -> ExitCode {
     // Reports when dropped, after the command's output.
-    let _span_trace = span_trace::install_from_env();
+    let _span_trace = wheat_trace::install_from_env();
     let args = std::env::args_os().collect::<Vec<_>>();
     let requested = requested_format(&args);
     if let Err(error) = require_supported_platform() {

@@ -3,7 +3,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{Context, Result};
@@ -59,8 +58,8 @@ impl Workspace {
 
     /// Runs `wheat --workspace <root> <arguments>`, which must succeed, and measures it.
     pub(crate) fn ok(&self, arguments: &[&str]) -> Result<Captured> {
-        let mut command = Command::new(&self.wheat);
-        crate::isolate(&mut command)
+        let mut command = crate::wheat_command(&self.wheat);
+        command
             .arg("--workspace")
             .arg(&self.root)
             .args(arguments)
@@ -99,8 +98,8 @@ impl Workspace {
         stores: &Path,
         arguments: &[&str],
     ) -> Result<Captured> {
-        let mut command = Command::new(&self.wheat);
-        crate::isolate(&mut command)
+        let mut command = crate::wheat_command(&self.wheat);
+        command
             .current_dir(directory)
             .args(arguments)
             .env("WHEAT_STORE_HOME", stores)

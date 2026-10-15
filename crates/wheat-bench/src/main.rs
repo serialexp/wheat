@@ -115,6 +115,9 @@ mod linux {
                 wheat,
                 scratch,
             } => {
+                // Spans of this process, such as an in-process server's; reported on
+                // stderr or to `WHEAT_TRACE` when the case ends.
+                let _span_trace = wheat_trace::install_from_env();
                 let output = quick::run_case(&name, scale, wheat, &scratch)?;
                 let mut stdout = std::io::stdout().lock();
                 serde_json::to_writer(&mut stdout, &output)?;

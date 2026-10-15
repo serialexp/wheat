@@ -1,4 +1,4 @@
-//! Opt-in timing of the phases a command goes through.
+//! Opt-in timing of the phases a Wheat process goes through.
 //!
 //! Wheat code marks its phases with `tracing` spans. Without a subscriber a span costs one
 //! disabled-callsite check, so the spans stay in place permanently. Two environment variables
@@ -7,11 +7,13 @@
 //! - `WHEAT_TRACE=<file>` writes every closed span as a Chrome trace event file. Perfetto
 //!   (<https://ui.perfetto.dev>, which runs in the browser without a server) and
 //!   `chrome://tracing` open it as a per-thread timeline, with each span's fields as arguments.
-//! - `WHEAT_TRACE_SUMMARY=1` prints a tree of the spans on stderr when the command ends: for
+//! - `WHEAT_TRACE_SUMMARY=1` prints a tree of the spans on stderr when the process ends: for
 //!   each path of nested span names, how often it ran, its total time, and its own time (the
 //!   total minus its child spans).
 //!
-//! Only spans from `wheat*` targets are recorded.
+//! Only spans from `wheat*` targets are recorded. A process with no subscriber of its own
+//! calls [`install_from_env`]; one that already builds a subscriber adds the layer from
+//! [`SpanTrace::from_env`] to it.
 
 use std::{
     cell::Cell,
@@ -41,33 +43,47 @@ use tracing_subscriber::{
 };
 
 /// Records spans until dropped, then writes the requested reports.
-pub(crate) struct SpanTrace {
+pub struct SpanTrace {
     recorded: Arc<Mutex<Recorded>>,
     trace_file: Option<PathBuf>,
     summary: bool,
 }
 
-/// Starts recording when `WHEAT_TRACE` or `WHEAT_TRACE_SUMMARY` asks for it.
-pub(crate) fn install_from_env() -> Option<SpanTrace> {
-    let trace_file = std::env::var_os("WHEAT_TRACE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let summary = std::env::var_os("WHEAT_TRACE_SUMMARY")
-        .is_some_and(|value| !value.is_empty() && value != "0");
-    if trace_file.is_none() && !summary {
-        return None;
+impl SpanTrace {
+    /// The recording `WHEAT_TRACE` or `WHEAT_TRACE_SUMMARY` asks for, with the layer that
+    /// feeds it, for a process that builds its own subscriber. `None` when neither is set.
+    pub fn from_env<S>() -> Option<(Self, impl Layer<S>)>
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        let trace_file = std::env::var_os("WHEAT_TRACE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let summary = std::env::var_os("WHEAT_TRACE_SUMMARY")
+            .is_some_and(|value| !value.is_empty() && value != "0");
+        if trace_file.is_none() && !summary {
+            return None;
+        }
+        let (recorder, recorded) = Recorder::new(trace_file.is_some());
+        let trace = Self {
+            recorded,
+            trace_file,
+            summary,
+        };
+        Some((trace, recorder.layer()))
     }
-    let (recorder, recorded) = Recorder::new(trace_file.is_some());
-    let subscriber = tracing_subscriber::registry().with(recorder.layer());
+}
+
+/// Starts recording when `WHEAT_TRACE` or `WHEAT_TRACE_SUMMARY` asks for it, as the process's
+/// only subscriber.
+pub fn install_from_env() -> Option<SpanTrace> {
+    let (trace, layer) = SpanTrace::from_env()?;
+    let subscriber = tracing_subscriber::registry().with(layer);
     if tracing::subscriber::set_global_default(subscriber).is_err() {
         eprintln!("warning: span tracing is unavailable: a tracing subscriber is already set");
         return None;
     }
-    Some(SpanTrace {
-        recorded,
-        trace_file,
-        summary,
-    })
+    Some(trace)
 }
 
 impl Drop for SpanTrace {

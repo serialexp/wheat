@@ -17,6 +17,7 @@ through import and push.
 | `wheat-protocol` | Native wire protocol messages and framing. |
 | `wheat-server` | Standalone native protocol server. |
 | `wheat-bench` | Benchmark profiles, uploaded to Gothab. |
+| `wheat-trace` | Opt-in span timing (`WHEAT_TRACE`, `WHEAT_TRACE_SUMMARY`) for the binaries. |
 
 Storage records are BinSchema-generated binary only. The schemas live in
 `crates/wheat-core/schemas/`; the generated code is committed under each crate's
@@ -43,6 +44,11 @@ Any `wheat` command can report its own timing:
   to stderr when the command ends.
 - `WHEAT_TRACE=trace.json wheat ...` writes a Chrome trace event timeline. Open it in
   [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`.
+
+`wheat-server` honours the same variables and reports when stopped with Ctrl-C. Under
+`wheat-bench quick`, each case process records its own spans, which covers the
+in-process server of the remote cases; the `wheat` commands a case runs record none.
+Use it with one `--case`, since every case writes the same `WHEAT_TRACE` file.
 
 ## Benchmarks
 

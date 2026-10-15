@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wheat-core = { path = "../wheat-core" }
 wheat-protocol = { path = "../wheat-protocol" }
 wheat-store = { path = "../wheat-store" }
+wheat-trace = { path = "../wheat-trace" }
 
 [dev-dependencies]
 futures = "0.3"
