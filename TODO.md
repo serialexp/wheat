@@ -3,6 +3,25 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Found while scoping the Scion lessons (2026-10-15)
+
+See `docs/design/wheat-lessons-from-scion.md` for the planned work; these are gaps
+between `wheat-native-protocol.md` and the code.
+
+- `[ ]` **The server ignores `publish_key`.** The client sends one
+  (`crates/wheat-cli/src/remote.rs`), but `wheat-server` never reads it, so a publish
+  whose CAS succeeded but whose reply was lost comes back `stale` on retry instead of
+  returning the original receipt.
+- `[ ]` **Content fetch checks no reachability.** `handle_content_fetch`
+  (`crates/wheat-server/src/fetch.rs`) serves any `ContentId` in the repository
+  entry's content store. The design says content is served only when the client's
+  authorized graph references it. Check whether a content store can be shared between
+  repositories; if so this leaks content across them.
+- `[ ]` **Protocol doc claims chunk-level resume.** `wheat-native-protocol.md`,
+  "Resolved design questions", says transfers resume from the last received chunk.
+  Nothing does; a partly received chunked blob is fetched again. Correct the doc or
+  implement it (tracked as "Resumable — content offsets" in the Scion doc).
+
 ## Security and performance scan (2026-09-26)
 
 Two read-only Antigravity scans of the whole repo, one for security and one for
