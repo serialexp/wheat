@@ -64,12 +64,10 @@ land and move completed bullets from Outstanding to Done.
 - [ ] **Client pushes the difference up front.** The client runs the server's walk
   from the last fetched head and sends the result, so a publish takes one round trip
   instead of one per tree level.
-- [ ] **Shorter commit section.** With one attempt per publish, throughput stops at
-  about 8.6 per second from 4 writers on: publishes queue on the commit lock, which
-  covers the join and the durable write of the staged objects. The join rewrites the
-  flat content manifest whole, so its cost grows with the repository (server CPU per
-  publish rose from 6 ms at 1 writer to 60 ms at 16). Candidates: write the staged
-  objects before taking the lock, and make the manifest join incremental.
+- [ ] **Packed appends and the catalog lock.** Throughput stops near 10 per second
+  at the packed store (see "Profile at 8 writers"): two appends of about 46 ms per
+  publish, and one catalog mutex that makes every read wait for them. Fix to be chosen
+  from that profile.
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
@@ -272,9 +270,34 @@ With staged writes, `TCP_NODELAY` and reconciliation (same machine and pinning):
 | 8 | 8.63 | 1.0 | 1 | 1.30 s | 4.1% |
 | 16 | 6.87 | 1.0 | 1 | 3.21 s | 10.2% |
 
-Almost every publish from 2 writers on is joined. Throughput now stops at the commit
-lock: the join and the durable write of the staged objects happen one publish at a
-time, and the join's cost grows with the repository.
+Almost every publish from 2 writers on is joined.
+
+#### Profile at 8 writers (2026-10-15, after content maps)
+
+`WHEAT_TRACE` on the bench's in-process server, 160 publishes at about 9.7 per
+second. Each publish holds the commit lock about 96 ms:
+
+| step under the commit lock | ms per publish |
+|---|---|
+| `publish_store`: one packed append of the staged objects | 50 |
+| `publish_join`: `union_envelopes`, of which `union_states` 4 to 7 | 26 to 29 |
+| `publish_validate` | 10 to 13 |
+| `publish_cas`: head file write | 9 to 10 |
+
+The packed store is the bottleneck, not the join's own work:
+
+- A publish makes two packed appends (content outside the lock, objects inside), at
+  about 46 ms each. Some append is running for 89% of the wall time, so appends
+  alone cap throughput near 10.7 per second.
+- Every packed read and append takes one `std::sync::Mutex<PackedCatalog>`. An append
+  holds it through all its fsyncs, so reads queue behind appends:
+  `packed_catalog_wait` totals 165 ms per publish, of which 28 ms inside the join and
+  10 ms inside validation (both under the commit lock) and 46 ms in the post-join
+  `fetch_push`. The join's own work is about 2 ms with one writer. The lock and the
+  fsyncs also block the runtime's worker threads.
+- One append of 46 ms: journal write 10, segment write and sync 6, head write 8,
+  journal removal 4, SQLite index transaction 17 (`journal_mode=DELETE`,
+  `synchronous=FULL`). The segment data itself is the smallest part.
 
 ### Alternative: per-label heads
 
