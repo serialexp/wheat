@@ -1,5 +1,12 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
+use async_trait::async_trait;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 use wheat_core::*;
@@ -192,6 +199,92 @@ proptest! {
             assert_eq!(lineage.union(left, right).await.unwrap(), built);
         });
     }
+}
+
+/// One batch that splits a node's prefix and also edits below the old node: the
+/// insert under the old node's next byte and the removal inside it both land.
+#[tokio::test]
+async fn a_batch_splitting_a_prefix_updates_the_old_node_too() {
+    let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "split-batch");
+    let sets = RetainedSetStore::new(&objects);
+    let id = |first: u8, last: u8| {
+        let mut digest = [5; 32];
+        digest[0] = first;
+        digest[31] = last;
+        ObjectId::from_digest(digest)
+    };
+    // The root's prefix is the 31 shared bytes.
+    let root = sets
+        .update_batch(
+            sets.empty_root().await.unwrap(),
+            [(id(0, 1), true), (id(0, 2), true)],
+        )
+        .await
+        .unwrap();
+    let root = sets
+        .update_batch(
+            root,
+            [
+                (id(9, 1), true),
+                (id(0, 3), true),
+                (id(0, 1), false),
+                (id(4, 4), false),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        root,
+        build_retained_set([id(0, 2), id(0, 3), id(9, 1)], |_| {})
+    );
+}
+
+struct CountsWrites {
+    inner: ObjectStoreAdapter,
+    writes: AtomicUsize,
+}
+
+#[async_trait]
+impl ImmutableObjectStore for CountsWrites {
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.inner.get(id).await
+    }
+    async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.put_if_absent(id, bytes).await
+    }
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.inner.exists_many(ids).await
+    }
+}
+
+/// A batch writes each node on its changed paths once, not a new root per edit:
+/// ten inserts below ten different root edges write those ten children and the root.
+#[tokio::test]
+async fn a_batch_writes_each_changed_node_once() {
+    let objects = CountsWrites {
+        inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), "batch-writes"),
+        writes: AtomicUsize::new(0),
+    };
+    let sets = RetainedSetStore::new(&objects);
+    let id = |first: u8, second: u8| {
+        let mut digest = [3; 32];
+        digest[0] = first;
+        digest[1] = second;
+        ObjectId::from_digest(digest)
+    };
+    let root = sets
+        .update_batch(
+            sets.empty_root().await.unwrap(),
+            (0..=255).flat_map(|first| (0..16).map(move |second| (id(first, second), true))),
+        )
+        .await
+        .unwrap();
+    objects.writes.store(0, Ordering::SeqCst);
+    sets.update_batch(root, (0..10).map(|first| (id(first * 20, 200), true)))
+        .await
+        .unwrap();
+    assert_eq!(objects.writes.load(Ordering::SeqCst), 11);
 }
 
 /// A single entry below the root is inlined in its parent. The same entry stored as
