@@ -179,6 +179,16 @@ impl<'a, S: ImmutableObjectStore> RevisionMapStore<'a, S> {
             inner: self.inner.cursor(root).await?,
         })
     }
+    /// A cursor over the changes from `lower` on, in change id order.
+    pub async fn cursor_from(
+        &self,
+        root: RevisionMapId,
+        lower: ChangeId,
+    ) -> Result<RevisionMapCursor<'a, S>, RevisionMapError> {
+        Ok(RevisionMapCursor {
+            inner: self.inner.cursor_from(root, &lower).await?,
+        })
+    }
     pub async fn get(
         &self,
         root: RevisionMapId,

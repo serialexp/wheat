@@ -305,6 +305,86 @@ async fn deterministic_batches_match_btree_map_and_cursor_order() {
     }
 }
 
+/// A cursor started at a bound yields what a full cursor yields from the bound on, for
+/// bounds on stored keys, between them, before the first and after the last.
+#[tokio::test]
+async fn a_cursor_from_a_bound_yields_the_keys_from_it_on() {
+    let objects = CountingStore::new(memory_store("cursor-from"));
+    let maps = RevisionMapStore::new(&objects);
+    let empty = maps.empty_root().await.unwrap();
+    // Keys sharing long prefixes and keys spread out, so the map has nested children
+    // as well as inline entries.
+    let mut state = 0x243f_6a88_85a3_08d3_u64;
+    let mut keys = Vec::new();
+    for index in 0..600_u32 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let mut bytes = [0x11_u8; 16];
+        if index % 3 == 0 {
+            bytes = (u128::from(state) << 64 | u128::from(state.rotate_left(17))).to_be_bytes();
+        } else {
+            bytes[13..].copy_from_slice(&state.to_be_bytes()[..3]);
+        }
+        keys.push(ChangeId::from_bytes(bytes));
+    }
+    let root = maps
+        .update_batch(
+            empty,
+            keys.iter().map(|key| {
+                (
+                    *key,
+                    Some(RevisionId::from_digest([key.as_bytes()[15]; 32])),
+                )
+            }),
+        )
+        .await
+        .unwrap();
+    let mut all = Vec::new();
+    let mut cursor = maps.cursor(root).await.unwrap();
+    while let Some(entry) = cursor.next().await.unwrap() {
+        all.push(entry);
+    }
+    assert_eq!(all.len(), 600);
+    let full_reads = objects.take_reads();
+
+    let mut bounds = vec![
+        ChangeId::from_bytes([0; 16]),
+        ChangeId::from_bytes([0xff; 16]),
+    ];
+    for (key, _) in all.iter().step_by(7) {
+        let value = u128::from_be_bytes(*key.as_bytes());
+        bounds.extend(
+            [value, value.wrapping_add(1), value.wrapping_sub(1)]
+                .map(|value| ChangeId::from_bytes(value.to_be_bytes())),
+        );
+    }
+    for bound in bounds {
+        let mut cursor = maps.cursor_from(root, bound).await.unwrap();
+        let mut from = Vec::new();
+        while let Some(entry) = cursor.next().await.unwrap() {
+            from.push(entry);
+        }
+        let expected = all
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key >= bound)
+            .collect::<Vec<_>>();
+        assert_eq!(from, expected, "from {bound}");
+    }
+
+    // Starting at the last key reads only the path down to it.
+    objects.take_reads();
+    let mut cursor = maps.cursor_from(root, all[599].0).await.unwrap();
+    assert_eq!(cursor.next().await.unwrap(), Some(all[599]));
+    assert_eq!(cursor.next().await.unwrap(), None);
+    let reads = objects.take_reads();
+    assert!(
+        reads * 4 < full_reads,
+        "a seek to the last key read {reads} nodes, a full walk {full_reads}"
+    );
+}
+
 #[tokio::test]
 async fn cursor_reports_a_missing_child_during_iteration() {
     let objects = memory_store("cursor-missing-child");

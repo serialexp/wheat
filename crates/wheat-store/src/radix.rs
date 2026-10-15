@@ -394,6 +394,64 @@ where
         })
     }
 
+    /// A cursor over the keys from `lower` on, in ascending order. Only the nodes on the
+    /// path to `lower` and those holding later keys are read.
+    pub(crate) async fn cursor_from(
+        &self,
+        root: C::Id,
+        lower: &C::Key,
+    ) -> Result<Cursor<'a, S, C>, Error> {
+        let bound = lower.bytes();
+        let mut stack = Vec::new();
+        let mut node = self.root(root).await?;
+        let mut position = 0;
+        loop {
+            let end = position + node.prefix.len();
+            match node.prefix.as_slice().cmp(&bound[position..end]) {
+                // Every key below this node comes before the bound.
+                std::cmp::Ordering::Less => break,
+                // Every key below this node comes after it.
+                std::cmp::Ordering::Greater => {
+                    stack.push((node, position, 0, 0, false));
+                    break;
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+            if end == C::Key::LEN {
+                // The node holds the bound itself.
+                stack.push((node, position, 0, 0, false));
+                break;
+            }
+            let edge = bound[end];
+            let child_index = node.children.partition_point(|(child, _)| *child < edge);
+            let entry_index = node
+                .entries
+                .partition_point(|(suffix, _)| suffix.as_slice() < &bound[end..]);
+            let descend = node
+                .children
+                .get(child_index)
+                .filter(|(child, _)| *child == edge)
+                .map(|(_, id)| *id);
+            match descend {
+                Some(id) => {
+                    stack.push((node, position, child_index + 1, entry_index, true));
+                    position = end + 1;
+                    node = self.read_at(id, position).await?;
+                }
+                None => {
+                    stack.push((node, position, child_index, entry_index, true));
+                    break;
+                }
+            }
+        }
+        Ok(Cursor {
+            store: Self::new(self.objects),
+            stack,
+            // Every byte on the path walked so far equals the bound's.
+            key: bound.to_vec(),
+        })
+    }
+
     pub(crate) async fn context_walk(&self, root: C::Id) -> Result<ContextWalk<'a, S, C>, Error> {
         let node = self.root(root).await?;
         Ok(ContextWalk {
