@@ -1,8 +1,8 @@
 # Wheat Lessons from Scion — Design
 
-Status: draft — review guidance landed; server-side publish reconciliation,
-optional sparse/on-demand/resumable transfer, derived-data indexes and deterministic
-simulation are not yet implemented
+Status: draft — review guidance and scope decisions landed; server-side publish
+reconciliation, resumable content and publish, lazy content, sparse materialization,
+derived-data indexes and deterministic simulation are not yet implemented
 Owner: bart
 Last updated: 2026-10-15
 
@@ -16,6 +16,11 @@ land and move completed bullets from Outstanding to Done.
 - [x] **Review guidance.** `CLAUDE.md` has a "Reviews" section: validate at trust
   boundaries, justify checks against trusted internal callers, and write performance
   contracts that count work rather than time.
+- [x] **Decision — target size (2026-10-15).** Wheat targets repositories up to the
+  size of TypeScript or Terraform. Larger monorepos are a non-goal, which defers
+  lazy structure, sparse fetching and per-label heads (see "Scope").
+- [x] **Decision — lazy granularity (2026-10-15).** Content only. Every client keeps
+  the full structural closure.
 
 ### Outstanding
 
@@ -28,41 +33,46 @@ land and move completed bullets from Outstanding to Done.
   uses, and refuses only real collisions.
 - [ ] **Client handling of a reconciled publish.** The client records the returned
   head without a fetch, and its next fetch walks from that head.
-- [ ] **Decision — reconciliation versus per-label heads.** Decide whether server
-  reconciliation is enough or whether labels get their own CAS later.
+- [ ] **Defer unless the contention benchmark shows the server merge as the
+  bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
+  without a head CAS.
 - [ ] **Open question — reconciled publish status.** Answer `ok`, or a distinct
   status so clients and logs can tell a fast-forward from a join.
 - [ ] **Capability negotiation.** `ClientHello` gains a capability list and the
   server fills `ServerHello.capabilities`, so optional modes are switched on per
   connection.
-- [ ] **Resumable — fetch.** A pending-fetch record in `remote.json` and a way to
-  skip what already arrived (decision below).
 - [ ] **Resumable — content offsets.** Per-blob start offsets in
   `ContentFetchRequest` and `ContentNeeded`; the server keeps partial uploads.
 - [ ] **Resumable — publish.** Server-side `publish_key` storage, and remote
   publishes that keep received objects across a dropped connection.
-- [ ] **Decision — fetch resume.** Pull-only retry or a have-hint on `FetchRequest`.
+- [ ] **Defer — resumable structural fetch.** A pending-fetch record in
+  `remote.json` and pull-only retry or a have-hint on `FetchRequest`. Structural
+  objects are small at the target size, so restarting the structural walk is
+  acceptable; content resume covers the expensive part.
 - [ ] **Decision — publish staging.** Store directly and seal on disconnect, or the
   designed staging with a TTL.
 - [ ] **Lazy — content only.** Fetch the label view's `required_content`, fault in
   older content when a command needs it.
-- [ ] **Lazy — structural.** Stop the fetch walk early and fault in structural
-  objects, which needs the store abstraction and a batched request by ID.
-- [ ] **Decision — lazy granularity.** Content only, or content and structure.
-- [ ] **Decision — where fault-in happens.** A faulting store wrapper or explicit
-  per-command prefetch.
-- [ ] **Decision — lazy client offline.** Fail or degrade.
-- [ ] **Decision — validation in a partial store.** Validate what is held, trust the
-  server's head, or keep full validation as fetch-everything.
-- [ ] **Sparse paths.** Path set in the workspace record, filtered materialization
-  and capture, path-aware server walk, path prefixes on `FetchRequest`.
-- [ ] **Decision — sparse scope.** Per workspace or per store.
+- [ ] **Decision — where content fault-in happens.** A faulting content-store
+  wrapper or explicit per-command prefetch.
+- [ ] **Decision — lazy client offline.** Fail or degrade when content is missing.
+- [ ] **Decision — validation with missing content.** `validate_complete` reads
+  every content blob; with lazy content it must skip, trust the server, or fetch
+  everything.
+- [ ] **Sparse materialization.** A path set in the workspace record; materialization
+  and capture touch only those paths and treat the rest as unchanged. The store
+  still holds the full structure.
+- [ ] **Defer — lazy structure.** Stop the fetch walk early and fault in structural
+  objects. Needs the store abstraction behind `LocalRepository`, a batched request
+  by ID, and a partial-store answer for every `validate_envelope` caller.
+- [ ] **Defer — sparse fetching.** Path-aware server walk and path prefixes on
+  `FetchRequest`. Depends on lazy structure.
 - [ ] **Derived data — one parent-recursive mechanism.** Change-ID index, path
   history and blame computed from parents' values, eagerly or lazily, in the store.
 - [ ] **Open question — eager or lazy per index.** Which derived indexes are computed
   on publish and which on first use.
 - [ ] **Derived data — server queries.** Expose the same queries over the native
-  protocol, used when asked or when the client lacks the data (sparse clone).
+  protocol, used when asked or when the client lacks the data (lazy content).
 - [ ] **Defer until Wheat runs inside Gothab — deterministic simulation.** A
   simulated client/server harness with dropped connections, interrupted transfers
   and many concurrent publishers, driving the real CLI code paths.
@@ -85,8 +95,9 @@ work has its reasoning attached.
 - Record what Scion does that bears on Wheat, and what Wheat takes from it.
 - Fix publish contention between unrelated changes before the native schema is
   locked.
-- Keep sparse, on-demand and resumable transfer possible as optional modes without
-  making them the default.
+- Add the optional transfer modes that pay off at the target size (lazy content,
+  sparse materialization, resumable content and publish) without making them the
+  default.
 - Give history queries (blame, path history, change-ID lookup) one mechanism that
   works locally and on the server.
 
@@ -95,6 +106,8 @@ work has its reasoning attached.
 - Becoming Scion. Scion assumes always-online clients and no full repository
   anywhere. Wheat keeps full local clones as the default; offline work and local
   changes stay first-class.
+- Monorepos beyond the size of TypeScript or Terraform. Google, Apple and Anthropic
+  build their own systems for those.
 - A Spanner (or similar managed database) backend. Scion's storage choice fits
   Anthropic's budget. Wheat's backends stay configurable and nobody plans this one.
 - Removing packed segments or repacking. Wheat's segments exist because per-object
@@ -283,6 +296,26 @@ server, or refuse in sparse mode.
 7. **Publish staging.** Store directly and seal on disconnect, as the local store
    effectively does, or the designed staging area with a TTL.
 
+### Scope (decided 2026-10-15)
+
+Wheat targets repositories up to the size of TypeScript or Terraform (TypeScript has
+about 31,600 commits on main). At that size structural objects are small next to file
+content, and most of a clone is old content that agents and CI never read. So:
+
+- **Lazy content only (decision 1).** Every client keeps the full structural
+  closure; only content outside the current label view arrives on demand. Most rows
+  of the dependency table stay as they are. Decisions 2 to 4 still apply, narrowed to
+  content.
+- **Sparse materialization, not sparse fetching (decision 5).** A workspace may
+  write only some paths to disk, which needs the existing path filters in
+  materialization and capture. Per workspace fits that, as `wheat-local-cli.md`
+  sketches. Sparse fetching depends on lazy structure and is deferred with it.
+- **Resume content and publish, not the structural fetch (decision 6).** Restarting
+  a structural walk is cheap at the target size; restarting a large blob is not.
+  Decision 6 is deferred with the structural resume.
+- **Lazy structure and per-label heads are deferred.** They stay in the checklist
+  as "Defer" so they are not forgotten if the target changes.
+
 Two things in `wheat-native-protocol.md` disagree with the code: "Resumable large
 transfers" is listed as resolved with resume from the last received chunk, which
 does not exist, and `publish_key` idempotency is described but not implemented. Both
@@ -302,8 +335,9 @@ For Wheat:
 - The mechanism lives in the store and runs locally by default, because local
   changes exist that no server has seen.
 - The same queries are exposed over the native protocol. A client uses them when
-  asked to, or by default when it does not hold the data (a sparse or on-demand
-  clone).
+  asked to, or by default when it does not hold the data. With lazy content that is
+  mostly blame over history the client has not fetched; Gothab's web UI needs the
+  same queries on the server regardless.
 - Each index type gets a work-counting contract (values computed per query) in
   `wheat-bench`, so a linear scan of history fails a test.
 
@@ -328,15 +362,14 @@ rather than an internal substrate.
 1. Contention benchmark, so the problem has a number.
 2. Server-side reconciliation and client handling of a reconciled publish; add the
    benchmark's contract rule.
-3. Capability negotiation, then resumable transfers, then lazy content, then lazy
-   structure and sparse paths, each after its decisions above.
+3. Capability negotiation, then resumable content and publish, then lazy content
+   and sparse materialization, each after its decisions above.
 4. The parent-recursive derived-data mechanism, starting with the change-ID index.
 5. Server queries over the native protocol.
 6. Deterministic simulation, after the Gothab integration.
 
 ## Open questions for review
 
-- Is server reconciliation enough, or do labels need their own CAS?
 - Should a reconciled publish answer `ok` or a distinct status, so clients and logs
   can tell a fast-forward from a join?
 - Which derived indexes are computed eagerly on publish and which lazily?
