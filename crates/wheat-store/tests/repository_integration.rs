@@ -397,19 +397,160 @@ async fn revisions_that_do_not_combine_are_refused() {
     );
 }
 
+/// One side revised a change the basis already holds, the other added work on top. The
+/// joined view starts below the revised change and composes the basis's later change
+/// again.
 #[tokio::test]
-async fn a_frontier_that_revises_its_basis_is_refused() {
+async fn a_frontier_that_revises_its_basis_joins_from_below_the_change() {
     let fixture = Fixture::new().await;
     let base = fixture.base;
     let (a, first) = fixture.create(base, base, "a", b"a1").await;
-    let revised = revise(&fixture, base, first, a, Revision::Replace(b"a2"), 1).await;
+    let (b, basis) = fixture.create(base, first, "b", b"b").await;
+    let revised = revise(&fixture, base, basis, a, Revision::Add("x"), 1).await;
+    let (c, added) = fixture.create(base, basis, "c", b"c").await;
 
-    let error = fixture.integrate(first, &[revised]).await.unwrap_err();
+    let outcome = fixture.integrate(basis, &[revised, added]).await.unwrap();
 
-    assert!(
-        matches!(&error, RepositoryMutationError::FrontierRevisesBasis(changes) if changes == &[a]),
-        "{error}"
+    assert_eq!(outcome.composed, [a, c]);
+    assert_eq!(outcome.reapplied, [b]);
+    assert!(outcome.combined.is_empty());
+    assert!(outcome.conflicted.is_empty());
+    let joined = outcome.resulting_view;
+    for (path, bytes) in [
+        ("a", b"a1".as_slice()),
+        ("x", b"x"),
+        ("b", b"b"),
+        ("c", b"c"),
+    ] {
+        assert_eq!(fixture.file(joined, path).await, Some(ContentId::of(bytes)));
+    }
+    assert_eq!(fixture.frontiers(basis).await, [joined]);
+    let reader = fixture.reader();
+    reader
+        .validate_complete(
+            reader
+                .envelope(fixture.head().envelope)
+                .await
+                .unwrap()
+                .state,
+        )
+        .await
+        .unwrap();
+
+    // Composed in canonical order, so revising a change in the middle keeps the rest.
+    let later = revise(&fixture, base, joined, b, Revision::Add("y"), 2).await;
+    for path in ["a", "x", "b", "c", "y"] {
+        assert!(
+            fixture.file(later, path).await.is_some(),
+            "{path} is missing"
+        );
+    }
+}
+
+/// Revising a change the basis itself holds, as resolving a conflict in a label's view
+/// does, composes from below the change. The result is still a frontier of the basis,
+/// and the basis's changes are applied once.
+#[tokio::test]
+async fn revising_a_change_the_basis_holds_makes_a_frontier_of_it() {
+    for first_in_order in [true, false] {
+        let fixture = Fixture::new().await;
+        let base = fixture.base;
+        let (a, first) = fixture.create(base, base, "a", b"a1").await;
+        let (b, basis) = fixture.create(base, first, "b", b"b").await;
+        let revised = if first_in_order { a } else { b };
+
+        let result = revise(&fixture, basis, basis, revised, Revision::Add("x"), 1).await;
+
+        assert_eq!(fixture.frontiers(basis).await, [result], "{revised}");
+        for path in ["a", "b", "x"] {
+            assert!(
+                fixture.file(result, path).await.is_some(),
+                "{path} is missing"
+            );
+        }
+        let view = fixture.reader().view(result).await.unwrap();
+        let mut conflicts = ConflictSetStore::new(&fixture.objects)
+            .cursor(view.unresolved_conflicts)
+            .await
+            .unwrap();
+        assert!(conflicts.next().await.unwrap().is_none(), "{revised}");
+    }
+}
+
+/// Both sides revised a change the basis holds: the revisions combine where the change
+/// sits, below the basis's later change.
+#[tokio::test]
+async fn revisions_of_a_basis_change_combine_below_the_basis() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (a, first) = fixture.create(base, base, "a", b"a1").await;
+    let (b, basis) = fixture.create(base, first, "b", b"b").await;
+    let left = revise(&fixture, base, basis, a, Revision::Add("x"), 100).await;
+    let right = revise(&fixture, base, basis, a, Revision::Add("y"), 200).await;
+
+    let outcome = fixture.integrate(basis, &[left, right]).await.unwrap();
+
+    assert_eq!(outcome.composed, [a]);
+    assert_eq!(outcome.reapplied, [b]);
+    assert_eq!(outcome.combined.keys().collect::<Vec<_>>(), [&a]);
+    let joined = outcome.resulting_view;
+    for path in ["a", "x", "y", "b"] {
+        assert!(
+            fixture.file(joined, path).await.is_some(),
+            "{path} is missing"
+        );
+    }
+    // Authored where `a` lands: the view below it, not the basis.
+    assert_eq!(
+        revision_in(&fixture, joined, a).await.authored_against,
+        base
     );
+    assert_ne!(first, base);
+}
+
+/// A change with no dependencies whose id sorts before the basis's change belongs below
+/// it in canonical order. The joined view must be composed that way, or revising the
+/// basis's change afterwards composes from a view that lacks the joined change.
+#[tokio::test]
+async fn a_joined_change_that_sorts_below_the_basis_is_kept_by_later_revisions() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let early = fixture.next_change();
+    let (late, basis) = fixture.create(base, base, "late", b"late").await;
+    fixture.content.put(b"early").unwrap();
+    let (prepared, outcome) = fixture
+        .mutator()
+        .create(
+            fixture.head(),
+            base,
+            basis,
+            ChangeProposal {
+                id: early,
+                metadata: ChangeMetadata::default(),
+                dependencies: Default::default(),
+                revision_metadata: RevisionMetadata::default(),
+                edits: exact("early", None, b"early"),
+            },
+        )
+        .await
+        .unwrap();
+    fixture.mutator().publish(prepared).await.unwrap();
+    let with_early = outcome.resulting_view;
+    let (_, beside) = fixture.create(base, basis, "beside", b"beside").await;
+
+    let joined = fixture
+        .integrate(basis, &[with_early, beside])
+        .await
+        .unwrap()
+        .resulting_view;
+    let revised = revise(&fixture, base, joined, late, Revision::Add("more"), 1).await;
+
+    for path in ["early", "late", "beside", "more"] {
+        assert!(
+            fixture.file(revised, path).await.is_some(),
+            "{path} is missing"
+        );
+    }
 }
 
 /// Joining one change on each side reads what the frontiers add, so a longer history
@@ -435,6 +576,40 @@ async fn integration_reads_what_the_frontiers_add() {
             .await
             .unwrap();
         assert_eq!(outcome.composed.len(), 2);
+        reads.push(fixture.objects.reads.load(Ordering::Relaxed));
+    }
+    assert!(
+        reads[1] <= reads[0] + 16,
+        "reads grew with the history: {reads:?}"
+    );
+}
+
+/// Joining a revision of a change near the top of the basis reads the changes from it
+/// up, not the history below it.
+#[tokio::test]
+async fn integrating_a_revised_basis_change_reads_from_the_change_up() {
+    let mut reads = Vec::new();
+    for history in [24, 192] {
+        let fixture = Fixture::new().await;
+        let mut below = fixture.base;
+        for index in 0..history {
+            below = fixture
+                .create(fixture.base, below, &format!("history/{index}"), b"h")
+                .await
+                .1;
+        }
+        let (a, first) = fixture.create(fixture.base, below, "a", b"a1").await;
+        let (_, basis) = fixture.create(fixture.base, first, "b", b"b").await;
+        let revised = revise(&fixture, fixture.base, basis, a, Revision::Add("x"), 1).await;
+        let (_, added) = fixture.create(fixture.base, basis, "c", b"c").await;
+        fixture.objects.reads.store(0, Ordering::Relaxed);
+        let (_, outcome) = fixture
+            .mutator()
+            .integrate(fixture.head(), basis, &[revised, added])
+            .await
+            .unwrap();
+        assert_eq!(outcome.composed.len(), 2);
+        assert_eq!(outcome.reapplied.len(), 1);
         reads.push(fixture.objects.reads.load(Ordering::Relaxed));
     }
     assert!(

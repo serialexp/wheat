@@ -234,6 +234,30 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **`wheat integrate` refuses a frontier that revises its label's view
+  (2026-10-09).** Done 2026-10-15. Integrate now starts the joined view below the
+  lowest revised change on the label's composition path and composes the label's
+  changes above it again (`reapplied` in the outcome and the CLI JSON). Finding that
+  start reads the revised changes' applications, not the history below them. Fixing it
+  turned up three more bugs, fixed in the same commit:
+  - integrate composed the frontiers' changes on top of the label's view even when
+    canonical order puts one below some of the label's changes (a change created with
+    `--independent` or `--depends-on` before them). Revising a label change afterwards
+    rebuilt from a view that lacked the joined change and dropped it. Integrate now
+    also starts below the first label change canonical order puts after a joined
+    change, found with a new seek, `RevisionMapStore::cursor_from`, over the label's
+    changes with higher ids;
+  - revising a change the basis holds (`wheat resolve` on a conflict in a label's
+    view) left the result outside the label's descendants: the continuation edge was
+    skipped when the effective view was the basis. The resolution vanished from
+    `frontier list`, and the next pull switched past it;
+  - revising the first change in canonical order composed from the basis view, which
+    can already hold it, so a label change was applied twice. `prefix_view(0)` is now
+    the view the first change was applied onto.
+  Tests in `crates/wheat-store/tests/repository_integration.rs` (including the read
+  count of `integrating_a_revised_basis_change_reads_from_the_change_up`),
+  `revision_map.rs` (`a_cursor_from_a_bound_yields_the_keys_from_it_on`) and
+  `pull_takes_a_resolution_of_a_conflict_the_label_holds` in the CLI.
 - `[x]` **The `.gitignore` fallback diagnostic points at a missing command.** Done
   2026-10-09: `wheat ignore import` (`crates/wheat-cli/src/ignore_import.rs`), see
   `wheat-local-tooling.md`.

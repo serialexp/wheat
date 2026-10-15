@@ -472,15 +472,18 @@ left after the fetch there is nothing to join, and the workspace moves to it as
 error says to run `wheat integrate` once the cause is settled.
 
 `wheat integrate` (2026-10-09) joins the active label's descendant frontiers, or
-the chosen ones, into one view: the label's view with every change the frontiers
-add composed onto it in canonical order, each at the revision it already has. A
-change that no longer applies cleanly is recorded as a durable conflict, as in any
-composition. Every joined frontier gets a lineage edge to the new view, so it is
-the label's one frontier, and the workspace switches to it. Uncaptured tracked
-edits block it like a switch. If the switch itself is refused (an untracked file
-in the way, or `.git` paths), the joined view is kept and the error names the
-`wheat switch` that finishes it. Frontiers revising a change the label's view
-already holds are refused for now.
+the chosen ones, into one view: all their changes composed in canonical order,
+each at the revision it already has. Usually that is the label's view with what
+the frontiers add composed onto it. When a frontier revised a change the label's
+view already holds (`wheat resolve` on a conflict in it does), or a joined change
+sorts below some of the label's changes, the joined view starts at the view below
+the lowest such change on the label's path, and the label's changes above it are
+composed again (`reapplied` in the JSON). A change that no longer applies cleanly
+is recorded as a durable conflict, as in any composition. Every joined frontier
+gets a lineage edge to the new view, so it is the label's one frontier, and the
+workspace switches to it. Uncaptured tracked edits block it like a switch. If the
+switch itself is refused (an untracked file in the way, or `.git` paths), the
+joined view is kept and the error names the `wheat switch` that finishes it.
 
 Frontiers may hold different revisions of one change, as when both sides of a
 fetch revised it. A revision another one descends from is superseded by it.

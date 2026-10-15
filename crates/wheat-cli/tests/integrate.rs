@@ -320,6 +320,63 @@ fn pull_joins_the_remote_work_with_the_local_work() {
     ok(reader, reader_stores, &sides.config, &["publish"]);
 }
 
+/// A label made at a view with a conflict holds the conflicted change. Resolving it
+/// revises that change while the other side adds work on the label: a pull joins both,
+/// the resolution included.
+#[test]
+fn pull_takes_a_resolution_of_a_conflict_the_label_holds() {
+    let (sides, _server) = diverged([("same.txt", "remote"), ("same.txt", "local")]);
+    let config = &sides.config;
+    let (writer, writer_stores) = &sides.writer;
+    let (reader, reader_stores) = &sides.reader;
+    let joined = ok_json(reader, reader_stores, config, &["integrate"]);
+    assert_eq!(
+        joined["conflicted"].as_array().unwrap().len(),
+        1,
+        "{joined}"
+    );
+    ok(reader, reader_stores, config, &["label", "create", "dev"]);
+    ok(reader, reader_stores, config, &["switch", "dev"]);
+    ok(reader, reader_stores, config, &["publish"]);
+    ok(writer, writer_stores, config, &["fetch"]);
+    ok(writer, writer_stores, config, &["switch", "dev"]);
+
+    ok(
+        reader,
+        reader_stores,
+        config,
+        &["resolve", "--path", "same.txt", "--value", "settled"],
+    );
+    change(&sides.writer, config, "more.txt", "more");
+    ok(writer, writer_stores, config, &["publish"]);
+    assert_eq!(frontier_count(&sides.reader, config), 1);
+
+    let pulled = ok_json(reader, reader_stores, config, &["pull"]);
+
+    assert_eq!(pulled["integrate"]["integrated"], true, "{pulled}");
+    assert_eq!(
+        pulled["integrate"]["conflicted"].as_array().unwrap().len(),
+        0,
+        "{pulled}"
+    );
+    for (path, value) in [("same.txt", "settled"), ("more.txt", "more")] {
+        assert_eq!(
+            fs::read_to_string(reader.join(path)).unwrap(),
+            value,
+            "{path}"
+        );
+    }
+    let conflicts = ok_json(reader, reader_stores, config, &["conflicts"]);
+    assert_eq!(
+        conflicts["conflicts"].as_array().unwrap().len(),
+        0,
+        "{conflicts}"
+    );
+    assert_eq!(frontier_count(&sides.reader, config), 1);
+    ok(reader, reader_stores, config, &["validate"]);
+    ok(reader, reader_stores, config, &["publish"]);
+}
+
 /// A pull whose integrate is refused keeps the fetch and says what to run next.
 #[test]
 fn a_refused_integrate_keeps_the_pulled_fetch() {

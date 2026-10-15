@@ -52,11 +52,6 @@ pub enum RepositoryMutationError {
          another: {reason}"
     )]
     RevisionsDoNotCombine { change: ChangeId, reason: String },
-    #[error(
-        "a frontier revises or drops changes its basis already holds: {}",
-        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-    )]
-    FrontierRevisesBasis(Vec<ChangeId>),
 }
 
 type Result<T> = std::result::Result<T, RepositoryMutationError>;
@@ -119,7 +114,6 @@ pub struct AuthoringSession {
 
 pub(crate) struct Active {
     pub(crate) state: RepositoryStateRecord,
-    pub(crate) base: ViewRecord,
     pub(crate) effective: ViewRecord,
     pub(crate) revisions: BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
     /// The revision identities and canonical order represented by `effective` before this mutation.
@@ -616,7 +610,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 .into());
             }
         }
-        let base = reader.view(basis_view).await?;
         let effective = reader.view(effective_view).await?;
         let mut revisions = BTreeMap::new();
         let mut cursor = RevisionMapStore::new(self.objects)
@@ -638,7 +631,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             .collect();
         let mut active = Active {
             state,
-            base,
             effective,
             revisions,
             persisted_revisions,
@@ -776,12 +768,11 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     /// The view after the first `prefix` changes of the persisted canonical order.
     ///
     /// The target of the next persisted application is precisely that intermediate view, so no
-    /// edit or tree in the prefix needs to be read.
+    /// edit or tree in the prefix needs to be read. That holds for an empty prefix too: the
+    /// basis may itself hold changes, such as a label's view, and is then not the view below
+    /// them.
     #[tracing::instrument(level = "debug", skip_all, fields(prefix))]
     async fn prefix_view(&self, active: &Active, prefix: usize) -> Result<ViewRecord> {
-        if prefix == 0 {
-            return Ok(active.base);
-        }
         if prefix == active.persisted_order.len() {
             return Ok(active.effective);
         }
@@ -851,17 +842,15 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     /// Record a lineage edge from the prior effective view to the new composed result so that the
     /// prior effective view is no longer a leaf frontier.
     ///
-    /// `compose` is a pure reconstructor: it rebuilds the view from `active.base` and only records
-    /// edges between consecutively-composed intermediate views within a single call.  When the
-    /// effective view was already a descendant of the base (from a prior mutation), `compose`
-    /// produces a new result branching from the base, leaving the old effective as an orphaned leaf.
-    /// This explicit continuation edge connects the two, maintaining a single-frontier chain.
+    /// Composition rebuilds the result from the view below the first change that differs, and only
+    /// records edges between the views it composes. That view may be below the effective view, and
+    /// even below the basis when a change the basis holds is revised, which would leave the result
+    /// outside the basis's descendants and the old effective view an orphaned leaf. This explicit
+    /// continuation edge connects the two, maintaining a single-frontier chain.
     fn ensure_continuation_edge(active: &Active, resulting: &ViewRecord, fresh: &mut Fresh) {
         let effective_id = active.effective.id();
         let resulting_id = resulting.id();
-        // Only needed when the effective view is a non-trivial descendant of the base (otherwise
-        // compose's own base→result edge is sufficient) and the result differs from the effective.
-        if effective_id != active.base.id() && effective_id != resulting_id {
+        if effective_id != resulting_id {
             fresh.view_edges.insert((effective_id, resulting_id));
         }
     }

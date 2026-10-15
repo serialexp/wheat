@@ -2091,6 +2091,13 @@ fn integrate_workspace(
         frontiers.len(),
         outcome.composed.len()
     );
+    if !outcome.reapplied.is_empty() {
+        writeln!(
+            human,
+            "reapplied {} changes of label {label} above them",
+            outcome.reapplied.len()
+        )?;
+    }
     for (change, revision) in &outcome.combined {
         writeln!(
             human,
@@ -2112,6 +2119,7 @@ fn integrate_workspace(
             "view": view.to_string(),
             "frontiers": frontiers.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "composed": ids(&outcome.composed),
+            "reapplied": ids(&outcome.reapplied),
             "combined": outcome.combined.keys().map(ToString::to_string).collect::<Vec<_>>(),
             "conflicted": ids(&outcome.conflicted),
         }),
@@ -2124,9 +2132,7 @@ fn integrate_workspace(
 fn integration_failure(error: wheat_store::RepositoryMutationError) -> anyhow::Error {
     use wheat_store::RepositoryMutationError as Mutation;
     match error {
-        Mutation::RevisionsDoNotCombine { .. } | Mutation::FrontierRevisesBasis(_) => {
-            CliFailure::conflict(error.to_string())
-        }
+        Mutation::RevisionsDoNotCombine { .. } => CliFailure::conflict(error.to_string()),
         other => anyhow::Error::new(other),
     }
 }

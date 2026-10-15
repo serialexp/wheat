@@ -1,12 +1,23 @@
 //! Joining frontiers: one view holding the work of several views that grew apart below
 //! one basis, such as a label's view after a fetch kept local work beside the remote's.
 //!
-//! The joined view is the basis with every change the frontiers add composed onto it in
-//! canonical order: dependencies first, ties broken by the lowest change id. Changes
-//! keep their revisions, so where a frontier's own composition is repeated the
-//! applications and views come out the same objects. An application that conflicts is
-//! recorded as a durable conflict, as in any composition. Each frontier gets a lineage
-//! edge to the joined view, which leaves it the one frontier.
+//! Like every view, the joined view is its changes composed in canonical order:
+//! dependencies first, ties broken by the lowest change id. Revising composes from the
+//! view just below the revised change on that understanding. Usually everything the
+//! frontiers add comes after the basis's changes, and the joined view is the basis with
+//! those changes composed onto it. Two things make it start lower, at a view on the
+//! basis's own composition path:
+//!
+//! - a frontier that revised a change the basis holds: below that change;
+//! - a joined change that sorts before some of the basis's changes, such as one created
+//!   without dependencies before them: below the first of those.
+//!
+//! The basis's changes above that start are composed again with the rest. Finding the
+//! start reads the changes involved, not the history below them. Changes keep their
+//! revisions, so where a frontier's own composition is repeated the applications and
+//! views come out the same objects. An application that conflicts is recorded as a
+//! durable conflict, as in any composition. Each frontier gets a lineage edge to the
+//! joined view, which leaves it the one frontier.
 //!
 //! Frontiers may hold different revisions of one change. A revision another one
 //! descends from is superseded by it. Revisions that went their own ways from a common
@@ -22,9 +33,10 @@ use wheat_core::{
 };
 
 use crate::{
-    ImmutableObjectStore, PersistedRepositoryMutator, PreparedRepositoryMutation, PublicationStore,
-    RepositoryHead, RepositoryMutationError, RepositoryPublicationError, RepositoryReader,
-    RetainedSetStore, RevisionMapDelta, RevisionMapStore,
+    ApplicationMapStore, ImmutableObjectStore, PersistedRepositoryMutator,
+    PreparedRepositoryMutation, PublicationStore, RepositoryHead, RepositoryMutationError,
+    RepositoryPublicationError, RepositoryReader, RetainedSetStore, RevisionMapDelta,
+    RevisionMapStore,
     repository_mutation::{Fresh, topological_by},
 };
 
@@ -34,8 +46,11 @@ type Result<T> = std::result::Result<T, RepositoryMutationError>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntegrationOutcome {
     pub resulting_view: ViewId,
-    /// The changes composed onto the basis, in canonical order.
+    /// The changes the frontiers add to the basis or revise in it, in canonical order.
     pub composed: Vec<ChangeId>,
+    /// The basis's changes composed again because the joined view starts below them, in
+    /// canonical order.
+    pub reapplied: Vec<ChangeId>,
     /// The composed changes whose application conflicted.
     pub conflicted: Vec<ChangeId>,
     /// The revisions authored to combine revisions that went their own ways.
@@ -68,13 +83,11 @@ impl Joined {
 }
 
 impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_, O, P> {
-    /// Joins `frontiers`, each holding every change of `basis` at the basis's revision,
-    /// into one view.
+    /// Joins `frontiers`, each holding every change of `basis`, into one view.
     ///
-    /// Refused when a frontier revises or drops a change the basis holds, or when the
-    /// revisions of one change cannot be combined. Only what the frontiers add to the
-    /// basis is read, so the cost follows the work being joined, not the history below
-    /// the basis.
+    /// Refused when the revisions of one change cannot be combined. What is read follows
+    /// the work being joined and the basis's changes composed again above the start, not
+    /// the history below it.
     #[tracing::instrument(name = "integrate", level = "debug", skip_all, fields(frontiers = frontiers.len()))]
     pub async fn integrate(
         &self,
@@ -109,45 +122,45 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             }
         }
         let base = reader.view(basis).await?;
-
-        // The revisions each frontier adds to the basis.
-        let maps = RevisionMapStore::new(self.objects);
-        let mut added: BTreeMap<ChangeId, BTreeSet<RevisionId>> = BTreeMap::new();
-        let mut revises_basis = BTreeSet::new();
+        let mut tops = Vec::with_capacity(frontiers.len());
         for frontier in frontiers {
-            let view = reader.view(*frontier).await?;
-            for entry in maps
-                .delta(base.revisions, view.revisions, Default::default())
-                .await?
-            {
-                match entry {
-                    RevisionMapDelta::Added { change, revision } => {
-                        added.entry(change).or_default().insert(revision);
-                    }
-                    RevisionMapDelta::Changed { change, .. }
-                    | RevisionMapDelta::Removed { change, .. } => {
-                        revises_basis.insert(change);
-                    }
-                }
-            }
-        }
-        if !revises_basis.is_empty() {
-            return Err(RepositoryMutationError::FrontierRevisesBasis(
-                revises_basis.into_iter().collect(),
-            ));
+            tops.push(reader.view(*frontier).await?);
         }
 
+        // What the frontiers add to the basis, and which of its changes they revise.
+        let (added, revised) = self.frontier_revisions(&base, &tops).await?;
         let mut joined = BTreeMap::new();
         for (change, revisions) in &added {
-            let entry = self.join_revisions(*change, revisions).await?;
+            joined.insert(*change, self.join_revisions(*change, revisions).await?);
+        }
+        let start = match self.start_below(&base, &revised, &joined).await? {
+            Some(start) => {
+                // Every change the frontiers hold above the start, the basis's included.
+                let (above, revised_below) = self.frontier_revisions(&start, &tops).await?;
+                if !revised_below.is_empty() {
+                    return Err(RepositoryPublicationError::InvalidReferences(
+                        "a frontier revises a change below its integration start",
+                    )
+                    .into());
+                }
+                for (change, revisions) in &above {
+                    if !joined.contains_key(change) {
+                        joined.insert(*change, self.join_revisions(*change, revisions).await?);
+                    }
+                }
+                start
+            }
+            None => base,
+        };
+        let maps = RevisionMapStore::new(self.objects);
+        for entry in joined.values() {
             for dependency in entry.dependencies() {
-                if !added.contains_key(dependency)
-                    && maps.get(base.revisions, *dependency).await?.is_none()
+                if !joined.contains_key(dependency)
+                    && maps.get(start.revisions, *dependency).await?.is_none()
                 {
                     return Err(wheat_core::RepositoryError::UnknownDependency(*dependency).into());
                 }
             }
-            joined.insert(*change, entry);
         }
         let selected = joined.keys().copied().collect::<BTreeSet<_>>();
         let order = topological_by(&selected, |change| {
@@ -155,7 +168,7 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         })?;
 
         let mut fresh = Fresh::default();
-        let mut view = base;
+        let mut view = start;
         let mut conflicted = Vec::new();
         let mut combined = BTreeMap::new();
         for change in &order {
@@ -184,15 +197,133 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             }
         }
         let prepared = self.finish(expected, state, resulting_view, fresh).await?;
+        let (composed, reapplied) = order
+            .into_iter()
+            .partition(|change| added.contains_key(change) || revised.contains(change));
         Ok((
             prepared,
             IntegrationOutcome {
                 resulting_view,
-                composed: order,
+                composed,
+                reapplied,
                 conflicted,
                 combined,
             },
         ))
+    }
+
+    /// The revisions `frontiers` hold of each change `from` lacks, and the changes of
+    /// `from` some frontier holds at another revision.
+    async fn frontier_revisions(
+        &self,
+        from: &ViewRecord,
+        frontiers: &[ViewRecord],
+    ) -> Result<(BTreeMap<ChangeId, BTreeSet<RevisionId>>, BTreeSet<ChangeId>)> {
+        let maps = RevisionMapStore::new(self.objects);
+        let mut added: BTreeMap<ChangeId, BTreeSet<RevisionId>> = BTreeMap::new();
+        let mut revised = BTreeSet::new();
+        for frontier in frontiers {
+            for entry in maps
+                .delta(from.revisions, frontier.revisions, Default::default())
+                .await?
+            {
+                match entry {
+                    RevisionMapDelta::Added { change, revision } => {
+                        added.entry(change).or_default().insert(revision);
+                    }
+                    RevisionMapDelta::Changed { change, .. } => {
+                        revised.insert(change);
+                    }
+                    RevisionMapDelta::Removed { .. } => {
+                        return Err(RepositoryPublicationError::InvalidReferences(
+                            "a frontier lacks a change its basis holds",
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok((added, revised))
+    }
+
+    /// The view on `base`'s composition path the joined view starts from, when that is
+    /// below `base`: the lowest of the views just below each revised change, and just
+    /// below the first of `base`'s changes canonical order puts after a joined change.
+    ///
+    /// A joined change none of the others is a dependency of sorts after every one of
+    /// `base`'s changes that is ready no later than it with a lower id. So only `base`'s
+    /// changes with a higher id can be out of place, and of those only the ones whose
+    /// view below already holds all of its dependencies.
+    async fn start_below(
+        &self,
+        base: &ViewRecord,
+        revised: &BTreeSet<ChangeId>,
+        joined: &BTreeMap<ChangeId, Joined>,
+    ) -> Result<Option<ViewRecord>> {
+        let maps = RevisionMapStore::new(self.objects);
+        // The lowest candidate so far: a change of `base` and the view just below it.
+        let mut lowest: Option<(ChangeId, ViewRecord)> = None;
+        for change in revised {
+            let below = self.view_below(base, *change).await?;
+            self.keep_lower(&mut lowest, *change, below).await?;
+        }
+        for (change, entry) in joined {
+            let dependencies = entry.dependencies();
+            if dependencies
+                .iter()
+                .any(|dependency| joined.contains_key(dependency))
+            {
+                continue;
+            }
+            let mut later = maps.cursor_from(base.revisions, *change).await?;
+            'later: while let Some((other, _)) = later.next().await? {
+                let below = self.view_below(base, other).await?;
+                for dependency in dependencies {
+                    if maps.get(below.revisions, *dependency).await?.is_none() {
+                        continue 'later;
+                    }
+                }
+                self.keep_lower(&mut lowest, other, below).await?;
+            }
+        }
+        Ok(lowest.map(|(_, below)| below))
+    }
+
+    /// Replaces `lowest` with `change` and the view just below it when `change` comes
+    /// earlier on the same composition path: the view below the later one holds it.
+    async fn keep_lower(
+        &self,
+        lowest: &mut Option<(ChangeId, ViewRecord)>,
+        change: ChangeId,
+        below: ViewRecord,
+    ) -> Result<()> {
+        let lower = match lowest {
+            None => true,
+            Some((current, current_below)) => {
+                change != *current
+                    && RevisionMapStore::new(self.objects)
+                        .get(current_below.revisions, change)
+                        .await?
+                        .is_some()
+            }
+        };
+        if lower {
+            *lowest = Some((change, below));
+        }
+        Ok(())
+    }
+
+    /// The view `change` was applied onto in `view`'s composition.
+    async fn view_below(&self, view: &ViewRecord, change: ChangeId) -> Result<ViewRecord> {
+        let application = ApplicationMapStore::new(self.objects)
+            .get(view.applications, change)
+            .await?
+            .ok_or(wheat_core::RepositoryError::InvalidRepositoryState(
+                "view lacks the application of one of its changes",
+            ))?;
+        let reader = RepositoryReader::new(self.objects, self.content);
+        let application = reader.application(application).await?;
+        Ok(reader.view(application.target_view).await?)
     }
 
     /// The one revision of `change` the joined view holds, given the ones the frontiers
@@ -212,6 +343,9 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
                     "revision-map change mismatch",
                 )
                 .into());
+            }
+            if revisions.len() == 1 {
+                return Ok(Joined::Existing(*revision, record));
             }
             let mut ancestors = Vec::new();
             let mut next = record.predecessor;
