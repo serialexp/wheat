@@ -435,7 +435,8 @@ Client                          Server
   │                               │  - new objects well-formed
   │                               │  - envelope is valid transition
   │                               │  - closure complete
-  │                               │  - CAS: generation == expected + 1
+  │                               │  - head moved past expected: join
+  │                               │  - CAS: generation == current + 1
   │                               │
   │<──── PublishProgress ────────┤  op_id, phase, pct (optional)
   │<──── PublishResult ──────────┤  op_id, receipt_id,
@@ -458,6 +459,22 @@ and the current head's lacks: a head is accepted only once all its content is
 stored, so the rest is there already. A fetch does the same against the
 envelope the client last fetched.
 
+The expected head is the one the client last fetched or published. When the
+server's head has moved past it, the server joins the proposed state into its
+current head with the rules a fetch that keeps local work uses, with the
+expected envelope's labels as the merge base, and publishes the joined state.
+It answers `stale` only where that join stops: a label both sides moved
+differently, a change recorded with a different change object on each side, or
+states from different base views. Publishes to one repository take turns from
+reading the head to its CAS, so a join is never made against a head that is
+about to be replaced. A forced publish is never joined: it must name the
+current head.
+
+`ok` does not say whether the publish was joined. The client compares
+`new_head.envelope` with the envelope it proposed; when they differ, it fetches
+the joined state's objects and content over the same session, walking from its
+proposed envelope, and only then moves its head there.
+
 Every publish operation carries a client-generated `op_id` for connection-
 scoped correlation and a `publish_key` (128-bit, client-generated, unique
 per principal + repository) for cross-session idempotency. If the CAS
@@ -475,10 +492,10 @@ the *transition*:
 - The proposed envelope references a valid state whose views, changes,
   revisions, and applications form a complete closure — all referenced
   ObjectIds exist in the store (pre-existing or newly uploaded).
-- The transition from `expected_head.envelope` to the proposed envelope
-  satisfies monotonicity: no retained changes/views are removed (append-only
-  for non-GC transitions).
-- Generation is exactly `expected_head.generation + 1`.
+- The transition from the current head's envelope to the published one (the
+  proposed envelope, or the joined one) satisfies monotonicity: no retained
+  changes/views are removed (append-only for non-GC transitions).
+- Generation is exactly the current head's generation + 1.
 
 This is O(delta) not O(repository). A background audit can run full
 `validate_complete` periodically without blocking publication latency.

@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
@@ -3081,29 +3081,23 @@ fn native_publish(
 
     let token = credential::token_for(Some(&context.store_root), &parsed)?;
     let rt = runtime()?;
-    let outcome = rt.block_on(async {
+    let staged = remote::staged(&local.objects);
+    let (outcome, joined) = rt.block_on(async {
         let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
-        // Check that the remote hasn't advanced past what we last fetched.
-        if state.generation != last_fetched.generation || state.envelope != last_fetched.envelope {
-            // Special case: if this is a first publish (last_fetched is all zeros),
-            // we use the remote's current state as the expected head.
-            let is_first_publish =
-                last_fetched.generation == 0 && *last_fetched.envelope.as_bytes() == [0u8; 32];
-            if !is_first_publish {
-                remote::close(&mut session).await?;
-                bail!(
-                    "remote has advanced (generation {} → {}); run `wheat fetch` first",
-                    last_fetched.generation,
-                    state.generation,
-                );
+        // The server joins this publish with whatever was published since the head
+        // it names, so that is the last head fetched or published here. A first
+        // publish has none and names the remote's current head.
+        let is_first_publish =
+            last_fetched.generation == 0 && *last_fetched.envelope.as_bytes() == [0u8; 32];
+        let expected = if is_first_publish {
+            wheat_store::RepositoryHead {
+                generation: state.generation,
+                envelope: state.envelope,
             }
-        }
-
-        let expected = wheat_store::RepositoryHead {
-            generation: state.generation,
-            envelope: state.envelope,
+        } else {
+            last_fetched
         };
 
         let result = remote::publish(
@@ -3117,8 +3111,32 @@ fn native_publish(
         )
         .await?;
 
+        // A head the server joined holds others' work too. Fetch it from what was
+        // just published, which the server now holds, so the store keeps the whole
+        // closure of the head it records as fetched.
+        let joined = match result {
+            remote::PublishOutcome::Ok { new_envelope, .. }
+                if new_envelope != local_head.envelope =>
+            {
+                let since = Some(local_head.envelope);
+                remote::fetch_objects(&mut session, 2, &staged, new_envelope, since).await?;
+                remote::fetch_content(
+                    &mut session,
+                    3,
+                    &staged,
+                    &local.content,
+                    new_envelope,
+                    since,
+                )
+                .await?;
+                staged.flush().await?;
+                true
+            }
+            _ => false,
+        };
+
         remote::close(&mut session).await?;
-        Ok::<_, anyhow::Error>(result)
+        Ok::<_, anyhow::Error>((result, joined))
     })?;
 
     match outcome {
@@ -3126,6 +3144,18 @@ fn native_publish(
             new_generation,
             new_envelope,
         } => {
+            if joined {
+                local
+                    .heads
+                    .compare_and_advance(
+                        local_head,
+                        wheat_store::RepositoryHead {
+                            generation: local_head.generation + 1,
+                            envelope: new_envelope,
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("failed to update local head: {e}"))?;
+            }
             // Update remote config to track the new remote head.
             let new_remote_head = wheat_store::RepositoryHead {
                 generation: new_generation,
@@ -3137,14 +3167,21 @@ fn native_publish(
             }
             remote_cfg.write(&context.store_root)?;
 
-            let human =
-                format!("published to generation {new_generation}, envelope {new_envelope}\n");
+            let human = format!(
+                "published to generation {new_generation}, envelope {new_envelope}\n{}",
+                if joined {
+                    "joined with work published since the last fetch\n"
+                } else {
+                    ""
+                }
+            );
             Success::new(
                 "publish",
                 json!({
                     "status": "ok",
                     "generation": new_generation,
                     "envelope": new_envelope.to_string(),
+                    "joined": joined,
                 }),
                 human,
             )

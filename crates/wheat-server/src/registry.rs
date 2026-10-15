@@ -13,6 +13,10 @@ pub struct RepositoryEntry {
     pub objects: Box<dyn ImmutableObjectStore>,
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
+    /// Held by a publish from reading the head until its compare-and-swap, so
+    /// concurrent publishes take turns instead of each merging against a head that
+    /// another is about to replace.
+    pub commit: tokio::sync::Mutex<()>,
 }
 
 impl RepositoryEntry {
@@ -20,11 +24,24 @@ impl RepositoryEntry {
     pub fn open(data_dir: &Path) -> Result<Self, ObjectStoreError> {
         let packed = PackedObjectStore::open(data_dir.join("storage"))?;
         let content = packed.content_store();
-        Ok(Self {
-            objects: Box::new(packed),
+        Ok(Self::new(
+            Box::new(packed),
             content,
-            heads: LocalPublicationStore::new(data_dir.join("repository.head")),
-        })
+            LocalPublicationStore::new(data_dir.join("repository.head")),
+        ))
+    }
+
+    pub fn new(
+        objects: Box<dyn ImmutableObjectStore>,
+        content: ContentStore,
+        heads: LocalPublicationStore,
+    ) -> Self {
+        Self {
+            objects,
+            content,
+            heads,
+            commit: tokio::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -62,11 +79,7 @@ impl Registry {
         content: ContentStore,
         heads: LocalPublicationStore,
     ) -> Self {
-        let entry = Arc::new(RepositoryEntry {
-            objects,
-            content,
-            heads,
-        });
+        let entry = Arc::new(RepositoryEntry::new(objects, content, heads));
         let mut repos = HashMap::new();
         repos.insert(name, entry);
         Self { repos }

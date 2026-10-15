@@ -1,24 +1,21 @@
 //! Many writers publishing unrelated changes to one server at once.
 //!
-//! Changes are independent, but a publish names the repository head it expects, and
-//! the server takes only one publish per head. Every other writer that started from
-//! the same head is turned away: either by the client's own check before it uploads
-//! (`remote has advanced`) or by the server's compare-and-swap after the upload. It
-//! then fetches, which keeps its own change beside the new remote work, and publishes
-//! again. This case measures what that costs as writers are added.
+//! Changes are independent, but a publish names the repository head it last saw, and
+//! the repository has one head. When another writer published in between, the server
+//! joins the publish with that work, as a fetch would, and the writer takes the joined
+//! head. A publish is refused only where the two sides disagree (a label moved on
+//! both), or when the head keeps moving under it; the writer then fetches and
+//! publishes again. This case measures what that costs as writers are added.
 //!
 //! For each writer count a fresh server runs in this process, pinned to whole cores of
 //! its own, and each writer is a loop of `wheat` processes on the remaining cores:
 //! `change new`, then `publish` until it is accepted, with `fetch` after each refusal.
 //! Every writer has its own clone and store home, as separate agents would.
-//!
-//! There is no budget yet. The planned server-side reconciliation (see
-//! `docs/design/wheat-lessons-from-scion.md`) should bring attempts per publish close
-//! to 1, which is when this case gets a contract rule.
 
 use std::{path::PathBuf, sync::Barrier, time::Instant};
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 
 use super::{
     CaseContext, CaseOutput, Recorder,
@@ -82,10 +79,10 @@ struct WriterStats {
     attempts: Vec<usize>,
     /// From the first publish attempt of a change to its acceptance, fetches included.
     latencies: Vec<f64>,
-    /// Refused by the client's own check, before uploading anything.
-    refused_before_upload: usize,
-    /// Refused by the server's compare-and-swap, after the upload.
-    refused_after_upload: usize,
+    /// Publishes the server sent back as stale.
+    refused: usize,
+    /// Accepted publishes the server joined with work published since the last fetch.
+    joined: usize,
     publish_walls: Vec<f64>,
     fetch_walls: Vec<f64>,
 }
@@ -185,13 +182,13 @@ impl Level {
             "count",
         );
         recorder.value(
-            &format!("{step}.refused_before_upload_per_publish"),
-            sum(|writer| writer.refused_before_upload) / accepted,
+            &format!("{step}.refused_per_publish"),
+            sum(|writer| writer.refused) / accepted,
             "count",
         );
         recorder.value(
-            &format!("{step}.refused_after_upload_per_publish"),
-            sum(|writer| writer.refused_after_upload) / accepted,
+            &format!("{step}.joined_per_publish"),
+            sum(|writer| writer.joined) / accepted,
             "count",
         );
         recorder.value(
@@ -239,9 +236,11 @@ struct Client {
 
 /// How one `wheat publish` ended.
 enum Publish {
-    Accepted,
-    RefusedBeforeUpload,
-    RefusedAfterUpload,
+    /// `joined` when the server joined it with work published since the last fetch.
+    Accepted {
+        joined: bool,
+    },
+    Refused,
 }
 
 impl Client {
@@ -298,9 +297,11 @@ impl Client {
                 let (outcome, wall) = self.publish(source)?;
                 stats.publish_walls.push(wall);
                 match outcome {
-                    Publish::Accepted => break,
-                    Publish::RefusedBeforeUpload => stats.refused_before_upload += 1,
-                    Publish::RefusedAfterUpload => stats.refused_after_upload += 1,
+                    Publish::Accepted { joined } => {
+                        stats.joined += usize::from(joined);
+                        break;
+                    }
+                    Publish::Refused => stats.refused += 1,
                 }
                 let fetched = source.ok_in_stores(&self.root, &self.stores, &["fetch"])?;
                 stats.fetch_walls.push(fetched.timing.wall_seconds);
@@ -312,22 +313,26 @@ impl Client {
     }
 
     fn publish(&self, source: &Workspace) -> Result<(Publish, f64)> {
-        let captured = source.run_in_stores(&self.root, &self.stores, &["publish"])?;
+        let captured =
+            source.run_in_stores(&self.root, &self.stores, &["--format", "json", "publish"])?;
         let wall = captured.timing.wall_seconds;
         Ok((classify(&captured)?, wall))
     }
 }
 
-/// Sorts a refused publish by where it was refused; anything else is an error.
+/// Reads how a publish ended; a failure other than a stale refusal is an error.
 fn classify(captured: &Captured) -> Result<Publish> {
     if captured.status.success() {
-        return Ok(Publish::Accepted);
+        let document: Value = serde_json::from_slice(&captured.stdout)
+            .context("wheat publish printed no JSON document")?;
+        let Some(joined) = document["result"]["joined"].as_bool() else {
+            bail!("wheat publish did not say whether it joined: {document}");
+        };
+        return Ok(Publish::Accepted { joined });
     }
     let stderr = String::from_utf8_lossy(&captured.stderr);
-    if stderr.contains("remote has advanced") {
-        Ok(Publish::RefusedBeforeUpload)
-    } else if stderr.contains("publish rejected: remote is at generation") {
-        Ok(Publish::RefusedAfterUpload)
+    if stderr.contains("publish rejected: remote is at generation") {
+        Ok(Publish::Refused)
     } else {
         captured.ensure_success("wheat publish")?;
         unreachable!("ensure_success fails for an unsuccessful command")

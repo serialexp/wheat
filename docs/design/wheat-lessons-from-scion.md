@@ -38,6 +38,20 @@ land and move completed bullets from Outstanding to Done.
   30-change repository went from 160 ms to 20 to 40 ms. With both changes, one
   writer reaches 7.1 accepted publishes per second (was 1.6); 16 writers reach 2.4
   (was 0.7), still at 13 attempts per publish.
+- [x] **Server-side publish reconciliation (2026-10-15).** When the head moved past
+  the publish's expected head, the server joins the proposed state into the current
+  head with `union_envelopes`, the rules `wheat fetch` uses, and answers `stale` only
+  where the join refuses. A per-repository commit lock makes concurrent publishes
+  take turns from reading the head to its CAS. A forced publish must still name the
+  current head.
+- [x] **Client handling of a reconciled publish (2026-10-15).** The client no longer
+  refuses to publish behind the remote. When the returned envelope is not the one it
+  sent, it fetches the joined head's new objects over the same session, stores them
+  in one write, and moves its head there; `wheat publish` reports `joined`. Every
+  publish in `publish_contention` now takes one attempt, at every writer count.
+- [x] **Decision — reconciled publish status (2026-10-15).** `ok`, with no wire
+  change: the client tells a join from a fast-forward by comparing the returned
+  envelope with the one it proposed.
 
 ### Outstanding
 
@@ -50,16 +64,15 @@ land and move completed bullets from Outstanding to Done.
 - [ ] **Client pushes the difference up front.** The client runs the server's walk
   from the last fetched head and sends the result, so a publish takes one round trip
   instead of one per tree level.
-- [ ] **Server-side publish reconciliation.** On a stale expected head, the server
-  merges the proposed state into its current head with the same rules `wheat fetch`
-  uses, and refuses only real collisions.
-- [ ] **Client handling of a reconciled publish.** The client records the returned
-  head without a fetch, and its next fetch walks from that head.
+- [ ] **Shorter commit section.** With one attempt per publish, throughput stops at
+  about 8.6 per second from 4 writers on: publishes queue on the commit lock, which
+  covers the join and the durable write of the staged objects. The join rewrites the
+  flat content manifest whole, so its cost grows with the repository (server CPU per
+  publish rose from 6 ms at 1 writer to 60 ms at 16). Candidates: write the staged
+  objects before taking the lock, and make the manifest join incremental.
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
-- [ ] **Open question — reconciled publish status.** Answer `ok`, or a distinct
-  status so clients and logs can tell a fast-forward from a join.
 - [ ] **Capability negotiation.** `ClientHello` gains a capability list and the
   server fills `ServerHello.capabilities`, so optional modes are switched on per
   connection.
@@ -179,23 +192,22 @@ work has its reasoning attached.
 
 ## Publish contention on the repository head
 
-### Today
+### Before reconciliation
 
 Changes are logically independent: a change depends only on its parents. Publication
 is not. A publish sends one `RepositoryEnvelope`, and the server checks it against
 the single `RepositoryHead {generation, envelope}` of the repository
-(`crates/wheat-server/src/publish.rs`, the expected-head checks at the start of the
-publish and the CAS at the commit). The envelope reaches the `RepositoryState`,
+(`crates/wheat-server/src/publish.rs`). The envelope reaches the `RepositoryState`,
 which holds the label map and the retained roots of every change and revision.
 
-So two agents that publish revisions of unrelated changes from the same head
-collide. One wins the CAS. The other gets `stale_head`, fetches (which unions the
-remote state into its own), and publishes again, possibly losing the race again.
+So two agents that published revisions of unrelated changes from the same head
+collided. One won the CAS. The other got `stale_head`, fetched (which unions the
+remote state into its own), and published again, possibly losing the race again.
 With a handful of writers this is invisible. With a swarm it means most publishes
 cost a fetch and a retry, and the retry rate grows with the number of writers. This
 is the global shared state Scion limits to one row per ref.
 
-### Proposal: the server reconciles
+### The server reconciles (implemented 2026-10-15)
 
 Every part of a repository state only grows, and `wheat fetch` already knows how to
 join two states: the union of both, with a three-way merge of labels against the
@@ -209,15 +221,17 @@ that same join instead of answering `stale`:
    differently, a change recorded with a different change object on each side, or
    states from different base views. Those still answer `stale`, with a reason.
 4. Otherwise the server writes the joined state, advances the head by CAS, and
-   answers `ok` with the new head. A CAS lost during this step retries the join on
-   the server, not across the network.
-
-The client then records the returned head. Its own state is part of that head, so it
-needs no fetch to stay consistent; other writers' objects arrive on its next fetch,
-which walks from the new head.
+   answers `ok` with the new head. Publishes take turns on a per-repository commit
+   lock from reading the head to the CAS; a CAS still lost (to another process on
+   the same store) retries the join on the server, not across the network.
 
 The client publishes a head it never saw in full. That is acceptable because the
 join can only add: nothing the client published is dropped or changed.
+
+When the returned envelope differs from the one it proposed, the client fetches the
+joined head's objects over the same session, walking from its own proposed state,
+and moves its head there. Its workspace head can only point at a state it holds in
+full, so recording the returned head without those objects is not an option.
 
 The join reuses the existing cost model: it compares the two roots and skips the
 subtrees they share, so cost follows how far the states have drifted, not
@@ -247,6 +261,20 @@ writers an unlucky one keeps losing.
 
 Hence the order of work: one durable commit per operation, then server
 reconciliation, then a client-side push of the difference to cut round trips.
+
+With staged writes, `TCP_NODELAY` and reconciliation (same machine and pinning):
+
+| writers | accepted/s | attempts per publish | worst change | p95 latency | server busy |
+|---|---|---|---|---|---|
+| 1 | 6.24 | 1.0 | 1 | 0.09 s | 0.9% |
+| 2 | 6.43 | 1.0 | 1 | 0.38 s | 0.8% |
+| 4 | 8.73 | 1.0 | 1 | 0.41 s | 2.3% |
+| 8 | 8.63 | 1.0 | 1 | 1.30 s | 4.1% |
+| 16 | 6.87 | 1.0 | 1 | 3.21 s | 10.2% |
+
+Almost every publish from 2 writers on is joined. Throughput now stops at the commit
+lock: the join and the durable write of the staged objects happen one publish at a
+time, and the join's cost grows with the repository.
 
 ### Alternative: per-label heads
 
@@ -406,8 +434,8 @@ rather than an internal substrate.
 ## Phasing
 
 1. Contention benchmark, so the problem has a number.
-2. Server-side reconciliation and client handling of a reconciled publish; add the
-   benchmark's contract rule.
+2. Server-side reconciliation and client handling of a reconciled publish (done);
+   add the benchmark's contract rule.
 3. Capability negotiation, then resumable content and publish, then lazy content
    and sparse materialization, each after its decisions above.
 4. The parent-recursive derived-data mechanism, starting with the change-ID index.
@@ -416,8 +444,6 @@ rather than an internal substrate.
 
 ## Open questions for review
 
-- Should a reconciled publish answer `ok` or a distinct status, so clients and logs
-  can tell a fast-forward from a join?
 - Which derived indexes are computed eagerly on publish and which lazily?
 
 ## References

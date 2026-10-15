@@ -10,8 +10,9 @@ use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
     BatchObjectStore, DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError,
-    PublicationError, PublicationStore, RepositoryHead, RepositoryReader, StructuralDelta,
-    StructuralDeltaError, StructuralDeltaLimits, TransitionValidationOptions, TreeDiffLimits,
+    PublicationError, PublicationStore, RepositoryHead, RepositoryReader, RepositoryUnionError,
+    StructuralDelta, StructuralDeltaError, StructuralDeltaLimits, TransitionValidationOptions,
+    TreeDiffLimits,
 };
 
 use crate::connection::ConnectionError;
@@ -35,42 +36,27 @@ pub async fn handle_publish(
     let force = req.force;
     debug!(op_id, force, "publish: starting");
 
-    // Verify expected generation matches current head.
-    if req.expected_generation != current_head.generation {
-        send(
+    // The head the client last saw. A forced publish replaces the head, so it must
+    // be exactly this one. Any other publish is joined with whatever was published
+    // since, at commit.
+    let expected = RepositoryHead {
+        generation: req.expected_generation,
+        envelope: RepositoryEnvelopeId::from_digest(
+            req.expected_envelope
+                .bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| ConnectionError::Protocol("invalid expected envelope ID"))?,
+        ),
+    };
+    if force && expected != *current_head {
+        return stale(
             ws,
-            &publish_result(
-                op_id,
-                publish_stale_status(),
-                current_head.generation,
-                current_head.envelope.as_bytes(),
-                "expected generation does not match current head",
-            ),
+            op_id,
+            current_head,
+            "a forced publish must name the current head",
         )
-        .await?;
-        return Ok(None);
-    }
-
-    // Verify expected envelope matches current head.
-    let expected_envelope_bytes: [u8; 32] = req
-        .expected_envelope
-        .bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| ConnectionError::Protocol("invalid expected envelope ID"))?;
-    if expected_envelope_bytes != *current_head.envelope.as_bytes() {
-        send(
-            ws,
-            &publish_result(
-                op_id,
-                publish_stale_status(),
-                current_head.generation,
-                current_head.envelope.as_bytes(),
-                "expected envelope does not match current head",
-            ),
-        )
-        .await?;
-        return Ok(None);
+        .await;
     }
 
     let proposed_envelope_id = RepositoryEnvelopeId::from_digest(
@@ -239,7 +225,6 @@ pub async fn handle_publish(
         }
     }
 
-    // Run bounded delta validation.
     send(
         ws,
         &WheatProtocolMessage::PublishProgress(PublishProgressOutput {
@@ -250,113 +235,199 @@ pub async fn handle_publish(
         }),
     )
     .await?;
+    commit(
+        ws,
+        entry,
+        &staged,
+        &reader,
+        op_id,
+        expected,
+        proposed_envelope_id,
+        force,
+    )
+    .await
+}
 
-    let validation_options = TransitionValidationOptions {
-        allow_non_monotonic: force,
+/// Times one publish retries its compare-and-swap when another process sharing the
+/// store moved the head in between. Publishes through this server take turns on
+/// the entry's commit lock, so they never cause a retry.
+const MAX_COMMIT_ATTEMPTS: usize = 16;
+
+/// Makes `proposed` the head, joined with whatever was published since `expected`,
+/// and tells the client the new head.
+///
+/// The join is the one a fetch does: the union of both states, with labels merged
+/// three ways against `expected`. So writers of unrelated changes never have to
+/// fetch and try again; only a label both sides moved, or a change recorded
+/// differently on each side, sends the publish back as stale. A forced publish is
+/// never joined: it replaces exactly the head it names.
+#[tracing::instrument(name = "publish_commit", level = "debug", skip_all)]
+async fn commit(
+    ws: &mut WebSocketStream<TcpStream>,
+    entry: &RepositoryEntry,
+    staged: &Staged<'_>,
+    reader: &RepositoryReader<'_, Staged<'_>>,
+    op_id: u32,
+    expected: RepositoryHead,
+    proposed: RepositoryEnvelopeId,
+    force: bool,
+) -> Result<Option<RepositoryHead>, ConnectionError> {
+    let _turn = entry.commit.lock().await;
+    let internal = |what: &str, e: &dyn std::fmt::Display| {
+        ConnectionError::Internal(format!("publish: {what}: {e}"))
     };
-
-    if let Err(e) = reader
-        .validate_transition_with_options(
-            current_envelope.state,
-            envelope_record.state,
-            validation_options,
-        )
-        .await
-    {
-        info!(op_id, error = %e, "publish: validation failed");
-        send(
-            ws,
-            &publish_result(
-                op_id,
-                publish_rejected_status(),
-                current_head.generation,
-                current_head.envelope.as_bytes(),
-                &format!("validation failed: {e}"),
-            ),
-        )
-        .await?;
-        return Ok(None);
-    }
-
-    // Store the staged objects, then seal any buffered objects into a durable
-    // batch (e.g. a packed segment uploaded to S3) before the head can name them.
-    // Sealing is a no-op for local stores.
-    let stored = match staged.flush().await {
-        Ok(()) => entry.objects.seal().await,
-        Err(e) => Err(e),
-    };
-    if let Err(e) = stored {
-        warn!(op_id, error = %e, "publish: seal failed");
-        send(
-            ws,
-            &publish_result(
-                op_id,
-                publish_error_status(),
-                current_head.generation,
-                current_head.envelope.as_bytes(),
-                &format!("storing the published objects failed: {e}"),
-            ),
-        )
-        .await?;
-        return Ok(None);
-    }
-
-    // CAS the head.
-    let new_generation = current_head.generation + 1;
-    let proposed_head = RepositoryHead {
-        generation: new_generation,
-        envelope: proposed_envelope_id,
-    };
-
-    match entry
-        .heads
-        .compare_and_advance(*current_head, proposed_head)
-    {
-        Ok(()) => {
-            info!(op_id, generation = new_generation, "publish: committed");
-            send(
+    for _ in 0..MAX_COMMIT_ATTEMPTS {
+        let head = entry
+            .heads
+            .read()
+            .map_err(|e| internal("read the head", &e))?;
+        let joined = if head.envelope == expected.envelope {
+            proposed
+        } else if force {
+            return stale(
                 ws,
-                &publish_result(
-                    op_id,
-                    publish_ok_status(),
-                    new_generation,
-                    proposed_envelope_id.as_bytes(),
-                    "",
-                ),
+                op_id,
+                &head,
+                "a forced publish must name the current head",
             )
-            .await?;
-            Ok(Some(proposed_head))
+            .await;
+        } else {
+            match reader
+                .union_envelopes(Some(expected.envelope), proposed, head.envelope)
+                .await
+            {
+                Ok(joined) => joined,
+                Err(
+                    e @ (RepositoryUnionError::DifferentBaseView { .. }
+                    | RepositoryUnionError::DivergentChanges(_)
+                    | RepositoryUnionError::DivergentLabels(_)),
+                ) => {
+                    let message = format!("{e}; fetch and resolve, then publish again");
+                    return stale(ws, op_id, &head, &message).await;
+                }
+                Err(e) => return Err(internal("join with the current head", &e)),
+            }
+        };
+
+        let from = reader
+            .envelope(head.envelope)
+            .await
+            .map_err(|e| internal("read the current envelope", &e))?;
+        let to = reader
+            .envelope(joined)
+            .await
+            .map_err(|e| internal("read the joined envelope", &e))?;
+        let options = TransitionValidationOptions {
+            allow_non_monotonic: force,
+        };
+        if let Err(e) = reader
+            .validate_transition_with_options(from.state, to.state, options)
+            .await
+        {
+            info!(op_id, error = %e, "publish: validation failed");
+            return reject(ws, op_id, &head, &format!("validation failed: {e}")).await;
         }
-        Err(PublicationError::Stale { actual, .. }) => {
-            info!(op_id, "publish: stale head (concurrent publish won)");
-            send(
-                ws,
-                &publish_result(
-                    op_id,
-                    publish_stale_status(),
-                    actual.generation,
-                    actual.envelope.as_bytes(),
-                    "concurrent publish won the CAS race",
-                ),
-            )
-            .await?;
-            Ok(None)
-        }
-        Err(e) => {
+
+        // Store the staged objects, then seal any buffered objects into a durable
+        // batch (e.g. a packed segment uploaded to S3) before the head can name
+        // them. Sealing is a no-op for local stores.
+        let stored = match staged.flush().await {
+            Ok(()) => entry.objects.seal().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = stored {
+            warn!(op_id, error = %e, "publish: seal failed");
+            let message = format!("storing the published objects failed: {e}");
             send(
                 ws,
                 &publish_result(
                     op_id,
                     publish_error_status(),
-                    current_head.generation,
-                    current_head.envelope.as_bytes(),
-                    &format!("head advance failed: {e}"),
+                    head.generation,
+                    head.envelope.as_bytes(),
+                    &message,
                 ),
             )
             .await?;
-            Ok(None)
+            return Ok(None);
+        }
+
+        let new_head = RepositoryHead {
+            generation: head.generation + 1,
+            envelope: joined,
+        };
+        match entry.heads.compare_and_advance(head, new_head) {
+            Ok(()) => {
+                info!(
+                    op_id,
+                    generation = new_head.generation,
+                    joined = joined != proposed,
+                    "publish: committed"
+                );
+                send(
+                    ws,
+                    &publish_result(
+                        op_id,
+                        publish_ok_status(),
+                        new_head.generation,
+                        joined.as_bytes(),
+                        "",
+                    ),
+                )
+                .await?;
+                return Ok(Some(new_head));
+            }
+            // Another process sharing the store moved the head: join again.
+            Err(PublicationError::Stale { .. }) => continue,
+            Err(e) => {
+                send(
+                    ws,
+                    &publish_result(
+                        op_id,
+                        publish_error_status(),
+                        head.generation,
+                        head.envelope.as_bytes(),
+                        &format!("head advance failed: {e}"),
+                    ),
+                )
+                .await?;
+                return Ok(None);
+            }
         }
     }
+    let head = entry
+        .heads
+        .read()
+        .map_err(|e| internal("read the head", &e))?;
+    stale(
+        ws,
+        op_id,
+        &head,
+        "the head kept moving under this publish; try again",
+    )
+    .await
+}
+
+/// Send the publish back as stale: the client must fetch first.
+async fn stale(
+    ws: &mut WebSocketStream<TcpStream>,
+    op_id: u32,
+    head: &RepositoryHead,
+    message: &str,
+) -> Result<Option<RepositoryHead>, ConnectionError> {
+    info!(op_id, message, "publish: stale");
+    send(
+        ws,
+        &publish_result(
+            op_id,
+            publish_stale_status(),
+            head.generation,
+            head.envelope.as_bytes(),
+            message,
+        ),
+    )
+    .await?;
+    Ok(None)
 }
 
 /// Refuse the publish: tell the client, leave the head where it is.

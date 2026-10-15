@@ -184,24 +184,26 @@ async fn open_ok(addr: SocketAddr, token: &[u8]) -> (Ws, RepositoryStateOutput) 
 
 /// Send a publish whose head check would fail. A principal allowed to publish
 /// gets `stale`; one that is not gets `rejected` before the head is looked at.
+/// A publish of the head itself that names a generation the head is not at, so a
+/// forced publish is sent back as stale once it passes the access check.
+fn publish_request(state: &RepositoryStateOutput, force: bool) -> WheatProtocolMessage {
+    WheatProtocolMessage::PublishRequest(PublishRequestOutput {
+        message_type: 0x40,
+        op_id: 7,
+        publish_key: Uuid128 { bytes: vec![1; 16] },
+        envelope_id: state.head_envelope.clone(),
+        expected_generation: state.head_generation + 99,
+        expected_envelope: state.head_envelope.clone(),
+        force,
+    })
+}
+
 async fn publish_reply(
     ws: &mut Ws,
     state: &RepositoryStateOutput,
     force: bool,
 ) -> PublishResultOutput {
-    send_msg(
-        ws,
-        &WheatProtocolMessage::PublishRequest(PublishRequestOutput {
-            message_type: 0x40,
-            op_id: 7,
-            publish_key: Uuid128 { bytes: vec![1; 16] },
-            envelope_id: state.head_envelope.clone(),
-            expected_generation: state.head_generation + 99,
-            expected_envelope: state.head_envelope.clone(),
-            force,
-        }),
-    )
-    .await;
+    send_msg(ws, &publish_request(state, force)).await;
     match recv_msg(ws).await {
         WheatProtocolMessage::PublishResult(result) => {
             assert_eq!(result.op_id, 7);
@@ -304,15 +306,16 @@ async fn publish_access_cannot_force() {
     let server = start(token_file()).await;
     let (mut ws, state) = open_ok(server.addr, b"writer-token").await;
 
-    let normal = publish_reply(&mut ws, &state, false).await;
+    // Proposing the head itself leaves nothing to upload: past the access check,
+    // the object phase ends at once.
+    send_msg(&mut ws, &publish_request(&state, false)).await;
+    let normal = recv_msg(&mut ws).await;
     assert!(
-        matches!(
-            normal.status,
-            PublishResultStatus::PublishStatusStaleHead(_)
-        ),
-        "a writer's publish should reach the head check: {normal:?}"
+        matches!(normal, WheatProtocolMessage::ObjectsComplete(_)),
+        "a writer's publish should reach the object phase: {normal:?}"
     );
 
+    let (mut ws, state) = open_ok(server.addr, b"writer-token").await;
     let forced = publish_reply(&mut ws, &state, true).await;
     assert!(is_permission_denial(&forced), "{forced:?}");
     assert!(
