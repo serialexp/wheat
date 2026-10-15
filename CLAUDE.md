@@ -31,6 +31,14 @@ structs, no version bumps.
   a contract rule when it has a budget. Run the case in release before calling the work
   done, and commit the results file it saves under `bench/results/`.
 
+## Reviews
+
+Validate input at trust boundaries (network, disk, other processes), not between
+Wheat's own crates. When a review asks for a check against a trusted internal caller,
+say what failure it would catch before adding it. Performance contracts count work
+(objects read, bytes written, requests) rather than time, so an agent copying a slow
+pattern, like a linear scan where an index exists, fails a test.
+
 ## Finding where time goes
 
 Don't add ad-hoc timing prints. Put a `#[tracing::instrument(level = "debug",
