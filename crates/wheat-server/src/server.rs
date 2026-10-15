@@ -3,8 +3,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::net::TcpListener;
-use tracing::{error, info};
+use tokio::net::{TcpListener, TcpStream};
+use tracing::{error, info, warn};
 
 use crate::access::{AccessProvider, AuthConfigError, OpenLoopbackAccess, TokenFileAccess};
 use crate::config::FileConfig;
@@ -106,18 +106,26 @@ pub async fn run(
 
     loop {
         match listener.accept().await {
-            Ok((stream, _peer)) => {
-                let registry = Arc::clone(&registry);
-                let config = Arc::clone(&config);
-                tokio::spawn(async move {
-                    connection::handle_connection(stream, registry, config).await;
-                });
-            }
+            Ok((stream, _peer)) => spawn_connection(stream, &registry, &config),
             Err(e) => {
                 error!(error = %e, "accept failed");
             }
         }
     }
+}
+
+/// Serves one accepted connection on its own task.
+fn spawn_connection(stream: TcpStream, registry: &Arc<Registry>, config: &Arc<ServerConfig>) {
+    // Nagle's algorithm would hold back the tail of a reply until the client's
+    // delayed ACK, which costs every request/reply round tens of milliseconds.
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!(error = %e, "could not disable Nagle's algorithm");
+    }
+    let registry = Arc::clone(registry);
+    let config = Arc::clone(config);
+    tokio::spawn(async move {
+        connection::handle_connection(stream, registry, config).await;
+    });
 }
 
 /// Bind the listener, report the bound address, then accept until shutdown.
@@ -146,13 +154,7 @@ pub async fn run_until(
         _ = async {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _peer)) => {
-                        let registry = Arc::clone(&registry);
-                        let config = Arc::clone(&config);
-                        tokio::spawn(async move {
-                            connection::handle_connection(stream, registry, config).await;
-                        });
-                    }
+                    Ok((stream, _peer)) => spawn_connection(stream, &registry, &config),
                     Err(e) => {
                         error!(error = %e, "accept failed");
                     }

@@ -4,7 +4,13 @@
 
 mod support;
 
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use wheat_core::{
     ApplicationContext, ContentId, ObjectId, Repository, RepositoryEnvelopeId, Tree, ViewId,
@@ -77,12 +83,50 @@ impl ImmutableObjectStore for SealFails {
     }
 }
 
-impl Publishing {
-    async fn start() -> Self {
-        Self::start_with(false).await
+/// The server's store, counting the writes that reach it.
+struct CountsWrites {
+    store: LooseObjectStore,
+    writes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ImmutableObjectStore for CountsWrites {
+    async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.store.put_if_absent(id, bytes).await
     }
 
-    async fn start_with(seal_fails: bool) -> Self {
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.store.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.store.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.store.exists_many(ids).await
+    }
+}
+
+/// What the server's store does besides storing.
+enum Served {
+    Plain,
+    SealFails,
+    CountsWrites(Arc<AtomicUsize>),
+}
+
+impl Publishing {
+    async fn start() -> Self {
+        Self::start_with(Served::Plain).await
+    }
+
+    async fn start_with(served: Served) -> Self {
         let server_dir = tempfile::tempdir().unwrap();
         let server_objects = scratch_store(&server_dir);
         let server_content = scratch_content(&server_dir);
@@ -115,10 +159,13 @@ impl Publishing {
             .await
             .unwrap();
 
-        let served: Box<dyn ImmutableObjectStore> = if seal_fails {
-            Box::new(SealFails(server_objects.clone()))
-        } else {
-            Box::new(server_objects.clone())
+        let served: Box<dyn ImmutableObjectStore> = match served {
+            Served::Plain => Box::new(server_objects.clone()),
+            Served::SealFails => Box::new(SealFails(server_objects.clone())),
+            Served::CountsWrites(writes) => Box::new(CountsWrites {
+                store: server_objects.clone(),
+                writes,
+            }),
         };
         let registry = Registry::single_with_stores(
             REPO.to_string(),
@@ -339,7 +386,7 @@ async fn send_whole(ws: &mut Ws, objects: Vec<(ObjectId, Vec<u8>)>) {
 
 #[tokio::test]
 async fn a_publish_whose_objects_cannot_be_sealed_leaves_the_head_alone() {
-    let mut publishing = Publishing::start_with(true).await;
+    let mut publishing = Publishing::start_with(Served::SealFails).await;
     let proposed = publishing.propose(&files_in_own_directories(3)).await;
     let mut ws = publishing.request(proposed).await;
 
@@ -373,6 +420,63 @@ async fn a_publish_larger_than_one_round_leaves_the_server_complete() {
     let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
     assert_published(&result, proposed);
     publishing.assert_server_complete(proposed).await;
+}
+
+/// Each durable write costs several fsyncs, so a publish's objects are staged and
+/// stored together once it is accepted, not once per round of the walk.
+#[tokio::test]
+async fn a_publish_of_several_rounds_stores_its_objects_in_one_write() {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut publishing = Publishing::start_with(Served::CountsWrites(writes.clone())).await;
+    let proposed = publishing
+        .propose(&[
+            ("a/b/c/one.txt".to_owned(), b"one".to_vec()),
+            ("d/e/two.txt".to_owned(), b"two".to_vec()),
+        ])
+        .await;
+    let mut ws = publishing.request(proposed).await;
+
+    let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    assert!(rounds.len() > 1, "{rounds:?}");
+    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    assert_published(&result, proposed);
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    publishing.assert_server_complete(proposed).await;
+}
+
+#[tokio::test]
+async fn a_publish_refused_after_a_round_stores_nothing() {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut publishing = Publishing::start_with(Served::CountsWrites(writes.clone())).await;
+    let proposed = publishing
+        .propose(&[("a/b/c/one.txt".to_owned(), b"one".to_vec())])
+        .await;
+    let mut ws = publishing.request(proposed).await;
+
+    let first = next_round(&mut ws).await;
+    let mut answered = Vec::new();
+    for id in &first {
+        answered.push((*id, publishing.object(*id).await));
+    }
+    send_whole(&mut ws, answered).await;
+    let second = next_round(&mut ws).await;
+    let unasked = first[0];
+    assert!(!second.contains(&unasked), "{second:?}");
+    send_whole(&mut ws, vec![(unasked, publishing.object(unasked).await)]).await;
+
+    let refusal = expect_refusal(&mut ws).await;
+    assert!(refusal.contains("not requested"), "{refusal}");
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    for id in first {
+        assert!(
+            matches!(
+                publishing.server_objects.get(id).await,
+                Err(ObjectStoreError::Missing(_))
+            ),
+            "{id} was stored"
+        );
+    }
+    publishing.assert_head_unchanged().await;
 }
 
 /// A head is accepted only once all its content is stored, so a publish asks only

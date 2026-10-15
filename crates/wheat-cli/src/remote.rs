@@ -16,8 +16,8 @@ use url::{Host, Url};
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, ViewId};
 use wheat_protocol::*;
 use wheat_store::{
-    ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead, RepositoryReader,
-    StructuralDelta, StructuralDeltaLimits,
+    BatchObjectStore, ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead,
+    RepositoryReader, StructuralDelta, StructuralDeltaLimits,
 };
 
 // ---------------------------------------------------------------------------
@@ -383,7 +383,10 @@ pub async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_MESSAGE_SIZE));
-    let (mut ws, _) = connect_async_with_config(ws_url, Some(limits), false)
+    // Nagle's algorithm would hold back the tail of a message until the server's
+    // delayed ACK, which costs every request/reply round tens of milliseconds.
+    let disable_nagle = true;
+    let (mut ws, _) = connect_async_with_config(ws_url, Some(limits), disable_nagle)
         .await
         .with_context(|| format!("failed to connect to {ws_url}"))?;
 
@@ -491,6 +494,20 @@ pub async fn open_repository(session: &mut WheatSession, name: &str) -> Result<R
 
 /// Writers used to store one batch of fetched objects.
 const FETCH_WRITE_CONCURRENCY: usize = 8;
+
+/// Most objects a fetch or clone stages before writing them early.
+const STAGED_OBJECTS: usize = 65_536;
+/// Most object bytes a fetch or clone stages before writing them early.
+const STAGED_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A write buffer over `objects` for one fetch or clone. Each durable write costs
+/// several fsyncs, so the objects it receives, and those a merge with local work
+/// makes, are stored together by [`BatchObjectStore::flush`] just before the head
+/// moves, not once per message. Reads see staged objects. Only a transfer larger
+/// than the stage is written early, in stage-sized batches.
+pub fn staged<O: ImmutableObjectStore + ?Sized>(objects: &O) -> BatchObjectStore<'_, O> {
+    BatchObjectStore::new(objects, STAGED_OBJECTS, STAGED_OBJECT_BYTES)
+}
 
 /// What one structural fetch transferred.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -28,15 +28,25 @@ land and move completed bullets from Outstanding to Done.
   writers, 0.7 at 16, with 7.7 attempts per publish and one change needing 281. The
   server was at most 2% busy; per-batch fsyncs and fetch-and-retry dominate (see
   "Measured contention").
+- [x] **Staged writes for publish and fetch (2026-10-15).** The server stages a
+  publish's uploaded objects in a `BatchObjectStore` and stores them once, after
+  validation and before the head CAS; a refused publish stores nothing. Fetch and
+  clone stage received and merged objects and store them once before the head
+  moves. `packed_append` spans make the appends countable.
+- [x] **Nagle off on both ends (2026-10-15).** Each request/reply round of a publish
+  waited about 16 ms for a delayed ACK; with `TCP_NODELAY` a publish into a
+  30-change repository went from 160 ms to 20 to 40 ms. With both changes, one
+  writer reaches 7.1 accepted publishes per second (was 1.6); 16 writers reach 2.4
+  (was 0.7), still at 13 attempts per publish.
 
 ### Outstanding
 
 - [ ] **Publish contention budget.** Contract rules on `publish_contention`: at least
   10 accepted publishes per second with 8 writers, and one attempt per publish at
   every writer count.
-- [ ] **One durable commit per publish and per fetch.** The server stages a
-  publish's uploaded objects and commits them once before the head CAS; a fetch
-  commits once before the local head moves.
+- [ ] **One append for content and objects together.** A publish or fetch still
+  makes two durable appends to the packed store, one through the content store and
+  one for the staged objects. A transaction spanning both would halve its fsyncs.
 - [ ] **Client pushes the difference up front.** The client runs the server's walk
   from the last fetched head and sends the result, so a publish takes one round trip
   instead of one per tree level.

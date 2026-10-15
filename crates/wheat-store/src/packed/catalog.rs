@@ -688,6 +688,8 @@ impl PackedCatalog {
         Ok(super::segment::projected_total_length(count, 0, payload)?)
     }
 
+    /// One durable append to the active segment: several fsyncs, so callers batch.
+    #[tracing::instrument(name = "packed_append", level = "debug", skip_all)]
     fn append_active_batch(
         &mut self,
         records: Vec<PreparedSegmentRecord<'_>>,

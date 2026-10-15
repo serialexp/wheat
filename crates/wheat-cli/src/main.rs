@@ -2725,14 +2725,15 @@ fn native_clone(
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
 
         // Fetch all structural objects.
-        let fetched =
-            remote::fetch_objects(&mut session, 1, &objects, state.envelope, None).await?;
+        let staged = remote::staged(&objects);
+        let fetched = remote::fetch_objects(&mut session, 1, &staged, state.envelope, None).await?;
 
         // Fetch all content.
         let content_count =
-            remote::fetch_content(&mut session, 2, &objects, &content, state.envelope, None)
+            remote::fetch_content(&mut session, 2, &staged, &content, state.envelope, None)
                 .await?
                 .fetched;
+        staged.flush().await?;
 
         write_stderr(format_args!(
             "fetched {} objects ({} pulled), {content_count} content blobs\n",
@@ -2854,6 +2855,7 @@ fn native_fetch(
 
     let token = credential::token_for(Some(&context.store_root), &parsed)?;
     let rt = runtime()?;
+    let staged = remote::staged(&local.objects);
     let (remote_state, since, fetched, content) = rt.block_on(async {
         let mut session = remote::connect(&parsed, &token).await?;
         let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
@@ -2876,12 +2878,12 @@ fn native_fetch(
             && local.objects.exists_many(&[since_object]).await? == [true])
         .then_some(since);
         let fetched =
-            remote::fetch_objects(&mut session, 1, &local.objects, state.envelope, since).await?;
+            remote::fetch_objects(&mut session, 1, &staged, state.envelope, since).await?;
 
         let content = remote::fetch_content(
             &mut session,
             2,
-            &local.objects,
+            &staged,
             &local.content,
             state.envelope,
             since,
@@ -2904,7 +2906,7 @@ fn native_fetch(
         local_head.envelope
     } else {
         rt.block_on(
-            RepositoryReader::new(&local.objects, &local.content).union_envelopes(
+            RepositoryReader::new(&staged, &local.content).union_envelopes(
                 since,
                 local_head.envelope,
                 remote_state.envelope,
@@ -2912,6 +2914,9 @@ fn native_fetch(
         )
         .map_err(union_failure)?
     };
+    // The store must hold the fetched closure before the remote configuration
+    // records it, and the new head before the head names it.
+    rt.block_on(staged.flush())?;
 
     if !remote_moved && envelope == local_head.envelope {
         return Success::new(

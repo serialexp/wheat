@@ -237,6 +237,63 @@ fn a_fetch_keeps_local_work_beside_the_remotes() {
     assert_eq!(frontiers(&writer, &writer_stores, &config), joined);
 }
 
+/// Each durable append costs several fsyncs, so a fetch stores what it receives and
+/// what its merge with local work makes together, not once per message or update:
+/// one append for the fetched content, one for the objects.
+#[test]
+fn a_fetch_that_keeps_local_work_stores_it_in_two_appends() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server = serve(root, &config);
+    let clone = |name: &str| {
+        let stores = root.join(format!("{name}-stores"));
+        let workspace = root.join(name);
+        ok(
+            root,
+            &stores,
+            &config,
+            &["clone", &server.url, workspace.to_str().unwrap()],
+        );
+        (workspace, stores)
+    };
+    let (writer, writer_stores) = clone("writer");
+    let (reader, reader_stores) = clone("reader");
+    for name in ["a/b/one", "c/two", "three"] {
+        add_change(&writer, &writer_stores, &config, name);
+    }
+    ok(&writer, &writer_stores, &config, &["publish"]);
+    add_change(&reader, &reader_stores, &config, "d/local");
+
+    let trace = root.join("fetch-trace.json");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wheat"))
+        .current_dir(&reader)
+        .args(["--format", "json", "fetch"])
+        .env("WHEAT_STORE_HOME", &reader_stores)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("WHEAT_TRACE", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fetched: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(fetched["result"]["kept_local"], true, "{fetched}");
+
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&trace).unwrap()).unwrap();
+    let appends = document["traceEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["name"] == "packed_append")
+        .count();
+    assert_eq!(appends, 2);
+    ok(&reader, &reader_stores, &config, &["validate"]);
+}
+
 /// `--force` drops the local work and takes the remote as it is.
 #[test]
 fn a_forced_fetch_drops_local_work() {

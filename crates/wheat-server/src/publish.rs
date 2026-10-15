@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
-    DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, PublicationError,
-    PublicationStore, RepositoryHead, RepositoryReader, StructuralDelta, StructuralDeltaError,
-    StructuralDeltaLimits, TransitionValidationOptions, TreeDiffLimits,
+    BatchObjectStore, DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError,
+    PublicationError, PublicationStore, RepositoryHead, RepositoryReader, StructuralDelta,
+    StructuralDeltaError, StructuralDeltaLimits, TransitionValidationOptions, TreeDiffLimits,
 };
 
 use crate::connection::ConnectionError;
@@ -81,15 +81,21 @@ pub async fn handle_publish(
             .map_err(|_| ConnectionError::Protocol("invalid envelope ID"))?,
     );
 
+    // Uploaded objects are staged and stored in one durable write once the publish
+    // is accepted, rather than one per round of the walk. A refused publish leaves
+    // nothing behind. Only a publish larger than the stage is written early, in
+    // stage-sized batches, and those objects are harmless if it is then refused.
+    let staged = BatchObjectStore::new(&*entry.objects, STAGED_OBJECTS, STAGED_OBJECT_BYTES);
+
     // --- Object transfer phase ---
     if let Some(refusal) =
-        receive_objects(ws, entry, op_id, current_head, proposed_envelope_id).await?
+        receive_objects(ws, &staged, op_id, current_head, proposed_envelope_id).await?
     {
         return reject(ws, op_id, current_head, &refusal).await;
     }
 
     // --- Content transfer phase ---
-    let reader = RepositoryReader::new(&entry.objects, &entry.content);
+    let reader = RepositoryReader::new(&staged, &entry.content);
     let envelope_record = reader
         .envelope(proposed_envelope_id)
         .await
@@ -121,7 +127,7 @@ pub async fn handle_publish(
     // current head lacks can be missing (transition validation relies on the same).
     // Bulk-check those: for S3 backends this does one LIST call instead of one GET
     // per item.
-    let candidates = wheat_store::ContentSetStore::new(&entry.objects)
+    let candidates = wheat_store::ContentSetStore::new(&staged)
         .added(current_manifest.content, manifest.content)
         .await
         .map_err(|e| ConnectionError::Internal(format!("failed to compare content sets: {e}")))?;
@@ -139,8 +145,7 @@ pub async fn handle_publish(
         // Diff the old and new trees to find which files changed, then use
         // the old ContentId as a delta base for each new ContentId. This
         // produces much smaller stored objects for typical edits.
-        let base_map =
-            compute_delta_base_map(&entry.objects, &reader, &current_state, &state).await;
+        let base_map = compute_delta_base_map(&staged, &reader, &current_state, &state).await;
 
         // Ask in rounds of at most MAX_WANT_IDS, one ContentNeeded each. In
         // every round accept only the requested blobs, each once, and store
@@ -273,9 +278,14 @@ pub async fn handle_publish(
         return Ok(None);
     }
 
-    // Seal any buffered objects into a durable batch (e.g. a packed segment
-    // uploaded to S3) before the head can name them. No-op for local stores.
-    if let Err(e) = entry.objects.seal().await {
+    // Store the staged objects, then seal any buffered objects into a durable
+    // batch (e.g. a packed segment uploaded to S3) before the head can name them.
+    // Sealing is a no-op for local stores.
+    let stored = match staged.flush().await {
+        Ok(()) => entry.objects.seal().await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = stored {
         warn!(op_id, error = %e, "publish: seal failed");
         send(
             ws,
@@ -408,6 +418,16 @@ impl PendingContent {
 /// Writers used to store one message's worth of uploaded objects.
 const OBJECT_WRITE_CONCURRENCY: usize = 8;
 
+/// A publish's uploaded objects, held until the publish is accepted. Reads see them
+/// before they are stored.
+type Staged<'a> = BatchObjectStore<'a, dyn ImmutableObjectStore>;
+
+/// Most objects one publish stages before writing them early.
+const STAGED_OBJECTS: usize = 65_536;
+/// Most object bytes one publish stages before writing them early, like
+/// [`PENDING_CONTENT_BYTES`] for content.
+const STAGED_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Asks for the objects of `proposed` that the store lacks, until it has them all.
 ///
 /// Walks from the current head to `proposed` ([`StructuralDelta`]). Each batch of
@@ -418,13 +438,13 @@ const OBJECT_WRITE_CONCURRENCY: usize = 8;
 #[tracing::instrument(name = "publish_objects", level = "debug", skip_all)]
 async fn receive_objects(
     ws: &mut WebSocketStream<TcpStream>,
-    entry: &RepositoryEntry,
+    staged: &Staged<'_>,
     op_id: u32,
     current_head: &RepositoryHead,
     proposed: RepositoryEnvelopeId,
 ) -> Result<Option<String>, ConnectionError> {
     let mut delta = StructuralDelta::new(
-        &entry.objects,
+        staged,
         Some(current_head.envelope),
         proposed,
         StructuralDeltaLimits::default(),
@@ -465,7 +485,7 @@ async fn receive_objects(
             }),
         )
         .await?;
-        if let Some(refusal) = receive_round(ws, entry, op_id, &ids).await? {
+        if let Some(refusal) = receive_round(ws, staged, op_id, &ids).await? {
             return Ok(Some(refusal));
         }
         rounds += 1;
@@ -488,7 +508,7 @@ async fn receive_objects(
 /// refused, if it is.
 async fn receive_round(
     ws: &mut WebSocketStream<TcpStream>,
-    entry: &RepositoryEntry,
+    staged: &Staged<'_>,
     op_id: u32,
     ids: &[ObjectId],
 ) -> Result<Option<String>, ConnectionError> {
@@ -507,7 +527,7 @@ async fn receive_round(
                     }
                     objects.push((id, object.data));
                 }
-                if let Some(refusal) = store_objects(entry, &objects).await? {
+                if let Some(refusal) = store_objects(staged, &objects).await? {
                     return Ok(Some(refusal));
                 }
             }
@@ -522,7 +542,7 @@ async fn receive_round(
                 if ObjectId::of_canonical_bytes(&object.1) != id {
                     return Ok(Some(format!("object identity mismatch for {id}")));
                 }
-                if let Some(refusal) = store_objects(entry, &[object]).await? {
+                if let Some(refusal) = store_objects(staged, &[object]).await? {
                     return Ok(Some(refusal));
                 }
             }
@@ -536,17 +556,13 @@ async fn receive_round(
     Ok(None)
 }
 
-/// Stores uploaded objects. Returns why they are refused when they are not valid
+/// Stages uploaded objects. Returns why they are refused when they are not valid
 /// Wheat objects.
 async fn store_objects(
-    entry: &RepositoryEntry,
+    staged: &Staged<'_>,
     objects: &[(ObjectId, Vec<u8>)],
 ) -> Result<Option<String>, ConnectionError> {
-    match entry
-        .objects
-        .put_batch(objects, OBJECT_WRITE_CONCURRENCY)
-        .await
-    {
+    match staged.put_batch(objects, OBJECT_WRITE_CONCURRENCY).await {
         Ok(()) => Ok(None),
         Err(error @ ObjectStoreError::InvalidFormat(_)) => Ok(Some(error.to_string())),
         Err(error) => Err(ConnectionError::Internal(format!(
@@ -558,13 +574,9 @@ async fn store_objects(
 /// Diff old and new Merkle trees to find `new_content → old_content` base
 /// mappings for delta compression. Falls back to an empty map on any error
 /// (delta compression is an optimization, not a correctness requirement).
-#[expect(
-    clippy::borrowed_box,
-    reason = "MerkleTreeStore requires Sized, so &Box<dyn> is needed"
-)]
 async fn compute_delta_base_map(
-    objects: &Box<dyn ImmutableObjectStore>,
-    reader: &RepositoryReader<'_, Box<dyn ImmutableObjectStore>>,
+    objects: &Staged<'_>,
+    reader: &RepositoryReader<'_, Staged<'_>>,
     old_state: &wheat_core::RepositoryStateRecord,
     new_state: &wheat_core::RepositoryStateRecord,
 ) -> HashMap<ContentId, ContentId> {
