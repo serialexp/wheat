@@ -79,6 +79,52 @@ async fn staged_objects_and_content_read_as_stored_and_flush_appends_once() {
 }
 
 #[tokio::test]
+async fn taken_stages_read_beneath_another_stage_and_store_in_one_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, trace) = PackedObjectStore::open_traced(dir.path()).unwrap();
+    let content = store.content_store();
+    let (object_id, object_bytes) = object();
+    let (blob_id, blob_bytes) = blob("accepted content");
+    let before = durable_appends(&trace);
+
+    let first = RepositoryStage::new(&store, 16, 1 << 20);
+    first.put_if_absent(object_id, &object_bytes).await.unwrap();
+    let second = RepositoryStage::new(&store, 16, 1 << 20);
+    second
+        .put_content([(blob_id, blob_bytes.clone(), None)])
+        .await
+        .unwrap();
+    let mut pending = PendingPublications::default();
+    pending.push(first.take().await.unwrap());
+    pending.push(second.take().await.unwrap());
+
+    // Taken stages hold nothing more to write.
+    first.flush().await.unwrap();
+    second.flush().await.unwrap();
+    assert_eq!(durable_appends(&trace), before);
+
+    // Another stage sees the pending publications only through the view.
+    let third = RepositoryStage::new(&store, 16, 1 << 20);
+    assert_eq!(third.exists_many(&[object_id]).await.unwrap(), [false]);
+    assert!(third.content().get(blob_id).is_err());
+    let view = pending.over(&third);
+    assert_eq!(view.exists_many(&[object_id]).await.unwrap(), [true]);
+    assert_eq!(
+        view.get(object_id).await.unwrap().canonical_bytes,
+        object_bytes
+    );
+    assert_eq!(view.content().get(blob_id).unwrap(), blob_bytes);
+
+    pending.store(&store).await.unwrap();
+    assert_eq!(durable_appends(&trace), before + 1);
+    assert_eq!(
+        store.get(object_id).await.unwrap().canonical_bytes,
+        object_bytes
+    );
+    assert_eq!(content.get(blob_id).unwrap(), blob_bytes);
+}
+
+#[tokio::test]
 async fn content_reaching_the_byte_limit_is_stored_with_the_staged_objects() {
     let dir = tempfile::tempdir().unwrap();
     let (store, trace) = PackedObjectStore::open_traced(dir.path()).unwrap();

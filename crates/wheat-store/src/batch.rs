@@ -43,6 +43,32 @@ impl PendingObjects<'_> {
     pub(crate) fn written(&mut self) {
         self.0.clear();
     }
+
+    /// The buffered objects, removed for the caller to write later.
+    pub(crate) fn take(&mut self) -> BTreeMap<ObjectId, Vec<u8>> {
+        self.0.bytes = 0;
+        std::mem::take(&mut self.0.objects)
+    }
+}
+
+/// `canonical_bytes` as the object `id`, checking its identity and encoding.
+pub(crate) fn stored_object(
+    id: ObjectId,
+    canonical_bytes: Vec<u8>,
+) -> Result<StoredObject, ObjectStoreError> {
+    let actual = ObjectId::of_canonical_bytes(&canonical_bytes);
+    if actual != id {
+        return Err(ObjectStoreError::Corrupt {
+            expected: id,
+            actual,
+        });
+    }
+    let kind = validate_canonical_object(&canonical_bytes)?.into();
+    Ok(StoredObject {
+        id,
+        kind,
+        canonical_bytes: canonical_bytes.into(),
+    })
 }
 
 /// A bounded, read-through write buffer for an immutable object store.
@@ -121,22 +147,6 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
         pending.clear();
         Ok(())
     }
-
-    fn stored(id: ObjectId, canonical_bytes: Vec<u8>) -> Result<StoredObject, ObjectStoreError> {
-        let actual = ObjectId::of_canonical_bytes(&canonical_bytes);
-        if actual != id {
-            return Err(ObjectStoreError::Corrupt {
-                expected: id,
-                actual,
-            });
-        }
-        let kind = validate_canonical_object(&canonical_bytes)?.into();
-        Ok(StoredObject {
-            id,
-            kind,
-            canonical_bytes: canonical_bytes.into(),
-        })
-    }
 }
 
 #[async_trait]
@@ -191,7 +201,7 @@ impl<O: ImmutableObjectStore + ?Sized> ImmutableObjectStore for BatchObjectStore
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
         let pending = self.pending.lock().await;
         if let Some(bytes) = pending.objects.get(&id) {
-            return Self::stored(id, bytes.clone());
+            return stored_object(id, bytes.clone());
         }
         // Keep the lock while reading through so a concurrent put cannot create
         // an ordering-dependent false Missing result.
@@ -203,7 +213,7 @@ impl<O: ImmutableObjectStore + ?Sized> ImmutableObjectStore for BatchObjectStore
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(bytes) = pending.objects.get(id) {
-                Self::stored(*id, bytes.clone())?;
+                stored_object(*id, bytes.clone())?;
                 results.push(true);
             } else {
                 results.push(match self.backend.get(*id).await {

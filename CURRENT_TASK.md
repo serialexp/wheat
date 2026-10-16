@@ -273,6 +273,25 @@ crash between a seal's publication and the active segment's retirement duplicate
 its records (the old head check never matched); catalog.head and repack.intent are
 hand-encoded.
 
-Next: 4 (group commit; the commit lock serializes publishes, so this means batching
-several publishes' stores and CASes), 5 (spawn_blocking); then contract rules
-(step 4) and maybe client-side push.
+Option 3 committed 45a9cc2. Quiet runs at 8 writers: 40.2, 45.2, 43.4 accepted/s.
+Lock hold per publish at 8 writers (option3.json): CAS 9 (temp file sync + directory
+sync), store 5.5 (one sync), validate 1.6, join 0.9.
+
+Option 4 (group commit) done 2026-10-16. Bart did not answer the shape question;
+default taken: full batch. Design (written up in the design doc, "Group commit"):
+- wheat-store: `RepositoryStage::take` -> `StagedPublication`; `PendingPublications`
+  (stores several in one `put_publication`; `over(stage)` gives a `PendingView` that
+  reads them beneath a stage). Only the commit-phase join and validation use the view:
+  the receive phase must NOT see batched objects/content as present, or a failed
+  batch would leave a later publish naming data never stored.
+- wheat-server `commit.rs`: `commit::accept` joins/validates under the state lock
+  against the tentative head, moves the stage into the next batch; a spawned
+  committer stores, seals, and CASes per batch, re-joining when the durable head is
+  not the batch's base. A failed batch fails the next one (stale). A panicking
+  committer is cleaned up by the `Abandoned` guard. Tests:
+  `wheat-server/tests/group_commit_test.rs` (gated store), `repository_stage.rs`.
+- Result: 16 writers 50 -> 63-70/s; 8 writers unchanged (35-42; the committer is busy
+  ~50%, the writers' cycle outside the server's publish handling, ~170 ms, sets the
+  pace). Trace /tmp/wheat-profile/option4.json.
+
+Next: 5 (spawn_blocking); then contract rules (step 4) and maybe client-side push.

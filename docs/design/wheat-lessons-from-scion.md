@@ -62,6 +62,9 @@ land and move completed bullets from Outstanding to Done.
 - [x] **A cheaper append (2026-10-16).** The active segment is an append-only log of
   hash-chained frames: one write and one sync per append, with no journal and no
   head file. The locator runs `synchronous=NORMAL`. See "A cheaper append".
+- [x] **Group commit (2026-10-16).** Publishes still join one at a time, but onto the
+  last accepted publish before it is durable, and are stored and published in
+  batches: one write and one head compare-and-swap per batch. See "Group commit".
 
 ### Outstanding
 
@@ -75,9 +78,9 @@ land and move completed bullets from Outstanding to Done.
   at the packed store (see "Profile at 8 writers"): two appends of about 46 ms per
   publish, and one catalog mutex that makes every read wait for them. Being tried
   cumulatively; reads no longer wait for appends (see "Reads beside an append"), a
-  publish makes one append (see "One append per publish"), and an append costs about
-  4 ms instead of 38 (see "A cheaper append"). Still to try: group commit and the
-  blocking work off the runtime.
+  publish makes one append (see "One append per publish"), an append costs about
+  4 ms instead of 38 (see "A cheaper append"), and publishes are made durable in
+  batches (see "Group commit"). Still to try: the blocking work off the runtime.
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
@@ -402,7 +405,48 @@ Trade-offs:
 - Stores written before this change have an active segment in the old format and do
   not open. No released store uses it.
 
-### Alternative: per-label heads
+#### Group commit (2026-10-16)
+
+Fourth: publishes are made durable in batches (`wheat-server` `commit.rs`). A publish
+still joins and validates under a lock, one at a time, but onto the tentative head:
+the last accepted publish's envelope, durable or not. It then hands its stage's
+objects and content to the next batch and waits. A committer task stores a whole
+batch in one `put_publication`, seals, and moves the head once with one
+compare-and-swap. While it writes, the publishes after it join onto its head,
+reading its objects from memory (`PendingPublications::over`), and form the next
+batch.
+
+- Only the join and validation read the pending objects. A publish still receiving
+  checks presence against the durable store, so it never leaves out an object or
+  blob that only a batch which might yet fail holds.
+- Every publish in a batch is told the batch's head, which may include publishes
+  accepted after it; to the client that is an ordinary join.
+- A failed batch fails the batch joined onto it, as stale, so those clients publish
+  again from the durable head.
+- If the durable head is not the one a batch was built on (another process sharing
+  the store published, or an earlier batch was re-joined for that reason), the
+  committer joins the batch with it before the swap, as a publish used to. A batch
+  holding a forced publish is sent back as stale instead.
+- The committer runs in a task of its own, so a client that goes away does not stop
+  the others' batches. If it panics, its publishes fail and the next publish starts
+  a new one.
+
+| writers | accepted/s after a cheaper append | after (two runs, plus the saved run) |
+|---|---|---|
+| 1 | 15.72, 15.34, 11.48 | 13.64, 16.81, 16.81 |
+| 2 | 12.56, 14.37, 14.17 | 13.98, 12.18, 14.43 |
+| 4 | 22.61, 23.91, 21.64 | 25.90, 25.17, 28.43 |
+| 8 | 40.19, 45.21, 43.35 | 34.90, 41.57, 42.15 |
+| 16 | 49.61, 52.95, 53.57 | 65.26, 62.75, 69.80 |
+
+Still one attempt per publish at every count. Only 16 writers gain, because only
+there was the commit lock full. In the trace at 8 writers 160 publishes took 131
+batches and the committer was busy about half the time. The server spends about
+20 ms handling a publish, but each writer starts one only about every 170 ms, so at
+8 writers the time outside the server's publish handling sets the pace. At 16
+writers a batch averaged 2.2 publishes, again with the committer busy about half the
+time.
+
 
 Labels could get their own CAS, and changes and revisions could be accepted into
 the immutable store with no head CAS at all, closer to Scion's design. That removes

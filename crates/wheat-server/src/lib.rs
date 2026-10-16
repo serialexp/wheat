@@ -6,6 +6,7 @@
 //! `LocalPublicationStore`.
 
 pub mod access;
+pub mod commit;
 pub mod config;
 pub mod connection;
 pub mod fetch;

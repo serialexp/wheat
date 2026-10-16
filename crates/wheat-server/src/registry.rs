@@ -8,16 +8,17 @@ use wheat_store::{
     ContentStore, LocalPublicationStore, ObjectStoreError, PackedObjectStore, RepositoryStore,
 };
 
+use crate::commit::GroupCommit;
+
 /// A single repository's stores.
 pub struct RepositoryEntry {
     pub store: Box<dyn RepositoryStore>,
     /// `store`'s content.
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
-    /// Held by a publish from reading the head until its compare-and-swap, so
-    /// concurrent publishes take turns instead of each merging against a head that
-    /// another is about to replace.
-    pub commit: tokio::sync::Mutex<()>,
+    /// Publishes take turns joining onto the head, so none merges against a head
+    /// another is about to replace, and are made durable in batches.
+    pub commit: GroupCommit,
 }
 
 impl RepositoryEntry {
@@ -34,7 +35,7 @@ impl RepositoryEntry {
             content: store.content_store(),
             store,
             heads,
-            commit: tokio::sync::Mutex::new(()),
+            commit: GroupCommit::default(),
         }
     }
 }

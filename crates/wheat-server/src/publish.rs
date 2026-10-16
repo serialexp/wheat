@@ -2,19 +2,20 @@
 
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{Instrument as _, debug, debug_span, info, warn};
+use tracing::{debug, info, warn};
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
-    DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, PublicationError,
-    PublicationStore, RepositoryHead, RepositoryReader, RepositoryStage, RepositoryStore,
-    RepositoryStoreError, RepositoryUnionError, StructuralDelta, StructuralDeltaError,
-    StructuralDeltaLimits, TransitionValidationOptions, TreeDiffLimits,
+    DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryHead,
+    RepositoryReader, RepositoryStage, RepositoryStore, StructuralDelta, StructuralDeltaError,
+    StructuralDeltaLimits, TreeDiffLimits,
 };
 
+use crate::commit::{self, CommitFailure};
 use crate::connection::ConnectionError;
 use crate::registry::RepositoryEntry;
 use crate::wire::{
@@ -29,7 +30,7 @@ const _: () = assert!(MAX_CONTENT_SIZE == wheat_store::HARD_LOGICAL_RECORD_BYTES
 #[tracing::instrument(name = "publish", level = "debug", skip_all)]
 pub async fn handle_publish(
     ws: &mut WebSocketStream<TcpStream>,
-    entry: &RepositoryEntry,
+    entry: &Arc<RepositoryEntry>,
     current_head: &RepositoryHead,
     req: PublishRequestOutput,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
@@ -228,7 +229,6 @@ pub async fn handle_publish(
         ws,
         entry,
         &staged,
-        &reader,
         op_id,
         expected,
         proposed_envelope_id,
@@ -237,110 +237,55 @@ pub async fn handle_publish(
     .await
 }
 
-/// Times one publish retries its compare-and-swap when another process sharing the
-/// store moved the head in between. Publishes through this server take turns on
-/// the entry's commit lock, so they never cause a retry.
-const MAX_COMMIT_ATTEMPTS: usize = 16;
-
 /// Makes `proposed` the head, joined with whatever was published since `expected`,
 /// and tells the client the new head.
 ///
-/// The join is the one a fetch does: the union of both states, with labels merged
-/// three ways against `expected`. So writers of unrelated changes never have to
-/// fetch and try again; only a label both sides moved, or a change recorded
-/// differently on each side, sends the publish back as stale. A forced publish is
-/// never joined: it replaces exactly the head it names.
+/// So writers of unrelated changes never have to fetch and try again. Publishes join
+/// one at a time, onto the last accepted publish even before it is durable, and are
+/// then made durable in batches (see [`crate::commit`]). The head the client is told
+/// is its batch's, which includes every publish in the batch.
 #[tracing::instrument(name = "publish_commit", level = "debug", skip_all)]
 async fn commit(
     ws: &mut WebSocketStream<TcpStream>,
-    entry: &RepositoryEntry,
+    entry: &Arc<RepositoryEntry>,
     staged: &Staged<'_>,
-    reader: &RepositoryReader<'_, Staged<'_>>,
     op_id: u32,
     expected: RepositoryHead,
     proposed: RepositoryEnvelopeId,
     force: bool,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
-    let _turn = entry
-        .commit
-        .lock()
-        .instrument(debug_span!("publish_commit_wait"))
-        .await;
-    let internal = |what: &str, e: &dyn std::fmt::Display| {
-        ConnectionError::Internal(format!("publish: {what}: {e}"))
+    let outcome = match commit::accept(entry, staged, expected.envelope, proposed, force).await {
+        Ok(accepted) => accepted.durable().await,
+        Err(refused) => Err(refused),
     };
-    for _ in 0..MAX_COMMIT_ATTEMPTS {
-        let head = entry
-            .heads
-            .read()
-            .map_err(|e| internal("read the head", &e))?;
-        let joined = if head.envelope == expected.envelope {
-            proposed
-        } else if force {
-            return stale(
-                ws,
+    match outcome {
+        Ok(head) => {
+            info!(
                 op_id,
-                &head,
-                "a forced publish must name the current head",
+                generation = head.generation,
+                joined = head.envelope != proposed,
+                "publish: committed"
+            );
+            send(
+                ws,
+                &publish_result(
+                    op_id,
+                    publish_ok_status(),
+                    head.generation,
+                    head.envelope.as_bytes(),
+                    "",
+                ),
             )
-            .await;
-        } else {
-            match reader
-                .union_envelopes(Some(expected.envelope), proposed, head.envelope)
-                .instrument(debug_span!("publish_join"))
-                .await
-            {
-                Ok(joined) => joined,
-                Err(
-                    e @ (RepositoryUnionError::DifferentBaseView { .. }
-                    | RepositoryUnionError::DivergentChanges(_)
-                    | RepositoryUnionError::DivergentLabels(_)),
-                ) => {
-                    let message = format!("{e}; fetch and resolve, then publish again");
-                    return stale(ws, op_id, &head, &message).await;
-                }
-                Err(e) => return Err(internal("join with the current head", &e)),
-            }
-        };
-
-        let validated = async {
-            let from = reader
-                .envelope(head.envelope)
-                .await
-                .map_err(|e| internal("read the current envelope", &e))?;
-            let to = reader
-                .envelope(joined)
-                .await
-                .map_err(|e| internal("read the joined envelope", &e))?;
-            let options = TransitionValidationOptions {
-                allow_non_monotonic: force,
-            };
-            Ok::<_, ConnectionError>(
-                reader
-                    .validate_transition_with_options(from.state, to.state, options)
-                    .await,
-            )
+            .await?;
+            Ok(Some(head))
         }
-        .instrument(debug_span!("publish_validate"))
-        .await?;
-        if let Err(e) = validated {
-            info!(op_id, error = %e, "publish: validation failed");
-            return reject(ws, op_id, &head, &format!("validation failed: {e}")).await;
+        Err(CommitFailure::Stale { head, message }) => stale(ws, op_id, &head, &message).await,
+        Err(CommitFailure::Rejected { head, message }) => {
+            info!(op_id, message, "publish: validation failed");
+            reject(ws, op_id, &head, &message).await
         }
-
-        // Store the staged objects and content in one write, then seal any buffered
-        // objects into a durable batch (e.g. a packed segment uploaded to S3) before
-        // the head can name them. Sealing is a no-op for local stores.
-        let stored = async {
-            staged.flush().await?;
-            entry.store.seal().await?;
-            Ok::<_, RepositoryStoreError>(())
-        }
-        .instrument(debug_span!("publish_store"))
-        .await;
-        if let Err(e) = stored {
-            warn!(op_id, error = %e, "publish: seal failed");
-            let message = format!("storing the published objects failed: {e}");
+        Err(CommitFailure::Failed { head, message }) => {
+            warn!(op_id, message, "publish: commit failed");
             send(
                 ws,
                 &publish_result(
@@ -352,65 +297,10 @@ async fn commit(
                 ),
             )
             .await?;
-            return Ok(None);
+            Ok(None)
         }
-
-        let new_head = RepositoryHead {
-            generation: head.generation + 1,
-            envelope: joined,
-        };
-        let advanced =
-            debug_span!("publish_cas").in_scope(|| entry.heads.compare_and_advance(head, new_head));
-        match advanced {
-            Ok(()) => {
-                info!(
-                    op_id,
-                    generation = new_head.generation,
-                    joined = joined != proposed,
-                    "publish: committed"
-                );
-                send(
-                    ws,
-                    &publish_result(
-                        op_id,
-                        publish_ok_status(),
-                        new_head.generation,
-                        joined.as_bytes(),
-                        "",
-                    ),
-                )
-                .await?;
-                return Ok(Some(new_head));
-            }
-            // Another process sharing the store moved the head: join again.
-            Err(PublicationError::Stale { .. }) => continue,
-            Err(e) => {
-                send(
-                    ws,
-                    &publish_result(
-                        op_id,
-                        publish_error_status(),
-                        head.generation,
-                        head.envelope.as_bytes(),
-                        &format!("head advance failed: {e}"),
-                    ),
-                )
-                .await?;
-                return Ok(None);
-            }
-        }
+        Err(CommitFailure::Internal(message)) => Err(ConnectionError::Internal(message)),
     }
-    let head = entry
-        .heads
-        .read()
-        .map_err(|e| internal("read the head", &e))?;
-    stale(
-        ws,
-        op_id,
-        &head,
-        "the head kept moving under this publish; try again",
-    )
-    .await
 }
 
 /// Send the publish back as stale: the client must fetch first.

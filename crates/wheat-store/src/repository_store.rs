@@ -13,6 +13,7 @@ use wheat_core::{ContentId, ObjectId};
 use crate::{
     BatchObjectStore, ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError,
     StoredObject,
+    batch::stored_object,
     codec::{Codec, EnvelopeHeader},
     content_store::ContentBackend,
 };
@@ -285,6 +286,165 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
             .written(content.iter().map(|(id, _)| *id));
         Ok(())
     }
+
+    /// Takes everything staged out of the stage, to be stored later with other
+    /// publications in one [`PendingPublications::store`].
+    pub async fn take(&self) -> Result<Arc<StagedPublication>, RepositoryStoreError> {
+        let mut pending = self.objects.lock_pending().await;
+        let content = std::mem::take(&mut *self.staged.lock()?).blobs;
+        Ok(Arc::new(StagedPublication {
+            objects: pending.take(),
+            content,
+        }))
+    }
+}
+
+/// What one [`RepositoryStage`] held, taken out by [`RepositoryStage::take`].
+#[derive(Debug)]
+pub struct StagedPublication {
+    objects: BTreeMap<ObjectId, Vec<u8>>,
+    content: BTreeMap<ContentId, Arc<StagedBlob>>,
+}
+
+/// Publications accepted but not yet stored, readable in the meantime through
+/// [`Self::over`] and stored together by [`Self::store`].
+///
+/// A lookup tries each publication in turn, so it costs one map lookup per
+/// publication held; a server holds one per publish waiting on a write.
+#[derive(Clone, Debug, Default)]
+pub struct PendingPublications {
+    publications: Vec<Arc<StagedPublication>>,
+}
+
+impl PendingPublications {
+    pub fn push(&mut self, publication: Arc<StagedPublication>) {
+        self.publications.push(publication);
+    }
+
+    pub fn extend(&mut self, other: &Self) {
+        self.publications.extend(other.publications.iter().cloned());
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.publications.is_empty()
+    }
+
+    /// Stores every publication held in one write.
+    #[tracing::instrument(name = "pending_store", level = "debug", skip_all)]
+    pub async fn store<S: RepositoryStore + ?Sized>(
+        &self,
+        store: &S,
+    ) -> Result<(), RepositoryStoreError> {
+        let mut objects = BTreeMap::new();
+        let mut content = BTreeMap::new();
+        for publication in &self.publications {
+            objects.extend(publication.objects.iter());
+            content.extend(publication.content.iter());
+        }
+        if objects.is_empty() && content.is_empty() {
+            return Ok(());
+        }
+        let objects = objects
+            .into_iter()
+            .map(|(id, bytes)| (*id, bytes.clone()))
+            .collect::<Vec<_>>();
+        let content = content
+            .into_iter()
+            .map(|(id, blob)| ContentItem {
+                id: *id,
+                bytes: &blob.bytes,
+                base: blob.base,
+            })
+            .collect::<Vec<_>>();
+        store.put_publication(&objects, &content).await
+    }
+
+    /// `stage` with these publications beneath it: reads find what they hold, and
+    /// writes go to `stage`.
+    #[must_use]
+    pub fn over<'a, 's, S: RepositoryStore + ?Sized>(
+        &self,
+        stage: &'a RepositoryStage<'s, S>,
+    ) -> PendingView<'a, 's, S> {
+        let content = stage.content.overlaid(Arc::new(PendingContent {
+            publications: self.publications.clone(),
+            below: stage.content.clone(),
+        }));
+        PendingView {
+            publications: self.publications.clone(),
+            stage,
+            content,
+        }
+    }
+}
+
+/// A [`RepositoryStage`] with [`PendingPublications`] beneath it; see
+/// [`PendingPublications::over`].
+pub struct PendingView<'a, 's, S: ?Sized> {
+    publications: Vec<Arc<StagedPublication>>,
+    stage: &'a RepositoryStage<'s, S>,
+    content: ContentStore,
+}
+
+impl<S: ?Sized> PendingView<'_, '_, S> {
+    /// The stage's content with the pending content in it.
+    #[must_use]
+    pub fn content(&self) -> &ContentStore {
+        &self.content
+    }
+
+    fn object(&self, id: ObjectId) -> Option<&Vec<u8>> {
+        self.publications
+            .iter()
+            .find_map(|publication| publication.objects.get(&id))
+    }
+}
+
+#[async_trait]
+impl<S: RepositoryStore + ?Sized> ImmutableObjectStore for PendingView<'_, '_, S> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        if self.object(id).is_some() {
+            return Ok(());
+        }
+        self.stage.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.stage.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        match self.object(id) {
+            Some(bytes) => stored_object(id, bytes.clone()),
+            None => self.stage.get(id).await,
+        }
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        let mut results = vec![true; ids.len()];
+        let (below, positions): (Vec<_>, Vec<_>) = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| self.object(**id).is_none())
+            .map(|(position, id)| (*id, position))
+            .unzip();
+        if !below.is_empty() {
+            let found = self.stage.exists_many(&below).await?;
+            for (position, found) in positions.into_iter().zip(found) {
+                results[position] = found;
+            }
+        }
+        Ok(results)
+    }
 }
 
 #[async_trait]
@@ -318,6 +478,30 @@ impl<S: RepositoryStore + ?Sized> ImmutableObjectStore for RepositoryStage<'_, S
 struct StagedBlob {
     bytes: Vec<u8>,
     base: Option<ContentId>,
+}
+
+impl StagedBlob {
+    fn bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
+        if self.bytes.len() > max {
+            return Err(ContentStoreError::TooLarge {
+                id,
+                max,
+                minimum: self.bytes.len(),
+            });
+        }
+        Ok(self.bytes.clone())
+    }
+
+    fn raw_envelope(&self) -> (EnvelopeHeader, Vec<u8>) {
+        (
+            EnvelopeHeader {
+                codec: Codec::Raw,
+                stored_length: self.bytes.len() as u64,
+                logical_length: self.bytes.len() as u64,
+            },
+            self.bytes.clone(),
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -383,12 +567,7 @@ impl ContentBackend for StagedContent {
 
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         match self.staged(id)? {
-            Some(blob) if blob.bytes.len() > max => Err(ContentStoreError::TooLarge {
-                id,
-                max,
-                minimum: blob.bytes.len(),
-            }),
-            Some(blob) => Ok(blob.bytes.clone()),
+            Some(blob) => blob.bounded(id, max),
             None => self.stored.get_bounded(id, max),
         }
     }
@@ -398,14 +577,7 @@ impl ContentBackend for StagedContent {
         id: ContentId,
     ) -> Result<(EnvelopeHeader, Vec<u8>), ContentStoreError> {
         match self.staged(id)? {
-            Some(blob) => Ok((
-                EnvelopeHeader {
-                    codec: Codec::Raw,
-                    stored_length: blob.bytes.len() as u64,
-                    logical_length: blob.bytes.len() as u64,
-                },
-                blob.bytes.clone(),
-            )),
+            Some(blob) => Ok(blob.raw_envelope()),
             None => self.stored.raw_envelope(id),
         }
     }
@@ -436,6 +608,78 @@ impl ContentBackend for StagedContent {
         Some(stored.and_then(|mut ids| {
             ids.extend(self.lock()?.blobs.keys().copied());
             Ok(ids)
+        }))
+    }
+}
+
+/// [`PendingPublications`]' content in front of a stage's: the backend of
+/// [`PendingView::content`].
+#[derive(Debug)]
+struct PendingContent {
+    publications: Vec<Arc<StagedPublication>>,
+    below: ContentStore,
+}
+
+impl PendingContent {
+    fn pending(&self, id: ContentId) -> Option<&StagedBlob> {
+        self.publications
+            .iter()
+            .find_map(|publication| publication.content.get(&id))
+            .map(|blob| &**blob)
+    }
+}
+
+impl ContentBackend for PendingContent {
+    fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError> {
+        self.below
+            .put_many(contents.iter().cloned(), WRITE_CONCURRENCY)
+    }
+
+    fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
+        match self.pending(id) {
+            Some(blob) => blob.bounded(id, max),
+            None => self.below.get_bounded(id, max),
+        }
+    }
+
+    fn get_raw_envelope(
+        &self,
+        id: ContentId,
+    ) -> Result<(EnvelopeHeader, Vec<u8>), ContentStoreError> {
+        match self.pending(id) {
+            Some(blob) => Ok(blob.raw_envelope()),
+            None => self.below.raw_envelope(id),
+        }
+    }
+
+    fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
+        match self.pending(id) {
+            Some(blob) => Ok(blob.bytes.len() as u64),
+            None => self.below.logical_length(id),
+        }
+    }
+
+    fn put_raw_envelopes(
+        &self,
+        envelopes: &[(ContentId, Vec<u8>)],
+    ) -> Result<(), ContentStoreError> {
+        for (id, envelope) in envelopes {
+            self.below.put_raw_envelope(*id, envelope.clone())?;
+        }
+        Ok(())
+    }
+
+    fn supports_raw_envelopes(&self) -> bool {
+        self.below.supports_raw_envelopes()
+    }
+
+    fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
+        let below = self.below.list_ids()?;
+        Some(below.map(|mut ids| {
+            for publication in &self.publications {
+                ids.extend(publication.content.keys().copied());
+            }
+            ids
         }))
     }
 }
