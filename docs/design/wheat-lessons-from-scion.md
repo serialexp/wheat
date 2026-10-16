@@ -65,6 +65,11 @@ land and move completed bullets from Outstanding to Done.
 - [x] **Group commit (2026-10-16).** Publishes still join one at a time, but onto the
   last accepted publish before it is durable, and are stored and published in
   batches: one write and one head compare-and-swap per batch. See "Group commit".
+- [x] **Packed appends and the catalog lock (2026-10-16).** Throughput stopped near
+  10 per second at the packed store. All five fixes were tried cumulatively (see
+  "Profile at 8 writers" and the sections after it): 8 writers now reach 41 to 47
+  accepted publishes per second with one attempt each, and the server is about 5%
+  busy there.
 
 ### Outstanding
 
@@ -74,13 +79,6 @@ land and move completed bullets from Outstanding to Done.
 - [ ] **Client pushes the difference up front.** The client runs the server's walk
   from the last fetched head and sends the result, so a publish takes one round trip
   instead of one per tree level.
-- [ ] **Packed appends and the catalog lock.** Throughput stops near 10 per second
-  at the packed store (see "Profile at 8 writers"): two appends of about 46 ms per
-  publish, and one catalog mutex that makes every read wait for them. Being tried
-  cumulatively; reads no longer wait for appends (see "Reads beside an append"), a
-  publish makes one append (see "One append per publish"), an append costs about
-  4 ms instead of 38 (see "A cheaper append"), and publishes are made durable in
-  batches (see "Group commit"). Still to try: the blocking work off the runtime.
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
@@ -446,6 +444,33 @@ batches and the committer was busy about half the time. The server spends about
 8 writers the time outside the server's publish handling sets the pace. At 16
 writers a batch averaged 2.2 publishes, again with the committer busy about half the
 time.
+
+#### The committer off the runtime (2026-10-16)
+
+Fifth: the committer runs on Tokio's blocking pool (`spawn_blocking` driving it with
+`Handle::block_on`), so the batch write and the head's syncs, about 8 to 12 ms per
+batch, no longer hold a runtime worker that connections need. The rest of the
+server's disk work is reads, many per publish and each short. Moving each one to the
+blocking pool would cost a handoff per read (see the TODO item on blocking disk
+work), so they stay where they are.
+
+| writers | accepted/s after group commit | after (two runs, plus the saved run) | latency p50, ms (before, after) |
+|---|---|---|---|
+| 1 | 13.64, 16.81, 16.81 | 16.78, 15.23, 16.20 | 18, 18 |
+| 2 | 13.98, 12.18, 14.43 | 13.96, 13.82, 11.77 | 54, 54 |
+| 4 | 25.90, 25.17, 28.43 | 24.89, 29.31, 28.17 | 58, 59 |
+| 8 | 34.90, 41.57, 42.15 | 44.68, 41.25, 47.08 | 83, 76 |
+| 16 | 65.26, 62.75, 69.80 | 70.75, 70.63, 67.19 | 121, 118 |
+
+Latencies are from the saved runs.
+
+Still one attempt per publish. The gains are within the runs' spread, as the profile
+predicted: the server is about 5% busy at 8 writers and 16% at 16.
+
+Where a writer's time goes now: at 1 writer a publish takes 18 ms, but from 2 writers
+on, every publish is joined and the median jumps to about 55 ms. The server's join and
+push add only about 1 ms, so the rest is likely the client taking a joined head. That
+is not yet profiled.
 
 
 Labels could get their own CAS, and changes and revisions could be accepted into

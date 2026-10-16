@@ -215,9 +215,12 @@ impl CommitState {
         self.tentative = Some(joined);
         if !self.committing {
             self.committing = true;
-            // A task of its own, so a publish whose client goes away does not stop
-            // the batches of the others.
-            tokio::spawn(commit_batches(entry.clone()));
+            // A thread of its own, so a publish whose client goes away does not stop
+            // the batches of the others, and so the committer's writes and syncs
+            // block a thread of the blocking pool rather than a runtime worker.
+            let runtime = tokio::runtime::Handle::current();
+            let entry = entry.clone();
+            tokio::task::spawn_blocking(move || runtime.block_on(commit_batches(entry)));
         }
         receiver
     }

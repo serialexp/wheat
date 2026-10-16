@@ -85,6 +85,10 @@ Performance, most serious first:
   inside the shared stores. Options put to Bart: `block_in_place` at the server's
   call sites; `spawn_blocking` inside the stores (a handoff per get); or each
   handler's store work as one blocking job talking to the connection over channels.
+  Since 2026-10-16 the publish committer (`commit.rs`), which does the store write and
+  the head's syncs, runs on the blocking pool. What is left on the runtime are reads
+  and the stage's early writes; in `publish_contention` at 8 writers the server is
+  about 5% busy, so that case cannot show their cost.
 - `[ ]` **`wheat status` re-reads and re-hashes every file (scanner only).**
   `workspace_scan.rs` has no saved stat cache (mtime, ctime, size, inode, content ID),
   so every status reads all tracked files and their baselines, and fails once the

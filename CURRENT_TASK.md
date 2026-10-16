@@ -294,4 +294,15 @@ default taken: full batch. Design (written up in the design doc, "Group commit")
   ~50%, the writers' cycle outside the server's publish handling, ~170 ms, sets the
   pace). Trace /tmp/wheat-profile/option4.json.
 
-Next: 5 (spawn_blocking); then contract rules (step 4) and maybe client-side push.
+Option 5 done 2026-10-16: only the committer moved to the blocking pool
+(`spawn_blocking` + `Handle::block_on`); other disk work is short reads, and the
+server is ~5% busy at 8 writers, so per-read handoffs would cost more than they save
+(TODO item "wheat-server does blocking disk work" updated). Gains within noise (8
+writers 41-47/s, latency p50 83 -> 76 ms).
+
+Not yet profiled: from 2 writers on every publish is joined and the median publish
+latency jumps 18 -> ~55 ms; the server adds ~1 ms, so it is likely the client
+taking the joined head.
+
+Next: contract rules (step 4: writers_8.accepted_per_second >= 10, attempts_per_publish
+<= 1, attempts_max <= 1), then maybe the client-side push.
