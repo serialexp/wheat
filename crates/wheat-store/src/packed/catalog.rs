@@ -1,14 +1,15 @@
 //! Durable publication catalog for immutable and active packed segments.
 //!
-//! `catalog.head` and `active.head` are authority. SQLite is disposable derived
-//! state and is rebuilt from the authenticated immutable chain plus the active
-//! segment whenever its combined checkpoint disagrees.
+//! `catalog.head` and the newest verified frame of the active segment's log are
+//! authority. SQLite is disposable derived state and is rebuilt from the
+//! authenticated immutable chain plus the active segment whenever its combined
+//! checkpoint disagrees.
 
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -26,15 +27,12 @@ use wheat_core::{
 };
 
 use super::{
-    active::{
-        ActiveError, ActivePublishedState, ActiveRecoveryJournal, ActiveSegment, ActiveWrite,
-        ActiveWritten,
-    },
+    active::{ActiveError, ActivePublishedState, ActiveSegment, ActiveWrite, ActiveWritten},
     bulk::{BulkSegment, FinalizedBulk},
     segment::{
-        MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, METADATA_NAMESPACE,
-        PreparedSegmentRecord, SealedSegment, SegmentBuilder, SegmentError, SegmentReader,
-        SegmentRecord, prepare_delta_record, prepare_record, verify_logical,
+        MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE, PreparedSegmentRecord, SealedSegment,
+        SegmentBuilder, SegmentError, SegmentReader, SegmentRecord, prepare_delta_record,
+        prepare_record, verify_logical,
     },
     trace::PackedStoreTraceCounters,
 };
@@ -42,23 +40,17 @@ use crate::Durability;
 
 const SCHEMA: &str = include_str!("catalog_sql/schema.sql");
 const LOOKUP: &str = include_str!("catalog_sql/lookup.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SEGMENT_SUFFIX: &str = ".segment";
 const CATALOG_SUFFIX: &str = ".catalog";
 const CATALOG_HEAD_FILE: &str = "catalog.head";
 const ACTIVE_FILE: &str = "active.segment";
-const ACTIVE_HEAD_FILE: &str = "active.head";
-const ACTIVE_JOURNAL_FILE: &str = "active.append";
 const BULK_FILE_PREFIX: &str = "bulk-";
 const REPACK_INTENT_FILE: &str = "repack.intent";
 const REPACK_INTENT_MAGIC: &[u8; 8] = b"WHTRPK02";
 const CATALOG_HEAD_MAGIC: &[u8; 9] = b"WHEATPACK";
 const CATALOG_HEAD_VERSION: u8 = 1;
 const CATALOG_HEAD_LEN: usize = CATALOG_HEAD_MAGIC.len() + 1 + 8 + 32;
-const ACTIVE_HEAD_MAGIC: &[u8; 8] = b"WHEATAHD";
-const ACTIVE_JOURNAL_MAGIC: &[u8; 8] = b"WHEATAJR";
-const ACTIVE_FORMAT_VERSION: u8 = 1;
-const STATE_ENCODED_LEN: usize = 8 + 32 + 6 * 8;
 const CHECKSUM_LEN: usize = 32;
 const DEFAULT_ACTIVE_TARGET_BYTES: u64 = super::active::ACTIVE_SEGMENT_TARGET_BYTES;
 
@@ -430,13 +422,11 @@ struct DurablePut<'a> {
     prepared: Vec<PreparedSegmentRecord<'a>>,
 }
 
-/// The durable I/O of one append, done without the catalog: the journal, the
-/// segment write, the active head, the journal's removal and the locator rows,
-/// on a connection of the job's own.
+/// The durable I/O of one append, done without the catalog: the frame written
+/// to the active segment's log and synced, then the locator rows, on a
+/// connection of the job's own.
 struct AppendJob<'a> {
-    root: PathBuf,
     durability: Durability,
-    journal: ActiveRecoveryJournal,
     write: ActiveWrite<'a>,
     index: Connection,
     catalog_head: CatalogHead,
@@ -447,27 +437,19 @@ struct AppendJob<'a> {
     pause: Option<AppendPause>,
 }
 
-/// How far an [`AppendJob`] got.
-struct AppendOutcome<'a> {
+/// How far an [`AppendJob`] got: the segment write's outcome, then the locator
+/// row count after indexing what it added, or the indexing error.
+struct AppendOutcome {
     index: Connection,
-    stage: AppendStage<'a>,
+    written: ActiveWritten,
+    indexed: Result<u64, CatalogError>,
 }
 
-enum AppendStage<'a> {
-    /// Nothing reached the segment.
-    JournalFailed(ActiveWrite<'a>, CatalogError),
-    /// The segment write's outcome, then the locator row count after the steps that
-    /// follow it, or the first of them that failed.
-    Written(ActiveWritten, Result<u64, CatalogError>),
-}
-
-impl<'a> AppendJob<'a> {
+impl AppendJob<'_> {
     #[tracing::instrument(name = "packed_append", level = "debug", skip_all)]
-    fn run(self) -> AppendOutcome<'a> {
+    fn run(self) -> AppendOutcome {
         let Self {
-            root,
             durability,
-            journal,
             write,
             mut index,
             catalog_head,
@@ -483,52 +465,33 @@ impl<'a> AppendJob<'a> {
                 pause.wait();
             }
         };
-        let journaled = debug_span!("packed_append_journal")
-            .in_scope(|| write_active_journal(&root, &journal, durability));
-        if let Err(error) = journaled {
-            return AppendOutcome {
-                index,
-                stage: AppendStage::JournalFailed(write, error),
-            };
-        }
-        let (written, synced) = debug_span!("packed_append_segment").in_scope(|| {
-            let written = write.run();
-            let synced = written.sync(durability);
-            (written, synced)
+        let written = debug_span!("packed_append_segment").in_scope(|| {
+            let mut written = write.run();
+            written.sync(durability);
+            #[cfg(test)]
+            if failpoint == Some(AppendFailpoint::Sync) {
+                written.test_fail();
+            }
+            written
         });
         #[cfg(test)]
         pause_at(AppendPausePoint::SegmentWritten);
-        let rest = match written.appended() {
+        let indexed = match written.appended() {
             None => Ok(locator_rows),
-            Some((state, added)) => (|| {
-                #[cfg(test)]
-                if failpoint == Some(AppendFailpoint::MutationApplied) {
-                    return Err(CatalogError::Corrupt("test failure after active mutation"));
-                }
-                synced?;
-                debug_span!("packed_append_head")
-                    .in_scope(|| write_active_head(&root, state, durability))?;
-                #[cfg(test)]
-                if failpoint == Some(AppendFailpoint::HeadPublished) {
-                    return Err(CatalogError::Corrupt("test failure after active head"));
-                }
-                debug_span!("packed_append_journal_remove").in_scope(|| {
-                    remove_durable_file(&root, &root.join(ACTIVE_JOURNAL_FILE), durability)
-                })?;
-                #[cfg(test)]
-                if failpoint == Some(AppendFailpoint::JournalRemoved) {
-                    return Err(CatalogError::Corrupt("test failure after journal removal"));
-                }
-                debug_span!("packed_append_index").in_scope(|| {
-                    index_appended_entries(&mut index, &added, catalog_head, state, locator_rows)
-                })
-            })(),
+            #[cfg(test)]
+            Some(_) if failpoint == Some(AppendFailpoint::Synced) => Err(CatalogError::Corrupt(
+                "test failure after the synced append",
+            )),
+            Some((state, added)) => debug_span!("packed_append_index").in_scope(|| {
+                index_appended_entries(&mut index, added, catalog_head, state, locator_rows)
+            }),
         };
         #[cfg(test)]
         pause_at(AppendPausePoint::Indexed);
         AppendOutcome {
             index,
-            stage: AppendStage::Written(written, rest),
+            written,
+            indexed,
         }
     }
 }
@@ -537,7 +500,7 @@ impl<'a> AppendJob<'a> {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AppendPausePoint {
-    /// The records are in the segment file, which the head does not cover yet.
+    /// The records are in the segment's log, which the catalog has not taken on.
     SegmentWritten,
     /// The locator holds the records' rows; the catalog has not taken them on.
     Indexed,
@@ -570,9 +533,10 @@ pub(crate) struct AppendPauseHandle {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AppendFailpoint {
-    MutationApplied,
-    HeadPublished,
-    JournalRemoved,
+    /// Syncing the written frame fails.
+    Sync,
+    /// Indexing fails after the frame is synced.
+    Synced,
 }
 
 #[cfg(test)]
@@ -654,10 +618,7 @@ impl PackedCatalog {
         };
         recover_repack_intent(&root, durable_head, durability)?;
         let authority = read_catalog_authority(&catalogs, durable_head)?;
-        let committed_segment = authority
-            .as_ref()
-            .and_then(|snapshot| snapshot.segments.last().map(|item| item.segment));
-        let (active, active_retired) = recover_active(&root, durability, committed_segment)?;
+        let active = recover_active(&root, durability)?;
         remove_unpublished_bulk_files(&segments, durability)?;
         remove_unreachable_publications(
             &segments,
@@ -724,7 +685,7 @@ impl PackedCatalog {
         let checkpoint_valid = checkpoint
             .as_ref()
             .is_ok_and(|(head, active, _)| (*head, *active) == authority);
-        if active_retired || !checkpoint_valid {
+        if !checkpoint_valid {
             catalog.rebuild_index()?;
         } else {
             catalog.locator_rows = checkpoint.expect("validated checkpoint").2;
@@ -758,24 +719,6 @@ impl PackedCatalog {
         catalog.max_segment_entries = max_segment_entries;
         catalog.max_segment_payload_bytes = max_segment_payload_bytes;
         Ok(catalog)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_interrupt_append(
-        &mut self,
-        records: &[SegmentRecord<'_>],
-        publish_intended_head: bool,
-    ) -> Result<(), CatalogError> {
-        let intended = self.active.state().generation + 1;
-        let prepared = self.active.prepare_append(records, intended)?;
-        let journal = prepared.journal().clone();
-        write_active_journal(&self.root, &journal, self.durability)?;
-        let result = self.active.commit_append(prepared)?;
-        self.active.sync(self.durability)?;
-        if publish_intended_head {
-            write_active_head(&self.root, result.state, self.durability)?;
-        }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -958,7 +901,7 @@ impl PackedCatalog {
             };
             let projected = self.projected_physical_size(
                 self.active.entries().len(),
-                self.active.state().metadata.payload_bytes,
+                self.active.state().payload_bytes,
                 end + 1,
                 next_payload,
             );
@@ -968,7 +911,7 @@ impl PackedCatalog {
             if !fits && end != 0 {
                 break;
             }
-            if !fits && self.active.state().metadata.object_count != 0 {
+            if !fits && self.active.state().object_count != 0 {
                 self.seal_active()?;
                 payload = 0;
                 end = 0;
@@ -991,11 +934,11 @@ impl PackedCatalog {
     fn finish_put_append(
         &mut self,
         put: &DurablePut<'_>,
-        outcome: AppendOutcome<'_>,
+        outcome: AppendOutcome,
     ) -> Result<(), CatalogError> {
         self.finish_append(outcome)?;
         if !put.prepared.is_empty()
-            || self.active.state().metadata.total_length >= self.active_target_bytes
+            || self.active.state().total_length >= self.active_target_bytes
             || self.active.should_seal()
         {
             self.seal_active()?;
@@ -1044,7 +987,6 @@ impl PackedCatalog {
         let prepared = self
             .active
             .prepare_prepared_append(records, intended_generation)?;
-        let journal = prepared.journal().clone();
         let index = self
             .append_index
             .take()
@@ -1057,18 +999,16 @@ impl PackedCatalog {
                 return Err(error.into());
             }
         };
-        // Every operation from journal publication onward can leave observable
-        // state behind even when it returns an error. Keep this instance closed
-        // to writes until the entire authority + derived-index protocol completes.
+        // From the frame's write onward an error can leave observable state
+        // behind. Keep this instance closed to writes until the segment and the
+        // derived index both have the append.
         self.poisoned = true;
         self.append_in_flight = true;
         if let Some(trace) = &self.trace {
             trace.durable_append();
         }
         Ok(AppendJob {
-            root: self.root.clone(),
             durability: self.durability,
-            journal,
             write,
             index,
             catalog_head: self.generation.zip(self.head),
@@ -1080,19 +1020,12 @@ impl PackedCatalog {
         })
     }
 
-    /// Publishes what an [`AppendJob`] appended, or undoes its segment write.
-    fn finish_append(&mut self, outcome: AppendOutcome<'_>) -> Result<(), CatalogError> {
+    /// Publishes what an [`AppendJob`] appended, or truncates its failed frame.
+    fn finish_append(&mut self, outcome: AppendOutcome) -> Result<(), CatalogError> {
         self.append_index = Some(outcome.index);
         self.append_in_flight = false;
-        let (written, rest) = match outcome.stage {
-            AppendStage::JournalFailed(write, error) => {
-                self.active.abandon_append(write);
-                return Err(error);
-            }
-            AppendStage::Written(written, rest) => (written, rest),
-        };
-        self.active.finish_append(written)?;
-        self.locator_rows = rest?;
+        self.active.finish_append(outcome.written)?;
+        self.locator_rows = outcome.indexed?;
         self.poisoned = false;
         Ok(())
     }
@@ -1589,7 +1522,7 @@ impl PackedCatalog {
     }
 
     fn seal_active(&mut self) -> Result<(), CatalogError> {
-        if self.active.state().metadata.object_count == 0 {
+        if self.active.state().object_count == 0 {
             return Ok(());
         }
         // From this point onward a returned filesystem, sync, publication, or
@@ -1768,7 +1701,7 @@ impl PackedCatalog {
                 .ok_or(CatalogError::Corrupt("physical byte count overflow"))
         })?;
         let bytes = sealed_bytes
-            .checked_add(self.active.state().metadata.total_length)
+            .checked_add(self.active.state().total_length)
             .ok_or(CatalogError::Corrupt("physical byte count overflow"))?;
         let sealed_records = self
             .sealed_readers
@@ -1780,12 +1713,12 @@ impl PackedCatalog {
                     .ok_or(CatalogError::Corrupt("record count overflow"))
             })?;
         let records = sealed_records
-            .checked_add(self.active.state().metadata.object_count)
+            .checked_add(self.active.state().object_count)
             .ok_or(CatalogError::Corrupt("record count overflow"))?;
         let segments = self
             .sealed_sources
             .len()
-            .checked_add(usize::from(self.active.state().metadata.object_count != 0))
+            .checked_add(usize::from(self.active.state().object_count != 0))
             .ok_or(CatalogError::Corrupt("segment count overflow"))?;
         Ok((segments, bytes, records))
     }
@@ -2393,8 +2326,7 @@ impl PackedCatalog {
     fn read_checkpoint(&self) -> Result<CatalogCheckpoint, CatalogError> {
         let row = self.index.query_row(
             "SELECT catalog_generation,catalog_digest,active_generation,active_id,\
-             active_object_count,active_payload_bytes,active_total_length,active_index_start,\
-             active_directory_offset,active_directory_length,locator_count \
+             active_object_count,active_payload_bytes,active_total_length,locator_count \
              FROM checkpoint WHERE singleton=1",
             [],
             |row| {
@@ -2407,9 +2339,6 @@ impl PackedCatalog {
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
                 ))
             },
         )?;
@@ -2421,16 +2350,11 @@ impl PackedCatalog {
         let active = ActivePublishedState {
             generation: u64_value(row.2)?,
             id: SegmentId(digest32(row.3)?),
-            metadata: super::segment::SegmentMetadata {
-                object_count: u64_value(row.4)?,
-                payload_bytes: u64_value(row.5)?,
-                total_length: u64_value(row.6)?,
-                index_start: u64_value(row.7)?,
-                directory_offset: u64_value(row.8)?,
-                directory_length: u64_value(row.9)?,
-            },
+            object_count: u64_value(row.4)?,
+            payload_bytes: u64_value(row.5)?,
+            total_length: u64_value(row.6)?,
         };
-        Ok((catalog, active, u64_value(row.10)?))
+        Ok((catalog, active, u64_value(row.7)?))
     }
 }
 
@@ -2521,75 +2445,27 @@ fn delta_layout(
     Ok((order, planned))
 }
 
-fn recover_active(
-    root: &Path,
-    durability: Durability,
-    committed_segment: Option<[u8; 32]>,
-) -> Result<(ActiveSegment, bool), CatalogError> {
+/// Opens the active segment at its newest verified frame, dropping an append a
+/// crash interrupted, or creates it.
+fn recover_active(root: &Path, durability: Durability) -> Result<ActiveSegment, CatalogError> {
     let active_path = root.join(ACTIVE_FILE);
-    let head_path = root.join(ACTIVE_HEAD_FILE);
-    let journal_path = root.join(ACTIVE_JOURNAL_FILE);
-    if !head_path.exists() {
-        if journal_path.exists() {
-            return Err(CatalogError::Corrupt(
-                "active journal exists without active head",
-            ));
-        }
-        let active = if active_path.exists() {
-            // Creation publishes the complete empty active segment before its
-            // head. Recover that one safe interruption window, but reject
-            // arbitrary or non-empty files lacking publication metadata.
-            let reader = SegmentReader::open(File::open(&active_path)?)?;
-            if reader.metadata().object_count != 0 {
-                return Err(CatalogError::Corrupt(
-                    "non-empty active segment exists without active head",
-                ));
+    match ActiveSegment::recover(&active_path) {
+        Ok((active, torn)) => {
+            if torn {
+                active.sync(durability)?;
             }
-            ActiveSegment::reopen(
-                &active_path,
-                ActivePublishedState {
-                    generation: 0,
-                    id: reader.id(),
-                    metadata: reader.metadata(),
-                },
-            )?
-        } else {
-            ActiveSegment::create(&active_path, 0)?
-        };
-        active.sync(durability)?;
-        durability.sync_directory(root)?;
-        write_active_head(root, active.state(), durability)?;
-        return Ok((active, false));
+            return Ok(active);
+        }
+        Err(ActiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        // Only the first creation writes this path in place: retirement renames
+        // a synced log over it. No append can have followed an unfinished header.
+        Err(ActiveError::Unwritten) => fs::remove_file(&active_path)?,
+        Err(error) => return Err(error.into()),
     }
-    let published = read_active_head(&head_path)?;
-    if committed_segment == Some(published.id.0) {
-        let next_generation = published
-            .generation
-            .checked_add(1)
-            .ok_or(CatalogError::Corrupt("active generation overflow"))?;
-        remove_durable_file(root, &active_path, durability)?;
-        remove_durable_file(root, &journal_path, durability)?;
-        let active = ActiveSegment::create(&active_path, next_generation)?;
-        active.sync(durability)?;
-        durability.sync_directory(root)?;
-        write_active_head(root, active.state(), durability)?;
-        return Ok((active, true));
-    }
-    let Some(journal) = read_optional_active_journal(&journal_path)? else {
-        return Ok((ActiveSegment::reopen(active_path, published)?, false));
-    };
-    if published == journal.old {
-        let active = ActiveSegment::recover(&active_path, &journal)?;
-        active.sync(durability)?;
-        remove_durable_file(root, &journal_path, durability)?;
-        Ok((active, false))
-    } else if published.generation == journal.intended_generation {
-        let active = ActiveSegment::reopen(&active_path, published)?;
-        remove_durable_file(root, &journal_path, durability)?;
-        Ok((active, false))
-    } else {
-        Err(CatalogError::Corrupt("active journal does not match head"))
-    }
+    let active = ActiveSegment::create(&active_path, 0)?;
+    active.sync(durability)?;
+    durability.sync_directory(root)?;
+    Ok(active)
 }
 
 /// The block-compressed replacement need not equal the active segment's byte
@@ -2622,7 +2498,6 @@ fn retire_active(
     fs::rename(&temporary_path, &active_path)?;
     replacement.renamed(active_path);
     durability.sync_directory(root)?;
-    write_active_head(root, replacement.state(), durability)?;
     *active = replacement;
     Ok(())
 }
@@ -2648,11 +2523,14 @@ fn connect_index(path: &Path, durability: Durability) -> Result<Connection, Cata
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
+    // The locator is derived: an open whose checkpoint disagrees with the
+    // segments rebuilds it. So commits need not survive a power loss, and in
+    // write-ahead-log mode `NORMAL` makes them without a sync.
     connection.pragma_update(
         None,
         "synchronous",
         match durability {
-            Durability::Durable => "FULL",
+            Durability::Durable => "NORMAL",
             Durability::Deferred => "OFF",
         },
     )?;
@@ -2910,19 +2788,15 @@ fn write_checkpoint(
     transaction.execute(
         "UPDATE checkpoint SET catalog_generation=?1,catalog_digest=?2,active_generation=?3,\
          active_id=?4,active_object_count=?5,active_payload_bytes=?6,active_total_length=?7,\
-         active_index_start=?8,active_directory_offset=?9,active_directory_length=?10,\
-         locator_count=?11 WHERE singleton=1",
+         locator_count=?8 WHERE singleton=1",
         params![
             generation,
             digest.as_ref().map(|value| value.as_slice()),
             i64_value(active.generation)?,
             active.id.0.as_slice(),
-            i64_value(active.metadata.object_count)?,
-            i64_value(active.metadata.payload_bytes)?,
-            i64_value(active.metadata.total_length)?,
-            i64_value(active.metadata.index_start)?,
-            i64_value(active.metadata.directory_offset)?,
-            i64_value(active.metadata.directory_length)?,
+            i64_value(active.object_count)?,
+            i64_value(active.payload_bytes)?,
+            i64_value(active.total_length)?,
             locator_count,
         ],
     )?;
@@ -3247,132 +3121,6 @@ fn recover_repack_intent(
     // then retires the old generation. The intent can be removed now because
     // both branches have reached a self-describing authority.
     remove_durable_file(root, &path, durability)
-}
-
-fn encode_state(state: ActivePublishedState, output: &mut Vec<u8>) {
-    output.extend_from_slice(&state.generation.to_be_bytes());
-    output.extend_from_slice(&state.id.0);
-    for value in [
-        state.metadata.object_count,
-        state.metadata.payload_bytes,
-        state.metadata.total_length,
-        state.metadata.index_start,
-        state.metadata.directory_offset,
-        state.metadata.directory_length,
-    ] {
-        output.extend_from_slice(&value.to_be_bytes());
-    }
-}
-
-fn decode_state(bytes: &[u8]) -> Result<ActivePublishedState, CatalogError> {
-    if bytes.len() != STATE_ENCODED_LEN {
-        return Err(CatalogError::Corrupt("active state length"));
-    }
-    let value = |start| u64::from_be_bytes(bytes[start..start + 8].try_into().unwrap());
-    Ok(ActivePublishedState {
-        generation: value(0),
-        id: SegmentId(bytes[8..40].try_into().unwrap()),
-        metadata: super::segment::SegmentMetadata {
-            object_count: value(40),
-            payload_bytes: value(48),
-            total_length: value(56),
-            index_start: value(64),
-            directory_offset: value(72),
-            directory_length: value(80),
-        },
-    })
-}
-
-fn checked_envelope<'a>(encoded: &'a [u8], magic: &[u8; 8]) -> Result<&'a [u8], CatalogError> {
-    if encoded.len() < magic.len() + 1 + CHECKSUM_LEN
-        || !encoded.starts_with(magic)
-        || encoded[magic.len()] != ACTIVE_FORMAT_VERSION
-    {
-        return Err(CatalogError::Corrupt("active control format"));
-    }
-    let body_end = encoded.len() - CHECKSUM_LEN;
-    if blake3::hash(&encoded[..body_end]).as_bytes() != &encoded[body_end..] {
-        return Err(CatalogError::Corrupt("active control checksum"));
-    }
-    Ok(&encoded[magic.len() + 1..body_end])
-}
-
-fn write_active_head(
-    root: &Path,
-    state: ActivePublishedState,
-    durability: Durability,
-) -> Result<(), CatalogError> {
-    let mut encoded = Vec::with_capacity(8 + 1 + STATE_ENCODED_LEN + CHECKSUM_LEN);
-    encoded.extend_from_slice(ACTIVE_HEAD_MAGIC);
-    encoded.push(ACTIVE_FORMAT_VERSION);
-    encode_state(state, &mut encoded);
-    encoded.extend_from_slice(blake3::hash(&encoded).as_bytes());
-    atomic_write(root, &root.join(ACTIVE_HEAD_FILE), &encoded, durability)
-}
-
-fn read_active_head(path: &Path) -> Result<ActivePublishedState, CatalogError> {
-    let encoded = fs::read(path)?;
-    decode_state(checked_envelope(&encoded, ACTIVE_HEAD_MAGIC)?)
-}
-
-fn write_active_journal(
-    root: &Path,
-    journal: &ActiveRecoveryJournal,
-    durability: Durability,
-) -> Result<(), CatalogError> {
-    let mut encoded = Vec::with_capacity(
-        8 + 1 + STATE_ENCODED_LEN + 8 + 8 + journal.old_tail.len() + CHECKSUM_LEN,
-    );
-    encoded.extend_from_slice(ACTIVE_JOURNAL_MAGIC);
-    encoded.push(ACTIVE_FORMAT_VERSION);
-    encode_state(journal.old, &mut encoded);
-    encoded.extend_from_slice(&journal.intended_generation.to_be_bytes());
-    encoded.extend_from_slice(&(journal.old_tail.len() as u64).to_be_bytes());
-    encoded.extend_from_slice(&journal.old_tail);
-    encoded.extend_from_slice(blake3::hash(&encoded).as_bytes());
-    atomic_write(root, &root.join(ACTIVE_JOURNAL_FILE), &encoded, durability)
-}
-
-fn read_optional_active_journal(
-    path: &Path,
-) -> Result<Option<ActiveRecoveryJournal>, CatalogError> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let maximum = (ACTIVE_JOURNAL_MAGIC.len() + 1 + STATE_ENCODED_LEN + 16 + CHECKSUM_LEN) as u64
-        + MAX_SEGMENT_TAIL_BYTES;
-    let file_len = file.metadata()?.len();
-    if file_len > maximum {
-        return Err(CatalogError::Corrupt("active journal exceeds tail limit"));
-    }
-    let mut encoded = Vec::with_capacity(file_len as usize);
-    file.read_to_end(&mut encoded)?;
-    let body = checked_envelope(&encoded, ACTIVE_JOURNAL_MAGIC)?;
-    if body.len() < STATE_ENCODED_LEN + 16 {
-        return Err(CatalogError::Corrupt("active journal length"));
-    }
-    let old = decode_state(&body[..STATE_ENCODED_LEN])?;
-    let intended_generation = u64::from_be_bytes(
-        body[STATE_ENCODED_LEN..STATE_ENCODED_LEN + 8]
-            .try_into()
-            .unwrap(),
-    );
-    let tail_len = u64::from_be_bytes(
-        body[STATE_ENCODED_LEN + 8..STATE_ENCODED_LEN + 16]
-            .try_into()
-            .unwrap(),
-    );
-    let tail_len = usize::try_from(tail_len).map_err(|_| CatalogError::Corrupt("journal tail"))?;
-    if body.len() != STATE_ENCODED_LEN + 16 + tail_len {
-        return Err(CatalogError::Corrupt("active journal tail length"));
-    }
-    Ok(Some(ActiveRecoveryJournal {
-        old,
-        intended_generation,
-        old_tail: body[STATE_ENCODED_LEN + 16..].to_vec(),
-    }))
 }
 
 fn atomic_write(

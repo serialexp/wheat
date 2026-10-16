@@ -146,12 +146,20 @@ pub mod packed_segment_reader {
     use std::fs::File;
     use std::path::Path;
 
-    use crate::codec;
-    use crate::packed::segment::SegmentReader;
+    use wheat_core::SegmentIndexEntry;
 
-    /// Authenticated segment view returned by [`open_segment`].
+    use crate::codec;
+    use crate::packed::{active::ActiveSegment, segment::SegmentReader};
+
+    /// Authenticated segment view returned by [`open_segment`] and
+    /// [`open_active_segment`].
     pub struct AuthenticatedSegment {
-        reader: SegmentReader,
+        reader: Reader,
+    }
+
+    enum Reader {
+        Sealed(SegmentReader),
+        Active(ActiveSegment),
     }
 
     /// A single index entry exposed for measurement.
@@ -172,8 +180,11 @@ pub mod packed_segment_reader {
     impl AuthenticatedSegment {
         /// Returns all authenticated index entries.
         pub fn entries(&self) -> Vec<SegmentEntry> {
-            self.reader
-                .authenticated_entries()
+            let entries: &[SegmentIndexEntry] = match &self.reader {
+                Reader::Sealed(reader) => reader.authenticated_entries(),
+                Reader::Active(active) => active.entries(),
+            };
+            entries
                 .iter()
                 .map(|e| SegmentEntry {
                     namespace: e.namespace,
@@ -196,22 +207,38 @@ pub mod packed_segment_reader {
             digest: [u8; 32],
             max: usize,
         ) -> Result<Option<Vec<u8>>, String> {
-            self.reader
-                .lookup_entry_bounded(namespace, digest, max)
-                .map(|entry| entry.map(|(_, payload)| payload))
-                .map_err(|error| error.to_string())
+            match &mut self.reader {
+                Reader::Sealed(reader) => reader
+                    .lookup_entry_bounded(namespace, digest, max)
+                    .map(|found| found.map(|(_, payload)| payload))
+                    .map_err(|error| error.to_string()),
+                Reader::Active(active) => active
+                    .lookup_entry_bounded(namespace, digest, max)
+                    .map(|found| found.map(|(_, payload)| payload))
+                    .map_err(|error| error.to_string()),
+            }
         }
 
         /// Releases decompressed shared-block scratch during bounded traversals.
         pub fn clear_block_cache(&mut self) {
-            self.reader.clear_block_cache();
+            if let Reader::Sealed(reader) = &mut self.reader {
+                reader.clear_block_cache();
+            }
         }
     }
 
-    /// Opens and authenticates a segment file.
+    /// Opens and authenticates a sealed segment file.
     pub fn open_segment(file: File) -> Result<AuthenticatedSegment, String> {
         Ok(AuthenticatedSegment {
-            reader: SegmentReader::open(file).map_err(|e| e.to_string())?,
+            reader: Reader::Sealed(SegmentReader::open(file).map_err(|e| e.to_string())?),
+        })
+    }
+
+    /// Opens a packed store's active segment, a log of appends, read-only at
+    /// its newest verified append.
+    pub fn open_active_segment(path: &Path) -> Result<AuthenticatedSegment, String> {
+        Ok(AuthenticatedSegment {
+            reader: Reader::Active(ActiveSegment::open_read_only(path).map_err(|e| e.to_string())?),
         })
     }
 

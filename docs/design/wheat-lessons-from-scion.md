@@ -59,6 +59,9 @@ land and move completed bullets from Outstanding to Done.
   objects and content, readable, until the server accepts the publish or the client
   moves its head, so a refused publish stores no content either. See "One append per
   publish".
+- [x] **A cheaper append (2026-10-16).** The active segment is an append-only log of
+  hash-chained frames: one write and one sync per append, with no journal and no
+  head file. The locator runs `synchronous=NORMAL`. See "A cheaper append".
 
 ### Outstanding
 
@@ -71,9 +74,10 @@ land and move completed bullets from Outstanding to Done.
 - [ ] **Packed appends and the catalog lock.** Throughput stops near 10 per second
   at the packed store (see "Profile at 8 writers"): two appends of about 46 ms per
   publish, and one catalog mutex that makes every read wait for them. Being tried
-  cumulatively; reads no longer wait for appends (see "Reads beside an append") and a
-  publish makes one append (see "One append per publish"). Still to try: a cheaper
-  append, group commit, and the blocking work off the runtime.
+  cumulatively; reads no longer wait for appends (see "Reads beside an append"), a
+  publish makes one append (see "One append per publish"), and an append costs about
+  4 ms instead of 38 (see "A cheaper append"). Still to try: group commit and the
+  blocking work off the runtime.
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
@@ -351,6 +355,52 @@ about 52 ms at 8 writers: the append 38 (journal 9, segment 6 to 8, head 10,
 journal removal 5, locator 5.5), the head CAS 10 to 11, validation and join 3. That
 caps throughput near 19 per second, which is what the benchmark reaches; at 16
 writers a publish waits 520 ms for the lock.
+
+#### A cheaper append (2026-10-16)
+
+Third: the append itself. A V1 segment cannot grow by appending, because its
+payloads must be contiguous and its index sits after them; a fresh index per
+append would make the file quadratic in its record count. Sealing already
+rebuilds the records into a V1 segment, so the active segment became a log:
+
+- A header (`ActiveLogHeaderV1`) holding the generation it starts at.
+- One frame per append: a frame header (`ActiveLogFrameHeaderV1`: generation,
+  payload and index lengths, and a digest of those fields chained to the previous
+  frame), the payloads, a `SegmentIndexPageV1` with the frame's entries, and a
+  trailer (`ActiveLogFrameTrailerV1`) whose digest chains over the whole frame.
+- The newest verified frame is the published state; its chain digest is the state's
+  ID. There is no head file and no journal: an append writes one frame and syncs once,
+  and a failed write or sync truncates the frame away.
+- Opening walks the frames and verifies every chain digest, hashing the whole log
+  as opening did before. A frame cut short at the end of the file, or ending in
+  zeroed bytes, is a torn append and is truncated. A frame that fails its digest with
+  another frame after it refuses to open.
+
+The SQLite locator moved to `synchronous=NORMAL`. In WAL mode a crash can lose the
+last locator transactions but not corrupt the database, and the locator is rebuilt
+from the segments when it does not match them.
+
+| writers | accepted/s after one append per publish | after (two runs, plus the saved run) |
+|---|---|---|
+| 1 | 8.45, 9.29 | 15.72, 15.34, 11.48 |
+| 2 | 8.18, 8.16 | 12.56, 14.37, 14.17 |
+| 4 | 12.69, 13.47 | 22.61, 23.91, 21.64 |
+| 8 | 18.72, 18.81 | 40.19, 45.21, 43.35 |
+| 16 | 17.92, 18.42 | 49.61, 52.95, 53.57 |
+
+Still one attempt per publish at every count. In the trace at 8 writers an append
+takes about 4.4 ms (segment write and sync 3.7, locator 0.7), down from 38. The head
+CAS, an atomic write of the head file at 5 to 9 ms, is now the largest step under
+the commit lock, and at 16 writers a publish waits about 220 ms for it.
+
+Trade-offs:
+
+- Each frame adds 96 bytes of header and trailer and its own index page, so the
+  active segment grows faster than it did. It is still sealed by size and count.
+- A damaged frame in the middle of the log stops the store from opening rather than
+  dropping the frames after it.
+- Stores written before this change have an active segment in the old format and do
+  not open. No released store uses it.
 
 ### Alternative: per-label heads
 

@@ -22,18 +22,12 @@ CREATE TABLE checkpoint (
     active_object_count INTEGER,
     active_payload_bytes INTEGER,
     active_total_length INTEGER,
-    active_index_start INTEGER,
-    active_directory_offset INTEGER,
-    active_directory_length INTEGER,
     locator_count INTEGER NOT NULL DEFAULT 0 CHECK(locator_count >= 0),
     CHECK((catalog_generation IS NULL) = (catalog_digest IS NULL)),
     CHECK((active_generation IS NULL) = (active_id IS NULL)),
     CHECK((active_id IS NULL) = (active_object_count IS NULL)),
     CHECK((active_id IS NULL) = (active_payload_bytes IS NULL)),
-    CHECK((active_id IS NULL) = (active_total_length IS NULL)),
-    CHECK((active_id IS NULL) = (active_index_start IS NULL)),
-    CHECK((active_id IS NULL) = (active_directory_offset IS NULL)),
-    CHECK((active_id IS NULL) = (active_directory_length IS NULL))
+    CHECK((active_id IS NULL) = (active_total_length IS NULL))
 );
 INSERT INTO checkpoint(singleton) VALUES(1);
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;

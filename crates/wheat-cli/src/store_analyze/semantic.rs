@@ -53,17 +53,23 @@ impl ObjectSource {
                 }
             }
         }
+        paths.sort();
+        // The active segment is read first, as it was when it sorted before the
+        // sealed segments' directory.
         let active = storage.join("packed/active.segment");
         if active.is_file() {
-            paths.push(active);
+            paths.insert(0, active.clone());
         }
-        paths.sort();
 
         let mut readers = Vec::with_capacity(paths.len());
         let mut locations = HashMap::new();
         for path in paths {
-            let reader = packed_segment_reader::open_segment(fs::File::open(&path)?)
-                .map_err(|error| anyhow::anyhow!("authenticate {}: {error}", path.display()))?;
+            let reader = if path == active {
+                packed_segment_reader::open_active_segment(&path)
+            } else {
+                packed_segment_reader::open_segment(fs::File::open(&path)?)
+            }
+            .map_err(|error| anyhow::anyhow!("authenticate {}: {error}", path.display()))?;
             let index = readers.len();
             for entry in reader.entries() {
                 if entry.namespace == METADATA_NAMESPACE {

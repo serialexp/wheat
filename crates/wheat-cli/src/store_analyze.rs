@@ -336,17 +336,20 @@ fn analyze_segments(storage_root: &Path, roles: &semantic::ContentRoles) -> Resu
         } else {
             Vec::new()
         };
-        if active.is_file() {
-            segment_files.push(active);
-        }
         segment_files.sort();
+        if active.is_file() {
+            segment_files.push(active.clone());
+        }
 
         for path in &segment_files {
-            let file =
-                fs::File::open(path).with_context(|| format!("open segment {}", path.display()))?;
-            let reader = packed_segment_reader::open_segment(file).map_err(|error| {
-                anyhow::anyhow!("authenticate segment {}: {error}", path.display())
-            })?;
+            let reader = if *path == active {
+                packed_segment_reader::open_active_segment(path)
+            } else {
+                let file = fs::File::open(path)
+                    .with_context(|| format!("open segment {}", path.display()))?;
+                packed_segment_reader::open_segment(file)
+            }
+            .map_err(|error| anyhow::anyhow!("authenticate segment {}: {error}", path.display()))?;
 
             let metadata = fs::metadata(path)?;
             analysis.segment_disk_bytes += metadata.len();

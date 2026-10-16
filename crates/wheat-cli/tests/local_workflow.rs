@@ -210,7 +210,6 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
     // logical mutation or durability boundaries into immutable catalog generations.
     assert_eq!(packed_catalog_count(&store), catalogs_before);
     assert!(store.join("storage/packed/active.segment").is_file());
-    assert!(store.join("storage/packed/active.head").is_file());
     let reopened = wheat(&repository, &["status"]);
     assert!(String::from_utf8_lossy(&reopened.stdout).contains("active label: main"));
 

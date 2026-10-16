@@ -5797,6 +5797,281 @@ impl From<SegmentFooterV1Input> for SegmentFooterV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ActiveLogHeaderV1Input {
+    pub base_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveLogHeaderV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub base_generation: u64,
+}
+
+pub type ActiveLogHeaderV1 = ActiveLogHeaderV1Output;
+
+impl ActiveLogHeaderV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353100);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.base_generation);
+        Ok(())
+    }
+}
+
+impl ActiveLogHeaderV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353100u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353100, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let base_generation = decoder.read_u64_be()?;
+        Ok(Self {
+            magic,
+            version,
+            base_generation,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ActiveLogHeaderV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ActiveLogHeaderV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ActiveLogHeaderV1Output> for ActiveLogHeaderV1Input {
+    fn from(o: ActiveLogHeaderV1Output) -> Self {
+        Self {
+            base_generation: o.base_generation,
+        }
+    }
+}
+
+impl From<ActiveLogHeaderV1Input> for ActiveLogHeaderV1Output {
+    fn from(i: ActiveLogHeaderV1Input) -> Self {
+        Self {
+            magic: 1464353100u32,
+            version: 1u16,
+            base_generation: i.base_generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveLogFrameFieldsV1Input {
+    pub generation: u64,
+    pub payload_length: u64,
+    pub index_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveLogFrameFieldsV1Output {
+    pub magic: u32,
+    pub generation: u64,
+    pub payload_length: u64,
+    pub index_length: u64,
+}
+
+pub type ActiveLogFrameFieldsV1 = ActiveLogFrameFieldsV1Output;
+
+impl ActiveLogFrameFieldsV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353094);
+        encoder.write_u64_be(self.generation);
+        encoder.write_u64_be(self.payload_length);
+        encoder.write_u64_be(self.index_length);
+        Ok(())
+    }
+}
+
+impl ActiveLogFrameFieldsV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353094u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353094, got {}",
+                magic
+            )));
+        }
+        let generation = decoder.read_u64_be()?;
+        let payload_length = decoder.read_u64_be()?;
+        let index_length = decoder.read_u64_be()?;
+        Ok(Self {
+            magic,
+            generation,
+            payload_length,
+            index_length,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ActiveLogFrameFieldsV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ActiveLogFrameFieldsV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ActiveLogFrameFieldsV1Output> for ActiveLogFrameFieldsV1Input {
+    fn from(o: ActiveLogFrameFieldsV1Output) -> Self {
+        Self {
+            generation: o.generation,
+            payload_length: o.payload_length,
+            index_length: o.index_length,
+        }
+    }
+}
+
+impl From<ActiveLogFrameFieldsV1Input> for ActiveLogFrameFieldsV1Output {
+    fn from(i: ActiveLogFrameFieldsV1Input) -> Self {
+        Self {
+            magic: 1464353094u32,
+            generation: i.generation,
+            payload_length: i.payload_length,
+            index_length: i.index_length,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveLogFrameHeaderV1 {
+    pub fields: ActiveLogFrameFieldsV1Output,
+    pub fields_digest: Digest256,
+}
+
+impl ActiveLogFrameHeaderV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.fields.encode_into(encoder)?;
+        self.fields_digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let fields = ActiveLogFrameFieldsV1Output::decode_with_decoder(decoder)?;
+        let fields_digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            fields,
+            fields_digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveLogFrameTrailerV1Input {
+    pub chain_digest: Digest256,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveLogFrameTrailerV1Output {
+    pub magic: u32,
+    pub chain_digest: Digest256,
+}
+
+pub type ActiveLogFrameTrailerV1 = ActiveLogFrameTrailerV1Output;
+
+impl ActiveLogFrameTrailerV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353108);
+        self.chain_digest.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl ActiveLogFrameTrailerV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353108u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353108, got {}",
+                magic
+            )));
+        }
+        let chain_digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            chain_digest,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ActiveLogFrameTrailerV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ActiveLogFrameTrailerV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ActiveLogFrameTrailerV1Output> for ActiveLogFrameTrailerV1Input {
+    fn from(o: ActiveLogFrameTrailerV1Output) -> Self {
+        Self {
+            chain_digest: o.chain_digest,
+        }
+    }
+}
+
+impl From<ActiveLogFrameTrailerV1Input> for ActiveLogFrameTrailerV1Output {
+    fn from(i: ActiveLogFrameTrailerV1Input) -> Self {
+        Self {
+            magic: 1464353108u32,
+            chain_digest: i.chain_digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SegmentCatalogRecordV1Input {
     pub generation: u64,
     pub previous: Option<Digest256>,

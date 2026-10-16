@@ -709,6 +709,43 @@
         { name: "body_digest", type: "Digest256" },
       ],
     },
+    // The local packed store's active segment is an append-only log: this
+    // header, then one frame per durable append. Sealing rebuilds its records
+    // into a V1 segment, so the log never needs a V1 tail.
+    ActiveLogHeaderV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x5748414c },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "base_generation", type: "uint64" },
+      ],
+    },
+    // One append: `payload_length` payload bytes follow the frame header, then a
+    // SegmentIndexPageV1 of `index_length` bytes indexing them, then the trailer.
+    ActiveLogFrameFieldsV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484146 },
+        { name: "generation", type: "uint64" },
+        { name: "payload_length", type: "uint64" },
+        { name: "index_length", type: "uint64" },
+      ],
+    },
+    // `fields_digest` is BLAKE3 over the previous chain digest and the encoded
+    // fields. It tells a header a crash tore from a frame that was damaged later.
+    ActiveLogFrameHeaderV1: {
+      sequence: [
+        { name: "fields", type: "ActiveLogFrameFieldsV1" },
+        { name: "fields_digest", type: "Digest256" },
+      ],
+    },
+    // `chain_digest` is BLAKE3 over the previous chain digest and every byte of
+    // the frame before this trailer. The log header's chain digest is BLAKE3 of
+    // the encoded header.
+    ActiveLogFrameTrailerV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484154 },
+        { name: "chain_digest", type: "Digest256" },
+      ],
+    },
     // Remote (object-store) packed catalog: one record per appended segment,
     // chained through `previous`.
     SegmentCatalogRecordV1: {

@@ -1,11 +1,11 @@
-use std::{fs, io::Write};
+use std::fs;
 
 use rusqlite::{Connection, params};
 
+use super::active::ActiveError;
 use super::catalog::*;
 use super::segment::{
-    CONTENT_NAMESPACE, MAX_SEGMENT_TAIL_BYTES, SegmentError, SegmentRecord, test_content_map_kind,
-    test_content_map_root,
+    CONTENT_NAMESPACE, SegmentError, SegmentRecord, test_content_map_kind, test_content_map_root,
 };
 
 const LOCATOR_FILE: &str = "catalog-locator.sqlite3";
@@ -486,13 +486,11 @@ fn immutable_only_store_is_preserved_and_gains_an_active_pack() {
         store.put_records(&[old]).unwrap();
         assert_eq!(store.test_counts().unwrap(), (1, 2, 1));
     }
-    fs::remove_file(root.path().join("active.head")).unwrap();
     fs::remove_file(root.path().join("active.segment")).unwrap();
     fs::remove_file(root.path().join(LOCATOR_FILE)).unwrap();
 
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
     assert_value(&mut reopened, old);
-    assert!(root.path().join("active.head").exists());
     assert!(root.path().join("active.segment").exists());
 }
 
@@ -566,15 +564,27 @@ fn same_checkpoint_missing_locator_row_is_rebuilt_on_reopen() {
 }
 
 #[test]
-fn journal_with_old_head_restores_the_previous_active_commit() {
+fn an_append_a_crash_cut_short_is_dropped_and_unindexed_on_reopen() {
     let root = tempfile::tempdir().unwrap();
     let old = record(b"published");
-    let attempted = record(b"uncommitted");
+    let attempted = record(b"cut short");
+    let active = root.path().join("active.segment");
+    let durable_length;
     {
         let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
         store.put_records(&[old]).unwrap();
-        store.test_interrupt_append(&[attempted], false).unwrap();
+        durable_length = fs::metadata(&active).unwrap().len();
+        store.put_records(&[attempted]).unwrap();
     }
+    // The locator indexed the append, but its frame never fully reached the disk.
+    let length = fs::metadata(&active).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&active)
+        .unwrap()
+        .set_len(length - 10)
+        .unwrap();
+
     let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
     assert_value(&mut reopened, old);
     assert!(
@@ -583,50 +593,36 @@ fn journal_with_old_head_restores_the_previous_active_commit() {
             .unwrap()
             .is_none()
     );
-    assert!(!root.path().join("active.append").exists());
+    assert_eq!(reopened.test_counts().unwrap(), (1, 1, 0));
+    assert_eq!(fs::metadata(&active).unwrap().len(), durable_length);
+    reopened.put_records(&[attempted]).unwrap();
+    assert_value(&mut reopened, attempted);
 }
 
 #[test]
-fn journal_with_intended_head_validates_append_and_repairs_locator() {
+fn a_damaged_active_frame_is_rejected_before_the_locator_is_trusted() {
     let root = tempfile::tempdir().unwrap();
-    let old = record(b"published");
-    let appended = record(b"committed before sqlite");
+    let damaged = record(b"first frame");
+    let active = root.path().join("active.segment");
+    let damaged_at;
     {
         let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-        store.put_records(&[old]).unwrap();
-        store.test_interrupt_append(&[appended], true).unwrap();
+        store.put_records(&[damaged]).unwrap();
+        damaged_at = fs::metadata(&active).unwrap().len() - 40;
+        store.put_records(&[record(b"second frame")]).unwrap();
     }
-    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    assert_value(&mut reopened, old);
-    assert_value(&mut reopened, appended);
-    assert_eq!(reopened.test_counts().unwrap(), (2, 1, 0));
-    assert!(!root.path().join("active.append").exists());
-}
-
-#[test]
-fn corrupt_active_control_file_is_rejected_before_locator_is_trusted() {
-    let root = tempfile::tempdir().unwrap();
-    let value = record(b"authority");
-    {
-        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-        store.put_records(&[value]).unwrap();
-    }
-    fs::OpenOptions::new()
-        .append(true)
-        .open(root.path().join("active.head"))
-        .unwrap()
-        .write_all(b"corruption")
-        .unwrap();
-    assert!(PackedCatalog::open(root.path(), crate::Durability::Durable).is_err());
+    let mut bytes = fs::read(&active).unwrap();
+    bytes[damaged_at as usize] ^= 0x55;
+    fs::write(&active, bytes).unwrap();
+    assert!(matches!(
+        PackedCatalog::open(root.path(), crate::Durability::Durable),
+        Err(CatalogError::Active(ActiveError::Corrupt(_)))
+    ));
 }
 
 #[test]
 fn durable_post_mutation_errors_poison_and_recover_without_retry_ambiguity() {
-    for failpoint in [
-        AppendFailpoint::MutationApplied,
-        AppendFailpoint::HeadPublished,
-        AppendFailpoint::JournalRemoved,
-    ] {
+    for failpoint in [AppendFailpoint::Sync, AppendFailpoint::Synced] {
         let root = tempfile::tempdir().unwrap();
         let attempted = record(b"durable attempted append");
         let later = record(b"durable later append");
@@ -644,7 +640,8 @@ fn durable_post_mutation_errors_poison_and_recover_without_retry_ambiguity() {
             .get(CONTENT_NAMESPACE, attempted.digest)
             .unwrap()
             .is_some();
-        assert_eq!(present, failpoint != AppendFailpoint::MutationApplied);
+        // A frame whose sync failed is truncated; a synced one is indexed on reopen.
+        assert_eq!(present, failpoint == AppendFailpoint::Synced);
         reopened.put_records(&[attempted]).unwrap();
         assert_value(&mut reopened, attempted);
     }
@@ -740,23 +737,30 @@ fn seal_errors_after_authority_publication_poison_writer_and_recover_on_reopen()
 }
 
 #[test]
-fn empty_active_without_head_recovers_but_nonempty_unpublished_active_is_rejected() {
+fn an_interrupted_active_creation_recovers_but_a_damaged_log_header_is_rejected() {
     let fresh = tempfile::tempdir().unwrap();
     {
         let _store = PackedCatalog::open(fresh.path(), crate::Durability::Durable).unwrap();
     }
-    fs::remove_file(fresh.path().join("active.head")).unwrap();
-    let _reopened = PackedCatalog::open(fresh.path(), crate::Durability::Durable).unwrap();
+    // Creation's header never reached the disk.
+    fs::write(fresh.path().join("active.segment"), [0; 6]).unwrap();
+    let mut reopened = PackedCatalog::open(fresh.path(), crate::Durability::Durable).unwrap();
+    let value = record(b"after the recreated log");
+    reopened.put_records(&[value]).unwrap();
+    assert_value(&mut reopened, value);
 
-    let unpublished = tempfile::tempdir().unwrap();
-    let value = record(b"not published by a head");
+    let damaged = tempfile::tempdir().unwrap();
     {
-        let mut store =
-            PackedCatalog::open(unpublished.path(), crate::Durability::Durable).unwrap();
-        store.put_records(&[value]).unwrap();
+        let mut store = PackedCatalog::open(damaged.path(), crate::Durability::Durable).unwrap();
+        store
+            .put_records(&[record(b"behind a damaged header")])
+            .unwrap();
     }
-    fs::remove_file(unpublished.path().join("active.head")).unwrap();
-    assert!(PackedCatalog::open(unpublished.path(), crate::Durability::Durable).is_err());
+    let active = damaged.path().join("active.segment");
+    let mut bytes = fs::read(&active).unwrap();
+    bytes[0] ^= 0x55;
+    fs::write(&active, bytes).unwrap();
+    assert!(PackedCatalog::open(damaged.path(), crate::Durability::Durable).is_err());
 }
 
 #[test]
@@ -992,20 +996,6 @@ fn head_discovery_rejects_duplicate_valid_latest_generation() {
 }
 
 #[test]
-fn oversized_active_journal_is_rejected_before_allocation() {
-    let root = tempfile::tempdir().unwrap();
-    {
-        let _store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
-    }
-    let journal = fs::File::create(root.path().join("active.append")).unwrap();
-    journal.set_len(MAX_SEGMENT_TAIL_BYTES + 1024).unwrap();
-    assert!(matches!(
-        PackedCatalog::open(root.path(), crate::Durability::Durable),
-        Err(CatalogError::Corrupt("active journal exceeds tail limit"))
-    ));
-}
-
-#[test]
 fn duplicate_heavy_batch_does_not_false_preseal() {
     let root = tempfile::tempdir().unwrap();
     let value = record(b"one projected key");
@@ -1056,7 +1046,6 @@ fn impossible_record_leaves_prior_active_state_exact_and_usable() {
     .unwrap();
     store.put_records(&[prior]).unwrap();
     let old_active = fs::read(root.path().join("active.segment")).unwrap();
-    let old_head = fs::read(root.path().join("active.head")).unwrap();
     let old_counts = store.test_counts().unwrap();
 
     assert!(matches!(
@@ -1067,7 +1056,6 @@ fn impossible_record_leaves_prior_active_state_exact_and_usable() {
         fs::read(root.path().join("active.segment")).unwrap(),
         old_active
     );
-    assert_eq!(fs::read(root.path().join("active.head")).unwrap(), old_head);
     assert_eq!(store.test_counts().unwrap(), old_counts);
     assert_value(&mut store, prior);
     store.put_records(&[later]).unwrap();

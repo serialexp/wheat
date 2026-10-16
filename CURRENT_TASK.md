@@ -250,7 +250,29 @@ client fetch/clone/publish-join stage content and objects and flush once. 8 writ
 /tmp/wheat-profile/option2.json. Found: delta content on packed goes loose with its
 own fsyncs (TODO.md).
 
-Next: option 3 (cheaper append: journal 9 + head 10 + journal remove 5 of 38 ms),
-4 (group commit; the commit lock serializes publishes, so this means batching
+Option 3 (cheaper append), Bart's choices 2026-10-16: append-only with no journal,
+the head inside the segment, locator `synchronous=NORMAL`. A V1 segment cannot grow
+append-only (its payloads must be contiguous, and a cumulative tail per append is
+quadratic in space), and sealing already rebuilds the records through
+SegmentBuilder, so the active segment became a log: new BinSchema types
+`ActiveLog{Header,FrameFields,FrameHeader,FrameTrailer}V1` (wheat-objects schema,
+wrappers in wheat-core segment_records.rs), packed/active.rs rewritten. Each append
+writes one frame (header with a digest of its fields, payloads, an index page, a
+trailer with a chain digest) and syncs once; open walks the frames and the newest
+verified one is the state. `active.head`, `active.append` and their hand-rolled
+encodings are gone. Bart did not answer the two format questions; defaults taken:
+open still hashes the whole log (as before), and a damaged frame with a later frame
+after it refuses to open (only a crash-torn tail is truncated). Analysis tools open
+the log with `packed_segment_reader::open_active_segment`. Locator schema v6.
+
+Option 3 done 2026-10-16: append 38 -> ~4.4 ms (segment write + one sync 3.7, locator
+0.7). Trace: /tmp/wheat-profile/option3.json (tracing distorts 16 writers: 333k
+`packed_catalog_wait` spans). The head CAS (publish_cas, 7-9 ms, atomic head-file
+write) is now the largest step under the commit lock. Found and put in TODO.md: a
+crash between a seal's publication and the active segment's retirement duplicates
+its records (the old head check never matched); catalog.head and repack.intent are
+hand-encoded.
+
+Next: 4 (group commit; the commit lock serializes publishes, so this means batching
 several publishes' stores and CASes), 5 (spawn_blocking); then contract rules
 (step 4) and maybe client-side push.

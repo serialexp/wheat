@@ -10,7 +10,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use wheat_store::packed_segment_reader::{SegmentEntry, open_segment};
+use wheat_store::packed_segment_reader::{SegmentEntry, open_active_segment, open_segment};
 
 const DEFAULT_STORE: &str = "/tmp/wheat-gothab-binschema-Do1n2WGb/store";
 const MAX_SEGMENTS: usize = 64;
@@ -604,11 +604,13 @@ impl HistorySource {
                 paths.push(path);
             }
         }
+        paths.sort();
+        // The active segment is read first, as it was when it sorted before the
+        // sealed segments' directory.
         let active = storage.join("packed/active.segment");
         if active.is_file() {
-            paths.push(active);
+            paths.insert(0, active.clone());
         }
-        paths.sort();
         assert!(paths.len() <= MAX_SEGMENTS, "segment bound exceeded");
 
         let mut readers = Vec::with_capacity(paths.len());
@@ -616,8 +618,12 @@ impl HistorySource {
         let mut current = HashMap::new();
         let mut kinds = HashMap::new();
         for path in paths {
-            let reader = open_segment(File::open(&path).expect("open segment"))
-                .unwrap_or_else(|error| panic!("authenticate {}: {error}", path.display()));
+            let reader = if path == active {
+                open_active_segment(&path)
+            } else {
+                open_segment(File::open(&path).expect("open segment"))
+            }
+            .unwrap_or_else(|error| panic!("authenticate {}: {error}", path.display()));
             let index = readers.len();
             // Shared blocks are charged to their members by logical share.
             let mut block_logical = HashMap::<(u64, u64), u64>::new();

@@ -17,6 +17,9 @@ pub const SEGMENT_INDEX_ENTRY_ENCODED_SIZE: usize = 62;
 pub const SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE: usize = SEGMENT_INDEX_ENTRY_ENCODED_SIZE + 32;
 /// Longest chain of in-segment metadata deltas above a whole record.
 pub const SEGMENT_MAX_DELTA_DEPTH: u8 = 16;
+pub const ACTIVE_LOG_HEADER_ENCODED_SIZE: usize = 14;
+pub const ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE: usize = 60;
+pub const ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE: usize = 36;
 const DIRECTORY_ENTRY_SIZE: usize = 81;
 
 pub const SEGMENT_NAMESPACE_METADATA: u8 = 1;
@@ -444,6 +447,93 @@ pub fn decode_segment_footer(bytes: &[u8]) -> Result<SegmentFooter, SegmentRecor
         body_digest: digest_array(w.body_digest)?,
     };
     checked(bytes, f, encoded)
+}
+
+/// The fields of one active-log frame, which its header authenticates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveLogFrameFields {
+    pub generation: u64,
+    pub payload_length: u64,
+    pub index_length: u64,
+}
+
+pub fn encode_active_log_header(base_generation: u64) -> Result<Vec<u8>, SegmentRecordError> {
+    wire::ActiveLogHeaderV1Input { base_generation }
+        .encode()
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+/// Decodes an active-log header to its base generation.
+pub fn decode_active_log_header(bytes: &[u8]) -> Result<u64, SegmentRecordError> {
+    if bytes.len() != ACTIVE_LOG_HEADER_ENCODED_SIZE {
+        return Err(SegmentRecordError::NonCanonicalEncoding);
+    }
+    let w = wire::ActiveLogHeaderV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    checked(bytes, w.base_generation, w.encode())
+}
+
+/// The encoded fields alone, which the header's `fields_digest` covers.
+pub fn encode_active_log_frame_fields(
+    fields: &ActiveLogFrameFields,
+) -> Result<Vec<u8>, SegmentRecordError> {
+    frame_fields_wire(fields)
+        .encode()
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+pub fn encode_active_log_frame_header(
+    fields: &ActiveLogFrameFields,
+    fields_digest: [u8; 32],
+) -> Result<Vec<u8>, SegmentRecordError> {
+    wire::ActiveLogFrameHeaderV1 {
+        fields: frame_fields_wire(fields).into(),
+        fields_digest: digest(fields_digest),
+    }
+    .encode()
+    .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+/// Decodes a frame header to its fields and their digest.
+pub fn decode_active_log_frame_header(
+    bytes: &[u8],
+) -> Result<(ActiveLogFrameFields, [u8; 32]), SegmentRecordError> {
+    if bytes.len() != ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE {
+        return Err(SegmentRecordError::NonCanonicalEncoding);
+    }
+    let w = wire::ActiveLogFrameHeaderV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    let encoded = w.encode();
+    let fields = ActiveLogFrameFields {
+        generation: w.fields.generation,
+        payload_length: w.fields.payload_length,
+        index_length: w.fields.index_length,
+    };
+    checked(bytes, (fields, digest_array(w.fields_digest)?), encoded)
+}
+fn frame_fields_wire(fields: &ActiveLogFrameFields) -> wire::ActiveLogFrameFieldsV1Input {
+    wire::ActiveLogFrameFieldsV1Input {
+        generation: fields.generation,
+        payload_length: fields.payload_length,
+        index_length: fields.index_length,
+    }
+}
+
+pub fn encode_active_log_frame_trailer(
+    chain_digest: [u8; 32],
+) -> Result<Vec<u8>, SegmentRecordError> {
+    wire::ActiveLogFrameTrailerV1Input {
+        chain_digest: digest(chain_digest),
+    }
+    .encode()
+    .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+/// Decodes a frame trailer to its chain digest.
+pub fn decode_active_log_frame_trailer(bytes: &[u8]) -> Result<[u8; 32], SegmentRecordError> {
+    if bytes.len() != ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE {
+        return Err(SegmentRecordError::NonCanonicalEncoding);
+    }
+    let w = wire::ActiveLogFrameTrailerV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    let encoded = w.encode();
+    checked(bytes, digest_array(w.chain_digest)?, encoded)
 }
 
 pub fn encode_segment_catalog_record(

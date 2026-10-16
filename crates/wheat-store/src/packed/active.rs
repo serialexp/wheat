@@ -1,8 +1,12 @@
-//! Process-local mutable V1 segment growth.
+//! Process-local mutable segment growth, as an append-only log.
 //!
-//! An active segment always contains a complete, authenticated V1 segment at
-//! its published length. Appends retain the prefix and existing payload bytes,
-//! replacing only the cumulative index/directory/footer tail.
+//! The active segment is a header followed by one frame per durable append: the
+//! frame header, the new payloads, an index page of their entries, and a
+//! trailer whose chain digest covers the previous chain digest and the frame.
+//! An append only writes past the end of the file, so the bytes of every
+//! earlier frame stay as they were, and the newest frame whose chain verifies
+//! is the published state: no separate head or recovery journal exists.
+//! Sealing rebuilds the records into an immutable V1 segment.
 
 use std::{
     collections::HashMap,
@@ -13,34 +17,44 @@ use std::{
 
 use thiserror::Error;
 use wheat_core::{
-    SEGMENT_PREFIX_ENCODED_SIZE, SegmentId, SegmentIndexEntry, encode_segment_prefix,
+    ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE, ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE,
+    ACTIVE_LOG_HEADER_ENCODED_SIZE, ActiveLogFrameFields, SEGMENT_INDEX_ENTRY_ENCODED_SIZE,
+    SegmentId, SegmentIndexEntry, SegmentIndexPage, decode_active_log_frame_header,
+    decode_active_log_frame_trailer, decode_active_log_header, decode_segment_index_page,
+    encode_active_log_frame_fields, encode_active_log_frame_header,
+    encode_active_log_frame_trailer, encode_active_log_header, encode_segment_index_page,
 };
 
 #[cfg(test)]
 use super::segment::prepare_record;
 use super::segment::{
-    MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, SegmentError,
-    SegmentMetadata, SegmentReader, SegmentRecord, emit_cumulative_tail,
+    MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, SegmentError, SegmentRecord, key,
 };
-use crate::Durability;
+use crate::{Durability, codec::Codec};
 
-const PREFIX_LEN: u64 = SEGMENT_PREFIX_ENCODED_SIZE as u64;
+const HEADER_LEN: u64 = ACTIVE_LOG_HEADER_ENCODED_SIZE as u64;
+const FRAME_HEADER_LEN: u64 = ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE as u64;
+const FRAME_TRAILER_LEN: u64 = ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE as u64;
+/// The encoded fields lead the frame header; its last 32 bytes are their digest.
+const FRAME_FIELDS_LEN: usize = ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE - 32;
+/// The largest index page a frame can hold: every entry of a full segment.
+const MAX_FRAME_INDEX_BYTES: u64 =
+    4 + (MAX_SEGMENT_ENTRIES * SEGMENT_INDEX_ENTRY_ENCODED_SIZE) as u64;
 const IO_BUFFER_SIZE: usize = 64 * 1024;
 pub(crate) const ACTIVE_SEGMENT_TARGET_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The state the newest verified frame publishes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ActivePublishedState {
+    /// The log's base generation plus its number of frames.
     pub generation: u64,
+    /// The newest chain digest.
     pub id: SegmentId,
-    pub metadata: SegmentMetadata,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ActiveRecoveryJournal {
-    pub old: ActivePublishedState,
-    pub intended_generation: u64,
-    /// Exact old index, directory, and footer bytes beginning at `index_start`.
-    pub old_tail: Vec<u8>,
+    pub object_count: u64,
+    /// Stored bytes of the records, without the log's own framing.
+    pub payload_bytes: u64,
+    /// Length of the log up to the end of the newest frame.
+    pub total_length: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,15 +77,18 @@ pub(crate) enum ActiveError {
     Segment(#[from] SegmentError),
     #[error("active segment I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("published active-segment state does not match the file")]
-    PublishedStateMismatch,
+    #[error("active segment log is corrupt: {0}")]
+    Corrupt(&'static str),
+    /// The log's own header never reached the disk: creation was interrupted.
+    #[error("active segment log has no complete header")]
+    Unwritten,
     #[error("active-segment generation must increase by exactly one")]
     Generation,
     #[error("existing segment key differs from proposed bytes")]
     ConflictingKey,
     #[error("prepared append no longer applies to this active segment")]
     StaleAppend,
-    #[error("active segment is unusable until it is reopened or restored")]
+    #[error("active segment is unusable until it is reopened")]
     Poisoned,
     #[error("an append must add at least one new record")]
     NoChanges,
@@ -81,15 +98,9 @@ pub(crate) struct PreparedAppend<'a> {
     old: ActivePublishedState,
     intended_generation: u64,
     records: Vec<(SegmentRecord<'a>, crate::codec::PhysicalPayload)>,
-    journal: ActiveRecoveryJournal,
 }
 
 impl PreparedAppend<'_> {
-    /// Bytes which the caller must durably publish before `commit_append`.
-    pub(crate) fn journal(&self) -> &ActiveRecoveryJournal {
-        &self.journal
-    }
-
     #[cfg(test)]
     pub(crate) fn is_retry(&self) -> bool {
         self.records.is_empty()
@@ -98,13 +109,11 @@ impl PreparedAppend<'_> {
 
 /// The file writes of one append, made through a handle of their own so they need
 /// no access to the [`ActiveSegment`]. Meanwhile the segment keeps serving its
-/// published records: the writes start at the old index, past every published
-/// payload, and the segment's entries change only in
-/// [`ActiveSegment::finish_append`].
+/// published records: the frame starts where the published log ends, and the
+/// segment's entries change only in [`ActiveSegment::finish_append`].
 pub(crate) struct ActiveWrite<'a> {
     file: File,
     prepared: PreparedAppend<'a>,
-    entries: Vec<SegmentIndexEntry>,
     io_buffer: Vec<u8>,
     #[cfg(test)]
     fail_after_payload: bool,
@@ -113,104 +122,172 @@ pub(crate) struct ActiveWrite<'a> {
 /// What an [`ActiveWrite`] did, for [`ActiveSegment::finish_append`].
 pub(crate) struct ActiveWritten {
     file: File,
+    /// The state the frame publishes and its entries in key order.
     result: Result<(ActivePublishedState, Vec<SegmentIndexEntry>), ActiveError>,
-    added_keys: Vec<(u8, [u8; 32])>,
     old: ActivePublishedState,
-    journal: ActiveRecoveryJournal,
     io_buffer: Vec<u8>,
 }
 
 impl ActiveWrite<'_> {
-    /// Writes the new payloads and the cumulative tail after them.
+    /// Writes one frame after the published log.
     pub(crate) fn run(mut self) -> ActiveWritten {
-        let added_keys = self
-            .prepared
-            .records
-            .iter()
-            .map(|(record, _)| (record.namespace, record.digest))
-            .collect();
         let result = self.write();
         ActiveWritten {
             file: self.file,
-            result: result.map(|state| (state, self.entries)),
-            added_keys,
+            result,
             old: self.prepared.old,
-            journal: self.prepared.journal,
             io_buffer: self.io_buffer,
         }
     }
 
-    fn write(&mut self) -> Result<ActivePublishedState, ActiveError> {
+    fn write(&mut self) -> Result<(ActivePublishedState, Vec<SegmentIndexEntry>), ActiveError> {
         let old = self.prepared.old;
-        self.file.set_len(old.metadata.index_start)?;
-        self.file.seek(SeekFrom::Start(old.metadata.index_start))?;
-        let mut payload_bytes = old.metadata.payload_bytes;
+        // Bytes past the published log belong to no frame: a failed append that
+        // could not truncate them poisons the segment before another append.
+        self.file.set_len(old.total_length)?;
+        self.file.seek(SeekFrom::Start(old.total_length))?;
+
+        let payload_start = old
+            .total_length
+            .checked_add(FRAME_HEADER_LEN)
+            .ok_or(SegmentError::TooLarge)?;
+        let mut payload_length = 0_u64;
+        let mut entries = Vec::with_capacity(self.prepared.records.len());
         for (record, physical) in &self.prepared.records {
             let stored_length = physical.bytes.len() as u64;
-            let offset = PREFIX_LEN
-                .checked_add(payload_bytes)
-                .ok_or(SegmentError::TooLarge)?;
-            self.file.write_all(&physical.bytes)?;
-            payload_bytes = payload_bytes
-                .checked_add(stored_length)
-                .ok_or(SegmentError::TooLarge)?;
-            self.entries.push(SegmentIndexEntry {
+            entries.push(SegmentIndexEntry {
                 namespace: record.namespace,
                 kind: record.kind,
                 digest: record.digest,
-                offset,
+                offset: payload_start
+                    .checked_add(payload_length)
+                    .ok_or(SegmentError::TooLarge)?,
                 codec: physical.codec.to_byte(),
                 stored_length,
                 logical_length: physical.logical_length,
                 delta_base: None,
                 delta_depth: 0,
             });
+            payload_length = payload_length
+                .checked_add(stored_length)
+                .ok_or(SegmentError::TooLarge)?;
+        }
+        entries.sort_unstable_by_key(key);
+        let page = SegmentIndexPage { entries };
+        let index = encode_segment_index_page(&page).map_err(SegmentError::from)?;
+        let entries = page.entries;
+
+        let fields = ActiveLogFrameFields {
+            generation: self.prepared.intended_generation,
+            payload_length,
+            index_length: index.len() as u64,
+        };
+        let header = encode_active_log_frame_header(&fields, fields_digest(old.id, &fields)?)
+            .map_err(SegmentError::from)?;
+        let mut chain = blake3::Hasher::new();
+        chain.update(&old.id.0);
+        let mut writer = FrameWriter {
+            file: &mut self.file,
+            buffer: &mut self.io_buffer,
+            chain: &mut chain,
+        };
+        writer.buffer.clear();
+        writer.write(&header)?;
+        for (_, physical) in &self.prepared.records {
+            writer.write(&physical.bytes)?;
         }
         #[cfg(test)]
         if self.fail_after_payload {
+            writer.flush()?;
             return Err(std::io::Error::other("injected active append failure").into());
         }
-        let index_start = PREFIX_LEN
-            .checked_add(payload_bytes)
+        writer.write(&index)?;
+        let chain_digest = *chain.finalize().as_bytes();
+        let trailer = encode_active_log_frame_trailer(chain_digest).map_err(SegmentError::from)?;
+        self.file.write_all(&self.io_buffer)?;
+        self.file.write_all(&trailer)?;
+        self.io_buffer.clear();
+
+        let total_length = [FRAME_HEADER_LEN, payload_length, fields.index_length]
+            .into_iter()
+            .chain([FRAME_TRAILER_LEN])
+            .try_fold(old.total_length, u64::checked_add)
             .ok_or(SegmentError::TooLarge)?;
-        let footer = emit_cumulative_tail(
-            &mut self.file,
-            &mut self.entries,
-            index_start,
-            &mut self.io_buffer,
-        )?;
-        Ok(ActivePublishedState {
-            generation: self.prepared.intended_generation,
-            id: footer.segment_id(),
-            metadata: super::segment::metadata(&footer),
-        })
+        let state = ActivePublishedState {
+            generation: fields.generation,
+            id: SegmentId(chain_digest),
+            object_count: old.object_count + entries.len() as u64,
+            payload_bytes: old.payload_bytes + payload_length,
+            total_length,
+        };
+        Ok((state, entries))
     }
+}
+
+/// Buffers a frame's small writes into one and feeds every byte to the chain.
+struct FrameWriter<'a> {
+    file: &'a mut File,
+    buffer: &'a mut Vec<u8>,
+    chain: &'a mut blake3::Hasher,
+}
+
+impl FrameWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.chain.update(bytes);
+        if self.buffer.len() + bytes.len() > IO_BUFFER_SIZE {
+            self.flush()?;
+        }
+        if bytes.len() >= IO_BUFFER_SIZE {
+            self.file.write_all(bytes)
+        } else {
+            self.buffer.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.write_all(self.buffer)?;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+/// The digest a frame header carries over its encoded fields.
+fn fields_digest(
+    previous: SegmentId,
+    fields: &ActiveLogFrameFields,
+) -> Result<[u8; 32], SegmentError> {
+    let encoded = encode_active_log_frame_fields(fields)?;
+    Ok(fields_digest_of(previous, &encoded))
+}
+
+fn fields_digest_of(previous: SegmentId, encoded_fields: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&previous.0);
+    hasher.update(encoded_fields);
+    *hasher.finalize().as_bytes()
 }
 
 impl ActiveWritten {
     /// The state and the index entries the write added, when it succeeded.
-    pub(crate) fn appended(&self) -> Option<(ActivePublishedState, Vec<SegmentIndexEntry>)> {
+    pub(crate) fn appended(&self) -> Option<(ActivePublishedState, &[SegmentIndexEntry])> {
         let (state, entries) = self.result.as_ref().ok()?;
-        let added = self
-            .added_keys
-            .iter()
-            .map(|wanted| {
-                let index = entries
-                    .binary_search_by_key(wanted, super::segment::key)
-                    .expect("written entry must be indexed");
-                entries[index].clone()
-            })
-            .collect();
-        Some((*state, added))
+        Some((*state, entries))
     }
 
-    /// Makes the written bytes durable. Does nothing when the write failed, which
-    /// [`ActiveSegment::finish_append`] undoes instead.
-    pub(crate) fn sync(&self, durability: Durability) -> Result<(), ActiveError> {
-        if self.result.is_ok() {
-            durability.sync_file(&self.file)?;
+    /// Makes the written frame durable. A failed sync fails the write, which
+    /// [`ActiveSegment::finish_append`] then removes.
+    pub(crate) fn sync(&mut self, durability: Durability) {
+        if self.result.is_ok()
+            && let Err(error) = durability.sync_file(&self.file)
+        {
+            self.result = Err(error.into());
         }
-        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail(&mut self) {
+        self.result = Err(std::io::Error::other("injected active sync failure").into());
     }
 }
 
@@ -222,6 +299,13 @@ fn validate_projected(count: usize, payload_bytes: u64) -> Result<(), SegmentErr
         return Err(SegmentError::TooLarge);
     }
     Ok(())
+}
+
+/// A log read back from disk: its newest verified state and every entry in key
+/// order, and the length of the file the frames end at.
+struct Scanned {
+    state: ActivePublishedState,
+    entries: Vec<SegmentIndexEntry>,
 }
 
 pub(crate) struct ActiveSegment {
@@ -236,7 +320,7 @@ pub(crate) struct ActiveSegment {
 }
 
 impl ActiveSegment {
-    /// Creates a new process-local active segment with a valid empty V1 tail.
+    /// Creates a new, empty log whose state is at `generation`.
     pub(crate) fn create(path: impl AsRef<Path>, generation: u64) -> Result<Self, ActiveError> {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
@@ -244,25 +328,34 @@ impl ActiveSegment {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        file.write_all(&encode_segment_prefix().map_err(SegmentError::from)?)?;
-        let mut entries = Vec::new();
-        let mut io_buffer = vec![0; IO_BUFFER_SIZE];
-        let footer = emit_cumulative_tail(&mut file, &mut entries, PREFIX_LEN, &mut io_buffer)?;
+        let header = encode_active_log_header(generation).map_err(SegmentError::from)?;
+        file.write_all(&header)?;
         let state = ActivePublishedState {
             generation,
-            id: footer.segment_id(),
-            metadata: super::segment::metadata(&footer),
+            id: SegmentId(*blake3::hash(&header).as_bytes()),
+            object_count: 0,
+            payload_bytes: 0,
+            total_length: HEADER_LEN,
         };
-        Ok(Self {
+        Ok(Self::new(path, file, state, Vec::new()))
+    }
+
+    fn new(
+        path: PathBuf,
+        file: File,
+        state: ActivePublishedState,
+        entries: Vec<SegmentIndexEntry>,
+    ) -> Self {
+        Self {
             path,
             file,
             state,
             entries,
-            io_buffer,
+            io_buffer: Vec::with_capacity(IO_BUFFER_SIZE),
             poisoned: false,
             #[cfg(test)]
             fail_commit_after_payload: false,
-        })
+        }
     }
 
     /// Records that the segment's file was renamed to `path`, where appends
@@ -271,55 +364,29 @@ impl ActiveSegment {
         self.path = path.as_ref().to_path_buf();
     }
 
-    /// Reopens only when the complete V1 file authenticates as the supplied
-    /// published state. Bytes beyond its published length are ignored first.
-    pub(crate) fn reopen(
-        path: impl AsRef<Path>,
-        published: ActivePublishedState,
-    ) -> Result<Self, ActiveError> {
+    /// Opens the log for appending at its newest verified frame and truncates the
+    /// bytes of an append a crash interrupted. Returns whether it truncated any,
+    /// which the caller makes durable with [`Self::sync`].
+    pub(crate) fn recover(path: impl AsRef<Path>) -> Result<(Self, bool), ActiveError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let reader = SegmentReader::open_at_published_length(
-            file.try_clone()?,
-            published.metadata.total_length,
-        )?;
-        if reader.id() != published.id || reader.metadata() != published.metadata {
-            return Err(ActiveError::PublishedStateMismatch);
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let length = file.metadata()?.len();
+        let Scanned { state, entries } = scan(&mut file, length)?;
+        let torn = state.total_length != length;
+        if torn {
+            file.set_len(state.total_length)?;
         }
-        let (reader_file, _, _, entries) = reader.into_authenticated_parts();
-        drop(reader_file);
-        Ok(Self {
-            path,
-            file,
-            state: published,
-            entries,
-            io_buffer: vec![0; IO_BUFFER_SIZE],
-            poisoned: false,
-            #[cfg(test)]
-            fail_commit_after_payload: false,
-        })
+        Ok((Self::new(path, file, state, entries), torn))
     }
 
-    /// Opens a possibly interrupted file at the journal's old state and restores
-    /// its authenticated old tail before any caller can observe it.
-    pub(crate) fn recover(
-        path: impl AsRef<Path>,
-        journal: &ActiveRecoveryJournal,
-    ) -> Result<Self, ActiveError> {
+    /// Opens the log read-only at its newest verified frame, leaving the bytes of
+    /// an interrupted append in place.
+    pub(crate) fn open_read_only(path: impl AsRef<Path>) -> Result<Self, ActiveError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let mut active = Self {
-            path,
-            file,
-            state: journal.old,
-            entries: Vec::new(),
-            io_buffer: vec![0; IO_BUFFER_SIZE],
-            poisoned: true,
-            #[cfg(test)]
-            fail_commit_after_payload: false,
-        };
-        active.restore(journal)?;
-        Ok(active)
+        let mut file = File::open(&path)?;
+        let length = file.metadata()?.len();
+        let Scanned { state, entries } = scan(&mut file, length)?;
+        Ok(Self::new(path, file, state, entries))
     }
 
     pub(crate) fn state(&self) -> ActivePublishedState {
@@ -331,8 +398,8 @@ impl ActiveSegment {
         self.fail_commit_after_payload = true;
     }
 
-    /// Validates/deduplicates a bounded batch and captures the exact old tail.
-    /// No segment bytes are changed by this method.
+    /// Validates and deduplicates a bounded batch. No segment bytes are changed
+    /// by this method.
     #[cfg(test)]
     pub(crate) fn prepare_append<'a>(
         &mut self,
@@ -362,7 +429,7 @@ impl ActiveSegment {
 
         let mut accepted = Vec::with_capacity(records.len());
         let mut accepted_by_key = HashMap::with_capacity(records.len());
-        let mut projected_payload = self.state.metadata.payload_bytes;
+        let mut projected_payload = self.state.payload_bytes;
         for prepared in records {
             let record = prepared.logical;
             if let Some(index) = self.find_entry(record.namespace, record.digest) {
@@ -401,43 +468,14 @@ impl ActiveSegment {
         if !retry && accepted.is_empty() {
             return Err(ActiveError::NoChanges);
         }
-
-        // The recovery allocation is deliberately deferred until every record has
-        // validated and the batch is known to perform a real append.
-        let old_tail = if retry {
-            Vec::new()
-        } else {
-            let old_tail_len = self
-                .state
-                .metadata
-                .total_length
-                .checked_sub(self.state.metadata.index_start)
-                .ok_or(ActiveError::PublishedStateMismatch)?;
-            if old_tail_len > MAX_SEGMENT_TAIL_BYTES {
-                return Err(ActiveError::PublishedStateMismatch);
-            }
-            let old_tail_size =
-                usize::try_from(old_tail_len).map_err(|_| ActiveError::PublishedStateMismatch)?;
-            let mut old_tail = vec![0; old_tail_size];
-            self.file
-                .seek(SeekFrom::Start(self.state.metadata.index_start))?;
-            self.file.read_exact(&mut old_tail)?;
-            old_tail
-        };
         Ok(PreparedAppend {
             old: self.state,
             intended_generation,
             records: accepted,
-            journal: ActiveRecoveryJournal {
-                old: self.state,
-                intended_generation,
-                old_tail,
-            },
         })
     }
 
-    /// Applies a prepared append. The caller owns journal durability and head
-    /// publication; the returned state is the value to publish after syncing.
+    /// Applies a prepared append without syncing it.
     #[cfg(test)]
     pub(crate) fn commit_append(
         &mut self,
@@ -476,30 +514,21 @@ impl ActiveSegment {
         Ok(Ok(ActiveWrite {
             file,
             prepared,
-            entries: self.entries.clone(),
             io_buffer: std::mem::take(&mut self.io_buffer),
             #[cfg(test)]
             fail_after_payload: std::mem::take(&mut self.fail_commit_after_payload),
         }))
     }
 
-    /// Ends an append whose writes never ran, which leaves the file as it was.
-    pub(crate) fn abandon_append(&mut self, write: ActiveWrite<'_>) {
-        self.io_buffer = write.io_buffer;
-        self.poisoned = false;
-    }
-
-    /// Publishes the records an [`ActiveWrite`] added, or restores the old tail when
-    /// it failed.
+    /// Publishes the records an [`ActiveWrite`] added, or truncates the frame it
+    /// failed to write.
     pub(crate) fn finish_append(
         &mut self,
         written: ActiveWritten,
     ) -> Result<ActiveAppendResult, ActiveError> {
-        let appended = written.appended();
         let ActiveWritten {
             result,
             old,
-            journal,
             io_buffer,
             ..
         } = written;
@@ -508,77 +537,28 @@ impl ActiveSegment {
             // Only the segment that began the append may finish it.
             return Err(ActiveError::StaleAppend);
         }
-        match (result, appended) {
-            (Ok((_, entries)), Some((state, added_entries))) => {
+        match result {
+            Ok((state, added_entries)) => {
+                // Both runs are in key order, which the stable sort merges in
+                // linear time.
+                self.entries.extend_from_slice(&added_entries);
+                self.entries.sort_by_key(key);
                 self.state = state;
-                self.entries = entries;
                 self.poisoned = false;
                 Ok(ActiveAppendResult {
                     state,
                     added_entries,
                 })
             }
-            (Ok(_), None) => unreachable!("a successful write has appended entries"),
-            (Err(error), _) => {
-                // Recovery authenticates a temporary candidate before touching
-                // the damaged file. If recovery itself fails, poison remains set.
-                if self.restore(&journal).is_ok() {
+            Err(error) => {
+                // The published frames are untouched; only the failed frame's
+                // bytes go. If even that fails, the segment stays poisoned.
+                if self.file.set_len(old.total_length).is_ok() {
                     self.poisoned = false;
                 }
                 Err(error)
             }
         }
-    }
-
-    /// Restores the exact previously published tail and truncates any attempted
-    /// payload/tail bytes. This is idempotent and validates a temporary image
-    /// before making any destructive change to the active file.
-    pub(crate) fn restore(&mut self, journal: &ActiveRecoveryJournal) -> Result<(), ActiveError> {
-        if journal.old != self.state
-            || journal.old.generation.checked_add(1) != Some(journal.intended_generation)
-        {
-            return Err(ActiveError::StaleAppend);
-        }
-        let expected_len = journal
-            .old
-            .metadata
-            .total_length
-            .checked_sub(journal.old.metadata.index_start)
-            .ok_or(ActiveError::PublishedStateMismatch)?;
-        if usize::try_from(expected_len).ok() != Some(journal.old_tail.len())
-            || expected_len > MAX_SEGMENT_TAIL_BYTES
-        {
-            return Err(ActiveError::PublishedStateMismatch);
-        }
-
-        let mut candidate = tempfile::tempfile()?;
-        self.file.seek(SeekFrom::Start(0))?;
-        std::io::copy(
-            &mut std::io::Read::by_ref(&mut self.file).take(journal.old.metadata.index_start),
-            &mut candidate,
-        )?;
-        if candidate.stream_position()? != journal.old.metadata.index_start {
-            return Err(ActiveError::PublishedStateMismatch);
-        }
-        candidate.write_all(&journal.old_tail)?;
-        candidate.set_len(journal.old.metadata.total_length)?;
-        let reader = SegmentReader::open(candidate.try_clone()?)?;
-        if reader.id() != journal.old.id || reader.metadata() != journal.old.metadata {
-            return Err(ActiveError::PublishedStateMismatch);
-        }
-        let (reader_file, _, _, entries) = reader.into_authenticated_parts();
-        drop(reader_file);
-
-        candidate.seek(SeekFrom::Start(journal.old.metadata.index_start))?;
-        self.file.set_len(journal.old.metadata.index_start)?;
-        self.file
-            .seek(SeekFrom::Start(journal.old.metadata.index_start))?;
-        std::io::copy(&mut candidate, &mut self.file)?;
-        self.file.set_len(journal.old.metadata.total_length)?;
-        self.entries = entries;
-        self.state = journal.old;
-        self.poisoned = false;
-        Ok(())
     }
 
     pub(crate) fn sync(&self, durability: Durability) -> Result<(), ActiveError> {
@@ -592,25 +572,19 @@ impl ActiveSegment {
 
     /// The authenticated index entry for a key, without reading its payload.
     pub(crate) fn entry(&self, namespace: u8, digest: [u8; 32]) -> Option<&SegmentIndexEntry> {
-        self.entries
-            .binary_search_by_key(&(namespace, digest), super::segment::key)
-            .ok()
+        self.find_entry(namespace, digest)
             .map(|index| &self.entries[index])
     }
 
-    /// Reads through the index already authenticated when this active segment
-    /// was created, reopened, or last committed.
+    /// Reads through the index verified when this active segment was created,
+    /// recovered, or last appended to, and verifies the record's bytes.
     pub(crate) fn lookup_entry_bounded(
         &mut self,
         namespace: u8,
         digest: [u8; 32],
         max: usize,
     ) -> Result<Option<(SegmentIndexEntry, Vec<u8>)>, ActiveError> {
-        let wanted = (namespace, digest);
-        let Ok(index) = self
-            .entries
-            .binary_search_by_key(&wanted, super::segment::key)
-        else {
+        let Some(index) = self.find_entry(namespace, digest) else {
             return Ok(None);
         };
         let entry = self.entries[index].clone();
@@ -629,7 +603,7 @@ impl ActiveSegment {
         let mut stored = vec![0; stored_length];
         self.file.seek(SeekFrom::Start(entry.offset))?;
         self.file.read_exact(&mut stored)?;
-        let codec = crate::codec::Codec::from_byte(entry.codec).map_err(SegmentError::from)?;
+        let codec = Codec::from_byte(entry.codec).map_err(SegmentError::from)?;
         let bytes = crate::codec::decode(codec, stored, entry.logical_length, max)
             .map_err(SegmentError::from)?;
         super::segment::verify_logical(&entry, &bytes)?;
@@ -640,19 +614,19 @@ impl ActiveSegment {
     pub(crate) fn sealing_metadata(&self) -> ActiveSealMetadata {
         ActiveSealMetadata {
             id: self.state.id,
-            stored_length: self.state.metadata.total_length,
-            object_count: self.state.metadata.object_count,
+            stored_length: self.state.total_length,
+            object_count: self.state.object_count,
         }
     }
 
     pub(crate) fn should_seal(&self) -> bool {
-        self.state.metadata.total_length >= ACTIVE_SEGMENT_TARGET_BYTES
+        self.state.total_length >= ACTIVE_SEGMENT_TARGET_BYTES
             || self.entries.len() >= MAX_SEGMENT_ENTRIES
     }
 
     fn find_entry(&self, namespace: u8, digest: [u8; 32]) -> Option<usize> {
         self.entries
-            .binary_search_by_key(&(namespace, digest), super::segment::key)
+            .binary_search_by_key(&(namespace, digest), key)
             .ok()
     }
 
@@ -670,6 +644,196 @@ impl ActiveSegment {
     }
 }
 
+/// Reads the log's frames in order, verifying each one's chain digest and index.
+///
+/// Appends are sequential and each is synced before the next begins, so a crash
+/// can damage only the last frame, and only by leaving its bytes unwritten: the
+/// file ends inside it, or reads back zeros where the write did not land. Such
+/// a frame ends the log. A frame that fails verification while a later frame
+/// follows it, or whose header is damaged by anything but missing bytes, was
+/// damaged after it was synced, and the log is corrupt.
+fn scan(file: &mut File, length: u64) -> Result<Scanned, ActiveError> {
+    if length < HEADER_LEN {
+        return Err(ActiveError::Unwritten);
+    }
+    let mut header = [0; ACTIVE_LOG_HEADER_ENCODED_SIZE];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)?;
+    let base_generation = match decode_active_log_header(&header) {
+        Ok(generation) => generation,
+        // Creation writes the header first and syncs it before any append.
+        Err(_) if header.iter().all(|byte| *byte == 0) => return Err(ActiveError::Unwritten),
+        Err(_) => return Err(ActiveError::Corrupt("log header")),
+    };
+    let mut state = ActivePublishedState {
+        generation: base_generation,
+        id: SegmentId(*blake3::hash(&header).as_bytes()),
+        object_count: 0,
+        payload_bytes: 0,
+        total_length: HEADER_LEN,
+    };
+    let mut entries = Vec::new();
+    let mut buffer = vec![0; IO_BUFFER_SIZE];
+    let mut regions = Vec::new();
+    loop {
+        let start = state.total_length;
+        let remaining = length - start;
+        if remaining == 0 {
+            break;
+        }
+        if remaining < FRAME_HEADER_LEN {
+            break;
+        }
+        let mut frame_header = [0; ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut frame_header)?;
+        let decoded = decode_active_log_frame_header(&frame_header)
+            .ok()
+            .filter(|(_, digest)| {
+                *digest == fields_digest_of(state.id, &frame_header[..FRAME_FIELDS_LEN])
+            });
+        let Some((fields, _)) = decoded else {
+            // The digest ends the header, so a header the write did not finish
+            // ends in zeros.
+            if frame_header.last() == Some(&0) {
+                break;
+            }
+            return Err(ActiveError::Corrupt("frame header"));
+        };
+        // An authentic header's lengths are the ones the append wrote.
+        if state.generation.checked_add(1) != Some(fields.generation) {
+            return Err(ActiveError::Corrupt("frame generation"));
+        }
+        let payload_bytes = state
+            .payload_bytes
+            .checked_add(fields.payload_length)
+            .filter(|bytes| *bytes <= MAX_SEGMENT_PAYLOAD_BYTES)
+            .ok_or(ActiveError::Corrupt("frame payload length"))?;
+        if fields.index_length > MAX_FRAME_INDEX_BYTES {
+            return Err(ActiveError::Corrupt("frame index length"));
+        }
+        let payload_start = start + FRAME_HEADER_LEN;
+        let index_start = payload_start + fields.payload_length;
+        let trailer_start = index_start + fields.index_length;
+        let end = trailer_start + FRAME_TRAILER_LEN;
+        if end > length {
+            break;
+        }
+
+        let mut chain = blake3::Hasher::new();
+        chain.update(&state.id.0);
+        chain.update(&frame_header);
+        hash_range(
+            file,
+            payload_start,
+            fields.payload_length,
+            &mut chain,
+            &mut buffer,
+        )?;
+        let mut index = vec![0; fields.index_length as usize];
+        file.read_exact(&mut index)?;
+        chain.update(&index);
+        let mut trailer = [0; ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE];
+        file.read_exact(&mut trailer)?;
+        let chain_digest = *chain.finalize().as_bytes();
+        if decode_active_log_frame_trailer(&trailer).ok() != Some(chain_digest) {
+            if end == length {
+                break;
+            }
+            return Err(ActiveError::Corrupt("frame chain digest"));
+        }
+
+        let page = decode_segment_index_page(&index).map_err(SegmentError::from)?;
+        validate_frame_entries(
+            &page.entries,
+            payload_start,
+            fields.payload_length,
+            &mut regions,
+        )?;
+        let object_count = state.object_count + page.entries.len() as u64;
+        entries.extend(page.entries);
+        if entries.len() > MAX_SEGMENT_ENTRIES {
+            return Err(SegmentError::TooManyEntries.into());
+        }
+        state = ActivePublishedState {
+            generation: fields.generation,
+            id: SegmentId(chain_digest),
+            object_count,
+            payload_bytes,
+            total_length: end,
+        };
+    }
+    entries.sort_by_key(key);
+    if entries
+        .windows(2)
+        .any(|pair| key(&pair[0]) == key(&pair[1]))
+    {
+        return Err(SegmentError::DuplicateKey.into());
+    }
+    Ok(Scanned { state, entries })
+}
+
+/// Checks that a frame's entries are whole records in key order whose stored
+/// bytes cover its payload exactly.
+fn validate_frame_entries(
+    entries: &[SegmentIndexEntry],
+    payload_start: u64,
+    payload_length: u64,
+    regions: &mut Vec<(u64, u64)>,
+) -> Result<(), ActiveError> {
+    if entries.is_empty() {
+        return Err(ActiveError::Corrupt("empty frame"));
+    }
+    if entries
+        .windows(2)
+        .any(|pair| key(&pair[0]) >= key(&pair[1]))
+    {
+        return Err(ActiveError::Corrupt("frame index order"));
+    }
+    regions.clear();
+    for entry in entries {
+        let codec = Codec::from_byte(entry.codec).map_err(SegmentError::from)?;
+        if !matches!(codec, Codec::Raw | Codec::Zstd)
+            || entry.logical_length > crate::codec::HARD_LOGICAL_RECORD_BYTES as u64
+        {
+            return Err(ActiveError::Corrupt("frame entry"));
+        }
+        regions.push((entry.offset, entry.stored_length));
+    }
+    regions.sort_unstable();
+    let mut next = payload_start;
+    for &(offset, stored_length) in regions.iter() {
+        if offset != next {
+            return Err(ActiveError::Corrupt("frame payload coverage"));
+        }
+        next = offset
+            .checked_add(stored_length)
+            .ok_or(ActiveError::Corrupt("frame payload coverage"))?;
+    }
+    if next != payload_start + payload_length {
+        return Err(ActiveError::Corrupt("frame payload coverage"));
+    }
+    Ok(())
+}
+
+fn hash_range(
+    file: &mut File,
+    offset: u64,
+    length: u64,
+    hasher: &mut blake3::Hasher,
+    buffer: &mut [u8],
+) -> Result<(), ActiveError> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut remaining = length;
+    while remaining != 0 {
+        let amount = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        file.read_exact(&mut buffer[..amount])?;
+        hasher.update(&buffer[..amount]);
+        remaining -= amount as u64;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -677,7 +841,7 @@ mod tests {
     use wheat_core::ContentId;
 
     use super::*;
-    use crate::packed::segment::{CONTENT_NAMESPACE, MAX_INDEX_PAGE_ENTRIES};
+    use crate::packed::segment::CONTENT_NAMESPACE;
 
     fn record(bytes: &[u8]) -> SegmentRecord<'_> {
         SegmentRecord {
@@ -688,92 +852,193 @@ mod tests {
         }
     }
 
-    fn append(
-        active: &mut ActiveSegment,
-        records: &[SegmentRecord<'_>],
-    ) -> (ActiveAppendResult, ActiveRecoveryJournal) {
+    fn append(active: &mut ActiveSegment, records: &[SegmentRecord<'_>]) -> ActiveAppendResult {
         let generation = active.state().generation + 1;
         let prepared = active.prepare_append(records, generation).unwrap();
-        let journal = prepared.journal().clone();
-        let result = active.commit_append(prepared).unwrap();
-        (result, journal)
+        active.commit_append(prepared).unwrap()
     }
 
-    fn authenticated_entries(active: &ActiveSegment) -> Vec<SegmentIndexEntry> {
-        let reader = SegmentReader::open(active.file.try_clone().unwrap()).unwrap();
-        let (_, _, _, entries) = reader.into_authenticated_parts();
-        entries
+    fn recovered(path: &Path) -> (ActiveSegment, bool) {
+        ActiveSegment::recover(path).unwrap()
+    }
+
+    fn read(active: &mut ActiveSegment, bytes: &[u8]) -> Option<Vec<u8>> {
+        active
+            .lookup_entry_bounded(
+                CONTENT_NAMESPACE,
+                *ContentId::of(bytes).as_bytes(),
+                usize::MAX,
+            )
+            .unwrap()
+            .map(|(_, bytes)| bytes)
     }
 
     #[test]
-    fn multiple_appends_preserve_payload_bytes_and_offsets() {
+    fn appends_only_extend_the_file_and_recover_to_the_same_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active.segment");
+        let mut active = ActiveSegment::create(&path, 3).unwrap();
+        let created = fs::read(&path).unwrap();
+
+        append(&mut active, &[record(b"first payload")]);
+        let first = fs::read(&path).unwrap();
+        assert!(first.starts_with(&created));
+        let values: Vec<Vec<u8>> = (0_u32..300).map(|n| n.to_be_bytes().to_vec()).collect();
+        let records: Vec<_> = values.iter().map(|value| record(value)).collect();
+        append(&mut active, &records);
+        let second = fs::read(&path).unwrap();
+        assert!(second.starts_with(&first));
+
+        let state = active.state();
+        assert_eq!(state.generation, 5);
+        assert_eq!(state.object_count, 301);
+        assert_eq!(state.total_length, second.len() as u64);
+        assert!(
+            active
+                .entries()
+                .windows(2)
+                .all(|pair| key(&pair[0]) < key(&pair[1]))
+        );
+        let entries = active.entries().to_vec();
+        drop(active);
+
+        let (mut reopened, torn) = recovered(&path);
+        assert!(!torn);
+        assert_eq!(reopened.state(), state);
+        assert_eq!(reopened.entries(), entries);
+        assert_eq!(
+            read(&mut reopened, b"first payload").unwrap(),
+            b"first payload"
+        );
+        assert_eq!(read(&mut reopened, &values[299]).unwrap(), values[299]);
+    }
+
+    #[test]
+    fn a_frame_cut_short_anywhere_recovers_the_previous_state() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("active.segment");
         let mut active = ActiveSegment::create(&path, 0).unwrap();
+        append(&mut active, &[record(b"durable")]);
+        let durable = active.state();
+        append(&mut active, &[record(b"torn"), record(b"also torn")]);
+        let whole = fs::read(&path).unwrap();
+        drop(active);
 
-        let first = b"first payload";
-        let second = b"second payload";
-        append(&mut active, &[record(first)]);
-        let first_state = active.state();
-        let first_payload = fs::read(&path).unwrap()
-            [PREFIX_LEN as usize..first_state.metadata.index_start as usize]
-            .to_vec();
-        let first_entry = authenticated_entries(&active).remove(0);
-
-        append(&mut active, &[record(second)]);
-        let entries = authenticated_entries(&active);
-        let retained = entries
-            .iter()
-            .find(|entry| entry.digest == *ContentId::of(first).as_bytes())
-            .unwrap();
-        let added = entries
-            .iter()
-            .find(|entry| entry.digest == *ContentId::of(second).as_bytes())
-            .unwrap();
-        assert_eq!(retained.offset, first_entry.offset);
-        assert_eq!(retained.stored_length, first_entry.stored_length);
-        assert_eq!(retained.logical_length, first_entry.logical_length);
-        assert_eq!(added.offset, first_state.metadata.index_start);
-
-        let bytes = fs::read(path).unwrap();
-        assert_eq!(
-            &bytes[PREFIX_LEN as usize..PREFIX_LEN as usize + first_payload.len()],
-            first_payload
-        );
-        assert_eq!(
-            &bytes[added.offset as usize..(added.offset + added.stored_length) as usize],
-            second
-        );
+        for cut in durable.total_length..whole.len() as u64 {
+            fs::write(&path, &whole[..cut as usize]).unwrap();
+            let (mut reopened, torn) = recovered(&path);
+            assert_eq!(torn, cut != durable.total_length, "cut at {cut}");
+            assert_eq!(reopened.state(), durable, "cut at {cut}");
+            assert_eq!(fs::metadata(&path).unwrap().len(), durable.total_length);
+            assert!(read(&mut reopened, b"torn").is_none());
+            assert_eq!(read(&mut reopened, b"durable").unwrap(), b"durable");
+        }
     }
 
     #[test]
-    fn cumulative_index_is_sorted_across_page_boundaries() {
+    fn unwritten_bytes_of_the_last_frame_end_the_log() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("active.segment");
-        let mut active = ActiveSegment::create(&path, 10).unwrap();
-        let values: Vec<Vec<u8>> = (0..MAX_INDEX_PAGE_ENTRIES + 5)
-            .rev()
-            .map(|number| number.to_be_bytes().to_vec())
-            .collect();
-        let records: Vec<_> = values.iter().map(|value| record(value)).collect();
-        append(&mut active, &records);
+        let mut active = ActiveSegment::create(&path, 0).unwrap();
+        append(&mut active, &[record(b"durable")]);
+        let durable = active.state();
+        append(&mut active, &[record(b"partly on disk")]);
+        let whole = fs::read(&path).unwrap();
+        drop(active);
+        let frame = durable.total_length as usize;
 
-        let entries = authenticated_entries(&active);
-        assert_eq!(entries.len(), values.len());
-        assert!(entries.windows(2).all(|pair| {
-            (pair[0].namespace, pair[0].digest) < (pair[1].namespace, pair[1].digest)
-        }));
-        let raw = fs::read(&path).unwrap();
-        let footer = wheat_core::decode_segment_footer(
-            &raw[raw.len() - wheat_core::SEGMENT_FOOTER_ENCODED_SIZE..],
-        )
-        .unwrap();
-        let directory = wheat_core::decode_segment_directory(
-            &raw[footer.directory_offset as usize
-                ..(footer.directory_offset + footer.directory_length) as usize],
-        )
-        .unwrap();
-        assert!(directory.pages.len() >= 2);
+        // The file grew, but the data of all or part of the frame never landed.
+        for zeroed in [
+            frame..whole.len(),
+            frame + 40..whole.len(),
+            frame + 70..frame + 80,
+        ] {
+            let mut bytes = whole.clone();
+            bytes[zeroed.clone()].fill(0);
+            fs::write(&path, &bytes).unwrap();
+            let (reopened, torn) = recovered(&path);
+            assert!(torn, "zeroed {zeroed:?}");
+            assert_eq!(reopened.state(), durable, "zeroed {zeroed:?}");
+        }
+        // Zeros past the last frame are dropped too.
+        let mut bytes = whole.clone();
+        bytes.extend([0; 100]);
+        fs::write(&path, &bytes).unwrap();
+        let (reopened, torn) = recovered(&path);
+        assert!(torn);
+        assert_eq!(reopened.state().total_length, whole.len() as u64);
+    }
+
+    #[test]
+    fn damage_to_a_frame_with_a_later_frame_is_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active.segment");
+        let mut active = ActiveSegment::create(&path, 0).unwrap();
+        append(&mut active, &[record(b"first")]);
+        let first_end = active.state().total_length as usize;
+        append(&mut active, &[record(b"second")]);
+        let whole = fs::read(&path).unwrap();
+        drop(active);
+        let first_start = HEADER_LEN as usize;
+
+        // A payload byte, an index byte, the trailer, and a header field.
+        for at in [
+            first_start + FRAME_HEADER_LEN as usize,
+            first_end - FRAME_TRAILER_LEN as usize - 1,
+            first_end - 1,
+            first_start + 10,
+        ] {
+            let mut bytes = whole.clone();
+            bytes[at] ^= 0x55;
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                matches!(ActiveSegment::recover(&path), Err(ActiveError::Corrupt(_))),
+                "flipped byte {at}"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "recovery left the file alone"
+            );
+        }
+        let mut bytes = whole;
+        bytes[0] ^= 0x55;
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            ActiveSegment::recover(&path),
+            Err(ActiveError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn an_interrupted_creation_is_unwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active.segment");
+        for bytes in [&[][..], &[0; 5][..], &[0; HEADER_LEN as usize][..]] {
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                ActiveSegment::recover(&path),
+                Err(ActiveError::Unwritten)
+            ));
+        }
+    }
+
+    #[test]
+    fn read_only_open_leaves_an_interrupted_append_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active.segment");
+        let mut active = ActiveSegment::create(&path, 0).unwrap();
+        append(&mut active, &[record(b"durable")]);
+        let durable = active.state();
+        drop(active);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"partial frame");
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = ActiveSegment::open_read_only(&path).unwrap();
+        assert_eq!(reader.state(), durable);
+        assert_eq!(read(&mut reader, b"durable").unwrap(), b"durable");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
@@ -826,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_count_payload_and_recovery_tail_bounds_are_enforced() {
+    fn explicit_count_and_payload_bounds_are_enforced() {
         assert!(matches!(
             validate_projected(MAX_SEGMENT_ENTRIES + 1, 0),
             Err(SegmentError::TooManyEntries)
@@ -835,21 +1100,10 @@ mod tests {
             validate_projected(1, MAX_SEGMENT_PAYLOAD_BYTES + 1),
             Err(SegmentError::TooLarge)
         ));
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("active.segment");
-        let mut active = ActiveSegment::create(path, 0).unwrap();
-        let prepared = active.prepare_append(&[record(b"x")], 1).unwrap();
-        let mut journal = prepared.journal().clone();
-        journal.old_tail.push(0);
-        assert!(matches!(
-            active.restore(&journal),
-            Err(ActiveError::PublishedStateMismatch)
-        ));
     }
 
     #[test]
-    fn commit_failure_after_payload_restores_exact_authenticated_state_and_remains_usable() {
+    fn a_failed_append_truncates_its_frame_and_the_segment_stays_usable() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("active.segment");
         let mut active = ActiveSegment::create(&path, 7).unwrap();
@@ -869,61 +1123,36 @@ mod tests {
         assert_eq!(active.state(), old_state);
         assert_eq!(active.entries(), old_entries);
         assert_eq!(fs::read(&path).unwrap(), old_bytes);
-        let reader = SegmentReader::open(active.file.try_clone().unwrap()).unwrap();
-        assert_eq!(reader.id(), old_state.id);
-        assert_eq!(reader.metadata(), old_state.metadata);
 
         append(&mut active, &[record(b"usable afterward")]);
         assert_eq!(active.state().generation, 9);
-        assert!(
-            active
-                .lookup_entry_bounded(
-                    CONTENT_NAMESPACE,
-                    *ContentId::of(b"usable afterward").as_bytes(),
-                    usize::MAX,
-                )
-                .unwrap()
-                .is_some()
-        );
+        assert!(read(&mut active, b"usable afterward").is_some());
+        drop(active);
+        let (reopened, _) = recovered(&path);
+        assert_eq!(reopened.state().generation, 9);
     }
 
     #[test]
-    fn exact_old_tail_restores_after_append_and_reopen_ignores_suffix() {
+    fn a_failed_sync_truncates_the_frame() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("active.segment");
         let mut active = ActiveSegment::create(&path, 0).unwrap();
-        append(&mut active, &[record(b"old")]);
+        append(&mut active, &[record(b"published")]);
         let old_state = active.state();
-        let old_bytes = fs::read(&path).unwrap();
-
-        let prepared = active.prepare_append(&[record(b"new")], 2).unwrap();
-        let journal = prepared.journal().clone();
-        active.commit_append(prepared).unwrap();
-        active.file.seek(SeekFrom::End(0)).unwrap();
-        active.file.write_all(b"partial-unpublished-tail").unwrap();
-        drop(active);
-        let mut active = ActiveSegment::recover(&path, &journal).unwrap();
+        let prepared = active.prepare_append(&[record(b"unsynced")], 2).unwrap();
+        let Ok(write) = active.begin_append(prepared).unwrap() else {
+            panic!("a new record is written");
+        };
+        let mut written = write.run();
+        written.test_fail();
+        assert!(active.finish_append(written).is_err());
         assert_eq!(active.state(), old_state);
-        assert_eq!(fs::read(&path).unwrap(), old_bytes);
-
-        active.file.seek(SeekFrom::End(0)).unwrap();
-        active.file.write_all(b"ignored suffix").unwrap();
-        drop(active);
-        let reopened = ActiveSegment::reopen(&path, old_state).unwrap();
-        assert_eq!(reopened.state(), old_state);
-        assert!(fs::metadata(&path).unwrap().len() > old_state.metadata.total_length);
-
-        let mut wrong = old_state;
-        wrong.generation += 1;
-        wrong.id = SegmentId([7; 32]);
-        assert!(matches!(
-            ActiveSegment::reopen(path, wrong),
-            Err(ActiveError::PublishedStateMismatch)
-        ));
+        assert_eq!(fs::metadata(&path).unwrap().len(), old_state.total_length);
+        assert!(read(&mut active, b"unsynced").is_none());
     }
 
     #[test]
-    fn sealing_metadata_describes_the_current_v1_segment() {
+    fn sealing_metadata_describes_the_current_log() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("active.segment");
         let mut active = ActiveSegment::create(path, 4).unwrap();
@@ -934,7 +1163,7 @@ mod tests {
             active.sealing_metadata(),
             ActiveSealMetadata {
                 id: state.id,
-                stored_length: state.metadata.total_length,
+                stored_length: state.total_length,
                 object_count: 1,
             }
         );

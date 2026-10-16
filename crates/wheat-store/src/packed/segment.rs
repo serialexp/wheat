@@ -599,23 +599,8 @@ pub(crate) struct SegmentReader {
 
 impl SegmentReader {
     /// Opens and fully authenticates the body once. Payloads are not retained.
-    pub(crate) fn open(file: File) -> Result<Self, SegmentError> {
+    pub(crate) fn open(mut file: File) -> Result<Self, SegmentError> {
         let actual_len = file.metadata()?.len();
-        Self::open_at_length(file, actual_len)
-    }
-
-    /// Authenticates a published prefix while ignoring an uncommitted suffix.
-    pub(super) fn open_at_published_length(
-        file: File,
-        published_length: u64,
-    ) -> Result<Self, SegmentError> {
-        if file.metadata()?.len() < published_length {
-            return Err(SegmentError::Format("truncated published segment"));
-        }
-        Self::open_at_length(file, published_length)
-    }
-
-    fn open_at_length(mut file: File, actual_len: u64) -> Result<Self, SegmentError> {
         // Bound all subsequent allocations, including a forged directory length.
         const MAX_PHYSICAL_BYTES: u64 =
             MAX_SEGMENT_PAYLOAD_BYTES + MAX_SEGMENT_TAIL_BYTES + FOOTER_LEN;
@@ -765,12 +750,6 @@ impl SegmentReader {
 
     pub(crate) fn metadata(&self) -> SegmentMetadata {
         self.metadata
-    }
-
-    pub(crate) fn into_authenticated_parts(
-        self,
-    ) -> (File, SegmentId, SegmentMetadata, Vec<SegmentIndexEntry>) {
-        (self.file, self.id, self.metadata, self.entries_by_key)
     }
 
     /// Borrows the index decoded and authenticated by `open`.

@@ -315,6 +315,45 @@ fn catalog_record_round_trips_and_is_canonical() {
     }
 }
 
+#[test]
+fn active_log_records_round_trip_at_fixed_sizes_and_are_distinct() {
+    let header = encode_active_log_header(7).unwrap();
+    assert_eq!(header.len(), ACTIVE_LOG_HEADER_ENCODED_SIZE);
+    assert_eq!(decode_active_log_header(&header).unwrap(), 7);
+
+    let fields = ActiveLogFrameFields {
+        generation: 8,
+        payload_length: 1 << 40,
+        index_length: 66,
+    };
+    let frame = encode_active_log_frame_header(&fields, [4; 32]).unwrap();
+    assert_eq!(frame.len(), ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE);
+    assert_eq!(
+        decode_active_log_frame_header(&frame).unwrap(),
+        (fields, [4; 32])
+    );
+    // The header digest covers exactly the encoded fields, which lead the header.
+    let encoded_fields = encode_active_log_frame_fields(&fields).unwrap();
+    assert!(frame.starts_with(&encoded_fields));
+    assert_eq!(frame.len(), encoded_fields.len() + 32);
+
+    let trailer = encode_active_log_frame_trailer([5; 32]).unwrap();
+    assert_eq!(trailer.len(), ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE);
+    assert_eq!(decode_active_log_frame_trailer(&trailer).unwrap(), [5; 32]);
+
+    let mut long = trailer.clone();
+    long.push(0);
+    assert_eq!(
+        decode_active_log_frame_trailer(&long),
+        Err(SegmentRecordError::NonCanonicalEncoding)
+    );
+    // Zeroed bytes, as a crash can leave them, decode as none of the records.
+    assert!(decode_active_log_header(&[0; ACTIVE_LOG_HEADER_ENCODED_SIZE]).is_err());
+    assert!(decode_active_log_frame_header(&[0; ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE]).is_err());
+    assert!(decode_active_log_frame_trailer(&[0; ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE]).is_err());
+    assert!(decode_segment_prefix(&header[..6]).is_err());
+}
+
 /// The remote chain record and the local snapshot share a directory layout
 /// (`catalog/{generation}-{digest}.catalog`), so neither may decode as the other.
 #[test]
