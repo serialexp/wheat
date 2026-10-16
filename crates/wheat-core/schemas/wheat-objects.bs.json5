@@ -207,6 +207,17 @@
           items: { type: "RevisionId" },
         },
         {
+          // A combined revision's other inputs, sorted, never the predecessor;
+          // empty for an ordinary revision.
+          name: "combines",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "RevisionId" },
+        },
+        // 1 + the largest generation among the predecessor and `combines`; 0 with none.
+        { name: "generation", type: "uint64" },
+        {
           name: "dependencies",
           type: "array",
           kind: "length_prefixed",
@@ -314,6 +325,20 @@
         { name: "unresolved_conflicts", type: "ConflictSetId" },
         // The blobs the tree names, each with the number of tree entries naming it.
         { name: "required_content", type: "ContentMapId" },
+        // The number of changes in `revisions`.
+        { name: "size", type: "uint64" },
+        {
+          // Zero or one element: the last change in the canonical order, none for
+          // the base. An array for the same reason as RevisionV1's predecessors.
+          name: "last",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ChangeId" },
+        },
+        // The sum over its changes of 1 + their revision's generation. Every lineage
+        // edge increases it.
+        { name: "weight", type: "uint64" },
       ],
     },
 

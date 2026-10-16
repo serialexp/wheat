@@ -53,6 +53,12 @@ pub enum RepositoryMutationError {
          another: {reason}"
     )]
     RevisionsDoNotCombine { change: ChangeId, reason: String },
+    #[error(
+        "the frontiers hold {count} revisions of change {change} that went their own ways, \
+         and at most {} combine at once; integrate fewer frontiers at a time (--frontier)",
+        wheat_core::MAX_COMBINES + 1
+    )]
+    TooManyRevisions { change: ChangeId, count: usize },
 }
 
 type Result<T> = std::result::Result<T, RepositoryMutationError>;
@@ -123,10 +129,33 @@ pub(crate) struct Active {
     reverse_dependencies: BTreeMap<ChangeId, BTreeSet<ChangeId>>,
 }
 
-/// An application of a revision's edits, with the evidence for each edit that failed
-/// (the recorded conflict's edits; empty when the application is clean).
+/// How [`PersistedRepositoryMutator::apply`] replays a revision's edits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Replay {
+    /// Authoring an ordinary revision where it lands: every edit must apply, and only
+    /// generated content and trees are written.
+    Author,
+    /// Authoring a combined revision: its inputs' edits may already be satisfied where
+    /// it lands, as for a reapplied revision, but none may fail.
+    AuthorCombined,
+    /// Applying a revision: an edit may already be satisfied, and a conflict is written.
+    Apply,
+}
+
+impl Replay {
+    /// Whether an edit whose result is already in place counts as applied.
+    #[must_use]
+    pub(crate) fn allows_already_satisfied(self) -> bool {
+        self != Self::Author
+    }
+}
+
+/// A replay of a revision's edits: its result, the evidence for each edit that applied,
+/// and the evidence for each edit that failed (the conflict's edits; empty when the
+/// result is clean).
 pub(crate) struct AppliedEdits {
-    pub(crate) application: ApplicationRecord,
+    pub(crate) result: ApplicationResultRecord,
+    pub(crate) applied: BTreeMap<EditId, AppliedEditEvidence>,
     pub(crate) failed: BTreeMap<EditId, FailedEditEvidence>,
 }
 
@@ -134,7 +163,7 @@ impl AppliedEdits {
     /// The clean resulting tree, or [`RepositoryError::InvalidEdits`] naming each edit
     /// that failed and why.
     pub(crate) fn clean_tree(&self, edits: &BTreeMap<EditId, EditRecord>) -> Result<TreeId> {
-        match self.application.result {
+        match self.result {
             ApplicationResultRecord::Clean { tree } => Ok(tree),
             ApplicationResultRecord::Conflicted { .. } => Err(RepositoryError::InvalidEdits(
                 RejectedEdit::collect(edits, &self.failed),
@@ -728,21 +757,32 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let mut view = self.prefix_view(active, prefix).await?;
         let mut authored = BTreeMap::new();
         for change in order.into_iter().skip(prefix) {
-            let (revision_id, edits) = if let Some(revision) = pending.remove(&change) {
+            let (revision_id, generation, edits) = if let Some(revision) = pending.remove(&change) {
                 let preliminary = self
-                    .apply(
-                        RevisionId::from_digest([0; 32]),
-                        &view,
-                        &revision.edits.edits,
-                        fresh,
-                        false,
-                    )
+                    .apply(&view, &revision.edits.edits, fresh, Replay::Author)
                     .await?;
                 let tree = preliminary.clean_tree(&revision.edits.edits)?;
+                let generation = match revision.predecessor {
+                    None => 0,
+                    Some(predecessor) => {
+                        let parent = match active.revisions.get(&change) {
+                            Some((id, record)) if *id == predecessor => record.generation,
+                            _ => {
+                                RepositoryReader::new(self.objects, self.content)
+                                    .revision(predecessor)
+                                    .await?
+                                    .generation
+                            }
+                        };
+                        generation_after([parent])?
+                    }
+                };
                 let record = RevisionRecord {
                     change_id: change,
                     metadata: revision.metadata,
                     predecessor: revision.predecessor,
+                    combines: BTreeSet::new(),
+                    generation,
                     dependencies: revision.dependencies,
                     authored_against: view.id(),
                     edits: revision.edits.edits.keys().copied().collect(),
@@ -753,13 +793,17 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 let revision_id = self.put_revision(&record, fresh).await?;
                 active.revisions.insert(change, (revision_id, record));
                 authored.insert(change, revision_id);
-                (revision_id, revision.edits.edits)
+                (revision_id, generation, revision.edits.edits)
             } else {
                 let (revision_id, revision) = &active.revisions[&change];
-                (*revision_id, self.load_edits(revision).await?)
+                (
+                    *revision_id,
+                    revision.generation,
+                    self.load_edits(revision).await?,
+                )
             };
             view = self
-                .apply_step(view, change, revision_id, &edits, fresh)
+                .apply_step(view, change, revision_id, generation, &edits, fresh)
                 .await?;
         }
         active.rebuild_graph();
@@ -789,21 +833,37 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(reader.view(application.target_view).await?)
     }
 
-    /// Applies one change's revision onto `view` and records the resulting view.
+    /// Applies one change's revision, of `generation`, onto `view` and records the
+    /// resulting view.
     #[tracing::instrument(level = "debug", skip_all, fields(change = %change))]
     pub(crate) async fn apply_step(
         &self,
         view: ViewRecord,
         change: ChangeId,
         revision_id: RevisionId,
+        generation: u64,
         edits: &BTreeMap<EditId, EditRecord>,
         fresh: &mut Fresh,
     ) -> Result<ViewRecord> {
-        let application = self
-            .apply(revision_id, &view, edits, fresh, true)
-            .await?
-            .application;
+        let order =
+            view.order
+                .then(change, generation)
+                .ok_or(RepositoryError::InvalidRepositoryState(
+                    "view weight overflow",
+                ))?;
+        let replay = self.apply(&view, edits, fresh, Replay::Apply).await?;
+        let application = ApplicationRecord {
+            revision_id,
+            target_view: view.id(),
+            result: replay.result,
+            applied: replay.applied,
+        };
         let application_id = application.id();
+        self.objects
+            .put_if_absent(application_id.into(), &application.canonical_bytes())
+            .await?;
+        fresh.objects += 1;
+        fresh.applications.insert(application_id);
         let tree = match application.result {
             ApplicationResultRecord::Clean { tree } => tree,
             ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
@@ -832,6 +892,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             applications: application_root,
             unresolved_conflicts: conflict_root,
             required_content: content,
+            order,
         };
         self.put_view(&next, fresh).await?;
         if parent != next.id() {
@@ -872,11 +933,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     #[tracing::instrument(name = "apply_revision", level = "debug", skip_all, fields(edits = edits.len()))]
     pub(crate) async fn apply(
         &self,
-        revision: RevisionId,
         target: &ViewRecord,
         edits: &BTreeMap<EditId, EditRecord>,
         fresh: &mut Fresh,
-        persist: bool,
+        replay: Replay,
     ) -> Result<AppliedEdits> {
         let trees = MerkleTreeStore::new(self.objects);
         let paths = edit_paths(edits);
@@ -891,7 +951,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
         let before = flat.clone();
         let limits = wheat_core::edit_application::ApplicationLimits {
-            allow_already_satisfied: persist,
+            allow_already_satisfied: replay.allows_already_satisfied(),
             ..Default::default()
         };
         let output = wheat_core::edit_application::apply_edits(
@@ -985,7 +1045,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             (ApplicationResultRecord::Clean { tree }, failed)
         } else {
             let conflict = Conflict::new(target.id(), failed);
-            if persist {
+            if replay == Replay::Apply {
                 self.objects
                     .put_if_absent(conflict.id.into(), &conflict.canonical_bytes())
                     .await?;
@@ -999,21 +1059,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 conflict.edits,
             )
         };
-        let application = ApplicationRecord {
-            revision_id: revision,
-            target_view: target.id(),
+        Ok(AppliedEdits {
             result,
             applied,
-        };
-        if persist {
-            self.objects
-                .put_if_absent(application.id().into(), &application.canonical_bytes())
-                .await?;
-            fresh.objects += 1;
-            fresh.applications.insert(application.id());
-        }
-        Ok(AppliedEdits {
-            application,
             failed,
         })
     }
@@ -1316,6 +1364,15 @@ fn unchanged_prefix(
                     == active.revisions.get(new).map(|(revision, _)| revision)
         })
         .count()
+}
+
+/// The generation of a revision whose parents have `parents`' generations.
+pub(crate) fn generation_after(parents: impl IntoIterator<Item = u64>) -> Result<u64> {
+    Ok(
+        next_generation(parents).ok_or(RepositoryError::InvalidRepositoryState(
+            "revision generation overflow",
+        ))?,
+    )
 }
 
 fn topological(

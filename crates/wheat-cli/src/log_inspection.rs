@@ -314,6 +314,8 @@ mod tests {
                     provenance: None,
                 },
                 predecessor: None,
+                combines: Default::default(),
+                generation: 0,
                 dependencies: Default::default(),
                 authored_against: ViewId::from_digest([3; 32]),
                 edits: Default::default(),

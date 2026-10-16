@@ -474,7 +474,8 @@ fn view_identity_covers_the_application_and_conflict_manifest() {
         .unwrap();
     let revision = outcome.revision_id;
     let frontier = BTreeMap::from([(change, revision)]);
-    let plain = RepositoryView::new(tree.clone(), frontier.clone());
+    let order = ViewOrder::BASE.then(change, 0).unwrap();
+    let plain = RepositoryView::new(tree.clone(), frontier.clone(), order);
     let edit = source
         .revision(revision)
         .unwrap()
@@ -507,6 +508,7 @@ fn view_identity_covers_the_application_and_conflict_manifest() {
         frontier,
         BTreeMap::from([(change, application.id)]),
         BTreeSet::from([conflict.id]),
+        order,
     );
     assert_ne!(plain.id, manifested.id);
     assert_eq!(plain.tree, manifested.tree);
@@ -531,6 +533,7 @@ fn one_revision_can_be_applied_to_unrelated_target_views() {
     let unrelated = RepositoryView::new(
         Tree::from_iter([("unrelated".into(), value(&io, "other"))]),
         BTreeMap::new(),
+        ViewOrder::BASE,
     );
     let first = repository
         .apply_revision(created.revision_id, &first_target, ctx)

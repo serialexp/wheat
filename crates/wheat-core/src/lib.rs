@@ -59,9 +59,9 @@ pub use model::{
     Actor, Application, ApplicationResult, AppliedEditEvidence, ByteRange, CanonicalObject, Change,
     ChangeMetadata, ChangeRevision, Conflict, ConflictResolution, ConflictResolutionEvidence,
     DependencyGraph, DirectoryEntry, DirectoryNode, EditFailure, EditSubsumption, EditTransition,
-    FailedEditEvidence, FileKind, FileValue, RejectedEdit, RepositoryClosure, RepositoryState,
-    RepositoryView, RevisionEdits, RevisionMapChild, RevisionMapNode, RevisionMetadata,
-    SourceProvenance, Timestamp, Tree,
+    FailedEditEvidence, FileKind, FileValue, MAX_COMBINES, RejectedEdit, RepositoryClosure,
+    RepositoryState, RepositoryView, RevisionEdits, RevisionMapChild, RevisionMapNode,
+    RevisionMetadata, SourceProvenance, Timestamp, Tree, ViewOrder, next_generation,
 };
 pub use persisted::{RepositoryStateRecord, ViewRecord};
 pub use repository::{

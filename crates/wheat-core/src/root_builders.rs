@@ -24,6 +24,7 @@ pub fn build_view_record(
         applications,
         unresolved_conflicts,
         required_content,
+        order: view.order,
     }
 }
 

@@ -128,6 +128,15 @@ pub fn decode_view_record(bytes: &[u8]) -> Result<crate::ViewRecord, CanonicalOb
             &v.unresolved_conflicts.digest,
         )?),
         required_content: ContentMapId::from_digest(digest_domain(&v.required_content.digest)?),
+        order: crate::ViewOrder {
+            size: v.size,
+            last: v
+                .last
+                .first()
+                .map(crate::semantic_records::change_id_domain)
+                .transpose()?,
+            weight: v.weight,
+        },
     })
 }
 
@@ -980,6 +989,8 @@ pub(crate) fn revision_bytes(revision: &ChangeRevision) -> Vec<u8> {
             change_id: change_id(revision.change_id),
             metadata: revision_metadata(&revision.metadata),
             predecessors: revision.predecessor.into_iter().map(revision_id).collect(),
+            combines: revision.combines.iter().copied().map(revision_id).collect(),
+            generation: revision.generation,
             dependencies: revision
                 .dependencies
                 .iter()
@@ -1190,6 +1201,9 @@ pub(crate) fn view_record_bytes(record: &crate::ViewRecord) -> Vec<u8> {
             applications: application_map_id(record.applications),
             unresolved_conflicts: conflict_set_id(record.unresolved_conflicts),
             required_content: content_map_id(record.required_content),
+            size: record.order.size,
+            last: record.order.last.into_iter().map(change_id).collect(),
+            weight: record.order.weight,
         }
         .into(),
     ))
@@ -1344,6 +1358,34 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 ));
             }
             validate_sorted_unique_by(
+                &revision.combines,
+                |input| input.digest.bytes.as_slice(),
+                "revision combines",
+            )?;
+            if revision.combines.len() > crate::MAX_COMBINES {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "revision combines too many revisions",
+                ));
+            }
+            match revision.predecessors.first() {
+                None if !revision.combines.is_empty() => {
+                    return Err(CanonicalObjectError::InvalidCollection(
+                        "combined revision must have a predecessor",
+                    ));
+                }
+                Some(predecessor) if revision.combines.contains(predecessor) => {
+                    return Err(CanonicalObjectError::InvalidCollection(
+                        "combined revision must not combine its predecessor",
+                    ));
+                }
+                _ => {}
+            }
+            if (revision.generation == 0) != revision.predecessors.is_empty() {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "revision generation must be 0 exactly when it has no predecessor",
+                ));
+            }
+            validate_sorted_unique_by(
                 &revision.dependencies,
                 |dependency| dependency.uuid.bytes.as_slice(),
                 "revision dependencies",
@@ -1371,7 +1413,25 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 validate_failed_evidence(&entry.evidence)?;
             }
         }
-        wire::WheatObject::ViewV1(_) => {}
+        wire::WheatObject::ViewV1(view) => {
+            if view.last.len() > 1 {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "view must have at most one last change",
+                ));
+            }
+            // The base has no changes; any other view has a last change and at least
+            // weight 1 for each of its changes.
+            let consistent = if view.size == 0 {
+                view.last.is_empty() && view.weight == 0
+            } else {
+                !view.last.is_empty() && view.weight >= view.size
+            };
+            if !consistent {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "view size, last change and weight disagree",
+                ));
+            }
+        }
         wire::WheatObject::ContentMapNodeV1(node) => {
             if node.value.len() > 1 {
                 return Err(CanonicalObjectError::InvalidCollection(

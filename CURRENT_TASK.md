@@ -1,0 +1,225 @@
+# Current task
+
+## 2026-10-09: integration (pull) — Bart: "clean up those small items. Then pick up
+integration, since nobody can use the thing without it."
+
+### Small items: done
+
+- 71b5f70 content fetch ends with an Error for an unreadable blob (was a hang).
+- d8a0c41 websocket message limit 16 MiB on both ends (frame limit already was).
+- d8b293a publish seals objects before the head moves (was after: S3 head could
+  name objects never stored); seal error no longer leaks its message.
+- a563fb1 a directory and a file can trade places in one revision (reader,
+  edit application via `apply_final_edits`, capture settlement, lookups).
+- d69d379 `wheat ignore import`.
+- New TODO: `status` lists an untracked directory and each file in it.
+
+### Integration: Bart's decisions (2026-10-09)
+
+- Fetch with unpublished work: **union** the remote state into the local one.
+- Labels on fetch: **three-way** against the last fetched manifest; a label both
+  sides moved differently makes fetch refuse and list them.
+- UX: **`wheat integrate`** (join the active label's frontiers, or chosen ones,
+  into one view and materialize it) **and `wheat pull`** (fetch + integrate).
+- Divergent revisions of one change in the joined frontiers: "Order them by date
+  and see if the changes in the revisions still apply on top of one another? At
+  worst we get the same changes in a new revision." Reading: earlier revision
+  (by date) + the later one's net edit changes since their common predecessor
+  → a new revision with the earlier as predecessor. Open: what to do when that
+  merged revision does not apply cleanly (authored revisions must be clean) —
+  default plan: refuse, naming the change and paths; ask Bart if it comes up.
+
+### Facts that shape it (from research)
+
+- State = base_view + change map + lineage map + content manifest + 4 retained
+  sets, all grow-only. Labels live in the envelope, outside the state.
+- Publish validation (`repository_transition.rs:45-206`): same base_view, retained
+  sets only grow, old lineage edges kept, change map entries added/changed only to
+  retained objects, content only grows. Labels unchecked; publish sends the local
+  manifest wholesale.
+- Mutations never move labels; new work shows as descendant frontiers (leaf views
+  of the lineage below the label's view). Integrate = join frontiers
+  (`compose_changes` in the design docs): reuse revisions, new applications/views,
+  durable conflicts, continuation edges from each joined frontier.
+- Retained changes must not hold two change objects for one ChangeId
+  ("duplicate change identity"), so the union refuses a ChangeId whose change
+  object differs between the sides.
+
+### Step 1 notes
+
+- `crates/wheat-store/src/repository_union.rs`: `RepositoryReader::union_states`,
+  `union_envelopes(base, local, remote)`, `merge_labels`, `RepositoryUnionError`.
+- `radix::union` is now paired_diff + update_batch (was: read both whole; its doc
+  comment claimed otherwise). `ChangeMapStore::union` (DivergentEntries error),
+  `ViewLineageMapStore::union` (child-set union per shared parent).
+- `native_fetch` keeps local work (`kept_local` in JSON); `--force` takes remote.
+- Tests: `crates/wheat-store/tests/repository_union.rs` (union == both histories
+  recorded in one repo; read count 41 vs 55 for 16 vs 160 shared changes),
+  `crates/wheat-cli/tests/remote_fetch.rs` (3 new).
+- `frontier list --format json` printed IDs as byte arrays; fixed (helpers moved to
+  `command_output`). status/conflicts have the same bug: TODO.md.
+
+### Plan: all four steps committed
+
+1. Union fetch + three-way labels — 0631439.
+2. `wheat integrate` — 19c47af (`repository_integration.rs`; canonical order,
+   durable conflicts, continuation edges; CLI `integrate_workspace`).
+3. Divergent revisions per Bart's rule — c311917. A combination that does not
+   apply cleanly is refused (`RevisionsDoNotCombine`), naming the change.
+4. `wheat pull` — dfdd85f (fetch + integrate; one frontier → switch as refresh;
+   a refused integrate keeps the fetch).
+
+Scale is covered by read-count tests in `crates/wheat-store/tests/repository_union.rs`
+and `repository_integration.rs`, not by a wheat-bench case. Full suite at dfdd85f:
+1,121 passed, 18 skipped.
+
+Follow-ups in TODO.md: status/conflicts JSON IDs as byte arrays; combined revisions
+carry no subsumption evidence. Steps 1-4 and the site were pushed 2026-10-10.
+
+### 2026-10-15: the FrontierRevisesBasis refusal (Bart: "important to do right now")
+
+Committed 3588883 (radix `cursor_from` seek) and 5a4fdb6 (integrate starts below the
+lowest revised/out-of-order label change; resolve on a label-held conflict now
+stays a frontier; `prefix_view(0)` fix). Details in TODO_DONE.md under "Loose ends".
+Not pushed. Full suite 1,127 passed, 18 skipped.
+
+## 2026-10-15: label moves — design (Bart: "lets think about how to do label moves")
+
+Plan: `docs/design/wheat-label-moves.md` (untracked), with Bart's decisions 1-11.
+Codex reviewed it twice (thread 01a13dbf-fb44-7ba3-b181-d10e6ec464ed). Round 2 found
+the ancestry approach (`combines` on revisions as extra predecessors) still leaky:
+`Joined::Existing` reuse records no ancestry; criss-cross merge bases; the BFS stop
+condition doesn't find nearest common ancestors; squash erases target-side removals
+and `combines`; publish validation must use equality (`pred.edits == preserved ∪
+removed`) and can't trust claimed merge parents; `combines` missing from object_graph,
+structural_delta, rewrite retention, reconstruction; displaced materialization vs the
+journal's basis invariant; squash boundary uses the remote, not the basis; fetch rule
+for label create/delete/metadata; resolver and materialization still fully validate.
+Existing bugs found: `join_revisions` resurrects removed edits (J/B2 example in the
+plan); publish doesn't check new revisions against their predecessors.
+Bart chose the ancestry DAG; review 3 fixes are in the plan (pairwise merge,
+squash never collapses combined revisions, decision 12 per-edit removal evidence,
+journal/materialize changes). Decision 13: incremental validation at publish/fetch is
+a prerequisite project: `docs/design/wheat-incremental-validation.md` (untracked).
+Codex review 1 of that plan (same thread) found: union of two valid increments can
+make a lineage cycle; forced rewrites need full validation (or checks of surviving
+references); step 5 must check revision.change_id == key and dependency closure;
+integrate can add a non-composition edge into an existing view; full validation's
+"exactly one child" rule is ambiguous with shortcut edges; change-map bijection;
+bootstrap/base mode; content membership must be against the aggregate manifest;
+`last_fetched` is set from the server's publish ack without checking it equals the
+offered envelope; content manifests are flat snapshots, so content checks are
+repository-sized; closure/parent-discovery/budget algorithms unspecified; canonical
+order must be validated (criterion: every change of T after k's last dependency in
+T's canonical order has a lower id than k).
+Bart chose: canonical order validated via an application position + binary-lifting
+max-ID index; content manifests become radix maps (ContentId → count) now.
+Validation plan reviewed 5 rounds; round 5 found no new P1/P2. Key additions: view
+`size`/`last`/`weight` with weight(child) > weight(parent) on every lineage edge
+(acyclic per edge); revision `combines` (≤64) + `generation` and always-authored
+combined revisions moved into the prerequisite; canonical radix encoding (I9) checked
+in validators; orphaned applications refused; publish ack must equal the offered
+envelope. Label-moves plan aligned to build on it.
+Both plans committed in fcf8483. Bart: "lets start with plan 1".
+
+### Plan 1 implementation (docs/design/wheat-incremental-validation.md, "Order of work")
+
+- Step 1 done, 41c54f7. Bart chose to fix the updater rather than check I9 only in
+  validators: `update_node` returns `Updated::{Node, Leaf, Pruned}`, and
+  `validate_node_at` refuses a value on a non-root node on every read. Parity
+  proptests are in `crates/wheat-store/tests/collection_builder_parity.rs`. Suite:
+  1,138 passed, 18 skipped.
+- 7551122: `update_batch` was per-edit (a root rewrite per key; the batched path
+  mishandled prefix splits). Now one pass. Gothab replay as radix content set: 377 MiB
+  → 32 MiB loose (flat snapshots 218 MiB). This answers why 651c01b left radix.
+  Recorded in the plan's "Content maps" section. I asked Bart whether to
+  measure first or go ahead; there was no answer, so I measured, and the numbers
+  support his radix decision.
+- Step 2 (content maps), split in two:
+  - 2a: add `ContentSetNode` (radix set, tag 0x0c01, segment/loose code 12) and
+    `ContentMapNode` (ContentId → u32 count) with stores, builders, every
+    registration (object_graph, structural_delta, store_analyze, metadata_repack
+    pairing, segment codes, loose ObjectKind) and parity tests.
+  - 2b: ViewV1.required_content → ContentMapId, state → radix ContentSetId; drop
+    ContentManifestV1/snapshot/delta/chain code; migrate users (inventory: the
+    Explore agent's report — commit_content, commit_writer, repository_mutation,
+    union, transition, rewrite, hydration, verify, verification_scratch,
+    object_graph, structural_delta, metadata_repack, store_analyze, remote.rs
+    fetch_content, server publish, wheat-git finalize + content_accumulator +
+    staged_import verify_mapping, core model/repository/root_builders/wire).
+  - Possible parity bug to check in 2b: `repository_rewrite.rs:562-645` rebuilds the
+    aggregate without application/conflict partial trees and conflict evidence
+    targets, which core `canonical_closure` includes.
+  - 2b done, uncommitted (2026-10-15). The rewrite now adds application result trees
+    and conflict evidence targets to the aggregate. No test fails without that fix:
+    every retained application's target view is retained, and its produced view is
+    usually another application's target, so I found no scenario reaching the gap.
+    `rewrite_preserves_a_preexisting_conflicted_descendant_application` now runs
+    `validate_complete`. Verifier: base map against its tree in full, every other
+    view's map against its first lineage parent's by the tree diff, full comparison
+    on a diff limit (unit tests `repository_verify::content_map_tests`). Import resume
+    authenticates content-map nodes once with position-keyed receipts
+    (`authenticate_content_map_once`); the finalize contract
+    `finalization_reads_each_views_content_change_not_its_whole_map` fails at 3,448
+    reads vs a budget of 310 if views are diffed against the empty map. Suite: 1,140
+    passed, 18 skipped; clippy, fmt, check-windows clean.
+  - 2b committed as fece015 (Bart: "Commit it whole with mine", so publish.rs went in
+    whole, including @calm-lynx's span hunks).
+  - The publish_content bench fails `clone.peak_rss` (430–513 MB against 256 MiB). Not
+    step 2. Massif on the clone puts 384 MiB of the 397 MiB heap peak in
+    `materialization::load_install` → `ContentStore::get`, under `Batcher::next_batch`:
+    since a88d542 (2026-10-05, batched materialization) a batch holds up to
+    `MAX_OPERATION_RESIDENT_BYTES` = 512 MiB of file content, so all 32 × 12 MiB
+    blobs are resident at once. The budget was measured 2026-09-26, before a88d542, and
+    no publish_content run between then and 2026-10-15 recorded the clone's peak.
+    Bart chose a separate batch cap: `MAX_BATCH_RESIDENT_BYTES` = 64 MiB (the clone
+    peaks at 98 MiB), with unit test `batches_of_large_files_hold_at_most_the_batch_bound`.
+    Pushed through fece015 on Bart's OK. Repro: wrap `target/release/wheat` with
+    `valgrind --tool=massif` for `clone … reader` and point `WHEAT_BENCH_WHEAT` at the
+    wrapper.
+- Step 3 done (2026-10-16): revisions carry `combines` (≤ 64, never the predecessor)
+  and `generation`; views carry `order { size, last, weight }`. `join_revisions`
+  always authors a combined revision (earliest input as predecessor) and refuses
+  more than 65 lines (`TooManyRevisions`). Combined revisions replay like reapplied
+  ones: `Replay::{Author, AuthorCombined, Apply}` in `repository_mutation.rs`.
+  Full validation checks generations, combines inputs (retained, same change), each
+  view's order against its composition parent (`verify_view_order`) and the weight
+  rule on every lineage edge. Tests: `crates/wheat-store/tests/view_order_validation.rs`
+  (forgeries), new cases in `tests/repository_integration.rs`, core
+  `revision_parents_and_view_order_are_checked_on_decode`, object_graph combines refs.
+  Suite: 1,153 passed, 18 skipped. Release bench (transition_validate, deep_stack,
+  checkpoint_stack) shows no regression. Next: step 4, the application order index.
+
+## 2026-10-15: publish throughput (@calm-lynx) — Bart: "We should be able to do 10 of these"
+
+Plan and numbers: `docs/design/wheat-lessons-from-scion.md` ("Measured contention",
+Outstanding). Done and committed: staged writes + TCP_NODELAY (0446f8b), server-side
+join of publishes behind the remote (79bbb99). `publish_contention` now needs 1 attempt
+per publish at 1-16 writers but tops out at ~8.6/s at 8 writers (target 10): publishes
+queue on `RepositoryEntry::commit`, about 115 ms each at 8 writers, server ~4% busy.
+
+Bart: "Always profile first". Done: wheat-trace crate (415cd40), publish spans (in
+fece015), packed append step spans (c0ae347), profile written up in the design doc
+(3b8010a, "Profile at 8 writers"). The bottleneck is the packed store: two ~46 ms
+appends per publish, and one catalog mutex every read waits on during appends.
+
+Repro: `WHEAT_TRACE=/tmp/x.json target/release/wheat-bench quick --case
+publish_contention --no-save --output /tmp/p.json`; analysis scripts that split the
+trace by writer level were in /tmp/wheat-profile/scripts (levels.py, wait.py,
+append.py; levels split on >1.5 s gaps between publishes, so 1/2/4 writers merge).
+
+Bart: try all five options cumulatively on main, measuring after each (1. catalog
+lock outside the append's fsyncs, 2. one append per publish, 3. cheaper append,
+4. group commit, 5. blocking work off the runtime).
+
+Option 1 done 2026-10-16: `SharedCatalog` in packed/catalog.rs, `AppendJob` runs the
+I/O without the catalog mutex, locator in WAL. Test
+`reads_proceed_beside_an_append_and_see_only_published_records`. 8 writers 9.2 ->
+13.5/s; 2 writers 6.7 -> 5.7 is noise (earlier runs 5.05-6.72; the server is idle
+~75 ms between publishes at 1-2 writers, so clients set the pace; per-level split
+script /tmp/wheat-profile/scripts/bylevel.py). Appends (33-37 ms,
+two per publish) now run 96% of the time. Numbers in the design doc ("Reads beside
+an append"); trace in /tmp/wheat-profile/option1.json.
+
+Next: option 2 (one append per publish), then 3-5; then contract rules (step 4) and
+maybe client-side push.

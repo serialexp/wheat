@@ -158,6 +158,8 @@ pub(crate) fn tree<'a, E>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RevisionSite {
     Predecessor,
+    /// One of the other inputs of a combined revision.
+    Combines,
     AuthoredAgainst,
     Tree,
     /// An edit of the revision, or one its transition names.
@@ -175,6 +177,9 @@ pub(crate) fn revision<E>(
 ) -> Result<(), E> {
     if let Some(id) = record.predecessor {
         f(Ref::Object(RevisionSite::Predecessor, id.into()))?;
+    }
+    for id in &record.combines {
+        f(Ref::Object(RevisionSite::Combines, (*id).into()))?;
     }
     f(Ref::Object(
         RevisionSite::AuthoredAgainst,
@@ -719,6 +724,36 @@ mod tests {
             }
             assert_eq!(members(&objects, root.into()).await, keys, "{count} keys");
         }
+    }
+
+    #[test]
+    fn a_combined_revision_refers_to_each_of_its_inputs() {
+        let id = |byte| wheat_core::RevisionId::from_digest([byte; 32]);
+        let record = RevisionRecord {
+            change_id: wheat_core::ChangeId::from_bytes([1; 16]),
+            metadata: wheat_core::RevisionMetadata::default(),
+            predecessor: Some(id(1)),
+            combines: [id(2), id(3)].into(),
+            generation: 1,
+            dependencies: Default::default(),
+            authored_against: wheat_core::ViewId::from_digest([4; 32]),
+            edits: Default::default(),
+            transition: wheat_core::EditTransition::default(),
+            resulting_tree: wheat_core::TreeId::from_digest([5; 32]),
+        };
+        let mut parents = Vec::new();
+        revision(&record, |reference| {
+            match reference {
+                Ref::Object(RevisionSite::Predecessor | RevisionSite::Combines, object) => {
+                    parents.push(object);
+                }
+                Ref::Object(..) => {}
+                other => panic!("a revision refers to {other:?}"),
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(parents, [id(1), id(2), id(3)].map(ObjectId::from).to_vec());
     }
 
     #[tokio::test]

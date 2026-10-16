@@ -94,6 +94,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             }
             views.push(RepositoryView {
                 id,
+                order: record.order,
                 tree,
                 frontier,
                 applications,

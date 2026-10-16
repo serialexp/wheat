@@ -70,7 +70,9 @@ impl Repository {
             }
             if revision
                 .predecessor
-                .is_some_and(|id| !self.revisions.contains_key(&id))
+                .iter()
+                .chain(&revision.combines)
+                .any(|id| !self.revisions.contains_key(id))
                 || !self.views.contains_key(&revision.authored_against)
             {
                 return Err(RepositoryError::InvalidRepositoryState(

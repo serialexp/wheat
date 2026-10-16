@@ -8,8 +8,8 @@ use wheat_core::{
     Application, ApplicationContext, ApplicationResult, CanonicalObjectError, Conflict, ContentId,
     ContentIo, DirectoryEntry, DirectoryNode, EditFailure, EditOperation, EditRecord,
     EditTransition, FailedEditEvidence, FileKind, FileValue, Repository, RepositoryView,
-    RevisionEdits, RevisionMapChild, RevisionMapId, RevisionMapNode, Tree, decode_directory_node,
-    decode_revision_map_node,
+    RevisionEdits, RevisionMapChild, RevisionMapId, RevisionMapNode, Tree, ViewOrder,
+    decode_directory_node, decode_revision_map_node,
 };
 
 fn content(value: &str) -> FileValue {
@@ -238,11 +238,110 @@ fn canonical_revision_has_a_pinned_encoding_and_id() {
 
     assert_eq!(
         hex(&revision.canonical_bytes()),
-        "030101890f2d3c4b7a689abcdef01234567800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffd452bee2968bcda67e36be70d825aac89821148f5dbaec55815fab21454fc800000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
+        "030101890f2d3c4b7a689abcdef0123456780000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048024dc114434a502c17cfc9fa047f0515a932ecfd4b8b91c13fcd5d15debf3600000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
     );
     // Revision ID is BLAKE3 of the canonical bytes above.
     let expected_id = wheat_core::RevisionId::of_canonical_bytes(&revision.canonical_bytes());
     assert_eq!(revision.id(), expected_id);
+}
+
+#[test]
+fn revision_parents_and_view_order_are_checked_on_decode() {
+    use wheat_core::{
+        ChangeId, RevisionId, RevisionRecord, TreeId, ViewId, ViewRecord, decode_revision_record,
+        decode_view_record,
+    };
+    let predecessor = RevisionId::from_digest([1; 32]);
+    let other = RevisionId::from_digest([2; 32]);
+    let revision = RevisionRecord {
+        change_id: ChangeId::from_bytes([1; 16]),
+        metadata: wheat_core::RevisionMetadata::default(),
+        predecessor: Some(predecessor),
+        combines: BTreeSet::from([other]),
+        generation: 3,
+        dependencies: BTreeSet::new(),
+        authored_against: ViewId::from_digest([3; 32]),
+        edits: BTreeSet::new(),
+        transition: EditTransition::default(),
+        resulting_tree: TreeId::from_digest([4; 32]),
+    };
+    assert_eq!(
+        decode_revision_record(&revision.canonical_bytes()).unwrap(),
+        revision
+    );
+    let refused =
+        |forged: RevisionRecord| decode_revision_record(&forged.canonical_bytes()).is_err();
+    // A combined revision never combines its own predecessor.
+    assert!(refused(RevisionRecord {
+        combines: BTreeSet::from([predecessor, other]),
+        ..revision.clone()
+    }));
+    // Combining needs a predecessor, and only a revision without one has generation 0.
+    assert!(refused(RevisionRecord {
+        predecessor: None,
+        ..revision.clone()
+    }));
+    assert!(refused(RevisionRecord {
+        generation: 0,
+        ..revision.clone()
+    }));
+    assert!(refused(RevisionRecord {
+        predecessor: None,
+        combines: BTreeSet::new(),
+        generation: 1,
+        ..revision.clone()
+    }));
+    let too_many = (0..=wheat_core::MAX_COMBINES)
+        .map(|index| RevisionId::from_digest([u8::try_from(index + 10).unwrap(); 32]))
+        .collect();
+    assert!(refused(RevisionRecord {
+        combines: too_many,
+        ..revision.clone()
+    }));
+
+    let base = ViewRecord {
+        tree: TreeId::from_digest([5; 32]),
+        revisions: RevisionMapId::from_digest([6; 32]),
+        applications: wheat_core::ApplicationMapId::from_digest([7; 32]),
+        unresolved_conflicts: wheat_core::ConflictSetId::from_digest([8; 32]),
+        required_content: wheat_core::ContentMapId::from_digest([9; 32]),
+        order: ViewOrder::BASE,
+    };
+    let change = ChangeId::from_bytes([2; 16]);
+    let one = ViewOrder::BASE.then(change, 4).unwrap();
+    assert_eq!(
+        one,
+        ViewOrder {
+            size: 1,
+            last: Some(change),
+            weight: 5
+        }
+    );
+    for order in [ViewOrder::BASE, one] {
+        let view = ViewRecord { order, ..base };
+        assert_eq!(decode_view_record(&view.canonical_bytes()).unwrap(), view);
+    }
+    for order in [
+        ViewOrder {
+            last: Some(change),
+            ..ViewOrder::BASE
+        },
+        ViewOrder {
+            weight: 1,
+            ..ViewOrder::BASE
+        },
+        ViewOrder { last: None, ..one },
+        ViewOrder { weight: 0, ..one },
+    ] {
+        // View encoding runs the canonical check decoding runs, so a forged order
+        // cannot even be encoded.
+        let view = ViewRecord { order, ..base };
+        assert!(
+            std::panic::catch_unwind(move || view.canonical_bytes()).is_err(),
+            "{order:?}"
+        );
+    }
+    assert_eq!(ViewOrder::BASE.then(change, u64::MAX), None);
 }
 
 #[test]
@@ -275,14 +374,17 @@ fn file_kind_changes_tree_and_revision_identity() {
     let regular = RepositoryView::new(
         BTreeMap::from([("file".to_owned(), file("same", FileKind::Regular))]),
         BTreeMap::new(),
+        ViewOrder::BASE,
     );
     let executable = RepositoryView::new(
         BTreeMap::from([("file".to_owned(), file("same", FileKind::Executable))]),
         BTreeMap::new(),
+        ViewOrder::BASE,
     );
     let symlink = RepositoryView::new(
         BTreeMap::from([("file".to_owned(), file("same", FileKind::Symlink))]),
         BTreeMap::new(),
+        ViewOrder::BASE,
     );
     assert_ne!(regular.id, executable.id);
     assert_ne!(regular.id, symlink.id);
@@ -355,16 +457,16 @@ fn canonical_map_order_does_not_change_view_identity() {
         ("z".to_owned(), content("last")),
         ("a".to_owned(), content("first")),
     ]);
-    let first = RepositoryView::new(tree.clone(), BTreeMap::new());
+    let first = RepositoryView::new(tree.clone(), BTreeMap::new(), ViewOrder::BASE);
     let reordered = tree.into_iter().rev().collect::<BTreeMap<_, _>>();
-    let second = RepositoryView::new(reordered, BTreeMap::new());
+    let second = RepositoryView::new(reordered, BTreeMap::new(), ViewOrder::BASE);
 
     assert_eq!(first.id, second.id);
 }
 
 #[test]
 fn conflict_edits_are_canonicalized_before_identity() {
-    let view = RepositoryView::new(Tree::new(), BTreeMap::new());
+    let view = RepositoryView::new(Tree::new(), BTreeMap::new(), ViewOrder::BASE);
     let a = EditRecord::new(
         "a",
         EditOperation::ExactFile {
@@ -420,6 +522,7 @@ fn conflict_edits_are_canonicalized_before_identity() {
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeSet::from([conflict_id]),
+        ViewOrder::BASE,
     );
     assert_ne!(view.id, manifested.id);
 }

@@ -1,6 +1,6 @@
 use crate::{
     ApplicationMapId, ChangeMapId, ConflictSetId, ContentMapId, ContentSetId, RepositoryStateId,
-    RetainedSetId, RevisionMapId, TreeId, ViewId, ViewLineageMapId,
+    RetainedSetId, RevisionMapId, TreeId, ViewId, ViewLineageMapId, ViewOrder,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,6 +11,7 @@ pub struct ViewRecord {
     pub unresolved_conflicts: ConflictSetId,
     /// The blobs the tree names, each with the number of tree entries naming it.
     pub required_content: ContentMapId,
+    pub order: ViewOrder,
 }
 
 impl ViewRecord {

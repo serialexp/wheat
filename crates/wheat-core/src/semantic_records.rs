@@ -23,6 +23,9 @@ pub struct RevisionRecord {
     pub change_id: ChangeId,
     pub metadata: RevisionMetadata,
     pub predecessor: Option<RevisionId>,
+    /// A combined revision's inputs other than its predecessor.
+    pub combines: BTreeSet<RevisionId>,
+    pub generation: u64,
     pub dependencies: BTreeSet<ChangeId>,
     pub authored_against: ViewId,
     pub edits: BTreeSet<EditId>,
@@ -42,6 +45,13 @@ impl RevisionRecord {
                 change_id: change_id_wire(self.change_id),
                 metadata: revision_metadata_wire(&self.metadata),
                 predecessors: self.predecessor.into_iter().map(revision_id_wire).collect(),
+                combines: self
+                    .combines
+                    .iter()
+                    .copied()
+                    .map(revision_id_wire)
+                    .collect(),
+                generation: self.generation,
                 dependencies: self
                     .dependencies
                     .iter()
@@ -147,6 +157,12 @@ pub fn decode_revision_record(bytes: &[u8]) -> Result<RevisionRecord, CanonicalO
             .first()
             .map(revision_id_domain)
             .transpose()?,
+        combines: revision
+            .combines
+            .iter()
+            .map(revision_id_domain)
+            .collect::<Result<_, _>>()?,
+        generation: revision.generation,
         dependencies: revision
             .dependencies
             .iter()
@@ -384,7 +400,7 @@ fn failed_evidence_domain(
     })
 }
 
-fn change_id_domain(id: &binschema::ChangeId) -> Result<ChangeId, CanonicalObjectError> {
+pub(crate) fn change_id_domain(id: &binschema::ChangeId) -> Result<ChangeId, CanonicalObjectError> {
     let bytes = id
         .uuid
         .bytes

@@ -2126,12 +2126,14 @@ fn integrate_workspace(
     )
 }
 
-/// Frontiers that cannot be joined yet are a conflict the user settles; anything else
-/// is a failure to read or write the store.
+/// Frontiers that cannot be joined yet are a conflict the user settles, and too many
+/// revisions of one change to combine at once a limit; anything else is a failure to
+/// read or write the store.
 fn integration_failure(error: wheat_store::RepositoryMutationError) -> anyhow::Error {
     use wheat_store::RepositoryMutationError as Mutation;
     match error {
         Mutation::RevisionsDoNotCombine { .. } => CliFailure::conflict(error.to_string()),
+        Mutation::TooManyRevisions { .. } => CliFailure::limit(error.to_string()),
         other => anyhow::Error::new(other),
     }
 }

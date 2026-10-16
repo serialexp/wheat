@@ -509,7 +509,11 @@ content it needs anyway; close or keep per Bart.
    authenticates each content-map node once rather than each view's whole map.
 3. Revision `combines` and `generation` with every traversal; `join_revisions`
    always authoring one combined revision; view `size`, `last`, `weight`; the weight rule in full
-   validation.
+   validation. Done. Full validation checks each view's order against its composition
+   parent (the target of the application of `last`) rather than recomputing it from
+   the view's maps; step 5's map check on that edge completes the induction. A
+   combined revision replays like a reapplied one (an edit may find its change already
+   made, never a conflict), and `join_revisions` refuses more than 65 lines at once.
 4. Application order index: format, `apply_step`, full validation of I2; tests
    including the canonical-order cases.
 5. Full validation tightened (partition equality, I1 for every view, composition

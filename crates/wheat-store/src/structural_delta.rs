@@ -1228,9 +1228,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
 
     async fn follow_revision(&mut self, stored: &StoredObject) -> Result<()> {
         let revision = decode(stored, wheat_core::decode_revision_record)?;
-        // Before the edits are pushed: those the predecessor had may be old.
-        if let Some(predecessor) = revision.predecessor {
-            self.learn_old_edits(predecessor).await?;
+        // Before the edits are pushed: those the predecessor or the combined inputs had
+        // may be old.
+        for parent in revision.predecessor.iter().chain(&revision.combines) {
+            self.learn_old_edits(*parent).await?;
         }
         let old_tree = self.old_tree_for(revision.authored_against).await?;
         object_graph::revision(&revision, |reference| {
@@ -1238,7 +1239,9 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                 return Ok(());
             };
             match site {
-                RevisionSite::Predecessor => self.push_entity(id, Entity::Revision, false),
+                RevisionSite::Predecessor | RevisionSite::Combines => {
+                    self.push_entity(id, Entity::Revision, false)
+                }
                 RevisionSite::AuthoredAgainst => self.push_entity(id, Entity::View, false),
                 RevisionSite::Tree => self.push_paired(Task::Tree { id, old: old_tree }, old_tree),
                 RevisionSite::Edit => self.push_edit(id),

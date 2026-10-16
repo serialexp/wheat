@@ -194,6 +194,8 @@ pub struct ChangeRevision {
     pub(crate) change_id: ChangeId,
     pub(crate) metadata: RevisionMetadata,
     pub(crate) predecessor: Option<RevisionId>,
+    pub(crate) combines: BTreeSet<RevisionId>,
+    pub(crate) generation: u64,
     pub(crate) dependencies: BTreeSet<ChangeId>,
     pub(crate) authored_against: ViewId,
     pub(crate) edits: RevisionEdits,
@@ -219,6 +221,17 @@ impl ChangeRevision {
     #[must_use]
     pub fn predecessor(&self) -> Option<RevisionId> {
         self.predecessor
+    }
+
+    /// A combined revision's inputs other than its predecessor.
+    #[must_use]
+    pub fn combines(&self) -> &BTreeSet<RevisionId> {
+        &self.combines
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[must_use]
@@ -522,6 +535,50 @@ impl DependencyGraph {
     }
 }
 
+/// The most inputs a combined revision has besides its predecessor.
+pub const MAX_COMBINES: usize = 64;
+
+/// A revision's generation: 1 + the largest generation among its parents (its
+/// predecessor and the revisions it combines), 0 with none. `None` on overflow.
+#[must_use]
+pub fn next_generation(parents: impl IntoIterator<Item = u64>) -> Option<u64> {
+    parents
+        .into_iter()
+        .max()
+        .map_or(Some(0), |highest| highest.checked_add(1))
+}
+
+/// A view's place in its history, determined by its revision map: how many changes
+/// it has, the last of them in the canonical order, and its weight, the sum over its
+/// changes of 1 + their revision's generation. Every lineage edge increases the
+/// weight, so the lineage cannot hold a cycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ViewOrder {
+    pub size: u64,
+    pub last: Option<ChangeId>,
+    pub weight: u64,
+}
+
+impl ViewOrder {
+    /// The base view's: no changes.
+    pub const BASE: Self = Self {
+        size: 0,
+        last: None,
+        weight: 0,
+    };
+
+    /// The order of this view with `change` applied last, at a revision of
+    /// `generation`. `None` on overflow.
+    #[must_use]
+    pub fn then(self, change: ChangeId, generation: u64) -> Option<Self> {
+        Some(Self {
+            size: self.size.checked_add(1)?,
+            last: Some(change),
+            weight: self.weight.checked_add(generation.checked_add(1)?)?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryView {
     pub id: ViewId,
@@ -531,12 +588,13 @@ pub struct RepositoryView {
     pub unresolved_conflicts: BTreeSet<ConflictId>,
     /// Each blob the tree names, with the number of tree entries naming it.
     pub required_content: BTreeMap<ContentId, u32>,
+    pub order: ViewOrder,
 }
 
 impl RepositoryView {
     #[must_use]
-    pub fn new(tree: Tree, frontier: BTreeMap<ChangeId, RevisionId>) -> Self {
-        Self::from_manifest(tree, frontier, BTreeMap::new(), BTreeSet::new())
+    pub fn new(tree: Tree, frontier: BTreeMap<ChangeId, RevisionId>, order: ViewOrder) -> Self {
+        Self::from_manifest(tree, frontier, BTreeMap::new(), BTreeSet::new(), order)
     }
 
     #[must_use]
@@ -545,6 +603,7 @@ impl RepositoryView {
         frontier: BTreeMap<ChangeId, RevisionId>,
         applications: BTreeMap<ChangeId, ApplicationId>,
         unresolved_conflicts: BTreeSet<ConflictId>,
+        order: ViewOrder,
     ) -> Self {
         let mut required_content = BTreeMap::new();
         for value in tree.values() {
@@ -557,6 +616,7 @@ impl RepositoryView {
             applications,
             unresolved_conflicts,
             required_content,
+            order,
         };
         view.id = ViewId::of_canonical_bytes(&crate::wire::view_bytes(&view));
         view

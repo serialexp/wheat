@@ -20,16 +20,23 @@
 //! joined view, which leaves it the one frontier.
 //!
 //! Frontiers may hold different revisions of one change. A revision another one
-//! descends from is superseded by it. Revisions that went their own ways from a common
-//! predecessor are combined by date: the earliest one, with each later one's edit
-//! changes since that predecessor laid on top in commit order, becomes a new revision
-//! following the earliest. Like any authored revision it must apply cleanly where it
-//! lands; if it does not, integration is refused and names the change.
+//! descends from (through predecessors and the inputs of combined revisions) is
+//! superseded by it. Revisions that went their own ways from a common predecessor are
+//! combined by date: the earliest one, with each later one's edit changes since that
+//! predecessor laid on top in commit order, becomes one new revision whose predecessor
+//! is the earliest and which records the others as the revisions it combines. It is a
+//! new revision even when one input already holds the combined edits, so it descends
+//! from every input and each frontier's edge to the joined view increases its weight.
+//! At most [`MAX_COMBINES`] + 1 revisions combine at once; more is refused, naming the
+//! change. The combination may find an edit already satisfied where it lands, as a
+//! reapplied revision may, but none may fail; if one does, integration is refused and
+//! names the change.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use wheat_core::{
-    ChangeId, EditId, EditRecord, EditTransition, RevisionId, RevisionRecord, ViewId, ViewRecord,
+    ChangeId, EditId, EditRecord, EditTransition, MAX_COMBINES, RevisionId, RevisionRecord, ViewId,
+    ViewRecord,
 };
 
 use crate::{
@@ -37,7 +44,7 @@ use crate::{
     PreparedRepositoryMutation, PublicationStore, RepositoryHead, RepositoryMutationError,
     RepositoryPublicationError, RepositoryReader, RetainedSetStore, RevisionMapDelta,
     RevisionMapStore,
-    repository_mutation::{Fresh, topological_by},
+    repository_mutation::{Fresh, Replay, generation_after, topological_by},
 };
 
 type Result<T> = std::result::Result<T, RepositoryMutationError>;
@@ -66,7 +73,11 @@ enum Joined {
 }
 
 struct Combination {
+    /// The earliest input.
     predecessor: RevisionId,
+    /// The other inputs.
+    combines: BTreeSet<RevisionId>,
+    generation: u64,
     metadata: wheat_core::RevisionMetadata,
     dependencies: BTreeSet<ChangeId>,
     edits: BTreeMap<EditId, EditRecord>,
@@ -172,18 +183,22 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         let mut conflicted = Vec::new();
         let mut combined = BTreeMap::new();
         for change in &order {
-            let (revision, edits) = match joined.remove(change).expect("ordered change") {
-                Joined::Existing(revision, record) => (revision, self.load_edits(&record).await?),
+            let (revision, generation, edits) = match joined.remove(change).expect("ordered change")
+            {
+                Joined::Existing(revision, record) => {
+                    (revision, record.generation, self.load_edits(&record).await?)
+                }
                 Joined::Combined(combination) => {
-                    let revision = self
+                    let generation = combination.generation;
+                    let (revision, edits) = self
                         .author_combination(*change, combination, &view, &mut fresh)
                         .await?;
-                    combined.insert(*change, revision.0);
-                    revision
+                    combined.insert(*change, revision);
+                    (revision, generation, edits)
                 }
             };
             let next = self
-                .apply_step(view, *change, revision, &edits, &mut fresh)
+                .apply_step(view, *change, revision, generation, &edits, &mut fresh)
                 .await?;
             if next.unresolved_conflicts != view.unresolved_conflicts {
                 conflicted.push(*change);
@@ -347,12 +362,7 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             if revisions.len() == 1 {
                 return Ok(Joined::Existing(*revision, record));
             }
-            let mut ancestors = Vec::new();
-            let mut next = record.predecessor;
-            while let Some(predecessor) = next {
-                ancestors.push(predecessor);
-                next = reader.revision(predecessor).await?.predecessor;
-            }
+            let ancestors = revision_ancestors(&reader, &record).await?;
             lines.insert(*revision, (record, ancestors));
         }
         // A revision another one descends from is superseded by it.
@@ -364,6 +374,12 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         if lines.len() == 1 {
             let (revision, (record, _)) = lines.pop_first().expect("one revision");
             return Ok(Joined::Existing(revision, record));
+        }
+        if lines.len() > MAX_COMBINES + 1 {
+            return Err(RepositoryMutationError::TooManyRevisions {
+                change,
+                count: lines.len(),
+            });
         }
 
         // The nearest predecessor every remaining line shares.
@@ -391,17 +407,14 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             dependencies.extend(later.dependencies.iter().copied());
             metadata = later.metadata.clone();
         }
-        // When one revision already holds the combined edits, it is the combination.
-        if let Some((revision, (record, _))) = lines
-            .iter()
-            .rev()
-            .find(|(_, (record, _))| record.edits == selected)
-        {
-            return Ok(Joined::Existing(*revision, record.clone()));
-        }
-        if first.edits == selected {
-            return Ok(Joined::Existing(earliest, first));
-        }
+        // Always a new revision, even when one input already holds the combined edits:
+        // the joined view's edge from every frontier must increase its weight, so the
+        // revision descends from every input.
+        let generation = generation_after(
+            std::iter::once(first.generation)
+                .chain(lines.iter().map(|(_, (record, _))| record.generation)),
+        )?;
+        let combines = lines.iter().map(|(revision, _)| *revision).collect();
         let mut edits = BTreeMap::new();
         for edit in &selected {
             edits.insert(*edit, reader.edit(*edit).await?);
@@ -415,6 +428,8 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         };
         Ok(Joined::Combined(Combination {
             predecessor: earliest,
+            combines,
+            generation,
             metadata,
             dependencies,
             edits,
@@ -422,8 +437,9 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         }))
     }
 
-    /// Authors `combination` where `change` lands, on `view`, as a revision that must
-    /// apply cleanly there. Returns it with its edits.
+    /// Authors `combination` where `change` lands, on `view`, as a revision none of
+    /// whose edits may fail there; an edit may already be satisfied, as when another
+    /// change already made it. Returns it with its edits.
     async fn author_combination(
         &self,
         change: ChangeId,
@@ -432,13 +448,7 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         fresh: &mut Fresh,
     ) -> Result<(RevisionId, BTreeMap<EditId, EditRecord>)> {
         let preliminary = self
-            .apply(
-                RevisionId::from_digest([0; 32]),
-                view,
-                &combination.edits,
-                fresh,
-                false,
-            )
+            .apply(view, &combination.edits, fresh, Replay::AuthorCombined)
             .await?;
         let tree = preliminary
             .clean_tree(&combination.edits)
@@ -450,6 +460,8 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             change_id: change,
             metadata: combination.metadata,
             predecessor: Some(combination.predecessor),
+            combines: combination.combines,
+            generation: combination.generation,
             dependencies: combination.dependencies,
             authored_against: view.id(),
             edits: combination.edits.keys().copied().collect(),
@@ -460,4 +472,29 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         let revision = self.put_revision(&record, fresh).await?;
         Ok((revision, combination.edits))
     }
+}
+
+/// Every revision `record` descends from, through predecessors and the inputs of
+/// combined revisions, nearest first, each once.
+async fn revision_ancestors<O: ImmutableObjectStore>(
+    reader: &RepositoryReader<'_, O>,
+    record: &RevisionRecord,
+) -> Result<Vec<RevisionId>> {
+    let mut ancestors = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = record
+        .predecessor
+        .iter()
+        .chain(&record.combines)
+        .copied()
+        .collect::<VecDeque<_>>();
+    while let Some(revision) = pending.pop_front() {
+        if !seen.insert(revision) {
+            continue;
+        }
+        ancestors.push(revision);
+        let parent = reader.revision(revision).await?;
+        pending.extend(parent.predecessor.iter().chain(&parent.combines).copied());
+    }
+    Ok(ancestors)
 }

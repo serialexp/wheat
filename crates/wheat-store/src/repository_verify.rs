@@ -11,7 +11,8 @@ use lru::LruCache;
 use crate::{
     ApplicationMapStore, ConflictSetStore, ContentMapDelta, ContentMapError, ContentMapStore,
     ContentSetStore, ContentStoreError, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError,
-    RepositoryPublicationError, RepositoryReader, RetainedSetStore, StoredObject, TreeDiffLimits,
+    RepositoryPublicationError, RepositoryReader, RetainedSetStore, RevisionMapStore, StoredObject,
+    TreeDiffLimits,
     application_map::ApplicationCollection,
     radix::{ContextWalkStep, DiffLimits, PairedContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
@@ -758,6 +759,47 @@ where
         })
     }
 
+    /// Checks `view`'s size, last change and weight against its composition parent: the
+    /// target of its last change's application, with that change's revision applied.
+    /// The base has none. With every view's maps those of its composition parent plus
+    /// its last change, this proves each view's order from its maps, one view at a time.
+    async fn verify_view_order(
+        &self,
+        state: &RepositoryStateRecord,
+        id: ViewId,
+        view: &ViewRecord,
+    ) -> Result<()> {
+        if id == state.base_view {
+            return if view.order == ViewOrder::BASE {
+                Ok(())
+            } else {
+                Err(invalid("base view has changes in its order"))
+            };
+        }
+        let change = view
+            .order
+            .last
+            .ok_or_else(|| invalid("non-base view has no last change"))?;
+        let revision_id = RevisionMapStore::new(self.reader.objects)
+            .get(view.revisions, change)
+            .await?
+            .ok_or_else(|| invalid("view's last change is not in its revision map"))?;
+        let application_id = ApplicationMapStore::new(self.reader.objects)
+            .get(view.applications, change)
+            .await?
+            .ok_or_else(|| invalid("view's last change has no application"))?;
+        let application = self.reader.application(application_id).await?;
+        if application.revision_id != revision_id {
+            return Err(invalid("view's last application is of another revision"));
+        }
+        let revision = self.reader.revision(revision_id).await?;
+        let parent = self.reader.view(application.target_view).await?;
+        if parent.order.then(change, revision.generation) != Some(view.order) {
+            return Err(invalid("view order does not follow its composition parent"));
+        }
+        Ok(())
+    }
+
     async fn verify_lineage_semantics(
         &self,
         state: &RepositoryStateRecord,
@@ -787,9 +829,26 @@ where
                 children_by_parent.entry(*parent).or_default().push(child);
             }
         }
+        let mut weights = BTreeMap::new();
         for view in &retained_views {
             if *view != state.base_view && incoming.get(view).copied().unwrap_or_default() == 0 {
                 return Err(invalid("retained non-base view lacks incoming lineage"));
+            }
+            let record = self.reader.view(*view).await?;
+            self.verify_view_order(state, *view, &record).await?;
+            weights.insert(*view, record.order.weight);
+        }
+        // Every edge increases the weight, so the lineage has no cycle, whatever other
+        // valid states it is joined with.
+        for (parent, children) in &children_by_parent {
+            for child in children {
+                match (weights.get(parent), weights.get(child)) {
+                    (Some(parent), Some(child)) if child > parent => {}
+                    (Some(_), Some(_)) => {
+                        return Err(invalid("lineage edge does not increase view weight"));
+                    }
+                    _ => return Err(invalid("lineage edge names an unretained view")),
+                }
             }
         }
 
@@ -990,11 +1049,17 @@ where
             for dependency in &revision.dependencies {
                 self.retained_change(*dependency)?;
             }
-            if let Some(id) = revision.predecessor {
-                self.retained(RETAINED_REVISIONS, id.into())?;
-                if self.reader.revision(id).await?.change_id != revision.change_id {
+            let mut parent_generations = Vec::new();
+            for id in revision.predecessor.iter().chain(&revision.combines) {
+                self.retained(RETAINED_REVISIONS, (*id).into())?;
+                let parent = self.reader.revision(*id).await?;
+                if parent.change_id != revision.change_id {
                     return Err(invalid("predecessor belongs to another change"));
                 }
+                parent_generations.push(parent.generation);
+            }
+            if wheat_core::next_generation(parent_generations) != Some(revision.generation) {
+                return Err(invalid("revision generation does not follow its parents"));
             }
             self.tree(revision.resulting_tree, aggregate).await?;
             let transition = &revision.transition;
@@ -1079,11 +1144,18 @@ where
             let replay = self
                 .replay(authored.tree, revision.resulting_tree, &revision.edits)
                 .await?;
+            // A combined revision follows a reapplied revision's rule: an edit already
+            // satisfied where it landed is fine. Any other revision's edits all applied.
+            let combined = !revision.combines.is_empty();
             if replay.result.outcomes.values().any(|outcome| {
                 !matches!(
                     outcome,
                     wheat_core::edit_application::ApplicationOutcome::Applied { .. }
-                )
+                ) && !(combined
+                    && matches!(
+                        outcome,
+                        wheat_core::edit_application::ApplicationOutcome::AlreadySatisfied { .. }
+                    ))
             }) {
                 return Err(invalid("authored revision does not apply cleanly"));
             }
@@ -1389,6 +1461,7 @@ mod content_map_tests {
             applications: ApplicationMapId::from_digest([0; 32]),
             unresolved_conflicts: ConflictSetId::from_digest([0; 32]),
             required_content,
+            order: ViewOrder::BASE,
         }
     }
 

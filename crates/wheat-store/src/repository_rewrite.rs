@@ -509,10 +509,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
                 if views.insert(revision.authored_against) {
                     view_queue.push_back(revision.authored_against);
                 }
-                if let Some(predecessor) = revision.predecessor
-                    && revisions.insert(predecessor)
-                {
-                    revision_queue.push_back(predecessor);
+                for parent in revision.predecessor.iter().chain(&revision.combines) {
+                    if revisions.insert(*parent) {
+                        revision_queue.push_back(*parent);
+                    }
                 }
                 for resolution in revision.transition.resolutions {
                     if applications.insert(resolution.application) {
@@ -979,6 +979,8 @@ mod tests {
                 change_id: change(index),
                 metadata: RevisionMetadata::default(),
                 predecessor: None,
+                combines: BTreeSet::new(),
+                generation: 0,
                 dependencies,
                 authored_against: ViewId::from_digest([0; 32]),
                 edits: BTreeSet::new(),

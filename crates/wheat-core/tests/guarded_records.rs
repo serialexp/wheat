@@ -103,6 +103,8 @@ fn revision_encodes_selected_ids_not_edit_definitions_in_canonical_order() {
         change_id: ChangeId::from_bytes([1; 16]),
         metadata: RevisionMetadata::default(),
         predecessor: None,
+        combines: BTreeSet::new(),
+        generation: 0,
         dependencies: BTreeSet::new(),
         authored_against: ViewId::from_digest([2; 32]),
         edits: edits.clone(),

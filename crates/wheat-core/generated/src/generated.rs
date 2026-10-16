@@ -61,6 +61,11 @@ impl WheatObject {
                 for item in &v.predecessors {
                     item.encode_into(encoder)?;
                 }
+                encoder.write_uint32(v.combines.len() as u32, Endianness::BigEndian);
+                for item in &v.combines {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint64(v.generation, Endianness::BigEndian);
                 encoder.write_uint32(v.dependencies.len() as u32, Endianness::BigEndian);
                 for item in &v.dependencies {
                     item.encode_into(encoder)?;
@@ -98,6 +103,12 @@ impl WheatObject {
                 v.applications.encode_into(encoder)?;
                 v.unresolved_conflicts.encode_into(encoder)?;
                 v.required_content.encode_into(encoder)?;
+                encoder.write_uint64(v.size, Endianness::BigEndian);
+                encoder.write_uint32(v.last.len() as u32, Endianness::BigEndian);
+                for item in &v.last {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint64(v.weight, Endianness::BigEndian);
             }
             WheatObject::ContentMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -1714,6 +1725,8 @@ pub struct RevisionV1Input {
     pub change_id: ChangeId,
     pub metadata: RevisionMetadataV1,
     pub predecessors: Vec<RevisionId>,
+    pub combines: Vec<RevisionId>,
+    pub generation: u64,
     pub dependencies: Vec<ChangeId>,
     pub authored_against: ViewId,
     pub edits: Vec<EditId>,
@@ -1727,6 +1740,8 @@ pub struct RevisionV1Output {
     pub change_id: ChangeId,
     pub metadata: RevisionMetadataV1,
     pub predecessors: Vec<RevisionId>,
+    pub combines: Vec<RevisionId>,
+    pub generation: u64,
     pub dependencies: Vec<ChangeId>,
     pub authored_against: ViewId,
     pub edits: Vec<EditId>,
@@ -1751,6 +1766,11 @@ impl RevisionV1Input {
         for item in &self.predecessors {
             item.encode_into(encoder)?;
         }
+        encoder.write_u32_be(self.combines.len() as u32);
+        for item in &self.combines {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u64_be(self.generation);
         encoder.write_u32_be(self.dependencies.len() as u32);
         for item in &self.dependencies {
             item.encode_into(encoder)?;
@@ -1789,6 +1809,13 @@ impl RevisionV1Output {
             predecessors.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
+        let mut combines = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = RevisionId::decode_with_decoder(decoder)?;
+            combines.push(item);
+        }
+        let generation = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
         let mut dependencies = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
             let item = ChangeId::decode_with_decoder(decoder)?;
@@ -1808,6 +1835,8 @@ impl RevisionV1Output {
             change_id,
             metadata,
             predecessors,
+            combines,
+            generation,
             dependencies,
             authored_against,
             edits,
@@ -1829,6 +1858,8 @@ impl From<RevisionV1Output> for RevisionV1Input {
             change_id: o.change_id,
             metadata: o.metadata,
             predecessors: o.predecessors,
+            combines: o.combines,
+            generation: o.generation,
             dependencies: o.dependencies,
             authored_against: o.authored_against,
             edits: o.edits,
@@ -1845,6 +1876,8 @@ impl From<RevisionV1Input> for RevisionV1Output {
             change_id: i.change_id,
             metadata: i.metadata,
             predecessors: i.predecessors,
+            combines: i.combines,
+            generation: i.generation,
             dependencies: i.dependencies,
             authored_against: i.authored_against,
             edits: i.edits,
@@ -3018,6 +3051,9 @@ pub struct ViewV1Input {
     pub applications: ApplicationMapId,
     pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentMapId,
+    pub size: u64,
+    pub last: Vec<ChangeId>,
+    pub weight: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3028,6 +3064,9 @@ pub struct ViewV1Output {
     pub applications: ApplicationMapId,
     pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentMapId,
+    pub size: u64,
+    pub last: Vec<ChangeId>,
+    pub weight: u64,
 }
 
 pub type ViewV1 = ViewV1Output;
@@ -3046,6 +3085,12 @@ impl ViewV1Input {
         self.applications.encode_into(encoder)?;
         self.unresolved_conflicts.encode_into(encoder)?;
         self.required_content.encode_into(encoder)?;
+        encoder.write_u64_be(self.size);
+        encoder.write_u32_be(self.last.len() as u32);
+        for item in &self.last {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u64_be(self.weight);
         Ok(())
     }
 }
@@ -3069,6 +3114,14 @@ impl ViewV1Output {
         let applications = ApplicationMapId::decode_with_decoder(decoder)?;
         let unresolved_conflicts = ConflictSetId::decode_with_decoder(decoder)?;
         let required_content = ContentMapId::decode_with_decoder(decoder)?;
+        let size = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut last = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = ChangeId::decode_with_decoder(decoder)?;
+            last.push(item);
+        }
+        let weight = decoder.read_u64_be()?;
         Ok(Self {
             wire_tag,
             tree,
@@ -3076,6 +3129,9 @@ impl ViewV1Output {
             applications,
             unresolved_conflicts,
             required_content,
+            size,
+            last,
+            weight,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -3094,6 +3150,9 @@ impl From<ViewV1Output> for ViewV1Input {
             applications: o.applications,
             unresolved_conflicts: o.unresolved_conflicts,
             required_content: o.required_content,
+            size: o.size,
+            last: o.last,
+            weight: o.weight,
         }
     }
 }
@@ -3107,6 +3166,9 @@ impl From<ViewV1Input> for ViewV1Output {
             applications: i.applications,
             unresolved_conflicts: i.unresolved_conflicts,
             required_content: i.required_content,
+            size: i.size,
+            last: i.last,
+            weight: i.weight,
         }
     }
 }

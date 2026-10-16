@@ -1,12 +1,12 @@
 //! Direct, copy-on-write persistence of clean, first-parent commits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wheat_core::{
     ApplicationId, ApplicationRecord, ApplicationResultRecord, AppliedEditEvidence, ByteRange,
     CanonicalObjectError, Change, ChangeId, ChangeObjectId, ChangeProposal, ContentIo, EditId,
-    RevisionId, RevisionRecord, Tree, ViewId, ViewRecord, decode_view_record,
+    RevisionId, RevisionRecord, Tree, ViewId, ViewOrder, ViewRecord, decode_view_record,
     edit_application::{ApplicationError, ApplicationLimits, ApplicationOutcome, apply_edits},
 };
 
@@ -51,6 +51,8 @@ pub enum CommitWriterError {
     DuplicateChange(ChangeId),
     #[error("parent view has unresolved conflicts")]
     ConflictedParent,
+    #[error("the view's size or weight overflows")]
+    OrderOverflow,
     #[error("edit application failed: {0:?}")]
     Application(ApplicationError),
     #[error("edit application did not produce a clean result")]
@@ -102,6 +104,7 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             applications,
             unresolved_conflicts,
             required_content,
+            order: ViewOrder::BASE,
         };
         self.put(view.id().into(), &view.canonical_bytes()).await?;
         Ok(view.id())
@@ -251,6 +254,8 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             change_id: proposal.id,
             metadata: proposal.revision_metadata,
             predecessor: None,
+            combines: BTreeSet::new(),
+            generation: 0,
             dependencies: proposal.dependencies,
             authored_against: parent,
             edits: proposal.edits.edits.keys().copied().collect(),
@@ -294,6 +299,10 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             applications: application_root,
             unresolved_conflicts: parent_record.unresolved_conflicts,
             required_content,
+            order: parent_record
+                .order
+                .then(proposal.id, revision.generation)
+                .ok_or(CommitWriterError::OrderOverflow)?,
         };
         let resulting_view = view.id();
         self.put(resulting_view.into(), &view.canonical_bytes())

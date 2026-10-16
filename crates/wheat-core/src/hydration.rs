@@ -38,6 +38,8 @@ pub fn hydrate_revision(
         change_id: record.change_id,
         metadata: record.metadata,
         predecessor: record.predecessor,
+        combines: record.combines,
+        generation: record.generation,
         dependencies: record.dependencies,
         authored_against: record.authored_against,
         edits: RevisionEdits {

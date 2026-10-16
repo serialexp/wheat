@@ -9,7 +9,7 @@ use crate::{
     ChangeRevision, Conflict, ConflictId, ConflictResolution, ContentIo, DependencyGraph,
     EditFailure, EditId, EditRecord, FailedEditEvidence, ObjectId, RejectedEdit, RepositoryClosure,
     RepositoryState, RepositoryStateId, RepositoryStateRecord, RepositoryView, RevisionEdits,
-    RevisionId, RevisionMetadata, RevisionRecord, Tree, ViewId,
+    RevisionId, RevisionMetadata, RevisionRecord, Tree, ViewId, ViewOrder,
 };
 
 mod application;
@@ -144,7 +144,7 @@ struct ActiveSelection {
 impl Repository {
     #[must_use]
     pub fn new(base_tree: Tree) -> Self {
-        let view = RepositoryView::new(base_tree, BTreeMap::new());
+        let view = RepositoryView::new(base_tree, BTreeMap::new(), ViewOrder::BASE);
         let id = view.id;
         let mut views = BTreeMap::new();
         views.insert(id, view);
@@ -1065,6 +1065,8 @@ impl Repository {
                 change_id: proposal.id,
                 metadata: proposal.revision_metadata,
                 predecessor: None,
+                combines: BTreeSet::new(),
+                generation: 0,
                 dependencies: proposal.dependencies.clone(),
                 authored_against: target.id,
                 edits: proposal.edits,
@@ -1086,6 +1088,7 @@ impl Repository {
                 frontier,
                 applications,
                 conflicts,
+                order_after(&target, proposal.id, revision.generation)?,
             );
 
             self.changes.insert(
@@ -1201,11 +1204,25 @@ impl Repository {
                 )));
             }
         };
+        let parent_generations = revision
+            .predecessor
+            .map(|predecessor| {
+                self.revisions
+                    .get(&predecessor)
+                    .map(ChangeRevision::generation)
+                    .ok_or(RepositoryError::UnknownRevision(predecessor))
+            })
+            .transpose()?;
+        let generation = crate::next_generation(parent_generations).ok_or(
+            RepositoryError::InvalidRepositoryState("revision generation overflow"),
+        )?;
         let mut record = ChangeRevision {
             id: RevisionId::from_digest([0; 32]),
             change_id: change,
             metadata: revision.metadata,
             predecessor: revision.predecessor,
+            combines: BTreeSet::new(),
+            generation,
             dependencies: revision.dependencies,
             authored_against: spot.id,
             edits: revision.edits,
@@ -1254,11 +1271,13 @@ impl Repository {
         if let ApplicationResult::Conflicted { conflict, .. } = &application.result {
             conflicts.insert(conflict.id);
         }
+        let order = order_after(&target, change, revision.generation)?;
         let view = RepositoryView::from_manifest(
             application.result.materialized_tree().clone(),
             frontier,
             applications,
             conflicts,
+            order,
         );
         self.applications.insert(application.id, application);
         self.record_view(target.id, view.clone());
@@ -1327,6 +1346,20 @@ impl Repository {
         debug_assert_eq!(ordered.len(), selected.len(), "dependency graph is acyclic");
         ordered
     }
+}
+
+/// The order of `target` with `change` applied last at a revision of `generation`.
+fn order_after(
+    target: &RepositoryView,
+    change: ChangeId,
+    generation: u64,
+) -> Result<ViewOrder, RepositoryError> {
+    target
+        .order
+        .then(change, generation)
+        .ok_or(RepositoryError::InvalidRepositoryState(
+            "view weight overflow",
+        ))
 }
 
 fn single_outcome(outcome: RevisionsOutcome, change: ChangeId) -> RevisionOutcome {

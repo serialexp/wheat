@@ -99,20 +99,18 @@ fn identity_and_emitted_view_roots_use_the_same_builder() {
 fn root_only_view_encoding_stays_constant_size() {
     let mut tree = Tree::new();
     let mut frontier = BTreeMap::new();
-    let empty = RepositoryView::new(tree.clone(), frontier.clone());
+    let mut order = ViewOrder::BASE;
+    let mut views = Vec::new();
     for n in 0..32u8 {
         tree.insert(format!("file{n}"), content(&[n]));
-        frontier.insert(
-            ChangeId::from_bytes([n; 16]),
-            RevisionId::from_digest([n; 32]),
-        );
+        let change = ChangeId::from_bytes([n; 16]);
+        frontier.insert(change, RevisionId::from_digest([n; 32]));
+        order = order.then(change, 0).unwrap();
+        views.push(RepositoryView::new(tree.clone(), frontier.clone(), order));
     }
-    let populated = RepositoryView::new(tree, frontier);
-    assert_eq!(
-        empty.canonical_bytes().len(),
-        populated.canonical_bytes().len()
-    );
-    assert_ne!(empty.id, populated.id);
+    let (first, last) = (&views[0], &views[31]);
+    assert_eq!(first.canonical_bytes().len(), last.canonical_bytes().len());
+    assert_ne!(first.id, last.id);
 }
 
 #[test]
