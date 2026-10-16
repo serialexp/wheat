@@ -32,6 +32,10 @@ pub(crate) const NAME: &str = "publish_contention";
 /// A writer that needs more attempts than this for one change is starved; the case
 /// fails rather than spin.
 const MAX_ATTEMPTS: usize = 500;
+/// The writer count the throughput budget is for, and the budget: accepted publishes
+/// per second.
+const BUDGET_WRITERS: usize = 8;
+const ACCEPTED_PER_SECOND_BUDGET: f64 = 10.0;
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let writer_counts: &[usize] = context.scale.pick(&[1, 2, 4, 8, 16], &[1, 2]);
@@ -59,7 +63,20 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         )
         .with_context(|| format!("{writers} writers"))?;
         level.record(&mut recorder, writers);
+        // The server joins a publish with whatever was published since, so unrelated
+        // changes are accepted on their first attempt however many writers there are.
+        recorder.at_most(
+            &format!("writers_{writers}.attempts_per_publish"),
+            1.0,
+            "count",
+        );
+        recorder.at_most(&format!("writers_{writers}.attempts_max"), 1.0, "count");
     }
+    recorder.at_least(
+        &format!("writers_{BUDGET_WRITERS}.accepted_per_second"),
+        ACCEPTED_PER_SECOND_BUDGET,
+        "count",
+    );
     Ok(recorder.finish())
 }
 

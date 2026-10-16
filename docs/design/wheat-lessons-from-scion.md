@@ -70,12 +70,12 @@ land and move completed bullets from Outstanding to Done.
   "Profile at 8 writers" and the sections after it): 8 writers now reach 41 to 47
   accepted publishes per second with one attempt each, and the server is about 5%
   busy there.
+- [x] **Publish contention budget (2026-10-16).** Contract rules on
+  `publish_contention`: at least 10 accepted publishes per second with 8 writers, and
+  `attempts_per_publish` and `attempts_max` at most 1 at every writer count.
 
 ### Outstanding
 
-- [ ] **Publish contention budget.** Contract rules on `publish_contention`: at least
-  10 accepted publishes per second with 8 writers, and one attempt per publish at
-  every writer count.
 - [ ] **Client pushes the difference up front.** The client runs the server's walk
   from the last fetched head and sends the result, so a publish takes one round trip
   instead of one per tree level.

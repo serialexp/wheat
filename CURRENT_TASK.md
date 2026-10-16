@@ -304,5 +304,9 @@ Not yet profiled: from 2 writers on every publish is joined and the median publi
 latency jumps 18 -> ~55 ms; the server adds ~1 ms, so it is likely the client
 taking the joined head.
 
-Next: contract rules (step 4: writers_8.accepted_per_second >= 10, attempts_per_publish
-<= 1, attempts_max <= 1), then maybe the client-side push.
+Contract rules done 2026-10-16 (`publish_contention.rs`: writers_8.accepted_per_second
+>= 10; attempts_per_publish and attempts_max <= 1 at every writer count; new
+`Recorder::at_least`). Full-size run: no violations.
+
+Left of Bart's plan: "maybe" the client-side push of the difference (design doc
+Outstanding item). Not started; needs Bart's go-ahead.

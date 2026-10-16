@@ -167,6 +167,13 @@ impl Recorder {
             .push(ContractRule::at_most(name, value, unit));
     }
 
+    pub(crate) fn at_least(&mut self, name: &str, value: f64, unit: &str) {
+        let name = self.name(name);
+        self.output
+            .rules
+            .push(ContractRule::at_least(name, value, unit));
+    }
+
     pub(crate) fn finish(self) -> CaseOutput {
         self.output
     }
