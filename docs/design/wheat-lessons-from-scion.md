@@ -66,8 +66,8 @@ land and move completed bullets from Outstanding to Done.
   instead of one per tree level.
 - [ ] **Packed appends and the catalog lock.** Throughput stops near 10 per second
   at the packed store (see "Profile at 8 writers"): two appends of about 46 ms per
-  publish, and one catalog mutex that makes every read wait for them. Fix to be chosen
-  from that profile.
+  publish, and one catalog mutex that makes every read wait for them. Being tried
+  cumulatively; reads no longer wait for appends (see "Reads beside an append").
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
@@ -298,6 +298,30 @@ The packed store is the bottleneck, not the join's own work:
 - One append of 46 ms: journal write 10, segment write and sync 6, head write 8,
   journal removal 4, SQLite index transaction 17 (`journal_mode=DELETE`,
   `synchronous=FULL`). The segment data itself is the smallest part.
+
+#### Reads beside an append (2026-10-16)
+
+The fixes from that profile are being tried cumulatively, measuring after each.
+First: a durable append does its I/O without the catalog mutex. It plans under the
+lock, then runs the journal, segment write, head, journal removal and locator rows
+holding only a writer lock, on its own file handle and its own SQLite connection,
+then takes the catalog again to install the result. Reads go on meanwhile and see
+only published records. The locator moved to `journal_mode=WAL` so the reading
+connection is not blocked by the appending one's commit.
+
+| writers | accepted/s before | after (two runs) |
+|---|---|---|
+| 1 | 7.54 | 8.80, 8.53 |
+| 2 | 6.72 | 5.62, 5.82 |
+| 4 | 8.43 | 10.66, 9.47 |
+| 8 | 9.24 | 13.67, 13.32 |
+| 16 | 9.13 | 12.67, 11.83 |
+
+Every count still takes one attempt per publish. Catalog waits fell from 165 ms to
+about 2 ms per publish. The locator transaction fell from 17 ms to about 5, so an
+append takes 33 to 37 ms. Appends are now the ceiling: at 8 and 16 writers one is
+running 96% of the wall time, and a publish still makes two. The drop at 2 writers
+reproduced and is not explained yet.
 
 ### Alternative: per-label heads
 

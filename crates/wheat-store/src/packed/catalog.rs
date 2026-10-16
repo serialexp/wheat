@@ -9,8 +9,9 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
 
@@ -25,7 +26,10 @@ use wheat_core::{
 };
 
 use super::{
-    active::{ActiveError, ActivePublishedState, ActiveRecoveryJournal, ActiveSegment},
+    active::{
+        ActiveError, ActivePublishedState, ActiveRecoveryJournal, ActiveSegment, ActiveWrite,
+        ActiveWritten,
+    },
     bulk::{BulkSegment, FinalizedBulk},
     segment::{
         MAX_SEGMENT_PAYLOAD_BYTES, MAX_SEGMENT_TAIL_BYTES, METADATA_NAMESPACE,
@@ -76,6 +80,12 @@ pub(crate) enum CatalogError {
     Corrupt(&'static str),
     #[error("catalog must be reopened after an interrupted seal")]
     Poisoned,
+    /// A read beside an append found the locator in need of repair, which waits
+    /// for the append. [`SharedCatalog`] retries the read once it is done.
+    #[error("the locator needs repair, which waits for the append in progress")]
+    AppendInFlight,
+    #[error("packed catalog lock is poisoned: a holder panicked")]
+    LockPoisoned,
     #[error("repack requires durable storage without pending deferred writes")]
     RepackUnsupported,
     #[error("repack inventory exceeds its {limit} record limit")]
@@ -251,6 +261,11 @@ pub(crate) struct PackedCatalog {
     catalogs: PathBuf,
     _lock: File,
     index: Connection,
+    /// A second connection to the locator, for appends: an [`AppendJob`] takes it
+    /// and writes its rows while `index` serves reads.
+    append_index: Option<Connection>,
+    /// Between [`Self::begin_append`] and [`Self::finish_append`].
+    append_in_flight: bool,
     generation: Option<u64>,
     head: Option<[u8; 32]>,
     content_generation: PhysicalContentGeneration,
@@ -272,11 +287,284 @@ pub(crate) struct PackedCatalog {
     #[cfg(test)]
     append_failpoint: Option<AppendFailpoint>,
     #[cfg(test)]
+    append_pause: Option<AppendPause>,
+    #[cfg(test)]
     deferred_failpoint: Option<DeferredFailpoint>,
     #[cfg(test)]
     close_failpoint: Option<CloseFailpoint>,
     #[cfg(test)]
     repack_failpoint: Option<RepackFailpoint>,
+}
+
+/// A [`PackedCatalog`] shared between threads. Writers take turns on `writer`; a
+/// durable append does its I/O holding only that, so reads of published records
+/// go on meanwhile instead of waiting out the append's fsyncs. Every operation
+/// other than a read or a put is exclusive: it waits for any append to finish
+/// and holds off the next.
+pub(crate) struct SharedCatalog {
+    writer: Mutex<()>,
+    catalog: Mutex<PackedCatalog>,
+}
+
+/// Exclusive use of a [`SharedCatalog`]: no append is in progress.
+pub(crate) struct ExclusiveCatalog<'a> {
+    _writer: MutexGuard<'a, ()>,
+    catalog: MutexGuard<'a, PackedCatalog>,
+}
+
+impl Deref for ExclusiveCatalog<'_> {
+    type Target = PackedCatalog;
+
+    fn deref(&self) -> &PackedCatalog {
+        &self.catalog
+    }
+}
+
+impl DerefMut for ExclusiveCatalog<'_> {
+    fn deref_mut(&mut self) -> &mut PackedCatalog {
+        &mut self.catalog
+    }
+}
+
+impl SharedCatalog {
+    pub(crate) fn new(catalog: PackedCatalog) -> Self {
+        Self {
+            writer: Mutex::new(()),
+            catalog: Mutex::new(catalog),
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> Result<PackedCatalog, CatalogError> {
+        self.catalog
+            .into_inner()
+            .map_err(|_| CatalogError::LockPoisoned)
+    }
+
+    /// Waits for any append to finish and holds off the next.
+    pub(crate) fn exclusive(&self) -> Result<ExclusiveCatalog<'_>, CatalogError> {
+        let writer = debug_span!("packed_writer_wait").in_scope(|| self.writer.lock());
+        Ok(ExclusiveCatalog {
+            _writer: writer.map_err(|_| CatalogError::LockPoisoned)?,
+            catalog: self.lock()?,
+        })
+    }
+
+    /// The catalog between appends' steps. Only for reads: an append may be in
+    /// progress.
+    fn lock(&self) -> Result<MutexGuard<'_, PackedCatalog>, CatalogError> {
+        debug_span!("packed_catalog_wait")
+            .in_scope(|| self.catalog.lock())
+            .map_err(|_| CatalogError::LockPoisoned)
+    }
+
+    /// See [`PackedCatalog::put_records`].
+    pub(crate) fn put_records(&self, records: &[SegmentRecord<'_>]) -> Result<(), CatalogError> {
+        let mut exclusive = self.exclusive()?;
+        if exclusive.durability == Durability::Deferred {
+            return exclusive.put_records(records);
+        }
+        let ExclusiveCatalog {
+            _writer: _turn,
+            mut catalog,
+        } = exclusive;
+        let mut put = catalog.begin_durable_put(records)?;
+        while let Some(job) = catalog.next_append(&mut put)? {
+            drop(catalog);
+            let outcome = job.run();
+            catalog = self.lock()?;
+            catalog.finish_put_append(&put, outcome)?;
+        }
+        Ok(())
+    }
+
+    /// Runs `read` beside any append in progress, or after it when the read needs
+    /// the locator repaired.
+    fn read<T>(
+        &self,
+        read: impl Fn(&mut PackedCatalog) -> Result<T, CatalogError>,
+    ) -> Result<T, CatalogError> {
+        let result = read(&mut *self.lock()?);
+        match result {
+            Err(CatalogError::AppendInFlight) => read(&mut *self.exclusive()?),
+            result => result,
+        }
+    }
+
+    /// See [`PackedCatalog::get`].
+    pub(crate) fn get(
+        &self,
+        namespace: u8,
+        digest: [u8; 32],
+    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+        self.read(|catalog| catalog.get(namespace, digest))
+    }
+
+    /// See [`PackedCatalog::get_bounded`].
+    pub(crate) fn get_bounded(
+        &self,
+        namespace: u8,
+        digest: [u8; 32],
+        max: usize,
+    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+        self.read(|catalog| catalog.get_bounded(namespace, digest, max))
+    }
+
+    /// See [`PackedCatalog::logical_length`].
+    pub(crate) fn logical_length(
+        &self,
+        namespace: u8,
+        digest: [u8; 32],
+    ) -> Result<Option<u64>, CatalogError> {
+        self.read(|catalog| catalog.logical_length(namespace, digest))
+    }
+
+    /// The catalog for a read of its published state, beside any append in
+    /// progress.
+    pub(crate) fn published(&self) -> Result<MutexGuard<'_, PackedCatalog>, CatalogError> {
+        self.lock()
+    }
+}
+
+/// The prepared records of a durable put that are still to be appended.
+struct DurablePut<'a> {
+    prepared: Vec<PreparedSegmentRecord<'a>>,
+}
+
+/// The durable I/O of one append, done without the catalog: the journal, the
+/// segment write, the active head, the journal's removal and the locator rows,
+/// on a connection of the job's own.
+struct AppendJob<'a> {
+    root: PathBuf,
+    durability: Durability,
+    journal: ActiveRecoveryJournal,
+    write: ActiveWrite<'a>,
+    index: Connection,
+    catalog_head: CatalogHead,
+    locator_rows: u64,
+    #[cfg(test)]
+    failpoint: Option<AppendFailpoint>,
+    #[cfg(test)]
+    pause: Option<AppendPause>,
+}
+
+/// How far an [`AppendJob`] got.
+struct AppendOutcome<'a> {
+    index: Connection,
+    stage: AppendStage<'a>,
+}
+
+enum AppendStage<'a> {
+    /// Nothing reached the segment.
+    JournalFailed(ActiveWrite<'a>, CatalogError),
+    /// The segment write's outcome, then the locator row count after the steps that
+    /// follow it, or the first of them that failed.
+    Written(ActiveWritten, Result<u64, CatalogError>),
+}
+
+impl<'a> AppendJob<'a> {
+    #[tracing::instrument(name = "packed_append", level = "debug", skip_all)]
+    fn run(self) -> AppendOutcome<'a> {
+        let Self {
+            root,
+            durability,
+            journal,
+            write,
+            mut index,
+            catalog_head,
+            locator_rows,
+            #[cfg(test)]
+            failpoint,
+            #[cfg(test)]
+            pause,
+        } = self;
+        #[cfg(test)]
+        let pause_at = |point| {
+            if let Some(pause) = pause.as_ref().filter(|pause| pause.at == point) {
+                pause.wait();
+            }
+        };
+        let journaled = debug_span!("packed_append_journal")
+            .in_scope(|| write_active_journal(&root, &journal, durability));
+        if let Err(error) = journaled {
+            return AppendOutcome {
+                index,
+                stage: AppendStage::JournalFailed(write, error),
+            };
+        }
+        let (written, synced) = debug_span!("packed_append_segment").in_scope(|| {
+            let written = write.run();
+            let synced = written.sync(durability);
+            (written, synced)
+        });
+        #[cfg(test)]
+        pause_at(AppendPausePoint::SegmentWritten);
+        let rest = match written.appended() {
+            None => Ok(locator_rows),
+            Some((state, added)) => (|| {
+                #[cfg(test)]
+                if failpoint == Some(AppendFailpoint::MutationApplied) {
+                    return Err(CatalogError::Corrupt("test failure after active mutation"));
+                }
+                synced?;
+                debug_span!("packed_append_head")
+                    .in_scope(|| write_active_head(&root, state, durability))?;
+                #[cfg(test)]
+                if failpoint == Some(AppendFailpoint::HeadPublished) {
+                    return Err(CatalogError::Corrupt("test failure after active head"));
+                }
+                debug_span!("packed_append_journal_remove").in_scope(|| {
+                    remove_durable_file(&root, &root.join(ACTIVE_JOURNAL_FILE), durability)
+                })?;
+                #[cfg(test)]
+                if failpoint == Some(AppendFailpoint::JournalRemoved) {
+                    return Err(CatalogError::Corrupt("test failure after journal removal"));
+                }
+                debug_span!("packed_append_index").in_scope(|| {
+                    index_appended_entries(&mut index, &added, catalog_head, state, locator_rows)
+                })
+            })(),
+        };
+        #[cfg(test)]
+        pause_at(AppendPausePoint::Indexed);
+        AppendOutcome {
+            index,
+            stage: AppendStage::Written(written, rest),
+        }
+    }
+}
+
+/// Where a test stops an [`AppendJob`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AppendPausePoint {
+    /// The records are in the segment file, which the head does not cover yet.
+    SegmentWritten,
+    /// The locator holds the records' rows; the catalog has not taken them on.
+    Indexed,
+}
+
+#[cfg(test)]
+struct AppendPause {
+    at: AppendPausePoint,
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl AppendPause {
+    fn wait(&self) {
+        // A test that has dropped its handle is not waiting to resume the append.
+        if self.reached.send(()).is_ok() {
+            let _ = self.resume.recv();
+        }
+    }
+}
+
+/// The test's side of an [`AppendPause`].
+#[cfg(test)]
+pub(crate) struct AppendPauseHandle {
+    pub(crate) reached: std::sync::mpsc::Receiver<()>,
+    pub(crate) resume: std::sync::mpsc::Sender<()>,
 }
 
 #[cfg(test)]
@@ -390,6 +678,7 @@ impl PackedCatalog {
         if index_was_missing || index_recreated {
             durability.sync_directory(&root)?;
         }
+        let append_index = connect_index(&index_path, durability)?;
         let sealed_sources = authority.as_ref().map_or_else(Vec::new, authority_sources);
         let mut catalog = Self {
             root,
@@ -397,6 +686,8 @@ impl PackedCatalog {
             catalogs,
             _lock: lock,
             index,
+            append_index: Some(append_index),
+            append_in_flight: false,
             generation: durable_head.map(|(generation, _)| generation),
             head: durable_head.map(|(_, digest)| digest),
             content_generation: authority
@@ -419,6 +710,8 @@ impl PackedCatalog {
             seal_failpoint: None,
             #[cfg(test)]
             append_failpoint: None,
+            #[cfg(test)]
+            append_pause: None,
             #[cfg(test)]
             deferred_failpoint: None,
             #[cfg(test)]
@@ -495,6 +788,19 @@ impl PackedCatalog {
         self.append_failpoint = Some(failpoint);
     }
 
+    /// Makes the next append stop at `at` until the test lets it go on.
+    #[cfg(test)]
+    pub(crate) fn test_pause_next_append(&mut self, at: AppendPausePoint) -> AppendPauseHandle {
+        let (reached_sender, reached) = std::sync::mpsc::channel();
+        let (resume, resume_receiver) = std::sync::mpsc::channel();
+        self.append_pause = Some(AppendPause {
+            at,
+            reached: reached_sender,
+            resume: resume_receiver,
+        });
+        AppendPauseHandle { reached, resume }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_set_deferred_failpoint(&mut self, failpoint: DeferredFailpoint) {
         self.deferred_failpoint = Some(failpoint);
@@ -567,11 +873,27 @@ impl PackedCatalog {
     }
 
     fn put_records_durable(&mut self, records: &[SegmentRecord<'_>]) -> Result<(), CatalogError> {
+        let mut put = self.begin_durable_put(records)?;
+        while let Some(job) = self.next_append(&mut put)? {
+            let outcome = job.run();
+            self.finish_put_append(&put, outcome)?;
+        }
+        Ok(())
+    }
+
+    /// Validates `records` and prepares the ones this catalog lacks, for
+    /// [`Self::next_append`].
+    fn begin_durable_put<'a>(
+        &mut self,
+        records: &[SegmentRecord<'a>],
+    ) -> Result<DurablePut<'a>, CatalogError> {
         if self.poisoned {
             return Err(CatalogError::Poisoned);
         }
         if records.is_empty() {
-            return Ok(());
+            return Ok(DurablePut {
+                prepared: Vec::new(),
+            });
         }
         // Resolve and deduplicate keys before projecting the active size. A
         // duplicate-heavy batch must not cause a false pre-seal.
@@ -599,13 +921,10 @@ impl PackedCatalog {
                 pending.push(*record);
             }
         }
-        if pending.is_empty() {
-            return Ok(());
-        }
         // Prepare every new logical record exactly once. Partitioning and all
         // downstream writers operate on these stored bytes, while duplicate and
         // existing-key checks above deliberately compare the logical bytes.
-        let mut prepared = pending
+        let prepared = pending
             .into_iter()
             .map(prepare_record)
             .collect::<Result<Vec<_>, _>>()?;
@@ -615,53 +934,71 @@ impl PackedCatalog {
         for record in &prepared {
             self.projected_physical_size(0, 0, 1, record.stored_length())?;
         }
+        Ok(DurablePut { prepared })
+    }
 
+    /// The append of the next batch of `put`, sealing the active segment first
+    /// when the batch does not fit it, or `None` when `put` is done.
+    fn next_append<'a>(
+        &mut self,
+        put: &mut DurablePut<'a>,
+    ) -> Result<Option<AppendJob<'a>>, CatalogError> {
+        let prepared = &mut put.prepared;
+        if prepared.is_empty() {
+            return Ok(None);
+        }
         // Partition at the catalog boundary. Adapters may submit arbitrarily
         // large batches; each active append remains bounded by the format and
         // target, while a record which cannot fit an empty segment still fails.
-        let mut start = 0;
-        while start < prepared.len() {
-            let mut end = start;
-            let mut payload = 0_u64;
-            while end < prepared.len() {
-                let Some(next_payload) = payload.checked_add(prepared[end].stored_length()) else {
-                    break;
-                };
-                let projected = self.projected_physical_size(
-                    self.active.entries().len(),
-                    self.active.state().metadata.payload_bytes,
-                    end - start + 1,
-                    next_payload,
-                );
-                let fits = projected
-                    .as_ref()
-                    .is_ok_and(|&size| size <= self.active_target_bytes);
-                if !fits && end != start {
-                    break;
-                }
-                if !fits && self.active.state().metadata.object_count != 0 {
-                    self.seal_active()?;
-                    payload = 0;
-                    end = start;
-                    continue;
-                }
-                payload = next_payload;
-                end += 1;
-                if projected.is_ok_and(|size| size > self.active_target_bytes) {
-                    break;
-                }
+        let mut end = 0;
+        let mut payload = 0_u64;
+        while end < prepared.len() {
+            let Some(next_payload) = payload.checked_add(prepared[end].stored_length()) else {
+                break;
+            };
+            let projected = self.projected_physical_size(
+                self.active.entries().len(),
+                self.active.state().metadata.payload_bytes,
+                end + 1,
+                next_payload,
+            );
+            let fits = projected
+                .as_ref()
+                .is_ok_and(|&size| size <= self.active_target_bytes);
+            if !fits && end != 0 {
+                break;
             }
-            if end == start {
-                return Err(SegmentError::TooLarge.into());
-            }
-            self.append_active_batch(prepared.drain(start..end).collect())?;
-            start = 0;
-            if !prepared.is_empty()
-                || self.active.state().metadata.total_length >= self.active_target_bytes
-                || self.active.should_seal()
-            {
+            if !fits && self.active.state().metadata.object_count != 0 {
                 self.seal_active()?;
+                payload = 0;
+                end = 0;
+                continue;
             }
+            payload = next_payload;
+            end += 1;
+            if projected.is_ok_and(|size| size > self.active_target_bytes) {
+                break;
+            }
+        }
+        if end == 0 {
+            return Err(SegmentError::TooLarge.into());
+        }
+        self.begin_append(prepared.drain(..end).collect()).map(Some)
+    }
+
+    /// Finishes one append of `put`, then seals the active segment when the rest of
+    /// `put` will not fit or the segment is full.
+    fn finish_put_append(
+        &mut self,
+        put: &DurablePut<'_>,
+        outcome: AppendOutcome<'_>,
+    ) -> Result<(), CatalogError> {
+        self.finish_append(outcome)?;
+        if !put.prepared.is_empty()
+            || self.active.state().metadata.total_length >= self.active_target_bytes
+            || self.active.should_seal()
+        {
+            self.seal_active()?;
         }
         Ok(())
     }
@@ -689,12 +1026,15 @@ impl PackedCatalog {
         Ok(super::segment::projected_total_length(count, 0, payload)?)
     }
 
-    /// One durable append to the active segment: several fsyncs, so callers batch.
-    #[tracing::instrument(name = "packed_append", level = "debug", skip_all)]
-    fn append_active_batch(
+    /// Starts one durable append of `records` to the active segment. The returned
+    /// job does its I/O without this catalog, which keeps serving reads of
+    /// published records until [`Self::finish_append`] takes the job's outcome.
+    /// Nothing else may change the catalog in between.
+    fn begin_append<'a>(
         &mut self,
-        records: Vec<PreparedSegmentRecord<'_>>,
-    ) -> Result<(), CatalogError> {
+        records: Vec<PreparedSegmentRecord<'a>>,
+    ) -> Result<AppendJob<'a>, CatalogError> {
+        assert!(!self.append_in_flight, "one append at a time");
         let intended_generation = self
             .active
             .state()
@@ -705,40 +1045,51 @@ impl PackedCatalog {
             .active
             .prepare_prepared_append(records, intended_generation)?;
         let journal = prepared.journal().clone();
+        let index = self
+            .append_index
+            .take()
+            .ok_or(CatalogError::Corrupt("append index connection is in use"))?;
+        let write = match self.active.begin_append(prepared) {
+            Ok(Ok(write)) => write,
+            Ok(Err(_)) => unreachable!("a prepared append of new records writes them"),
+            Err(error) => {
+                self.append_index = Some(index);
+                return Err(error.into());
+            }
+        };
         // Every operation from journal publication onward can leave observable
         // state behind even when it returns an error. Keep this instance closed
         // to writes until the entire authority + derived-index protocol completes.
         self.poisoned = true;
-        debug_span!("packed_append_journal")
-            .in_scope(|| write_active_journal(&self.root, &journal, self.durability))?;
-        let result = debug_span!("packed_append_segment").in_scope(|| {
-            let result = self.active.commit_append(prepared)?;
+        self.append_in_flight = true;
+        Ok(AppendJob {
+            root: self.root.clone(),
+            durability: self.durability,
+            journal,
+            write,
+            index,
+            catalog_head: self.generation.zip(self.head),
+            locator_rows: self.locator_rows,
             #[cfg(test)]
-            if self.append_failpoint == Some(AppendFailpoint::MutationApplied) {
-                return Err(CatalogError::Corrupt("test failure after active mutation"));
+            failpoint: self.append_failpoint,
+            #[cfg(test)]
+            pause: self.append_pause.take(),
+        })
+    }
+
+    /// Publishes what an [`AppendJob`] appended, or undoes its segment write.
+    fn finish_append(&mut self, outcome: AppendOutcome<'_>) -> Result<(), CatalogError> {
+        self.append_index = Some(outcome.index);
+        self.append_in_flight = false;
+        let (written, rest) = match outcome.stage {
+            AppendStage::JournalFailed(write, error) => {
+                self.active.abandon_append(write);
+                return Err(error);
             }
-            self.active.sync(self.durability)?;
-            Ok::<_, CatalogError>(result)
-        })?;
-        debug_span!("packed_append_head")
-            .in_scope(|| write_active_head(&self.root, result.state, self.durability))?;
-        #[cfg(test)]
-        if self.append_failpoint == Some(AppendFailpoint::HeadPublished) {
-            return Err(CatalogError::Corrupt("test failure after active head"));
-        }
-        debug_span!("packed_append_journal_remove").in_scope(|| {
-            remove_durable_file(
-                &self.root,
-                &self.root.join(ACTIVE_JOURNAL_FILE),
-                self.durability,
-            )
-        })?;
-        #[cfg(test)]
-        if self.append_failpoint == Some(AppendFailpoint::JournalRemoved) {
-            return Err(CatalogError::Corrupt("test failure after journal removal"));
-        }
-        debug_span!("packed_append_index")
-            .in_scope(|| self.index_active_entries_and_checkpoint(&result.added_entries))?;
+            AppendStage::Written(written, rest) => (written, rest),
+        };
+        self.active.finish_append(written)?;
+        self.locator_rows = rest?;
         self.poisoned = false;
         Ok(())
     }
@@ -983,6 +1334,9 @@ impl PackedCatalog {
             }
             return Ok(Some(found));
         }
+        if self.append_in_flight {
+            return self.read_beside_append(namespace, digest, mode);
+        }
         for attempt in 0..2 {
             let location = (|| -> Result<Option<LocatorRow>, CatalogError> {
                 let mut lookup = self.index.prepare_cached(LOOKUP)?;
@@ -1030,6 +1384,66 @@ impl PackedCatalog {
             self.rebuild_index()?;
         }
         unreachable!()
+    }
+
+    /// A keyed read while an [`AppendJob`] runs. The locator may already hold rows
+    /// of the records being appended, which the active segment has not published:
+    /// they read as absent, as they are until the append finishes. Where the
+    /// normal path would repair the locator, this returns
+    /// [`CatalogError::AppendInFlight`] instead.
+    fn read_beside_append(
+        &mut self,
+        namespace: u8,
+        digest: [u8; 32],
+        mode: ReadMode,
+    ) -> Result<Option<Found>, CatalogError> {
+        let found = |authority: Authority| match authority.payload {
+            Some(bytes) => Found::Payload {
+                kind: authority.entry.kind,
+                bytes,
+            },
+            None => Found::Length(authority.entry.logical_length),
+        };
+        if let Some(authority) =
+            self.lookup_authority(namespace, digest, Some(ACTIVE_FILE), mode)?
+        {
+            return Ok(Some(found(authority)));
+        }
+        let location = self
+            .index
+            .prepare_cached(LOOKUP)
+            .and_then(|mut lookup| {
+                lookup
+                    .query_row(params![namespace, digest.as_slice()], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    })
+                    .optional()
+            })
+            .map_err(|_| CatalogError::AppendInFlight)?;
+        match location {
+            Some(location) if location.5 != ACTIVE_FILE => {
+                match self.read_authoritative_location(namespace, digest, Some(&location), mode) {
+                    Err(CatalogError::Corrupt(_) | CatalogError::Database(_)) => {
+                        Err(CatalogError::AppendInFlight)
+                    }
+                    result => result,
+                }
+            }
+            // No row, or a row of a record still being appended. Either way the
+            // key is absent unless a sealed segment holds it, which would mean
+            // the locator is stale.
+            _ => match self.lookup_authority(namespace, digest, None, mode)? {
+                Some(_) => Err(CatalogError::AppendInFlight),
+                None => Ok(None),
+            },
+        }
     }
 
     fn read_authoritative_location(
@@ -1869,29 +2283,6 @@ impl PackedCatalog {
         Ok(())
     }
 
-    fn index_active_entries_and_checkpoint(
-        &mut self,
-        entries: &[SegmentIndexEntry],
-    ) -> Result<(), CatalogError> {
-        let added = u64::try_from(entries.len())
-            .map_err(|_| CatalogError::Corrupt("locator count overflow"))?;
-        let locator_rows = self
-            .locator_rows
-            .checked_add(added)
-            .ok_or(CatalogError::Corrupt("locator count overflow"))?;
-        let transaction = self.index.transaction()?;
-        insert_source_entries(&transaction, ACTIVE_FILE, entries)?;
-        write_checkpoint(
-            &transaction,
-            self.generation.zip(self.head),
-            self.active.state(),
-            locator_rows,
-        )?;
-        transaction.commit()?;
-        self.locator_rows = locator_rows;
-        Ok(())
-    }
-
     /// Closes the derived SQLite index explicitly before releasing the packed-store lock.
     ///
     /// `rusqlite::Connection` can report errors while closing (for example, from unfinished
@@ -1910,6 +2301,8 @@ impl PackedCatalog {
             catalogs,
             _lock,
             index,
+            append_index,
+            append_in_flight: _,
             generation: _,
             head: _,
             content_generation: _,
@@ -1931,6 +2324,8 @@ impl PackedCatalog {
             #[cfg(test)]
                 append_failpoint: _,
             #[cfg(test)]
+                append_pause: _,
+            #[cfg(test)]
                 deferred_failpoint: _,
             #[cfg(test)]
                 close_failpoint: _,
@@ -1938,20 +2333,22 @@ impl PackedCatalog {
                 repack_failpoint: _,
         } = self;
 
-        let close_result = index.close();
+        // `index` closes last: the last connection to close folds the write-ahead
+        // log into the database.
+        let close = |connection: Connection| {
+            connection.close().map_err(|(connection, error)| {
+                drop(connection);
+                CatalogError::Database(error)
+            })
+        };
+        let append_closed = append_index.map_or(Ok(()), close);
+        let index_closed = close(index);
         drop(active);
         drop(_lock);
         drop(catalogs);
         drop(segments);
         drop(root);
-
-        match close_result {
-            Ok(()) => Ok(()),
-            Err((connection, error)) => {
-                drop(connection);
-                Err(CatalogError::Database(error))
-            }
-        }
+        append_closed.and(index_closed)
     }
 
     fn recount_locator_rows(&self) -> Result<u64, CatalogError> {
@@ -2211,14 +2608,16 @@ fn retire_active(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let replacement = ActiveSegment::create(&temporary_path, next_generation)?;
+    let mut replacement = ActiveSegment::create(&temporary_path, next_generation)?;
     replacement.sync(durability)?;
     if fail_before_rename {
         return Err(CatalogError::Corrupt(
             "test failure during active retirement",
         ));
     }
-    fs::rename(&temporary_path, root.join(ACTIVE_FILE))?;
+    let active_path = root.join(ACTIVE_FILE);
+    fs::rename(&temporary_path, &active_path)?;
+    replacement.renamed(active_path);
     durability.sync_directory(root)?;
     write_active_head(root, replacement.state(), durability)?;
     *active = replacement;
@@ -2226,19 +2625,7 @@ fn retire_active(
 }
 
 fn open_index(path: &Path, durability: Durability) -> Result<Connection, CatalogError> {
-    let connection = Connection::open(path)?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.pragma_update(None, "journal_mode", "DELETE")?;
-    connection.pragma_update(
-        None,
-        "synchronous",
-        match durability {
-            Durability::Durable => "FULL",
-            Durability::Deferred => "OFF",
-        },
-    )?;
-    connection.pragma_update(None, "temp_store", "MEMORY")?;
-    connection.pragma_update(None, "cache_size", -8192)?;
+    let connection = connect_index(path, durability)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 0 {
         connection.execute_batch(SCHEMA)?;
@@ -2249,6 +2636,25 @@ fn open_index(path: &Path, durability: Durability) -> Result<Connection, Catalog
     if integrity != "ok" {
         return Err(CatalogError::Corrupt("locator database integrity"));
     }
+    Ok(connection)
+}
+
+/// A connection to the locator database, without the checks [`open_index`] makes.
+/// Write-ahead logging lets one connection read while another commits.
+fn connect_index(path: &Path, durability: Durability) -> Result<Connection, CatalogError> {
+    let connection = Connection::open(path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(
+        None,
+        "synchronous",
+        match durability {
+            Durability::Durable => "FULL",
+            Durability::Deferred => "OFF",
+        },
+    )?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    connection.pragma_update(None, "cache_size", -8192)?;
     Ok(connection)
 }
 
@@ -2460,6 +2866,26 @@ fn insert_source_entries(
         ])?;
     }
     Ok(())
+}
+
+/// Adds the locator rows of an append's new entries and moves the checkpoint to
+/// the active segment's new `state`. Returns the new row count.
+fn index_appended_entries(
+    index: &mut Connection,
+    entries: &[SegmentIndexEntry],
+    catalog_head: CatalogHead,
+    state: ActivePublishedState,
+    locator_rows: u64,
+) -> Result<u64, CatalogError> {
+    let locator_rows = u64::try_from(entries.len())
+        .ok()
+        .and_then(|added| locator_rows.checked_add(added))
+        .ok_or(CatalogError::Corrupt("locator count overflow"))?;
+    let transaction = index.transaction()?;
+    insert_source_entries(&transaction, ACTIVE_FILE, entries)?;
+    write_checkpoint(&transaction, catalog_head, state, locator_rows)?;
+    transaction.commit()?;
+    Ok(locator_rows)
 }
 
 fn locator_count(connection: &Connection) -> Result<u64, CatalogError> {

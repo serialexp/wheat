@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use thiserror::Error;
@@ -96,6 +96,124 @@ impl PreparedAppend<'_> {
     }
 }
 
+/// The file writes of one append, made through a handle of their own so they need
+/// no access to the [`ActiveSegment`]. Meanwhile the segment keeps serving its
+/// published records: the writes start at the old index, past every published
+/// payload, and the segment's entries change only in
+/// [`ActiveSegment::finish_append`].
+pub(crate) struct ActiveWrite<'a> {
+    file: File,
+    prepared: PreparedAppend<'a>,
+    entries: Vec<SegmentIndexEntry>,
+    io_buffer: Vec<u8>,
+    #[cfg(test)]
+    fail_after_payload: bool,
+}
+
+/// What an [`ActiveWrite`] did, for [`ActiveSegment::finish_append`].
+pub(crate) struct ActiveWritten {
+    file: File,
+    result: Result<(ActivePublishedState, Vec<SegmentIndexEntry>), ActiveError>,
+    added_keys: Vec<(u8, [u8; 32])>,
+    old: ActivePublishedState,
+    journal: ActiveRecoveryJournal,
+    io_buffer: Vec<u8>,
+}
+
+impl ActiveWrite<'_> {
+    /// Writes the new payloads and the cumulative tail after them.
+    pub(crate) fn run(mut self) -> ActiveWritten {
+        let added_keys = self
+            .prepared
+            .records
+            .iter()
+            .map(|(record, _)| (record.namespace, record.digest))
+            .collect();
+        let result = self.write();
+        ActiveWritten {
+            file: self.file,
+            result: result.map(|state| (state, self.entries)),
+            added_keys,
+            old: self.prepared.old,
+            journal: self.prepared.journal,
+            io_buffer: self.io_buffer,
+        }
+    }
+
+    fn write(&mut self) -> Result<ActivePublishedState, ActiveError> {
+        let old = self.prepared.old;
+        self.file.set_len(old.metadata.index_start)?;
+        self.file.seek(SeekFrom::Start(old.metadata.index_start))?;
+        let mut payload_bytes = old.metadata.payload_bytes;
+        for (record, physical) in &self.prepared.records {
+            let stored_length = physical.bytes.len() as u64;
+            let offset = PREFIX_LEN
+                .checked_add(payload_bytes)
+                .ok_or(SegmentError::TooLarge)?;
+            self.file.write_all(&physical.bytes)?;
+            payload_bytes = payload_bytes
+                .checked_add(stored_length)
+                .ok_or(SegmentError::TooLarge)?;
+            self.entries.push(SegmentIndexEntry {
+                namespace: record.namespace,
+                kind: record.kind,
+                digest: record.digest,
+                offset,
+                codec: physical.codec.to_byte(),
+                stored_length,
+                logical_length: physical.logical_length,
+                delta_base: None,
+                delta_depth: 0,
+            });
+        }
+        #[cfg(test)]
+        if self.fail_after_payload {
+            return Err(std::io::Error::other("injected active append failure").into());
+        }
+        let index_start = PREFIX_LEN
+            .checked_add(payload_bytes)
+            .ok_or(SegmentError::TooLarge)?;
+        let footer = emit_cumulative_tail(
+            &mut self.file,
+            &mut self.entries,
+            index_start,
+            &mut self.io_buffer,
+        )?;
+        Ok(ActivePublishedState {
+            generation: self.prepared.intended_generation,
+            id: footer.segment_id(),
+            metadata: super::segment::metadata(&footer),
+        })
+    }
+}
+
+impl ActiveWritten {
+    /// The state and the index entries the write added, when it succeeded.
+    pub(crate) fn appended(&self) -> Option<(ActivePublishedState, Vec<SegmentIndexEntry>)> {
+        let (state, entries) = self.result.as_ref().ok()?;
+        let added = self
+            .added_keys
+            .iter()
+            .map(|wanted| {
+                let index = entries
+                    .binary_search_by_key(wanted, super::segment::key)
+                    .expect("written entry must be indexed");
+                entries[index].clone()
+            })
+            .collect();
+        Some((*state, added))
+    }
+
+    /// Makes the written bytes durable. Does nothing when the write failed, which
+    /// [`ActiveSegment::finish_append`] undoes instead.
+    pub(crate) fn sync(&self, durability: Durability) -> Result<(), ActiveError> {
+        if self.result.is_ok() {
+            durability.sync_file(&self.file)?;
+        }
+        Ok(())
+    }
+}
+
 fn validate_projected(count: usize, payload_bytes: u64) -> Result<(), SegmentError> {
     if count > MAX_SEGMENT_ENTRIES {
         return Err(SegmentError::TooManyEntries);
@@ -107,6 +225,7 @@ fn validate_projected(count: usize, payload_bytes: u64) -> Result<(), SegmentErr
 }
 
 pub(crate) struct ActiveSegment {
+    path: PathBuf,
     file: File,
     state: ActivePublishedState,
     entries: Vec<SegmentIndexEntry>,
@@ -119,11 +238,12 @@ pub(crate) struct ActiveSegment {
 impl ActiveSegment {
     /// Creates a new process-local active segment with a valid empty V1 tail.
     pub(crate) fn create(path: impl AsRef<Path>, generation: u64) -> Result<Self, ActiveError> {
+        let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(path)?;
+            .open(&path)?;
         file.write_all(&encode_segment_prefix().map_err(SegmentError::from)?)?;
         let mut entries = Vec::new();
         let mut io_buffer = vec![0; IO_BUFFER_SIZE];
@@ -134,6 +254,7 @@ impl ActiveSegment {
             metadata: super::segment::metadata(&footer),
         };
         Ok(Self {
+            path,
             file,
             state,
             entries,
@@ -144,13 +265,20 @@ impl ActiveSegment {
         })
     }
 
+    /// Records that the segment's file was renamed to `path`, where appends
+    /// reopen it.
+    pub(crate) fn renamed(&mut self, path: impl AsRef<Path>) {
+        self.path = path.as_ref().to_path_buf();
+    }
+
     /// Reopens only when the complete V1 file authenticates as the supplied
     /// published state. Bytes beyond its published length are ignored first.
     pub(crate) fn reopen(
         path: impl AsRef<Path>,
         published: ActivePublishedState,
     ) -> Result<Self, ActiveError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let reader = SegmentReader::open_at_published_length(
             file.try_clone()?,
             published.metadata.total_length,
@@ -161,6 +289,7 @@ impl ActiveSegment {
         let (reader_file, _, _, entries) = reader.into_authenticated_parts();
         drop(reader_file);
         Ok(Self {
+            path,
             file,
             state: published,
             entries,
@@ -177,8 +306,10 @@ impl ActiveSegment {
         path: impl AsRef<Path>,
         journal: &ActiveRecoveryJournal,
     ) -> Result<Self, ActiveError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut active = Self {
+            path,
             file,
             state: journal.old,
             entries: Vec::new(),
@@ -307,10 +438,25 @@ impl ActiveSegment {
 
     /// Applies a prepared append. The caller owns journal durability and head
     /// publication; the returned state is the value to publish after syncing.
+    #[cfg(test)]
     pub(crate) fn commit_append(
         &mut self,
         prepared: PreparedAppend<'_>,
     ) -> Result<ActiveAppendResult, ActiveError> {
+        match self.begin_append(prepared)? {
+            Ok(write) => self.finish_append(write.run()),
+            Err(unchanged) => Ok(unchanged),
+        }
+    }
+
+    /// Starts applying a prepared append: the writes it needs, or the unchanged
+    /// result of a retry that adds nothing. The segment refuses other appends until
+    /// [`Self::finish_append`] gets the writes' outcome; until then it serves its
+    /// published records as before.
+    pub(crate) fn begin_append<'a>(
+        &mut self,
+        prepared: PreparedAppend<'a>,
+    ) -> Result<Result<ActiveWrite<'a>, ActiveAppendResult>, ActiveError> {
         if self.poisoned {
             return Err(ActiveError::Poisoned);
         }
@@ -319,88 +465,64 @@ impl ActiveSegment {
         }
         if prepared.records.is_empty() {
             debug_assert_eq!(prepared.intended_generation, self.state.generation);
-            return Ok(ActiveAppendResult {
+            return Ok(Err(ActiveAppendResult {
                 state: self.state,
                 added_entries: Vec::new(),
-            });
+            }));
         }
-
-        let added_keys: Vec<_> = prepared
-            .records
-            .iter()
-            .map(|(record, _)| (record.namespace, record.digest))
-            .collect();
+        // A handle of its own: readers seek this segment's handle meanwhile.
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         self.poisoned = true;
-        let append_result = (|| -> Result<_, ActiveError> {
-            self.file.set_len(self.state.metadata.index_start)?;
-            self.file
-                .seek(SeekFrom::Start(self.state.metadata.index_start))?;
-            let mut payload_bytes = self.state.metadata.payload_bytes;
-            for (record, physical) in &prepared.records {
-                let stored_length = physical.bytes.len() as u64;
-                let offset = PREFIX_LEN
-                    .checked_add(payload_bytes)
-                    .ok_or(SegmentError::TooLarge)?;
-                self.file.write_all(&physical.bytes)?;
-                payload_bytes = payload_bytes
-                    .checked_add(stored_length)
-                    .ok_or(SegmentError::TooLarge)?;
-                self.entries.push(SegmentIndexEntry {
-                    namespace: record.namespace,
-                    kind: record.kind,
-                    digest: record.digest,
-                    offset,
-                    codec: physical.codec.to_byte(),
-                    stored_length,
-                    logical_length: physical.logical_length,
-                    delta_base: None,
-                    delta_depth: 0,
-                });
-            }
+        Ok(Ok(ActiveWrite {
+            file,
+            prepared,
+            entries: self.entries.clone(),
+            io_buffer: std::mem::take(&mut self.io_buffer),
             #[cfg(test)]
-            if self.fail_commit_after_payload {
-                self.fail_commit_after_payload = false;
-                return Err(std::io::Error::other("injected active append failure").into());
-            }
-            let index_start = PREFIX_LEN
-                .checked_add(payload_bytes)
-                .ok_or(SegmentError::TooLarge)?;
-            let footer = emit_cumulative_tail(
-                &mut self.file,
-                &mut self.entries,
-                index_start,
-                &mut self.io_buffer,
-            )?;
-            Ok(ActivePublishedState {
-                generation: prepared.intended_generation,
-                id: footer.segment_id(),
-                metadata: super::segment::metadata(&footer),
-            })
-        })();
+            fail_after_payload: std::mem::take(&mut self.fail_commit_after_payload),
+        }))
+    }
 
-        match append_result {
-            Ok(state) => {
+    /// Ends an append whose writes never ran, which leaves the file as it was.
+    pub(crate) fn abandon_append(&mut self, write: ActiveWrite<'_>) {
+        self.io_buffer = write.io_buffer;
+        self.poisoned = false;
+    }
+
+    /// Publishes the records an [`ActiveWrite`] added, or restores the old tail when
+    /// it failed.
+    pub(crate) fn finish_append(
+        &mut self,
+        written: ActiveWritten,
+    ) -> Result<ActiveAppendResult, ActiveError> {
+        let appended = written.appended();
+        let ActiveWritten {
+            result,
+            old,
+            journal,
+            io_buffer,
+            ..
+        } = written;
+        self.io_buffer = io_buffer;
+        if self.state != old {
+            // Only the segment that began the append may finish it.
+            return Err(ActiveError::StaleAppend);
+        }
+        match (result, appended) {
+            (Ok((_, entries)), Some((state, added_entries))) => {
                 self.state = state;
+                self.entries = entries;
                 self.poisoned = false;
-                let added_entries = added_keys
-                    .iter()
-                    .map(|wanted| {
-                        let index = self
-                            .entries
-                            .binary_search_by_key(wanted, super::segment::key)
-                            .expect("committed entry must remain indexed");
-                        self.entries[index].clone()
-                    })
-                    .collect();
                 Ok(ActiveAppendResult {
                     state,
                     added_entries,
                 })
             }
-            Err(error) => {
+            (Ok(_), None) => unreachable!("a successful write has appended entries"),
+            (Err(error), _) => {
                 // Recovery authenticates a temporary candidate before touching
                 // the damaged file. If recovery itself fails, poison remains set.
-                if self.restore(&prepared.journal).is_ok() {
+                if self.restore(&journal).is_ok() {
                     self.poisoned = false;
                 }
                 Err(error)

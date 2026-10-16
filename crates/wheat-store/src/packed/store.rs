@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -15,7 +15,10 @@ use wheat_core::{
 };
 
 use super::{
-    catalog::{CatalogError, LooseMetadataRecord, MetadataRepackInput, PackedCatalog},
+    catalog::{
+        CatalogError, ExclusiveCatalog, LooseMetadataRecord, MetadataRepackInput, PackedCatalog,
+        SharedCatalog,
+    },
     generation_reader::GenerationReader,
     segment::{CONTENT_NAMESPACE, METADATA_NAMESPACE, SegmentRecord},
     trace::{PackedStoreTrace, PackedStoreTraceCounters},
@@ -127,7 +130,7 @@ pub struct PackedObjectStore {
 }
 
 struct PackedEngine {
-    catalog: Arc<Mutex<PackedCatalog>>,
+    catalog: SharedCatalog,
     generation_reader: Mutex<Option<GenerationReader>>,
     objects: LooseObjectStore,
     content: ContentStore,
@@ -147,13 +150,6 @@ impl fmt::Debug for PackedObjectStore {
 }
 
 impl PackedEngine {
-    /// Takes the catalog lock, which every packed read and append goes through.
-    /// `packed_catalog_wait` spans show how long callers queue for it. `None` when a
-    /// holder panicked.
-    fn lock_catalog(&self) -> Option<MutexGuard<'_, PackedCatalog>> {
-        tracing::debug_span!("packed_catalog_wait").in_scope(|| self.catalog.lock().ok())
-    }
-
     /// Runs `lookup` against the published content generation's reader, or returns
     /// `None` when no generation is published. The catalog lock is held throughout so a
     /// repack on this handle cannot retire the generation's pack mid-lookup.
@@ -162,9 +158,10 @@ impl PackedEngine {
         id: ContentId,
         lookup: impl FnOnce(&mut GenerationReader) -> Result<Option<T>, ContentStoreError>,
     ) -> Result<Option<T>, ContentStoreError> {
-        let catalog = self.lock_catalog().ok_or_else(|| {
-            ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned"))
-        })?;
+        let catalog = self
+            .catalog
+            .published()
+            .map_err(|error| content_catalog_error(id, error))?;
         let generation = catalog.content_generation();
         if generation.generation == 0 && generation.manifest == [0; 32] {
             return Ok(None);
@@ -251,7 +248,7 @@ impl PackedObjectStore {
         drop(content_manifest);
         Ok(Self {
             engine: Arc::new(PackedEngine {
-                catalog: Arc::new(Mutex::new(catalog)),
+                catalog: SharedCatalog::new(catalog),
                 generation_reader: Mutex::new(None),
                 objects: LooseObjectStore::with_durability(root.join("loose-objects"), durability),
                 content: ContentStore::with_durability(root.join("loose-content"), durability),
@@ -298,12 +295,8 @@ impl PackedObjectStore {
                 "StillReferenced: packed object/content store handles remain live".into(),
             )
         })?;
-        let catalog = Arc::try_unwrap(engine.catalog)
-            .map_err(|_| {
-                ObjectStoreError::Backend(
-                    "StillReferenced: packed catalog handle remains live".into(),
-                )
-            })?
+        let catalog = engine
+            .catalog
             .into_inner()
             .map_err(|_| ObjectStoreError::Backend("packed catalog mutex poisoned".into()))?;
         catalog.close().map_err(object_catalog_error)?;
@@ -616,10 +609,12 @@ impl PackedObjectStore {
         Ok(records)
     }
 
-    fn catalog(&self) -> Result<MutexGuard<'_, PackedCatalog>, ObjectStoreError> {
+    /// The catalog for anything but a read or a put: waits for any append to finish.
+    fn catalog(&self) -> Result<ExclusiveCatalog<'_>, ObjectStoreError> {
         self.engine
-            .lock_catalog()
-            .ok_or_else(|| ObjectStoreError::Backend("packed catalog mutex poisoned".into()))
+            .catalog
+            .exclusive()
+            .map_err(object_catalog_error)
     }
 }
 
@@ -1207,7 +1202,8 @@ impl ImmutableObjectStore for PackedObjectStore {
                     bytes: data,
                 })
                 .collect::<Vec<_>>();
-            self.catalog()?
+            self.engine
+                .catalog
                 .put_records(&records)
                 .map_err(object_catalog_error)?;
         }
@@ -1216,7 +1212,8 @@ impl ImmutableObjectStore for PackedObjectStore {
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
         let Some((stored_kind, bytes)) = self
-            .catalog()?
+            .engine
+            .catalog
             .get(METADATA_NAMESPACE, *id.as_bytes())
             .map_err(object_catalog_error)?
         else {
@@ -1292,10 +1289,7 @@ impl ContentBackend for PackedEngine {
                     bytes,
                 })
                 .collect::<Vec<_>>();
-            self.lock_catalog()
-                .ok_or_else(|| {
-                    ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned"))
-                })?
+            self.catalog
                 .put_records(&records)
                 .map_err(|error| content_catalog_error(packed[0].0, error))?;
         }
@@ -1305,8 +1299,8 @@ impl ContentBackend for PackedEngine {
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         let generation = self
             .catalog
-            .lock()
-            .map_err(|_| ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned")))?
+            .published()
+            .map_err(|error| content_catalog_error(id, error))?
             .content_generation();
         if generation.generation != 0 || generation.manifest != [0; 32] {
             return crate::content_store::resolve_delta_chain(id, max, |current_id| {
@@ -1315,8 +1309,6 @@ impl ContentBackend for PackedEngine {
         }
         let value = self
             .catalog
-            .lock()
-            .map_err(|_| ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned")))?
             .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), max)
             .map_err(|error| match error {
                 CatalogError::Segment(super::segment::SegmentError::ReadLimit { minimum }) => {
@@ -1362,8 +1354,6 @@ impl ContentBackend for PackedEngine {
         // Content not yet repacked lives in segments as raw bytes, not envelopes.
         let value = self
             .catalog
-            .lock()
-            .map_err(|_| ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned")))?
             .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), usize::MAX)
             .map_err(|error| content_catalog_error(id, error))?;
         if let Some((_kind, bytes)) = value {
@@ -1387,8 +1377,6 @@ impl ContentBackend for PackedEngine {
         }
         let length = self
             .catalog
-            .lock()
-            .map_err(|_| ContentStoreError::Io(io::Error::other("packed catalog mutex poisoned")))?
             .logical_length(CONTENT_NAMESPACE, *id.as_bytes())
             .map_err(|error| content_catalog_error(id, error))?;
         match length {

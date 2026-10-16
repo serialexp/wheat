@@ -1143,6 +1143,79 @@ fn threshold_seal_publishes_once_repoints_one_source_and_bounds_counts() {
     );
 }
 
+#[test]
+fn reads_proceed_beside_an_append_and_see_only_published_records() {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    // Long enough that only a read stuck behind the paused append misses it.
+    const STUCK: Duration = Duration::from_secs(60);
+
+    for point in [AppendPausePoint::SegmentWritten, AppendPausePoint::Indexed] {
+        let root = tempfile::tempdir().unwrap();
+        let sealed = record(b"in a sealed segment");
+        let active = record(b"in the active segment");
+        let appending = record(b"being appended");
+        let absent = record(b"never stored");
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+            .unwrap()
+            .put_records(&[sealed])
+            .unwrap();
+        let mut catalog = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        catalog.put_records(&[active]).unwrap();
+        let pause = catalog.test_pause_next_append(point);
+        let shared = Arc::new(SharedCatalog::new(catalog));
+
+        let writer = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || shared.put_records(&[appending])
+        });
+        pause.reached.recv_timeout(STUCK).unwrap();
+
+        let (sender, reads) = mpsc::channel();
+        std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                let read = |value: SegmentRecord<'_>| {
+                    (
+                        shared.get(CONTENT_NAMESPACE, value.digest).unwrap(),
+                        shared
+                            .logical_length(CONTENT_NAMESPACE, value.digest)
+                            .unwrap(),
+                    )
+                };
+                let _ = sender.send([read(sealed), read(active), read(appending), read(absent)]);
+            }
+        });
+        let [sealed_read, active_read, appending_read, absent_read] = reads
+            .recv_timeout(STUCK)
+            .unwrap_or_else(|_| panic!("reads waited for the append paused at {point:?}"));
+        for (value, read) in [(sealed, sealed_read), (active, active_read)] {
+            assert_eq!(
+                read,
+                (
+                    Some((value.kind, value.bytes.to_vec())),
+                    Some(value.bytes.len() as u64)
+                ),
+                "{point:?}"
+            );
+        }
+        assert_eq!(appending_read, (None, None), "{point:?}");
+        assert_eq!(absent_read, (None, None), "{point:?}");
+
+        pause.resume.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        for value in [sealed, active, appending] {
+            assert_eq!(
+                shared.get(CONTENT_NAMESPACE, value.digest).unwrap(),
+                Some((value.kind, value.bytes.to_vec())),
+                "{point:?}"
+            );
+        }
+        assert_eq!(shared.get(CONTENT_NAMESPACE, absent.digest).unwrap(), None);
+    }
+}
+
 /// `count` canonical content-map roots, newest (largest) first; map `k + 1` is
 /// map `k` minus one blob, so each older root is a small delta of its successor.
 fn content_map_history(count: usize) -> Vec<([u8; 32], Vec<u8>)> {
