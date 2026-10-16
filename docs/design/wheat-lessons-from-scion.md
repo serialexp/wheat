@@ -320,8 +320,12 @@ connection is not blocked by the appending one's commit.
 Every count still takes one attempt per publish. Catalog waits fell from 165 ms to
 about 2 ms per publish. The locator transaction fell from 17 ms to about 5, so an
 append takes 33 to 37 ms. Appends are now the ceiling: at 8 and 16 writers one is
-running 96% of the wall time, and a publish still makes two. The drop at 2 writers
-reproduced and is not explained yet.
+running 96% of the wall time, and a publish still makes two.
+
+The 2-writer figure is noise, not a regression: earlier runs at that level gave 5.05
+to 6.72, and in the traces the server's time per 2-writer publish fell from 115 to
+94 ms. At 1 and 2 writers the server is idle about 75 ms between publishes, so the
+clients set the pace there.
 
 ### Alternative: per-label heads
 
