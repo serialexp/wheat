@@ -479,6 +479,7 @@ pub struct Application {
     pub id: ApplicationId,
     pub revision_id: RevisionId,
     pub target_view: ViewId,
+    pub order: ApplicationOrder,
     pub result: ApplicationResult,
     pub applied: BTreeMap<EditId, AppliedEditEvidence>,
 }
@@ -488,6 +489,7 @@ impl Application {
     pub fn new(
         revision_id: RevisionId,
         target_view: ViewId,
+        order: ApplicationOrder,
         result: ApplicationResult,
         applied: BTreeMap<EditId, AppliedEditEvidence>,
     ) -> Self {
@@ -499,6 +501,7 @@ impl Application {
             id: ApplicationId::from_digest([0; 32]),
             revision_id,
             target_view,
+            order,
             result,
             applied,
         };
@@ -576,6 +579,166 @@ impl ViewOrder {
             last: Some(change),
             weight: self.weight.checked_add(generation.checked_add(1)?)?,
         })
+    }
+}
+
+/// An application's place in the canonical order of the view it produces, and an index
+/// over the changes before it there: for each `j` that fits, the application `2^j`
+/// positions back and the highest ChangeId among the `2^j` positions ending at this
+/// one. Determined by the target view, so the same in every history reaching it. It
+/// finds the highest ChangeId over any run of a view's last positions in O(log n)
+/// application reads ([`RangeMax`]), which is how a view is checked to hold its last
+/// change last in canonical order.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApplicationOrder {
+    /// The change's index in its result view's canonical order: the target's size.
+    pub position: u64,
+    /// The target's producing application, `skip[0]`; none on the base.
+    pub previous: Option<ApplicationId>,
+    /// `skip[j]` is the application at `position - 2^j`, for each `2^j <= position`.
+    pub skip: Vec<ApplicationId>,
+    /// `window_max[j]` is the highest ChangeId at positions `position - 2^j + 1` through
+    /// `position` (from 0 where that starts below), for each `2^j <= position + 1`.
+    pub window_max: Vec<ChangeId>,
+}
+
+/// An application order index that does not line up with the applications it names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("application order index does not line up with the applications it names")]
+pub struct OrderIndexMismatch;
+
+impl ApplicationOrder {
+    /// How many `skip` entries an application at `position` has.
+    #[must_use]
+    pub fn skip_levels(position: u64) -> usize {
+        position.checked_ilog2().map_or(0, |log| log as usize + 1)
+    }
+
+    /// How many `window_max` entries an application at `position` has.
+    #[must_use]
+    pub fn window_levels(position: u64) -> usize {
+        (u128::from(position) + 1).ilog2() as usize + 1
+    }
+
+    /// Whether the entries' counts fit the position and `previous` is `skip[0]`.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        self.skip.len() == Self::skip_levels(self.position)
+            && self.window_max.len() == Self::window_levels(self.position)
+            && self.previous == self.skip.first().copied()
+    }
+
+    /// Starts the order of `change` applied onto a view of `position` changes whose
+    /// producing application is `previous`. Complete it by passing the order of each
+    /// application [`Self::wanted`] names to [`Self::extend`].
+    ///
+    /// # Panics
+    ///
+    /// When `previous` is missing for a non-base target or given for the base.
+    #[must_use]
+    pub fn begin(change: ChangeId, position: u64, previous: Option<ApplicationId>) -> Self {
+        assert_eq!(
+            previous.is_some(),
+            position > 0,
+            "exactly the base view has no producing application"
+        );
+        Self {
+            position,
+            previous,
+            skip: previous.into_iter().collect(),
+            window_max: vec![change],
+        }
+    }
+
+    /// The application whose order the next level needs, until the index is complete.
+    #[must_use]
+    pub fn wanted(&self) -> Option<ApplicationId> {
+        (self.window_max.len() < Self::window_levels(self.position))
+            .then(|| self.skip[self.window_max.len() - 1])
+    }
+
+    /// Adds the next level from `node`, the order of the application [`Self::wanted`]
+    /// named.
+    ///
+    /// # Errors
+    ///
+    /// When `node` is not at the position that application must be at, or is not well
+    /// formed.
+    pub fn extend(&mut self, node: &Self) -> Result<(), OrderIndexMismatch> {
+        let level = self.window_max.len();
+        let distance = 1_u64 << (level - 1);
+        if node.position != self.position - distance || !node.is_well_formed() {
+            return Err(OrderIndexMismatch);
+        }
+        self.window_max
+            .push(self.window_max[level - 1].max(node.window_max[level - 1]));
+        if self.skip.len() < Self::skip_levels(self.position) {
+            self.skip.push(node.skip[level - 1]);
+        }
+        Ok(())
+    }
+}
+
+/// The highest ChangeId at a view's positions `from` onwards, found from the order
+/// index by walking back from the view's producing application: start with that
+/// application's order and pass each order [`Self::fold`] asks for next.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeMax {
+    from: u64,
+    /// Where the next folded application must be.
+    expected: u64,
+    highest: Option<ChangeId>,
+}
+
+impl RangeMax {
+    /// Starts a query over positions `from` up to a view's `size`.
+    #[must_use]
+    pub fn new(from: u64, size: u64) -> Self {
+        Self {
+            from,
+            expected: size.wrapping_sub(1),
+            highest: None,
+        }
+    }
+
+    /// Whether the range holds no position, so nothing need be read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.from > self.expected || self.expected == u64::MAX
+    }
+
+    /// Folds in the longest window ending at `node` that stays in the range, and
+    /// returns the application to fold next, if the range has positions left.
+    ///
+    /// # Errors
+    ///
+    /// When `node` is not at the expected position or is not well formed.
+    pub fn fold(
+        &mut self,
+        node: &ApplicationOrder,
+    ) -> Result<Option<ApplicationId>, OrderIndexMismatch> {
+        if self.is_empty() || node.position != self.expected || !node.is_well_formed() {
+            return Err(OrderIndexMismatch);
+        }
+        let remaining = node.position - self.from + 1;
+        // `remaining <= position + 1`, so the window exists.
+        let level = remaining.ilog2() as usize;
+        let window = node.window_max[level];
+        self.highest = Some(self.highest.map_or(window, |highest| highest.max(window)));
+        let length = 1_u64 << level;
+        if remaining == length {
+            self.expected = u64::MAX;
+            return Ok(None);
+        }
+        // Positions remain below the window, so `2^level <= position` and the skip exists.
+        self.expected = node.position - length;
+        Ok(Some(node.skip[level]))
+    }
+
+    /// The highest ChangeId folded so far; the answer once [`Self::fold`] returns `None`.
+    #[must_use]
+    pub fn highest(&self) -> Option<ChangeId> {
+        self.highest
     }
 }
 

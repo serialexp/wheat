@@ -188,7 +188,19 @@ Both plans committed in fcf8483. Bart: "lets start with plan 1".
   (forgeries), new cases in `tests/repository_integration.rs`, core
   `revision_parents_and_view_order_are_checked_on_decode`, object_graph combines refs.
   Suite: 1,153 passed, 18 skipped. Release bench (transition_validate, deep_stack,
-  checkpoint_stack) shows no regression. Next: step 4, the application order index.
+  checkpoint_stack) shows no regression. Committed as c3157c5 (not pushed).
+- Step 4 done (2026-10-16): applications carry `ApplicationOrder { position, previous,
+  skip, window_max }` (core `model.rs`, with the `begin`/`wanted`/`extend` builder and
+  the `RangeMax` query, both cursors so sync core and async store share them). Store:
+  `RepositoryReader::{application_order, highest_change_from}`; `apply_step` and the
+  commit writer fill the index; full validation recomputes it per retained application
+  and checks I2 (`verify_application_order`). Nothing existing needed reordering: every
+  producer already composes in canonical order. Tests: core `tests/application_order.rs`
+  (brute force at positions 0–1,000, reads = set bits), store
+  `view_order_validation.rs` (index forgeries, out-of-order view refused, an exact
+  control, a low ID after its dependency accepted), object_graph skip refs. Suite:
+  1,161 passed, 18 skipped. Bench: no change beyond noise (deep_stack.reapply 0.91 s
+  under load, 0.77 s rerun). Next: step 5, full validation tightened.
 
 ## 2026-10-15: publish throughput (@calm-lynx) — Bart: "We should be able to do 10 of these"
 
@@ -221,5 +233,13 @@ script /tmp/wheat-profile/scripts/bylevel.py). Appends (33-37 ms,
 two per publish) now run 96% of the time. Numbers in the design doc ("Reads beside
 an append"); trace in /tmp/wheat-profile/option1.json.
 
-Next: option 2 (one append per publish), then 3-5; then contract rules (step 4) and
-maybe client-side push.
+Option 2 (one append per publish), Bart's choices 2026-10-16: stage content too (a
+refused publish leaves nothing behind); a new wheat-store trait `RepositoryStore:
+ImmutableObjectStore` with `content_store()` and a joint objects+content write,
+implemented by PackedObjectStore (one put_records) and RemotePackedStore;
+RepositoryEntry holds one `Box<dyn RepositoryStore>`. Applies to the server publish
+AND the client fetch. Validation reads added content in full
+(repository_transition.rs:161), so staged content must be readable before it is
+stored, like BatchObjectStore's staged objects.
+
+Next after option 2: 3-5; then contract rules (step 4) and maybe client-side push.

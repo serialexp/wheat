@@ -800,6 +800,46 @@ where
         Ok(())
     }
 
+    /// Checks `application`'s order index against its target `parent`, and that its
+    /// change comes last in the canonical order of `parent`'s changes and it (I2): every
+    /// change of `parent` after the last of its dependencies has a lower ID. O(log n)
+    /// application reads, and one more per dependency.
+    async fn verify_application_order(
+        &self,
+        application: &ApplicationRecord,
+        revision: &RevisionRecord,
+        parent: &ViewRecord,
+    ) -> Result<()> {
+        let expected = self
+            .reader
+            .application_order(parent, revision.change_id)
+            .await?;
+        if application.order != expected {
+            return Err(invalid(
+                "application order index does not follow its target",
+            ));
+        }
+        let applications = ApplicationMapStore::new(self.reader.objects);
+        let mut after_dependencies = 0;
+        for dependency in &revision.dependencies {
+            let id = applications
+                .get(parent.applications, *dependency)
+                .await?
+                .ok_or_else(|| invalid("application target lacks a dependency of its revision"))?;
+            let position = self.reader.application(id).await?.order.position;
+            after_dependencies = after_dependencies.max(position + 1);
+        }
+        if self
+            .reader
+            .highest_change_from(parent, after_dependencies)
+            .await?
+            .is_some_and(|highest| highest >= revision.change_id)
+        {
+            return Err(invalid("application is out of canonical order"));
+        }
+        Ok(())
+    }
+
     async fn verify_lineage_semantics(
         &self,
         state: &RepositoryStateRecord,
@@ -866,6 +906,8 @@ where
             {
                 return Err(invalid("application target already selects application"));
             }
+            self.verify_application_order(&application, &revision, &parent)
+                .await?;
             let mut matches = 0usize;
             for child in children_by_parent
                 .get(&application.target_view)

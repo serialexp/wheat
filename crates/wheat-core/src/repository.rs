@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Application, ApplicationContext, ApplicationId, ApplicationRecord, ApplicationResult,
-    AppliedEditEvidence, ByteRange, CanonicalObject, Change, ChangeId, ChangeMetadata,
-    ChangeRevision, Conflict, ConflictId, ConflictResolution, ContentIo, DependencyGraph,
-    EditFailure, EditId, EditRecord, FailedEditEvidence, ObjectId, RejectedEdit, RepositoryClosure,
-    RepositoryState, RepositoryStateId, RepositoryStateRecord, RepositoryView, RevisionEdits,
-    RevisionId, RevisionMetadata, RevisionRecord, Tree, ViewId, ViewOrder,
+    Application, ApplicationContext, ApplicationId, ApplicationOrder, ApplicationRecord,
+    ApplicationResult, AppliedEditEvidence, ByteRange, CanonicalObject, Change, ChangeId,
+    ChangeMetadata, ChangeRevision, Conflict, ConflictId, ConflictResolution, ContentIo,
+    DependencyGraph, EditFailure, EditId, EditRecord, FailedEditEvidence, ObjectId, RejectedEdit,
+    RepositoryClosure, RepositoryState, RepositoryStateId, RepositoryStateRecord, RepositoryView,
+    RevisionEdits, RevisionId, RevisionMetadata, RevisionRecord, Tree, ViewId, ViewOrder,
 };
 
 mod application;
@@ -653,7 +653,8 @@ impl Repository {
             .revisions
             .get(&revision)
             .ok_or(RepositoryError::UnknownRevision(revision))?;
-        application::execute(revision.id, target, revision.edits(), context, false)
+        let order = self.application_order(target, revision.change_id)?;
+        application::execute(revision.id, target, order, revision.edits(), context, false)
     }
 
     pub fn create_change<C: ContentIo + ?Sized>(
@@ -1049,8 +1050,15 @@ impl Repository {
                 self.compose(&selection, &closure, context)?
             };
             let pending_id = RevisionId::from_digest([0; 32]);
-            let preliminary =
-                application::execute(pending_id, &target, &proposal.edits.edits, context, false)?;
+            let order = self.application_order(&target, proposal.id)?;
+            let preliminary = application::execute(
+                pending_id,
+                &target,
+                order.clone(),
+                &proposal.edits.edits,
+                context,
+                false,
+            )?;
             let tree = match &preliminary.result {
                 ApplicationResult::Clean { tree } => tree,
                 ApplicationResult::Conflicted { conflict, .. } => {
@@ -1074,7 +1082,7 @@ impl Repository {
             };
             revision.id = RevisionId::of_canonical_bytes(&revision.canonical_bytes());
             let application =
-                application::execute(revision.id, &target, revision.edits(), context, true)?;
+                application::execute(revision.id, &target, order, revision.edits(), context, true)?;
             let mut frontier = target.frontier.clone();
             frontier.insert(proposal.id, revision.id);
             let mut applications = target.applications.clone();
@@ -1191,6 +1199,7 @@ impl Repository {
         let preliminary = application::execute(
             RevisionId::from_digest([0; 32]),
             spot,
+            self.application_order(spot, change)?,
             &revision.edits.edits,
             context,
             false,
@@ -1260,9 +1269,10 @@ impl Repository {
             .get(&change)
             .copied()
             .ok_or(RepositoryError::UnknownChange(change))?;
+        let order = self.application_order(&target, change)?;
         let revision = &self.revisions[&revision_id];
         let application =
-            application::execute(revision_id, &target, revision.edits(), context, true)?;
+            application::execute(revision_id, &target, order, revision.edits(), context, true)?;
         let mut frontier = target.frontier.clone();
         frontier.insert(change, revision_id);
         let mut applications = target.applications.clone();
@@ -1282,6 +1292,37 @@ impl Repository {
         self.applications.insert(application.id, application);
         self.record_view(target.id, view.clone());
         Ok(view)
+    }
+
+    /// The order index of `change` applied onto `target`, read from the applications
+    /// along `target`'s composition.
+    fn application_order(
+        &self,
+        target: &RepositoryView,
+        change: ChangeId,
+    ) -> Result<ApplicationOrder, RepositoryError> {
+        let previous = target
+            .order
+            .last
+            .map(|last| {
+                target.applications.get(&last).copied().ok_or(
+                    RepositoryError::InvalidRepositoryState("view lacks its last application"),
+                )
+            })
+            .transpose()?;
+        let mut order = ApplicationOrder::begin(change, target.order.size, previous);
+        while let Some(id) = order.wanted() {
+            let node =
+                self.applications
+                    .get(&id)
+                    .ok_or(RepositoryError::InvalidRepositoryState(
+                        "order index names an unknown application",
+                    ))?;
+            order
+                .extend(&node.order)
+                .map_err(|_| RepositoryError::InvalidRepositoryState("application order index"))?;
+        }
+        Ok(order)
     }
 
     fn collect_ancestors(

@@ -1264,6 +1264,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             match site {
                 ApplicationSite::Revision => self.push_entity(id, Entity::Revision, false),
                 ApplicationSite::TargetView => self.push_entity(id, Entity::View, false),
+                ApplicationSite::Skip => self.push_entity(id, Entity::Application, false),
                 ApplicationSite::Tree => {
                     self.push_paired(Task::Tree { id, old: old_tree }, old_tree)
                 }

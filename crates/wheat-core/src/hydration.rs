@@ -111,6 +111,7 @@ pub fn hydrate_application(
         id,
         revision_id: record.revision_id,
         target_view: record.target_view,
+        order: record.order,
         result,
         applied: record.applied,
     };

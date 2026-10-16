@@ -71,4 +71,67 @@ impl<'a, O: ImmutableObjectStore> RepositoryReader<'a, O> {
     read_record!(change, ChangeObjectId, Change, Change, decode_change);
     read_record!(edit, EditId, EditRecord, Edit, decode_edit_record);
     read_record!(conflict, ConflictId, Conflict, Conflict, decode_conflict);
+
+    /// `view`'s producing application: the application of its last change. None for the
+    /// base.
+    pub(crate) async fn producing_application(
+        &self,
+        view: &ViewRecord,
+    ) -> Result<Option<ApplicationId>> {
+        let Some(last) = view.order.last else {
+            return Ok(None);
+        };
+        crate::ApplicationMapStore::new(self.objects)
+            .get(view.applications, last)
+            .await?
+            .map(Some)
+            .ok_or(RepositoryPublicationError::InvalidReferences(
+                "view lacks its last change's application",
+            ))
+    }
+
+    /// The order index of `change` applied onto `target`: O(log n) application reads
+    /// along `target`'s composition.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn application_order(
+        &self,
+        target: &ViewRecord,
+        change: ChangeId,
+    ) -> Result<ApplicationOrder> {
+        let previous = self.producing_application(target).await?;
+        let mut order = ApplicationOrder::begin(change, target.order.size, previous);
+        while let Some(id) = order.wanted() {
+            order
+                .extend(&self.application(id).await?.order)
+                .map_err(|_| order_index_mismatch())?;
+        }
+        Ok(order)
+    }
+
+    /// The highest ChangeId at `view`'s canonical positions `from` onwards, none when
+    /// there are none: O(log n) application reads.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn highest_change_from(
+        &self,
+        view: &ViewRecord,
+        from: u64,
+    ) -> Result<Option<ChangeId>> {
+        let mut query = RangeMax::new(from, view.order.size);
+        if query.is_empty() {
+            return Ok(None);
+        }
+        let mut next = self.producing_application(view).await?;
+        while let Some(id) = next {
+            next = query
+                .fold(&self.application(id).await?.order)
+                .map_err(|_| order_index_mismatch())?;
+        }
+        Ok(query.highest())
+    }
+}
+
+fn order_index_mismatch() -> RepositoryPublicationError {
+    RepositoryPublicationError::InvalidReferences(
+        "application order index does not line up with the applications it names",
+    )
 }

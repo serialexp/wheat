@@ -515,7 +515,11 @@ content it needs anyway; close or keep per Bart.
    combined revision replays like a reapplied one (an edit may find its change already
    made, never a conflict), and `join_revisions` refuses more than 65 lines at once.
 4. Application order index: format, `apply_step`, full validation of I2; tests
-   including the canonical-order cases.
+   including the canonical-order cases. Done. I2 is a property of an application
+   (its change last on its target), so full validation checks it, with the recomputed
+   index, once per retained application. An index whose entry counts don't fit its
+   position is refused on decode, so a walk never indexes past its end. The index
+   entries are references in the object graph.
 5. Full validation tightened (partition equality, I1 for every view, composition
    edges by maps).
 6. `increment_validation.rs`: steps 1, 2, 6-8 and the lineage map diff; then steps

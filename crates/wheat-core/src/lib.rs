@@ -56,12 +56,13 @@ pub use id::{
     RevisionMapId, TreeId, ViewId, ViewLabelManifestId, ViewLineageMapId,
 };
 pub use model::{
-    Actor, Application, ApplicationResult, AppliedEditEvidence, ByteRange, CanonicalObject, Change,
-    ChangeMetadata, ChangeRevision, Conflict, ConflictResolution, ConflictResolutionEvidence,
-    DependencyGraph, DirectoryEntry, DirectoryNode, EditFailure, EditSubsumption, EditTransition,
-    FailedEditEvidence, FileKind, FileValue, MAX_COMBINES, RejectedEdit, RepositoryClosure,
-    RepositoryState, RepositoryView, RevisionEdits, RevisionMapChild, RevisionMapNode,
-    RevisionMetadata, SourceProvenance, Timestamp, Tree, ViewOrder, next_generation,
+    Actor, Application, ApplicationOrder, ApplicationResult, AppliedEditEvidence, ByteRange,
+    CanonicalObject, Change, ChangeMetadata, ChangeRevision, Conflict, ConflictResolution,
+    ConflictResolutionEvidence, DependencyGraph, DirectoryEntry, DirectoryNode, EditFailure,
+    EditSubsumption, EditTransition, FailedEditEvidence, FileKind, FileValue, MAX_COMBINES,
+    OrderIndexMismatch, RangeMax, RejectedEdit, RepositoryClosure, RepositoryState, RepositoryView,
+    RevisionEdits, RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance,
+    Timestamp, Tree, ViewOrder, next_generation,
 };
 pub use persisted::{RepositoryStateRecord, ViewRecord};
 pub use repository::{

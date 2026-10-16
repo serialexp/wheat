@@ -855,6 +855,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let application = ApplicationRecord {
             revision_id,
             target_view: view.id(),
+            order: RepositoryReader::new(self.objects, self.content)
+                .application_order(&view, change)
+                .await?,
             result: replay.result,
             applied: replay.applied,
         };

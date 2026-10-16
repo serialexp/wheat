@@ -497,6 +497,7 @@ fn view_identity_covers_the_application_and_conflict_manifest() {
     let application = Application::new(
         revision,
         plain.id,
+        ApplicationOrder::begin(change, 0, None),
         ApplicationResult::Conflicted {
             partial_tree: tree.clone(),
             conflict: conflict.clone(),

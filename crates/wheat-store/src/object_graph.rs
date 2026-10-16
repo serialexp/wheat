@@ -217,6 +217,8 @@ pub(crate) fn revision<E>(
 pub(crate) enum ApplicationSite {
     Revision,
     TargetView,
+    /// An application the order index names (`previous` is `skip[0]`).
+    Skip,
     /// The resulting tree, or the partial tree of a conflicted application.
     Tree,
     Conflict,
@@ -236,6 +238,9 @@ pub(crate) fn application<E>(
         ApplicationSite::TargetView,
         record.target_view.into(),
     ))?;
+    for id in &record.order.skip {
+        f(Ref::Object(ApplicationSite::Skip, (*id).into()))?;
+    }
     match record.result {
         ApplicationResultRecord::Clean { tree } => {
             f(Ref::Object(ApplicationSite::Tree, tree.into()))?;
@@ -754,6 +759,35 @@ mod tests {
         })
         .unwrap();
         assert_eq!(parents, [id(1), id(2), id(3)].map(ObjectId::from).to_vec());
+    }
+
+    #[test]
+    fn an_application_refers_to_each_application_its_order_index_names() {
+        let id = |byte| wheat_core::ApplicationId::from_digest([byte; 32]);
+        let change = wheat_core::ChangeId::from_bytes([1; 16]);
+        let record = ApplicationRecord {
+            revision_id: wheat_core::RevisionId::from_digest([1; 32]),
+            target_view: wheat_core::ViewId::from_digest([2; 32]),
+            order: wheat_core::ApplicationOrder {
+                position: 2,
+                previous: Some(id(3)),
+                skip: vec![id(3), id(4)],
+                window_max: vec![change, change],
+            },
+            result: ApplicationResultRecord::Clean {
+                tree: wheat_core::TreeId::from_digest([5; 32]),
+            },
+            applied: Default::default(),
+        };
+        let mut skips = Vec::new();
+        application(&record, |reference| {
+            if let Ref::Object(ApplicationSite::Skip, object) = reference {
+                skips.push(object);
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(skips, [id(3), id(4)].map(ObjectId::from).to_vec());
     }
 
     #[tokio::test]

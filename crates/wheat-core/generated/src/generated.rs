@@ -82,6 +82,19 @@ impl WheatObject {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
                 v.revision_id.encode_into(encoder)?;
                 v.target_view.encode_into(encoder)?;
+                encoder.write_uint64(v.position, Endianness::BigEndian);
+                encoder.write_uint32(v.previous.len() as u32, Endianness::BigEndian);
+                for item in &v.previous {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.skip.len() as u32, Endianness::BigEndian);
+                for item in &v.skip {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.window_max.len() as u32, Endianness::BigEndian);
+                for item in &v.window_max {
+                    item.encode_into(encoder)?;
+                }
                 v.result.encode_into(encoder)?;
                 encoder.write_uint32(v.applied.len() as u32, Endianness::BigEndian);
                 for item in &v.applied {
@@ -2073,6 +2086,10 @@ impl ConflictResolutionEvidenceV1 {
 pub struct ApplicationV1Input {
     pub revision_id: RevisionId,
     pub target_view: ViewId,
+    pub position: u64,
+    pub previous: Vec<ApplicationId>,
+    pub skip: Vec<ApplicationId>,
+    pub window_max: Vec<ChangeId>,
     pub result: ApplicationResultV1,
     pub applied: Vec<AppliedEditEntryV1>,
 }
@@ -2082,6 +2099,10 @@ pub struct ApplicationV1Output {
     pub wire_tag: u16,
     pub revision_id: RevisionId,
     pub target_view: ViewId,
+    pub position: u64,
+    pub previous: Vec<ApplicationId>,
+    pub skip: Vec<ApplicationId>,
+    pub window_max: Vec<ChangeId>,
     pub result: ApplicationResultV1,
     pub applied: Vec<AppliedEditEntryV1>,
 }
@@ -2099,6 +2120,19 @@ impl ApplicationV1Input {
         encoder.write_u16_be(1025);
         self.revision_id.encode_into(encoder)?;
         self.target_view.encode_into(encoder)?;
+        encoder.write_u64_be(self.position);
+        encoder.write_u32_be(self.previous.len() as u32);
+        for item in &self.previous {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.skip.len() as u32);
+        for item in &self.skip {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.window_max.len() as u32);
+        for item in &self.window_max {
+            item.encode_into(encoder)?;
+        }
         self.result.encode_into(encoder)?;
         encoder.write_u32_be(self.applied.len() as u32);
         for item in &self.applied {
@@ -2124,6 +2158,25 @@ impl ApplicationV1Output {
         }
         let revision_id = RevisionId::decode_with_decoder(decoder)?;
         let target_view = ViewId::decode_with_decoder(decoder)?;
+        let position = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut previous = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = ApplicationId::decode_with_decoder(decoder)?;
+            previous.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut skip = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = ApplicationId::decode_with_decoder(decoder)?;
+            skip.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut window_max = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = ChangeId::decode_with_decoder(decoder)?;
+            window_max.push(item);
+        }
         let result = ApplicationResultV1::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
         let mut applied = Vec::with_capacity(decoder.capacity_hint(length));
@@ -2135,6 +2188,10 @@ impl ApplicationV1Output {
             wire_tag,
             revision_id,
             target_view,
+            position,
+            previous,
+            skip,
+            window_max,
             result,
             applied,
         })
@@ -2152,6 +2209,10 @@ impl From<ApplicationV1Output> for ApplicationV1Input {
         Self {
             revision_id: o.revision_id,
             target_view: o.target_view,
+            position: o.position,
+            previous: o.previous,
+            skip: o.skip,
+            window_max: o.window_max,
             result: o.result,
             applied: o.applied,
         }
@@ -2164,6 +2225,10 @@ impl From<ApplicationV1Input> for ApplicationV1Output {
             wire_tag: 1025u16,
             revision_id: i.revision_id,
             target_view: i.target_view,
+            position: i.position,
+            previous: i.previous,
+            skip: i.skip,
+            window_max: i.window_max,
             result: i.result,
             applied: i.applied,
         }

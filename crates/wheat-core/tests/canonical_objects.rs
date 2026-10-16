@@ -511,6 +511,7 @@ fn conflict_edits_are_canonicalized_before_identity() {
     let _application = Application::new(
         wheat_core::RevisionId::from_digest([7; 32]),
         view.id,
+        wheat_core::ApplicationOrder::begin(wheat_core::ChangeId::from_bytes([7; 16]), 0, None),
         ApplicationResult::Conflicted {
             partial_tree: Tree::new(),
             conflict: first,

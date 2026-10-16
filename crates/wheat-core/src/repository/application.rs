@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn execute<C: ContentIo + ?Sized>(
     revision: RevisionId,
     target: &RepositoryView,
+    order: ApplicationOrder,
     edits: &BTreeMap<EditId, EditRecord>,
     context: ApplicationContext<'_, C>,
     allow_already_satisfied: bool,
@@ -99,7 +100,9 @@ pub(super) fn execute<C: ContentIo + ?Sized>(
             conflict: Conflict::new(target.id, failed),
         }
     };
-    Ok(Application::new(revision, target.id, result, applied))
+    Ok(Application::new(
+        revision, target.id, order, result, applied,
+    ))
 }
 
 fn byte_range(range: std::ops::Range<usize>) -> ByteRange {

@@ -254,6 +254,34 @@
         { name: "wire_tag", type: "uint16", const: 0x0401 },
         { name: "revision_id", type: "RevisionId" },
         { name: "target_view", type: "ViewId" },
+        // The change's index in the result view's canonical order: the target's size.
+        { name: "position", type: "uint64" },
+        {
+          // Zero or one element: the target's producing application, none on the
+          // base. An array for the same reason as RevisionV1's predecessors.
+          name: "previous",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ApplicationId" },
+        },
+        {
+          // skip[j]: the application at position - 2^j, for each 2^j <= position.
+          name: "skip",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ApplicationId" },
+        },
+        {
+          // window_max[j]: the highest ChangeId among the 2^j positions ending at
+          // this one, for each 2^j <= position + 1.
+          name: "window_max",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint32",
+          items: { type: "ChangeId" },
+        },
         { name: "result", type: "ApplicationResultV1" },
         { name: "applied", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "AppliedEditEntryV1" } },
       ],

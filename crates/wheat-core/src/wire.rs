@@ -1123,6 +1123,27 @@ pub(crate) fn application_bytes(application: &Application) -> Vec<u8> {
         wire::ApplicationV1Input {
             revision_id: revision_id(application.revision_id),
             target_view: view_id(application.target_view),
+            position: application.order.position,
+            previous: application
+                .order
+                .previous
+                .into_iter()
+                .map(application_id)
+                .collect(),
+            skip: application
+                .order
+                .skip
+                .iter()
+                .copied()
+                .map(application_id)
+                .collect(),
+            window_max: application
+                .order
+                .window_max
+                .iter()
+                .copied()
+                .map(change_id)
+                .collect(),
             result,
             applied: application
                 .applied
@@ -1394,6 +1415,18 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             validate_transition(&revision.transition, &revision.edits)?;
         }
         wire::WheatObject::ApplicationV1(application) => {
+            // The recurrence is checked against the applications named; the shape
+            // alone is checked here, so a walk of the index never indexes past its end.
+            let position = application.position;
+            if application.previous.len() > 1
+                || application.skip.len() != crate::ApplicationOrder::skip_levels(position)
+                || application.window_max.len() != crate::ApplicationOrder::window_levels(position)
+                || application.previous.first() != application.skip.first()
+            {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "application order index does not fit its position",
+                ));
+            }
             validate_sorted_unique_by(
                 &application.applied,
                 |e| e.edit.digest.bytes.as_slice(),

@@ -53,6 +53,8 @@ pub enum CommitWriterError {
     ConflictedParent,
     #[error("the view's size or weight overflows")]
     OrderOverflow,
+    #[error("the parent view's applications could not be read")]
+    Reader(#[from] crate::RepositoryPublicationError),
     #[error("edit application failed: {0:?}")]
     Application(ApplicationError),
     #[error("edit application did not produce a clean result")]
@@ -268,6 +270,9 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         let application = ApplicationRecord {
             revision_id,
             target_view: parent,
+            order: crate::RepositoryReader::new(self.objects, self.content)
+                .application_order(&parent_record, proposal.id)
+                .await?,
             result: ApplicationResultRecord::Clean {
                 tree: resulting_tree,
             },

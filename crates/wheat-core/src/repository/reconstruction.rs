@@ -92,6 +92,11 @@ impl Repository {
         for application in self.applications.values() {
             if !self.revisions.contains_key(&application.revision_id)
                 || !self.views.contains_key(&application.target_view)
+                || application
+                    .order
+                    .skip
+                    .iter()
+                    .any(|id| !self.applications.contains_key(id))
             {
                 return Err(RepositoryError::InvalidRepositoryState(
                     "application object reference",

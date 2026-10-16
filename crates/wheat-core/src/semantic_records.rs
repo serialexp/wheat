@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use wheat_binschema::generated as binschema;
 
 use crate::{
-    Actor, ApplicationId, AppliedEditEvidence, ByteRange, CanonicalObjectError,
+    Actor, ApplicationId, ApplicationOrder, AppliedEditEvidence, ByteRange, CanonicalObjectError,
     CanonicalObjectKind, Change, ChangeId, ChangeMetadata, Conflict, ConflictId,
     ConflictResolutionEvidence, ContentId, EditFailure, EditId, EditSubsumption, EditTransition,
     FailedEditEvidence, FileKind, FileValue, RevisionId, RevisionMetadata, SourceProvenance,
@@ -91,6 +91,7 @@ pub enum ApplicationResultRecord {
 pub struct ApplicationRecord {
     pub revision_id: RevisionId,
     pub target_view: ViewId,
+    pub order: ApplicationOrder,
     pub result: ApplicationResultRecord,
     pub applied: BTreeMap<EditId, AppliedEditEvidence>,
 }
@@ -123,6 +124,27 @@ impl ApplicationRecord {
             binschema::ApplicationV1Input {
                 revision_id: revision_id_wire(self.revision_id),
                 target_view: view_id_wire(self.target_view),
+                position: self.order.position,
+                previous: self
+                    .order
+                    .previous
+                    .into_iter()
+                    .map(application_id_wire)
+                    .collect(),
+                skip: self
+                    .order
+                    .skip
+                    .iter()
+                    .copied()
+                    .map(application_id_wire)
+                    .collect(),
+                window_max: self
+                    .order
+                    .window_max
+                    .iter()
+                    .copied()
+                    .map(change_id_wire)
+                    .collect(),
                 result,
                 applied: self
                     .applied
@@ -200,6 +222,24 @@ pub fn decode_application_record(bytes: &[u8]) -> Result<ApplicationRecord, Cano
     Ok(ApplicationRecord {
         revision_id: revision_id_domain(&application.revision_id)?,
         target_view: view_id_domain(&application.target_view)?,
+        order: ApplicationOrder {
+            position: application.position,
+            previous: application
+                .previous
+                .first()
+                .map(application_id_domain)
+                .transpose()?,
+            skip: application
+                .skip
+                .iter()
+                .map(application_id_domain)
+                .collect::<Result<_, _>>()?,
+            window_max: application
+                .window_max
+                .iter()
+                .map(change_id_domain)
+                .collect::<Result<_, _>>()?,
+        },
         result,
         applied: application
             .applied
