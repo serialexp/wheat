@@ -248,7 +248,7 @@ async fn run_session(
                     let head = entry.heads.read().map_err(|e| {
                         ConnectionError::Internal(format!("failed to read head: {e}"))
                     })?;
-                    let reader = RepositoryReader::new(&entry.objects, &entry.content);
+                    let reader = RepositoryReader::new(&entry.store, &entry.content);
                     let envelope = reader.envelope(head.envelope).await.map_err(|e| {
                         ConnectionError::Internal(format!("failed to read envelope: {e}"))
                     })?;

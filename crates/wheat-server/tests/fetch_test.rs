@@ -15,7 +15,7 @@ use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
     ContentStore, Durability, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
-    RepositoryPublisher, RepositoryReader,
+    RepositoryPublisher, RepositoryReader, SeparateRepositoryStore,
 };
 
 use support::{
@@ -102,8 +102,10 @@ async fn serve_history(changes: usize) -> Served {
 
     let registry = Registry::single_with_stores(
         REPO.to_string(),
-        Box::new(objects.clone()),
-        content.clone(),
+        Box::new(SeparateRepositoryStore::new(
+            objects.clone(),
+            content.clone(),
+        )),
         heads,
     );
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();

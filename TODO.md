@@ -21,6 +21,14 @@ between `wheat-native-protocol.md` and the code.
   "Resolved design questions", says transfers resume from the last received chunk.
   Nothing does; a partly received chunked blob is fetched again. Correct the doc or
   implement it (tracked as "Resumable — content offsets" in the Scion doc).
+- `[ ]` **Delta content on the packed store bypasses the one append.** On
+  `PackedObjectStore`, delta-encoded content is written as one loose envelope file per
+  blob (`PackedEngine::put_raw_envelopes`, and `put_publication`), each with its own
+  file and directory syncs, outside the catalog append. Each modified file of a
+  publish or fetch therefore costs extra fsyncs; `publish_contention` only adds new
+  files, so it does not show this. Options: store deltas as segment records, or skip
+  deltas on the durable write path and leave them to repack. Measure with a case that
+  modifies files first.
 
 ## Security and performance scan (2026-09-26)
 

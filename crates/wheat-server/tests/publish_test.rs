@@ -21,7 +21,8 @@ use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
     ContentStore, Durability, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
-    ObjectStoreError, RepositoryPublisher, RepositoryReader, StoredObject,
+    ObjectStoreError, RepositoryPublisher, RepositoryReader, RepositoryStore,
+    SeparateRepositoryStore, StoredObject,
 };
 
 use support::{
@@ -159,20 +160,25 @@ impl Publishing {
             .await
             .unwrap();
 
-        let served: Box<dyn ImmutableObjectStore> = match served {
-            Served::Plain => Box::new(server_objects.clone()),
-            Served::SealFails => Box::new(SealFails(server_objects.clone())),
-            Served::CountsWrites(writes) => Box::new(CountsWrites {
-                store: server_objects.clone(),
-                writes,
-            }),
+        let content = server_content.clone();
+        let served: Box<dyn RepositoryStore> = match served {
+            Served::Plain => Box::new(SeparateRepositoryStore::new(
+                server_objects.clone(),
+                content,
+            )),
+            Served::SealFails => Box::new(SeparateRepositoryStore::new(
+                SealFails(server_objects.clone()),
+                content,
+            )),
+            Served::CountsWrites(writes) => Box::new(SeparateRepositoryStore::new(
+                CountsWrites {
+                    store: server_objects.clone(),
+                    writes,
+                },
+                content,
+            )),
         };
-        let registry = Registry::single_with_stores(
-            REPO.to_string(),
-            served,
-            server_content.clone(),
-            server_heads,
-        );
+        let registry = Registry::single_with_stores(REPO.to_string(), served, server_heads);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready, ready_rx) = tokio::sync::oneshot::channel();
         let any_port: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -497,6 +503,51 @@ async fn content_is_asked_for_only_where_the_head_lacks_it() {
     let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
     assert_published(&result, proposed);
     assert_eq!(asked, [ContentId::of(&notes)]);
+}
+
+/// Content is staged with the objects and stored only when the publish is accepted.
+#[tokio::test]
+async fn content_of_a_publish_that_is_never_committed_is_not_stored() {
+    let mut publishing = Publishing::start().await;
+    let notes = b"never committed".to_vec();
+    let proposed = publishing
+        .propose(&[("notes.txt".to_owned(), notes.clone())])
+        .await;
+    let mut ws = publishing.request(proposed).await;
+
+    upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    let WheatProtocolMessage::ContentNeeded(needed) = recv_msg(&mut ws).await else {
+        panic!("expected ContentNeeded");
+    };
+    for id in needed.content_ids {
+        let blob = ContentId::from_digest(id.bytes.as_slice().try_into().unwrap());
+        let data = publishing.client_content.get(blob).unwrap();
+        send_msg(
+            &mut ws,
+            &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
+                message_type: 0x44,
+                op_id: OP,
+                content_id: id,
+                data,
+            }),
+        )
+        .await;
+    }
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
+            message_type: 0x46,
+            op_id: OP,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut ws).await,
+        WheatProtocolMessage::ContentComplete(_)
+    ));
+
+    assert!(!publishing.server_content.contains(ContentId::of(&notes)));
+    publishing.assert_head_unchanged().await;
 }
 
 #[tokio::test]

@@ -116,9 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StoreMode::S3Packed => {
             let config = s3_config_from_env()?;
             let store = wheat_store::RemotePackedStore::open(&config).await?;
-            let content = store.content_store();
             let heads = wheat_store::LocalPublicationStore::new(data_dir.join("repository.head"));
-            Registry::single_with_stores(repo_name, Box::new(store), content, heads)
+            Registry::single_with_stores(repo_name, Box::new(store), heads)
         }
     };
 

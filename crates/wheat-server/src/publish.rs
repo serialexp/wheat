@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
-    BatchObjectStore, DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError,
-    PublicationError, PublicationStore, RepositoryHead, RepositoryReader, RepositoryUnionError,
-    StructuralDelta, StructuralDeltaError, StructuralDeltaLimits, TransitionValidationOptions,
-    TreeDiffLimits,
+    DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, PublicationError,
+    PublicationStore, RepositoryHead, RepositoryReader, RepositoryStage, RepositoryStore,
+    RepositoryStoreError, RepositoryUnionError, StructuralDelta, StructuralDeltaError,
+    StructuralDeltaLimits, TransitionValidationOptions, TreeDiffLimits,
 };
 
 use crate::connection::ConnectionError;
@@ -68,11 +68,12 @@ pub async fn handle_publish(
             .map_err(|_| ConnectionError::Protocol("invalid envelope ID"))?,
     );
 
-    // Uploaded objects are staged and stored in one durable write once the publish
-    // is accepted, rather than one per round of the walk. A refused publish leaves
-    // nothing behind. Only a publish larger than the stage is written early, in
-    // stage-sized batches, and those objects are harmless if it is then refused.
-    let staged = BatchObjectStore::new(&*entry.objects, STAGED_OBJECTS, STAGED_OBJECT_BYTES);
+    // Uploaded objects and content are staged and stored together in one durable
+    // write once the publish is accepted, rather than one per round of the walk. A
+    // refused publish leaves nothing behind. Only a publish larger than the stage is
+    // written early, in stage-sized batches, and what they hold is harmless if it
+    // is then refused.
+    let staged = RepositoryStage::new(&*entry.store, STAGED_OBJECTS, STAGED_BYTES);
 
     // --- Object transfer phase ---
     if let Some(refusal) =
@@ -82,7 +83,7 @@ pub async fn handle_publish(
     }
 
     // --- Content transfer phase ---
-    let reader = RepositoryReader::new(&staged, &entry.content);
+    let reader = RepositoryReader::new(&staged, staged.content());
     let envelope_record = reader
         .envelope(proposed_envelope_id)
         .await
@@ -125,10 +126,8 @@ pub async fn handle_publish(
         let base_map = compute_delta_base_map(&staged, &reader, &current_state, &state).await;
 
         // Ask in rounds of at most MAX_WANT_IDS, one ContentNeeded each. In
-        // every round accept only the requested blobs, each once, and store
-        // them in batches as they arrive so the session never holds more
-        // than one batch plus the blob being reassembled.
-        let mut pending = PendingContent::default();
+        // every round accept only the requested blobs, each once, and stage them
+        // as they arrive; the stage bounds what the session holds.
         for round in missing.chunks(MAX_WANT_IDS) {
             send(
                 ws,
@@ -181,13 +180,12 @@ pub async fn handle_publish(
                         return reject(ws, op_id, current_head, "content identity mismatch").await;
                     }
                     let base = base_map.get(&id).copied();
-                    if pending.push(id, data, base) {
-                        pending.store(entry)?;
-                    }
+                    staged.put_content([(id, data, base)]).await.map_err(|e| {
+                        ConnectionError::Internal(format!("failed to store content batch: {e}"))
+                    })?;
                 }
             }
         }
-        pending.store(entry)?;
     }
 
     // Nothing more is needed; the client may commit.
@@ -330,12 +328,13 @@ async fn commit(
             return reject(ws, op_id, &head, &format!("validation failed: {e}")).await;
         }
 
-        // Store the staged objects, then seal any buffered objects into a durable
-        // batch (e.g. a packed segment uploaded to S3) before the head can name
-        // them. Sealing is a no-op for local stores.
+        // Store the staged objects and content in one write, then seal any buffered
+        // objects into a durable batch (e.g. a packed segment uploaded to S3) before
+        // the head can name them. Sealing is a no-op for local stores.
         let stored = async {
             staged.flush().await?;
-            entry.objects.seal().await
+            entry.store.seal().await?;
+            Ok::<_, RepositoryStoreError>(())
         }
         .instrument(debug_span!("publish_store"))
         .await;
@@ -458,52 +457,18 @@ async fn reject(
     Ok(None)
 }
 
-/// Uploaded bytes held before they are stored together. Storing in batches
-/// keeps concurrent writes for remote backends; the cap keeps a publish
-/// from holding every uploaded blob in memory at once.
-const PENDING_CONTENT_BYTES: usize = 64 * 1024 * 1024;
-
-/// Uploaded content waiting to be stored, with its delta base.
-#[derive(Default)]
-struct PendingContent {
-    items: Vec<(ContentId, Vec<u8>, Option<ContentId>)>,
-    bytes: usize,
-}
-
-impl PendingContent {
-    /// Add a blob. Returns true once the batch is full and should be stored.
-    fn push(&mut self, id: ContentId, data: Vec<u8>, base: Option<ContentId>) -> bool {
-        self.bytes += data.len();
-        self.items.push((id, data, base));
-        self.bytes >= PENDING_CONTENT_BYTES
-    }
-
-    /// Store everything pending, with delta compression where a base is known.
-    fn store(&mut self, entry: &RepositoryEntry) -> Result<(), ConnectionError> {
-        if self.items.is_empty() {
-            return Ok(());
-        }
-        let items = std::mem::take(&mut self.items);
-        self.bytes = 0;
-        entry
-            .content
-            .put_many_with_bases(items, 8)
-            .map_err(|e| ConnectionError::Internal(format!("failed to store content batch: {e}")))
-    }
-}
-
 /// Writers used to store one message's worth of uploaded objects.
 const OBJECT_WRITE_CONCURRENCY: usize = 8;
 
-/// A publish's uploaded objects, held until the publish is accepted. Reads see them
-/// before they are stored.
-type Staged<'a> = BatchObjectStore<'a, dyn ImmutableObjectStore>;
+/// A publish's uploaded objects and content, held until the publish is accepted.
+/// Reads see them before they are stored.
+type Staged<'a> = RepositoryStage<'a, dyn RepositoryStore>;
 
 /// Most objects one publish stages before writing them early.
 const STAGED_OBJECTS: usize = 65_536;
-/// Most object bytes one publish stages before writing them early, like
-/// [`PENDING_CONTENT_BYTES`] for content.
-const STAGED_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+/// Most object bytes, and separately most content bytes, one publish stages before
+/// writing them early, so a publish never holds every uploaded blob in memory.
+const STAGED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Asks for the objects of `proposed` that the store lacks, until it has them all.
 ///

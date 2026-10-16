@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use wheat_core::{ObjectId, validate_canonical_object};
 
 use crate::{ImmutableObjectStore, ObjectStoreError, StoredObject};
@@ -13,6 +13,36 @@ const MAX_CONCURRENCY: usize = 16;
 struct Pending {
     objects: BTreeMap<ObjectId, Vec<u8>>,
     bytes: usize,
+}
+
+impl Pending {
+    fn batch(&self) -> Vec<(ObjectId, Vec<u8>)> {
+        self.objects
+            .iter()
+            .map(|(id, bytes)| (*id, bytes.clone()))
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.objects.clear();
+        self.bytes = 0;
+    }
+}
+
+/// The buffered objects of a [`BatchObjectStore`], held so the caller can write them
+/// itself. Nothing is buffered or read through meanwhile.
+pub(crate) struct PendingObjects<'a>(MutexGuard<'a, Pending>);
+
+impl PendingObjects<'_> {
+    /// The buffered objects, to write.
+    pub(crate) fn batch(&self) -> Vec<(ObjectId, Vec<u8>)> {
+        self.0.batch()
+    }
+
+    /// Forgets the buffered objects once the caller has made them durable.
+    pub(crate) fn written(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// A bounded, read-through write buffer for an immutable object store.
@@ -75,18 +105,20 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
         self.flush_locked(&mut pending).await
     }
 
+    /// Holds the buffered objects for a write the caller makes instead of
+    /// [`Self::flush`].
+    pub(crate) async fn lock_pending(&self) -> PendingObjects<'_> {
+        PendingObjects(self.pending.lock().await)
+    }
+
     async fn flush_locked(&self, pending: &mut Pending) -> Result<(), ObjectStoreError> {
         if pending.objects.is_empty() {
             return Ok(());
         }
-        let objects = pending
-            .objects
-            .iter()
-            .map(|(id, bytes)| (*id, bytes.clone()))
-            .collect::<Vec<_>>();
-        self.backend.put_batch(&objects, self.concurrency).await?;
-        pending.objects.clear();
-        pending.bytes = 0;
+        self.backend
+            .put_batch(&pending.batch(), self.concurrency)
+            .await?;
+        pending.clear();
         Ok(())
     }
 

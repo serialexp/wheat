@@ -16,8 +16,8 @@ use url::{Host, Url};
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, ViewId};
 use wheat_protocol::*;
 use wheat_store::{
-    BatchObjectStore, ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead,
-    RepositoryReader, StructuralDelta, StructuralDeltaLimits,
+    ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead, RepositoryReader,
+    RepositoryStage, RepositoryStore, StructuralDelta, StructuralDeltaLimits,
 };
 
 // ---------------------------------------------------------------------------
@@ -497,16 +497,17 @@ const FETCH_WRITE_CONCURRENCY: usize = 8;
 
 /// Most objects a fetch or clone stages before writing them early.
 const STAGED_OBJECTS: usize = 65_536;
-/// Most object bytes a fetch or clone stages before writing them early.
-const STAGED_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+/// Most object bytes, and separately most content bytes, a fetch or clone stages
+/// before writing them early, so it never holds every blob in memory at once.
+const STAGED_BYTES: usize = 64 * 1024 * 1024;
 
-/// A write buffer over `objects` for one fetch or clone. Each durable write costs
-/// several fsyncs, so the objects it receives, and those a merge with local work
-/// makes, are stored together by [`BatchObjectStore::flush`] just before the head
-/// moves, not once per message. Reads see staged objects. Only a transfer larger
-/// than the stage is written early, in stage-sized batches.
-pub fn staged<O: ImmutableObjectStore + ?Sized>(objects: &O) -> BatchObjectStore<'_, O> {
-    BatchObjectStore::new(objects, STAGED_OBJECTS, STAGED_OBJECT_BYTES)
+/// A write buffer over `store` for one fetch or clone. Each durable write costs
+/// several fsyncs, so the objects and content it receives, and the objects a merge
+/// with local work makes, are stored together by [`RepositoryStage::flush`] just
+/// before the head moves, not once per message. Reads see what is staged. Only a
+/// transfer larger than the stage is written early, in stage-sized batches.
+pub fn staged<S: RepositoryStore + ?Sized>(store: &S) -> RepositoryStage<'_, S> {
+    RepositoryStage::new(store, STAGED_OBJECTS, STAGED_BYTES)
 }
 
 /// What one structural fetch transferred.
@@ -714,22 +715,23 @@ pub struct FetchedContent {
 ///
 /// With `since`, only content that `since`'s set lacks is looked up: the
 /// client keeps an envelope as `since` only once all its content is stored.
-pub async fn fetch_content<O: ImmutableObjectStore>(
+/// Fetched content is staged with the objects in `stage`.
+pub async fn fetch_content<S: RepositoryStore + ?Sized>(
     session: &mut WheatSession,
     op_id: u32,
-    objects: &O,
-    content: &ContentStore,
+    stage: &RepositoryStage<'_, S>,
     envelope_id: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
 ) -> Result<FetchedContent> {
-    let reader = RepositoryReader::new(objects, content);
+    let content = stage.content();
+    let reader = RepositoryReader::new(stage, content);
     let required = async |envelope_id| -> Result<_> {
         let envelope = reader.envelope(envelope_id).await?;
         let state = reader.state(envelope.state).await?;
         Ok(state.required_content)
     };
     let new = required(envelope_id).await?;
-    let content_set = wheat_store::ContentSetStore::new(objects);
+    let content_set = wheat_store::ContentSetStore::new(stage);
     let candidates = match since {
         Some(since) => content_set.added(required(since).await?, new).await?,
         None => {
@@ -756,7 +758,13 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
     }
 
     let total = missing.len();
-    let mut pending = PendingContent::default();
+    // The stage checks that each blob matches its ID.
+    let stage_blob = async |id, data| {
+        stage
+            .put_content([(id, data, None)])
+            .await
+            .context("storing fetched content")
+    };
 
     // Request content in batches.
     for batch in missing.chunks(MAX_WANT_IDS) {
@@ -790,7 +798,7 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                         receiver
                             .accept_whole(id, entry.data.len())
                             .context("server sent content that breaks the fetch rules")?;
-                        pending.push(content, id, entry.data)?;
+                        stage_blob(id, entry.data).await?;
                     }
                 }
                 WheatProtocolMessage::ContentChunk(chunk) => {
@@ -802,7 +810,7 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
                         .accept_chunk(chunk_id, chunk.offset, chunk.data, chunk.is_final)
                         .context("server sent content that breaks the fetch rules")?;
                     if let Some((id, data)) = finished {
-                        pending.push(content, id, data)?;
+                        stage_blob(id, data).await?;
                     }
                 }
                 WheatProtocolMessage::Error(e) if e.op_id == op_id => {
@@ -814,48 +822,11 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
             }
         }
     }
-    pending.store(content)?;
 
     Ok(FetchedContent {
         checked,
         fetched: total,
     })
-}
-
-/// Fetched blobs held until there are enough to store together.
-const PENDING_CONTENT_BYTES: usize = 64 * 1024 * 1024;
-
-/// Writers used to store fetched blobs. Each blob is synced on its own, so
-/// several writers let those waits overlap.
-const CONTENT_WRITE_CONCURRENCY: usize = 8;
-
-/// Fetched blobs waiting to be stored. Storing them in batches lets the store's
-/// writers work in parallel; the byte cap keeps a fetch from holding every blob
-/// in memory at once.
-#[derive(Default)]
-struct PendingContent {
-    items: Vec<(ContentId, Vec<u8>)>,
-    bytes: usize,
-}
-
-impl PendingContent {
-    /// Adds a blob, and stores the batch once it is full.
-    fn push(&mut self, content: &ContentStore, id: ContentId, data: Vec<u8>) -> Result<()> {
-        self.bytes += data.len();
-        self.items.push((id, data));
-        if self.bytes >= PENDING_CONTENT_BYTES {
-            self.store(content)?;
-        }
-        Ok(())
-    }
-
-    /// Stores every pending blob. The store checks that each matches its ID.
-    fn store(&mut self, content: &ContentStore) -> Result<()> {
-        self.bytes = 0;
-        content
-            .put_many(std::mem::take(&mut self.items), CONTENT_WRITE_CONCURRENCY)
-            .context("storing fetched content")
-    }
 }
 
 // ---------------------------------------------------------------------------

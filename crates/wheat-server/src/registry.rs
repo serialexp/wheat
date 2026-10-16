@@ -5,12 +5,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use wheat_store::{
-    ContentStore, ImmutableObjectStore, LocalPublicationStore, ObjectStoreError, PackedObjectStore,
+    ContentStore, LocalPublicationStore, ObjectStoreError, PackedObjectStore, RepositoryStore,
 };
 
 /// A single repository's stores.
 pub struct RepositoryEntry {
-    pub objects: Box<dyn ImmutableObjectStore>,
+    pub store: Box<dyn RepositoryStore>,
+    /// `store`'s content.
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
     /// Held by a publish from reading the head until its compare-and-swap, so
@@ -22,23 +23,16 @@ pub struct RepositoryEntry {
 impl RepositoryEntry {
     /// Opens the packed store in `data_dir/storage` and its publication head.
     pub fn open(data_dir: &Path) -> Result<Self, ObjectStoreError> {
-        let packed = PackedObjectStore::open(data_dir.join("storage"))?;
-        let content = packed.content_store();
         Ok(Self::new(
-            Box::new(packed),
-            content,
+            Box::new(PackedObjectStore::open(data_dir.join("storage"))?),
             LocalPublicationStore::new(data_dir.join("repository.head")),
         ))
     }
 
-    pub fn new(
-        objects: Box<dyn ImmutableObjectStore>,
-        content: ContentStore,
-        heads: LocalPublicationStore,
-    ) -> Self {
+    pub fn new(store: Box<dyn RepositoryStore>, heads: LocalPublicationStore) -> Self {
         Self {
-            objects,
-            content,
+            content: store.content_store(),
+            store,
             heads,
             commit: tokio::sync::Mutex::new(()),
         }
@@ -75,11 +69,10 @@ impl Registry {
     /// Create a registry serving a single repository with pre-built stores.
     pub fn single_with_stores(
         name: String,
-        objects: Box<dyn ImmutableObjectStore>,
-        content: ContentStore,
+        store: Box<dyn RepositoryStore>,
         heads: LocalPublicationStore,
     ) -> Self {
-        let entry = Arc::new(RepositoryEntry::new(objects, content, heads));
+        let entry = Arc::new(RepositoryEntry::new(store, heads));
         let mut repos = HashMap::new();
         repos.insert(name, entry);
         Self { repos }

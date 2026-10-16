@@ -217,10 +217,8 @@ async fn start_s3_server(
     repo_name: &str,
 ) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let store = RemotePackedStore::open(config).await.unwrap();
-    let content = store.content_store();
     let heads = LocalPublicationStore::new(head_dir.join("repository.head"));
-    let registry =
-        Registry::single_with_stores(repo_name.to_string(), Box::new(store), content, heads);
+    let registry = Registry::single_with_stores(repo_name.to_string(), Box::new(store), heads);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

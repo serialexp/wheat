@@ -1062,6 +1062,9 @@ impl PackedCatalog {
         // to writes until the entire authority + derived-index protocol completes.
         self.poisoned = true;
         self.append_in_flight = true;
+        if let Some(trace) = &self.trace {
+            trace.durable_append();
+        }
         Ok(AppendJob {
             root: self.root.clone(),
             durability: self.durability,

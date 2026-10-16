@@ -268,6 +268,35 @@ impl ContentStore {
         }
     }
 
+    /// This store's root and durability over `backend`, which sees this store
+    /// through its own handle.
+    pub(crate) fn overlaid(&self, backend: Arc<dyn ContentBackend>) -> Self {
+        Self::with_backend(self.root.clone(), backend, self.durability)
+    }
+
+    /// The stored envelope of `id`: its header and stored payload.
+    pub(crate) fn raw_envelope(
+        &self,
+        id: ContentId,
+    ) -> Result<(codec::EnvelopeHeader, Vec<u8>), ContentStoreError> {
+        match &self.backend {
+            Some(backend) => backend.get_raw_envelope(id),
+            None => self.read_local_raw_envelope(id),
+        }
+    }
+
+    /// Whether [`Self::put_raw_envelope`] can store delta envelopes here.
+    pub(crate) fn supports_raw_envelopes(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_none_or(|backend| backend.supports_raw_envelopes())
+    }
+
+    /// Every stored ID, when the backend can list them in one call.
+    pub(crate) fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
+        self.backend.as_ref().and_then(|backend| backend.list_ids())
+    }
+
     #[tracing::instrument(name = "content_put", level = "debug", skip_all, fields(bytes = bytes.len()))]
     pub fn put(&self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
         let id = ContentId::of(bytes);
@@ -359,6 +388,21 @@ impl ContentStore {
         if self.contains(id) {
             return Ok(());
         }
+        match self.delta_envelope(id, bytes, base_id)? {
+            Some(envelope) => self.put_raw_envelope(id, envelope),
+            None => self.put_with_id(id, bytes),
+        }
+    }
+
+    /// The delta envelope storing `bytes` (whose ID is `id`) against `base_id`, or
+    /// `None` when they should be stored whole: the backend takes no envelopes, the
+    /// base is missing or at the end of a full chain, or no delta is smaller.
+    pub(crate) fn delta_envelope(
+        &self,
+        id: ContentId,
+        bytes: &[u8],
+        base_id: ContentId,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
         // Backends that don't support raw envelope writes (e.g. packed stores)
         // cannot store delta-encoded content — skip the delta attempt entirely.
         if self
@@ -366,7 +410,7 @@ impl ContentStore {
             .as_ref()
             .is_some_and(|b| !b.supports_raw_envelopes())
         {
-            return self.put_with_id(id, bytes);
+            return Ok(None);
         }
         // Keep the stored chain within the same 16-link bound enforced by
         // resolution. A chain with 16 deltas still needs one final full-base
@@ -375,23 +419,20 @@ impl ContentStore {
             .delta_chain_depth(base_id)
             .unwrap_or(MAX_DELTA_CHAIN_DEPTH);
         if base_depth >= MAX_DELTA_CHAIN_DEPTH {
-            return self.put_with_id(id, bytes);
+            return Ok(None);
         }
         // Try to compute a delta against the base content.
         let base_bytes = match self.get(base_id) {
             Ok(base) => base,
-            Err(ContentStoreError::Missing(_)) => {
-                return self.put_with_id(id, bytes);
-            }
+            Err(ContentStoreError::Missing(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        if let Some(patch) = crate::delta::compute_delta(&base_bytes, bytes) {
-            let envelope = codec::encode_delta_envelope(bytes.len(), base_id, &patch)
-                .map_err(|e| codec_error(id, usize::MAX, e))?;
-            self.put_raw_envelope(id, envelope)
-        } else {
-            self.put_with_id(id, bytes)
-        }
+        crate::delta::compute_delta(&base_bytes, bytes)
+            .map(|patch| {
+                codec::encode_delta_envelope(bytes.len(), base_id, &patch)
+                    .map_err(|e| codec_error(id, usize::MAX, e))
+            })
+            .transpose()
     }
 
     /// Store content from a batch, with optional delta base hints.

@@ -58,6 +58,11 @@ pub use repository_integration::IntegrationOutcome;
 mod repository_mutation;
 mod repository_publication;
 mod repository_reader;
+mod repository_store;
+pub use repository_store::{
+    ContentItem, RepositoryStage, RepositoryStore, RepositoryStoreError, SeparateRepositoryStore,
+    put_separately,
+};
 mod repository_rewrite;
 mod repository_transition;
 mod repository_union;

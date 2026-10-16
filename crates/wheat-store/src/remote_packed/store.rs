@@ -19,7 +19,8 @@ use crate::packed::segment::{
     SegmentBuilder, SegmentError, SegmentRecord, prepare_record,
 };
 use crate::{
-    ContentStore, Durability, ImmutableObjectStore, ObjectKind, ObjectStoreError, StoredObject,
+    ContentItem, ContentStore, Durability, ImmutableObjectStore, ObjectKind, ObjectStoreError,
+    RepositoryStore, RepositoryStoreError, StoredObject, put_separately,
 };
 
 const DEFAULT_SEGMENT_CACHE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
@@ -249,6 +250,29 @@ impl RemotePackedStore {
             .lookup_entry_bounded(namespace, digest, usize::MAX)
             .map(|opt| opt.map(|(entry, bytes)| (entry.kind, bytes)))
             .map_err(segment_integrity)
+    }
+}
+
+/// Content is one object per blob in the bucket, apart from the object segments, so
+/// a publication is two writes.
+#[async_trait]
+impl RepositoryStore for RemotePackedStore {
+    fn content_store(&self) -> ContentStore {
+        RemotePackedStore::content_store(self)
+    }
+
+    async fn put_publication(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        content: &[ContentItem<'_>],
+    ) -> Result<(), RepositoryStoreError> {
+        put_separately(
+            self,
+            &RemotePackedStore::content_store(self),
+            objects,
+            content,
+        )
+        .await
     }
 }
 

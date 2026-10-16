@@ -242,4 +242,15 @@ AND the client fetch. Validation reads added content in full
 (repository_transition.rs:161), so staged content must be readable before it is
 stored, like BatchObjectStore's staged objects.
 
-Next after option 2: 3-5; then contract rules (step 4) and maybe client-side push.
+Option 2 done 2026-10-16: `RepositoryStore` / `RepositoryStage` /
+`SeparateRepositoryStore` in wheat-store/src/repository_store.rs; server publish and
+client fetch/clone/publish-join stage content and objects and flush once. 8 writers
+13.5 -> 18.8/s. Now one 38 ms append per publish inside the commit lock (lock held
+~52 ms: append 38, head CAS 10, rest 3), so the ceiling is ~19/s. Trace:
+/tmp/wheat-profile/option2.json. Found: delta content on packed goes loose with its
+own fsyncs (TODO.md).
+
+Next: option 3 (cheaper append: journal 9 + head 10 + journal remove 5 of 38 ms),
+4 (group commit; the commit lock serializes publishes, so this means batching
+several publishes' stores and CASes), 5 (spawn_blocking); then contract rules
+(step 4) and maybe client-side push.

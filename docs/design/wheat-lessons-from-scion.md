@@ -52,22 +52,28 @@ land and move completed bullets from Outstanding to Done.
 - [x] **Decision — reconciled publish status (2026-10-15).** `ok`, with no wire
   change: the client tells a join from a fast-forward by comparing the returned
   envelope with the one it proposed.
+- [x] **One append for content and objects together (2026-10-16).** A
+  `RepositoryStore` is an object store with its content store, and its
+  `put_publication` writes both: the packed store in one catalog append, the S3 store
+  and separate stores content first. A `RepositoryStage` holds a publish's or fetch's
+  objects and content, readable, until the server accepts the publish or the client
+  moves its head, so a refused publish stores no content either. See "One append per
+  publish".
 
 ### Outstanding
 
 - [ ] **Publish contention budget.** Contract rules on `publish_contention`: at least
   10 accepted publishes per second with 8 writers, and one attempt per publish at
   every writer count.
-- [ ] **One append for content and objects together.** A publish or fetch still
-  makes two durable appends to the packed store, one through the content store and
-  one for the staged objects. A transaction spanning both would halve its fsyncs.
 - [ ] **Client pushes the difference up front.** The client runs the server's walk
   from the last fetched head and sends the result, so a publish takes one round trip
   instead of one per tree level.
 - [ ] **Packed appends and the catalog lock.** Throughput stops near 10 per second
   at the packed store (see "Profile at 8 writers"): two appends of about 46 ms per
   publish, and one catalog mutex that makes every read wait for them. Being tried
-  cumulatively; reads no longer wait for appends (see "Reads beside an append").
+  cumulatively; reads no longer wait for appends (see "Reads beside an append") and a
+  publish makes one append (see "One append per publish"). Still to try: a cheaper
+  append, group commit, and the blocking work off the runtime.
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
@@ -326,6 +332,25 @@ The 2-writer figure is noise, not a regression: earlier runs at that level gave 
 to 6.72, and in the traces the server's time per 2-writer publish fell from 115 to
 94 ms. At 1 and 2 writers the server is idle about 75 ms between publishes, so the
 clients set the pace there.
+
+#### One append per publish (2026-10-16)
+
+Second: content is staged with the objects and both are stored in one packed append
+at `publish_store`, inside the commit lock. The client's fetch does the same.
+
+| writers | accepted/s after reads beside an append | after (two runs) |
+|---|---|---|
+| 1 | 8.80, 8.53 | 8.45, 9.29 |
+| 2 | 5.62, 5.82 | 8.18, 8.16 |
+| 4 | 10.66, 9.47 | 12.69, 13.47 |
+| 8 | 13.67, 13.32 | 18.72, 18.81 |
+| 16 | 12.67, 11.83 | 17.92, 18.42 |
+
+Still one attempt per publish at every count. Each publish now holds the commit lock
+about 52 ms at 8 writers: the append 38 (journal 9, segment 6 to 8, head 10,
+journal removal 5, locator 5.5), the head CAS 10 to 11, validation and join 3. That
+caps throughput near 19 per second, which is what the benchmark reaches; at 16
+writers a publish waits 520 ms for the lock.
 
 ### Alternative: per-label heads
 

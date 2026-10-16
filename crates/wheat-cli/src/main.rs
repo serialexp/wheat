@@ -2717,7 +2717,6 @@ fn native_clone(
     std::fs::create_dir(&store_root)?;
 
     let objects = wheat_store::PackedObjectStore::open(store_root.join("storage"))?;
-    let content = objects.content_store();
     let heads = wheat_store::LocalPublicationStore::new(store_root.join("repository.head"));
 
     let rt = runtime()?;
@@ -2730,10 +2729,9 @@ fn native_clone(
         let fetched = remote::fetch_objects(&mut session, 1, &staged, state.envelope, None).await?;
 
         // Fetch all content.
-        let content_count =
-            remote::fetch_content(&mut session, 2, &staged, &content, state.envelope, None)
-                .await?
-                .fetched;
+        let content_count = remote::fetch_content(&mut session, 2, &staged, state.envelope, None)
+            .await?
+            .fetched;
         staged.flush().await?;
 
         write_stderr(format_args!(
@@ -2752,7 +2750,6 @@ fn native_clone(
         Ok::<_, anyhow::Error>((state, label, fetched, content_count))
     })?;
     // Release the packed store's process lock; the workspace reopens the store below.
-    drop(content);
     drop(objects);
 
     // Write the head.
@@ -2881,15 +2878,8 @@ fn native_fetch(
         let fetched =
             remote::fetch_objects(&mut session, 1, &staged, state.envelope, since).await?;
 
-        let content = remote::fetch_content(
-            &mut session,
-            2,
-            &staged,
-            &local.content,
-            state.envelope,
-            since,
-        )
-        .await?;
+        let content =
+            remote::fetch_content(&mut session, 2, &staged, state.envelope, since).await?;
 
         remote::close(&mut session).await?;
         Ok::<_, anyhow::Error>((state, since, fetched, content))
@@ -2907,7 +2897,7 @@ fn native_fetch(
         local_head.envelope
     } else {
         rt.block_on(
-            RepositoryReader::new(&staged, &local.content).union_envelopes(
+            RepositoryReader::new(&staged, staged.content()).union_envelopes(
                 since,
                 local_head.envelope,
                 remote_state.envelope,
@@ -3121,15 +3111,7 @@ fn native_publish(
             {
                 let since = Some(local_head.envelope);
                 remote::fetch_objects(&mut session, 2, &staged, new_envelope, since).await?;
-                remote::fetch_content(
-                    &mut session,
-                    3,
-                    &staged,
-                    &local.content,
-                    new_envelope,
-                    since,
-                )
-                .await?;
+                remote::fetch_content(&mut session, 3, &staged, new_envelope, since).await?;
                 staged.flush().await?;
                 true
             }

@@ -30,6 +30,8 @@ pub struct PackedStoreTraceSnapshot {
     pub deferred_put_duplicates: u64,
     pub deferred_appends: u64,
     pub deferred_index_transactions: u64,
+    /// Durable appends to the active segment, each with its own fsyncs.
+    pub durable_appends: u64,
     pub locator_recounts: u64,
     pub bulk_rolls: u64,
     pub bulk_finalizations: u64,
@@ -77,6 +79,7 @@ pub(crate) struct PackedStoreTraceCounters {
     deferred_put_duplicates: AtomicU64,
     deferred_appends: AtomicU64,
     deferred_index_transactions: AtomicU64,
+    durable_appends: AtomicU64,
     locator_recounts: AtomicU64,
     bulk_rolls: AtomicU64,
     bulk_finalizations: AtomicU64,
@@ -152,6 +155,10 @@ impl PackedStoreTraceCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn durable_append(&self) {
+        self.durable_appends.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn locator_recount(&self) {
         self.locator_recounts.fetch_add(1, Ordering::Relaxed);
     }
@@ -208,6 +215,7 @@ impl PackedStoreTraceCounters {
             deferred_put_duplicates: load(&self.deferred_put_duplicates),
             deferred_appends: load(&self.deferred_appends),
             deferred_index_transactions: load(&self.deferred_index_transactions),
+            durable_appends: load(&self.durable_appends),
             locator_recounts: load(&self.locator_recounts),
             bulk_rolls: load(&self.bulk_rolls),
             bulk_finalizations: load(&self.bulk_finalizations),

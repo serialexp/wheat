@@ -12,7 +12,7 @@ use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
-    BatchObjectStore, ContentStore, LocalPublicationStore, PackedObjectStore,
+    BatchObjectStore, ContentStore, LocalPublicationStore, PackedObjectStore, PackedStoreTrace,
     PersistedRepositoryMutator, PublicationStore, RepositoryHead, RepositoryPublisher,
     RepositoryReader, finalize_mutation_publication, prepare_mutation_publication,
 };
@@ -53,7 +53,6 @@ async fn start_server_sharing(
     let registry = Registry::single_with_stores(
         repo_name.to_string(),
         Box::new(objects.clone()),
-        content.clone(),
         heads.clone(),
     );
     let (addr, shutdown) = serve(registry).await;
@@ -163,6 +162,8 @@ struct ContentPhase {
     content: ContentStore,
     /// The server's generation before the publish.
     generation: u64,
+    /// The server store's counters.
+    trace: PackedStoreTrace,
     addr: SocketAddr,
     shutdown: tokio::sync::oneshot::Sender<()>,
     _server_dir: tempfile::TempDir,
@@ -176,7 +177,14 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
     let server_dir = tempfile::tempdir().unwrap();
     let _repo = setup_repo(server_dir.path()).await;
 
-    let (addr, shutdown) = start_server(server_dir.path(), "test/repo").await;
+    let (server_store, trace) =
+        PackedObjectStore::open_traced(server_dir.path().join("storage")).unwrap();
+    let (addr, shutdown) = serve(Registry::single_with_stores(
+        "test/repo".to_string(),
+        Box::new(server_store),
+        LocalPublicationStore::new(server_dir.path().join("repository.head")),
+    ))
+    .await;
 
     // Clone first.
     let clone_dir = tempfile::tempdir().unwrap();
@@ -303,6 +311,7 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
         needed,
         content: clone_content,
         generation,
+        trace,
         addr,
         shutdown,
         _server_dir: server_dir,
@@ -416,6 +425,8 @@ async fn assert_upload_refused(phase: &mut ContentPhase, reason: &str) {
 #[tokio::test]
 async fn publish_round_trip() {
     let mut phase = publish_to_content_phase(b"goodbye wheat").await;
+    let appends = || phase.trace.snapshot().unwrap().durable_appends;
+    let before = appends();
     let ws = &mut phase.ws;
     for digest in &phase.needed {
         let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
@@ -426,6 +437,8 @@ async fn publish_round_trip() {
     let pr = commit_publish(ws).await;
     let generation = phase.generation;
     assert_published(&pr, generation);
+    // The objects and the content go into the store together.
+    assert_eq!(appends() - before, 1);
 
     // Verify: reconnect and check the server's head advanced.
     phase.ws.close(None).await.ok();

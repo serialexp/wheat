@@ -239,9 +239,9 @@ fn a_fetch_keeps_local_work_beside_the_remotes() {
 
 /// Each durable append costs several fsyncs, so a fetch stores what it receives and
 /// what its merge with local work makes together, not once per message or update:
-/// one append for the fetched content, one for the objects.
+/// one append for the fetched content and the objects.
 #[test]
-fn a_fetch_that_keeps_local_work_stores_it_in_two_appends() {
+fn a_fetch_that_keeps_local_work_stores_it_in_one_append() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let config = root.join("config");
@@ -290,7 +290,7 @@ fn a_fetch_that_keeps_local_work_stores_it_in_two_appends() {
         .iter()
         .filter(|event| event["name"] == "packed_append")
         .count();
-    assert_eq!(appends, 2);
+    assert_eq!(appends, 1);
     ok(&reader, &reader_stores, &config, &["validate"]);
 }
 

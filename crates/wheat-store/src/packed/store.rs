@@ -25,10 +25,11 @@ use super::{
 };
 use crate::content_store::ContentBackend;
 use crate::{
-    ContentGenerationIndex, ContentGenerationManifest, ContentRepackLimits, ContentRepackPlan,
-    ContentStore, ContentStoreError, Durability, ImmutableObjectStore, LocalPublicationStore,
-    LooseObjectStore, ObjectKind, ObjectStoreError, PreparedContentGeneration, PublicationStore,
-    RepositoryHead, RepositoryReader, StoredObject, content_generation_index_path,
+    ContentGenerationIndex, ContentGenerationManifest, ContentItem, ContentRepackLimits,
+    ContentRepackPlan, ContentStore, ContentStoreError, Durability, ImmutableObjectStore,
+    LocalPublicationStore, LooseObjectStore, ObjectKind, ObjectStoreError,
+    PreparedContentGeneration, PublicationStore, RepositoryHead, RepositoryReader, RepositoryStore,
+    RepositoryStoreError, StoredObject, content_generation_index_path,
     content_generation_shard_manifest_path, content_generation_shard_pack_path,
     content_repack::{plan_content_repack, prepare_content_repack},
     metadata_repack::{HistoryPlan, HistoryPlanLimits, MetadataDeltaPlan, plan_history_deltas},
@@ -150,6 +151,42 @@ impl fmt::Debug for PackedObjectStore {
 }
 
 impl PackedEngine {
+    /// Checks the identity of `contents` and stores the blobs too large for a
+    /// segment as loose files. Returns the catalog records of the rest, for the
+    /// caller to append.
+    fn content_records<'c>(
+        &self,
+        contents: impl ExactSizeIterator<Item = (ContentId, &'c [u8])> + Clone,
+    ) -> Result<Vec<SegmentRecord<'c>>, ContentStoreError> {
+        if let Some(trace) = &self.trace {
+            trace.content_put_batch(
+                contents.len(),
+                contents.clone().map(|(_, bytes)| bytes.len()).sum(),
+            );
+        }
+        let mut records = Vec::new();
+        for (id, bytes) in contents {
+            let actual = ContentId::of(bytes);
+            if actual != id {
+                return Err(ContentStoreError::Corrupt {
+                    expected: id,
+                    actual,
+                });
+            }
+            if bytes.len() > self.loose_threshold {
+                self.content.put_many([(id, bytes.to_vec())], 1)?;
+            } else {
+                records.push(SegmentRecord {
+                    namespace: CONTENT_NAMESPACE,
+                    kind: 0,
+                    digest: *id.as_bytes(),
+                    bytes,
+                });
+            }
+        }
+        Ok(records)
+    }
+
     /// Runs `lookup` against the published content generation's reader, or returns
     /// `None` when no generation is published. The catalog lock is held throughout so a
     /// repack on this handle cannot retire the generation's pack mid-lookup.
@@ -211,6 +248,18 @@ impl PackedObjectStore {
     ) -> Result<(Self, PackedStoreTrace), ObjectStoreError> {
         let store =
             Self::open_with_options(root, DEFAULT_LOOSE_THRESHOLD, Durability::Deferred, true)?;
+        let trace = PackedStoreTrace {
+            counters: Arc::downgrade(store.engine.trace.as_ref().expect("trace was enabled")),
+        };
+        Ok((store, trace))
+    }
+
+    /// Opens durable storage with constant-memory diagnostic counters enabled.
+    pub fn open_traced(
+        root: impl AsRef<Path>,
+    ) -> Result<(Self, PackedStoreTrace), ObjectStoreError> {
+        let store =
+            Self::open_with_options(root, DEFAULT_LOOSE_THRESHOLD, Durability::Durable, true)?;
         let trace = PackedStoreTrace {
             counters: Arc::downgrade(store.engine.trace.as_ref().expect("trace was enabled")),
         };
@@ -615,6 +664,58 @@ impl PackedObjectStore {
             .catalog
             .exclusive()
             .map_err(object_catalog_error)
+    }
+
+    /// Checks `objects` and stores the ones too large for a segment as loose files.
+    /// Returns the catalog records of the rest, for the caller to append.
+    async fn object_records<'o>(
+        &self,
+        objects: &'o [(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<Vec<SegmentRecord<'o>>, ObjectStoreError> {
+        if let Some(trace) = &self.engine.trace {
+            trace.object_put_batch(
+                objects.len(),
+                objects.iter().map(|(_, bytes)| bytes.len()).sum(),
+            );
+        }
+        let mut unique = BTreeMap::new();
+        for (id, bytes) in objects {
+            let canonical_kind: ObjectKind = validate_canonical_object(bytes)?.into();
+            let actual = ObjectId::of_canonical_bytes(bytes);
+            if actual != *id {
+                return Err(ObjectStoreError::Corrupt {
+                    expected: *id,
+                    actual,
+                });
+            }
+            if let Some(previous) = unique.insert(*id, (canonical_kind, bytes))
+                && previous.1 != bytes
+            {
+                return Err(ObjectStoreError::Corrupt {
+                    expected: *id,
+                    actual,
+                });
+            }
+        }
+        let mut records = Vec::new();
+        let mut loose = Vec::new();
+        for (id, (kind, bytes)) in unique {
+            if bytes.len() > self.engine.loose_threshold {
+                loose.push((id, bytes.clone()));
+            } else {
+                records.push(SegmentRecord {
+                    namespace: METADATA_NAMESPACE,
+                    kind: kind as u16,
+                    digest: *id.as_bytes(),
+                    bytes,
+                });
+            }
+        }
+        if !loose.is_empty() {
+            self.engine.objects.put_batch(&loose, concurrency).await?;
+        }
+        Ok(records)
     }
 }
 
@@ -1144,6 +1245,55 @@ fn content_catalog_error(id: ContentId, error: CatalogError) -> ContentStoreErro
     }
 }
 
+/// Writers for the objects of a publication too large for a segment.
+const LOOSE_WRITE_CONCURRENCY: usize = 8;
+
+#[async_trait]
+impl RepositoryStore for PackedObjectStore {
+    fn content_store(&self) -> ContentStore {
+        PackedObjectStore::content_store(self)
+    }
+
+    /// One catalog append for every object and content blob that fits a segment.
+    /// Delta-encoded content and anything larger is stored loose first.
+    async fn put_publication(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        content: &[ContentItem<'_>],
+    ) -> Result<(), RepositoryStoreError> {
+        let mut records = self
+            .object_records(objects, LOOSE_WRITE_CONCURRENCY)
+            .await?;
+        let content_store = PackedObjectStore::content_store(self);
+        let mut whole = Vec::with_capacity(content.len());
+        for item in content {
+            if let Some(base) = item.base
+                && ContentId::of(item.bytes) == item.id
+            {
+                if content_store.contains(item.id) {
+                    continue;
+                }
+                // As in `ContentStore::put_many_with_bases`, a failed delta stores
+                // the content whole.
+                if let Ok(Some(envelope)) = content_store.delta_envelope(item.id, item.bytes, base)
+                {
+                    self.engine.content.put_raw_envelope(item.id, envelope)?;
+                    continue;
+                }
+            }
+            whole.push((item.id, item.bytes));
+        }
+        records.extend(self.engine.content_records(whole.iter().copied())?);
+        if !records.is_empty() {
+            self.engine
+                .catalog
+                .put_records(&records)
+                .map_err(object_catalog_error)?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ImmutableObjectStore for PackedObjectStore {
     async fn put_if_absent(&self, id: ObjectId, bytes: &[u8]) -> Result<(), ObjectStoreError> {
@@ -1155,53 +1305,8 @@ impl ImmutableObjectStore for PackedObjectStore {
         objects: &[(ObjectId, Vec<u8>)],
         concurrency: usize,
     ) -> Result<(), ObjectStoreError> {
-        if let Some(trace) = &self.engine.trace {
-            trace.object_put_batch(
-                objects.len(),
-                objects.iter().map(|(_, bytes)| bytes.len()).sum(),
-            );
-        }
-        let mut unique = BTreeMap::new();
-        for (id, bytes) in objects {
-            let canonical_kind: ObjectKind = validate_canonical_object(bytes)?.into();
-            let actual = ObjectId::of_canonical_bytes(bytes);
-            if actual != *id {
-                return Err(ObjectStoreError::Corrupt {
-                    expected: *id,
-                    actual,
-                });
-            }
-            if let Some(previous) = unique.insert(*id, (canonical_kind, bytes))
-                && previous.1 != bytes
-            {
-                return Err(ObjectStoreError::Corrupt {
-                    expected: *id,
-                    actual,
-                });
-            }
-        }
-        let mut packed = Vec::new();
-        let mut loose = Vec::new();
-        for (id, (kind, bytes)) in unique {
-            if bytes.len() > self.engine.loose_threshold {
-                loose.push((id, bytes.clone()));
-            } else {
-                packed.push((id, kind, bytes));
-            }
-        }
-        if !loose.is_empty() {
-            self.engine.objects.put_batch(&loose, concurrency).await?;
-        }
-        if !packed.is_empty() {
-            let records = packed
-                .iter()
-                .map(|(id, kind, data)| SegmentRecord {
-                    namespace: METADATA_NAMESPACE,
-                    kind: *kind as u16,
-                    digest: *id.as_bytes(),
-                    bytes: data,
-                })
-                .collect::<Vec<_>>();
+        let records = self.object_records(objects, concurrency).await?;
+        if !records.is_empty() {
             self.engine
                 .catalog
                 .put_records(&records)
@@ -1258,40 +1363,12 @@ impl ImmutableObjectStore for PackedObjectStore {
 #[async_trait]
 impl ContentBackend for PackedEngine {
     fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError> {
-        if let Some(trace) = &self.trace {
-            trace.content_put_batch(
-                contents.len(),
-                contents.iter().map(|(_, bytes)| bytes.len()).sum(),
-            );
-        }
-        let mut packed = Vec::new();
-        for (id, bytes) in contents {
-            let actual = ContentId::of(bytes);
-            if actual != *id {
-                return Err(ContentStoreError::Corrupt {
-                    expected: *id,
-                    actual,
-                });
-            }
-            if bytes.len() > self.loose_threshold {
-                self.content.put_many([(*id, bytes.clone())], 1)?;
-            } else {
-                packed.push((*id, bytes));
-            }
-        }
-        if !packed.is_empty() {
-            let records = packed
-                .iter()
-                .map(|(id, bytes)| SegmentRecord {
-                    namespace: CONTENT_NAMESPACE,
-                    kind: 0,
-                    digest: *id.as_bytes(),
-                    bytes,
-                })
-                .collect::<Vec<_>>();
-            self.catalog
-                .put_records(&records)
-                .map_err(|error| content_catalog_error(packed[0].0, error))?;
+        let records =
+            self.content_records(contents.iter().map(|(id, bytes)| (*id, bytes.as_slice())))?;
+        if let Some(first) = records.first() {
+            self.catalog.put_records(&records).map_err(|error| {
+                content_catalog_error(ContentId::from_digest(first.digest), error)
+            })?;
         }
         Ok(())
     }

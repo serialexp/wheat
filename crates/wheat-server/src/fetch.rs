@@ -40,12 +40,12 @@ pub async fn handle_fetch(
 ) -> Result<(), ConnectionError> {
     let op_id = req.op_id;
     let want = digest_to_object_id(&req.want_envelope)?;
-    if !is_envelope(&entry.objects, want).await? {
+    if !is_envelope(&entry.store, want).await? {
         let message = "the wanted envelope is not in this repository";
         return send_object_error(ws, op_id, NOT_FOUND, message, want).await;
     }
     let since = digest_to_object_id(&req.since_envelope)?;
-    let since = if *since.as_bytes() == [0; 32] || !is_envelope(&entry.objects, since).await? {
+    let since = if *since.as_bytes() == [0; 32] || !is_envelope(&entry.store, since).await? {
         None
     } else {
         Some(RepositoryEnvelopeId::from_digest(*since.as_bytes()))
@@ -130,12 +130,8 @@ async fn push(
     since: Option<RepositoryEnvelopeId>,
     want: RepositoryEnvelopeId,
 ) -> Result<Option<u64>, ConnectionError> {
-    let mut delta = StructuralDelta::new(
-        &entry.objects,
-        since,
-        want,
-        StructuralDeltaLimits::default(),
-    );
+    let mut delta =
+        StructuralDelta::new(&entry.store, since, want, StructuralDeltaLimits::default());
     let mut batch = BatchSender::new(op_id);
     let mut pushed = 0u64;
     while let Some(step) = delta
@@ -272,7 +268,7 @@ async fn answer_want(
     let mut bytes = 0;
     for (index, digest) in wanted.ids.iter().enumerate() {
         let id = digest_to_object_id(digest)?;
-        let object = match entry.objects.get(id).await {
+        let object = match entry.store.get(id).await {
             Ok(object) => object,
             Err(ObjectStoreError::Missing(_)) => {
                 let message = "a wanted object is not in this repository";
