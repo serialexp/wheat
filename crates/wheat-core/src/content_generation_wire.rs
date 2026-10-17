@@ -15,16 +15,6 @@ use crate::ContentId;
 /// entry cap; a reader decodes at most one shard of this size at a time.
 pub const CONTENT_GENERATION_SHARD_ENTRIES: usize = 16_384;
 
-const INDEX_HEADER_SIZE: usize = 4 + 2 + 8 + 8 + 4;
-const INDEX_TRAILER_SIZE: usize = 32 + 32;
-// ContentId (algorithm plus digest), entry count, pack length, manifest digest.
-const SHARD_REF_SIZE: usize = 33 + 4 + 8 + 32;
-const SHARD_HEADER_SIZE: usize = 4 + 2 + 8 + 4 + 4;
-// ContentId (algorithm plus digest), envelope digest, three u64s, absent
-// optional ContentId discriminator, and delta depth. This conservative lower
-// bound is used before the generated decoder allocates the entries vector.
-const MIN_ENTRY_SIZE: usize = 33 + 32 + (3 * 8) + 1 + 1;
-
 /// One content envelope's physical representation within its shard.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentGenerationWireEntry {
@@ -76,8 +66,8 @@ pub enum ContentGenerationWireError {
     TooManyEntries { actual: usize },
     #[error("content generation index does not split {entries} entries into full shards")]
     InvalidShardLayout { entries: u64 },
-    #[error("content generation manifest is truncated or cannot contain its declared entries")]
-    InvalidLength,
+    #[error("content generation index names more shards than a u32 counts")]
+    TooManyShards,
     #[error("content generation manifest does not decode: {0}")]
     Decode(String),
     #[error("content generation manifest is not exactly and canonically encoded")]
@@ -136,16 +126,6 @@ pub fn encode_content_generation_index(
 pub fn decode_content_generation_index(
     bytes: &[u8],
 ) -> Result<ContentGenerationWireIndex, ContentGenerationWireError> {
-    if bytes.len() < INDEX_HEADER_SIZE + INDEX_TRAILER_SIZE {
-        return Err(ContentGenerationWireError::InvalidLength);
-    }
-    let count = u32::from_be_bytes(bytes[22..26].try_into().unwrap()) as usize;
-    preflight(
-        bytes.len(),
-        INDEX_HEADER_SIZE + INDEX_TRAILER_SIZE,
-        count,
-        SHARD_REF_SIZE,
-    )?;
     let index = wire::ContentGenerationManifestV1::decode(bytes)
         .map_err(|error| ContentGenerationWireError::Decode(format!("{error:?}")))?;
     let canonical = index
@@ -193,16 +173,13 @@ pub fn encode_content_generation_shard(
 pub fn decode_content_generation_shard(
     bytes: &[u8],
 ) -> Result<ContentGenerationWireShard, ContentGenerationWireError> {
-    if bytes.len() < SHARD_HEADER_SIZE {
-        return Err(ContentGenerationWireError::InvalidLength);
-    }
-    let count = u32::from_be_bytes(bytes[18..22].try_into().unwrap()) as usize;
-    if count > CONTENT_GENERATION_SHARD_ENTRIES {
-        return Err(ContentGenerationWireError::TooManyEntries { actual: count });
-    }
-    preflight(bytes.len(), SHARD_HEADER_SIZE, count, MIN_ENTRY_SIZE)?;
     let shard = wire::ContentGenerationShardV1::decode(bytes)
         .map_err(|error| ContentGenerationWireError::Decode(format!("{error:?}")))?;
+    if shard.entries.len() > CONTENT_GENERATION_SHARD_ENTRIES {
+        return Err(ContentGenerationWireError::TooManyEntries {
+            actual: shard.entries.len(),
+        });
+    }
     let canonical = shard
         .encode()
         .map_err(|error| ContentGenerationWireError::Decode(format!("{error:?}")))?;
@@ -220,22 +197,108 @@ pub fn decode_content_generation_shard(
     })
 }
 
-/// Rejects a declared item count the input is too short to hold, before the
-/// generated decoder allocates for it.
-fn preflight(
-    length: usize,
-    fixed: usize,
-    count: usize,
-    item_size: usize,
-) -> Result<(), ContentGenerationWireError> {
-    let minimum = count
-        .checked_mul(item_size)
-        .and_then(|items| items.checked_add(fixed))
-        .ok_or(ContentGenerationWireError::InvalidLength)?;
-    if minimum > length {
-        return Err(ContentGenerationWireError::InvalidLength);
+/// The digest an index's `manifest_digest` carries: its generation number,
+/// fingerprint, entry count, and shard references.
+pub fn content_generation_index_digest(
+    generation: u64,
+    content_fingerprint: [u8; 32],
+    entry_count: u64,
+    shards: impl ExactSizeIterator<Item = ContentGenerationWireShardRef>,
+) -> Result<[u8; 32], ContentGenerationWireError> {
+    // The generated encoder writes the shard count as `len() as u32`.
+    u32::try_from(shards.len()).map_err(|_| ContentGenerationWireError::TooManyShards)?;
+    let input = wire::ContentGenerationIndexDigestInputV1 {
+        generation,
+        content_fingerprint: digest_wire(content_fingerprint),
+        entry_count,
+        shards: shards.map(|shard| shard_ref_wire(&shard)).collect(),
     }
-    Ok(())
+    .encode()
+    .map_err(|error| ContentGenerationWireError::Decode(format!("{error:?}")))?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"wheat-content-generation-index-v1\0");
+    hash.update(&input);
+    Ok(*hash.finalize().as_bytes())
+}
+
+/// Generation-independent fingerprint of `entries`, in the order given: every
+/// entry's canonical encoding, which says where each sits in its shard pack.
+/// An encoding is self-delimiting, so the sequence needs no count.
+pub fn content_generation_fingerprint(
+    entries: impl IntoIterator<Item = ContentGenerationWireEntry>,
+) -> Result<[u8; 32], ContentGenerationWireError> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"wheat-content-generation-v1\0");
+    let mut scratch = EntryScratch::default();
+    for entry in entries {
+        hash.update(scratch.encode(&entry)?);
+    }
+    Ok(*hash.finalize().as_bytes())
+}
+
+/// One wire entry and one encoder reused for every entry, so fingerprinting a
+/// generation of millions of entries allocates nothing per entry.
+struct EntryScratch {
+    entry: wire::ContentGenerationEntryV1,
+    /// The delta base's buffers while the current entry has none.
+    spare_base: Option<wire::ContentId>,
+    encoder: wheat_binschema::BitStreamEncoder,
+}
+
+impl Default for EntryScratch {
+    fn default() -> Self {
+        let zero = ContentId::from_digest([0; 32]);
+        Self {
+            entry: wire::ContentGenerationEntryV1 {
+                id: content_id_wire(zero),
+                envelope_digest: digest_wire([0; 32]),
+                pack_offset: 0,
+                physical_length: 0,
+                logical_length: 0,
+                delta_base: None,
+                delta_depth: 0,
+            },
+            spare_base: Some(content_id_wire(zero)),
+            encoder: wheat_binschema::BitStreamEncoder::new(wheat_binschema::BitOrder::MsbFirst),
+        }
+    }
+}
+
+impl EntryScratch {
+    fn encode(
+        &mut self,
+        entry: &ContentGenerationWireEntry,
+    ) -> Result<&[u8], ContentGenerationWireError> {
+        let wire = &mut self.entry;
+        wire.id.digest.bytes.copy_from_slice(entry.id.as_bytes());
+        wire.envelope_digest
+            .bytes
+            .copy_from_slice(&entry.envelope_digest);
+        wire.pack_offset = entry.pack_offset;
+        wire.physical_length = entry.physical_length;
+        wire.logical_length = entry.logical_length;
+        wire.delta_depth = entry.delta_depth;
+        match entry.delta_base {
+            Some(base) => {
+                let mut id = wire
+                    .delta_base
+                    .take()
+                    .or_else(|| self.spare_base.take())
+                    .expect("the scratch holds one delta base");
+                id.digest.bytes.copy_from_slice(base.as_bytes());
+                wire.delta_base = Some(id);
+            }
+            None => {
+                if let Some(id) = wire.delta_base.take() {
+                    self.spare_base = Some(id);
+                }
+            }
+        }
+        self.encoder.clear();
+        wire.encode_into(&mut self.encoder)
+            .map_err(|error| ContentGenerationWireError::Decode(format!("{error:?}")))?;
+        Ok(self.encoder.buffer())
+    }
 }
 
 fn shard_ref_wire(shard: &ContentGenerationWireShardRef) -> wire::ContentGenerationShardRefV1 {
@@ -331,5 +394,86 @@ mod tests {
         assert!(!ok(u64::from(FULL) + 1, &[1, FULL]));
         assert!(!ok(u64::from(FULL), &[FULL, 0]));
         assert!(!ok(3, &[2]));
+    }
+
+    fn entry(n: u8, delta_base: Option<u8>) -> ContentGenerationWireEntry {
+        ContentGenerationWireEntry {
+            id: ContentId::from_digest([n; 32]),
+            envelope_digest: [n.wrapping_add(1); 32],
+            pack_offset: u64::from(n) * 10,
+            physical_length: u64::from(n) + 1,
+            logical_length: u64::from(n) + 2,
+            delta_base: delta_base.map(|base| ContentId::from_digest([base; 32])),
+            delta_depth: u8::from(delta_base.is_some()),
+        }
+    }
+
+    #[test]
+    fn fingerprint_hashes_each_entrys_own_encoding() {
+        // Alternating delta bases exercise the scratch's spare base buffer.
+        let entries = [
+            entry(1, Some(9)),
+            entry(2, None),
+            entry(3, Some(8)),
+            entry(4, Some(7)),
+            entry(5, None),
+        ];
+        let mut expected = blake3::Hasher::new();
+        expected.update(b"wheat-content-generation-v1\0");
+        for entry in &entries {
+            expected.update(&entry_wire(entry).encode().unwrap());
+        }
+        assert_eq!(
+            content_generation_fingerprint(entries.iter().cloned()).unwrap(),
+            *expected.finalize().as_bytes()
+        );
+        let mut moved = entries.clone();
+        moved[4].pack_offset += 1;
+        assert_ne!(
+            content_generation_fingerprint(moved).unwrap(),
+            content_generation_fingerprint(entries).unwrap()
+        );
+    }
+
+    #[test]
+    fn index_digest_covers_every_field() {
+        let shard = ContentGenerationWireShardRef {
+            first_id: ContentId::from_digest([1; 32]),
+            entry_count: 1,
+            pack_length: 10,
+            manifest: [2; 32],
+        };
+        let digest = |generation, fingerprint, entries, shard: ContentGenerationWireShardRef| {
+            content_generation_index_digest(generation, fingerprint, entries, [shard].into_iter())
+                .unwrap()
+        };
+        let base = digest(1, [3; 32], 1, shard);
+        assert_ne!(base, digest(2, [3; 32], 1, shard));
+        assert_ne!(base, digest(1, [4; 32], 1, shard));
+        assert_ne!(base, digest(1, [3; 32], 2, shard));
+        for changed in [
+            ContentGenerationWireShardRef {
+                first_id: ContentId::from_digest([5; 32]),
+                ..shard
+            },
+            ContentGenerationWireShardRef {
+                entry_count: 2,
+                ..shard
+            },
+            ContentGenerationWireShardRef {
+                pack_length: 11,
+                ..shard
+            },
+            ContentGenerationWireShardRef {
+                manifest: [6; 32],
+                ..shard
+            },
+        ] {
+            assert_ne!(base, digest(1, [3; 32], 1, changed));
+        }
+        assert_ne!(
+            base,
+            content_generation_index_digest(1, [3; 32], 1, std::iter::empty()).unwrap()
+        );
     }
 }

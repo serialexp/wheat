@@ -2,6 +2,18 @@
 
 Finished items, moved here from `TODO.md` under the same headings.
 
+## Found while scoping the Scion lessons (2026-10-15)
+
+- `[x]` **`catalog.head` and `repack.intent` are hand-encoded.** Both are BinSchema
+  records now, along with six more hand-built layouts the new guard test found: the
+  repository head, the content envelope header, the snapshot and ownership manifests,
+  the materialization progress record and the Git import source. The content
+  generation fingerprint and index digest hash BinSchema encodings too. BinSchema's
+  Rust decoder now caps an array reservation by how many items the bytes left can
+  hold, so the hand-read count checks before decoding are gone.
+  `crates/wheat-core/tests/no_hand_rolled_encodings.rs` fails on any new
+  `to_/from_*_bytes` or `byteorder` use outside generated code and tests.
+
 ## Security and performance scan (2026-09-26)
 
 - `[x]` **Content manifests are full snapshots, so comparing two still reads both

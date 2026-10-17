@@ -38,10 +38,6 @@ between `wheat-native-protocol.md` and the code.
   this compared the active segment's ID with the sealed one's, which never matched
   once sealing rebuilt the records with block compression. Fix: record in the log
   which catalog generation sealed it, or retire before publishing.
-- `[ ]` **`catalog.head` and `repack.intent` are hand-encoded.** `write_catalog_head`
-  and `write_repack_intent` (`crates/wheat-store/src/packed/catalog.rs`) build their
-  bytes by hand with a BLAKE3 checksum, against the BinSchema-only rule. Give both a
-  BinSchema record.
 
 ## Security and performance scan (2026-09-26)
 

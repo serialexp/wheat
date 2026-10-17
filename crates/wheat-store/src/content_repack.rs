@@ -422,7 +422,7 @@ pub fn plan_content_repack(
                 "content pack offset",
             ))?;
     }
-    let content_fingerprint = fingerprint_entries(&entries);
+    let content_fingerprint = fingerprint_entries(&entries)?;
     if let Some(current) = current
         && current.content_fingerprint == content_fingerprint
     {

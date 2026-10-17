@@ -4080,9 +4080,11 @@ name = "wheat-core"
 version = "0.2.0"
 dependencies = [
  "blake3",
+ "proc-macro2",
  "proptest",
  "serde",
  "serde_yaml",
+ "syn 2.0.119",
  "thiserror",
  "tracing",
  "uuid",

@@ -1,3 +1,3 @@
 pub mod generated;
 
-pub use binschema_runtime::{BitOrder, BitStreamDecoder};
+pub use binschema_runtime::{BitOrder, BitStreamDecoder, BitStreamEncoder};

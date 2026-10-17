@@ -12,8 +12,10 @@ uuid = { workspace = true }
 wheat-binschema = { package = "wheat-binschema-generated", path = "generated" }
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
 proptest = "1"
 serde_yaml = { workspace = true }
+syn = { version = "2", features = ["full", "visit"] }
 
 [lints]
 workspace = true

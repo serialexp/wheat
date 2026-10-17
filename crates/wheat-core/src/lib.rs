@@ -44,6 +44,7 @@ pub use collection_builders::{
 pub use content_generation_wire::{
     CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationWireEntry, ContentGenerationWireError,
     ContentGenerationWireIndex, ContentGenerationWireShard, ContentGenerationWireShardRef,
+    content_generation_fingerprint, content_generation_index_digest,
     decode_content_generation_index, decode_content_generation_shard,
     encode_content_generation_index, encode_content_generation_shard,
 };

@@ -357,4 +357,16 @@ Guard: `crates/wheat-core/tests/no_hand_rolled_encodings.rs` (syn; skips generat
 tests/, `#[cfg(test)]`, wheat-bench, wheat-trace) fails on `to_/from_{be,le,ne}_bytes`
 and `byteorder`. A byte-string-const rule was left out: it would flag hex tables and
 hash domain tags. Exceptions: `NOT_PERSISTED` (matcher.rs only); a stale entry fails.
-It passes once the count checks and digest inputs are gone.
+
+Done 2026-10-17. binschema `9af4a10` adds `capacity_hint_sized` and has the
+generator emit it with each item's minimum encoded size. Both wheat gen scripts are
+pinned to it; `wheat-gen-schema` now also re-exports `BitStreamEncoder`. The
+hand count reads are gone: a forged count now fails as a decode error (out of input),
+and limits (`MAX_PHYSICAL_CATALOG_SEGMENTS`, shard entries, snapshot max_objects/
+max_contents) are checked after decoding. Item 8: `ContentGenerationIndexDigestInputV1`
+plus `content_generation_index_digest` / `content_generation_fingerprint` in
+content_generation_wire.rs; the fingerprint reuses one wire entry and one encoder, and
+no longer hashes the entry count, since each entry's encoding delimits itself. Guard passes.
+Suite 1186 passed; clippy, fmt, gen-schema checks, check-windows clean;
+`sharded_manifest` and `content_repack_plan` in release are within noise of
+2026-09-25. Still open in binschema TODO.md: the encoder's `len() as u32` truncation.

@@ -703,7 +703,7 @@ impl ServerHelloOutput {
         let protocol_version_max = decoder.read_u16_be()?;
         let server_id = decoder.read_bytes_vec(32)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut capabilities = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut capabilities = Vec::with_capacity(decoder.capacity_hint_sized(length, 2));
         for _ in 0..length {
             let str_len = decoder.read_u16_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -1333,7 +1333,7 @@ impl RepositoryStateOutput {
         let head_generation = decoder.read_u64_be()?;
         let head_envelope = Digest256::decode_with_decoder(decoder)?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
         for _ in 0..length {
             let item = LabelEntry::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -1516,7 +1516,7 @@ impl ListLabelsResultOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
         for _ in 0..length {
             let item = LabelEntry::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -1698,7 +1698,7 @@ impl ObjectBatchOutput {
         let op_id = decoder.read_u32_be()?;
         let sequence = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = ObjectEntry::decode_with_decoder(decoder)?;
             objects.push(item);
@@ -1792,7 +1792,7 @@ impl ObjectWantOutput {
         let op_id = decoder.read_u32_be()?;
         let want_sequence = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut ids = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             ids.push(item);
@@ -2042,7 +2042,7 @@ impl ObjectWantReplyOutput {
         let op_id = decoder.read_u32_be()?;
         let want_sequence = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = ObjectEntry::decode_with_decoder(decoder)?;
             objects.push(item);
@@ -2236,7 +2236,7 @@ impl ContentFetchRequestOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut content_ids = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut content_ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             content_ids.push(item);
@@ -2327,7 +2327,7 @@ impl ContentBatchOutput {
         let op_id = decoder.read_u32_be()?;
         let sequence = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut contents = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut contents = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = ContentEntry::decode_with_decoder(decoder)?;
             contents.push(item);
@@ -2728,7 +2728,7 @@ impl ObjectsNeededOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut ids = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             ids.push(item);
@@ -2885,7 +2885,7 @@ impl ContentNeededOutput {
         }
         let op_id = decoder.read_u32_be()?;
         let length = decoder.read_u16_be()? as usize;
-        let mut content_ids = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut content_ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
             content_ids.push(item);

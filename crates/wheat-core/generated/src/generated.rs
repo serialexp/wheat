@@ -1031,7 +1031,7 @@ impl TreeV1Output {
             )));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 37));
         for _ in 0..length {
             let item = DirectoryEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -1472,7 +1472,7 @@ impl SourceProvenanceV1 {
         let length = decoder.read_u32_be()? as usize;
         let object_id = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut parent_object_ids = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut parent_object_ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
         for _ in 0..length {
             let item = SourceObjectIdV1::decode_with_decoder(decoder)?;
             parent_object_ids.push(item);
@@ -1816,27 +1816,27 @@ impl RevisionV1Output {
         let change_id = ChangeId::decode_with_decoder(decoder)?;
         let metadata = RevisionMetadataV1::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut predecessors = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut predecessors = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = RevisionId::decode_with_decoder(decoder)?;
             predecessors.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut combines = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut combines = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = RevisionId::decode_with_decoder(decoder)?;
             combines.push(item);
         }
         let generation = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut dependencies = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut dependencies = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
         for _ in 0..length {
             let item = ChangeId::decode_with_decoder(decoder)?;
             dependencies.push(item);
         }
         let authored_against = ViewId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut edits = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut edits = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             edits.push(item);
@@ -1947,31 +1947,31 @@ impl EditTransitionV1 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut preserved = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut preserved = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             preserved.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut added = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut added = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             added.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut removed = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut removed = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             removed.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut subsumed = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut subsumed = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = EditSubsumptionV1::decode_with_decoder(decoder)?;
             subsumed.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut resolutions = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut resolutions = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
         for _ in 0..length {
             let item = ConflictResolutionEvidenceV1::decode_with_decoder(decoder)?;
             resolutions.push(item);
@@ -2016,7 +2016,7 @@ impl EditSubsumptionV1 {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let source = EditId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut replacements = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut replacements = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             replacements.push(item);
@@ -2063,13 +2063,13 @@ impl ConflictResolutionEvidenceV1 {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let application = ApplicationId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut conflicted_edits = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut conflicted_edits = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             conflicted_edits.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut replacement_edits = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut replacement_edits = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             replacement_edits.push(item);
@@ -2160,26 +2160,26 @@ impl ApplicationV1Output {
         let target_view = ViewId::decode_with_decoder(decoder)?;
         let position = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut previous = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut previous = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = ApplicationId::decode_with_decoder(decoder)?;
             previous.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut skip = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut skip = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = ApplicationId::decode_with_decoder(decoder)?;
             skip.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut window_max = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut window_max = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
         for _ in 0..length {
             let item = ChangeId::decode_with_decoder(decoder)?;
             window_max.push(item);
         }
         let result = ApplicationResultV1::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut applied = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut applied = Vec::with_capacity(decoder.capacity_hint_sized(length, 44));
         for _ in 0..length {
             let item = AppliedEditEntryV1::decode_with_decoder(decoder)?;
             applied.push(item);
@@ -2488,7 +2488,7 @@ impl ConflictV1Output {
         }
         let target_view = ViewId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut edits = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut edits = Vec::with_capacity(decoder.capacity_hint_sized(length, 37));
         for _ in 0..length {
             let item = FailedEditEntryV1::decode_with_decoder(decoder)?;
             edits.push(item);
@@ -2625,19 +2625,19 @@ impl AppliedEditEvidenceV1 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut target = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut target = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
         for _ in 0..length {
             let item = FileValueV1::decode_with_decoder(decoder)?;
             target.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut read = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut read = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
         for _ in 0..length {
             let item = ByteRangeV1::decode_with_decoder(decoder)?;
             read.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut write = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut write = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
         for _ in 0..length {
             let item = ByteRangeV1::decode_with_decoder(decoder)?;
             write.push(item);
@@ -2710,7 +2710,7 @@ impl FailedEditEvidenceV1 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut target = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut target = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
         for _ in 0..length {
             let item = FileValueV1::decode_with_decoder(decoder)?;
             target.push(item);
@@ -2961,7 +2961,7 @@ impl InterferenceFailureV1Output {
             )));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut with = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut with = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = EditId::decode_with_decoder(decoder)?;
             with.push(item);
@@ -3181,7 +3181,7 @@ impl ViewV1Output {
         let required_content = ContentMapId::decode_with_decoder(decoder)?;
         let size = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut last = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut last = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
         for _ in 0..length {
             let item = ChangeId::decode_with_decoder(decoder)?;
             last.push(item);
@@ -3303,19 +3303,19 @@ impl ContentMapNodeV1Output {
         let length = decoder.read_u32_be()? as usize;
         let prefix = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut value = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut value = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
         for _ in 0..length {
             let item = decoder.read_u32_be()?;
             value.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ContentMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 8));
         for _ in 0..length {
             let item = ContentMapEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -3490,19 +3490,19 @@ impl RevisionMapNodeV1Output {
         let length = decoder.read_u32_be()? as usize;
         let prefix = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut value = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut value = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = RevisionId::decode_with_decoder(decoder)?;
             value.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = RevisionMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = RevisionMapEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -3677,19 +3677,19 @@ impl ChangeMapNodeV1Output {
         let length = decoder.read_u32_be()? as usize;
         let prefix = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut value = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut value = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = ChangeObjectId::decode_with_decoder(decoder)?;
             value.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ChangeMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = ChangeMapEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -3864,19 +3864,19 @@ impl ApplicationMapNodeV1Output {
         let length = decoder.read_u32_be()? as usize;
         let prefix = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut value = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut value = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = ApplicationId::decode_with_decoder(decoder)?;
             value.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ApplicationMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = ApplicationMapEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -4051,19 +4051,19 @@ impl ViewLineageMapNodeV1Output {
         let length = decoder.read_u32_be()? as usize;
         let prefix = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut value = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut value = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = RetainedSetId::decode_with_decoder(decoder)?;
             value.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ViewLineageMapChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
         for _ in 0..length {
             let item = ViewLineageMapEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -4236,13 +4236,13 @@ impl ConflictSetNodeV1Output {
         let prefix = decoder.read_bytes_vec(length)?;
         let present = decoder.read_byte()? != 0;
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ConflictSetChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
         for _ in 0..length {
             let item = SetEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -4380,13 +4380,13 @@ impl ContentSetNodeV1Output {
         let prefix = decoder.read_bytes_vec(length)?;
         let present = decoder.read_byte()? != 0;
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ContentSetChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
         for _ in 0..length {
             let item = SetEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -4524,13 +4524,13 @@ impl RetainedSetNodeV1Output {
         let prefix = decoder.read_bytes_vec(length)?;
         let present = decoder.read_byte()? != 0;
         let length = decoder.read_u32_be()? as usize;
-        let mut children = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = RetainedSetChildV1::decode_with_decoder(decoder)?;
             children.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
         for _ in 0..length {
             let item = SetEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -4803,7 +4803,7 @@ impl ViewLabelManifestV1Output {
             )));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 41));
         for _ in 0..length {
             let item = ViewLabelManifestEntryV1::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -4883,7 +4883,7 @@ impl ViewLabelManifestEntryV1 {
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let view = ViewId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut original_git_refs = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut original_git_refs = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
         for _ in 0..length {
             let str_len = decoder.read_u32_be()? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
@@ -5346,13 +5346,13 @@ impl ExactFileEditV1Output {
             )));
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut expected = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut expected = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
         for _ in 0..length {
             let item = FileValueV1::decode_with_decoder(decoder)?;
             expected.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut replacement = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut replacement = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
         for _ in 0..length {
             let item = FileValueV1::decode_with_decoder(decoder)?;
             replacement.push(item);
@@ -5560,7 +5560,7 @@ impl SegmentIndexPageV1 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 62));
         for _ in 0..length {
             let item = SegmentIndexEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -5669,7 +5669,7 @@ impl SegmentDirectoryV1 {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let length = decoder.read_u32_be()? as usize;
-        let mut pages = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut pages = Vec::with_capacity(decoder.capacity_hint_sized(length, 81));
         for _ in 0..length {
             let item = SegmentDirectoryEntryV1::decode_with_decoder(decoder)?;
             pages.push(item);
@@ -6246,7 +6246,7 @@ impl PhysicalCatalogSnapshotV1Output {
         }
         let generation = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut segments = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut segments = Vec::with_capacity(decoder.capacity_hint_sized(length, 56));
         for _ in 0..length {
             let item = PhysicalSegmentDescriptorV1::decode_with_decoder(decoder)?;
             segments.push(item);
@@ -6796,7 +6796,7 @@ impl ContentGenerationManifestV1Output {
         let generation = decoder.read_u64_be()?;
         let entry_count = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut shards = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut shards = Vec::with_capacity(decoder.capacity_hint_sized(length, 77));
         for _ in 0..length {
             let item = ContentGenerationShardRefV1::decode_with_decoder(decoder)?;
             shards.push(item);
@@ -6844,6 +6844,56 @@ impl From<ContentGenerationManifestV1Input> for ContentGenerationManifestV1Outpu
             content_fingerprint: i.content_fingerprint,
             manifest_digest: i.manifest_digest,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationIndexDigestInputV1 {
+    pub generation: u64,
+    pub content_fingerprint: Digest256,
+    pub entry_count: u64,
+    pub shards: Vec<ContentGenerationShardRefV1>,
+}
+
+impl ContentGenerationIndexDigestInputV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be(self.generation);
+        self.content_fingerprint.encode_into(encoder)?;
+        encoder.write_u64_be(self.entry_count);
+        encoder.write_u32_be(self.shards.len() as u32);
+        for item in &self.shards {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let generation = decoder.read_u64_be()?;
+        let content_fingerprint = Digest256::decode_with_decoder(decoder)?;
+        let entry_count = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut shards = Vec::with_capacity(decoder.capacity_hint_sized(length, 77));
+        for _ in 0..length {
+            let item = ContentGenerationShardRefV1::decode_with_decoder(decoder)?;
+            shards.push(item);
+        }
+        Ok(Self {
+            generation,
+            content_fingerprint,
+            entry_count,
+            shards,
+        })
     }
 }
 
@@ -6909,7 +6959,7 @@ impl ContentGenerationShardV1Output {
         let generation = decoder.read_u64_be()?;
         let shard = decoder.read_u32_be()?;
         let length = decoder.read_u32_be()? as usize;
-        let mut entries = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 91));
         for _ in 0..length {
             let item = ContentGenerationEntryV1::decode_with_decoder(decoder)?;
             entries.push(item);
@@ -7242,13 +7292,13 @@ impl SnapshotManifestV1Output {
         let head_envelope = Digest256::decode_with_decoder(decoder)?;
         let envelope = Digest256::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
         for _ in 0..length {
             let item = InventoryEntryV1::decode_with_decoder(decoder)?;
             objects.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut contents = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut contents = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
         for _ in 0..length {
             let item = InventoryEntryV1::decode_with_decoder(decoder)?;
             contents.push(item);
@@ -7365,13 +7415,13 @@ impl OwnershipManifestV1Output {
         let owner_kind = decoder.read_byte()?;
         let owner_id = Digest256::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
         for _ in 0..length {
             let item = InventoryEntryV1::decode_with_decoder(decoder)?;
             objects.push(item);
         }
         let length = decoder.read_u32_be()? as usize;
-        let mut contents = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut contents = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
         for _ in 0..length {
             let item = InventoryEntryV1::decode_with_decoder(decoder)?;
             contents.push(item);
@@ -7615,7 +7665,7 @@ impl GitImportSourceV1Output {
         let length = decoder.read_u32_be()? as usize;
         let head = decoder.read_bytes_vec(length)?;
         let length = decoder.read_u32_be()? as usize;
-        let mut refs = Vec::with_capacity(decoder.capacity_hint(length));
+        let mut refs = Vec::with_capacity(decoder.capacity_hint_sized(length, 8));
         for _ in 0..length {
             let item = GitImportRefV1::decode_with_decoder(decoder)?;
             refs.push(item);

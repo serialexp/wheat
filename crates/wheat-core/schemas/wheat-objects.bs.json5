@@ -855,6 +855,18 @@
         { name: "manifest_digest", type: "Digest256" },
       ],
     },
+    // What an index's `manifest_digest` covers: hashed after the domain tag
+    // "wheat-content-generation-index-v1\0", never stored. The fingerprint is
+    // the tag "wheat-content-generation-v1\0" followed by every entry's
+    // ContentGenerationEntryV1 encoding in ID order.
+    ContentGenerationIndexDigestInputV1: {
+      sequence: [
+        { name: "generation", type: "uint64" },
+        { name: "content_fingerprint", type: "Digest256" },
+        { name: "entry_count", type: "uint64" },
+        { name: "shards", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentGenerationShardRefV1" } },
+      ],
+    },
     ContentGenerationShardV1: {
       sequence: [
         { name: "magic", type: "uint32", const: 0x57484353 },

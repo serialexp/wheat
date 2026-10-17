@@ -83,13 +83,13 @@ fn snapshot_manifest_round_trips_and_bounds_its_counts_before_decoding() {
         decode_snapshot_manifest(&bytes, 3, 1),
         Err(StoreRecordError::InvalidCount)
     );
-    // A forged count larger than the bytes can hold is refused before decoding.
+    // A forged count larger than the bytes can hold runs out of input.
     let mut forged = encode(&[], &[]);
     forged[78..82].copy_from_slice(&[0xff; 4]);
-    assert_eq!(
+    assert!(matches!(
         decode_snapshot_manifest(&forged, usize::MAX, usize::MAX),
-        Err(StoreRecordError::InvalidCount)
-    );
+        Err(StoreRecordError::Decode(_))
+    ));
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert!(decode_snapshot_manifest(&trailing, 3, 2).is_err());

@@ -46,10 +46,10 @@ fn physical_catalog_round_trips_and_rejects_noncanonical_order() {
     );
     let mut malicious_count = encoded.clone();
     malicious_count[14..18].copy_from_slice(&u32::MAX.to_be_bytes());
-    assert_eq!(
+    assert!(matches!(
         decode_physical_catalog_snapshot(&malicious_count),
-        Err(SegmentRecordError::InvalidCount)
-    );
+        Err(SegmentRecordError::Decode(_))
+    ));
 
     let mut invalid = snapshot;
     invalid.segments.swap(0, 1);
@@ -214,14 +214,15 @@ fn rejects_trailing_bytes_and_malicious_counts() {
     let mut prefix = encode_segment_prefix().unwrap();
     prefix.push(0);
     assert!(decode_segment_prefix(&prefix).is_err());
-    assert_eq!(
+    // A count the bytes cannot hold runs out of input.
+    assert!(matches!(
         decode_segment_index_page(&u32::MAX.to_be_bytes()),
-        Err(SegmentRecordError::InvalidCount)
-    );
-    assert_eq!(
+        Err(SegmentRecordError::Decode(_))
+    ));
+    assert!(matches!(
         decode_segment_directory(&u32::MAX.to_be_bytes()),
-        Err(SegmentRecordError::InvalidCount)
-    );
+        Err(SegmentRecordError::Decode(_))
+    ));
     let invalid = SegmentIndexPage {
         entries: vec![SegmentIndexEntry {
             namespace: 2,

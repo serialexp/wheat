@@ -20,7 +20,6 @@ pub const SEGMENT_MAX_DELTA_DEPTH: u8 = 16;
 pub const ACTIVE_LOG_HEADER_ENCODED_SIZE: usize = 14;
 pub const ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE: usize = 60;
 pub const ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE: usize = 36;
-const DIRECTORY_ENTRY_SIZE: usize = 81;
 
 pub const SEGMENT_NAMESPACE_METADATA: u8 = 1;
 pub const SEGMENT_NAMESPACE_CONTENT: u8 = 2;
@@ -171,8 +170,6 @@ pub struct RepackIntent {
 
 /// Hard allocation bound for an authenticated catalog snapshot.
 pub const MAX_PHYSICAL_CATALOG_SEGMENTS: usize = 1_000_000;
-const PHYSICAL_CATALOG_MAGIC: [u8; 4] = 0x5748_4354_u32.to_be_bytes();
-const PHYSICAL_CATALOG_VERSION: u16 = 1;
 
 impl SegmentFooter {
     pub fn segment_id(&self) -> SegmentId {
@@ -340,7 +337,6 @@ pub fn encode_segment_index_page(page: &SegmentIndexPage) -> Result<Vec<u8>, Seg
     .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
 }
 pub fn decode_segment_index_page(bytes: &[u8]) -> Result<SegmentIndexPage, SegmentRecordError> {
-    preflight_variable(bytes, SEGMENT_INDEX_ENTRY_ENCODED_SIZE)?;
     let w = wire::SegmentIndexPageV1::decode(bytes)
         .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
     let encoded = w.encode();
@@ -361,39 +357,6 @@ pub fn decode_segment_index_page(bytes: &[u8]) -> Result<SegmentIndexPage, Segme
         entries.push(e);
     }
     checked(bytes, SegmentIndexPage { entries }, encoded)
-}
-
-/// Bounds a length-prefixed array of variable-size items before decoding. The
-/// canonical re-encode check afterwards proves the exact length.
-fn preflight_variable(bytes: &[u8], min_item_size: usize) -> Result<(), SegmentRecordError> {
-    if bytes.len() < 4 {
-        return Err(SegmentRecordError::InvalidCount);
-    }
-    let count = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-    if count > (bytes.len() - 4) / min_item_size {
-        return Err(SegmentRecordError::InvalidCount);
-    }
-    Ok(())
-}
-
-fn preflight(bytes: &[u8], item_size: usize) -> Result<(), SegmentRecordError> {
-    if bytes.len() < 4 {
-        return Err(SegmentRecordError::InvalidCount);
-    }
-    let count = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-    if count > (bytes.len() - 4) / item_size
-        || 4usize
-            .checked_add(
-                count
-                    .checked_mul(item_size)
-                    .ok_or(SegmentRecordError::InvalidCount)?,
-            )
-            .ok_or(SegmentRecordError::InvalidCount)?
-            != bytes.len()
-    {
-        return Err(SegmentRecordError::InvalidCount);
-    }
-    Ok(())
 }
 
 pub fn encode_segment_directory(
@@ -417,7 +380,6 @@ pub fn encode_segment_directory(
         .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
 }
 pub fn decode_segment_directory(bytes: &[u8]) -> Result<SegmentDirectory, SegmentRecordError> {
-    preflight(bytes, DIRECTORY_ENTRY_SIZE)?;
     let w = wire::SegmentDirectoryV1::decode(bytes)
         .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
     let encoded = w.encode();
@@ -611,32 +573,6 @@ pub fn encode_physical_catalog_snapshot(
 pub fn decode_physical_catalog_snapshot(
     bytes: &[u8],
 ) -> Result<PhysicalCatalogSnapshot, SegmentRecordError> {
-    const HEADER: usize = 4 + 2 + 8 + 4;
-    const DESCRIPTOR: usize = 8 + 8 + 32 + 8;
-    const CONTENT: usize = 8 + 32;
-    if bytes.len() < HEADER + CONTENT
-        || bytes[..4] != PHYSICAL_CATALOG_MAGIC
-        || u16::from_be_bytes(bytes[4..6].try_into().unwrap()) != PHYSICAL_CATALOG_VERSION
-    {
-        return Err(SegmentRecordError::Decode(
-            "not a physical catalog snapshot".into(),
-        ));
-    }
-    // The generated decoder reserves the array from this count, so prove the
-    // complete fixed-width payload fits before giving it the untrusted bytes.
-    let count = u32::from_be_bytes(bytes[14..18].try_into().unwrap()) as usize;
-    if count > MAX_PHYSICAL_CATALOG_SEGMENTS
-        || HEADER
-            .checked_add(
-                count
-                    .checked_mul(DESCRIPTOR)
-                    .ok_or(SegmentRecordError::InvalidCount)?,
-            )
-            .and_then(|length| length.checked_add(CONTENT))
-            != Some(bytes.len())
-    {
-        return Err(SegmentRecordError::InvalidCount);
-    }
     let w = wire::PhysicalCatalogSnapshotV1::decode(bytes)
         .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
     let encoded = w.encode();

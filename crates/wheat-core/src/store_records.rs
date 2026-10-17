@@ -16,8 +16,6 @@ pub const MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE: usize = 36;
 pub const INVENTORY_ENTRY_ENCODED_SIZE: usize = 40;
 /// Encoded size of a snapshot manifest with empty inventories.
 pub const SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE: usize = 86;
-/// Bytes before a snapshot manifest's object count.
-const SNAPSHOT_MANIFEST_OBJECTS_OFFSET: usize = 78;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum StoreRecordError {
@@ -200,27 +198,17 @@ pub fn encode_snapshot_manifest(
     )
 }
 /// Decodes a snapshot manifest holding at most `max_objects` objects and
-/// `max_contents` contents. Both counts are checked against the limits and the
-/// supplied bytes before anything is allocated for them.
+/// `max_contents` contents. The generated decoder reserves no more entries
+/// than the bytes left can hold, so a forged count costs at most the input.
 pub fn decode_snapshot_manifest(
     bytes: &[u8],
     max_objects: usize,
     max_contents: usize,
 ) -> Result<SnapshotManifestRecord, StoreRecordError> {
-    let objects = inventory_count(bytes, SNAPSHOT_MANIFEST_OBJECTS_OFFSET, max_objects)?;
-    let contents_offset = objects
-        .checked_mul(INVENTORY_ENTRY_ENCODED_SIZE)
-        .and_then(|length| length.checked_add(SNAPSHOT_MANIFEST_OBJECTS_OFFSET + 4))
-        .ok_or(StoreRecordError::InvalidCount)?;
-    let contents = inventory_count(bytes, contents_offset, max_contents)?;
-    if contents
-        .checked_mul(INVENTORY_ENTRY_ENCODED_SIZE)
-        .and_then(|length| length.checked_add(contents_offset + 4))
-        != Some(bytes.len())
-    {
-        return Err(StoreRecordError::NonCanonicalEncoding);
-    }
     let w = wire::SnapshotManifestV1::decode(bytes).map_err(decode_error)?;
+    if w.objects.len() > max_objects || w.contents.len() > max_contents {
+        return Err(StoreRecordError::InvalidCount);
+    }
     let reencoded = w.encode();
     let manifest = SnapshotManifestRecord {
         head_generation: w.head_generation,
@@ -230,19 +218,6 @@ pub fn decode_snapshot_manifest(
         contents: inventory_domain(w.contents)?,
     };
     checked(bytes, manifest, reencoded)
-}
-
-/// Reads the inventory count at `offset`: the generated decoder reserves from
-/// it, so it must fit both `max` and the bytes left before decoding.
-fn inventory_count(bytes: &[u8], offset: usize, max: usize) -> Result<usize, StoreRecordError> {
-    let count = bytes
-        .get(offset..offset + 4)
-        .ok_or(StoreRecordError::NonCanonicalEncoding)?;
-    let count = u32::from_be_bytes(count.try_into().expect("four bytes")) as usize;
-    if count > max || count > (bytes.len() - offset - 4) / INVENTORY_ENTRY_ENCODED_SIZE {
-        return Err(StoreRecordError::InvalidCount);
-    }
-    Ok(count)
 }
 
 /// The canonical encoding of what one owner keeps alive; it is only ever hashed.

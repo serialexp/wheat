@@ -1084,6 +1084,16 @@ impl<'a> BitStreamDecoder<'a> {
         claimed.min(self.remaining_bytes())
     }
 
+    /// [`capacity_hint`](Self::capacity_hint) for items that each take at least
+    /// `min_item_bytes` encoded bytes: no more of them than the bytes left can
+    /// hold. An in-memory item can be far larger than its encoding, so capping by
+    /// the item count alone still lets a forged count reserve many times the
+    /// input's size.
+    #[inline]
+    pub fn capacity_hint_sized(&self, claimed: usize, min_item_bytes: usize) -> usize {
+        claimed.min(self.remaining_bytes() / min_item_bytes.max(1))
+    }
+
     /// Seeks to a specific byte position in the stream
     /// Note: This resets the bit offset to 0
     #[inline]
@@ -1172,6 +1182,20 @@ impl<'a> BitStreamDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_hint_sized_is_capped_by_how_many_items_the_bytes_left_hold() {
+        let bytes = [0u8; 10];
+        let mut decoder = BitStreamDecoder::new(&bytes, BitOrder::MsbFirst);
+        assert_eq!(decoder.capacity_hint_sized(usize::MAX, 4), 2);
+        assert_eq!(decoder.capacity_hint_sized(1, 4), 1);
+        assert_eq!(decoder.capacity_hint_sized(usize::MAX, 11), 0);
+        // A zero minimum is treated as one byte, like capacity_hint.
+        assert_eq!(decoder.capacity_hint_sized(usize::MAX, 0), 10);
+
+        decoder.read_bytes_vec(3).unwrap();
+        assert_eq!(decoder.capacity_hint_sized(usize::MAX, 4), 1);
+    }
 
     #[test]
     fn capacity_hint_is_capped_by_the_bytes_left() {

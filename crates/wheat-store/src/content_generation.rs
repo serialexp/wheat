@@ -15,10 +15,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use blake3::Hasher;
 use wheat_core::{
     ContentGenerationWireEntry, ContentGenerationWireIndex, ContentGenerationWireShard,
     ContentGenerationWireShardRef, ContentId, PhysicalContentGeneration,
+    content_generation_fingerprint, content_generation_index_digest,
     decode_content_generation_index, decode_content_generation_shard,
     encode_content_generation_index, encode_content_generation_shard,
 };
@@ -82,16 +82,7 @@ impl ContentGenerationIndex {
         encode_content_generation_index(&ContentGenerationWireIndex {
             generation: self.generation,
             entry_count: self.entry_count,
-            shards: self
-                .shards
-                .iter()
-                .map(|shard| ContentGenerationWireShardRef {
-                    first_id: shard.first_id,
-                    entry_count: shard.entry_count,
-                    pack_length: shard.pack_length,
-                    manifest: shard.manifest,
-                })
-                .collect(),
+            shards: self.shards.iter().map(shard_ref_wire).collect(),
             content_fingerprint: self.content_fingerprint,
             manifest_digest: self.manifest_digest,
         })
@@ -131,7 +122,7 @@ impl ContentGenerationIndex {
             index.content_fingerprint,
             index.entry_count,
             &index.shards,
-        ) != index.manifest_digest
+        )? != index.manifest_digest
         {
             return Err(invalid("manifest digest differs"));
         }
@@ -197,7 +188,7 @@ impl ContentGenerationManifest {
         generation: u64,
         entries: Vec<ContentGenerationEntry>,
     ) -> Result<Self, ContentRepackError> {
-        let content_fingerprint = fingerprint_entries(&entries);
+        let content_fingerprint = fingerprint_entries(&entries)?;
         let mut manifest = Self {
             generation,
             entries,
@@ -214,7 +205,7 @@ impl ContentGenerationManifest {
         if self.entries.windows(2).any(|pair| pair[0].id >= pair[1].id) {
             return Err(invalid("entries are not strictly ordered"));
         }
-        if fingerprint_entries(&self.entries) != self.content_fingerprint {
+        if fingerprint_entries(&self.entries)? != self.content_fingerprint {
             return Err(invalid("content fingerprint differs"));
         }
         if self.index()?.manifest_digest != self.manifest_digest {
@@ -280,7 +271,7 @@ impl ContentGenerationManifest {
                 self.content_fingerprint,
                 entry_count,
                 &shards,
-            ),
+            )?,
             shards,
             content_fingerprint: self.content_fingerprint,
         })
@@ -305,7 +296,7 @@ impl ContentGenerationManifest {
             content_fingerprint: index.content_fingerprint,
             manifest_digest: index.manifest_digest,
         };
-        if fingerprint_entries(&manifest.entries) != manifest.content_fingerprint {
+        if fingerprint_entries(&manifest.entries)? != manifest.content_fingerprint {
             return Err(invalid("content fingerprint differs"));
         }
         Ok(manifest)
@@ -402,47 +393,32 @@ fn index_digest(
     content_fingerprint: [u8; 32],
     entry_count: u64,
     shards: &[ContentGenerationShardRef],
-) -> [u8; 32] {
-    let mut hash = Hasher::new();
-    hash.update(b"wheat-content-generation-index-v1\0");
-    hash.update(&generation.to_be_bytes());
-    hash.update(&content_fingerprint);
-    hash.update(&entry_count.to_be_bytes());
-    hash.update(&(shards.len() as u64).to_be_bytes());
-    for shard in shards {
-        hash.update(shard.first_id.as_bytes());
-        hash.update(&shard.entry_count.to_be_bytes());
-        hash.update(&shard.pack_length.to_be_bytes());
-        hash.update(&shard.manifest);
-    }
-    *hash.finalize().as_bytes()
+) -> Result<[u8; 32], ContentRepackError> {
+    content_generation_index_digest(
+        generation,
+        content_fingerprint,
+        entry_count,
+        shards.iter().map(shard_ref_wire),
+    )
+    .map_err(|error| invalid(&error.to_string()))
 }
 
 /// Generation-independent fingerprint of every entry, including where each
 /// sits in its shard pack.
-pub(crate) fn fingerprint_entries(entries: &[ContentGenerationEntry]) -> [u8; 32] {
-    let mut hash = Hasher::new();
-    hash.update(b"wheat-content-generation-v1\0");
-    let entry_count = u64::try_from(entries.len()).expect("usize must fit in u64");
-    hash.update(&entry_count.to_be_bytes());
-    for entry in entries {
-        hash.update(entry.id.as_bytes());
-        hash.update(&entry.envelope_digest);
-        hash.update(&entry.pack_offset.to_be_bytes());
-        hash.update(&entry.physical_length.to_be_bytes());
-        hash.update(&entry.logical_length.to_be_bytes());
-        match entry.delta_base {
-            Some(base) => {
-                hash.update(&[1]);
-                hash.update(base.as_bytes());
-            }
-            None => {
-                hash.update(&[0]);
-            }
-        }
-        hash.update(&[entry.delta_depth]);
+pub(crate) fn fingerprint_entries(
+    entries: &[ContentGenerationEntry],
+) -> Result<[u8; 32], ContentRepackError> {
+    content_generation_fingerprint(entries.iter().map(entry_wire))
+        .map_err(|error| invalid(&error.to_string()))
+}
+
+fn shard_ref_wire(shard: &ContentGenerationShardRef) -> ContentGenerationWireShardRef {
+    ContentGenerationWireShardRef {
+        first_id: shard.first_id,
+        entry_count: shard.entry_count,
+        pack_length: shard.pack_length,
+        manifest: shard.manifest,
     }
-    *hash.finalize().as_bytes()
 }
 
 fn entry_wire(entry: &ContentGenerationEntry) -> ContentGenerationWireEntry {
@@ -636,7 +612,8 @@ mod tests {
             index.content_fingerprint,
             index.entry_count,
             &index.shards,
-        );
+        )
+        .unwrap();
         let error = ContentGenerationIndex::decode(&index.encoded().unwrap()).unwrap_err();
         assert!(error.to_string().contains("strictly ordered"), "{error}");
     }

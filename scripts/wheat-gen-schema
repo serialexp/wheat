@@ -17,7 +17,7 @@ CRATE_DIR="${REPO_ROOT}/crates/wheat-core"
 SCHEMA="${CRATE_DIR}/schemas/wheat-objects.bs.json5"
 OUT_DIR="${CRATE_DIR}/generated"
 BINSCHEMA_REPO="${BINSCHEMA_REPO:-${HOME}/Projects/binschema}"
-BINSCHEMA_REVISION="7377cb916843aa325071dd096de66be63cd0cc25"
+BINSCHEMA_REVISION="9af4a10703433e87a3db9e9c8304a1bbbb841e20"
 BINSCHEMA_CLI="${BINSCHEMA_REPO}/packages/binschema/dist/cli/index.js"
 
 if [[ ! -f "${BINSCHEMA_CLI}" ]]; then
@@ -44,9 +44,10 @@ regenerate() {
         "${output}/Cargo.toml"
     sed -i 's/name = "binschema-runtime"/name = "wheat-binschema-runtime"/' \
         "${output}/binschema_runtime/Cargo.toml"
-    # Canonical validation needs the decoder's final position without coupling
-    # wheat-core directly to the vendored runtime crate.
-    printf '\npub use binschema_runtime::{BitOrder, BitStreamDecoder};\n' >> "${output}/src/lib.rs"
+    # Canonical validation needs the decoder's final position, and hashing many
+    # records reuses one encoder, without coupling wheat-core directly to the
+    # vendored runtime crate.
+    printf '\npub use binschema_runtime::{BitOrder, BitStreamDecoder, BitStreamEncoder};\n' >> "${output}/src/lib.rs"
     # Keep committed output reproducible after workspace formatting. The CLI's
     # vendored runtime snapshot is not necessarily rustfmt-normalized.
     mapfile -d '' runtime_modules < <(fd --print0 --extension rs --exclude lib.rs . "${output}/binschema_runtime/src" | sort -z)
