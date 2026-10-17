@@ -5,13 +5,12 @@ use std::{
 };
 
 use thiserror::Error;
-use wheat_core::RepositoryEnvelopeId;
+use wheat_core::{
+    RepositoryEnvelopeId, RepositoryHeadRecord, StoreRecordError, decode_repository_head,
+    encode_repository_head,
+};
 
 use crate::Durability;
-
-const HEAD_MAGIC: &[u8; 9] = b"WHEATHEAD";
-const HEAD_VERSION: u8 = 2;
-const ENCODED_HEAD_LEN: usize = HEAD_MAGIC.len() + 1 + 8 + 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RepositoryHead {
@@ -38,36 +37,19 @@ impl RepositoryHead {
         })
     }
 
-    fn encode(self) -> [u8; ENCODED_HEAD_LEN] {
-        let mut encoded = [0_u8; ENCODED_HEAD_LEN];
-        encoded[..HEAD_MAGIC.len()].copy_from_slice(HEAD_MAGIC);
-        encoded[HEAD_MAGIC.len()] = HEAD_VERSION;
-        encoded[HEAD_MAGIC.len() + 1..HEAD_MAGIC.len() + 9]
-            .copy_from_slice(&self.generation.to_be_bytes());
-        encoded[HEAD_MAGIC.len() + 9..].copy_from_slice(self.envelope.as_bytes());
-        encoded
+    fn encode(self) -> Result<Vec<u8>, PublicationError> {
+        encode_repository_head(&RepositoryHeadRecord {
+            generation: self.generation,
+            envelope: self.envelope,
+        })
+        .map_err(PublicationError::Encode)
     }
 
     fn decode(encoded: &[u8]) -> Result<Self, PublicationError> {
-        if encoded.len() != ENCODED_HEAD_LEN
-            || &encoded[..HEAD_MAGIC.len()] != HEAD_MAGIC
-            || encoded[HEAD_MAGIC.len()] != HEAD_VERSION
-        {
-            return Err(PublicationError::CorruptHead);
-        }
-        let generation = u64::from_be_bytes(
-            encoded[HEAD_MAGIC.len() + 1..HEAD_MAGIC.len() + 9]
-                .try_into()
-                .expect("fixed generation range"),
-        );
-        let envelope = RepositoryEnvelopeId::from_digest(
-            encoded[HEAD_MAGIC.len() + 9..]
-                .try_into()
-                .expect("fixed digest range"),
-        );
+        let head = decode_repository_head(encoded).map_err(|_| PublicationError::CorruptHead)?;
         Ok(Self {
-            generation,
-            envelope,
+            generation: head.generation,
+            envelope: head.envelope,
         })
     }
 }
@@ -78,6 +60,8 @@ pub enum PublicationError {
     Missing,
     #[error("repository head is corrupt or has an unsupported version")]
     CorruptHead,
+    #[error("repository head does not encode")]
+    Encode(#[source] StoreRecordError),
     #[error("publication expected {expected:?}, but current head is {actual:?}")]
     Stale {
         expected: RepositoryHead,
@@ -207,7 +191,7 @@ impl LocalPublicationStore {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            file.write_all(&head.encode())?;
+            file.write_all(&head.encode()?)?;
             self.durability.sync_file(&file)?;
             fs::rename(&temporary, &self.head_path)?;
             self.durability.sync_directory(parent)?;

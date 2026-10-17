@@ -616,6 +616,7 @@ fn classify(error: &Error) -> Classification {
                 }
                 PublicationError::Missing
                 | PublicationError::CorruptHead
+                | PublicationError::Encode(_)
                 | PublicationError::InvalidGeneration => {
                     class("integrity", "corrupt_repository", false, 6)
                 }

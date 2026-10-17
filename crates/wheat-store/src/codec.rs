@@ -3,7 +3,10 @@
 use std::io::{self, Read};
 
 use thiserror::Error;
-use wheat_core::ContentId;
+use wheat_core::{
+    CONTENT_ENVELOPE_HEADER_ENCODED_SIZE, ContentEnvelopeHeaderRecord, ContentId,
+    decode_content_envelope_header, encode_content_envelope_header,
+};
 
 pub(crate) const RAW_THRESHOLD: usize = 1024;
 pub(crate) const ZSTD_LEVEL: i32 = 3;
@@ -15,9 +18,7 @@ pub const HARD_LOGICAL_RECORD_BYTES: usize = 1024 * 1024 * 1024;
 /// Current writers target 64 KiB blocks. Keeping the decode ceiling at 1 MiB
 /// preserves those blocks while leaving room for a future 256 KiB policy.
 pub(crate) const MAX_BLOCK_LOGICAL_BYTES: usize = 1024 * 1024;
-const ENVELOPE_MAGIC: &[u8; 4] = b"WHCE";
-const ENVELOPE_VERSION: u8 = 1;
-pub(crate) const ENVELOPE_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 8;
+pub(crate) const ENVELOPE_HEADER_LEN: usize = CONTENT_ENVELOPE_HEADER_ENCODED_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -351,14 +352,13 @@ pub(crate) fn encode_delta_envelope(
         (Codec::Delta, patch.to_vec())
     };
 
-    let stored_length = (base_ref_size + payload_after_base.len()) as u64;
-    let mut encoded =
-        Vec::with_capacity(ENVELOPE_HEADER_LEN + base_ref_size + payload_after_base.len());
-    encoded.extend_from_slice(ENVELOPE_MAGIC);
-    encoded.push(ENVELOPE_VERSION);
-    encoded.push(codec.to_byte());
-    encoded.extend_from_slice(&stored_length.to_be_bytes());
-    encoded.extend_from_slice(&logical_length.to_be_bytes());
+    let stored_length = base_ref_size + payload_after_base.len();
+    let mut encoded = encode_envelope_header(EnvelopeHeader {
+        codec,
+        stored_length: stored_length as u64,
+        logical_length,
+    })?;
+    encoded.reserve_exact(stored_length);
     encoded.extend_from_slice(base_id.as_bytes());
     encoded.extend_from_slice(&payload_after_base);
     Ok(encoded)
@@ -448,28 +448,33 @@ fn decompress_delta_patch(stored: &[u8], bound: u64) -> Result<Vec<u8>, CodecErr
 
 pub(crate) fn encode_envelope(logical: &[u8]) -> Result<Vec<u8>, CodecError> {
     let payload = prepare(logical)?;
-    let stored_length = payload.bytes.len() as u64;
-    let mut encoded = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.bytes.len());
-    encoded.extend_from_slice(ENVELOPE_MAGIC);
-    encoded.push(ENVELOPE_VERSION);
-    encoded.push(payload.codec.to_byte());
-    encoded.extend_from_slice(&stored_length.to_be_bytes());
-    encoded.extend_from_slice(&payload.logical_length.to_be_bytes());
+    let mut encoded = encode_envelope_header(EnvelopeHeader {
+        codec: payload.codec,
+        stored_length: payload.bytes.len() as u64,
+        logical_length: payload.logical_length,
+    })?;
+    encoded.reserve_exact(payload.bytes.len());
     encoded.extend_from_slice(&payload.bytes);
     Ok(encoded)
 }
 
+/// The encoded header alone; the stored payload follows it.
+pub(crate) fn encode_envelope_header(header: EnvelopeHeader) -> Result<Vec<u8>, CodecError> {
+    encode_content_envelope_header(&ContentEnvelopeHeaderRecord {
+        codec: header.codec.to_byte(),
+        stored_length: header.stored_length,
+        logical_length: header.logical_length,
+    })
+    .map_err(|_| CodecError::Format("envelope header does not encode"))
+}
+
 pub(crate) fn parse_envelope_header(encoded: &[u8]) -> Result<EnvelopeHeader, CodecError> {
-    if encoded.len() != ENVELOPE_HEADER_LEN || &encoded[..4] != ENVELOPE_MAGIC {
-        return Err(CodecError::Format("bad envelope prefix"));
-    }
-    if encoded[4] != ENVELOPE_VERSION {
-        return Err(CodecError::Format("unsupported envelope version"));
-    }
+    let header = decode_content_envelope_header(encoded)
+        .map_err(|_| CodecError::Format("bad envelope prefix"))?;
     Ok(EnvelopeHeader {
-        codec: Codec::from_byte(encoded[5])?,
-        stored_length: u64::from_be_bytes(encoded[6..14].try_into().unwrap()),
-        logical_length: u64::from_be_bytes(encoded[14..22].try_into().unwrap()),
+        codec: Codec::from_byte(header.codec)?,
+        stored_length: header.stored_length,
+        logical_length: header.logical_length,
     })
 }
 
@@ -689,8 +694,9 @@ mod tests {
         let mut trailing = encoded;
         trailing.push(0);
         // Repair the envelope stored length so frame-consumption validation sees it.
-        let length = (trailing.len() - ENVELOPE_HEADER_LEN) as u64;
-        trailing[6..14].copy_from_slice(&length.to_be_bytes());
+        let mut header = parse_envelope_header(&trailing[..ENVELOPE_HEADER_LEN]).unwrap();
+        header.stored_length = (trailing.len() - ENVELOPE_HEADER_LEN) as u64;
+        trailing[..ENVELOPE_HEADER_LEN].copy_from_slice(&encode_envelope_header(header).unwrap());
         assert!(matches!(
             decode_envelope(&trailing, usize::MAX),
             Err(CodecError::Format("trailing zstd frame bytes"))
@@ -699,9 +705,10 @@ mod tests {
 
     #[test]
     fn file_reader_rejects_forged_logical_length_before_payload_read() {
-        let mut header = encode_envelope(b"x").unwrap();
-        header.truncate(ENVELOPE_HEADER_LEN);
-        header[14..22].copy_from_slice(&u64::MAX.to_be_bytes());
+        let encoded = encode_envelope(b"x").unwrap();
+        let mut header = parse_envelope_header(&encoded[..ENVELOPE_HEADER_LEN]).unwrap();
+        header.logical_length = u64::MAX;
+        let header = encode_envelope_header(header).unwrap();
         let mut reader = &header[..];
         assert!(matches!(
             read_envelope_file(&mut reader, (ENVELOPE_HEADER_LEN + 1) as u64, usize::MAX),

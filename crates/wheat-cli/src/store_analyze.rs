@@ -11,11 +11,13 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use wheat_core::ContentId;
-#[cfg(test)]
-use wheat_core::{PhysicalCatalogSnapshot, encode_physical_catalog_snapshot};
 use wheat_core::{
-    PhysicalContentGeneration, SEGMENT_MAX_DELTA_DEPTH, decode_physical_catalog_snapshot,
-    validate_canonical_object,
+    PhysicalCatalogRef, PhysicalContentGeneration, SEGMENT_MAX_DELTA_DEPTH,
+    decode_physical_catalog_head, decode_physical_catalog_snapshot, validate_canonical_object,
+};
+#[cfg(test)]
+use wheat_core::{
+    PhysicalCatalogSnapshot, encode_physical_catalog_head, encode_physical_catalog_snapshot,
 };
 use wheat_store::packed_segment_reader::{self, read_loose_envelope};
 #[cfg(test)]
@@ -130,15 +132,8 @@ struct SelectedContentGeneration {
 /// store. A missing or malformed authority, or a snapshot that has not
 /// selected a content generation yet, has no selected generation.
 fn selected_content_generation(storage_root: &Path) -> Option<SelectedContentGeneration> {
-    const HEAD_MAGIC: &[u8] = b"WHEATPACK";
-    const HEAD_LEN: usize = HEAD_MAGIC.len() + 1 + 8 + 32;
-
     let head = fs::read(storage_root.join("packed/catalog.head")).ok()?;
-    if head.len() != HEAD_LEN || !head.starts_with(HEAD_MAGIC) || head[HEAD_MAGIC.len()] != 1 {
-        return None;
-    }
-    let generation = u64::from_be_bytes(head[10..18].try_into().ok()?);
-    let digest: [u8; 32] = head[18..50].try_into().ok()?;
+    let PhysicalCatalogRef { generation, digest } = decode_physical_catalog_head(&head).ok()??;
     let catalog = fs::read(
         storage_root
             .join("packed/catalog")
@@ -1313,10 +1308,11 @@ mod tests {
             catalog,
         )
         .unwrap();
-        let mut head = b"WHEATPACK".to_vec();
-        head.push(1);
-        head.extend_from_slice(&1u64.to_be_bytes());
-        head.extend_from_slice(&digest);
+        let head = encode_physical_catalog_head(Some(PhysicalCatalogRef {
+            generation: 1,
+            digest,
+        }))
+        .unwrap();
         fs::write(packed.join("catalog.head"), head).unwrap();
     }
 

@@ -22,7 +22,11 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-use wheat_core::{FileKind, FileValue, TreeId, ViewId};
+use wheat_core::{
+    FileKind, FileValue, MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE,
+    MaterializationProgressFields, TreeId, ViewId, decode_materialization_progress_record,
+    encode_materialization_progress_fields, encode_materialization_progress_record,
+};
 use wheat_ignore::WORKSPACE_CONTROL_NAMES as RESERVED;
 use wheat_store::{
     ContentStore, MerkleTreeStore, PublicationStore, RepositoryHead, TreeDiffLimits, TreeFile,
@@ -45,8 +49,7 @@ const VERSION: u32 = 4;
 const JOURNAL_NAME: &str = "materialization.json";
 const TRANSACTIONS: &str = "materialization-transactions";
 const PROGRESS_NAME: &str = "progress.log";
-const PROGRESS_MAGIC: &[u8; 4] = b"WMI1";
-const PROGRESS_RECORD_BYTES: usize = 36;
+const PROGRESS_RECORD_BYTES: usize = MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE;
 const PROGRESS_OPCODE_INSTALL_INTENT: u16 = 1;
 const PROGRESS_OPCODE_COMPLETE: u16 = 2;
 const PROGRESS_OPCODE_ABORTED: u16 = 3;
@@ -2215,15 +2218,14 @@ fn append_progress_record(
     opcode: u16,
     index: usize,
 ) -> Result<()> {
-    let index = u64::try_from(index)?;
-    let mut record = [0_u8; PROGRESS_RECORD_BYTES];
-    record[..4].copy_from_slice(PROGRESS_MAGIC);
-    record[4..6].copy_from_slice(&1_u16.to_le_bytes());
-    record[6..8].copy_from_slice(&opcode.to_le_bytes());
-    record[8..24].copy_from_slice(transaction_id.as_bytes());
-    record[24..32].copy_from_slice(&index.to_le_bytes());
-    let checksum = crc32fast::hash(&record[..32]);
-    record[32..].copy_from_slice(&checksum.to_le_bytes());
+    let fields = MaterializationProgressFields {
+        opcode,
+        transaction: *transaction_id.as_bytes(),
+        index: u64::try_from(index)?,
+    };
+    let checksum = crc32fast::hash(&encode_materialization_progress_fields(&fields)?);
+    let record = encode_materialization_progress_record(&fields, checksum)?;
+    debug_assert_eq!(record.len(), PROGRESS_RECORD_BYTES);
     progress.write_all(&record)?;
     progress.sync_data()?;
     Ok(())
@@ -2254,21 +2256,22 @@ fn read_progress(
     let complete_records = complete_bytes / PROGRESS_RECORD_BYTES;
     for physical_index in 0..complete_records {
         progress.read_exact(&mut record)?;
-        if let Err(error) = validate_progress_record(&record, transaction_id, installs, state) {
+        let fields = match validate_progress_record(&record, transaction_id, installs, state) {
+            Ok(fields) => fields,
             // An interrupted append may leave a full-width record whose payload or
             // checksum never reached stable storage. Only the last physical record
             // can be such a torn append; corruption before it is unambiguously in
             // committed progress and remains a hard error.
-            if physical_index + 1 == complete_records {
-                break;
+            Err(_) if physical_index + 1 == complete_records => break,
+            Err(error) => {
+                return Err(error)
+                    .context("materialization progress contains an invalid complete record");
             }
-            return Err(error)
-                .context("materialization progress contains an invalid complete record");
-        }
-        match u16::from_le_bytes(record[6..8].try_into()?) {
+        };
+        match fields.opcode {
             PROGRESS_OPCODE_INSTALL_INTENT => {
                 state.batch_start = state.intents;
-                state.intents = usize::try_from(u64::from_le_bytes(record[24..32].try_into()?))?;
+                state.intents = usize::try_from(fields.index)?;
             }
             PROGRESS_OPCODE_COMPLETE => state.complete = true,
             PROGRESS_OPCODE_ABORTED => state.aborted = true,
@@ -2290,23 +2293,14 @@ fn validate_progress_record(
     id: Uuid,
     installs: usize,
     state: ProgressState,
-) -> Result<()> {
-    ensure!(&record[..4] == PROGRESS_MAGIC, "invalid progress magic");
+) -> Result<MaterializationProgressFields> {
+    let fields = decode_progress_record(record)?;
     ensure!(
-        u16::from_le_bytes(record[4..6].try_into()?) == 1,
-        "invalid progress version"
-    );
-    ensure!(
-        &record[8..24] == id.as_bytes(),
+        &fields.transaction == id.as_bytes(),
         "progress transaction mismatch"
     );
-    ensure!(
-        u32::from_le_bytes(record[32..36].try_into()?) == crc32fast::hash(&record[..32]),
-        "invalid progress checksum"
-    );
-    let opcode = u16::from_le_bytes(record[6..8].try_into()?);
-    let index = usize::try_from(u64::from_le_bytes(record[24..32].try_into()?))?;
-    match opcode {
+    let index = usize::try_from(fields.index)?;
+    match fields.opcode {
         PROGRESS_OPCODE_INSTALL_INTENT => {
             ensure!(
                 !state.complete && !state.aborted,
@@ -2344,7 +2338,21 @@ fn validate_progress_record(
         }
         _ => bail!("invalid progress opcode"),
     }
-    Ok(())
+    Ok(fields)
+}
+
+/// Decodes a progress record whose checksum matches its fields. Its transaction
+/// and its place in the log are the caller's to check.
+fn decode_progress_record(
+    record: &[u8; PROGRESS_RECORD_BYTES],
+) -> Result<MaterializationProgressFields> {
+    let (fields, checksum) =
+        decode_materialization_progress_record(record).context("invalid progress record")?;
+    ensure!(
+        crc32fast::hash(&encode_materialization_progress_fields(&fields)?) == checksum,
+        "invalid progress checksum"
+    );
+    Ok(fields)
 }
 
 fn journal_exists(root: &Path) -> Result<bool> {
@@ -2673,9 +2681,10 @@ fn cleanup_orphan_transactions(root: &Path) -> Result<()> {
                     progress.seek(SeekFrom::End(-(PROGRESS_RECORD_BYTES as i64)))?;
                     let mut terminal = [0_u8; PROGRESS_RECORD_BYTES];
                     progress.read_exact(&mut terminal)?;
-                    let opcode = u16::from_le_bytes(terminal[6..8].try_into()?);
-                    let count = usize::try_from(u64::from_le_bytes(terminal[24..32].try_into()?))?;
-                    let installs = match opcode {
+                    let terminal = decode_progress_record(&terminal)
+                        .context("orphan materialization transaction is not durably terminal")?;
+                    let count = usize::try_from(terminal.index)?;
+                    let installs = match terminal.opcode {
                         PROGRESS_OPCODE_COMPLETE => count,
                         // The journal is gone, so its total install count is unavailable.
                         // One more than the authenticated intent prefix is a safe bound

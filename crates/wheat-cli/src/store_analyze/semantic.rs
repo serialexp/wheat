@@ -6,8 +6,9 @@ use anyhow::{Context, Result, bail};
 use wheat_core::{
     ApplicationResultRecord, DirectoryEntry, EditOperation, ObjectId, decode_application_record,
     decode_content_set_node, decode_directory_node, decode_edit_record,
-    decode_repository_envelope_record, decode_repository_state_record, decode_retained_set_node,
-    decode_revision_record, decode_view_label_manifest_record, decode_view_record,
+    decode_repository_envelope_record, decode_repository_head, decode_repository_state_record,
+    decode_retained_set_node, decode_revision_record, decode_view_label_manifest_record,
+    decode_view_record,
 };
 use wheat_store::packed_segment_reader::{self, AuthenticatedSegment, read_loose_envelope};
 
@@ -285,11 +286,9 @@ fn collect_set(
 }
 
 fn decode_head(bytes: &[u8]) -> Result<[u8; 32]> {
-    const MAGIC: &[u8] = b"WHEATHEAD";
-    if bytes.len() != 50 || !bytes.starts_with(MAGIC) || bytes[9] != 2 {
-        bail!("repository.head is corrupt or unsupported")
-    }
-    Ok(bytes[18..50].try_into().expect("fixed range"))
+    let head =
+        decode_repository_head(bytes).context("repository.head is corrupt or unsupported")?;
+    Ok(*head.envelope.as_bytes())
 }
 
 fn hex(bytes: &[u8; 32]) -> String {

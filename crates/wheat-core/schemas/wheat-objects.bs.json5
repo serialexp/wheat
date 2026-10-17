@@ -782,6 +782,39 @@
         { name: "manifest", type: "Digest256" },
       ],
     },
+    // One catalog snapshot by name: its generation and the BLAKE3 digest of its
+    // encoded PhysicalCatalogSnapshotV1.
+    PhysicalCatalogRefV1: {
+      sequence: [
+        { name: "generation", type: "uint64" },
+        { name: "digest", type: "Digest256" },
+      ],
+    },
+    // `catalog.head`: the snapshot that is the local packed store's authority.
+    // No snapshot means a store that has not sealed anything yet.
+    PhysicalCatalogHeadV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484348 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "head", type: "optional", value_type: "PhysicalCatalogRefV1" },
+      ],
+    },
+    // `repack.intent`: a repack about to move the head from `old` to `new`.
+    RepackIntentFieldsV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57485249 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "old", type: "optional", value_type: "PhysicalCatalogRefV1" },
+        { name: "new", type: "PhysicalCatalogRefV1" },
+      ],
+    },
+    // `fields_digest` is BLAKE3 over the encoded fields.
+    RepackIntentV1: {
+      sequence: [
+        { name: "fields", type: "RepackIntentFieldsV1" },
+        { name: "fields_digest", type: "Digest256" },
+      ],
+    },
 
     // Physical content-repack manifests. These are outside WheatObject: they
     // describe replaceable storage representation, not logical object identity.
@@ -829,6 +862,98 @@
         { name: "generation", type: "uint64" },
         { name: "shard", type: "uint32" },
         { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentGenerationEntryV1" } },
+      ],
+    },
+
+    // Store control records. Like the physical records above, none of these are
+    // WheatObject variants.
+
+    // `repository.head`: the published generation and its repository envelope.
+    RepositoryHeadV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57485248 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "generation", type: "uint64" },
+        { name: "envelope", type: "Digest256" },
+      ],
+    },
+    // The fixed header in front of every stored content envelope's payload.
+    // `codec` is the physical codec (0 raw, 1 zstd, 2 delta, 3 zstd'd delta);
+    // `stored_length` payload bytes follow.
+    ContentEnvelopeHeaderV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484345 },
+        { name: "version", type: "uint8", const: 1 },
+        { name: "codec", type: "uint8" },
+        { name: "stored_length", type: "uint64" },
+        { name: "logical_length", type: "uint64" },
+      ],
+    },
+    // One object or content blob a manifest accounts for, sorted by `id`.
+    InventoryEntryV1: {
+      sequence: [
+        { name: "id", type: "Digest256" },
+        { name: "bytes", type: "uint64" },
+      ],
+    },
+    // A native repository snapshot's manifest; its BLAKE3 digest is the snapshot ID.
+    SnapshotManifestV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x5748534e },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "head_generation", type: "uint64" },
+        { name: "head_envelope", type: "Digest256" },
+        { name: "envelope", type: "Digest256" },
+        { name: "objects", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
+        { name: "contents", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
+      ],
+    },
+    // What one owner (1 = repository, 2 = snapshot) keeps alive; its BLAKE3
+    // digest is the manifest ID.
+    OwnershipManifestV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484f4d },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "owner_kind", type: "uint8" },
+        { name: "owner_id", type: "Digest256" },
+        { name: "objects", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
+        { name: "contents", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
+      ],
+    },
+    // One record of a workspace materialization's `progress.log`. `opcode` is
+    // 1 = install intent (`index` installs announced), 2 = complete, 3 = aborted
+    // (`index` is the install count either way).
+    MaterializationProgressFieldsV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484d50 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "opcode", type: "uint16" },
+        { name: "transaction", type: "Uuid128" },
+        { name: "index", type: "uint64" },
+      ],
+    },
+    // `checksum` is CRC-32 over the encoded fields: it tells a torn append.
+    MaterializationProgressRecordV1: {
+      sequence: [
+        { name: "fields", type: "MaterializationProgressFieldsV1" },
+        { name: "checksum", type: "uint32" },
+      ],
+    },
+    // The Git source a staged import is bound to. The import journal keeps these
+    // bytes and refuses to resume against a source whose bytes differ.
+    GitImportSourceV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484749 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "path", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "head", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "refs", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "GitImportRefV1" } },
+      ],
+    },
+    GitImportRefV1: {
+      sequence: [
+        { name: "name", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "oid", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
       ],
     },
   },

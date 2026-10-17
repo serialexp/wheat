@@ -154,6 +154,21 @@ pub struct PhysicalCatalogSnapshot {
     pub content: PhysicalContentGeneration,
 }
 
+/// One catalog snapshot by name: its generation and the BLAKE3 digest of its
+/// encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalCatalogRef {
+    pub generation: u64,
+    pub digest: [u8; 32],
+}
+
+/// A repack about to move the catalog head from `old` to `new`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepackIntent {
+    pub old: Option<PhysicalCatalogRef>,
+    pub new: PhysicalCatalogRef,
+}
+
 /// Hard allocation bound for an authenticated catalog snapshot.
 pub const MAX_PHYSICAL_CATALOG_SEGMENTS: usize = 1_000_000;
 const PHYSICAL_CATALOG_MAGIC: [u8; 4] = 0x5748_4354_u32.to_be_bytes();
@@ -232,6 +247,8 @@ pub enum SegmentRecordError {
     InvalidDelta,
     #[error("segment record count cannot fit in supplied bytes")]
     InvalidCount,
+    #[error("record digest does not match its fields")]
+    DigestMismatch,
 }
 
 fn digest(bytes: [u8; 32]) -> wire::Digest256 {
@@ -669,4 +686,75 @@ fn validate_physical_catalog_snapshot(
         return Err(SegmentRecordError::NonCanonicalEncoding);
     }
     Ok(())
+}
+
+fn catalog_ref_wire(head: PhysicalCatalogRef) -> wire::PhysicalCatalogRefV1 {
+    wire::PhysicalCatalogRefV1 {
+        generation: head.generation,
+        digest: digest(head.digest),
+    }
+}
+fn catalog_ref_domain(
+    head: wire::PhysicalCatalogRefV1,
+) -> Result<PhysicalCatalogRef, SegmentRecordError> {
+    Ok(PhysicalCatalogRef {
+        generation: head.generation,
+        digest: digest_array(head.digest)?,
+    })
+}
+
+/// Encodes `catalog.head`. `None` is a store that has not sealed anything yet.
+pub fn encode_physical_catalog_head(
+    head: Option<PhysicalCatalogRef>,
+) -> Result<Vec<u8>, SegmentRecordError> {
+    wire::PhysicalCatalogHeadV1Input {
+        head: head.map(catalog_ref_wire),
+    }
+    .encode()
+    .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+pub fn decode_physical_catalog_head(
+    bytes: &[u8],
+) -> Result<Option<PhysicalCatalogRef>, SegmentRecordError> {
+    let w = wire::PhysicalCatalogHeadV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    let encoded = w.encode();
+    let head = w.head.map(catalog_ref_domain).transpose()?;
+    checked(bytes, head, encoded)
+}
+
+/// Encodes `repack.intent` with the digest of its fields.
+pub fn encode_repack_intent(intent: &RepackIntent) -> Result<Vec<u8>, SegmentRecordError> {
+    let fields: wire::RepackIntentFieldsV1 = wire::RepackIntentFieldsV1Input {
+        old: intent.old.map(catalog_ref_wire),
+        new: catalog_ref_wire(intent.new),
+    }
+    .into();
+    let encoded = fields
+        .encode()
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    wire::RepackIntentV1 {
+        fields,
+        fields_digest: digest(*blake3::hash(&encoded).as_bytes()),
+    }
+    .encode()
+    .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+/// Decodes `repack.intent` and checks the digest of its fields.
+pub fn decode_repack_intent(bytes: &[u8]) -> Result<RepackIntent, SegmentRecordError> {
+    let w = wire::RepackIntentV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    let encoded = w.encode();
+    let fields = w
+        .fields
+        .encode()
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    if blake3::hash(&fields).as_bytes() != &digest_array(w.fields_digest)? {
+        return Err(SegmentRecordError::DigestMismatch);
+    }
+    let intent = RepackIntent {
+        old: w.fields.old.map(catalog_ref_domain).transpose()?,
+        new: catalog_ref_domain(w.fields.new)?,
+    };
+    checked(bytes, intent, encoded)
 }

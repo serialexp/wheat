@@ -310,3 +310,51 @@ Contract rules done 2026-10-16 (`publish_contention.rs`: writers_8.accepted_per_
 
 Left of Bart's plan: "maybe" the client-side push of the difference (design doc
 Outstanding item). Not started; needs Bart's go-ahead.
+
+## 2026-10-17: hand-rolled persisted encodings (@calm-lynx) — Bart: convert all, strict guard
+
+How they got in: all predate the BinSchema-only rule (first in
+`crates/wheat-core/CLAUDE.md` 2026-09-24, `7f5420c`; root CLAUDE.md 2026-09-25,
+`6ce2538`); nobody swept the existing code. Bart picked "convert all, strict guard".
+
+To convert (each gets a BinSchema record + wheat-core wrapper, call sites switched):
+1. `catalog.head`, `repack.intent` (wheat-store packed/catalog.rs), plus the hand
+   reader of catalog.head in wheat-cli store_analyze.rs (and its test fixture).
+2. `repository.head` WHEATHEAD (wheat-store publication.rs), plus the hand reader in
+   wheat-cli store_analyze/semantic.rs.
+3. Content envelope header WHCE (wheat-store codec.rs). BinSchema layout can be
+   byte-identical (uint32 magic, uint8 version, uint8 codec, two uint64).
+4. Snapshot manifest WHEATSNP (wheat-store snapshot.rs; decoded, bounded by limits).
+5. Ownership manifest WHEATOWN (wheat-store ownership.rs; only hashed into its ID).
+6. Materialization progress.log WMI1 (wheat-cli materialization.rs; fixed 36-byte
+   records with crc32, torn-tail handling).
+7. Import source snapshot (wheat-git staged_import.rs `snapshot_bytes`; stored as a
+   blob in the import journal and compared byte-for-byte, never decoded).
+8. Digest inputs hashed by hand: content_generation.rs `index_digest` and
+   `fingerprint_entries` (both end up persisted in the manifest).
+
+Not storage, no change: `guarded/matcher.rs` word compare (in memory); integer ->
+ID helpers in tests; wheat-bench synthetic data; `import.marker` (a constant marker
+in a temporary staging directory).
+
+Items 1-7 done: schema types `PhysicalCatalog{Ref,Head}V1`, `RepackIntent{Fields,}V1`
+(wrappers in segment_records.rs), `RepositoryHeadV1`, `ContentEnvelopeHeaderV1`
+(byte-identical to the old WHCE header), `InventoryEntryV1`, `SnapshotManifestV1`,
+`OwnershipManifestV1`, `MaterializationProgress{Fields,Record}V1` (crc32 stays in
+the CLI), `GitImport{Source,Ref}V1` (wrappers in the new wheat-core
+store_records.rs). Tests: wheat-core tests/segment_records.rs, tests/store_records.rs.
+Suite 1183 passed. Found: the generated encoder writes a uint32 count as
+`len() as u32` (silent truncation); the new wrappers refuse longer arrays.
+
+Bart's answers 2026-10-17: count checks -> "Fix it in binschema" (cap the decode
+reservation at bytes left / the item's minimum encoded size, re-pin, regenerate, drop
+the hand count reads in segment_records.rs, content_generation_wire.rs,
+store_records.rs `inventory_count`). Digest inputs (item 8) -> "Hash BinSchema
+bytes" (each entry's ContentGenerationEntryV1 encoding; a small schema type for the
+index digest input).
+
+Guard: `crates/wheat-core/tests/no_hand_rolled_encodings.rs` (syn; skips generated/,
+tests/, `#[cfg(test)]`, wheat-bench, wheat-trace) fails on `to_/from_{be,le,ne}_bytes`
+and `byteorder`. A byte-string-const rule was left out: it would flag hex tables and
+hash domain tags. Exceptions: `NOT_PERSISTED` (matcher.rs only); a stale entry fails.
+It passes once the count checks and digest inputs are gone.

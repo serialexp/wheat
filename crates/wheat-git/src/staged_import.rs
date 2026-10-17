@@ -12,6 +12,7 @@ use wheat_core::{
     ApplicationResultRecord, AppliedEditEvidence, ByteRange, ChangeId, ChangeProposal, ObjectId,
     SourceProvenance, Tree,
     edit_application::{ApplicationLimits, ApplicationOutcome, apply_edits},
+    encode_git_import_source,
 };
 use wheat_store::{
     ApplicationMapStore, CommitWriterError, ConflictSetStore, ContentMapStore, ContentStore,
@@ -43,7 +44,6 @@ const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PROOF_RECEIPTS: usize = 65_536;
 
 const NAMESPACE: Uuid = Uuid::from_u128(0xc245_a89b_519f_5a4b_9b36_d62b_78f5_2901);
-const SNAPSHOT_VERSION: &[u8] = b"wheat-git-staged-import-v2\0";
 const DISCOVERY_BATCH: usize = 256;
 const MAX_STAGE_REFS: usize = 1024;
 /// The current import path materializes a complete blob and exact replacement
@@ -548,20 +548,16 @@ pub(super) fn snapshot_bytes(
 ) -> Result<Vec<u8>, StagedImportError> {
     let canonical =
         std::fs::canonicalize(supplied).map_err(|e| StagedImportError::Git(e.to_string()))?;
-    let mut out = SNAPSHOT_VERSION.to_vec();
-    push(&mut out, canonical.to_string_lossy().as_bytes());
     let head = std::fs::read(git.path().join("HEAD"))
         .map_err(|e| StagedImportError::Git(e.to_string()))?;
-    push(&mut out, &head);
-    for (name, oid) in branches {
-        push(&mut out, name.as_bytes());
-        push(&mut out, oid.as_bytes());
-    }
-    Ok(out)
-}
-fn push(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    out.extend_from_slice(bytes);
+    encode_git_import_source(
+        canonical.to_string_lossy().as_bytes(),
+        &head,
+        branches
+            .iter()
+            .map(|(name, oid)| (name.as_bytes(), oid.as_bytes())),
+    )
+    .map_err(|e| StagedImportError::Git(format!("Git source does not encode: {e}")))
 }
 
 /// Complete successful set traversals are proof-local receipts. They live only

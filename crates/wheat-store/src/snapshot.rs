@@ -5,7 +5,11 @@ use async_trait::async_trait;
 use rusqlite::{Connection, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
+use wheat_core::{
+    ContentId, INVENTORY_ENTRY_ENCODED_SIZE, InventoryRecord, ObjectId, RepositoryEnvelopeId,
+    SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE, StoreRecordError, decode_snapshot_manifest,
+    encode_snapshot_manifest,
+};
 
 use crate::{
     ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError, PublicationError,
@@ -13,10 +17,8 @@ use crate::{
     object_graph::{self, MalformedRadix, Reference},
 };
 
-const MAGIC: &[u8; 8] = b"WHEATSNP";
-const VERSION: u16 = 1;
-const INVENTORY_ENTRY_BYTES: usize = 40;
-const MANIFEST_FIXED_BYTES: usize = 98;
+const INVENTORY_ENTRY_BYTES: usize = INVENTORY_ENTRY_ENCODED_SIZE;
+const MANIFEST_FIXED_BYTES: usize = SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotLimits {
@@ -62,17 +64,14 @@ pub struct SnapshotManifest {
 impl SnapshotManifest {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            MANIFEST_FIXED_BYTES + (self.objects.len() + self.contents.len()) * 40,
-        );
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_be_bytes());
-        out.extend_from_slice(&self.head.generation.to_be_bytes());
-        out.extend_from_slice(self.head.envelope.as_bytes());
-        out.extend_from_slice(self.envelope.as_bytes());
-        encode_inventory(&mut out, &self.objects, |id| id.as_bytes());
-        encode_inventory(&mut out, &self.contents, |id| id.as_bytes());
-        out
+        encode_snapshot_manifest(
+            self.head.generation,
+            *self.head.envelope.as_bytes(),
+            *self.envelope.as_bytes(),
+            inventory_records(&self.objects, ObjectId::as_bytes),
+            inventory_records(&self.contents, ContentId::as_bytes),
+        )
+        .expect("an inventory holds fewer than 2^32 entries")
     }
 
     #[must_use]
@@ -104,42 +103,19 @@ impl SnapshotManifest {
         if bytes.len() > limits.max_manifest_bytes {
             return Err(SnapshotError::LimitExceeded("manifest bytes"));
         }
-        let fixed = MAGIC.len() + 2 + 8 + 32 + 32;
-        if bytes.len() < fixed || &bytes[..MAGIC.len()] != MAGIC {
-            return Err(SnapshotError::InvalidManifest(
-                "bad magic or truncated header",
-            ));
-        }
-        let mut offset = MAGIC.len();
-        if read_u16(bytes, &mut offset)? != VERSION {
-            return Err(SnapshotError::InvalidManifest("unsupported version"));
-        }
-        let generation = read_u64(bytes, &mut offset)?;
-        let head_envelope = RepositoryEnvelopeId::from_digest(read_digest(bytes, &mut offset)?);
-        let envelope = RepositoryEnvelopeId::from_digest(read_digest(bytes, &mut offset)?);
-        let objects = decode_inventory(
-            bytes,
-            &mut offset,
-            limits.max_objects,
-            ObjectId::from_digest,
-        )?;
-        let contents = decode_inventory(
-            bytes,
-            &mut offset,
-            limits.max_contents,
-            ContentId::from_digest,
-        )?;
-        if offset != bytes.len() {
-            return Err(SnapshotError::InvalidManifest("trailing bytes"));
-        }
+        let record = decode_snapshot_manifest(bytes, limits.max_objects, limits.max_contents)
+            .map_err(|error| match error {
+                StoreRecordError::InvalidCount => SnapshotError::LimitExceeded("inventory count"),
+                _ => SnapshotError::InvalidManifest("does not decode"),
+            })?;
         let manifest = Self {
             head: RepositoryHead {
-                generation,
-                envelope: head_envelope,
+                generation: record.head_generation,
+                envelope: RepositoryEnvelopeId::from_digest(record.head_envelope),
             },
-            envelope,
-            objects,
-            contents,
+            envelope: RepositoryEnvelopeId::from_digest(record.envelope),
+            objects: inventory_entries(record.objects, ObjectId::from_digest),
+            contents: inventory_entries(record.contents, ContentId::from_digest),
         };
         manifest.validate(limits)?;
         Ok(manifest)
@@ -183,67 +159,28 @@ impl SnapshotManifest {
     }
 }
 
-fn encode_inventory<I>(
-    out: &mut Vec<u8>,
-    inventory: &[InventoryEntry<I>],
-    digest: impl Fn(&I) -> &[u8; 32],
-) {
-    out.extend_from_slice(&(inventory.len() as u64).to_be_bytes());
-    for item in inventory {
-        out.extend_from_slice(digest(&item.id));
-        out.extend_from_slice(&item.bytes.to_be_bytes());
-    }
+/// An inventory as the manifest records encode it.
+pub(crate) fn inventory_records<'a, I>(
+    inventory: &'a [InventoryEntry<I>],
+    digest: fn(&I) -> &[u8; 32],
+) -> impl ExactSizeIterator<Item = InventoryRecord> + 'a {
+    inventory.iter().map(move |item| InventoryRecord {
+        id: *digest(&item.id),
+        bytes: item.bytes,
+    })
 }
 
-fn decode_inventory<I>(
-    bytes: &[u8],
-    offset: &mut usize,
-    max_count: usize,
-    id: impl Fn([u8; 32]) -> I,
-) -> Result<Vec<InventoryEntry<I>>, SnapshotError> {
-    let count = usize::try_from(read_u64(bytes, offset)?)
-        .map_err(|_| SnapshotError::LimitExceeded("inventory count"))?;
-    if count > max_count {
-        return Err(SnapshotError::LimitExceeded("inventory count"));
-    }
-    let encoded = count
-        .checked_mul(INVENTORY_ENTRY_BYTES)
-        .ok_or(SnapshotError::LimitExceeded("inventory bytes"))?;
-    if bytes.len().saturating_sub(*offset) < encoded {
-        return Err(SnapshotError::InvalidManifest("truncated inventory"));
-    }
-    let mut inventory = Vec::with_capacity(count);
-    for _ in 0..count {
-        inventory.push(InventoryEntry {
-            id: id(read_digest(bytes, offset)?),
-            bytes: read_u64(bytes, offset)?,
-        });
-    }
-    Ok(inventory)
-}
-
-fn read_u16(bytes: &[u8], offset: &mut usize) -> Result<u16, SnapshotError> {
-    let value = bytes
-        .get(*offset..*offset + 2)
-        .ok_or(SnapshotError::InvalidManifest("truncated integer"))?;
-    *offset += 2;
-    Ok(u16::from_be_bytes(value.try_into().expect("fixed range")))
-}
-
-fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, SnapshotError> {
-    let value = bytes
-        .get(*offset..*offset + 8)
-        .ok_or(SnapshotError::InvalidManifest("truncated integer"))?;
-    *offset += 8;
-    Ok(u64::from_be_bytes(value.try_into().expect("fixed range")))
-}
-
-fn read_digest(bytes: &[u8], offset: &mut usize) -> Result<[u8; 32], SnapshotError> {
-    let value = bytes
-        .get(*offset..*offset + 32)
-        .ok_or(SnapshotError::InvalidManifest("truncated digest"))?;
-    *offset += 32;
-    Ok(value.try_into().expect("fixed range"))
+fn inventory_entries<I>(
+    records: Vec<InventoryRecord>,
+    id: fn([u8; 32]) -> I,
+) -> Vec<InventoryEntry<I>> {
+    records
+        .into_iter()
+        .map(|record| InventoryEntry {
+            id: id(record.id),
+            bytes: record.bytes,
+        })
+        .collect()
 }
 
 fn validate_inventory<I: Ord>(

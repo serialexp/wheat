@@ -2,12 +2,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
-use wheat_core::{ContentId, ObjectId};
+use wheat_core::{ContentId, ObjectId, encode_ownership_manifest};
 
-use crate::{InventoryEntry, SnapshotId};
-
-const MAGIC: &[u8; 8] = b"WHEATOWN";
-const VERSION: u16 = 1;
+use crate::{InventoryEntry, SnapshotId, snapshot::inventory_records};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OwnerId(pub [u8; 32]);
@@ -52,14 +49,13 @@ pub struct OwnershipManifest {
 impl OwnershipManifest {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(51 + (self.objects.len() + self.contents.len()) * 40);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_be_bytes());
-        out.push(self.owner.kind as u8);
-        out.extend_from_slice(&self.owner.id.0);
-        append_inventory(&mut out, &self.objects, |id| id.as_bytes());
-        append_inventory(&mut out, &self.contents, |id| id.as_bytes());
-        out
+        encode_ownership_manifest(
+            self.owner.kind as u8,
+            self.owner.id.0,
+            inventory_records(&self.objects, ObjectId::as_bytes),
+            inventory_records(&self.contents, ContentId::as_bytes),
+        )
+        .expect("an inventory holds fewer than 2^32 entries")
     }
 
     #[must_use]
@@ -75,18 +71,6 @@ impl OwnershipManifest {
         }
         validate_inventory(&self.objects)?;
         validate_inventory(&self.contents)
-    }
-}
-
-fn append_inventory<I>(
-    out: &mut Vec<u8>,
-    inventory: &[InventoryEntry<I>],
-    digest: impl Fn(&I) -> &[u8; 32],
-) {
-    out.extend_from_slice(&(inventory.len() as u64).to_be_bytes());
-    for entry in inventory {
-        out.extend_from_slice(digest(&entry.id));
-        out.extend_from_slice(&entry.bytes.to_be_bytes());
     }
 }
 

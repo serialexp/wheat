@@ -21,9 +21,10 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use tracing::debug_span;
 use wheat_core::{
-    PhysicalCatalogSnapshot, PhysicalContentGeneration, PhysicalSegmentDescriptor, SegmentId,
-    SegmentIndexEntry, SegmentRecordError, decode_physical_catalog_snapshot,
-    encode_physical_catalog_snapshot,
+    PhysicalCatalogRef, PhysicalCatalogSnapshot, PhysicalContentGeneration,
+    PhysicalSegmentDescriptor, RepackIntent, SegmentId, SegmentIndexEntry, SegmentRecordError,
+    decode_physical_catalog_head, decode_physical_catalog_snapshot, decode_repack_intent,
+    encode_physical_catalog_head, encode_physical_catalog_snapshot, encode_repack_intent,
 };
 
 use super::{
@@ -47,11 +48,6 @@ const CATALOG_HEAD_FILE: &str = "catalog.head";
 const ACTIVE_FILE: &str = "active.segment";
 const BULK_FILE_PREFIX: &str = "bulk-";
 const REPACK_INTENT_FILE: &str = "repack.intent";
-const REPACK_INTENT_MAGIC: &[u8; 8] = b"WHTRPK02";
-const CATALOG_HEAD_MAGIC: &[u8; 9] = b"WHEATPACK";
-const CATALOG_HEAD_VERSION: u8 = 1;
-const CATALOG_HEAD_LEN: usize = CATALOG_HEAD_MAGIC.len() + 1 + 8 + 32;
-const CHECKSUM_LEN: usize = 32;
 const DEFAULT_ACTIVE_TARGET_BYTES: u64 = super::active::ACTIVE_SEGMENT_TARGET_BYTES;
 
 #[derive(Debug, Error)]
@@ -180,12 +176,6 @@ impl Found {
             Self::Payload { .. } => unreachable!("a length read returns a length"),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RepackIntent {
-    old: CatalogHead,
-    new: (u64, [u8; 32]),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2077,10 +2067,8 @@ impl PackedCatalog {
             publish_physical_snapshot(&self.root, &self.catalogs, &snapshot, self.durability)?;
         write_repack_intent(
             &self.root,
-            RepackIntent {
-                old: self.generation.zip(self.head),
-                new: (next_generation, digest),
-            },
+            self.generation.zip(self.head),
+            (next_generation, digest),
             self.durability,
         )?;
         #[cfg(test)]
@@ -2858,37 +2846,27 @@ fn publish_catalog_bytes(
     Ok(digest)
 }
 
-fn read_catalog_head(path: &Path) -> Result<Option<(u64, [u8; 32])>, CatalogError> {
-    let encoded = fs::read(path)?;
-    if encoded.len() == CATALOG_HEAD_MAGIC.len() + 1 && encoded.starts_with(CATALOG_HEAD_MAGIC) {
-        return (encoded[CATALOG_HEAD_MAGIC.len()] == CATALOG_HEAD_VERSION)
-            .then_some(None)
-            .ok_or(CatalogError::Corrupt("catalog head version"));
-    }
-    if encoded.len() != CATALOG_HEAD_LEN
-        || !encoded.starts_with(CATALOG_HEAD_MAGIC)
-        || encoded[CATALOG_HEAD_MAGIC.len()] != CATALOG_HEAD_VERSION
-    {
-        return Err(CatalogError::Corrupt("catalog head format"));
-    }
-    let generation = u64::from_be_bytes(encoded[10..18].try_into().unwrap());
-    Ok(Some((generation, encoded[18..50].try_into().unwrap())))
+fn read_catalog_head(path: &Path) -> Result<CatalogHead, CatalogError> {
+    let head = decode_physical_catalog_head(&fs::read(path)?)?;
+    Ok(head.map(catalog_head_pair))
 }
 
 fn write_catalog_head(
     root: &Path,
     path: &Path,
-    head: Option<(u64, [u8; 32])>,
+    head: CatalogHead,
     durability: Durability,
 ) -> Result<(), CatalogError> {
-    let mut encoded = Vec::with_capacity(CATALOG_HEAD_LEN);
-    encoded.extend_from_slice(CATALOG_HEAD_MAGIC);
-    encoded.push(CATALOG_HEAD_VERSION);
-    if let Some((generation, digest)) = head {
-        encoded.extend_from_slice(&generation.to_be_bytes());
-        encoded.extend_from_slice(&digest);
-    }
+    let encoded = encode_physical_catalog_head(head.map(catalog_ref))?;
     atomic_write(root, path, &encoded, durability)
+}
+
+fn catalog_ref((generation, digest): (u64, [u8; 32])) -> PhysicalCatalogRef {
+    PhysicalCatalogRef { generation, digest }
+}
+
+fn catalog_head_pair(head: PhysicalCatalogRef) -> (u64, [u8; 32]) {
+    (head.generation, head.digest)
 }
 
 /// Reads the snapshot named by the durable head. `None` means a store that
@@ -3021,51 +2999,15 @@ fn latest_catalog_head(
 
 fn write_repack_intent(
     root: &Path,
-    intent: RepackIntent,
+    old: CatalogHead,
+    new: (u64, [u8; 32]),
     durability: Durability,
 ) -> Result<(), CatalogError> {
-    let mut encoded = Vec::with_capacity(8 + 1 + CATALOG_HEAD_LEN * 2 + CHECKSUM_LEN);
-    encoded.extend_from_slice(REPACK_INTENT_MAGIC);
-    encode_optional_head(intent.old, &mut encoded);
-    encode_optional_head(Some(intent.new), &mut encoded);
-    let checksum = blake3::hash(&encoded);
-    encoded.extend_from_slice(checksum.as_bytes());
+    let encoded = encode_repack_intent(&RepackIntent {
+        old: old.map(catalog_ref),
+        new: catalog_ref(new),
+    })?;
     atomic_write(root, &root.join(REPACK_INTENT_FILE), &encoded, durability)
-}
-
-fn encode_optional_head(head: CatalogHead, output: &mut Vec<u8>) {
-    match head {
-        Some((generation, digest)) => {
-            output.push(1);
-            output.extend_from_slice(&generation.to_be_bytes());
-            output.extend_from_slice(&digest);
-        }
-        None => output.push(0),
-    }
-}
-
-fn decode_optional_head(bytes: &[u8], offset: &mut usize) -> Result<CatalogHead, CatalogError> {
-    let present = *bytes
-        .get(*offset)
-        .ok_or(CatalogError::Corrupt("repack intent length"))?;
-    *offset += 1;
-    match present {
-        0 => Ok(None),
-        1 => {
-            let end = offset
-                .checked_add(40)
-                .ok_or(CatalogError::Corrupt("repack intent length"))?;
-            let value = bytes
-                .get(*offset..end)
-                .ok_or(CatalogError::Corrupt("repack intent length"))?;
-            *offset = end;
-            Ok(Some((
-                u64::from_be_bytes(value[..8].try_into().unwrap()),
-                value[8..].try_into().unwrap(),
-            )))
-        }
-        _ => Err(CatalogError::Corrupt("repack intent head flag")),
-    }
 }
 
 fn recover_repack_intent(
@@ -3079,20 +3021,10 @@ fn recover_repack_intent(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    if encoded.len() < REPACK_INTENT_MAGIC.len() + 2 + CHECKSUM_LEN
-        || !encoded.starts_with(REPACK_INTENT_MAGIC)
-    {
-        return Err(CatalogError::Corrupt("repack intent format"));
-    }
-    let body_len = encoded.len() - CHECKSUM_LEN;
-    if blake3::hash(&encoded[..body_len]).as_bytes() != &encoded[body_len..] {
-        return Err(CatalogError::Corrupt("repack intent checksum"));
-    }
-    let mut offset = REPACK_INTENT_MAGIC.len();
-    let old = decode_optional_head(&encoded[..body_len], &mut offset)?;
-    let new = decode_optional_head(&encoded[..body_len], &mut offset)?
-        .ok_or(CatalogError::Corrupt("repack intent missing new head"))?;
-    if offset != body_len || (current != old && current != Some(new)) {
+    let intent = decode_repack_intent(&encoded)?;
+    let old = intent.old.map(catalog_head_pair);
+    let new = catalog_head_pair(intent.new);
+    if current != old && current != Some(new) {
         return Err(CatalogError::Corrupt("repack intent authority mismatch"));
     }
     if current == old {

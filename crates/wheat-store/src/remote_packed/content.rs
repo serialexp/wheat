@@ -543,7 +543,10 @@ mod tests {
         let path = Path::from("content");
         let id = ContentId::of(b"x");
         let mut encoded = codec::encode_envelope(b"x").unwrap();
-        encoded[14..22].copy_from_slice(&u64::MAX.to_be_bytes());
+        let header_length = codec::ENVELOPE_HEADER_LEN;
+        let mut header = codec::parse_envelope_header(&encoded[..header_length]).unwrap();
+        header.logical_length = u64::MAX;
+        encoded[..header_length].copy_from_slice(&codec::encode_envelope_header(header).unwrap());
         backend.put(&path, PutPayload::from(encoded)).await.unwrap();
         assert!(matches!(
             fetch_bounded_envelope(&backend, &path, id, usize::MAX).await,

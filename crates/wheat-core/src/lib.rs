@@ -24,6 +24,7 @@ mod repository;
 mod root_builders;
 mod segment_records;
 mod semantic_records;
+mod store_records;
 pub mod text_capture;
 mod wire;
 
@@ -73,22 +74,34 @@ pub use root_builders::{build_repository_state_record, build_view_record};
 pub use segment_records::{
     ACTIVE_LOG_FRAME_HEADER_ENCODED_SIZE, ACTIVE_LOG_FRAME_TRAILER_ENCODED_SIZE,
     ACTIVE_LOG_HEADER_ENCODED_SIZE, ActiveLogFrameFields, MAX_PHYSICAL_CATALOG_SEGMENTS,
-    PhysicalCatalogSnapshot, PhysicalContentGeneration, PhysicalSegmentDescriptor,
-    SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_FOOTER_ENCODED_SIZE,
-    SEGMENT_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_MAX_DELTA_DEPTH, SEGMENT_NAMESPACE_CONTENT,
-    SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE, SegmentCatalogRecord, SegmentCodec,
-    SegmentDirectory, SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry,
-    SegmentIndexKey, SegmentIndexPage, SegmentRecordError, decode_active_log_frame_header,
-    decode_active_log_frame_trailer, decode_active_log_header, decode_physical_catalog_snapshot,
+    PhysicalCatalogRef, PhysicalCatalogSnapshot, PhysicalContentGeneration,
+    PhysicalSegmentDescriptor, RepackIntent, SEGMENT_DELTA_INDEX_ENTRY_ENCODED_SIZE,
+    SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_MAX_DELTA_DEPTH,
+    SEGMENT_NAMESPACE_CONTENT, SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE,
+    SegmentCatalogRecord, SegmentCodec, SegmentDirectory, SegmentDirectoryEntry, SegmentFooter,
+    SegmentId, SegmentIndexEntry, SegmentIndexKey, SegmentIndexPage, SegmentRecordError,
+    decode_active_log_frame_header, decode_active_log_frame_trailer, decode_active_log_header,
+    decode_physical_catalog_head, decode_physical_catalog_snapshot, decode_repack_intent,
     decode_segment_catalog_record, decode_segment_directory, decode_segment_footer,
     decode_segment_index_page, decode_segment_prefix, encode_active_log_frame_fields,
     encode_active_log_frame_header, encode_active_log_frame_trailer, encode_active_log_header,
-    encode_physical_catalog_snapshot, encode_segment_catalog_record, encode_segment_directory,
-    encode_segment_footer, encode_segment_index_page, encode_segment_prefix,
+    encode_physical_catalog_head, encode_physical_catalog_snapshot, encode_repack_intent,
+    encode_segment_catalog_record, encode_segment_directory, encode_segment_footer,
+    encode_segment_index_page, encode_segment_prefix,
 };
 pub use semantic_records::{
     ApplicationRecord, ApplicationResultRecord, RevisionRecord, decode_application_record,
     decode_change, decode_conflict, decode_revision_record,
+};
+pub use store_records::{
+    CONTENT_ENVELOPE_HEADER_ENCODED_SIZE, ContentEnvelopeHeaderRecord,
+    INVENTORY_ENTRY_ENCODED_SIZE, InventoryRecord, MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE,
+    MaterializationProgressFields, REPOSITORY_HEAD_ENCODED_SIZE, RepositoryHeadRecord,
+    SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE, SnapshotManifestRecord, StoreRecordError,
+    decode_content_envelope_header, decode_materialization_progress_record, decode_repository_head,
+    decode_snapshot_manifest, encode_content_envelope_header, encode_git_import_source,
+    encode_materialization_progress_fields, encode_materialization_progress_record,
+    encode_ownership_manifest, encode_repository_head, encode_snapshot_manifest,
 };
 pub use wire::{
     CanonicalObjectError, CanonicalObjectKind, decode_application_map_node, decode_change_map_node,

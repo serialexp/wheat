@@ -6367,6 +6367,262 @@ impl PhysicalContentGenerationV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalCatalogRefV1 {
+    pub generation: u64,
+    pub digest: Digest256,
+}
+
+impl PhysicalCatalogRefV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be(self.generation);
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let generation = decoder.read_u64_be()?;
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self { generation, digest })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalCatalogHeadV1Input {
+    pub head: Option<PhysicalCatalogRefV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalCatalogHeadV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub head: Option<PhysicalCatalogRefV1>,
+}
+
+pub type PhysicalCatalogHeadV1 = PhysicalCatalogHeadV1Output;
+
+impl PhysicalCatalogHeadV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353608);
+        encoder.write_u16_be(1);
+        if let Some(ref v) = self.head {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        Ok(())
+    }
+}
+
+impl PhysicalCatalogHeadV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353608u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353608, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let has_value = decoder.read_uint8()? != 0;
+        let head = if has_value {
+            Some(PhysicalCatalogRefV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            magic,
+            version,
+            head,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        PhysicalCatalogHeadV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        PhysicalCatalogHeadV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<PhysicalCatalogHeadV1Output> for PhysicalCatalogHeadV1Input {
+    fn from(o: PhysicalCatalogHeadV1Output) -> Self {
+        Self { head: o.head }
+    }
+}
+
+impl From<PhysicalCatalogHeadV1Input> for PhysicalCatalogHeadV1Output {
+    fn from(i: PhysicalCatalogHeadV1Input) -> Self {
+        Self {
+            magic: 1464353608u32,
+            version: 1u16,
+            head: i.head,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepackIntentFieldsV1Input {
+    pub old: Option<PhysicalCatalogRefV1>,
+    pub new: PhysicalCatalogRefV1,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepackIntentFieldsV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub old: Option<PhysicalCatalogRefV1>,
+    pub new: PhysicalCatalogRefV1,
+}
+
+pub type RepackIntentFieldsV1 = RepackIntentFieldsV1Output;
+
+impl RepackIntentFieldsV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464357449);
+        encoder.write_u16_be(1);
+        if let Some(ref v) = self.old {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        self.new.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl RepackIntentFieldsV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464357449u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464357449, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let has_value = decoder.read_uint8()? != 0;
+        let old = if has_value {
+            Some(PhysicalCatalogRefV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let new = PhysicalCatalogRefV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            old,
+            new,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        RepackIntentFieldsV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        RepackIntentFieldsV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<RepackIntentFieldsV1Output> for RepackIntentFieldsV1Input {
+    fn from(o: RepackIntentFieldsV1Output) -> Self {
+        Self {
+            old: o.old,
+            new: o.new,
+        }
+    }
+}
+
+impl From<RepackIntentFieldsV1Input> for RepackIntentFieldsV1Output {
+    fn from(i: RepackIntentFieldsV1Input) -> Self {
+        Self {
+            magic: 1464357449u32,
+            version: 1u16,
+            old: i.old,
+            new: i.new,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepackIntentV1 {
+    pub fields: RepackIntentFieldsV1Output,
+    pub fields_digest: Digest256,
+}
+
+impl RepackIntentV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.fields.encode_into(encoder)?;
+        self.fields_digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let fields = RepackIntentFieldsV1Output::decode_with_decoder(decoder)?;
+        let fields_digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            fields,
+            fields_digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContentGenerationEntryV1 {
     pub id: ContentId,
     pub envelope_digest: Digest256,
@@ -6693,5 +6949,750 @@ impl From<ContentGenerationShardV1Input> for ContentGenerationShardV1Output {
             shard: i.shard,
             entries: i.entries,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryHeadV1Input {
+    pub generation: u64,
+    pub envelope: Digest256,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryHeadV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub generation: u64,
+    pub envelope: Digest256,
+}
+
+pub type RepositoryHeadV1 = RepositoryHeadV1Output;
+
+impl RepositoryHeadV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464357448);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.generation);
+        self.envelope.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl RepositoryHeadV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464357448u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464357448, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let generation = decoder.read_u64_be()?;
+        let envelope = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            generation,
+            envelope,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        RepositoryHeadV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        RepositoryHeadV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<RepositoryHeadV1Output> for RepositoryHeadV1Input {
+    fn from(o: RepositoryHeadV1Output) -> Self {
+        Self {
+            generation: o.generation,
+            envelope: o.envelope,
+        }
+    }
+}
+
+impl From<RepositoryHeadV1Input> for RepositoryHeadV1Output {
+    fn from(i: RepositoryHeadV1Input) -> Self {
+        Self {
+            magic: 1464357448u32,
+            version: 1u16,
+            generation: i.generation,
+            envelope: i.envelope,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentEnvelopeHeaderV1Input {
+    pub codec: u8,
+    pub stored_length: u64,
+    pub logical_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentEnvelopeHeaderV1Output {
+    pub magic: u32,
+    pub version: u8,
+    pub codec: u8,
+    pub stored_length: u64,
+    pub logical_length: u64,
+}
+
+pub type ContentEnvelopeHeaderV1 = ContentEnvelopeHeaderV1Output;
+
+impl ContentEnvelopeHeaderV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353605);
+        encoder.write_byte(1);
+        encoder.write_byte(self.codec);
+        encoder.write_u64_be(self.stored_length);
+        encoder.write_u64_be(self.logical_length);
+        Ok(())
+    }
+}
+
+impl ContentEnvelopeHeaderV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353605u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353605, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_byte()?;
+        if version != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let codec = decoder.read_byte()?;
+        let stored_length = decoder.read_u64_be()?;
+        let logical_length = decoder.read_u64_be()?;
+        Ok(Self {
+            magic,
+            version,
+            codec,
+            stored_length,
+            logical_length,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentEnvelopeHeaderV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentEnvelopeHeaderV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentEnvelopeHeaderV1Output> for ContentEnvelopeHeaderV1Input {
+    fn from(o: ContentEnvelopeHeaderV1Output) -> Self {
+        Self {
+            codec: o.codec,
+            stored_length: o.stored_length,
+            logical_length: o.logical_length,
+        }
+    }
+}
+
+impl From<ContentEnvelopeHeaderV1Input> for ContentEnvelopeHeaderV1Output {
+    fn from(i: ContentEnvelopeHeaderV1Input) -> Self {
+        Self {
+            magic: 1464353605u32,
+            version: 1u8,
+            codec: i.codec,
+            stored_length: i.stored_length,
+            logical_length: i.logical_length,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryEntryV1 {
+    pub id: Digest256,
+    pub bytes: u64,
+}
+
+impl InventoryEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.id.encode_into(encoder)?;
+        encoder.write_u64_be(self.bytes);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let id = Digest256::decode_with_decoder(decoder)?;
+        let bytes = decoder.read_u64_be()?;
+        Ok(Self { id, bytes })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotManifestV1Input {
+    pub head_generation: u64,
+    pub head_envelope: Digest256,
+    pub envelope: Digest256,
+    pub objects: Vec<InventoryEntryV1>,
+    pub contents: Vec<InventoryEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotManifestV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub head_generation: u64,
+    pub head_envelope: Digest256,
+    pub envelope: Digest256,
+    pub objects: Vec<InventoryEntryV1>,
+    pub contents: Vec<InventoryEntryV1>,
+}
+
+pub type SnapshotManifestV1 = SnapshotManifestV1Output;
+
+impl SnapshotManifestV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464357710);
+        encoder.write_u16_be(1);
+        encoder.write_u64_be(self.head_generation);
+        self.head_envelope.encode_into(encoder)?;
+        self.envelope.encode_into(encoder)?;
+        encoder.write_u32_be(self.objects.len() as u32);
+        for item in &self.objects {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.contents.len() as u32);
+        for item in &self.contents {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotManifestV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464357710u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464357710, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let head_generation = decoder.read_u64_be()?;
+        let head_envelope = Digest256::decode_with_decoder(decoder)?;
+        let envelope = Digest256::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = InventoryEntryV1::decode_with_decoder(decoder)?;
+            objects.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut contents = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = InventoryEntryV1::decode_with_decoder(decoder)?;
+            contents.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            head_generation,
+            head_envelope,
+            envelope,
+            objects,
+            contents,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        SnapshotManifestV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        SnapshotManifestV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<SnapshotManifestV1Output> for SnapshotManifestV1Input {
+    fn from(o: SnapshotManifestV1Output) -> Self {
+        Self {
+            head_generation: o.head_generation,
+            head_envelope: o.head_envelope,
+            envelope: o.envelope,
+            objects: o.objects,
+            contents: o.contents,
+        }
+    }
+}
+
+impl From<SnapshotManifestV1Input> for SnapshotManifestV1Output {
+    fn from(i: SnapshotManifestV1Input) -> Self {
+        Self {
+            magic: 1464357710u32,
+            version: 1u16,
+            head_generation: i.head_generation,
+            head_envelope: i.head_envelope,
+            envelope: i.envelope,
+            objects: i.objects,
+            contents: i.contents,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnershipManifestV1Input {
+    pub owner_kind: u8,
+    pub owner_id: Digest256,
+    pub objects: Vec<InventoryEntryV1>,
+    pub contents: Vec<InventoryEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnershipManifestV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub owner_kind: u8,
+    pub owner_id: Digest256,
+    pub objects: Vec<InventoryEntryV1>,
+    pub contents: Vec<InventoryEntryV1>,
+}
+
+pub type OwnershipManifestV1 = OwnershipManifestV1Output;
+
+impl OwnershipManifestV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464356685);
+        encoder.write_u16_be(1);
+        encoder.write_byte(self.owner_kind);
+        self.owner_id.encode_into(encoder)?;
+        encoder.write_u32_be(self.objects.len() as u32);
+        for item in &self.objects {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.contents.len() as u32);
+        for item in &self.contents {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl OwnershipManifestV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464356685u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464356685, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let owner_kind = decoder.read_byte()?;
+        let owner_id = Digest256::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut objects = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = InventoryEntryV1::decode_with_decoder(decoder)?;
+            objects.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut contents = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = InventoryEntryV1::decode_with_decoder(decoder)?;
+            contents.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            owner_kind,
+            owner_id,
+            objects,
+            contents,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OwnershipManifestV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OwnershipManifestV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OwnershipManifestV1Output> for OwnershipManifestV1Input {
+    fn from(o: OwnershipManifestV1Output) -> Self {
+        Self {
+            owner_kind: o.owner_kind,
+            owner_id: o.owner_id,
+            objects: o.objects,
+            contents: o.contents,
+        }
+    }
+}
+
+impl From<OwnershipManifestV1Input> for OwnershipManifestV1Output {
+    fn from(i: OwnershipManifestV1Input) -> Self {
+        Self {
+            magic: 1464356685u32,
+            version: 1u16,
+            owner_kind: i.owner_kind,
+            owner_id: i.owner_id,
+            objects: i.objects,
+            contents: i.contents,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializationProgressFieldsV1Input {
+    pub opcode: u16,
+    pub transaction: Uuid128,
+    pub index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializationProgressFieldsV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub opcode: u16,
+    pub transaction: Uuid128,
+    pub index: u64,
+}
+
+pub type MaterializationProgressFieldsV1 = MaterializationProgressFieldsV1Output;
+
+impl MaterializationProgressFieldsV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464356176);
+        encoder.write_u16_be(1);
+        encoder.write_u16_be(self.opcode);
+        self.transaction.encode_into(encoder)?;
+        encoder.write_u64_be(self.index);
+        Ok(())
+    }
+}
+
+impl MaterializationProgressFieldsV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464356176u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464356176, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let opcode = decoder.read_u16_be()?;
+        let transaction = Uuid128::decode_with_decoder(decoder)?;
+        let index = decoder.read_u64_be()?;
+        Ok(Self {
+            magic,
+            version,
+            opcode,
+            transaction,
+            index,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        MaterializationProgressFieldsV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        MaterializationProgressFieldsV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<MaterializationProgressFieldsV1Output> for MaterializationProgressFieldsV1Input {
+    fn from(o: MaterializationProgressFieldsV1Output) -> Self {
+        Self {
+            opcode: o.opcode,
+            transaction: o.transaction,
+            index: o.index,
+        }
+    }
+}
+
+impl From<MaterializationProgressFieldsV1Input> for MaterializationProgressFieldsV1Output {
+    fn from(i: MaterializationProgressFieldsV1Input) -> Self {
+        Self {
+            magic: 1464356176u32,
+            version: 1u16,
+            opcode: i.opcode,
+            transaction: i.transaction,
+            index: i.index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializationProgressRecordV1 {
+    pub fields: MaterializationProgressFieldsV1Output,
+    pub checksum: u32,
+}
+
+impl MaterializationProgressRecordV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.fields.encode_into(encoder)?;
+        encoder.write_u32_be(self.checksum);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let fields = MaterializationProgressFieldsV1Output::decode_with_decoder(decoder)?;
+        let checksum = decoder.read_u32_be()?;
+        Ok(Self { fields, checksum })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitImportSourceV1Input {
+    pub path: Vec<u8>,
+    pub head: Vec<u8>,
+    pub refs: Vec<GitImportRefV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitImportSourceV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub path: Vec<u8>,
+    pub head: Vec<u8>,
+    pub refs: Vec<GitImportRefV1>,
+}
+
+pub type GitImportSourceV1 = GitImportSourceV1Output;
+
+impl GitImportSourceV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464354633);
+        encoder.write_u16_be(1);
+        encoder.write_u32_be(self.path.len() as u32);
+        for item in &self.path {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.head.len() as u32);
+        for item in &self.head {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.refs.len() as u32);
+        for item in &self.refs {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl GitImportSourceV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464354633u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464354633, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let path = decoder.read_bytes_vec(length)?;
+        let length = decoder.read_u32_be()? as usize;
+        let head = decoder.read_bytes_vec(length)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut refs = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let item = GitImportRefV1::decode_with_decoder(decoder)?;
+            refs.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            path,
+            head,
+            refs,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        GitImportSourceV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        GitImportSourceV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<GitImportSourceV1Output> for GitImportSourceV1Input {
+    fn from(o: GitImportSourceV1Output) -> Self {
+        Self {
+            path: o.path,
+            head: o.head,
+            refs: o.refs,
+        }
+    }
+}
+
+impl From<GitImportSourceV1Input> for GitImportSourceV1Output {
+    fn from(i: GitImportSourceV1Input) -> Self {
+        Self {
+            magic: 1464354633u32,
+            version: 1u16,
+            path: i.path,
+            head: i.head,
+            refs: i.refs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitImportRefV1 {
+    pub name: Vec<u8>,
+    pub oid: Vec<u8>,
+}
+
+impl GitImportRefV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.name.len() as u32);
+        for item in &self.name {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_be(self.oid.len() as u32);
+        for item in &self.oid {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let name = decoder.read_bytes_vec(length)?;
+        let length = decoder.read_u32_be()? as usize;
+        let oid = decoder.read_bytes_vec(length)?;
+        Ok(Self { name, oid })
     }
 }

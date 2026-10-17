@@ -354,6 +354,69 @@ fn active_log_records_round_trip_at_fixed_sizes_and_are_distinct() {
     assert!(decode_segment_prefix(&header[..6]).is_err());
 }
 
+#[test]
+fn catalog_head_round_trips_with_and_without_a_snapshot() {
+    let named = PhysicalCatalogRef {
+        generation: 9,
+        digest: [3; 32],
+    };
+    for head in [None, Some(named)] {
+        let mut bytes = encode_physical_catalog_head(head).unwrap();
+        assert_eq!(decode_physical_catalog_head(&bytes).unwrap(), head);
+        bytes.push(0);
+        assert_eq!(
+            decode_physical_catalog_head(&bytes),
+            Err(SegmentRecordError::NonCanonicalEncoding)
+        );
+    }
+    // The presence flag is canonical: only 0 and 1.
+    let mut bytes = encode_physical_catalog_head(Some(named)).unwrap();
+    let flag = bytes.len() - 41;
+    assert_eq!(bytes[flag], 1);
+    bytes[flag] = 2;
+    assert_eq!(
+        decode_physical_catalog_head(&bytes),
+        Err(SegmentRecordError::NonCanonicalEncoding)
+    );
+}
+
+#[test]
+fn repack_intent_round_trips_and_its_digest_covers_every_field() {
+    let new = PhysicalCatalogRef {
+        generation: 4,
+        digest: [8; 32],
+    };
+    for old in [
+        None,
+        Some(PhysicalCatalogRef {
+            generation: 3,
+            digest: [7; 32],
+        }),
+    ] {
+        let intent = RepackIntent { old, new };
+        let bytes = encode_repack_intent(&intent).unwrap();
+        assert_eq!(decode_repack_intent(&bytes).unwrap(), intent);
+        // Changing any byte of the fields (after the magic and version) breaks the
+        // digest; the digest itself is the last 32 bytes.
+        for index in 6..bytes.len() - 32 {
+            let mut damaged = bytes.clone();
+            damaged[index] ^= 0x10;
+            assert!(decode_repack_intent(&damaged).is_err(), "byte {index}");
+        }
+        let mut damaged = bytes.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            decode_repack_intent(&damaged),
+            Err(SegmentRecordError::DigestMismatch)
+        );
+    }
+    // A catalog head is not a repack intent, and the other way round.
+    let head = encode_physical_catalog_head(Some(new)).unwrap();
+    assert!(decode_repack_intent(&head).is_err());
+    let intent = encode_repack_intent(&RepackIntent { old: None, new }).unwrap();
+    assert!(decode_physical_catalog_head(&intent).is_err());
+}
+
 /// The remote chain record and the local snapshot share a directory layout
 /// (`catalog/{generation}-{digest}.catalog`), so neither may decode as the other.
 #[test]
