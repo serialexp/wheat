@@ -3,6 +3,43 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Found while dogfooding (2026-10-19)
+
+A release build imported Wheat's own history (163 commits), pushed changes to a bare
+Git remote, and ran two clones against a `wheat-server` with a conflict between them.
+Import, Git push (incremental, fast-forward), clone, publish, fetch, pull and
+resolve worked; a fetched join with a conflict failed validation (fixed in 3485b1e).
+Besides labels never moving (`docs/design/wheat-label-moves.md`), plain-text
+`wheat://` (TLS item below) and read-only commands paying a full validation (1.4 s
+for `wheat labels` here; incremental-validation step 9):
+
+- `[ ]` **Git is one-way after the import.** `wheat import` only creates a fresh
+  repository and `wheat fetch` speaks only the native protocol, so commits pushed to
+  the Git remote by anyone else cannot be brought into an existing Wheat repository,
+  and `wheat push` to that branch then refuses ("points at unknown commit ...;
+  refusing to rewrite it"); `--force-with-lease` would drop those commits. Needs a decision:
+  incremental import of new Git commits onto a label, or Git only as an export.
+- `[ ]` **Resolving a conflict is awkward.** The workspace shows only one side of a
+  conflicted file, with no markers, and `wheat resolve` takes the whole resolved
+  file as `--value` on the command line (bounded by the argument size limit). After
+  resolving with exactly the content already in the workspace, `wheat materialize`
+  refuses ("changed from its exact observed value") and `status` keeps listing the
+  file as modified until `wheat restore` of that path. Options: resolve from the
+  workspace file, and treat a workspace file equal to the new view's as unchanged.
+- `[ ]` **`wheat conflicts` prints Rust debug output.** The human rendering shows
+  `target=Some(FileValue { content: ContentId([210, 80, ...]), kind: Regular })` and
+  `reason=NoMatch`; and it names the conflict and revision by ID only, not by change
+  message or path summary.
+- `[ ]` **`wheat log` lists changes in ChangeId order.** For imported history the
+  IDs are UUIDv5, so the log is in effectively random order, and it prints every
+  change with its whole message, with no limit or paging. Order by the view's
+  canonical order (or time), newest first, with a count limit.
+- `[ ]` **`publish_access_cannot_force` hung once under the full suite.** In
+  `just test` on 2026-10-19 (with uncommitted server publish work in the tree),
+  `wheat-server::access_test publish_access_cannot_force` ran into nextest's 300 s
+  timeout; 40 isolated runs of `access_test` passed in 0.2 s each. Possibly a lost
+  wakeup in the publish committer (`wheat-server/src/commit.rs`). @calm-lynx was told.
+
 ## Found while scoping the Scion lessons (2026-10-15)
 
 See `docs/design/wheat-lessons-from-scion.md` for the planned work; these are gaps
