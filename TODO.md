@@ -34,11 +34,6 @@ for `wheat labels` here; incremental-validation step 9):
   IDs are UUIDv5, so the log is in effectively random order, and it prints every
   change with its whole message, with no limit or paging. Order by the view's
   canonical order (or time), newest first, with a count limit.
-- `[ ]` **`publish_access_cannot_force` hung once under the full suite.** In
-  `just test` on 2026-10-19 (with uncommitted server publish work in the tree),
-  `wheat-server::access_test publish_access_cannot_force` ran into nextest's 300 s
-  timeout; 40 isolated runs of `access_test` passed in 0.2 s each. Possibly a lost
-  wakeup in the publish committer (`wheat-server/src/commit.rs`). @calm-lynx was told.
 
 ## Found while scoping the Scion lessons (2026-10-15)
 
