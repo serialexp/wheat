@@ -1,0 +1,157 @@
+name: Release
+
+# Builds `wheat` and `wheat-server` for every platform. A `v*` tag (matching the
+# workspace version, e.g. v0.2.0) also publishes a GitHub Release with one archive per
+# platform and SHA256SUMS, which install.sh downloads. Run it by hand to get the
+# archives as workflow artifacts without a release.
+#
+# The `wheat` CLI runs only on Linux: on macOS and Windows it refuses every command
+# (crash-safe materialization needs Linux's renameat2). Those archives are built so
+# the code keeps building there, and for wheat-server.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds on the oldest supported Ubuntu, so the binaries need only
+          # glibc 2.35. aarch64 is cross-compiled; arm64 hosted runners are not
+          # available to every private repository.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Cross-compiled on Apple silicon: the SDK covers both architectures.
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the aarch64 cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+          } >> "$GITHUB_ENV"
+
+      # aws-lc-sys (S3 support) assembles with NASM on Windows; use its prebuilt
+      # objects instead of installing NASM.
+      - name: Use prebuilt NASM objects
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "AWS_LC_SYS_PREBUILT_NASM=1" >> "$GITHUB_ENV"
+
+      - name: Install the pinned toolchain
+        shell: bash
+        run: rustup toolchain install && rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: >-
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p wheat-cli -p wheat-server --bin wheat --bin wheat-server
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          dir=target/${{ matrix.target }}/release
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu) run="qemu-aarch64 -L /usr/aarch64-linux-gnu" ;;
+            *) run="" ;;
+          esac
+          $run "$dir/wheat-server" --help > /dev/null
+          if [ "${{ runner.os }}" = Linux ]; then
+            $run "$dir/wheat" --version
+          else
+            # Elsewhere the CLI refuses every command with exit code 7.
+            code=0
+            "$dir/wheat" --version || code=$?
+            if [ "$code" != 7 ]; then
+              echo "expected the unsupported-platform refusal (7), got $code" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name=wheat-${{ matrix.target }}
+          dir=target/${{ matrix.target }}/release
+          mkdir -p "dist/$name"
+          cp README.md NOTICE.md "dist/$name/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp "$dir/wheat.exe" "$dir/wheat-server.exe" "dist/$name/"
+            (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+            echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp "$dir/wheat" "$dir/wheat-server" "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+            echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheat-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match the workspace version ${version}" >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum wheat-* > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "wheat $GITHUB_REF_NAME" \
+            --notes "Install on Linux with install.sh (see README). The wheat CLI runs only on Linux; the macOS and Windows archives are for wheat-server and refuse CLI commands."

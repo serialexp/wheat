@@ -1,0 +1,65 @@
+name: CI
+
+# Lint, test and type-check every push to main and every pull request. Everything runs
+# on Linux: the full five-platform build is in release.yml, on tags only, because the
+# repository is private and macOS and Windows minutes are billed at 10x and 2x.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      # Installs the toolchain rust-toolchain.toml pins, with rustfmt and clippy.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # The suite needs git (preinstalled). The S3 tests skip themselves without
+      # WHEAT_TEST_S3_*.
+      - run: cargo nextest run --workspace --all-targets --locked --profile ci
+      - run: cargo test --workspace --doc --locked
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  # Everything must build for Windows, though workspace file operations refuse to run
+  # there (`just check-windows`).
+  check-windows:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: rustup toolchain install && rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
+        env:
+          RUSTFLAGS: -D warnings
