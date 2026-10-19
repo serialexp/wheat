@@ -41,6 +41,7 @@ pub enum WheatProtocolMessage {
     PublishProgress(PublishProgressOutput),
     PublishResult(PublishResultOutput),
     ContentComplete(ContentCompleteOutput),
+    PublishPushEnd(PublishPushEndOutput),
     Credit(CreditOutput),
     Error(ErrorOutput),
 }
@@ -308,6 +309,12 @@ impl WheatProtocolMessage {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint32(v.op_id, Endianness::BigEndian);
             }
+            WheatProtocolMessage::PublishPushEnd(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_uint32(v.pushed_objects, Endianness::BigEndian);
+                encoder.write_uint32(v.pushed_contents, Endianness::BigEndian);
+            }
             WheatProtocolMessage::Credit(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint32(v.op_id, Endianness::BigEndian);
@@ -455,6 +462,10 @@ impl WheatProtocolMessage {
         } else if value == 0x4a {
             Ok(WheatProtocolMessage::ContentComplete(
                 ContentCompleteOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x4b {
+            Ok(WheatProtocolMessage::PublishPushEnd(
+                PublishPushEndOutput::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x60 {
             Ok(WheatProtocolMessage::Credit(
@@ -3253,6 +3264,92 @@ impl From<ContentCompleteInput> for ContentCompleteOutput {
         Self {
             message_type: 74u8,
             op_id: i.op_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishPushEndInput {
+    pub op_id: u32,
+    pub pushed_objects: u32,
+    pub pushed_contents: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishPushEndOutput {
+    pub message_type: u8,
+    pub op_id: u32,
+    pub pushed_objects: u32,
+    pub pushed_contents: u32,
+}
+
+pub type PublishPushEnd = PublishPushEndOutput;
+
+impl PublishPushEndInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(75);
+        encoder.write_u32_be(self.op_id);
+        encoder.write_u32_be(self.pushed_objects);
+        encoder.write_u32_be(self.pushed_contents);
+        Ok(())
+    }
+}
+
+impl PublishPushEndOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 75u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 75, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_u32_be()?;
+        let pushed_objects = decoder.read_u32_be()?;
+        let pushed_contents = decoder.read_u32_be()?;
+        Ok(Self {
+            message_type,
+            op_id,
+            pushed_objects,
+            pushed_contents,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        PublishPushEndInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        PublishPushEndInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<PublishPushEndOutput> for PublishPushEndInput {
+    fn from(o: PublishPushEndOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            pushed_objects: o.pushed_objects,
+            pushed_contents: o.pushed_contents,
+        }
+    }
+}
+
+impl From<PublishPushEndInput> for PublishPushEndOutput {
+    fn from(i: PublishPushEndInput) -> Self {
+        Self {
+            message_type: 75u8,
+            op_id: i.op_id,
+            pushed_objects: i.pushed_objects,
+            pushed_contents: i.pushed_contents,
         }
     }
 }

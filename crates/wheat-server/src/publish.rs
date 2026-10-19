@@ -19,20 +19,110 @@ use crate::commit::{self, CommitFailure};
 use crate::connection::ConnectionError;
 use crate::registry::RepositoryEntry;
 use crate::wire::{
-    digest_to_content_id, digest_to_object_id, publish_error_status, publish_ok_status,
-    publish_rejected_status, publish_result, publish_stale_status, recv, send,
+    connection_error_scope, digest_to_content_id, digest_to_object_id, publish_error_status,
+    publish_ok_status, publish_rejected_status, publish_result, publish_stale_status, recv, send,
+    send_error,
 };
 
 // A blob the protocol accepts must also fit the store.
 const _: () = assert!(MAX_CONTENT_SIZE == wheat_store::HARD_LOGICAL_RECORD_BYTES);
 
-/// Handle a publish request. Returns the new head if publication succeeded.
+/// What a client pushed unasked straight after its `PublishRequest`: objects of its
+/// own walk from the expected head, and small added blobs. The publish walks take
+/// what they need from here before asking; the rest is dropped with the publish.
+#[derive(Default)]
+pub struct Pushed {
+    objects: HashMap<ObjectId, Vec<u8>>,
+    contents: HashMap<ContentId, Vec<u8>>,
+}
+
+/// Reads the push that follows every `PublishRequest`, up to its `PublishPushEnd`.
+/// With `keep` false, for a publish refused before it starts, the bytes are only
+/// counted. A push past [`MAX_PUSHED_BYTES`], a blob over [`MAX_PUSHED_BLOB_SIZE`],
+/// counts that differ from what arrived, or any other message before the end break
+/// the protocol: the client is told why and the connection ends.
+#[tracing::instrument(name = "publish_push", level = "debug", skip_all)]
+pub async fn receive_push(
+    ws: &mut WebSocketStream<TcpStream>,
+    op_id: u32,
+    keep: bool,
+) -> Result<Pushed, ConnectionError> {
+    match read_push(ws, op_id, keep).await? {
+        Ok(pushed) => Ok(pushed),
+        Err(violation) => {
+            warn!(op_id, violation, "publish: broken push");
+            send_error(ws, op_id, 1, connection_error_scope(), false, violation).await?;
+            Err(ConnectionError::Protocol(violation))
+        }
+    }
+}
+
+/// [`receive_push`] up to the first rule the push breaks, which it returns.
+async fn read_push(
+    ws: &mut WebSocketStream<TcpStream>,
+    op_id: u32,
+    keep: bool,
+) -> Result<Result<Pushed, &'static str>, ConnectionError> {
+    let mut pushed = Pushed::default();
+    let (mut objects, mut contents, mut bytes) = (0u64, 0u64, 0usize);
+    loop {
+        match recv(ws).await? {
+            WheatProtocolMessage::ObjectBatch(batch) if batch.op_id == op_id => {
+                for object in batch.objects {
+                    bytes = bytes.saturating_add(object.data.len());
+                    if bytes > MAX_PUSHED_BYTES {
+                        return Ok(Err(OVER_PUSH_LIMIT));
+                    }
+                    objects += 1;
+                    let id = digest_to_object_id(&object.id)?;
+                    if keep {
+                        pushed.objects.entry(id).or_insert(object.data);
+                    }
+                }
+            }
+            WheatProtocolMessage::ContentUpload(upload) if upload.op_id == op_id => {
+                if upload.data.len() > MAX_PUSHED_BLOB_SIZE {
+                    return Ok(Err("a publish pushed a blob over MAX_PUSHED_BLOB_SIZE"));
+                }
+                bytes = bytes.saturating_add(upload.data.len());
+                if bytes > MAX_PUSHED_BYTES {
+                    return Ok(Err(OVER_PUSH_LIMIT));
+                }
+                contents += 1;
+                let id = digest_to_content_id(&upload.content_id)?;
+                if keep {
+                    pushed.contents.entry(id).or_insert(upload.data);
+                }
+            }
+            WheatProtocolMessage::PublishPushEnd(end) if end.op_id == op_id => {
+                if u64::from(end.pushed_objects) != objects
+                    || u64::from(end.pushed_contents) != contents
+                {
+                    return Ok(Err("PublishPushEnd counts differ from what was pushed"));
+                }
+                debug!(op_id, objects, contents, bytes, "publish: push received");
+                return Ok(Ok(pushed));
+            }
+            _ => {
+                return Ok(Err(
+                    "only ObjectBatch and ContentUpload may come before PublishPushEnd",
+                ));
+            }
+        }
+    }
+}
+
+const OVER_PUSH_LIMIT: &str = "a publish pushed more than MAX_PUSHED_BYTES";
+
+/// Handle a publish request whose push has been read. Returns the new head if
+/// publication succeeded.
 #[tracing::instrument(name = "publish", level = "debug", skip_all)]
 pub async fn handle_publish(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &Arc<RepositoryEntry>,
     current_head: &RepositoryHead,
     req: PublishRequestOutput,
+    mut pushed: Pushed,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
     let op_id = req.op_id;
     let force = req.force;
@@ -77,8 +167,15 @@ pub async fn handle_publish(
     let staged = RepositoryStage::new(&*entry.store, STAGED_OBJECTS, STAGED_BYTES);
 
     // --- Object transfer phase ---
-    if let Some(refusal) =
-        receive_objects(ws, &staged, op_id, current_head, proposed_envelope_id).await?
+    if let Some(refusal) = receive_objects(
+        ws,
+        &staged,
+        op_id,
+        current_head,
+        proposed_envelope_id,
+        &mut pushed.objects,
+    )
+    .await?
     {
         return reject(ws, op_id, current_head, &refusal).await;
     }
@@ -114,7 +211,7 @@ pub async fn handle_publish(
         .content
         .existing_ids(&candidates)
         .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
-    let missing: Vec<ContentId> = candidates
+    let mut missing: Vec<ContentId> = candidates
         .iter()
         .filter(|id| !existing.contains(id))
         .copied()
@@ -125,6 +222,26 @@ pub async fn handle_publish(
         // the old ContentId as a delta base for each new ContentId. This
         // produces much smaller stored objects for typical edits.
         let base_map = compute_delta_base_map(&staged, &reader, &current_state, &state).await;
+
+        // Take what the client pushed; ask only for the rest.
+        let mut asked = Vec::with_capacity(missing.len());
+        for id in missing {
+            let Some(data) = pushed.contents.remove(&id) else {
+                asked.push(id);
+                continue;
+            };
+            if ContentId::of(&data) != id {
+                return reject(ws, op_id, current_head, "content identity mismatch").await;
+            }
+            let base = base_map.get(&id).copied();
+            staged
+                .put_content([(id, data, base)])
+                .await
+                .map_err(|e| ConnectionError::Internal(format!("failed to store content: {e}")))?;
+        }
+        missing = asked;
+        // What the walk did not need is dropped now rather than held to the commit.
+        drop(pushed);
 
         // Ask in rounds of at most MAX_WANT_IDS, one ContentNeeded each. In
         // every round accept only the requested blobs, each once, and stage them
@@ -360,13 +477,14 @@ const STAGED_OBJECTS: usize = 65_536;
 /// writing them early, so a publish never holds every uploaded blob in memory.
 const STAGED_BYTES: usize = 64 * 1024 * 1024;
 
-/// Asks for the objects of `proposed` that the store lacks, until it has them all.
+/// Gets the objects of `proposed` that the store lacks, until it has them all.
 ///
 /// Walks from the current head to `proposed` ([`StructuralDelta`]). Each batch of
-/// objects the walk finds missing becomes one `ObjectsNeeded`, and the walk goes on
-/// only once every object of that batch has arrived. `ObjectsComplete` follows when
-/// the walk ends: the store then holds all of `proposed` that the current head does
-/// not already cover. Returns why the publish is refused, if it is.
+/// objects the walk finds missing is taken from `pushed` where the client pushed
+/// them; the rest become one `ObjectsNeeded`, and the walk goes on only once every
+/// object of that batch has arrived. `ObjectsComplete` follows when the walk ends:
+/// the store then holds all of `proposed` that the current head does not already
+/// cover. Returns why the publish is refused, if it is.
 #[tracing::instrument(name = "publish_objects", level = "debug", skip_all)]
 async fn receive_objects(
     ws: &mut WebSocketStream<TcpStream>,
@@ -374,6 +492,7 @@ async fn receive_objects(
     op_id: u32,
     current_head: &RepositoryHead,
     proposed: RepositoryEnvelopeId,
+    pushed: &mut HashMap<ObjectId, Vec<u8>>,
 ) -> Result<Option<String>, ConnectionError> {
     let mut delta = StructuralDelta::new(
         staged,
@@ -403,6 +522,30 @@ async fn receive_objects(
             Some(DeltaStep::Object(_)) => continue,
             Some(DeltaStep::Missing(ids)) => ids,
         };
+        let mut claimed = Vec::new();
+        let mut ids = ids;
+        ids.retain(|id| match pushed.remove(id) {
+            Some(data) => {
+                claimed.push((*id, data));
+                false
+            }
+            None => true,
+        });
+        if !claimed.is_empty() {
+            if let Some((id, _)) = claimed
+                .iter()
+                .find(|(id, data)| ObjectId::of_canonical_bytes(data) != *id)
+            {
+                return Ok(Some(format!("object identity mismatch for {id}")));
+            }
+            if let Some(refusal) = store_objects(staged, &claimed).await? {
+                return Ok(Some(refusal));
+            }
+        }
+        if ids.is_empty() {
+            delta.resume();
+            continue;
+        }
         send(
             ws,
             &WheatProtocolMessage::ObjectsNeeded(ObjectsNeededOutput {

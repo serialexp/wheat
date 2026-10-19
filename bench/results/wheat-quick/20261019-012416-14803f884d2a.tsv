@@ -1,0 +1,26 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261019-012416
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# publish_latency	{"large_mib":1,"publishes":10,"rtt_ms":30}
+# release	true
+# rev	14803f884d2a
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+publish_latency.total.wall	14.762229499	s
+publish_latency.total.peak_rss	22085632	bytes
+publish_latency.small.publish.wall	0.607361488	s
+publish_latency.small.round_trips	19	count
+publish_latency.small.client_bytes	8601	bytes
+publish_latency.small.server_bytes	1327	bytes
+publish_latency.large.publish.wall	0.621226153	s
+publish_latency.large.round_trips	20	count
+publish_latency.large.client_bytes	1066934	bytes
+publish_latency.large.server_bytes	1560	bytes
+run.total_time	14.762505278	s
+process.peak_rss	22085632	bytes
+suite.cases	1	count
+suite.case_failures	0	count

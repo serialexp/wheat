@@ -1,16 +1,22 @@
-//! Publish over the wire: the server walks from its head to the proposed envelope
-//! and asks for what it lacks, one `ObjectsNeeded` per round. Each round takes
-//! exactly the objects it asked for, whole or in chunks, and nothing else.
+//! Publish over the wire: the client pushes what it expects the server to lack,
+//! then the server walks from its head to the proposed envelope, takes what it
+//! needs from the push and asks for the rest, one `ObjectsNeeded` per round. Each
+//! round takes exactly the objects it asked for, whole or in chunks, and nothing
+//! else.
 
 mod support;
 
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
+
+use futures::StreamExt;
+use tokio_tungstenite::tungstenite::Message;
 
 use wheat_core::{
     ApplicationContext, ContentId, ObjectId, Repository, RepositoryEnvelopeId, Tree, ViewId,
@@ -20,14 +26,15 @@ use wheat_protocol::*;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
-    ContentStore, Durability, ImmutableObjectStore, LocalPublicationStore, LooseObjectStore,
-    ObjectStoreError, RepositoryPublisher, RepositoryReader, RepositoryStore,
-    SeparateRepositoryStore, StoredObject,
+    ContentStore, DeltaStep, Durability, ImmutableObjectStore, LocalPublicationStore,
+    LooseObjectStore, ObjectStoreError, RepositoryPublisher, RepositoryReader, RepositoryStore,
+    SeparateRepositoryStore, StoredObject, StructuralDelta, StructuralDeltaLimits,
 };
 
 use support::{
     Upload, Ws, connect_and_handshake, digest, edit, edits, object_batch, object_chunk, object_id,
-    open_repo, recv_msg, request_publish, send_msg, upload_objects,
+    open_repo, push_end, recv_msg, request_publish, request_publish_pushing, send_msg,
+    upload_objects,
 };
 
 const REPO: &str = "test/repo";
@@ -248,6 +255,36 @@ impl Publishing {
         ws
     }
 
+    /// Like [`Self::request`], but leaves the push and its `PublishPushEnd` to the
+    /// caller.
+    async fn request_pushing(&self, proposed: RepositoryEnvelopeId) -> Ws {
+        let mut ws = connect_and_handshake(self.addr).await;
+        assert_eq!(open_repo(&mut ws, REPO).await, self.base);
+        request_publish_pushing(&mut ws, OP, proposed, self.base, false).await;
+        ws
+    }
+
+    /// The objects of `proposed` that the server's head does not prove present, in
+    /// the order the client walks them.
+    async fn difference(&self, proposed: RepositoryEnvelopeId) -> Vec<(ObjectId, Vec<u8>)> {
+        let mut delta = StructuralDelta::new(
+            &self.client_objects,
+            Some(self.base.1),
+            proposed,
+            StructuralDeltaLimits::default(),
+        );
+        let mut objects = Vec::new();
+        while let Some(step) = delta.next().await.unwrap() {
+            match step {
+                DeltaStep::Object(object) => {
+                    objects.push((object.id, object.canonical_bytes.to_vec()));
+                }
+                DeltaStep::Missing(ids) => panic!("the client lacks {ids:?}"),
+            }
+        }
+        objects
+    }
+
     /// The client's copy of object `id`.
     async fn object(&self, id: ObjectId) -> Vec<u8> {
         self.client_objects
@@ -388,6 +425,246 @@ async fn send_whole(ws: &mut Ws, objects: Vec<(ObjectId, Vec<u8>)>) {
         })
         .collect();
     send_msg(ws, &object_batch(OP, entries)).await;
+}
+
+/// Pushes `data` as the blob `id`.
+async fn push_blob(ws: &mut Ws, id: ContentId, data: Vec<u8>) {
+    send_msg(
+        ws,
+        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
+            message_type: 0x44,
+            op_id: OP,
+            content_id: Digest256 {
+                bytes: id.as_bytes().to_vec(),
+            },
+            data,
+        }),
+    )
+    .await;
+}
+
+/// Pushes `objects` and `blobs`, then ends the push.
+async fn push(ws: &mut Ws, objects: Vec<(ObjectId, Vec<u8>)>, blobs: &[Vec<u8>]) {
+    let count = objects.len();
+    if count > 0 {
+        send_whole(ws, objects).await;
+    }
+    for blob in blobs {
+        push_blob(ws, ContentId::of(blob), blob.clone()).await;
+    }
+    send_msg(ws, &push_end(OP, count as u32, blobs.len() as u32)).await;
+}
+
+/// The values of `files`.
+fn values(files: &[(String, Vec<u8>)]) -> Vec<Vec<u8>> {
+    files.iter().map(|(_, value)| value.clone()).collect()
+}
+
+/// Takes the server's `Error` for a push that breaks the protocol, then the end of
+/// the connection.
+async fn expect_broken(ws: &mut Ws, violation: &str) {
+    match recv_msg(ws).await {
+        WheatProtocolMessage::Error(error) => {
+            assert!(error.message.contains(violation), "{}", error.message);
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    loop {
+        match ws.next().await {
+            None | Some(Err(_) | Ok(Message::Close(_))) => return,
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+            Some(Ok(other)) => panic!("expected the connection to end, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_publish_pushed_whole_needs_no_rounds() {
+    let mut publishing = Publishing::start().await;
+    let files = files_in_own_directories(3);
+    let proposed = publishing.propose(&files).await;
+    let difference = publishing.difference(proposed).await;
+    let mut ws = publishing.request_pushing(proposed).await;
+    push(&mut ws, difference, &values(&files)).await;
+
+    let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    assert!(rounds.is_empty(), "{rounds:?}");
+    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_published(&result, proposed);
+    publishing.assert_server_complete(proposed).await;
+}
+
+#[tokio::test]
+async fn the_server_asks_only_for_what_the_push_left_out() {
+    let mut publishing = Publishing::start().await;
+    let files = files_in_own_directories(3);
+    let proposed = publishing.propose(&files).await;
+    let mut difference = publishing.difference(proposed).await;
+    let left_out = difference.split_off(difference.len() / 2);
+    let pushed: HashSet<ObjectId> = difference.iter().map(|(id, _)| *id).collect();
+    let left_out_ids: Vec<ObjectId> = left_out.iter().map(|(id, _)| *id).collect();
+    let held = publishing
+        .server_objects
+        .exists_many(&left_out_ids)
+        .await
+        .unwrap();
+    let mut ws = publishing.request_pushing(proposed).await;
+    push(&mut ws, difference, &values(&files[..1])).await;
+
+    let mut asked = HashSet::new();
+    loop {
+        match recv_msg(&mut ws).await {
+            WheatProtocolMessage::ObjectsNeeded(needed) => {
+                let mut answer = Vec::new();
+                for id in needed.ids.iter().map(object_id) {
+                    assert!(!pushed.contains(&id), "{id} was pushed and asked for");
+                    asked.insert(id);
+                    answer.push((id, publishing.object(id).await));
+                }
+                send_whole(&mut ws, answer).await;
+            }
+            WheatProtocolMessage::ObjectsComplete(_) => break,
+            other => panic!("expected ObjectsNeeded or ObjectsComplete, got {other:?}"),
+        }
+    }
+    // The walk cannot prove some objects present that the server's store holds
+    // anyway; the server does not ask for those.
+    let lacked: HashSet<ObjectId> = left_out
+        .into_iter()
+        .zip(held)
+        .filter(|(_, held)| !held)
+        .map(|((id, _), _)| id)
+        .collect();
+    assert_eq!(asked, lacked);
+
+    let (result, mut asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let mut expected: Vec<ContentId> = files[1..]
+        .iter()
+        .map(|(_, value)| ContentId::of(value))
+        .collect();
+    asked.sort();
+    expected.sort();
+    assert_eq!(asked, expected);
+    assert_published(&result, proposed);
+    publishing.assert_server_complete(proposed).await;
+}
+
+#[tokio::test]
+async fn pushed_objects_and_blobs_the_publish_does_not_need_are_not_stored() {
+    let mut publishing = Publishing::start().await;
+    let files = files_in_own_directories(2);
+    let proposed = publishing.propose(&files).await;
+    let mut difference = publishing.difference(proposed).await;
+    let junk = b"an object no tree names".to_vec();
+    let junk_id = ObjectId::of_canonical_bytes(&junk);
+    difference.push((junk_id, junk));
+    let stray = b"a blob no file holds".to_vec();
+    let mut blobs = values(&files);
+    blobs.push(stray.clone());
+    let mut ws = publishing.request_pushing(proposed).await;
+    push(&mut ws, difference, &blobs).await;
+
+    let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    assert!(rounds.is_empty(), "{rounds:?}");
+    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_published(&result, proposed);
+    publishing.assert_server_complete(proposed).await;
+    assert!(matches!(
+        publishing.server_objects.get(junk_id).await,
+        Err(ObjectStoreError::Missing(_))
+    ));
+    assert!(!publishing.server_content.contains(ContentId::of(&stray)));
+}
+
+#[tokio::test]
+async fn a_pushed_object_that_does_not_match_its_id_is_refused() {
+    let mut publishing = Publishing::start().await;
+    let files = [("notes.txt".to_owned(), b"notes".to_vec())];
+    let proposed = publishing.propose(&files).await;
+    let mut difference = publishing.difference(proposed).await;
+    difference[0].1.push(0);
+    let mut ws = publishing.request_pushing(proposed).await;
+    push(&mut ws, difference, &values(&files)).await;
+
+    let refusal = expect_refusal(&mut ws).await;
+    assert!(refusal.contains("identity mismatch"), "{refusal}");
+    publishing.assert_head_unchanged().await;
+}
+
+#[tokio::test]
+async fn a_pushed_blob_that_does_not_match_its_id_is_refused() {
+    let mut publishing = Publishing::start().await;
+    let notes = b"notes".to_vec();
+    let proposed = publishing
+        .propose(&[("notes.txt".to_owned(), notes.clone())])
+        .await;
+    let difference = publishing.difference(proposed).await;
+    let count = difference.len() as u32;
+    let mut ws = publishing.request_pushing(proposed).await;
+    send_whole(&mut ws, difference).await;
+    push_blob(&mut ws, ContentId::of(&notes), b"not the notes".to_vec()).await;
+    send_msg(&mut ws, &push_end(OP, count, 1)).await;
+
+    let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    assert!(rounds.is_empty(), "{rounds:?}");
+    let refusal = expect_refusal(&mut ws).await;
+    assert!(refusal.contains("content identity mismatch"), "{refusal}");
+    assert!(!publishing.server_content.contains(ContentId::of(&notes)));
+    publishing.assert_head_unchanged().await;
+}
+
+#[tokio::test]
+async fn a_push_end_that_miscounts_the_push_ends_the_connection() {
+    let publishing = Publishing::start().await;
+    let mut ws = publishing.request_pushing(publishing.base.1).await;
+    send_msg(&mut ws, &push_end(OP, 1, 0)).await;
+
+    expect_broken(&mut ws, "counts differ").await;
+    publishing.assert_head_unchanged().await;
+}
+
+#[tokio::test]
+async fn a_pushed_blob_over_the_threshold_ends_the_connection() {
+    let publishing = Publishing::start().await;
+    let mut ws = publishing.request_pushing(publishing.base.1).await;
+    let blob = vec![7; MAX_PUSHED_BLOB_SIZE + 1];
+    push_blob(&mut ws, ContentId::of(&blob), blob).await;
+
+    expect_broken(&mut ws, "over MAX_PUSHED_BLOB_SIZE").await;
+    publishing.assert_head_unchanged().await;
+}
+
+#[tokio::test]
+async fn a_push_over_the_limit_ends_the_connection() {
+    let publishing = Publishing::start().await;
+    let mut ws = publishing.request_pushing(publishing.base.1).await;
+    let blob = vec![7; MAX_PUSHED_BLOB_SIZE];
+    let id = ContentId::of(&blob);
+    for _ in 0..=MAX_PUSHED_BYTES / MAX_PUSHED_BLOB_SIZE {
+        push_blob(&mut ws, id, blob.clone()).await;
+    }
+
+    expect_broken(&mut ws, "more than MAX_PUSHED_BYTES").await;
+    publishing.assert_head_unchanged().await;
+}
+
+#[tokio::test]
+async fn any_other_message_before_the_push_ends_ends_the_connection() {
+    let publishing = Publishing::start().await;
+    let mut ws = publishing.request_pushing(publishing.base.1).await;
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::PublishCommit(PublishCommitOutput {
+            message_type: 0x47,
+            op_id: OP,
+        }),
+    )
+    .await;
+
+    expect_broken(&mut ws, "only ObjectBatch and ContentUpload").await;
+    publishing.assert_head_unchanged().await;
 }
 
 #[tokio::test]

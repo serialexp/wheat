@@ -3,10 +3,10 @@
 use wheat_protocol::{
     CreditOutput, Digest256, ErrorOutput, ErrorScope, ErrorScopeConnectionOutput,
     FetchCompleteOutput, FetchPushEndOutput, FetchRequestOutput, ObjectBatchOutput,
-    ObjectChunkOutput, ObjectEntry, ObjectWantOutput, ObjectWantReplyOutput, PublishRequestOutput,
-    PublishResultOutput, PublishResultStatus, PublishStatusOkOutput, RepositoryOpenOutput,
-    ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus, SessionStatusOkOutput,
-    Uuid128, WheatProtocolMessage, decode_message, encode_message,
+    ObjectChunkOutput, ObjectEntry, ObjectWantOutput, ObjectWantReplyOutput, PublishPushEndOutput,
+    PublishRequestOutput, PublishResultOutput, PublishResultStatus, PublishStatusOkOutput,
+    RepositoryOpenOutput, ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus,
+    SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message, encode_message,
 };
 
 fn zero_digest() -> Digest256 {
@@ -91,6 +91,17 @@ fn fetch_pull_messages_round_trip() {
     ] {
         assert_eq!(round_trip(msg.clone()), msg);
     }
+}
+
+#[test]
+fn publish_push_end_round_trips() {
+    let msg = WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
+        message_type: 0x4b,
+        op_id: 7,
+        pushed_objects: 300,
+        pushed_contents: u32::MAX,
+    });
+    assert_eq!(round_trip(msg.clone()), msg);
 }
 
 #[test]

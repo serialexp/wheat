@@ -60,6 +60,16 @@ pub const MAX_CONTENT_BATCH_ITEMS: usize = 4;
 /// Maximum IDs in an ObjectWant or ContentFetchRequest.
 pub const MAX_WANT_IDS: usize = 4096;
 
+/// Largest blob a publishing client pushes before the server asks (256 KiB). A
+/// larger one waits for a ContentNeeded round, so a blob the server already holds
+/// costs that round rather than its bytes.
+pub const MAX_PUSHED_BLOB_SIZE: usize = 256 * 1024;
+
+/// Most object and blob bytes a client pushes, all told, before `PublishPushEnd`
+/// (32 MiB). The server holds them until its walk claims them; what does not fit
+/// is asked for.
+pub const MAX_PUSHED_BYTES: usize = 32 * 1024 * 1024;
+
 /// Decode a protocol message from raw WebSocket binary message bytes.
 ///
 /// Returns `Err` if the message is empty, exceeds 16 MiB, or the

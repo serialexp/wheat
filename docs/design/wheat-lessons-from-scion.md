@@ -73,12 +73,17 @@ land and move completed bullets from Outstanding to Done.
 - [x] **Publish contention budget (2026-10-16).** Contract rules on
   `publish_contention`: at least 10 accepted publishes per second with 8 writers, and
   `attempts_per_publish` and `attempts_max` at most 1 at every writer count.
+- [x] **Client pushes the difference up front (2026-10-19).** Right after
+  `PublishRequest` the client runs the server's walk from the expected head and sends
+  the objects, then the new blobs up to 256 KiB each, at most 32 MiB in all, closed by
+  `PublishPushEnd`. The server takes what its walk needs from the push and asks only
+  for the rest; `PublishCommit` stays. The `publish_latency` case puts a 30 ms
+  round-trip proxy between the CLI and the server. There a small publish went from 19
+  round trips and 0.61 s to 6 round trips and 0.19 s. One with a 1 MiB file, over the
+  push threshold, went from 20 round trips and 0.62 s to 7 and 0.23 s. Contract rules
+  hold both counts.
 
 ### Outstanding
-
-- [ ] **Client pushes the difference up front.** The client runs the server's walk
-  from the last fetched head and sends the result, so a publish takes one round trip
-  instead of one per tree level.
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.

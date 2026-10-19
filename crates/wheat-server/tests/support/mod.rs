@@ -403,8 +403,32 @@ pub fn object_chunk(
     })
 }
 
-/// Sends a `PublishRequest` for `envelope` on top of the server's `expected` head.
+/// Ends a publish's up-front push of `objects` objects and `contents` blobs.
+pub fn push_end(op_id: u32, objects: u32, contents: u32) -> WheatProtocolMessage {
+    WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
+        message_type: 0x4b,
+        op_id,
+        pushed_objects: objects,
+        pushed_contents: contents,
+    })
+}
+
+/// Sends a `PublishRequest` for `envelope` on top of the server's `expected` head,
+/// with an empty push, so the server asks for everything.
 pub async fn request_publish(
+    ws: &mut Ws,
+    op_id: u32,
+    envelope: RepositoryEnvelopeId,
+    expected: (u64, RepositoryEnvelopeId),
+    force: bool,
+) {
+    request_publish_pushing(ws, op_id, envelope, expected, force).await;
+    send_msg(ws, &push_end(op_id, 0, 0)).await;
+}
+
+/// Sends a `PublishRequest` and nothing after it: the caller pushes, then sends
+/// [`push_end`].
+pub async fn request_publish_pushing(
     ws: &mut Ws,
     op_id: u32,
     envelope: RepositoryEnvelopeId,

@@ -862,9 +862,19 @@ pub async fn publish<O: ImmutableObjectStore>(
         }),
     )
     .await?;
+    push_difference(
+        session,
+        op_id,
+        objects,
+        content,
+        local_envelope,
+        expected_remote.envelope,
+    )
+    .await?;
 
     // --- Object transfer phase ---
-    // The server asks in rounds; answer each with exactly the objects it names.
+    // The server asks in rounds for what the push left out; answer each with
+    // exactly the objects it names.
     loop {
         let msg = recv_msg(&mut session.ws).await?;
         match msg {
@@ -936,6 +946,145 @@ pub async fn publish<O: ImmutableObjectStore>(
             _ => {}
         }
     }
+}
+
+/// What one up-front push sent.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PushedDifference {
+    objects: u32,
+    contents: u32,
+    bytes: usize,
+}
+
+/// Pushes, unasked, what the server needs for `local` if its head is `expected`, so
+/// a publish needs no round of the server's walk: the objects of the walk from
+/// `expected` to `local`, then the added blobs of at most [`MAX_PUSHED_BLOB_SIZE`]
+/// bytes, together at most [`MAX_PUSHED_BYTES`], then `PublishPushEnd`. The server
+/// asks for what this leaves out: anything past the limits, and what its head lacks
+/// when it has moved past `expected`. Without `expected` here, the walk starts
+/// from nothing and stops at the limit.
+#[tracing::instrument(name = "publish_push", level = "debug", skip_all)]
+async fn push_difference<O: ImmutableObjectStore>(
+    session: &mut WheatSession,
+    op_id: u32,
+    objects: &O,
+    content: &ContentStore,
+    local: RepositoryEnvelopeId,
+    expected: RepositoryEnvelopeId,
+) -> Result<PushedDifference> {
+    let expected_object = ObjectId::from_digest(*expected.as_bytes());
+    let since = (*expected.as_bytes() != [0; 32]
+        && objects.exists_many(&[expected_object]).await? == [true])
+    .then_some(expected);
+    let mut pushed = PushedDifference::default();
+
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut delta = StructuralDelta::new(objects, since, local, StructuralDeltaLimits::default());
+    while let Some(step) = delta.next().await? {
+        let object = match step {
+            DeltaStep::Object(object) => object,
+            // This store lacks part of its own head. The server asks for it, and
+            // answering says what is missing.
+            DeltaStep::Missing(_) => break,
+        };
+        let len = object.canonical_bytes.len();
+        // An object too large for a batch is asked for and sent in chunks.
+        if len > MAX_OBJECT_BATCH_SIZE {
+            continue;
+        }
+        if pushed.bytes + len > MAX_PUSHED_BYTES {
+            break;
+        }
+        if batch.len() == MAX_OBJECT_BATCH_ITEMS || batch_bytes + len > MAX_OBJECT_BATCH_SIZE {
+            send_object_batch(session, op_id, std::mem::take(&mut batch)).await?;
+            batch_bytes = 0;
+        }
+        batch_bytes += len;
+        pushed.bytes += len;
+        pushed.objects += 1;
+        batch.push(ObjectEntry {
+            id: object_id_to_digest(object.id),
+            data: object.canonical_bytes.to_vec(),
+        });
+    }
+    if !batch.is_empty() {
+        send_object_batch(session, op_id, batch).await?;
+    }
+
+    let reader = RepositoryReader::new(objects, content);
+    let required = async |envelope_id| -> Result<_> {
+        let envelope = reader.envelope(envelope_id).await?;
+        Ok(reader.state(envelope.state).await?.required_content)
+    };
+    let sets = wheat_store::ContentSetStore::new(objects);
+    match since {
+        Some(since) => {
+            for id in sets
+                .added(required(since).await?, required(local).await?)
+                .await?
+            {
+                if !push_blob(session, op_id, content, id, &mut pushed).await? {
+                    break;
+                }
+            }
+        }
+        // A first publish: every blob is new, so stop reading at the limit.
+        None => {
+            let mut cursor = sets.cursor(required(local).await?).await?;
+            while let Some(id) = cursor.next().await? {
+                if !push_blob(session, op_id, content, id, &mut pushed).await? {
+                    break;
+                }
+            }
+        }
+    }
+
+    send_msg(
+        &mut session.ws,
+        &WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
+            message_type: 0x4b,
+            op_id,
+            pushed_objects: pushed.objects,
+            pushed_contents: pushed.contents,
+        }),
+    )
+    .await?;
+    Ok(pushed)
+}
+
+/// Pushes blob `id` when it is small enough and fits what is left of the push.
+/// Returns whether more may follow.
+async fn push_blob(
+    session: &mut WheatSession,
+    op_id: u32,
+    content: &ContentStore,
+    id: ContentId,
+    pushed: &mut PushedDifference,
+) -> Result<bool> {
+    let left = MAX_PUSHED_BYTES - pushed.bytes;
+    if left == 0 {
+        return Ok(false);
+    }
+    // The stored length is read from metadata, so a large blob is never read here.
+    let limit = MAX_PUSHED_BLOB_SIZE.min(left);
+    if content.logical_length(id)? > limit as u64 {
+        return Ok(true);
+    }
+    let data = content.get_bounded(id, limit)?;
+    pushed.bytes += data.len();
+    pushed.contents += 1;
+    send_msg(
+        &mut session.ws,
+        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
+            message_type: 0x44,
+            op_id,
+            content_id: content_id_to_digest(id),
+            data,
+        }),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Send the objects of one `ObjectsNeeded`: in `ObjectBatch`es that stay within

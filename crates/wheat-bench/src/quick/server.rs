@@ -22,6 +22,7 @@ pub(crate) struct Server {
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<std::io::Result<()>>,
     store: PathBuf,
+    addr: SocketAddr,
     url: String,
 }
 
@@ -68,12 +69,17 @@ impl Server {
             shutdown,
             task,
             store,
-            url: format!("wheat://{addr}/bench/repo"),
+            addr,
+            url: url(addr),
         })
     }
 
     pub(crate) fn url(&self) -> &str {
         &self.url
+    }
+
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
     }
 
     /// Stops serving and returns the store, which the case may then open itself.
@@ -82,6 +88,11 @@ impl Server {
         self.runtime.block_on(self.task)??;
         Ok(self.store)
     }
+}
+
+/// The URL of the bench repository served at `addr`, or reached through a proxy there.
+pub(crate) fn url(addr: SocketAddr) -> String {
+    format!("wheat://{addr}/bench/repo")
 }
 
 fn workspace_store(workspace: &Path) -> Result<PathBuf> {

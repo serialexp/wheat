@@ -79,7 +79,7 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     Ok(recorder.finish())
 }
 
-fn write_noise(path: &std::path::Path, seed: usize, len: usize) -> Result<()> {
+pub(crate) fn write_noise(path: &std::path::Path, seed: usize, len: usize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

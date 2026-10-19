@@ -59,7 +59,8 @@ top of them.
   to a `wheat-server` instance. URL scheme: `wheat://host:port/owner/repo`
   (TLS: `wheat+tls://`). Client protocol engine in `remote.rs`: fetch takes the
   push and pulls the gaps with the same walk, content fetch stores blobs in
-  batches, and publish answers each ObjectsNeeded round with exactly the
+  batches, and publish pushes the difference from the expected head, small
+  blobs included, then answers each ObjectsNeeded round with exactly the
   objects asked for (chunked above 8 MiB). Remote tracking via `remote.json`
   (url, last_fetched_generation, last_fetched_envelope). A fetch with local
   work the remote lacks keeps it: the new local head is the union of both
@@ -408,9 +409,13 @@ Client                          Server
   │                               │
   ├─ PublishRequest ─────────────>│  op_id, envelope_id,
   │                               │  expected_head: {generation, envelope}
+  ├─ ObjectBatch ... ────────────>│  the client's own walk from the
+  ├─ ContentUpload ... ──────────>│  expected head, and its new blobs
+  ├─ PublishPushEnd ─────────────>│  op_id, pushed_objects, pushed_contents
   │                               │
   │                               │  server walks from its head to the
-  │                               │  proposed envelope (StructuralDelta)
+  │                               │  proposed envelope (StructuralDelta),
+  │                               │  taking what it can from the push
   │<──── ObjectsNeeded ──────────┤  op_id, [missing_ids] (≤ 4096)
   │                               │
   ├─ ObjectBatch / ObjectChunk ──>│  exactly those objects, each once
@@ -445,9 +450,28 @@ Client                          Server
   │                               │
 ```
 
+Each `ObjectsNeeded` or `ContentNeeded` round costs a round trip, and the
+walk needs about one per tree level. So, like a fetch, a publish starts with a
+push. Right after `PublishRequest` the client runs the walk itself, from the
+expected envelope (when its store holds it; otherwise from nothing) to the
+proposed one, and sends what it finds. It then sends the blobs the proposed
+manifest adds over the expected one, and ends with `PublishPushEnd`, which
+counts both. Objects too large for one `ObjectBatch` are left for the rounds.
+So are blobs over 256 KiB (`MAX_PUSHED_BLOB_SIZE`). The whole push stops at
+32 MiB (`MAX_PUSHED_BYTES`), and the rounds ask for whatever it left out. The
+server holds the push in memory. A push over either limit, counts that differ
+from what arrived, or any other message before `PublishPushEnd` break the
+protocol: the server sends an `Error` and closes the connection. A publish
+refused before its walk, for lack of access, still reads its push, so the
+session stays usable.
+
 The object phase uses the same walk as fetch, run by the server from its
 current head to the proposed envelope. Each batch of objects the walk finds
-missing is one `ObjectsNeeded` round. A round takes exactly the objects it
+missing is first looked up in the push: pushed objects that hash to their ID
+are taken, and one that does not refuses the publish. The rest is one
+`ObjectsNeeded` round. Pushed blobs are taken the same way before the content
+phase asks for any. Whatever the push held that the walk never asked for is
+dropped, never stored. A round takes exactly the objects it
 asked for, whole or chunked, each once, and nothing else; anything else
 refuses the publish. So `ObjectsComplete` means the server holds everything
 of the proposed envelope that its head does not already cover. An object
@@ -757,6 +781,11 @@ PublishRequest
   expected_generation: u64
   expected_envelope: bytes[32]
   force: bool                                 // skip monotonicity check
+
+PublishPushEnd                                // the client's push is over;
+  op_id: u32                                  // ObjectBatch and ContentUpload
+  pushed_objects: u32                         // messages between the request
+  pushed_contents: u32                        // and this one
 
 ObjectsNeeded                                 // one round; answered with
   op_id: u32                                  // exactly these objects, in

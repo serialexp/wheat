@@ -198,12 +198,27 @@ fn publish_request(state: &RepositoryStateOutput, force: bool) -> WheatProtocolM
     })
 }
 
+/// Sends [`publish_request`] and an empty push.
+async fn send_publish(ws: &mut Ws, state: &RepositoryStateOutput, force: bool) {
+    send_msg(ws, &publish_request(state, force)).await;
+    send_msg(
+        ws,
+        &WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
+            message_type: 0x4b,
+            op_id: 7,
+            pushed_objects: 0,
+            pushed_contents: 0,
+        }),
+    )
+    .await;
+}
+
 async fn publish_reply(
     ws: &mut Ws,
     state: &RepositoryStateOutput,
     force: bool,
 ) -> PublishResultOutput {
-    send_msg(ws, &publish_request(state, force)).await;
+    send_publish(ws, state, force).await;
     match recv_msg(ws).await {
         WheatProtocolMessage::PublishResult(result) => {
             assert_eq!(result.op_id, 7);
@@ -301,6 +316,51 @@ async fn read_access_can_fetch_but_not_publish() {
     );
 }
 
+/// A refused publish still reads the push that follows it, so the session carries
+/// on in step.
+#[tokio::test]
+async fn a_refused_publish_reads_its_push_and_the_session_goes_on() {
+    let server = start(token_file()).await;
+    let (mut ws, state) = open_ok(server.addr, b"reader-token").await;
+
+    let pushed = b"pushed by a reader".to_vec();
+    send_msg(&mut ws, &publish_request(&state, false)).await;
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
+            message_type: 0x44,
+            op_id: 7,
+            content_id: Digest256 {
+                bytes: ContentId::of(&pushed).as_bytes().to_vec(),
+            },
+            data: pushed,
+        }),
+    )
+    .await;
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
+            message_type: 0x4b,
+            op_id: 7,
+            pushed_objects: 0,
+            pushed_contents: 1,
+        }),
+    )
+    .await;
+    match recv_msg(&mut ws).await {
+        WheatProtocolMessage::PublishResult(result) => {
+            assert!(is_permission_denial(&result), "{result:?}");
+        }
+        other => panic!("expected PublishResult, got {other:?}"),
+    }
+
+    send_msg(&mut ws, &fetch_request(1, &state)).await;
+    assert!(matches!(
+        recv_msg(&mut ws).await,
+        WheatProtocolMessage::ObjectBatch(_)
+    ));
+}
+
 #[tokio::test]
 async fn publish_access_cannot_force() {
     let server = start(token_file()).await;
@@ -308,7 +368,7 @@ async fn publish_access_cannot_force() {
 
     // Proposing the head itself leaves nothing to upload: past the access check,
     // the object phase ends at once.
-    send_msg(&mut ws, &publish_request(&state, false)).await;
+    send_publish(&mut ws, &state, false).await;
     let normal = recv_msg(&mut ws).await;
     assert!(
         matches!(normal, WheatProtocolMessage::ObjectsComplete(_)),

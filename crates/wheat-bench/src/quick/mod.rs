@@ -21,10 +21,12 @@ mod git;
 mod git_export_notes;
 mod history;
 mod import_resume_wide;
+mod latency_proxy;
 mod materialize_wide;
 mod packed_append;
 mod publish_content;
 mod publish_contention;
+mod publish_latency;
 mod server;
 mod sharded_manifest;
 mod snapshot_export;
@@ -66,6 +68,7 @@ pub const CASES: &[&str] = &[
     import_resume_wide::NAME,
     materialize_wide::NAME,
     publish_contention::NAME,
+    publish_latency::NAME,
 ];
 
 /// How big the cases are.
@@ -216,6 +219,7 @@ pub fn run_case(
         import_resume_wide::NAME => import_resume_wide::run(&context),
         materialize_wide::NAME => materialize_wide::run(&context),
         publish_contention::NAME => publish_contention::run(&context),
+        publish_latency::NAME => publish_latency::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

@@ -353,19 +353,23 @@ async fn run_session(
                 crate::fetch::handle_content_fetch(&mut ws, &entry, req).await?;
             }
             WheatProtocolMessage::PublishRequest(req) => {
-                // Read head fresh for each publish attempt.
-                let head = entry
-                    .heads
-                    .read()
-                    .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
                 let needed = if req.force {
                     Access::Force
                 } else {
                     Access::Publish
                 };
                 let granted = repository_access(config, &principal, &repository).await?;
-                if granted.is_none_or(|granted| granted < needed) {
-                    // Refuse before any object or content is uploaded.
+                let allowed = granted.is_some_and(|granted| granted >= needed);
+                // The client pushes before it hears anything back, so the push is
+                // read even for a publish refused here; it is not kept.
+                let pushed = crate::publish::receive_push(&mut ws, req.op_id, allowed).await?;
+                // Read head fresh for each publish attempt.
+                let head = entry
+                    .heads
+                    .read()
+                    .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
+                if !allowed {
+                    // Refuse before anything uploaded is kept.
                     info!(peer = %peer, principal = %principal.name, repo = %repository, %needed, "publish refused");
                     send(
                         &mut ws,
@@ -382,7 +386,7 @@ async fn run_session(
                     .await?;
                     continue;
                 }
-                crate::publish::handle_publish(&mut ws, &entry, &head, req).await?;
+                crate::publish::handle_publish(&mut ws, &entry, &head, req, pushed).await?;
             }
             _ => {
                 warn!(peer = %peer, "unexpected message in command loop");

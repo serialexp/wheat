@@ -65,6 +65,7 @@
         { type: "PublishProgress",       when: "value == 0x48" },
         { type: "PublishResult",         when: "value == 0x49" },
         { type: "ContentComplete",       when: "value == 0x4a" },
+        { type: "PublishPushEnd",        when: "value == 0x4b" },
 
         // Flow control (0x60)
         { type: "Credit",               when: "value == 0x60" },
@@ -478,6 +479,20 @@
       sequence: [
         { name: "message_type", type: "uint8", const: 0x4a },
         { name: "op_id", type: "uint32" },
+      ],
+    },
+
+    // Ends what the client pushed unasked straight after its PublishRequest: the
+    // objects of its walk from the expected head (ObjectBatch) and the added blobs
+    // of at most MAX_PUSHED_BLOB_SIZE bytes (ContentUpload), together at most
+    // MAX_PUSHED_BYTES. The counts are of what was sent, so nothing is lost
+    // unnoticed. The server takes what its own walk needs and asks for the rest.
+    PublishPushEnd: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x4b },
+        { name: "op_id", type: "uint32" },
+        { name: "pushed_objects", type: "uint32" },
+        { name: "pushed_contents", type: "uint32" },
       ],
     },
 
