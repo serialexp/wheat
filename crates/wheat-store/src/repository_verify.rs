@@ -908,6 +908,14 @@ where
             }
             self.verify_application_order(&application, &revision, &parent)
                 .await?;
+            // The application's composition edge goes to the child that has its change
+            // last and selects it. Other children may select it too, through an edge
+            // spanning several changes, and one whose later changes leave the tree as
+            // it was has the same tree, so the tree does not tell them apart.
+            let result_tree = match application.result {
+                ApplicationResultRecord::Clean { tree } => tree,
+                ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
+            };
             let mut matches = 0usize;
             for child in children_by_parent
                 .get(&application.target_view)
@@ -915,16 +923,17 @@ where
                 .flatten()
             {
                 let view = self.reader.view(*child).await?;
-                let result_tree = match application.result {
-                    ApplicationResultRecord::Clean { tree } => tree,
-                    ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
-                };
-                if view.tree == result_tree
+                if view.order.last == Some(revision.change_id)
                     && applications
                         .get(view.applications, revision.change_id)
                         .await?
                         == Some(application_id)
                 {
+                    if view.tree != result_tree {
+                        return Err(invalid(
+                            "view tree is not the result of its last application",
+                        ));
+                    }
                     matches += 1;
                 }
             }

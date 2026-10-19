@@ -431,7 +431,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
         }))
     }
 
-    /// The one view in `old`'s lineage that `application` produced from its target.
+    /// The one view in `old`'s lineage that `application` produced from its target: the
+    /// target's child with the application's change last, selecting it. Full validation
+    /// identifies the composition edge the same way.
     async fn produced_view(
         &self,
         old: &RepositoryStateRecord,
@@ -440,10 +442,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
         let reader = RepositoryReader::new(self.objects, self.content);
         let application = reader.application(application_id).await?;
         let change = reader.revision(application.revision_id).await?.change_id;
-        let tree = match application.result {
-            ApplicationResultRecord::Clean { tree } => tree,
-            ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
-        };
         let children = ViewLineageMapStore::new(self.objects)
             .get(old.view_lineage, application.target_view)
             .await?
@@ -454,7 +452,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
         while let Some(child) = cursor.next().await? {
             let child = ViewId::from_digest(*child.as_bytes());
             let view = reader.view(child).await?;
-            if view.tree == tree
+            if view.order.last == Some(change)
                 && maps.get(view.applications, change).await? == Some(application_id)
                 && produced.replace(child).is_some()
             {

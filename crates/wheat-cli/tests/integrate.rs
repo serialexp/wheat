@@ -198,6 +198,8 @@ fn work_on_one_path_joins_with_a_conflict_to_resolve() {
         1,
         "{conflicts}"
     );
+    ok(reader, stores, &sides.config, &["validate"]);
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 1);
 }
 
 #[test]
@@ -318,6 +320,32 @@ fn pull_joins_the_remote_work_with_the_local_work() {
         "local"
     );
     ok(reader, reader_stores, &sides.config, &["publish"]);
+}
+
+/// The writer's change was published first; the reader's stack, one change of it on
+/// the same path, was joined with it on publish. The join has an edge from the
+/// writer's view over two changes, the last conflicted and leaving the tree as it was,
+/// so its view has the same tree as the one-change child and selects the same
+/// application. Fetching that join into the writer's store, and integrating it, stays
+/// valid.
+#[test]
+fn a_fetched_join_with_a_conflict_stays_valid() {
+    let (sides, _server) = sides();
+    let (writer, writer_stores) = &sides.writer;
+    let (reader, reader_stores) = &sides.reader;
+    change(&sides.writer, &sides.config, "same.txt", "writer");
+    ok(writer, writer_stores, &sides.config, &["publish"]);
+    change(&sides.reader, &sides.config, "other.txt", "other");
+    change(&sides.reader, &sides.config, "same.txt", "reader");
+    ok(reader, reader_stores, &sides.config, &["publish"]);
+    ok(writer, writer_stores, &sides.config, &["fetch"]);
+    ok(writer, writer_stores, &sides.config, &["validate"]);
+
+    let joined = ok_json(writer, writer_stores, &sides.config, &["integrate"]);
+
+    assert_eq!(joined["integrated"], true, "{joined}");
+    ok(writer, writer_stores, &sides.config, &["validate"]);
+    assert_eq!(frontier_count(&sides.writer, &sides.config), 1);
 }
 
 /// A label made at a view with a conflict holds the conflicted change. Resolving it
