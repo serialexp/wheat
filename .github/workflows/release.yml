@@ -86,7 +86,7 @@ jobs:
             aarch64-unknown-linux-gnu) run="qemu-aarch64 -L /usr/aarch64-linux-gnu" ;;
             *) run="" ;;
           esac
-          $run "$dir/wheat-server" --help > /dev/null
+          $run "$dir/wheat-server" --version
           if [ "${{ runner.os }}" = Linux ]; then
             $run "$dir/wheat" --version
           else

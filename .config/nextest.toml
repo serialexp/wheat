@@ -4,7 +4,11 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-# CI profile: inherits the default settings and writes JUnit XML.
+# CI profile: inherits the default settings, runs every test even after a failure so
+# one run reports them all, and writes JUnit XML.
+[profile.ci]
+fail-fast = false
+
 [profile.ci.junit]
 path = "junit.xml"
 store-success-output = false

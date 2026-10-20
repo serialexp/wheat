@@ -44,6 +44,7 @@ enum ServerCommand {
 #[command(
     name = "wheat-server",
     about = "Wheat native protocol server",
+    version,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
