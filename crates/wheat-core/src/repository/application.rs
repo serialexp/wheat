@@ -20,15 +20,10 @@ pub(super) fn execute<C: ContentIo + ?Sized>(
 
     // The application engine returns generated objects in canonical ID order. Durability must
     // precede insertion of any repository metadata which references them.
-    for (id, bytes) in &output.generated_content {
-        if crate::ContentId::of(bytes) != *id {
-            return Err(RepositoryError::InvalidRepositoryState(
-                "generated content identity",
-            ));
-        }
+    for content in output.generated_content.values() {
         context
             .content
-            .store_generated(*id, bytes)
+            .store_generated(content.borrowed())
             .map_err(|error| RepositoryError::ContentIo(error.to_string()))?;
     }
 

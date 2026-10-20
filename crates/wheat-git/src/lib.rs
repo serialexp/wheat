@@ -707,12 +707,12 @@ fn edits_between(
             guarded::Limits::default(),
         )?;
         edits.extend(captured.edits);
-        for (id, bytes) in captured.content {
+        for (id, captured) in captured.content {
             if let std::collections::btree_map::Entry::Vacant(entry) = content.entry(id) {
                 // Guarded capture may retain replacement fragments in addition to
                 // tree blobs; charge them before copying into the pending map.
-                accounting.content(bytes.len(), limits)?;
-                entry.insert(VerifiedContent::new(bytes));
+                accounting.content(captured.len(), limits)?;
+                entry.insert(captured);
             }
         }
     }

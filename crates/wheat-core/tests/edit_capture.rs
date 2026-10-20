@@ -26,7 +26,10 @@ fn normalized_inputs_have_identical_identity() {
     assert!(captured.edits.is_empty());
     let value = captured.before.unwrap();
     assert_eq!(value.content, ContentId::of(b"one\ntwo\nthree\n"));
-    assert_eq!(captured.content[&value.content], b"one\ntwo\nthree\n");
+    assert_eq!(
+        captured.content[&value.content].bytes(),
+        b"one\ntwo\nthree\n"
+    );
 }
 
 #[test]
@@ -47,8 +50,8 @@ fn binary_and_symlink_snapshots_are_byte_exact() {
             Limits::default(),
         )
         .unwrap();
-        assert_eq!(captured.content[&ContentId::of(before)], before);
-        assert_eq!(captured.content[&ContentId::of(after)], after);
+        assert_eq!(captured.content[&ContentId::of(before)].bytes(), before);
+        assert_eq!(captured.content[&ContentId::of(after)].bytes(), after);
         assert!(matches!(
             captured.edits.values().next().unwrap().operation,
             EditOperation::ExactFile { .. }
@@ -253,6 +256,39 @@ fn authoring_budget_failure_never_falls_back_to_exact() {
 }
 
 #[test]
+fn captured_content_is_hashed_once() {
+    // Each snapshot and fragment is hashed where capture produces it; the stored copy
+    // carries that identity rather than being hashed again on its way out.
+    for (kind, before, after) in [
+        (
+            FileKind::Regular,
+            &b"one\ntwo\nthree\nfour\n"[..],
+            &b"one\nTWO\nthree\nfour\nfive\n"[..],
+        ),
+        (FileKind::Regular, &b"a\0b"[..], &b"a\0c"[..]),
+        (FileKind::Symlink, &b"old/target"[..], &b"new/target"[..]),
+    ] {
+        let hashed = wheat_core::content_bytes_hashed();
+        let captured = capture_edit(
+            "file",
+            Some(file(kind, before)),
+            Some(file(kind, after)),
+            None,
+            Limits::default(),
+        )
+        .unwrap();
+        let hashed = wheat_core::content_bytes_hashed() - hashed;
+
+        let stored = captured
+            .content
+            .values()
+            .map(|content| content.len() as u64)
+            .sum::<u64>();
+        assert_eq!(hashed, stored);
+    }
+}
+
+#[test]
 fn final_newline_change_is_guarded_and_preserved() {
     let captured = capture_edit(
         "newline.txt",
@@ -270,7 +306,7 @@ fn final_newline_change_is_guarded_and_preserved() {
             .all(|record| matches!(record.operation, EditOperation::GuardedText { .. }))
     );
     assert_eq!(
-        captured.content[&captured.after.unwrap().content],
+        captured.content[&captured.after.unwrap().content].bytes(),
         b"last line\n"
     );
 }

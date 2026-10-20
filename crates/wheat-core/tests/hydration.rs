@@ -10,8 +10,10 @@ impl ContentIo for Memory {
     fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
         self.0.borrow().get(&id).cloned().ok_or("missing")
     }
-    fn store_generated(&self, id: ContentId, b: &[u8]) -> Result<(), Self::Error> {
-        self.0.borrow_mut().insert(id, b.to_vec());
+    fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
+        self.0
+            .borrow_mut()
+            .insert(content.id(), content.bytes().to_vec());
         Ok(())
     }
 }

@@ -335,7 +335,7 @@ impl ContentStore {
     #[tracing::instrument(name = "content_put", level = "debug", skip_all, fields(bytes = bytes.len()))]
     pub fn put(&self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
         let content = VerifiedContent::new(bytes);
-        self.put_one(content)?;
+        self.put_verified(content)?;
         Ok(content.id())
     }
 
@@ -372,7 +372,7 @@ impl ContentStore {
                             let Ok(content) = next else {
                                 return Ok(());
                             };
-                            self.put_one(content)?;
+                            self.put_verified(content)?;
                         }
                     })
                 })
@@ -401,7 +401,7 @@ impl ContentStore {
         }
         match self.delta_envelope(id, content.bytes(), base_id)? {
             Some(envelope) => self.put_raw_envelope(id, envelope),
-            None => self.put_one(content),
+            None => self.put_verified(content),
         }
     }
 
@@ -533,7 +533,8 @@ impl ContentStore {
         Ok(())
     }
 
-    fn put_one(&self, content: VerifiedContent<&[u8]>) -> Result<(), ContentStoreError> {
+    /// Stores content verified where it came in, without hashing it again.
+    pub fn put_verified(&self, content: VerifiedContent<&[u8]>) -> Result<(), ContentStoreError> {
         if let Some(backend) = &self.backend {
             return backend.put_many(&[content]);
         }

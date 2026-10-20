@@ -403,14 +403,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 wheat_core::guarded::Limits::default(),
             )
             .map_err(|error| RepositoryError::EditApplication(format!("capture: {error:?}")))?;
-            for (id, bytes) in captured.content {
-                let actual = captured_content.put(&bytes).map_err(content_error)?;
-                if actual != id {
-                    return Err(RepositoryError::ContentIo(format!(
-                        "captured content {id} hashed to {actual}"
-                    ))
-                    .into());
-                }
+            for content in captured.content.into_values() {
+                captured_content
+                    .put_verified(content)
+                    .map_err(content_error)?;
             }
             replacements.extend(captured.edits);
         }
@@ -969,14 +965,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let content_error =
             |error: crate::ContentStoreError| RepositoryError::ContentIo(error.to_string());
         let mut generated = crate::ContentWriteBatch::new(self.content);
-        for (id, bytes) in &output.generated_content {
-            let actual = generated.put(bytes).map_err(content_error)?;
-            if actual != *id {
-                return Err(RepositoryError::ContentIo(format!(
-                    "generated content {id} hashed to {actual}"
-                ))
-                .into());
-            }
+        for (id, content) in &output.generated_content {
+            generated
+                .put_verified(content.borrowed())
+                .map_err(content_error)?;
             fresh.content.insert(*id);
         }
         generated.commit().map_err(content_error)?;

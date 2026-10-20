@@ -345,9 +345,8 @@ fn record_blob_edit(
     // Store them as complete content so each import record is independently
     // readable across staged batches and restarts. Bounded reverse-delta chains
     // remain a repack-only physical-layout optimization.
-    for (id, bytes) in captured.content {
-        let stored = content.put(&bytes)?;
-        debug_assert_eq!(stored, id);
+    for captured in captured.content.into_values() {
+        content.put_verified(captured.borrowed())?;
     }
     edits.extend(captured.edits);
     Ok(())

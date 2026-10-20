@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use wheat_core::{
     ApplicationResultRecord, ChangeId, ContentIo, EditId, EditOperation, EditRecord,
     EditSubsumption, EditTransition, RevisionEdits, RevisionId, RevisionMetadata, RevisionRequest,
-    TreeId, ViewId,
+    TreeId, VerifiedContent, ViewId,
     edit_capture::{FileSnapshot, capture_edit},
     edit_placement::LaterEdit,
     guarded::{GuardedEdit, Limits, authoring},
@@ -535,7 +535,7 @@ fn guarded_record(
 /// Durably retains captured content in bounded batches.
 pub(crate) fn persist_content(
     store: &ContentStore,
-    content: BTreeMap<wheat_core::ContentId, Vec<u8>>,
+    content: BTreeMap<wheat_core::ContentId, VerifiedContent>,
 ) -> Result<()> {
     let mut batch = ContentWriteBatch::new(store);
     stage_content(&mut batch, content)?;
@@ -543,16 +543,14 @@ pub(crate) fn persist_content(
     Ok(())
 }
 
-/// Stages captured content; it is durable only once the batch is committed.
+/// Stages captured content, which capture already hashed; it is durable only once the
+/// batch is committed.
 fn stage_content(
     batch: &mut ContentWriteBatch<'_>,
-    content: BTreeMap<wheat_core::ContentId, Vec<u8>>,
+    content: BTreeMap<wheat_core::ContentId, VerifiedContent>,
 ) -> Result<()> {
-    for (expected, bytes) in content {
-        let actual = batch.put(&bytes)?;
-        if actual != expected {
-            bail!("captured content identity mismatch");
-        }
+    for content in content.into_values() {
+        batch.put_verified(content)?;
     }
     Ok(())
 }

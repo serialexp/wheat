@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     CanonicalObjectError, ContentId, EditId, EditOperation, EditRecord, FileKind, FileValue, Tree,
-    guarded,
+    VerifiedContent, guarded,
 };
 
 /// Default bound on the edits one revision may apply.
@@ -71,7 +71,7 @@ pub enum ApplicationOutcome {
 pub struct ApplicationResult {
     pub tree: Tree,
     /// New blobs produced by guarded text edits. Exact replacements remain externally addressed.
-    pub generated_content: BTreeMap<ContentId, Vec<u8>>,
+    pub generated_content: BTreeMap<ContentId, VerifiedContent>,
     pub outcomes: BTreeMap<EditId, ApplicationOutcome>,
 }
 
@@ -365,8 +365,9 @@ where
                     limit: limits.max_generated_bytes,
                 });
             }
-            let content = ContentId::of(&result.content);
-            generated_content.entry(content).or_insert(result.content);
+            let generated = VerifiedContent::new(result.content);
+            let content = generated.id();
+            generated_content.entry(content).or_insert(generated);
             tree.insert(
                 path,
                 FileValue {

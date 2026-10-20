@@ -61,7 +61,7 @@ fn independent_moved_guards_apply_against_original() {
         result.outcomes[&b.id()],
         ApplicationOutcome::Applied { .. }
     ));
-    let output = result.generated_content[&result.tree["f"].content].as_slice();
+    let output = result.generated_content[&result.tree["f"].content].bytes();
     assert_eq!(output, b"header\nONE\nmiddle\nTWO\nfooter\n");
 }
 
@@ -285,7 +285,10 @@ fn aggregate_work_budget_is_shared_across_paths() {
         ApplicationOutcome::Applied { .. }
     ));
     assert_eq!(result.generated_content.len(), 1);
-    assert_eq!(result.generated_content[&result.tree["a"].content], b"xbc");
+    assert_eq!(
+        result.generated_content[&result.tree["a"].content].bytes(),
+        b"xbc"
+    );
     assert_eq!(result.tree["a"], result.tree["b"]);
 }
 

@@ -1,3 +1,4 @@
+use wheat_core::VerifiedContent;
 use wheat_store::{ContentStore, ContentStoreError, ContentWriteBatch};
 
 #[test]
@@ -57,4 +58,22 @@ fn failed_commit_preserves_tail_for_retry() {
     std::fs::remove_file(&root).unwrap();
     batch.commit().unwrap();
     assert_eq!(content.get(id).unwrap(), b"retry");
+}
+
+#[test]
+fn verified_content_is_staged_without_hashing_it_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let content = ContentStore::new(directory.path());
+    let small = VerifiedContent::new(b"small".to_vec());
+    let large = VerifiedContent::new(vec![7; 8 * 1024 * 1024 + 1]);
+
+    let hashed = wheat_core::content_bytes_hashed();
+    let mut batch = ContentWriteBatch::new(&content);
+    batch.put_verified(small.clone()).unwrap();
+    batch.put_verified(large.borrowed()).unwrap();
+    batch.commit().unwrap();
+    assert_eq!(wheat_core::content_bytes_hashed(), hashed);
+
+    assert_eq!(content.get(small.id()).unwrap(), small.bytes());
+    assert_eq!(content.get(large.id()).unwrap(), large.bytes());
 }

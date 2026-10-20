@@ -10,8 +10,10 @@ impl ContentIo for Memory {
     fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
         self.0.borrow().get(&id).cloned().ok_or("missing")
     }
-    fn store_generated(&self, id: ContentId, b: &[u8]) -> Result<(), Self::Error> {
-        self.0.borrow_mut().insert(id, b.to_vec());
+    fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
+        self.0
+            .borrow_mut()
+            .insert(content.id(), content.bytes().to_vec());
         Ok(())
     }
 }
@@ -80,8 +82,8 @@ fn closure_emits_standalone_definitions_and_retains_fragments() {
         guarded::Limits::default(),
     )
     .unwrap();
-    for (id, b) in &captured.content {
-        io.store_generated(*id, b).unwrap();
+    for content in captured.content.values() {
+        io.store_generated(content.borrowed()).unwrap();
     }
     let ids = captured.edits.keys().copied().collect::<BTreeSet<_>>();
     let edits = RevisionEdits {

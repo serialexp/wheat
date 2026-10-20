@@ -28,20 +28,31 @@ impl<'a> ContentWriteBatch<'a> {
     pub fn put(&mut self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
         let content = VerifiedContent::new(bytes);
         let id = content.id();
+        self.put_verified(content)?;
+        Ok(id)
+    }
+
+    /// Stages content verified where it came in, without hashing it again. Owned
+    /// bytes are kept as they are; borrowed ones are copied only when staged.
+    pub fn put_verified<B: AsRef<[u8]> + Into<Vec<u8>>>(
+        &mut self,
+        content: VerifiedContent<B>,
+    ) -> Result<(), ContentStoreError> {
+        let id = content.id();
         if self.pending.contains_key(&id) {
-            return Ok(id);
+            return Ok(());
         }
-        if bytes.len() > MAX_BYTES {
+        let len = content.len();
+        if len > MAX_BYTES {
             self.commit()?;
-            self.store.put_many(&[content], 1)?;
-            return Ok(id);
+            return self.store.put_verified(content.borrowed());
         }
-        if self.pending.len() == MAX_OBJECTS || self.bytes + bytes.len() > MAX_BYTES {
+        if self.pending.len() == MAX_OBJECTS || self.bytes + len > MAX_BYTES {
             self.commit()?;
         }
         self.pending.insert(id, content.into_owned());
-        self.bytes += bytes.len();
-        Ok(id)
+        self.bytes += len;
+        Ok(())
     }
 
     /// Store content with an optional delta base hint.

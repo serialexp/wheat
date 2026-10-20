@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::{
     CanonicalObjectError, ContentId, EditId, EditOperation, EditRecord, FileKind, FileValue,
+    VerifiedContent,
     guarded::{self, Limits},
     text_capture::{self, CapturedBytes},
 };
@@ -34,7 +35,7 @@ pub struct CapturedEdit {
     pub after: Option<FileValue>,
     pub edits: BTreeMap<EditId, EditRecord>,
     /// Canonical file bodies and guarded-edit fragments, keyed by their digest.
-    pub content: BTreeMap<ContentId, Vec<u8>>,
+    pub content: BTreeMap<ContentId, VerifiedContent>,
 }
 
 /// Failure to validate or derive a captured transition.
@@ -136,9 +137,7 @@ pub fn capture_edit_with_limits(
         return Err(EditCaptureError::UnsupportedExplicitGuards);
     }
     if let Some(ranges) = explicit_guard_ranges {
-        let workspace = after
-            .as_ref()
-            .map_or(&[][..], |snapshot| snapshot.bytes.as_ref());
+        let workspace = after.as_ref().map_or(&[][..], CanonicalSnapshot::bytes);
         for (index, range) in ranges.iter().enumerate() {
             if range.start > range.end
                 || range.end > workspace.len()
@@ -166,10 +165,10 @@ pub fn capture_edit_with_limits(
         let before = before.as_ref().expect("matched above");
         let after = after.as_ref().expect("matched above");
         let definitions = guarded::authoring::normalize(
-            &before.bytes,
+            before.bytes(),
             &[],
-            &before.bytes,
-            &after.bytes,
+            before.bytes(),
+            after.bytes(),
             explicit_guard_ranges,
             limits.guarded,
         )
@@ -215,46 +214,41 @@ pub fn capture_edit_with_limits(
     Ok(result)
 }
 
+/// A snapshot's canonical bytes, hashed once when canonicalized.
 #[derive(Debug)]
 struct CanonicalSnapshot<'a> {
     kind: FileKind,
-    bytes: Cow<'a, [u8]>,
+    content: VerifiedContent<Cow<'a, [u8]>>,
     is_text: bool,
 }
 
 impl CanonicalSnapshot<'_> {
     fn value(&self) -> FileValue {
         FileValue {
-            content: ContentId::of(&self.bytes),
+            content: self.content.id(),
             kind: self.kind,
         }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.content.bytes()
     }
 }
 
 fn canonicalize(snapshot: FileSnapshot<'_>) -> CanonicalSnapshot<'_> {
-    if snapshot.kind == FileKind::Symlink {
-        return CanonicalSnapshot {
-            kind: snapshot.kind,
-            bytes: Cow::Borrowed(snapshot.bytes),
-            is_text: false,
-        };
-    }
-    match text_capture::capture(snapshot.bytes) {
-        CapturedBytes::Text(Cow::Borrowed(text)) => CanonicalSnapshot {
-            kind: snapshot.kind,
-            bytes: Cow::Borrowed(text.as_bytes()),
-            is_text: true,
-        },
-        CapturedBytes::Text(Cow::Owned(text)) => CanonicalSnapshot {
-            kind: snapshot.kind,
-            bytes: Cow::Owned(text.into_bytes()),
-            is_text: true,
-        },
-        CapturedBytes::Binary(bytes) => CanonicalSnapshot {
-            kind: snapshot.kind,
-            bytes,
-            is_text: false,
-        },
+    let (bytes, is_text) = if snapshot.kind == FileKind::Symlink {
+        (Cow::Borrowed(snapshot.bytes), false)
+    } else {
+        match text_capture::capture(snapshot.bytes) {
+            CapturedBytes::Text(Cow::Borrowed(text)) => (Cow::Borrowed(text.as_bytes()), true),
+            CapturedBytes::Text(Cow::Owned(text)) => (Cow::Owned(text.into_bytes()), true),
+            CapturedBytes::Binary(bytes) => (bytes, false),
+        }
+    };
+    CanonicalSnapshot {
+        kind: snapshot.kind,
+        content: VerifiedContent::new(bytes),
+        is_text,
     }
 }
 
@@ -264,8 +258,8 @@ fn guarded_text_eligible(
     max_lines: usize,
 ) -> bool {
     snapshot.is_text
-        && snapshot.bytes.len() <= limits.max_input_bytes
-        && line_count(&snapshot.bytes) <= max_lines
+        && snapshot.bytes().len() <= limits.max_input_bytes
+        && line_count(snapshot.bytes()) <= max_lines
 }
 
 fn line_count(bytes: &[u8]) -> usize {
@@ -290,22 +284,22 @@ fn check_bound(
     Ok(())
 }
 
-fn insert_content(content: &mut BTreeMap<ContentId, Vec<u8>>, bytes: &[u8]) -> ContentId {
-    let id = ContentId::of(bytes);
-    content.entry(id).or_insert_with(|| bytes.to_vec());
+fn insert_content(content: &mut BTreeMap<ContentId, VerifiedContent>, bytes: &[u8]) -> ContentId {
+    let verified = VerifiedContent::new(bytes);
+    let id = verified.id();
+    content.entry(id).or_insert_with(|| verified.into_owned());
     id
 }
 
 fn insert_snapshots(
-    content: &mut BTreeMap<ContentId, Vec<u8>>,
+    content: &mut BTreeMap<ContentId, VerifiedContent>,
     before: Option<CanonicalSnapshot<'_>>,
     after: Option<CanonicalSnapshot<'_>>,
 ) {
     for snapshot in [before, after].into_iter().flatten() {
-        let id = ContentId::of(&snapshot.bytes);
         content
-            .entry(id)
-            .or_insert_with(|| snapshot.bytes.into_owned());
+            .entry(snapshot.content.id())
+            .or_insert_with(|| snapshot.content.into_owned());
     }
 }
 

@@ -953,10 +953,10 @@ impl Repository {
             edits.extend(captured.edits);
             generated.extend(captured.content);
         }
-        for (id, bytes) in generated {
+        for content in generated.values() {
             context
                 .content
-                .store_generated(id, &bytes)
+                .store_generated(content.borrowed())
                 .map_err(|error| RepositoryError::ContentIo(error.to_string()))?;
         }
         let replacement_edits = edits.keys().copied().collect::<BTreeSet<_>>();

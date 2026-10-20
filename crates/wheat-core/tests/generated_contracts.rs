@@ -16,8 +16,10 @@ impl ContentIo for Memory {
         self.0.borrow().get(&id).cloned().ok_or("missing")
     }
 
-    fn store_generated(&self, id: ContentId, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.0.borrow_mut().insert(id, bytes.to_vec());
+    fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
+        self.0
+            .borrow_mut()
+            .insert(content.id(), content.bytes().to_vec());
         Ok(())
     }
 }

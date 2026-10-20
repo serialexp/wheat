@@ -235,7 +235,7 @@ fn replay(
             Some(next) if Some(next) == value => file,
             Some(next) => {
                 let bytes = match result.generated_content.remove(&next.content) {
-                    Some(bytes) => bytes,
+                    Some(content) => content.into_inner(),
                     None => store.resolve(next.content)?,
                 };
                 Some((next, Cow::Owned(bytes)))

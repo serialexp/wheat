@@ -42,9 +42,15 @@ Progress:
 - Not benched yet. When I tried, @lucky-raven had an in-flight `structural_delta.rs`
   change (publish path), so the bench would have measured their code too. Run
   `just bench` once the tree is quiet and commit the results file.
-- The Git importer still hashes `capture_edit`'s replacement fragments a second time
-  (`VerifiedContent::new` in wheat-git lib.rs `edits_between`). Stage 4 fixes this by
-  making `CapturedEdit::content` verified.
+- Stage 4 done: `CapturedEdit::content`, `ApplicationResult::generated_content` and
+  `ContentIo::store_generated` carry `VerifiedContent`; capture hashes each canonical
+  snapshot once (it hashed it twice, then `ContentWriteBatch::put` a third time);
+  `ContentWriteBatch::put_verified` and `ContentStore::put_verified` (public now) store
+  without hashing. The CLI, the Git importer (`edits_between`, `tree_diff`) and
+  `repository_mutation` use them. Contracts: core `captured_content_is_hashed_once`,
+  store `verified_content_is_staged_without_hashing_it_again`. Still hashed twice on
+  `wheat add`, by design: the workspace scan hashes raw file bytes to compare with the
+  index, and capture hashes the canonical (newline-normalized) bytes, which can differ.
 - Objects (not content) are still validated twice on remote_packed seal (at
   `put_if_absent` and again via `CheckedRecord::check` in `seal`). That's out of
   scope; it's noted here.

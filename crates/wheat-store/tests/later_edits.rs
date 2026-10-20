@@ -91,8 +91,8 @@ fn edit(content: &ContentStore, path: &str, before: Option<&str>, after: &str) -
         Limits::default(),
     )
     .unwrap();
-    for bytes in captured.content.values() {
-        content.put(bytes).unwrap();
+    for captured in captured.content.values() {
+        content.put_verified(captured.borrowed()).unwrap();
     }
     RevisionEdits {
         transition: EditTransition {

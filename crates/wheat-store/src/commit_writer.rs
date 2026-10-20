@@ -6,8 +6,7 @@ use thiserror::Error;
 use wheat_core::{
     ApplicationId, ApplicationRecord, ApplicationResultRecord, AppliedEditEvidence, ByteRange,
     CanonicalObjectError, Change, ChangeId, ChangeObjectId, ChangeProposal, ContentIo, EditId,
-    RevisionId, RevisionRecord, Tree, VerifiedContent, ViewId, ViewOrder, ViewRecord,
-    decode_view_record,
+    RevisionId, RevisionRecord, Tree, ViewId, ViewOrder, ViewRecord, decode_view_record,
     edit_application::{ApplicationError, ApplicationLimits, ApplicationOutcome, apply_edits},
 };
 
@@ -199,13 +198,11 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
 
         // Generated blobs must be durable before any metadata can refer to them.
         // Use delta compression when we know the old version of the same file.
-        for (id, bytes) in &output.generated_content {
+        for (id, content) in &output.generated_content {
             if let Some(&base_id) = base_hints.get(id) {
-                let content = VerifiedContent::check(*id, bytes.as_slice())
-                    .map_err(ContentStoreError::from)?;
-                self.content.put_with_base(content, base_id)?;
+                self.content.put_with_base(content.borrowed(), base_id)?;
             } else {
-                self.content.store_generated(*id, bytes)?;
+                self.content.store_generated(content.borrowed())?;
             }
         }
 

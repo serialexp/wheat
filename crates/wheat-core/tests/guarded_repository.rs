@@ -21,12 +21,14 @@ impl ContentIo for Io {
         self.resolves.set(self.resolves.get() + 1);
         self.objects.borrow().get(&id).cloned().ok_or("missing")
     }
-    fn store_generated(&self, id: ContentId, b: &[u8]) -> Result<(), Self::Error> {
+    fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
         self.stores.set(self.stores.get() + 1);
         if self.fail_store.get() {
             Err("sink")
         } else {
-            self.objects.borrow_mut().insert(id, b.to_vec());
+            self.objects
+                .borrow_mut()
+                .insert(content.id(), content.bytes().to_vec());
             Ok(())
         }
     }
@@ -73,8 +75,10 @@ fn capture(io: &Io, before: &[u8], after: &[u8]) -> RevisionEdits {
         guarded::Limits::default(),
     )
     .unwrap();
-    for (id, b) in &c.content {
-        io.objects.borrow_mut().insert(*id, b.clone());
+    for (id, content) in &c.content {
+        io.objects
+            .borrow_mut()
+            .insert(*id, content.bytes().to_vec());
     }
     let ids = c.edits.keys().copied().collect::<BTreeSet<_>>();
     RevisionEdits {
