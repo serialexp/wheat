@@ -72,9 +72,14 @@ Progress:
 - Benched at e0705d4 (`20261020-040238-e0705d419805.tsv`, all 16 cases, none failed).
   No full-suite run exists from before the hash-once work; the only cases shared with
   65bb956 (head_receipts, publish_contention, remote_latency) didn't regress, and
-  1–2-writer server CPU per publish fell ~20%. A full baseline at 65bb956 needs a
-  `git init` in a scratch export (wheat-bench stamps with `git rev-parse`); I asked
-  Bart and got no answer.
+  1–2-writer server CPU per publish fell ~20%. Bart then allowed a `git init` in a
+  scratch export, so 65bb956 got a full run plus repeats (results not committed: the
+  scratch repo's rev stamp is fake). With 2–3 runs per tree (65bb956 / 01013f1 / HEAD):
+  publish_content add 1.8–2.0 s → 1.3–1.9 s, publish 1.8–2.2 s → 1.4–1.8 s, add_scale
+  add_modified 4.3 s → 3.6 s, deep_stack moving 1.03 s → 0.86 s. Clone wall and
+  packed_append overlap across trees (noise). Clone server peak RSS was 64–119 MB at
+  65bb956 and a steady ~64 MB since. fetch_incremental's +13% objects / +26% reads per
+  change come from e0705d4 (fetch-walk fix); at 01013f1 they matched 65bb956.
 - Objects (not content) are still validated twice on remote_packed seal (at
   `put_if_absent` and again via `CheckedRecord::check` in `seal`). That's out of
   scope; it's noted here.
