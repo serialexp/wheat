@@ -34,8 +34,6 @@ pub enum WheatProtocolMessage {
     ObjectsNeeded(ObjectsNeededOutput),
     ObjectsComplete(ObjectsCompleteOutput),
     ContentNeeded(ContentNeededOutput),
-    ContentUpload(ContentUploadOutput),
-    ContentUploadChunk(ContentUploadChunkOutput),
     ContentUploadComplete(ContentUploadCompleteOutput),
     PublishCommit(PublishCommitOutput),
     PublishProgress(PublishProgressOutput),
@@ -254,26 +252,6 @@ impl WheatProtocolMessage {
                     item.encode_into(encoder)?;
                 }
             }
-            WheatProtocolMessage::ContentUpload(v) => {
-                encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                v.content_id.encode_into(encoder)?;
-                encoder.write_uint32(v.data.len() as u32, Endianness::BigEndian);
-                for item in &v.data {
-                    encoder.write_uint8(*item);
-                }
-            }
-            WheatProtocolMessage::ContentUploadChunk(v) => {
-                encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                v.content_id.encode_into(encoder)?;
-                encoder.write_uint64(v.offset, Endianness::BigEndian);
-                encoder.write_uint32(v.data.len() as u32, Endianness::BigEndian);
-                for item in &v.data {
-                    encoder.write_uint8(*item);
-                }
-                encoder.write_uint8(if v.is_final { 1 } else { 0 });
-            }
             WheatProtocolMessage::ContentUploadComplete(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint32(v.op_id, Endianness::BigEndian);
@@ -434,14 +412,6 @@ impl WheatProtocolMessage {
         } else if value == 0x43 {
             Ok(WheatProtocolMessage::ContentNeeded(
                 ContentNeededOutput::decode_with_decoder(decoder)?,
-            ))
-        } else if value == 0x44 {
-            Ok(WheatProtocolMessage::ContentUpload(
-                ContentUploadOutput::decode_with_decoder(decoder)?,
-            ))
-        } else if value == 0x45 {
-            Ok(WheatProtocolMessage::ContentUploadChunk(
-                ContentUploadChunkOutput::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x46 {
             Ok(WheatProtocolMessage::ContentUploadComplete(
@@ -2930,200 +2900,6 @@ impl From<ContentNeededInput> for ContentNeededOutput {
             message_type: 67u8,
             op_id: i.op_id,
             content_ids: i.content_ids,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentUploadInput {
-    pub op_id: u32,
-    pub content_id: Digest256,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentUploadOutput {
-    pub message_type: u8,
-    pub op_id: u32,
-    pub content_id: Digest256,
-    pub data: Vec<u8>,
-}
-
-pub type ContentUpload = ContentUploadOutput;
-
-impl ContentUploadInput {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_byte(68);
-        encoder.write_u32_be(self.op_id);
-        self.content_id.encode_into(encoder)?;
-        encoder.write_u32_be(self.data.len() as u32);
-        for item in &self.data {
-            encoder.write_byte(*item);
-        }
-        Ok(())
-    }
-}
-
-impl ContentUploadOutput {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let message_type = decoder.read_byte()?;
-        if message_type != 68u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 68, got {}",
-                message_type
-            )));
-        }
-        let op_id = decoder.read_u32_be()?;
-        let content_id = Digest256::decode_with_decoder(decoder)?;
-        let length = decoder.read_u32_be()? as usize;
-        let data = decoder.read_bytes_vec(length)?;
-        Ok(Self {
-            message_type,
-            op_id,
-            content_id,
-            data,
-        })
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        ContentUploadInput::from(self.clone()).encode()
-    }
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ContentUploadInput::from(self.clone()).encode_into(encoder)
-    }
-}
-
-impl From<ContentUploadOutput> for ContentUploadInput {
-    fn from(o: ContentUploadOutput) -> Self {
-        Self {
-            op_id: o.op_id,
-            content_id: o.content_id,
-            data: o.data,
-        }
-    }
-}
-
-impl From<ContentUploadInput> for ContentUploadOutput {
-    fn from(i: ContentUploadInput) -> Self {
-        Self {
-            message_type: 68u8,
-            op_id: i.op_id,
-            content_id: i.content_id,
-            data: i.data,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentUploadChunkInput {
-    pub op_id: u32,
-    pub content_id: Digest256,
-    pub offset: u64,
-    pub data: Vec<u8>,
-    pub is_final: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContentUploadChunkOutput {
-    pub message_type: u8,
-    pub op_id: u32,
-    pub content_id: Digest256,
-    pub offset: u64,
-    pub data: Vec<u8>,
-    pub is_final: bool,
-}
-
-pub type ContentUploadChunk = ContentUploadChunkOutput;
-
-impl ContentUploadChunkInput {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_byte(69);
-        encoder.write_u32_be(self.op_id);
-        self.content_id.encode_into(encoder)?;
-        encoder.write_u64_be(self.offset);
-        encoder.write_u32_be(self.data.len() as u32);
-        for item in &self.data {
-            encoder.write_byte(*item);
-        }
-        encoder.write_byte(if self.is_final { 1 } else { 0 });
-        Ok(())
-    }
-}
-
-impl ContentUploadChunkOutput {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let message_type = decoder.read_byte()?;
-        if message_type != 69u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 69, got {}",
-                message_type
-            )));
-        }
-        let op_id = decoder.read_u32_be()?;
-        let content_id = Digest256::decode_with_decoder(decoder)?;
-        let offset = decoder.read_u64_be()?;
-        let length = decoder.read_u32_be()? as usize;
-        let data = decoder.read_bytes_vec(length)?;
-        let is_final = decoder.read_byte()? != 0;
-        Ok(Self {
-            message_type,
-            op_id,
-            content_id,
-            offset,
-            data,
-            is_final,
-        })
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        ContentUploadChunkInput::from(self.clone()).encode()
-    }
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ContentUploadChunkInput::from(self.clone()).encode_into(encoder)
-    }
-}
-
-impl From<ContentUploadChunkOutput> for ContentUploadChunkInput {
-    fn from(o: ContentUploadChunkOutput) -> Self {
-        Self {
-            op_id: o.op_id,
-            content_id: o.content_id,
-            offset: o.offset,
-            data: o.data,
-            is_final: o.is_final,
-        }
-    }
-}
-
-impl From<ContentUploadChunkInput> for ContentUploadChunkOutput {
-    fn from(i: ContentUploadChunkInput) -> Self {
-        Self {
-            message_type: 69u8,
-            op_id: i.op_id,
-            content_id: i.content_id,
-            offset: i.offset,
-            data: i.data,
-            is_final: i.is_final,
         }
     }
 }

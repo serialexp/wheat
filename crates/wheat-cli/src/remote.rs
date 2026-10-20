@@ -900,10 +900,14 @@ pub async fn publish<O: ImmutableObjectStore>(
         let msg = recv_msg(&mut session.ws).await?;
         match msg {
             WheatProtocolMessage::ContentNeeded(cn) if cn.op_id == op_id => {
+                let mut batch = ContentBatcher::new(op_id);
                 for digest in &cn.content_ids {
                     let id = digest_to_content_id(digest)?;
                     let data = content.get(id)?;
-                    upload_content(session, op_id, digest, data).await?;
+                    upload_content(session, &mut batch, digest, data).await?;
+                }
+                if let Some(open) = batch.finish() {
+                    send_msg(&mut session.ws, &open).await?;
                 }
 
                 // Signal that this round's content has been uploaded.
@@ -1020,13 +1024,14 @@ async fn push_difference<O: ImmutableObjectStore>(
         Ok(reader.state(envelope.state).await?.required_content)
     };
     let sets = wheat_store::ContentSetStore::new(objects);
+    let mut blobs = ContentBatcher::new(op_id);
     match since {
         Some(since) => {
             for id in sets
                 .added(required(since).await?, required(local).await?)
                 .await?
             {
-                if !push_blob(session, op_id, content, id, &mut pushed).await? {
+                if !push_blob(session, &mut blobs, content, id, &mut pushed).await? {
                     break;
                 }
             }
@@ -1035,11 +1040,14 @@ async fn push_difference<O: ImmutableObjectStore>(
         None => {
             let mut cursor = sets.cursor(required(local).await?).await?;
             while let Some(id) = cursor.next().await? {
-                if !push_blob(session, op_id, content, id, &mut pushed).await? {
+                if !push_blob(session, &mut blobs, content, id, &mut pushed).await? {
                     break;
                 }
             }
         }
+    }
+    if let Some(open) = blobs.finish() {
+        send_msg(&mut session.ws, &open).await?;
     }
 
     send_msg(
@@ -1055,11 +1063,11 @@ async fn push_difference<O: ImmutableObjectStore>(
     Ok(pushed)
 }
 
-/// Pushes blob `id` when it is small enough and fits what is left of the push.
-/// Returns whether more may follow.
+/// Pushes blob `id`, into `blobs`, when it is small enough and fits what is left
+/// of the push. Returns whether more may follow.
 async fn push_blob(
     session: &mut WheatSession,
-    op_id: u32,
+    blobs: &mut ContentBatcher,
     content: &ContentStore,
     id: ContentId,
     pushed: &mut PushedDifference,
@@ -1076,16 +1084,9 @@ async fn push_blob(
     let data = content.get_bounded(id, limit)?;
     pushed.bytes += data.len();
     pushed.contents += 1;
-    send_msg(
-        &mut session.ws,
-        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-            message_type: 0x44,
-            op_id,
-            content_id: content_id_to_digest(id),
-            data,
-        }),
-    )
-    .await?;
+    if let Some(full) = blobs.push(content_id_to_digest(id), data) {
+        send_msg(&mut session.ws, &full).await?;
+    }
     Ok(true)
 }
 
@@ -1168,43 +1169,23 @@ fn object_chunks(
     })
 }
 
-/// Send one requested blob: in one `ContentUpload` when it fits a chunk,
-/// otherwise as `ContentUploadChunk` messages of at most
-/// `MAX_CONTENT_CHUNK_SIZE` bytes each, so no message passes the size limit.
+/// Send one requested blob: into `batch` when it fits a chunk, otherwise at once as
+/// `ContentChunk` messages of at most `MAX_CONTENT_CHUNK_SIZE` bytes each, so no
+/// message passes the size limit.
 async fn upload_content(
     session: &mut WheatSession,
-    op_id: u32,
+    batch: &mut ContentBatcher,
     digest: &Digest256,
     data: Vec<u8>,
 ) -> Result<()> {
     if data.len() <= MAX_CONTENT_CHUNK_SIZE {
-        return send_msg(
-            &mut session.ws,
-            &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                message_type: 0x44,
-                op_id,
-                content_id: digest.clone(),
-                data,
-            }),
-        )
-        .await;
+        if let Some(full) = batch.push(digest.clone(), data) {
+            send_msg(&mut session.ws, &full).await?;
+        }
+        return Ok(());
     }
-    let mut offset = 0;
-    for piece in data.chunks(MAX_CONTENT_CHUNK_SIZE) {
-        let end = offset + piece.len();
-        send_msg(
-            &mut session.ws,
-            &WheatProtocolMessage::ContentUploadChunk(ContentUploadChunkOutput {
-                message_type: 0x45,
-                op_id,
-                content_id: digest.clone(),
-                offset: offset as u64,
-                data: piece.to_vec(),
-                is_final: end == data.len(),
-            }),
-        )
-        .await?;
-        offset = end;
+    for chunk in content_chunks(batch.op_id(), digest, &data) {
+        send_msg(&mut session.ws, &chunk).await?;
     }
     Ok(())
 }

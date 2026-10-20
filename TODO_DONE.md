@@ -16,6 +16,12 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **Uploads go one file per message (scanner only).** The client sent each
+  blob as its own `ContentUpload`. Uploads now use `ContentBatch` and `ContentChunk`,
+  built by the shared `ContentBatcher` in `wheat-protocol` (2026-10-20): a publish of
+  2,000 small files went from 2,016 messages to 17. Contract in bench
+  `remote_latency`. Streaming large blobs to disk stays open in `TODO.md`.
+
 - `[x]` **Content manifests are full snapshots, so comparing two still reads both
   (2026-10-05).** Publish and fetch now look up only the content the old head lacks,
   but finding it decodes both manifests' snapshots (about 3.3 MB each at 100,000

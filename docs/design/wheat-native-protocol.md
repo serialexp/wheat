@@ -391,7 +391,11 @@ untrusted:
 
 Any broken rule ends the transfer: the client fails the fetch, and the server
 answers with a rejected `PublishResult` and leaves the head where it was.
-Senders use one message for blobs up to 4 MiB and chunks of 4 MiB above that.
+Both directions send content with the same two messages, `ContentBatch` and
+`ContentChunk`, built by `ContentBatcher` in `wheat-protocol`. Blobs up to
+4 MiB go whole in batches of at most 12 MiB and 4096 blobs; a larger blob goes
+in chunks of 4 MiB. A change of many small files therefore takes a handful of
+messages, not one per file.
 The server stores uploads in batches of up to 64 MiB as they arrive, so a
 publish holds one batch and the blob being reassembled, not every upload.
 
@@ -410,7 +414,7 @@ Client                          Server
   ├─ PublishRequest ─────────────>│  op_id, envelope_id,
   │                               │  expected_head: {generation, envelope}
   ├─ ObjectBatch ... ────────────>│  the client's own walk from the
-  ├─ ContentUpload ... ──────────>│  expected head, and its new blobs
+  ├─ ContentBatch ... ───────────>│  expected head, and its new blobs
   ├─ PublishPushEnd ─────────────>│  op_id, pushed_objects, pushed_contents
   │                               │
   │                               │  server walks from its head to the
@@ -427,7 +431,7 @@ Client                          Server
   │<──── ObjectsComplete ────────┤  op_id (structural closure done)
   │                               │
   │<──── ContentNeeded ──────────┤  op_id, [missing content_ids] (bounded)
-  ├─ ContentUpload ──────────────>│  op_id, (id, bytes) or chunks
+  ├─ ContentBatch / ContentChunk >│  op_id, (id, bytes) or chunks
   ├─ ContentUploadComplete ──────>│  op_id (this round's content sent)
   │                               │  ... repeat until the server has
   │                               │  ... every missing blob ...
@@ -761,9 +765,10 @@ ContentFetchRequest
 ContentBatch
   op_id: u32
   sequence: u32
-  contents: array<{ id: bytes[32], data: bytes (max 4 MiB) }, max=4>
-  // Aggregate encoded size must not exceed 12 MiB (headroom within
-  // the 16 MiB WebSocket cap for framing overhead). Large content
+  contents: array<{ id: bytes[32], data: bytes (max 4 MiB) }, max=4096>
+  // Sent by the server on fetch and by the client on publish.
+  // Aggregate data must not exceed 12 MiB (headroom within the
+  // 16 MiB WebSocket cap for framing overhead). Large content
   // (> 4 MiB) is transferred as multiple ContentChunk messages
   // rather than a single ContentBatch item.
 
@@ -791,7 +796,7 @@ PublishRequest
   force: bool                                 // skip monotonicity check
 
 PublishPushEnd                                // the client's push is over;
-  op_id: u32                                  // ObjectBatch and ContentUpload
+  op_id: u32                                  // ObjectBatch and ContentBatch
   pushed_objects: u32                         // messages between the request
   pushed_contents: u32                        // and this one
 
@@ -806,17 +811,8 @@ ContentNeeded                                 // server lists missing content,
   op_id: u32                                  // one round of at most 4096
   content_ids: array<bytes[32], max=4096>
 
-ContentUpload                                 // client pushes content bytes
-  op_id: u32
-  content_id: bytes[32]
-  data: bytes (max 4 MiB)                     // small content in one message
-
-ContentUploadChunk                            // client pushes large content
-  op_id: u32
-  content_id: bytes[32]
-  offset: u64                                 // bytes of this id sent so far
-  data: bytes (max 4 MiB)
-  final: bool
+// The client uploads content in ContentBatch and ContentChunk, as the
+// server sends it on fetch. Type bytes 0x44 and 0x45 are unused.
 
 ContentUploadComplete                         // this round's content uploaded
   op_id: u32

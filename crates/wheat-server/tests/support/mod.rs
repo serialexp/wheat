@@ -404,6 +404,25 @@ pub fn object_chunk(
 }
 
 /// Ends a publish's up-front push of `objects` objects and `contents` blobs.
+/// One `ContentBatch` of `blobs`, each under its claimed ID.
+pub fn content_batch(
+    op_id: u32,
+    blobs: impl IntoIterator<Item = (ContentId, Vec<u8>)>,
+) -> WheatProtocolMessage {
+    WheatProtocolMessage::ContentBatch(ContentBatchOutput {
+        message_type: 0x31,
+        op_id,
+        sequence: 0,
+        contents: blobs
+            .into_iter()
+            .map(|(id, data)| ContentEntry {
+                id: digest(id.as_bytes()),
+                data,
+            })
+            .collect(),
+    })
+}
+
 pub fn push_end(op_id: u32, objects: u32, contents: u32) -> WheatProtocolMessage {
     WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
         message_type: 0x4b,

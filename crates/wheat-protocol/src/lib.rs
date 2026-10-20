@@ -21,8 +21,10 @@
 //! rejected. The framing layer (not binschema) enforces aggregate
 //! message-size bounds and per-field maximums before allocating.
 
+mod content_batch;
 mod transfer_receiver;
 
+pub use content_batch::{ContentBatcher, content_chunks};
 pub use transfer_receiver::{TransferError, TransferReceiver};
 pub use wheat_protocol_generated::generated::*;
 pub use wheat_protocol_generated::{BitOrder, BitStreamDecoder, BitStreamEncoder};
@@ -54,8 +56,9 @@ pub const MAX_CONTENT_SIZE: usize = 1024 * 1024 * 1024;
 /// Maximum items in an ObjectBatch.
 pub const MAX_OBJECT_BATCH_ITEMS: usize = 256;
 
-/// Maximum items in a ContentBatch.
-pub const MAX_CONTENT_BATCH_ITEMS: usize = 4;
+/// Maximum items in a ContentBatch: as many as one ContentNeeded round asks for,
+/// so a round of small blobs fits one message.
+pub const MAX_CONTENT_BATCH_ITEMS: usize = MAX_WANT_IDS;
 
 /// Maximum IDs in an ObjectWant or ContentFetchRequest.
 pub const MAX_WANT_IDS: usize = 4096;

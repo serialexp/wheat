@@ -30,6 +30,10 @@ for `wheat labels` here; incremental-validation step 9):
   `target=Some(FileValue { content: ContentId([210, 80, ...]), kind: Regular })` and
   `reason=NoMatch`; and it names the conflict and revision by ID only, not by change
   message or path summary.
+- `[ ]` **`wheat add <directory>` adds nothing (2026-10-20).** With `many/00/1.txt`
+  and `many/00/2.txt` untracked, `wheat add many` reports "added 1 path(s)" and makes
+  a revision, but `status` still lists every file under `many/` as untracked. Either
+  add the directory's files or refuse a directory by name.
 - `[ ]` **`wheat log` lists changes in ChangeId order.** For imported history the
   IDs are UUIDv5, so the log is in effectively random order, and it prints every
   change with its whole message, with no limit or paging. Order by the view's
@@ -131,9 +135,9 @@ Performance, most serious first:
   `workspace_scan.rs` has no saved stat cache (mtime, ctime, size, inode, content ID),
   so every status reads all tracked files and their baselines, and fails once the
   workspace passes `MAX_TOTAL_READ_BYTES` (1 GiB).
-- `[ ]` **Uploads go one file per message (scanner only).** `publish_to_remote`
-  (`remote.rs`, around line 950) sends each blob as its own `ContentUpload`. Add a
-  batched upload message and stream large blobs to disk on the server.
+- `[ ]` **The server reassembles a chunked upload in memory (scanner only).** A blob
+  that comes as `ContentChunk`s is held whole until its last chunk, up to 1 GiB
+  (`MAX_CONTENT_SIZE`). Stream large blobs to disk instead.
 - `[ ]` **Re-adding 20,000 files to one change takes 5.4 s (2026-10-05).** Release,
   NVMe, `wheat add` of 20,000 modified files to a change that already edits them
   all (`WHEAT_TRACE_SUMMARY=1`): `persist_edits` 1.6 s, the first

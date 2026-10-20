@@ -382,13 +382,16 @@ async fn a_refused_publish_reads_its_push_and_the_session_goes_on() {
     send_msg(&mut ws, &publish_request(&state, false)).await;
     send_msg(
         &mut ws,
-        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-            message_type: 0x44,
+        &WheatProtocolMessage::ContentBatch(ContentBatchOutput {
+            message_type: 0x31,
             op_id: 7,
-            content_id: Digest256 {
-                bytes: ContentId::of(&pushed).as_bytes().to_vec(),
-            },
-            data: pushed,
+            sequence: 0,
+            contents: vec![ContentEntry {
+                id: Digest256 {
+                    bytes: ContentId::of(&pushed).as_bytes().to_vec(),
+                },
+                data: pushed,
+            }],
         }),
     )
     .await;

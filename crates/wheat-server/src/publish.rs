@@ -80,18 +80,20 @@ async fn read_push(
                     }
                 }
             }
-            WheatProtocolMessage::ContentUpload(upload) if upload.op_id == op_id => {
-                if upload.data.len() > MAX_PUSHED_BLOB_SIZE {
-                    return Ok(Err("a publish pushed a blob over MAX_PUSHED_BLOB_SIZE"));
-                }
-                bytes = bytes.saturating_add(upload.data.len());
-                if bytes > MAX_PUSHED_BYTES {
-                    return Ok(Err(OVER_PUSH_LIMIT));
-                }
-                contents += 1;
-                let id = digest_to_content_id(&upload.content_id)?;
-                if keep {
-                    pushed.contents.entry(id).or_insert(upload.data);
+            WheatProtocolMessage::ContentBatch(batch) if batch.op_id == op_id => {
+                for blob in batch.contents {
+                    if blob.data.len() > MAX_PUSHED_BLOB_SIZE {
+                        return Ok(Err("a publish pushed a blob over MAX_PUSHED_BLOB_SIZE"));
+                    }
+                    bytes = bytes.saturating_add(blob.data.len());
+                    if bytes > MAX_PUSHED_BYTES {
+                        return Ok(Err(OVER_PUSH_LIMIT));
+                    }
+                    contents += 1;
+                    let id = digest_to_content_id(&blob.id)?;
+                    if keep {
+                        pushed.contents.entry(id).or_insert(blob.data);
+                    }
                 }
             }
             WheatProtocolMessage::PublishPushEnd(end) if end.op_id == op_id => {
@@ -105,7 +107,7 @@ async fn read_push(
             }
             _ => {
                 return Ok(Err(
-                    "only ObjectBatch and ContentUpload may come before PublishPushEnd",
+                    "only ObjectBatch and ContentBatch may come before PublishPushEnd",
                 ));
             }
         }
@@ -264,18 +266,22 @@ pub async fn handle_publish(
             let mut receiver = TransferReceiver::new(round.iter().copied(), MAX_CONTENT_SIZE);
             loop {
                 let msg = recv(ws).await?;
-                let received = match msg {
-                    WheatProtocolMessage::ContentUpload(upload) if upload.op_id == op_id => {
-                        let id = digest_to_content_id(&upload.content_id)?;
-                        if let Err(e) = receiver.accept_whole(id, upload.data.len()) {
-                            return reject(ws, op_id, current_head, &format!("{e}")).await;
+                let received: Vec<(ContentId, Vec<u8>)> = match msg {
+                    WheatProtocolMessage::ContentBatch(batch) if batch.op_id == op_id => {
+                        let mut blobs = Vec::with_capacity(batch.contents.len());
+                        for blob in batch.contents {
+                            let id = digest_to_content_id(&blob.id)?;
+                            if let Err(e) = receiver.accept_whole(id, blob.data.len()) {
+                                return reject(ws, op_id, current_head, &format!("{e}")).await;
+                            }
+                            blobs.push((id, blob.data));
                         }
-                        Some((id, upload.data))
+                        blobs
                     }
-                    WheatProtocolMessage::ContentUploadChunk(chunk) if chunk.op_id == op_id => {
+                    WheatProtocolMessage::ContentChunk(chunk) if chunk.op_id == op_id => {
                         let id = digest_to_content_id(&chunk.content_id)?;
                         match receiver.accept_chunk(id, chunk.offset, chunk.data, chunk.is_final) {
-                            Ok(finished) => finished,
+                            Ok(finished) => finished.into_iter().collect(),
                             Err(e) => {
                                 return reject(ws, op_id, current_head, &format!("{e}")).await;
                             }
@@ -290,18 +296,19 @@ pub async fn handle_publish(
                     }
                     _ => {
                         warn!(op_id, "publish: unexpected message during content upload");
-                        None
+                        Vec::new()
                     }
                 };
-                if let Some((id, data)) = received {
-                    if ContentId::of(&data) != id {
-                        return reject(ws, op_id, current_head, "content identity mismatch").await;
-                    }
-                    let base = base_map.get(&id).copied();
-                    staged.put_content([(id, data, base)]).await.map_err(|e| {
-                        ConnectionError::Internal(format!("failed to store content batch: {e}"))
-                    })?;
+                if received.iter().any(|(id, data)| ContentId::of(data) != *id) {
+                    return reject(ws, op_id, current_head, "content identity mismatch").await;
                 }
+                let blobs = received.into_iter().map(|(id, data)| {
+                    let base = base_map.get(&id).copied();
+                    (id, data, base)
+                });
+                staged.put_content(blobs).await.map_err(|e| {
+                    ConnectionError::Internal(format!("failed to store content batch: {e}"))
+                })?;
             }
         }
     }

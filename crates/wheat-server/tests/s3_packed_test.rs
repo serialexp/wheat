@@ -20,8 +20,8 @@ use wheat_store::{
 };
 
 use support::{
-    Upload, Ws, connect_and_handshake, edit, fetch_content, fetch_objects, open_repo, recv_msg,
-    request_publish, send_msg, upload_objects,
+    Upload, Ws, connect_and_handshake, content_batch, edit, fetch_content, fetch_objects,
+    open_repo, recv_msg, request_publish, send_msg, upload_objects,
 };
 
 // ---------------------------------------------------------------------------
@@ -242,21 +242,13 @@ async fn upload_needed_content(ws: &mut Ws, content: &ContentStore) -> usize {
         match recv_msg(ws).await {
             WheatProtocolMessage::ContentNeeded(cn) => {
                 assert_eq!(cn.op_id, 1);
+                let mut blobs = Vec::new();
                 for digest in &cn.content_ids {
                     let id = ContentId::from_digest(digest.bytes.as_slice().try_into().unwrap());
-                    let data = content.get(id).unwrap();
-                    send_msg(
-                        ws,
-                        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                            message_type: 0x44,
-                            op_id: 1,
-                            content_id: digest.clone(),
-                            data,
-                        }),
-                    )
-                    .await;
-                    sent += 1;
+                    blobs.push((id, content.get(id).unwrap()));
                 }
+                sent += blobs.len();
+                send_msg(ws, &content_batch(1, blobs)).await;
                 send_msg(
                     ws,
                     &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {

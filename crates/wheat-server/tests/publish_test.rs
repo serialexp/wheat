@@ -32,9 +32,9 @@ use wheat_store::{
 };
 
 use support::{
-    Upload, Ws, connect_and_handshake, digest, edit, edits, object_batch, object_chunk, object_id,
-    open_repo, push_end, recv_msg, request_publish, request_publish_pushing, send_msg,
-    upload_objects,
+    Upload, Ws, connect_and_handshake, content_batch, digest, edit, edits, object_batch,
+    object_chunk, object_id, open_repo, push_end, recv_msg, request_publish,
+    request_publish_pushing, send_msg, upload_objects,
 };
 
 const REPO: &str = "test/repo";
@@ -331,21 +331,14 @@ async fn upload_content_and_commit(
             WheatProtocolMessage::ContentNeeded(needed) => {
                 assert_eq!(needed.op_id, OP);
                 assert!(needed.content_ids.len() <= MAX_WANT_IDS);
+                let mut blobs = Vec::new();
                 for id in needed.content_ids {
                     let blob = ContentId::from_digest(id.bytes.as_slice().try_into().unwrap());
                     asked.push(blob);
-                    let data = content.get(blob).unwrap();
-                    send_msg(
-                        ws,
-                        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                            message_type: 0x44,
-                            op_id: OP,
-                            content_id: id,
-                            data,
-                        }),
-                    )
-                    .await;
+                    blobs.push((blob, content.get(blob).unwrap()));
                 }
+                // The test blobs are small: one batch holds a round.
+                send_msg(ws, &content_batch(OP, blobs)).await;
                 send_msg(
                     ws,
                     &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
@@ -427,20 +420,9 @@ async fn send_whole(ws: &mut Ws, objects: Vec<(ObjectId, Vec<u8>)>) {
     send_msg(ws, &object_batch(OP, entries)).await;
 }
 
-/// Pushes `data` as the blob `id`.
+/// Pushes `data` as the blob `id`, in a batch of its own.
 async fn push_blob(ws: &mut Ws, id: ContentId, data: Vec<u8>) {
-    send_msg(
-        ws,
-        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-            message_type: 0x44,
-            op_id: OP,
-            content_id: Digest256 {
-                bytes: id.as_bytes().to_vec(),
-            },
-            data,
-        }),
-    )
-    .await;
+    send_msg(ws, &content_batch(OP, [(id, data)])).await;
 }
 
 /// Pushes `objects` and `blobs`, then ends the push.
@@ -663,7 +645,7 @@ async fn any_other_message_before_the_push_ends_ends_the_connection() {
     )
     .await;
 
-    expect_broken(&mut ws, "only ObjectBatch and ContentUpload").await;
+    expect_broken(&mut ws, "only ObjectBatch and ContentBatch").await;
     publishing.assert_head_unchanged().await;
 }
 
@@ -796,20 +778,11 @@ async fn content_of_a_publish_that_is_never_committed_is_not_stored() {
     let WheatProtocolMessage::ContentNeeded(needed) = recv_msg(&mut ws).await else {
         panic!("expected ContentNeeded");
     };
-    for id in needed.content_ids {
+    let blobs = needed.content_ids.iter().map(|id| {
         let blob = ContentId::from_digest(id.bytes.as_slice().try_into().unwrap());
-        let data = publishing.client_content.get(blob).unwrap();
-        send_msg(
-            &mut ws,
-            &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-                message_type: 0x44,
-                op_id: OP,
-                content_id: id,
-                data,
-            }),
-        )
-        .await;
-    }
+        (blob, publishing.client_content.get(blob).unwrap())
+    });
+    send_msg(&mut ws, &content_batch(OP, blobs)).await;
     send_msg(
         &mut ws,
         &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {

@@ -8,7 +8,8 @@
 //!
 //! It also counts turns: bursts of client bytes that open a connection or follow
 //! bytes from the server. Every turn costs one RTT, so turns are the round trips a
-//! command needed. They are counts, so a contract on them holds on any machine.
+//! command needed. And it counts the WebSocket data frames each way, which are the
+//! protocol's messages. They are counts, so a contract on them holds on any machine.
 
 use std::{
     net::SocketAddr,
@@ -48,6 +49,9 @@ pub(crate) struct Traffic {
     pub(crate) turns: u64,
     pub(crate) client_bytes: u64,
     pub(crate) server_bytes: u64,
+    /// WebSocket data frames: the protocol sends each message as one.
+    pub(crate) client_messages: u64,
+    pub(crate) server_messages: u64,
 }
 
 #[derive(Default)]
@@ -55,6 +59,8 @@ struct Counters {
     turns: AtomicU64,
     client_bytes: AtomicU64,
     server_bytes: AtomicU64,
+    client_messages: AtomicU64,
+    server_messages: AtomicU64,
 }
 
 /// Which side sent last on one connection; a client burst after the server's is a
@@ -108,6 +114,8 @@ impl LatencyProxy {
             turns: self.counters.turns.swap(0, Ordering::Relaxed),
             client_bytes: self.counters.client_bytes.swap(0, Ordering::Relaxed),
             server_bytes: self.counters.server_bytes.swap(0, Ordering::Relaxed),
+            client_messages: self.counters.client_messages.swap(0, Ordering::Relaxed),
+            server_messages: self.counters.server_messages.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -172,6 +180,7 @@ async fn direction(
         let _ = to.shutdown().await;
     });
     let mut buffer = vec![0_u8; 64 * 1024];
+    let mut frames = FrameCounter::default();
     loop {
         let read = match from.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
@@ -179,6 +188,12 @@ async fn direction(
         };
         let arrived = Instant::now();
         count(side, read, &last, &counters);
+        let messages = frames.feed(&buffer[..read]);
+        match side {
+            Side::Client => &counters.client_messages,
+            Side::Server => &counters.server_messages,
+        }
+        .fetch_add(messages, Ordering::Relaxed);
         if queue
             .send((arrived + delay, buffer[..read].to_vec()))
             .is_err()
@@ -208,6 +223,107 @@ fn count(side: Side, bytes: usize, last: &Mutex<Option<Side>>, counters: &Counte
         }
     }
     *last = Some(side);
+}
+
+/// Counts the WebSocket data frames in one direction of a connection, past its HTTP
+/// upgrade, from bytes split however they arrive.
+#[derive(Default)]
+struct FrameCounter {
+    state: FrameState,
+}
+
+enum FrameState {
+    /// In the HTTP upgrade, with this many bytes of its closing `\r\n\r\n` seen.
+    Upgrade { matched: usize },
+    /// In a frame header, with `have` of its bytes read.
+    Header { header: [u8; 14], have: usize },
+    /// In a frame's payload, with `left` bytes to go.
+    Payload { left: u64 },
+}
+
+impl Default for FrameState {
+    fn default() -> Self {
+        Self::Upgrade { matched: 0 }
+    }
+}
+
+impl FrameCounter {
+    /// Reads `bytes` and returns how many data frames begin in them.
+    fn feed(&mut self, mut bytes: &[u8]) -> u64 {
+        const END_OF_HEADERS: &[u8] = b"\r\n\r\n";
+        let mut frames = 0;
+        while let Some(&byte) = bytes.first() {
+            match &mut self.state {
+                FrameState::Upgrade { matched } => {
+                    bytes = &bytes[1..];
+                    *matched = if byte == END_OF_HEADERS[*matched] {
+                        *matched + 1
+                    } else {
+                        usize::from(byte == b'\r')
+                    };
+                    if *matched == END_OF_HEADERS.len() {
+                        self.state = FrameState::Header {
+                            header: [0; 14],
+                            have: 0,
+                        };
+                    }
+                }
+                FrameState::Header { header, have } => {
+                    bytes = &bytes[1..];
+                    header[*have] = byte;
+                    *have += 1;
+                    if let Some((payload, data)) = frame_header(&header[..*have]) {
+                        frames += u64::from(data);
+                        self.state = if payload == 0 {
+                            FrameState::Header {
+                                header: [0; 14],
+                                have: 0,
+                            }
+                        } else {
+                            FrameState::Payload { left: payload }
+                        };
+                    }
+                }
+                FrameState::Payload { left } => {
+                    let skipped = (*left).min(bytes.len() as u64);
+                    bytes = &bytes[skipped as usize..];
+                    *left -= skipped;
+                    if *left == 0 {
+                        self.state = FrameState::Header {
+                            header: [0; 14],
+                            have: 0,
+                        };
+                    }
+                }
+            }
+        }
+        frames
+    }
+}
+
+/// The payload length of a complete frame header, and whether the frame carries
+/// data rather than control; `None` while `header` is still short.
+fn frame_header(header: &[u8]) -> Option<(u64, bool)> {
+    let [first, second, ..] = *header else {
+        return None;
+    };
+    let extended = match second & 0x7f {
+        126 => 2,
+        127 => 8,
+        _ => 0,
+    };
+    let mask = if second & 0x80 == 0 { 0 } else { 4 };
+    if header.len() < 2 + extended + mask {
+        return None;
+    }
+    let payload = match extended {
+        0 => u64::from(second & 0x7f),
+        _ => header[2..2 + extended]
+            .iter()
+            .fold(0, |length, &byte| length << 8 | u64::from(byte)),
+    };
+    // Opcodes 0x8 and up are close, ping and pong.
+    Some((payload, first & 0x08 == 0))
 }
 
 #[cfg(test)]
@@ -260,5 +376,51 @@ mod tests {
         assert_eq!(proxy.take(), Traffic::default());
         drop(socket);
         proxy.stop().unwrap();
+    }
+
+    /// One WebSocket frame with `opcode` and `payload`, masked as a client's are.
+    fn frame(opcode: u8, payload: usize, masked: bool) -> Vec<u8> {
+        let mask = if masked { 0x80 } else { 0 };
+        let mut bytes = vec![0x80 | opcode];
+        match payload {
+            0..=125 => bytes.push(mask | payload as u8),
+            126..=0xffff => {
+                bytes.push(mask | 126);
+                bytes.extend_from_slice(&(payload as u16).to_be_bytes());
+            }
+            _ => {
+                bytes.push(mask | 127);
+                bytes.extend_from_slice(&(payload as u64).to_be_bytes());
+            }
+        }
+        if masked {
+            bytes.extend_from_slice(&[1, 2, 3, 4]);
+        }
+        bytes.resize(bytes.len() + payload, 0x81);
+        bytes
+    }
+
+    #[test]
+    fn the_frame_counter_counts_data_frames_however_the_bytes_are_split() {
+        let mut stream =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\r\n\r\n".to_vec();
+        for (opcode, payload, masked) in [
+            (0x2, 5, false),
+            (0x2, 300, true),
+            (0x9, 0, true),
+            (0x2, 70_000, false),
+            (0x2, 0, true),
+            (0x8, 2, false),
+        ] {
+            stream.extend(frame(opcode, payload, masked));
+        }
+
+        assert_eq!(FrameCounter::default().feed(&stream), 4);
+        let mut counter = FrameCounter::default();
+        let one_at_a_time: u64 = stream.iter().map(|byte| counter.feed(&[*byte])).sum();
+        assert_eq!(one_at_a_time, 4);
+        let mut counter = FrameCounter::default();
+        let in_pieces: u64 = stream.chunks(7).map(|piece| counter.feed(piece)).sum();
+        assert_eq!(in_pieces, 4);
     }
 }

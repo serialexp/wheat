@@ -338,7 +338,9 @@ pub async fn handle_content_fetch(
     match entry.content.get_many_bounded(&ids, MAX_CONTENT_CHUNK_SIZE) {
         Ok(items) => {
             for (id, data) in items {
-                batch.push(ws, id, data).await?;
+                if let Some(full) = batch.push(content_digest(id), data) {
+                    send(ws, &full).await?;
+                }
             }
         }
         Err(error) => {
@@ -346,7 +348,9 @@ pub async fn handle_content_fetch(
             for &id in &ids {
                 let data = match entry.content.get_bounded(id, MAX_CONTENT_CHUNK_SIZE) {
                     Ok(data) => {
-                        batch.push(ws, id, data).await?;
+                        if let Some(full) = batch.push(content_digest(id), data) {
+                            send(ws, &full).await?;
+                        }
                         continue;
                     }
                     Err(wheat_store::ContentStoreError::TooLarge { .. }) => entry.content.get(id),
@@ -354,8 +358,13 @@ pub async fn handle_content_fetch(
                 };
                 match data {
                     Ok(data) => {
-                        batch.flush(ws).await?;
-                        send_content_chunks(ws, op_id, id, &data).await?;
+                        if let Some(open) = batch.finish() {
+                            send(ws, &open).await?;
+                        }
+                        let digest = content_digest(id);
+                        for chunk in content_chunks(op_id, &digest, &data) {
+                            send(ws, &chunk).await?;
+                        }
                     }
                     Err(error) => {
                         debug!(op_id, content_id = %id, %error, "content fetch: unreadable");
@@ -370,93 +379,16 @@ pub async fn handle_content_fetch(
             }
         }
     }
-    batch.flush(ws).await
-}
-
-/// Blobs collected into `ContentBatch` messages of bounded size.
-struct ContentBatcher {
-    op_id: u32,
-    sequence: u32,
-    contents: Vec<ContentEntry>,
-    bytes: usize,
-}
-
-impl ContentBatcher {
-    fn new(op_id: u32) -> Self {
-        Self {
-            op_id,
-            sequence: 0,
-            contents: Vec::new(),
-            bytes: 0,
-        }
-    }
-
-    async fn push(
-        &mut self,
-        ws: &mut WebSocketStream<TcpStream>,
-        id: wheat_core::ContentId,
-        data: Vec<u8>,
-    ) -> Result<(), ConnectionError> {
-        self.bytes += data.len();
-        self.contents.push(ContentEntry {
-            id: Digest256 {
-                bytes: id.as_bytes().to_vec(),
-            },
-            data,
-        });
-        if self.bytes >= MAX_CONTENT_BATCH_SIZE || self.contents.len() >= MAX_CONTENT_BATCH_ITEMS {
-            self.flush(ws).await?;
-        }
-        Ok(())
-    }
-
-    async fn flush(&mut self, ws: &mut WebSocketStream<TcpStream>) -> Result<(), ConnectionError> {
-        if self.contents.is_empty() {
-            return Ok(());
-        }
-        send(
-            ws,
-            &WheatProtocolMessage::ContentBatch(ContentBatchOutput {
-                message_type: 0x31,
-                op_id: self.op_id,
-                sequence: self.sequence,
-                contents: std::mem::take(&mut self.contents),
-            }),
-        )
-        .await?;
-        self.bytes = 0;
-        self.sequence += 1;
-        Ok(())
+    match batch.finish() {
+        Some(open) => send(ws, &open).await,
+        None => Ok(()),
     }
 }
 
-/// Send one blob as `ContentChunk`s of at most `MAX_CONTENT_CHUNK_SIZE` bytes.
-async fn send_content_chunks(
-    ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
-    id: wheat_core::ContentId,
-    data: &[u8],
-) -> Result<(), ConnectionError> {
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let end = (offset + MAX_CONTENT_CHUNK_SIZE).min(data.len());
-        send(
-            ws,
-            &WheatProtocolMessage::ContentChunk(ContentChunkOutput {
-                message_type: 0x32,
-                op_id,
-                content_id: Digest256 {
-                    bytes: id.as_bytes().to_vec(),
-                },
-                offset: offset as u64,
-                data: data[offset..end].to_vec(),
-                is_final: end == data.len(),
-            }),
-        )
-        .await?;
-        offset = end;
+fn content_digest(id: wheat_core::ContentId) -> Digest256 {
+    Digest256 {
+        bytes: id.as_bytes().to_vec(),
     }
-    Ok(())
 }
 
 /// Send an operation-scoped, non-retryable Error about one blob.

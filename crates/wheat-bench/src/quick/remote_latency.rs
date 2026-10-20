@@ -13,7 +13,7 @@
 //! asked. After each publish a reader fetches it. At the end a new workspace clones
 //! the repository.
 
-use std::{path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 
@@ -38,10 +38,12 @@ const DIRECTORY: &str = "deep/a/b/c/d";
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let publishes = context.scale.pick(10, 2);
+    let many_files = context.scale.pick(2_000, 40);
     let mut recorder = Recorder::new(NAME);
     recorder.parameter("rtt_ms", RTT.as_millis());
     recorder.parameter("publishes", publishes);
     recorder.parameter("large_mib", LARGE_MIB);
+    recorder.parameter("many_files", many_files);
 
     let source = Workspace::new(context)?;
     let server = Server::start(source.root())?;
@@ -99,6 +101,29 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     publish.record(&mut recorder, "large.publish");
     fetch.record(&mut recorder, "large.fetch");
 
+    // One change of many small files, each in a message of its own unless blobs
+    // travel in batches.
+    writer.ok(&source, &["change", "new", "--message", "many"])?;
+    let paths: Vec<String> = (0..many_files)
+        .map(|index| format!("many/{:02}/{index}.txt", index % 20))
+        .collect();
+    for (index, path) in paths.iter().enumerate() {
+        let path = writer.root.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, format!("small file {index}\n").repeat(4))?;
+    }
+    let mut add = vec!["add"];
+    add.extend(paths.iter().map(String::as_str));
+    writer.ok(&source, &add)?;
+    let mut publish = Commands::default();
+    let mut fetch = Commands::default();
+    publish.add(writer.ok(&source, &["publish"])?, &proxy);
+    fetch.add(reader.ok(&source, &["fetch"])?, &proxy);
+    publish.record(&mut recorder, "many.publish");
+    fetch.record(&mut recorder, "many.fetch");
+
     let mut clone = Commands::default();
     let (_, cloned) = Client::clone(context, &source, &url, "cloned")?;
     clone.add(cloned, &proxy);
@@ -115,6 +140,10 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     for step in ["small.fetch", "large.fetch", "clone"] {
         recorder.at_most(&format!("{step}.round_trips"), 5.0, "count");
     }
+    // Small blobs travel in batches both ways. Before, 2,000 files took 2,016
+    // messages up and 515 down; with batches they take 17 and 16 (2026-10-20).
+    recorder.at_most("many.publish.client_messages", 20.0, "count");
+    recorder.at_most("many.fetch.server_messages", 20.0, "count");
 
     proxy.stop()?;
     server.stop()?;
@@ -188,6 +217,16 @@ impl Commands {
             &format!("{step}.server_bytes"),
             most(|traffic| traffic.server_bytes),
             "bytes",
+        );
+        recorder.value(
+            &format!("{step}.client_messages"),
+            most(|traffic| traffic.client_messages),
+            "count",
+        );
+        recorder.value(
+            &format!("{step}.server_messages"),
+            most(|traffic| traffic.server_messages),
+            "count",
         );
     }
 }

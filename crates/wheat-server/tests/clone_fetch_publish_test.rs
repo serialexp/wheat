@@ -322,11 +322,14 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
 async fn upload_whole(ws: &mut Ws, digest: &Digest256, data: Vec<u8>) {
     send_msg(
         ws,
-        &WheatProtocolMessage::ContentUpload(ContentUploadOutput {
-            message_type: 0x44,
+        &WheatProtocolMessage::ContentBatch(ContentBatchOutput {
+            message_type: 0x31,
             op_id: PUBLISH_OP,
-            content_id: digest.clone(),
-            data,
+            sequence: 0,
+            contents: vec![ContentEntry {
+                id: digest.clone(),
+                data,
+            }],
         }),
     )
     .await;
@@ -335,8 +338,8 @@ async fn upload_whole(ws: &mut Ws, digest: &Digest256, data: Vec<u8>) {
 async fn upload_chunk(ws: &mut Ws, digest: &Digest256, offset: u64, data: &[u8], is_final: bool) {
     send_msg(
         ws,
-        &WheatProtocolMessage::ContentUploadChunk(ContentUploadChunkOutput {
-            message_type: 0x45,
+        &WheatProtocolMessage::ContentChunk(ContentChunkOutput {
+            message_type: 0x32,
             op_id: PUBLISH_OP,
             content_id: digest.clone(),
             offset,
