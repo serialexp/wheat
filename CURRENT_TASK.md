@@ -51,6 +51,19 @@ Progress:
   store `verified_content_is_staged_without_hashing_it_again`. Still hashed twice on
   `wheat add`, by design: the workspace scan hashes raw file bytes to compare with the
   index, and capture hashes the canonical (newline-normalized) bytes, which can differ.
+- Stage 5, packed reads (Bart chose "verified envelopes"): a read hashed 3× from a
+  sealed or active segment (reader, catalog again, `resolve_delta_chain`), 2× from the
+  bulk tail, and staged/pending reads re-hashed verified blobs. Packed readers now return
+  `VerifiedPayload` (made only by `verify_logical`/`verify_payload`); the catalog no
+  longer re-verifies; `ContentBackend::get_stored` returns `StoredContent::{Verified,
+  Envelope}` and `resolve_delta_chain` hashes only envelopes. Seal rebuild and metadata
+  repack write the read payload as a `CheckedRecord` without re-checking it, and
+  `prepare_delta_record` takes a `CheckedRecord`. Contracts:
+  `a_packed_content_read_hashes_its_bytes_once`,
+  `content_reads_beside_a_content_generation_hash_once`,
+  `staged_content_reads_back_without_hashing`.
+- Next: `ContentIo::resolve` returns `VerifiedContent` so `apply_edits` stops re-hashing
+  resolved content (`edit_application.rs:196`); `resolve_delta_chain` would return it.
 - Objects (not content) are still validated twice on remote_packed seal (at
   `put_if_absent` and again via `CheckedRecord::check` in `seal`). That's out of
   scope; it's noted here.

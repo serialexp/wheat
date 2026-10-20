@@ -8,6 +8,34 @@ use wheat_store::{
     RepositoryPublisher,
 };
 
+/// With a content generation published, a read of content repacked into it and of content
+/// written since, which still lives in a segment, each hash the bytes once.
+#[tokio::test(flavor = "multi_thread")]
+async fn content_reads_beside_a_content_generation_hash_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = PackedObjectStore::open(directory.path().join("storage")).unwrap();
+    let content = objects.content_store();
+    let heads = LocalPublicationStore::new(directory.path().join("repository.head"));
+    let repacked = content.put(&[31; 4096]).unwrap();
+    RepositoryPublisher::new(&objects, &content, &heads)
+        .initialize(&Repository::new(Tree::new()))
+        .await
+        .unwrap();
+    let plan = objects
+        .plan_repack(&heads, RepackOptions::default())
+        .await
+        .unwrap();
+    assert!(!objects.execute_repack(&heads, plan).unwrap().no_op);
+    let written_since = content.put(&[32; 4096]).unwrap();
+
+    for id in [repacked, written_since] {
+        let before = wheat_core::content_bytes_hashed();
+        let bytes = content.get(id).unwrap();
+        assert_eq!(wheat_core::content_bytes_hashed() - before, 4096);
+        assert_eq!(bytes.len(), 4096);
+    }
+}
+
 #[tokio::test]
 async fn whole_repository_repack_preserves_content_reopens_and_then_is_true_noop() {
     let directory = tempfile::tempdir().unwrap();

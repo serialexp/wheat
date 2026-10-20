@@ -107,25 +107,45 @@ impl From<ContentMismatch> for ContentStoreError {
     }
 }
 
+/// One content record as a backend holds it.
+#[derive(Debug)]
+pub(crate) enum StoredContent {
+    /// Logical bytes the backend checked against their ID as it read them, which
+    /// nothing above needs to hash again.
+    Verified(VerifiedContent),
+    /// An envelope's header and stored payload, which only resolving it authenticates.
+    Envelope(codec::EnvelopeHeader, Vec<u8>),
+}
+
+impl StoredContent {
+    pub(crate) fn logical_length(&self) -> u64 {
+        match self {
+            Self::Verified(content) => content.len() as u64,
+            Self::Envelope(header, _) => header.logical_length,
+        }
+    }
+}
+
+impl From<(codec::EnvelopeHeader, Vec<u8>)> for StoredContent {
+    fn from((header, stored): (codec::EnvelopeHeader, Vec<u8>)) -> Self {
+        Self::Envelope(header, stored)
+    }
+}
+
 pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
     /// Stores `contents`, which arrive verified and are not hashed again.
     fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError>;
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError>;
 
-    /// Read the raw envelope for a content ID: header + stored payload bytes.
-    ///
-    /// Used by `resolve_delta_chain` for iterative delta resolution.
-    fn get_raw_envelope(
-        &self,
-        id: ContentId,
-    ) -> Result<(crate::codec::EnvelopeHeader, Vec<u8>), ContentStoreError>;
+    /// The content's record as stored: bytes the backend verified as it read them, or
+    /// an envelope for `resolve_delta_chain` to resolve.
+    fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError>;
 
     /// The content's logical length from stored metadata (see
-    /// [`ContentStore::logical_length`]). The default reads the raw envelope without
+    /// [`ContentStore::logical_length`]). The default reads the stored record without
     /// decoding it; backends that index lengths answer without reading the payload.
     fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
-        self.get_raw_envelope(id)
-            .map(|(header, _)| header.logical_length)
+        self.get_stored(id).map(|stored| stored.logical_length())
     }
 
     /// Write pre-encoded envelope bytes directly to storage.
@@ -177,16 +197,16 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
 
 /// Iteratively resolve a content delta chain and verify the final ContentId.
 ///
-/// `fetch_raw` is a closure that reads the raw envelope for a given ContentId,
-/// returning `(EnvelopeHeader, raw_stored_payload)`. The delta chain is followed
-/// until a non-delta codec is found, then patches are applied in reverse
-/// (base → target) to reconstruct the requested content.
+/// `fetch` reads the stored record of a given ContentId. The delta chain is followed
+/// until a record that is not a delta, then patches are applied in reverse
+/// (base → target) to reconstruct the requested content. A record the backend
+/// verified as it read it is not hashed again; every other one is.
 ///
 /// The `max` bound applies only to the final reconstructed output.
 pub(crate) fn resolve_delta_chain(
     id: ContentId,
     max: usize,
-    fetch_raw: impl Fn(ContentId) -> Result<(codec::EnvelopeHeader, Vec<u8>), ContentStoreError>,
+    fetch: impl Fn(ContentId) -> Result<StoredContent, ContentStoreError>,
 ) -> Result<Vec<u8>, ContentStoreError> {
     use crate::delta;
 
@@ -198,14 +218,14 @@ pub(crate) fn resolve_delta_chain(
     let mut current_id = id;
 
     for depth in 0..=MAX_DELTA_CHAIN_DEPTH {
-        let (header, stored) = fetch_raw(current_id)?;
+        let stored = fetch(current_id)?;
         let decode_max = if depth == 0 {
             max.min(codec::HARD_LOGICAL_RECORD_BYTES)
         } else {
             codec::HARD_LOGICAL_RECORD_BYTES
         };
         let logical_length =
-            usize::try_from(header.logical_length).map_err(|_| ContentStoreError::TooLarge {
+            usize::try_from(stored.logical_length()).map_err(|_| ContentStoreError::TooLarge {
                 id: current_id,
                 max: decode_max,
                 minimum: codec::HARD_LOGICAL_RECORD_BYTES.saturating_add(1),
@@ -218,52 +238,57 @@ pub(crate) fn resolve_delta_chain(
             });
         }
 
-        match codec::decode_payload(header.codec, stored, header.logical_length, decode_max)
-            .map_err(|e| codec_error(current_id, decode_max, e))?
-        {
-            codec::DecodedPayload::Content(bytes) => {
-                // The terminal base is content-addressed too. Verify it before
-                // trusting it as input to any patch in the chain.
-                let actual = ContentId::of(&bytes);
-                if actual != current_id {
-                    return Err(ContentStoreError::Corrupt {
-                        expected: current_id,
-                        actual,
-                    });
-                }
-
-                let mut result = bytes;
-                for (link_index, (target_id, expected_size, patch)) in
-                    chain.iter().rev().enumerate()
+        let base = match stored {
+            StoredContent::Verified(content) => content.into_inner(),
+            StoredContent::Envelope(header, payload) => {
+                match codec::decode_payload(
+                    header.codec,
+                    payload,
+                    header.logical_length,
+                    decode_max,
+                )
+                .map_err(|e| codec_error(current_id, decode_max, e))?
                 {
-                    let result_limit = if link_index + 1 == chain.len() {
-                        max.min(codec::HARD_LOGICAL_RECORD_BYTES)
-                    } else {
-                        codec::HARD_LOGICAL_RECORD_BYTES
-                    };
-                    result = delta::apply_delta(&result, patch, *expected_size, result_limit)
-                        .map_err(|e| ContentStoreError::DeltaResolution {
-                            id: *target_id,
-                            reason: e.to_string(),
-                        })?;
-                    let actual = ContentId::of(&result);
-                    if actual != *target_id {
-                        return Err(ContentStoreError::Corrupt {
-                            expected: *target_id,
-                            actual,
-                        });
+                    // The terminal base is content-addressed too. Verify it before
+                    // trusting it as input to any patch in the chain.
+                    codec::DecodedPayload::Content(bytes) => {
+                        VerifiedContent::check(current_id, bytes)?.into_inner()
+                    }
+                    codec::DecodedPayload::Delta { base_id, patch, .. } => {
+                        if depth == MAX_DELTA_CHAIN_DEPTH {
+                            return Err(ContentStoreError::DeltaChainTooDeep { id });
+                        }
+                        chain.push((current_id, logical_length, patch));
+                        current_id = base_id;
+                        continue;
                     }
                 }
-                return Ok(result);
             }
-            codec::DecodedPayload::Delta { base_id, patch, .. } => {
-                if depth == MAX_DELTA_CHAIN_DEPTH {
-                    return Err(ContentStoreError::DeltaChainTooDeep { id });
-                }
-                chain.push((current_id, logical_length, patch));
-                current_id = base_id;
+        };
+
+        let mut result = base;
+        for (link_index, (target_id, expected_size, patch)) in chain.iter().rev().enumerate() {
+            let result_limit = if link_index + 1 == chain.len() {
+                max.min(codec::HARD_LOGICAL_RECORD_BYTES)
+            } else {
+                codec::HARD_LOGICAL_RECORD_BYTES
+            };
+            result =
+                delta::apply_delta(&result, patch, *expected_size, result_limit).map_err(|e| {
+                    ContentStoreError::DeltaResolution {
+                        id: *target_id,
+                        reason: e.to_string(),
+                    }
+                })?;
+            let actual = ContentId::of(&result);
+            if actual != *target_id {
+                return Err(ContentStoreError::Corrupt {
+                    expected: *target_id,
+                    actual,
+                });
             }
         }
+        return Ok(result);
     }
 
     unreachable!("bounded delta-chain loop always returns")
@@ -309,14 +334,11 @@ impl ContentStore {
         Self::with_backend(self.root.clone(), backend, self.durability)
     }
 
-    /// The stored envelope of `id`: its header and stored payload.
-    pub(crate) fn raw_envelope(
-        &self,
-        id: ContentId,
-    ) -> Result<(codec::EnvelopeHeader, Vec<u8>), ContentStoreError> {
+    /// The stored record of `id`: content its backend verified, or an envelope.
+    pub(crate) fn stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
         match &self.backend {
-            Some(backend) => backend.get_raw_envelope(id),
-            None => self.read_local_raw_envelope(id),
+            Some(backend) => backend.get_stored(id),
+            None => self.read_local_raw_envelope(id).map(StoredContent::from),
         }
     }
 
@@ -594,12 +616,7 @@ impl ContentStore {
     /// bound applies to the final reconstructed output, not to intermediate
     /// base fetches.
     pub fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
-        if let Some(backend) = &self.backend {
-            return resolve_delta_chain(id, max, |current_id| backend.get_raw_envelope(current_id));
-        }
-        resolve_delta_chain(id, max, |current_id| {
-            self.read_local_raw_envelope(current_id)
-        })
+        resolve_delta_chain(id, max, |current_id| self.stored(current_id))
     }
 
     /// Read a local envelope file and return (header, raw stored payload).
@@ -722,17 +739,11 @@ impl ContentStore {
     /// content, 2 if it's a delta against a delta against raw, etc.
     /// Returns `None` if the content can't be inspected.
     fn delta_chain_depth(&self, id: ContentId) -> Option<usize> {
-        let fetch_raw = |cid: ContentId| -> Option<(codec::EnvelopeHeader, Vec<u8>)> {
-            if let Some(backend) = &self.backend {
-                backend.get_raw_envelope(cid).ok()
-            } else {
-                self.read_local_raw_envelope(cid).ok()
-            }
-        };
-
         let mut current = id;
         for depth in 0..MAX_DELTA_CHAIN_DEPTH {
-            let (header, stored) = fetch_raw(current)?;
+            let StoredContent::Envelope(header, stored) = self.stored(current).ok()? else {
+                return Some(depth);
+            };
             if !header.codec.is_delta() {
                 return Some(depth);
             }
@@ -841,6 +852,7 @@ mod tests {
             envelopes
                 .get(&current_id)
                 .cloned()
+                .map(StoredContent::from)
                 .ok_or(ContentStoreError::Missing(current_id))
         })
     }

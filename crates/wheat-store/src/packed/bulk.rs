@@ -18,8 +18,8 @@ use std::{
 use wheat_core::{SEGMENT_PREFIX_ENCODED_SIZE, SegmentIndexEntry, encode_segment_prefix};
 
 use super::segment::{
-    BLOCK_TARGET_BYTES, SegmentError, SegmentMetadata, emit_cumulative_tail,
-    projected_total_length, verify_logical,
+    BLOCK_TARGET_BYTES, SegmentError, SegmentMetadata, VerifiedPayload, emit_cumulative_tail,
+    projected_total_length, verify_logical, verify_payload,
 };
 use crate::codec::{self, Codec};
 
@@ -238,7 +238,7 @@ impl BulkSegment {
         namespace: u8,
         digest: [u8; 32],
         max: usize,
-    ) -> Result<Option<(u16, Vec<u8>)>, SegmentError> {
+    ) -> Result<Option<VerifiedPayload>, SegmentError> {
         // Check pending block records first (not yet flushed to file).
         for record in &self.pending_block {
             if record.namespace == namespace && record.digest == digest {
@@ -248,21 +248,13 @@ impl BulkSegment {
                         minimum: logical_length,
                     });
                 }
-                verify_logical(
-                    &SegmentIndexEntry {
-                        namespace: record.namespace,
-                        kind: record.kind,
-                        digest: record.digest,
-                        offset: 0,
-                        codec: Codec::ZstdBlock.to_byte(),
-                        stored_length: 0,
-                        logical_length: logical_length as u64,
-                        delta_base: None,
-                        delta_depth: 0,
-                    },
-                    &record.logical_bytes,
-                )?;
-                return Ok(Some((record.kind, record.logical_bytes.clone())));
+                return verify_payload(
+                    record.namespace,
+                    record.kind,
+                    record.digest,
+                    record.logical_bytes.clone(),
+                )
+                .map(Some);
             }
         }
 
@@ -305,8 +297,7 @@ impl BulkSegment {
                 ));
             }
             let bytes = decompressed[offset_in_block..end].to_vec();
-            verify_logical(&entry, &bytes)?;
-            Ok(Some((entry.kind, bytes)))
+            verify_logical(&entry, bytes).map(Some)
         } else {
             let stored_length = usize::try_from(entry.stored_length)
                 .map_err(|_| SegmentError::Format("stored length"))?;
@@ -314,8 +305,7 @@ impl BulkSegment {
             self.file.seek(SeekFrom::Start(entry.offset))?;
             self.file.read_exact(&mut stored)?;
             let bytes = codec::decode(codec_val, stored, entry.logical_length, max)?;
-            verify_logical(&entry, &bytes)?;
-            Ok(Some((entry.kind, bytes)))
+            verify_logical(&entry, bytes).map(Some)
         }
     }
 

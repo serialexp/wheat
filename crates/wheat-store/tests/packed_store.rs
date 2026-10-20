@@ -176,6 +176,43 @@ fn logical_length_covers_every_packed_location_without_reading_payloads() {
     assert_eq!(content.logical_length(loose).unwrap(), 17);
 }
 
+/// A content read is authenticated once, wherever packed content lives: the pending bulk
+/// tail, a sealed segment, the active segment or a loose fallback.
+#[test]
+fn a_packed_content_read_hashes_its_bytes_once() {
+    let hashed_by_get = |content: &wheat_store::ContentStore, id: ContentId| {
+        let before = wheat_core::content_bytes_hashed();
+        let bytes = content.get(id).unwrap();
+        (
+            wheat_core::content_bytes_hashed() - before,
+            bytes.len() as u64,
+        )
+    };
+    let root = tempfile::tempdir().unwrap();
+    let objects = PackedObjectStore::open_deferred(root.path()).unwrap();
+    let content = objects.content_store();
+    let pending = content.put(&[21; 4096]).unwrap();
+    let (hashed, length) = hashed_by_get(&content, pending);
+    assert_eq!(hashed, length, "bulk tail");
+    drop(content);
+    objects.close().unwrap();
+
+    let objects = PackedObjectStore::open(root.path()).unwrap();
+    let content = objects.content_store();
+    let (hashed, length) = hashed_by_get(&content, pending);
+    assert_eq!(hashed, length, "sealed segment");
+    let active = content.put(&[22; 4096]).unwrap();
+    let (hashed, length) = hashed_by_get(&content, active);
+    assert_eq!(hashed, length, "active segment");
+
+    let loose_root = tempfile::tempdir().unwrap();
+    let objects = PackedObjectStore::open_with_loose_threshold(loose_root.path(), 16).unwrap();
+    let content = objects.content_store();
+    let loose = content.put(&[23; 4096]).unwrap();
+    let (hashed, length) = hashed_by_get(&content, loose);
+    assert_eq!(hashed, length, "loose fallback");
+}
+
 #[tokio::test]
 async fn large_metadata_uses_standalone_fallback() {
     let root = tempfile::tempdir().unwrap();

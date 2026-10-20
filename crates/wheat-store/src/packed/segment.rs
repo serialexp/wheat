@@ -217,16 +217,16 @@ pub(crate) fn prepare_record(
 /// the target's own size. The patch is applied back before it is accepted, so a
 /// written delta always reproduces the exact target bytes.
 pub(crate) fn prepare_delta_record<'a>(
-    record: SegmentRecord<'a>,
+    record: CheckedRecord<'a>,
     base: [u8; 32],
     base_bytes: &[u8],
 ) -> Result<Option<PreparedSegmentDelta<'a>>, SegmentError> {
+    let record = record.record();
     if record.namespace != METADATA_NAMESPACE || base == record.digest {
         return Err(SegmentError::Format(
             "delta records are metadata with another base",
         ));
     }
-    validate_record(record)?;
     let Some(patch) = delta::compute_delta(base_bytes, record.bytes) else {
         return Ok(None);
     };
@@ -858,7 +858,7 @@ impl SegmentReader {
         namespace: u8,
         digest: [u8; 32],
         max: usize,
-    ) -> Result<Option<(&SegmentIndexEntry, Vec<u8>)>, SegmentError> {
+    ) -> Result<Option<(&SegmentIndexEntry, VerifiedPayload)>, SegmentError> {
         let wanted = (namespace, digest);
         let Ok(index) = self.entries_by_key.binary_search_by_key(&wanted, key) else {
             return Ok(None);
@@ -879,8 +879,8 @@ impl SegmentReader {
         } else {
             self.read_whole(index)?
         };
-        verify_logical(&self.entries_by_key[index], &bytes)?;
-        Ok(Some((&self.entries_by_key[index], bytes)))
+        let payload = verify_logical(&self.entries_by_key[index], bytes)?;
+        Ok(Some((&self.entries_by_key[index], payload)))
     }
 
     /// Logical bytes of a whole (non-delta) entry, unverified.
@@ -977,7 +977,7 @@ impl SegmentReader {
     ) -> Result<Option<(u16, Vec<u8>)>, SegmentError> {
         Ok(self
             .lookup_entry_bounded(namespace, digest, usize::MAX)?
-            .map(|(entry, bytes)| (entry.kind, bytes)))
+            .map(|(entry, payload)| (entry.kind, payload.into_bytes())))
     }
 }
 
@@ -1065,26 +1065,102 @@ fn validate_delta_chains(entries: &[SegmentIndexEntry]) -> Result<(), SegmentErr
     Ok(())
 }
 
-pub(super) fn verify_logical(entry: &SegmentIndexEntry, bytes: &[u8]) -> Result<(), SegmentError> {
-    match entry.namespace {
-        CONTENT_NAMESPACE => {
-            if ContentId::of(bytes).as_bytes() != &entry.digest {
-                return Err(SegmentError::ObjectDigest);
-            }
+/// A record's logical bytes, checked against its index entry as they were read: content
+/// against its digest, metadata as a canonical object of the entry's kind and digest.
+/// Only [`verify_logical`] makes one, so whoever holds it need not check the bytes again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VerifiedPayload {
+    Content(VerifiedContent),
+    Metadata {
+        kind: u16,
+        digest: [u8; 32],
+        bytes: Vec<u8>,
+    },
+}
+
+impl VerifiedPayload {
+    pub(crate) fn kind(&self) -> u16 {
+        match self {
+            Self::Content(_) => 0,
+            Self::Metadata { kind, .. } => *kind,
         }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Content(content) => content.bytes(),
+            Self::Metadata { bytes, .. } => bytes,
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Content(content) => content.into_inner(),
+            Self::Metadata { bytes, .. } => bytes,
+        }
+    }
+
+    pub(crate) fn into_content(self) -> Option<VerifiedContent> {
+        match self {
+            Self::Content(content) => Some(content),
+            Self::Metadata { .. } => None,
+        }
+    }
+
+    /// The payload as a record to write elsewhere, which needs no check: it was checked
+    /// as it was read.
+    pub(crate) fn record(&self) -> CheckedRecord<'_> {
+        match self {
+            Self::Content(content) => CheckedRecord::content(content.borrowed()),
+            Self::Metadata {
+                kind,
+                digest,
+                bytes,
+            } => CheckedRecord(SegmentRecord {
+                namespace: METADATA_NAMESPACE,
+                kind: *kind,
+                digest: *digest,
+                bytes,
+            }),
+        }
+    }
+}
+
+pub(super) fn verify_logical(
+    entry: &SegmentIndexEntry,
+    bytes: Vec<u8>,
+) -> Result<VerifiedPayload, SegmentError> {
+    verify_payload(entry.namespace, entry.kind, entry.digest, bytes)
+}
+
+/// Checks `bytes` are the record keyed by `namespace`, `kind` and `digest`.
+pub(super) fn verify_payload(
+    namespace: u8,
+    kind: u16,
+    digest: [u8; 32],
+    bytes: Vec<u8>,
+) -> Result<VerifiedPayload, SegmentError> {
+    match namespace {
+        CONTENT_NAMESPACE => VerifiedContent::check(ContentId::from_digest(digest), bytes)
+            .map(VerifiedPayload::Content)
+            .map_err(|_| SegmentError::ObjectDigest),
         METADATA_NAMESPACE => {
-            if ObjectId::of_canonical_bytes(bytes).as_bytes() != &entry.digest {
+            if ObjectId::of_canonical_bytes(&bytes).as_bytes() != &digest {
                 return Err(SegmentError::ObjectDigest);
             }
             let expected =
-                SegmentIndexEntry::canonical_kind(entry.kind).ok_or(SegmentError::WrongKind)?;
-            if validate_canonical_object(bytes)? != expected {
+                SegmentIndexEntry::canonical_kind(kind).ok_or(SegmentError::WrongKind)?;
+            if validate_canonical_object(&bytes)? != expected {
                 return Err(SegmentError::WrongKind);
             }
+            Ok(VerifiedPayload::Metadata {
+                kind,
+                digest,
+                bytes,
+            })
         }
-        _ => return Err(SegmentError::Format("namespace")),
+        _ => Err(SegmentError::Format("namespace")),
     }
-    Ok(())
 }
 
 fn hash_range(file: &mut File, offset: u64, length: u64) -> Result<[u8; 32], SegmentError> {
@@ -1313,7 +1389,7 @@ mod tests {
                     delta_base: None,
                     delta_depth: 0,
                 },
-                &canonical,
+                canonical.clone(),
             ),
             Err(SegmentError::WrongKind)
         ));
@@ -1681,10 +1757,10 @@ mod tests {
         builder.push(metadata_record(*tip, tip_bytes)).unwrap();
         for pair in records.windows(2) {
             let ((base, base_bytes), (target, target_bytes)) = (&pair[0], &pair[1]);
-            let prepared =
-                prepare_delta_record(metadata_record(*target, target_bytes), *base, base_bytes)
-                    .unwrap()
-                    .expect("adjacent maps delta well");
+            let target = CheckedRecord::check(metadata_record(*target, target_bytes)).unwrap();
+            let prepared = prepare_delta_record(target, *base, base_bytes)
+                .unwrap()
+                .expect("adjacent maps delta well");
             assert!(prepared.physical.codec.is_delta());
             builder.push_delta(prepared).unwrap();
         }
@@ -1703,7 +1779,7 @@ mod tests {
                 .unwrap();
             assert_eq!(usize::from(entry.delta_depth), depth);
             assert_eq!(entry.delta_base.is_some(), depth > 0);
-            assert_eq!(&read, bytes);
+            assert_eq!(read.bytes(), bytes.as_slice());
         }
         let deltas = records.len() - 1;
         let entries = reader.authenticated_entries();
@@ -1722,10 +1798,10 @@ mod tests {
         let (base, base_bytes) = test_content_map_root(50);
         let (target, target_bytes) = test_content_map_root(49);
         let mut builder = SegmentBuilder::new(directory.path()).unwrap();
-        let prepared =
-            prepare_delta_record(metadata_record(target, &target_bytes), base, &base_bytes)
-                .unwrap()
-                .unwrap();
+        let target = CheckedRecord::check(metadata_record(target, &target_bytes)).unwrap();
+        let prepared = prepare_delta_record(target, base, &base_bytes)
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             builder.push_delta(prepared.clone()),
             Err(SegmentError::Format("delta base is not in the segment"))
@@ -1735,7 +1811,7 @@ mod tests {
         assert_eq!(builder.push_delta(prepared).unwrap(), 1);
         assert!(matches!(
             prepare_delta_record(
-                content_record(b"content bytes are never deltas"),
+                CheckedRecord::check(content_record(b"content bytes are never deltas")).unwrap(),
                 base,
                 &base_bytes
             ),
@@ -1752,7 +1828,7 @@ mod tests {
             .unwrap();
         for (index, pair) in records.windows(2).enumerate() {
             let prepared = prepare_delta_record(
-                metadata_record(pair[1].0, &pair[1].1),
+                CheckedRecord::check(metadata_record(pair[1].0, &pair[1].1)).unwrap(),
                 pair[0].0,
                 &pair[0].1,
             )
@@ -1855,7 +1931,7 @@ mod tests {
                 .lookup_entry_bounded(METADATA_NAMESPACE, *digest, usize::MAX)
                 .unwrap()
                 .unwrap();
-            assert_eq!(&read, bytes);
+            assert_eq!(read.bytes(), bytes.as_slice());
         }
     }
 }

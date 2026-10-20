@@ -28,7 +28,8 @@ use wheat_core::{
 #[cfg(test)]
 use super::segment::{CheckedRecord, prepare_record};
 use super::segment::{
-    MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, SegmentError, SegmentRecord, key,
+    MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, SegmentError, SegmentRecord, VerifiedPayload,
+    key,
 };
 use crate::{Durability, codec::Codec};
 
@@ -583,7 +584,7 @@ impl ActiveSegment {
         namespace: u8,
         digest: [u8; 32],
         max: usize,
-    ) -> Result<Option<(SegmentIndexEntry, Vec<u8>)>, ActiveError> {
+    ) -> Result<Option<(SegmentIndexEntry, VerifiedPayload)>, ActiveError> {
         let Some(index) = self.find_entry(namespace, digest) else {
             return Ok(None);
         };
@@ -606,8 +607,8 @@ impl ActiveSegment {
         let codec = Codec::from_byte(entry.codec).map_err(SegmentError::from)?;
         let bytes = crate::codec::decode(codec, stored, entry.logical_length, max)
             .map_err(SegmentError::from)?;
-        super::segment::verify_logical(&entry, &bytes)?;
-        Ok(Some((entry, bytes)))
+        let payload = super::segment::verify_logical(&entry, bytes)?;
+        Ok(Some((entry, payload)))
     }
 
     #[cfg(test)]
@@ -640,7 +641,7 @@ impl ActiveSegment {
         else {
             return Ok(false);
         };
-        Ok(actual == proposed)
+        Ok(actual.bytes() == proposed)
     }
 }
 
@@ -870,7 +871,7 @@ mod tests {
                 usize::MAX,
             )
             .unwrap()
-            .map(|(_, bytes)| bytes)
+            .map(|(_, payload)| payload.into_bytes())
     }
 
     #[test]

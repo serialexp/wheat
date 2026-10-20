@@ -32,8 +32,8 @@ use super::{
     bulk::{BulkSegment, FinalizedBulk},
     segment::{
         CheckedRecord, MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE, PreparedSegmentRecord,
-        SealedSegment, SegmentBuilder, SegmentError, SegmentReader, SegmentRecord,
-        prepare_delta_record, prepare_record, verify_logical,
+        SealedSegment, SegmentBuilder, SegmentError, SegmentReader, SegmentRecord, VerifiedPayload,
+        prepare_delta_record, prepare_record, verify_payload,
     },
     trace::PackedStoreTraceCounters,
 };
@@ -152,20 +152,20 @@ enum ReadMode {
 
 /// A keyed catalog read's result, shaped by its [`ReadMode`].
 enum Found {
-    Payload { kind: u16, bytes: Vec<u8> },
+    Payload(VerifiedPayload),
     Length(u64),
 }
 
 /// A key's authenticated index entry, carrying its payload only in [`ReadMode::Payload`].
 struct Authority {
     entry: SegmentIndexEntry,
-    payload: Option<Vec<u8>>,
+    payload: Option<VerifiedPayload>,
 }
 
 impl Found {
-    fn into_payload(self) -> (u16, Vec<u8>) {
+    fn into_payload(self) -> VerifiedPayload {
         match self {
-            Self::Payload { kind, bytes } => (kind, bytes),
+            Self::Payload(payload) => payload,
             Self::Length(_) => unreachable!("a payload read returns a payload"),
         }
     }
@@ -377,7 +377,7 @@ impl SharedCatalog {
         &self,
         namespace: u8,
         digest: [u8; 32],
-    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+    ) -> Result<Option<VerifiedPayload>, CatalogError> {
         self.read(|catalog| catalog.get(namespace, digest))
     }
 
@@ -387,7 +387,7 @@ impl SharedCatalog {
         namespace: u8,
         digest: [u8; 32],
         max: usize,
-    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+    ) -> Result<Option<VerifiedPayload>, CatalogError> {
         self.read(|catalog| catalog.get_bounded(namespace, digest, max))
     }
 
@@ -843,8 +843,8 @@ impl PackedCatalog {
                 }
                 continue;
             }
-            if let Some((kind, bytes)) = self.get(record.namespace, record.digest)? {
-                if kind != record.kind || bytes != record.bytes {
+            if let Some(existing) = self.get(record.namespace, record.digest)? {
+                if existing.kind() != record.kind || existing.bytes() != record.bytes {
                     return Err(CatalogError::Corrupt(
                         "existing key differs from proposed bytes",
                     ));
@@ -1029,11 +1029,11 @@ impl PackedCatalog {
         }
         for checked in records {
             let record = checked.record();
-            if let Some((kind, bytes)) = self.get(record.namespace, record.digest)? {
+            if let Some(existing) = self.get(record.namespace, record.digest)? {
                 if let Some(trace) = &self.trace {
                     trace.deferred_duplicate();
                 }
-                if kind != record.kind || bytes != record.bytes {
+                if existing.kind() != record.kind || existing.bytes() != record.bytes {
                     return Err(CatalogError::Corrupt(
                         "existing key differs from proposed bytes",
                     ));
@@ -1194,7 +1194,7 @@ impl PackedCatalog {
         &mut self,
         namespace: u8,
         digest: [u8; 32],
-    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+    ) -> Result<Option<VerifiedPayload>, CatalogError> {
         self.get_bounded(namespace, digest, usize::MAX)
     }
 
@@ -1203,7 +1203,7 @@ impl PackedCatalog {
         namespace: u8,
         digest: [u8; 32],
         max: usize,
-    ) -> Result<Option<(u16, Vec<u8>)>, CatalogError> {
+    ) -> Result<Option<VerifiedPayload>, CatalogError> {
         Ok(self
             .read_traced(namespace, digest, ReadMode::Payload { max })?
             .map(Found::into_payload))
@@ -1249,7 +1249,7 @@ impl PackedCatalog {
             (Some(bulk), ReadMode::Payload { max }) => bulk
                 .segment
                 .lookup_bounded(namespace, digest, max)?
-                .map(|(kind, bytes)| Found::Payload { kind, bytes }),
+                .map(Found::Payload),
             (Some(bulk), ReadMode::Length) => bulk
                 .segment
                 .logical_length(namespace, digest)
@@ -1325,10 +1325,7 @@ impl PackedCatalog {
         mode: ReadMode,
     ) -> Result<Option<Found>, CatalogError> {
         let found = |authority: Authority| match authority.payload {
-            Some(bytes) => Found::Payload {
-                kind: authority.entry.kind,
-                bytes,
-            },
+            Some(payload) => Found::Payload(payload),
             None => Found::Length(authority.entry.logical_length),
         };
         if let Some(authority) =
@@ -1400,10 +1397,8 @@ impl PackedCatalog {
                 minimum: usize::try_from(*logical_length).unwrap_or(usize::MAX),
             }));
         }
-        let Some(Authority {
-            entry,
-            payload: bytes,
-        }) = self.lookup_authority(namespace, digest, Some(source), mode)?
+        let Some(Authority { entry, payload }) =
+            self.lookup_authority(namespace, digest, Some(source), mode)?
         else {
             return Err(CatalogError::Corrupt(
                 "locator source or key is not authoritative",
@@ -1419,11 +1414,9 @@ impl PackedCatalog {
                 "locator disagrees with authoritative index",
             ));
         }
-        Ok(Some(match bytes {
-            Some(bytes) => {
-                verify_logical(&entry, &bytes)?;
-                Found::Payload { kind: *kind, bytes }
-            }
+        // The source's reader verified the payload as it read it.
+        Ok(Some(match payload {
+            Some(payload) => Found::Payload(payload),
             None => Found::Length(entry.logical_length),
         }))
     }
@@ -1620,19 +1613,13 @@ impl PackedCatalog {
         let entries = self.active.entries().to_vec();
         let mut builder = SegmentBuilder::new(&self.segments)?;
         for entry in &entries {
-            let (_, bytes) = self
+            let (_, payload) = self
                 .active
                 .lookup_entry_bounded(entry.namespace, entry.digest, usize::MAX)?
                 .ok_or(CatalogError::Corrupt(
                     "active segment entry missing during seal rebuild",
                 ))?;
-            let record = SegmentRecord {
-                namespace: entry.namespace,
-                kind: entry.kind,
-                digest: entry.digest,
-                bytes: &bytes,
-            };
-            builder.push_prepared(prepare_record(CheckedRecord::check(record)?)?)?;
+            builder.push_prepared(prepare_record(payload.record())?)?;
         }
         Ok(builder.seal()?)
     }
@@ -1917,20 +1904,15 @@ impl PackedCatalog {
         // The previously written record's body, kept only when a planned
         // delta uses it as a base. In base-first layout that delta usually
         // comes next, so a base is rarely read twice.
-        let mut previous: Option<([u8; 32], Vec<u8>)> = None;
+        let mut previous: Option<([u8; 32], VerifiedPayload)> = None;
         for index in order {
             let record = inventory[index];
-            let bytes = self.read_repack_body(record, metadata.read_loose)?;
+            let body = self.read_repack_body(record, metadata.read_loose)?;
             source_body_reads = source_body_reads
                 .checked_add(1)
                 .ok_or(CatalogError::Corrupt("source body read count overflow"))?;
-            let logical = SegmentRecord {
-                namespace: record.namespace,
-                kind: record.kind,
-                digest: record.digest,
-                bytes: &bytes,
-            };
-            let whole = prepare_record(CheckedRecord::check(logical)?)?;
+            let logical = body.record();
+            let whole = prepare_record(logical)?;
             let mut resident = if previous.is_some() { 2 } else { 1 };
             // A planned base is usable only while it is in the open segment
             // with room for one more link.
@@ -1943,13 +1925,16 @@ impl PackedCatalog {
             if let Some(base) = usable_base {
                 let base = inventory[base];
                 let base_bytes = match &previous {
-                    Some((digest, body)) if *digest == base.digest => Cow::Borrowed(body),
+                    Some((digest, body)) if *digest == base.digest => Cow::Borrowed(body.bytes()),
                     _ => {
                         source_body_reads = source_body_reads
                             .checked_add(1)
                             .ok_or(CatalogError::Corrupt("source body read count overflow"))?;
                         resident += 1;
-                        Cow::Owned(self.read_repack_body(base, metadata.read_loose)?)
+                        Cow::Owned(
+                            self.read_repack_body(base, metadata.read_loose)?
+                                .into_bytes(),
+                        )
                     }
                 };
                 delta = prepare_delta_record(logical, base.digest, &base_bytes)?
@@ -1979,7 +1964,7 @@ impl PackedCatalog {
                 None => builder.push_prepared(whole)?,
             }
             builder_is_empty = false;
-            previous = is_base[index].then_some((record.digest, bytes));
+            previous = is_base[index].then_some((record.digest, body));
         }
         if !builder_is_empty {
             replacements.push(builder.seal()?);
@@ -2137,31 +2122,36 @@ impl PackedCatalog {
         &mut self,
         record: RepackInventoryEntry,
         read_loose: &mut dyn FnMut([u8; 32]) -> Result<Vec<u8>, CatalogError>,
-    ) -> Result<Vec<u8>, CatalogError> {
+    ) -> Result<VerifiedPayload, CatalogError> {
         match record.source {
             RecordSource::Segment(segment) => {
                 let reader = self
                     .sealed_readers
                     .get_mut(&segment)
                     .ok_or(CatalogError::Corrupt("repack source reader missing"))?;
-                let (_, bytes) = reader
+                let (_, payload) = reader
                     .lookup_entry_bounded(record.namespace, record.digest, usize::MAX)?
                     .ok_or(CatalogError::Corrupt(
                         "authenticated inventory entry missing",
                     ))?;
                 reader.clear_block_cache();
-                Ok(bytes)
+                Ok(payload)
             }
             RecordSource::Loose => {
                 let bytes = read_loose(record.digest)?;
-                // The loose reader verified identity; the inventory's kind and
-                // length came from the same verified bytes at planning time.
                 if bytes.len() as u64 != record.logical_length {
                     return Err(CatalogError::Corrupt(
                         "loose metadata changed since planning",
                     ));
                 }
-                Ok(bytes)
+                // The loose reader checked the object's identity; this also checks it
+                // is the kind the inventory recorded.
+                Ok(verify_payload(
+                    record.namespace,
+                    record.kind,
+                    record.digest,
+                    bytes,
+                )?)
             }
         }
     }

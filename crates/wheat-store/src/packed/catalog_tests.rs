@@ -5,8 +5,8 @@ use rusqlite::{Connection, params};
 use super::active::ActiveError;
 use super::catalog::*;
 use super::segment::{
-    CONTENT_NAMESPACE, CheckedRecord, SegmentError, SegmentRecord, test_content_map_kind,
-    test_content_map_root,
+    CONTENT_NAMESPACE, CheckedRecord, SegmentError, SegmentRecord, VerifiedPayload,
+    test_content_map_kind, test_content_map_root,
 };
 
 const LOCATOR_FILE: &str = "catalog-locator.sqlite3";
@@ -16,10 +16,13 @@ fn record(bytes: &[u8]) -> CheckedRecord<'_> {
 }
 
 fn assert_value(store: &mut PackedCatalog, value: CheckedRecord<'_>) {
-    assert_eq!(
-        store.get(CONTENT_NAMESPACE, value.digest).unwrap().unwrap(),
-        (value.kind, value.bytes.to_vec())
-    );
+    let payload = store.get(CONTENT_NAMESPACE, value.digest).unwrap().unwrap();
+    assert_eq!((payload.kind(), payload.bytes()), (value.kind, value.bytes));
+}
+
+/// A read payload as the kind and bytes a test compares.
+fn kind_and_bytes(payload: VerifiedPayload) -> (u16, Vec<u8>) {
+    (payload.kind(), payload.into_bytes())
 }
 
 fn repack_options() -> CatalogRepackOptions {
@@ -1151,7 +1154,10 @@ fn reads_proceed_beside_an_append_and_see_only_published_records() {
             move || {
                 let read = |value: CheckedRecord<'_>| {
                     (
-                        shared.get(CONTENT_NAMESPACE, value.digest).unwrap(),
+                        shared
+                            .get(CONTENT_NAMESPACE, value.digest)
+                            .unwrap()
+                            .map(kind_and_bytes),
                         shared
                             .logical_length(CONTENT_NAMESPACE, value.digest)
                             .unwrap(),
@@ -1180,7 +1186,10 @@ fn reads_proceed_beside_an_append_and_see_only_published_records() {
         writer.join().unwrap().unwrap();
         for value in [sealed, active, appending] {
             assert_eq!(
-                shared.get(CONTENT_NAMESPACE, value.digest).unwrap(),
+                shared
+                    .get(CONTENT_NAMESPACE, value.digest)
+                    .unwrap()
+                    .map(kind_and_bytes),
                 Some((value.kind, value.bytes.to_vec())),
                 "{point:?}"
             );
@@ -1260,8 +1269,8 @@ fn assert_history(store: &mut PackedCatalog, history: &[([u8; 32], Vec<u8>)]) {
             store
                 .get(super::segment::METADATA_NAMESPACE, record.digest)
                 .unwrap()
-                .unwrap(),
-            (record.kind, record.bytes.to_vec())
+                .map(kind_and_bytes),
+            Some((record.kind, record.bytes.to_vec()))
         );
     }
 }

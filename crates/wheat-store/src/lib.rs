@@ -213,11 +213,11 @@ pub mod packed_segment_reader {
             match &mut self.reader {
                 Reader::Sealed(reader) => reader
                     .lookup_entry_bounded(namespace, digest, max)
-                    .map(|found| found.map(|(_, payload)| payload))
+                    .map(|found| found.map(|(_, payload)| payload.into_bytes()))
                     .map_err(|error| error.to_string()),
                 Reader::Active(active) => active
                     .lookup_entry_bounded(namespace, digest, max)
-                    .map(|found| found.map(|(_, payload)| payload))
+                    .map(|found| found.map(|(_, payload)| payload.into_bytes()))
                     .map_err(|error| error.to_string()),
             }
         }

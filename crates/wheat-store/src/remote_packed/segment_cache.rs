@@ -52,7 +52,7 @@ impl SegmentCache {
         entry
             .reader
             .lookup_entry_bounded(namespace, digest, usize::MAX)
-            .map(|opt| opt.map(|(index_entry, bytes)| (index_entry.kind, bytes)))
+            .map(|opt| opt.map(|(index_entry, payload)| (index_entry.kind, payload.into_bytes())))
     }
 
     /// Insert a segment into the cache from its raw bytes.

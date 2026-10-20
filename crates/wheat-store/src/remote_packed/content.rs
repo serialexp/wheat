@@ -6,7 +6,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore as BackendObjectStore, ObjectStoreExt, path::Path};
 use wheat_core::{ContentId, VerifiedContent};
 
-use crate::content_store::ContentBackend;
+use crate::content_store::{ContentBackend, StoredContent};
 use crate::{ContentStoreError, codec};
 
 fn codec_error(id: ContentId, max: usize, error: codec::CodecError) -> ContentStoreError {
@@ -328,21 +328,17 @@ impl ContentBackend for RemoteContentBackend {
     }
 
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
-        crate::content_store::resolve_delta_chain(id, max, |current_id| {
-            self.get_raw_envelope(current_id)
-        })
+        crate::content_store::resolve_delta_chain(id, max, |current_id| self.get_stored(current_id))
     }
 
-    fn get_raw_envelope(
-        &self,
-        id: ContentId,
-    ) -> Result<(codec::EnvelopeHeader, Vec<u8>), ContentStoreError> {
+    fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|e| ContentStoreError::Io(std::io::Error::other(e)))?;
         let path = self.path(id);
         tokio::task::block_in_place(|| {
             rt.block_on(fetch_raw_envelope(self.backend.as_ref(), &path, id))
         })
+        .map(StoredContent::from)
     }
 
     fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {

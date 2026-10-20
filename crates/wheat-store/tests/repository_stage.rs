@@ -170,6 +170,29 @@ async fn verified_content_is_stored_without_hashing_it_again() {
     }
 }
 
+/// Staged and batched content is held verified, so reading it back through the stage or
+/// the pending publications hashes nothing.
+#[tokio::test]
+async fn staged_content_reads_back_without_hashing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackedObjectStore::open(dir.path()).unwrap();
+    let staged = VerifiedContent::new(vec![41; 4096]);
+    let pending = VerifiedContent::new(vec![42; 4096]);
+    let stage = RepositoryStage::new(&store, 16, 1 << 20);
+    stage.put_content([(staged.clone(), None)]).await.unwrap();
+    let taken = RepositoryStage::new(&store, 16, 1 << 20);
+    taken.put_content([(pending.clone(), None)]).await.unwrap();
+    let mut publications = PendingPublications::default();
+    publications.push(taken.take().await.unwrap());
+    let view = publications.over(&stage);
+
+    let before = wheat_core::content_bytes_hashed();
+    assert_eq!(stage.content().get(staged.id()).unwrap(), staged.bytes());
+    assert_eq!(view.content().get(staged.id()).unwrap(), staged.bytes());
+    assert_eq!(view.content().get(pending.id()).unwrap(), pending.bytes());
+    assert_eq!(wheat_core::content_bytes_hashed(), before);
+}
+
 #[tokio::test]
 async fn content_reaching_the_byte_limit_is_stored_with_the_staged_objects() {
     let dir = tempfile::tempdir().unwrap();

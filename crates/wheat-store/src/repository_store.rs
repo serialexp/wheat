@@ -14,8 +14,7 @@ use crate::{
     BatchObjectStore, ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError,
     StoredObject,
     batch::stored_object,
-    codec::{Codec, EnvelopeHeader},
-    content_store::{ContentBackend, ContentItem},
+    content_store::{ContentBackend, ContentItem, StoredContent},
 };
 
 #[derive(Debug, Error)]
@@ -470,15 +469,8 @@ impl StagedBlob {
         Ok(self.content.bytes().to_vec())
     }
 
-    fn raw_envelope(&self) -> (EnvelopeHeader, Vec<u8>) {
-        (
-            EnvelopeHeader {
-                codec: Codec::Raw,
-                stored_length: self.len() as u64,
-                logical_length: self.len() as u64,
-            },
-            self.content.bytes().to_vec(),
-        )
+    fn stored(&self) -> StoredContent {
+        StoredContent::Verified(self.content.clone())
     }
 }
 
@@ -551,13 +543,10 @@ impl ContentBackend for StagedContent {
         }
     }
 
-    fn get_raw_envelope(
-        &self,
-        id: ContentId,
-    ) -> Result<(EnvelopeHeader, Vec<u8>), ContentStoreError> {
+    fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
         match self.staged(id)? {
-            Some(blob) => Ok(blob.raw_envelope()),
-            None => self.stored.raw_envelope(id),
+            Some(blob) => Ok(blob.stored()),
+            None => self.stored.stored(id),
         }
     }
 
@@ -620,13 +609,10 @@ impl ContentBackend for PendingContent {
         }
     }
 
-    fn get_raw_envelope(
-        &self,
-        id: ContentId,
-    ) -> Result<(EnvelopeHeader, Vec<u8>), ContentStoreError> {
+    fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
         match self.pending(id) {
-            Some(blob) => Ok(blob.raw_envelope()),
-            None => self.below.raw_envelope(id),
+            Some(blob) => Ok(blob.stored()),
+            None => self.below.stored(id),
         }
     }
 

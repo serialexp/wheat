@@ -20,10 +20,10 @@ use super::{
         SharedCatalog,
     },
     generation_reader::GenerationReader,
-    segment::{CONTENT_NAMESPACE, CheckedRecord, METADATA_NAMESPACE},
+    segment::{CONTENT_NAMESPACE, CheckedRecord, METADATA_NAMESPACE, VerifiedPayload},
     trace::{PackedStoreTrace, PackedStoreTraceCounters},
 };
-use crate::content_store::ContentBackend;
+use crate::content_store::{ContentBackend, StoredContent};
 use crate::{
     ContentGenerationIndex, ContentGenerationManifest, ContentItem, ContentRepackLimits,
     ContentRepackPlan, ContentStore, ContentStoreError, Durability, ImmutableObjectStore,
@@ -375,9 +375,12 @@ impl PackedObjectStore {
                 options.content_limits.max_record_logical_bytes,
                 |current| {
                     if current == *id {
-                        self.engine.content.read_local_raw_envelope(current)
+                        self.engine
+                            .content
+                            .read_local_raw_envelope(current)
+                            .map(StoredContent::from)
                     } else {
-                        self.engine.get_raw_envelope(current)
+                        self.engine.get_stored(current)
                     }
                 },
             )?;
@@ -1282,7 +1285,7 @@ impl ImmutableObjectStore for PackedObjectStore {
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
-        let Some((stored_kind, bytes)) = self
+        let Some(payload) = self
             .engine
             .catalog
             .get(METADATA_NAMESPACE, *id.as_bytes())
@@ -1300,16 +1303,16 @@ impl ImmutableObjectStore for PackedObjectStore {
         };
         // SegmentReader authenticated the immutable segment and verified this
         // payload against the requested object digest before returning it.
-        let kind = ObjectKind::from_code(stored_kind).ok_or_else(|| {
+        let kind = ObjectKind::from_code(payload.kind()).ok_or_else(|| {
             ObjectStoreError::Integrity("packed metadata has an unknown object kind".into())
         })?;
         if let Some(trace) = &self.engine.trace {
-            trace.object_get(kind as u8, bytes.len());
+            trace.object_get(kind as u8, payload.bytes().len());
         }
         Ok(StoredObject {
             id,
             kind,
-            canonical_bytes: bytes.into(),
+            canonical_bytes: payload.into_bytes().into(),
         })
     }
 
@@ -1346,7 +1349,7 @@ impl ContentBackend for PackedEngine {
             .content_generation();
         if generation.generation != 0 || generation.manifest != [0; 32] {
             return crate::content_store::resolve_delta_chain(id, max, |current_id| {
-                self.get_raw_envelope(current_id)
+                self.get_stored(current_id)
             });
         }
         let value = self
@@ -1358,20 +1361,20 @@ impl ContentBackend for PackedEngine {
                 }
                 error => content_catalog_error(id, error),
             })?;
-        if let Some((_, bytes)) = value.as_ref().filter(|(_, bytes)| bytes.len() > max) {
+        if let Some(payload) = value.as_ref().filter(|payload| payload.bytes().len() > max) {
             return Err(ContentStoreError::TooLarge {
                 id,
                 max,
-                minimum: bytes.len(),
+                minimum: payload.bytes().len(),
             });
         }
-        let Some((_kind, bytes)) = value else {
+        let Some(payload) = value else {
             // Not in a packed segment — could be oversized raw content or a
             // delta envelope in the loose content directory. Use
-            // resolve_delta_chain with our own get_raw_envelope so that a
+            // resolve_delta_chain with our own get_stored so that a
             // delta stored loose can reference a base in a packed segment.
             let bytes = crate::content_store::resolve_delta_chain(id, max, |current_id| {
-                self.get_raw_envelope(current_id)
+                self.get_stored(current_id)
             })?;
             if let Some(trace) = &self.trace {
                 trace.content_get(bytes.len());
@@ -1380,34 +1383,30 @@ impl ContentBackend for PackedEngine {
         };
         // SegmentReader authenticated the immutable segment and verified this
         // payload against the requested content digest before returning it.
+        let bytes = payload.into_bytes();
         if let Some(trace) = &self.trace {
             trace.content_get(bytes.len());
         }
         Ok(bytes)
     }
 
-    fn get_raw_envelope(
-        &self,
-        id: ContentId,
-    ) -> Result<(crate::codec::EnvelopeHeader, Vec<u8>), ContentStoreError> {
+    fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
         if let Some(record) = self.with_generation(id, |reader| reader.read(id))? {
-            return Ok(record);
+            return Ok(record.into());
         }
-        // Content not yet repacked lives in segments as raw bytes, not envelopes.
+        // Content not yet repacked lives in segments as raw bytes, which the segment's
+        // reader verified as it read them.
         let value = self
             .catalog
             .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), usize::MAX)
             .map_err(|error| content_catalog_error(id, error))?;
-        if let Some((_kind, bytes)) = value {
-            let header = crate::codec::EnvelopeHeader {
-                codec: crate::codec::Codec::Raw,
-                stored_length: bytes.len() as u64,
-                logical_length: bytes.len() as u64,
-            };
-            return Ok((header, bytes));
+        if let Some(content) = value.and_then(VerifiedPayload::into_content) {
+            return Ok(StoredContent::Verified(content));
         }
         // Fall back to loose content store (which uses envelope files).
-        self.content.read_local_raw_envelope(id)
+        self.content
+            .read_local_raw_envelope(id)
+            .map(StoredContent::from)
     }
 
     /// Answers from indexed metadata in the same order reads resolve content: the

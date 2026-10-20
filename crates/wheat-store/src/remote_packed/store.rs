@@ -248,7 +248,7 @@ impl RemotePackedStore {
         // Look up the object in the now-cached segment.
         reader
             .lookup_entry_bounded(namespace, digest, usize::MAX)
-            .map(|opt| opt.map(|(entry, bytes)| (entry.kind, bytes)))
+            .map(|opt| opt.map(|(entry, payload)| (entry.kind, payload.into_bytes())))
             .map_err(segment_integrity)
     }
 }
