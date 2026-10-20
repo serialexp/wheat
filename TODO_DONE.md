@@ -2,6 +2,25 @@
 
 Finished items, moved here from `TODO.md` under the same headings.
 
+## Found while dogfooding (2026-10-19)
+
+- `[x]` **`structural_delta::one_step_forward_yields_little_more_than_the_difference`
+  fails about 1 run in 20** (failed CI on 37d047f). Change IDs are UUIDv7, so the
+  radix maps' shape depends on which millisecond each change was made in. When two keys
+  straddle a byte boundary, a new view's map splits a node that its old counterpart
+  keeps whole, and the walk sent the split-off node again. Done 2026-10-20 by fixing
+  the walk, not the test. There were two causes:
+  - A revised or resolved view paired with its nearest old ancestor. Now it pairs
+    with the old view it replaces, which is the old child of its parent's counterpart
+    ending in the same change, and whose maps split the same way.
+  - A radix node shared by two collections, pruned as aligned in one, was walked and
+    sent again in the other. Now anything pruned as aligned counts as old everywhere.
+
+  `one_step_forward_yields_the_difference_however_change_ids_split_the_maps` covers
+  48 fixed ID layouts. On the old walk, at least 30 of 96 such layouts failed. The 3,000-run
+  stress of the random test passes. `fetch_incremental` gained a revise step: 9.5
+  instead of 11.5 objects per recomposed view, for 19.0 instead of 17.6 store reads.
+
 ## Found while scoping the Scion lessons (2026-10-15)
 
 - `[x]` **`catalog.head` and `repack.intent` are hand-encoded.** Both are BinSchema
@@ -272,6 +291,9 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **`one_step_forward_yields_little_more_than_the_difference` fails about one
+  run in twelve (2026-09-26).** The same flake, found again on 2026-10-19 and fixed
+  on 2026-10-20 by better pairing; see "Found while dogfooding (2026-10-19)".
 - `[x]` **Uploaded content is hashed four or five times on the server (2026-09-26).**
   Measured at six times on a loose server. Done 2026-10-20: content is hashed where
   it comes in, which makes it a `VerifiedContent` (wheat-core). The stage,

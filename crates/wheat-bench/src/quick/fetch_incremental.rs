@@ -8,6 +8,12 @@
 //! them: neither the push, the walk's store reads, nor the content IDs the client
 //! looks up for that one change may grow with the history. The early reader then
 //! catches up on everything in between, and its store must validate.
+//!
+//! Last, the writer revises change `early`, which recomposes every view above it, and
+//! the late reader fetches that. Each new view pairs with the old view it replaces;
+//! when it paired with the old view below its stack instead, it pushed 11.5 objects
+//! per recomposed view for 17.6 store reads (2026-10-20, release, mean of four
+//! runs), against 9.5 objects for 19.0 reads with the replaced view.
 
 use std::path::PathBuf;
 
@@ -50,6 +56,7 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let mut history = History {
         writer: clients.clone_new("writer")?.0,
         envelopes: Vec::new(),
+        changes: Vec::new(),
         publishes: Vec::new(),
     };
 
@@ -69,6 +76,13 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     clients.run(&early_reader, &["validate"])?;
     recorder.runs("publish", &history.publishes);
 
+    // Revising change `early` recomposes every view above it; the late reader fetches
+    // that.
+    let revised = history.revise(&clients, early)?;
+    let fetch_revise = clients.fetch(&late_reader)?;
+    clients.run(&late_reader, &["validate"])?;
+    let recomposed = (changes + 1 - early + 1) as f64;
+
     // The walks the server ran for those fetches, now counted on its store.
     let envelopes = history.envelopes;
     let store = server.stop()?;
@@ -79,10 +93,12 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let walk_late = runtime.block_on(walk(&objects, envelope(changes), envelope(changes + 1)))?;
     let walk_catch_up =
         runtime.block_on(walk(&objects, envelope(early + 1), envelope(changes + 1)))?;
+    let walk_revise = runtime.block_on(walk(&objects, envelope(changes + 1), revised))?;
     for (name, fetched, walked) in [
         ("early", &fetch_early, &walk_early),
         ("late", &fetch_late, &walk_late),
         ("catch-up", &catch_up, &walk_catch_up),
+        ("revise", &fetch_revise, &walk_revise),
     ] {
         ensure!(
             number(&fetched.result, "pushed")? == walked.emitted as f64,
@@ -97,6 +113,8 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         ("fetch_early", &fetch_early, &walk_early, 1.0),
         ("fetch_late", &fetch_late, &walk_late, 1.0),
         ("catch_up", &catch_up, &walk_catch_up, caught_up),
+        // Per recomposed view.
+        ("revise", &fetch_revise, &walk_revise, recomposed),
     ] {
         recorder.timing(step, fetched.timing);
         recorder.value(
@@ -224,10 +242,11 @@ impl Clients<'_> {
 }
 
 /// The writer's published history: `envelopes[n - 1]` is the envelope after change
-/// `n`.
+/// `n`, and `changes[n - 1]` that change's ID.
 struct History {
     writer: Client,
     envelopes: Vec<RepositoryEnvelopeId>,
+    changes: Vec<String>,
     publishes: Vec<Timing>,
 }
 
@@ -236,9 +255,9 @@ impl History {
     fn publish_until(&mut self, clients: &Clients<'_>, changes: usize) -> Result<()> {
         while self.envelopes.len() < changes {
             let change = self.envelopes.len() + 1;
-            let path = format!("dir{}/file{change}.txt", change % 16);
+            let path = change_path(change);
             let value = format!("change {change}\n");
-            clients.run(
+            let created = clients.run(
                 &self.writer,
                 &[
                     "change",
@@ -251,15 +270,43 @@ impl History {
                     &format!("change {change}"),
                 ],
             )?;
-            let published = clients.run(&self.writer, &["publish"])?;
-            self.publishes.push(published.timing);
-            let envelope = published.result["envelope"]
+            let id = created.result["change"]
                 .as_str()
-                .context("publish reported no envelope")?;
-            self.envelopes.push(envelope.parse()?);
+                .context("change new reported no change")?;
+            self.changes.push(id.to_owned());
+            self.publish(clients)?;
         }
         Ok(())
     }
+
+    /// Gives change `change` a new revision, which recomposes every view above it,
+    /// and publishes that.
+    fn revise(&mut self, clients: &Clients<'_>, change: usize) -> Result<RepositoryEnvelopeId> {
+        clients.run(&self.writer, &["materialize"])?;
+        let path = change_path(change);
+        std::fs::write(self.writer.root.join(&path), format!("revised {change}\n"))?;
+        let id = &self.changes[change - 1];
+        clients.run(
+            &self.writer,
+            &["add", "--message", "revised", "--change", id, &path],
+        )?;
+        self.publish(clients)
+    }
+
+    fn publish(&mut self, clients: &Clients<'_>) -> Result<RepositoryEnvelopeId> {
+        let published = clients.run(&self.writer, &["publish"])?;
+        self.publishes.push(published.timing);
+        let envelope: RepositoryEnvelopeId = published.result["envelope"]
+            .as_str()
+            .context("publish reported no envelope")?
+            .parse()?;
+        self.envelopes.push(envelope);
+        Ok(envelope)
+    }
+}
+
+fn change_path(change: usize) -> String {
+    format!("dir{}/file{change}.txt", change % 16)
 }
 
 /// A command's timing and its JSON `result`.

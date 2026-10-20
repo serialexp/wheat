@@ -74,6 +74,11 @@ async fn record(
 /// Branches, a dependency, a revision that conflicts a later change, its
 /// resolution, and labels that move.
 async fn history() -> History {
+    history_with(std::array::from_fn(|_| ChangeId::new())).await
+}
+
+/// [`history`] with the IDs of its changes `a`, `b`, `d` and `c`, in that order.
+async fn history_with([a, b, d, c]: [ChangeId; 4]) -> History {
     let dir = tempfile::tempdir().unwrap();
     let objects = scratch_store(&dir);
     let content = ContentStore::new(dir.path().join("content"));
@@ -102,7 +107,6 @@ async fn history() -> History {
     let base = repository.base_view().id;
     step!(repository, &[("main", base)]);
 
-    let a = ChangeId::new();
     let a1_edits = exact("a", None, b"a1");
     let a1_edit = *a1_edits.edits.keys().next().unwrap();
     let a1 = repository
@@ -117,7 +121,6 @@ async fn history() -> History {
         .unwrap();
     step!(repository, &[("main", a1.resulting_view)]);
 
-    let b = ChangeId::new();
     let b1 = repository
         .create_change_with_id(
             base,
@@ -131,7 +134,6 @@ async fn history() -> History {
     step!(repository, &[("main", b1.resulting_view)]);
 
     // A second branch off the base view.
-    let d = ChangeId::new();
     let d1 = repository
         .create_change_with_id(
             base,
@@ -147,7 +149,6 @@ async fn history() -> History {
         &[("main", b1.resulting_view), ("side", d1.resulting_view)]
     );
 
-    let c = ChangeId::new();
     let c1 = repository
         .create_change_with_metadata(
             base,
@@ -365,7 +366,34 @@ async fn every_pair_yields_the_difference_and_nothing_outside_the_closure() {
 
 #[tokio::test]
 async fn one_step_forward_yields_little_more_than_the_difference() {
-    let history = history().await;
+    assert_one_step_forward_yields_the_difference(&history().await, "random IDs").await;
+}
+
+/// Which change IDs share a key prefix decides where the views' radix maps split.
+/// A revised or resolved view must still pair with the view it replaces, whose maps
+/// split the same way, not with the ancestor below it, whose maps may not. Every
+/// layout of the four changes on either side of one byte, at a few depths.
+#[tokio::test]
+async fn one_step_forward_yields_the_difference_however_change_ids_split_the_maps() {
+    for position in [4, 7, 14] {
+        for layout in 0..16u8 {
+            // Version-7 UUIDs, like `ChangeId::new`'s, that differ only in byte
+            // `position` (by `layout`) and in the last byte.
+            let id = |index: u8| {
+                let mut bytes = [
+                    0x01, 0xa1, 0x56, 0xea, 0x11, 0x22, 0x70, 0x33, 0, 0, 0, 0, 0, 0, 0, index,
+                ];
+                bytes[position] = if layout >> index & 1 == 1 { 0x5c } else { 0x5b };
+                ChangeId::from_bytes(bytes)
+            };
+            let history = history_with([id(0), id(1), id(2), id(3)]).await;
+            let context = format!("byte {position}, layout {layout:04b}");
+            assert_one_step_forward_yields_the_difference(&history, &context).await;
+        }
+    }
+}
+
+async fn assert_one_step_forward_yields_the_difference(history: &History, context: &str) {
     for i in 1..history.envelopes.len() {
         let yielded = walk(
             &history.objects,
@@ -384,7 +412,7 @@ async fn one_step_forward_yields_little_more_than_the_difference() {
         }
         assert!(
             extra.is_empty(),
-            "step {i}: yielded {} of a closure of {}, including old {extra:?}",
+            "{context}, step {i}: yielded {} of a closure of {}, including old {extra:?}",
             yielded.len(),
             history.closures[i].len()
         );

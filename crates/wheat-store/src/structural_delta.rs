@@ -51,7 +51,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use wheat_core::{
-    CanonicalObjectError, DirectoryEntry, ObjectId, RepositoryEnvelopeId, RetainedSetId,
+    CanonicalObjectError, ChangeId, DirectoryEntry, ObjectId, RepositoryEnvelopeId, RetainedSetId,
     RevisionId, ViewId,
 };
 
@@ -74,6 +74,9 @@ pub struct StructuralDeltaLimits {
     pub max_pending: usize,
     /// Most lineage links followed to find a new view's nearest old ancestor.
     pub max_lineage_chain: usize,
+    /// Most old children of one view read to find the old view a new one replaces;
+    /// a view with more pairs its new children with itself.
+    pub max_old_children: usize,
 }
 
 impl Default for StructuralDeltaLimits {
@@ -82,6 +85,7 @@ impl Default for StructuralDeltaLimits {
             max_missing_batch: 4_096,
             max_pending: 4_000_000,
             max_lineage_chain: 100_000,
+            max_old_children: 64,
         }
     }
 }
@@ -111,6 +115,8 @@ pub struct StructuralDeltaStats {
     pub old_missing: u64,
     /// Subgraphs skipped because the old side has the same ID at the same place.
     pub pruned_aligned: u64,
+    /// Subgraphs skipped because the old side had the same ID at another place.
+    pub pruned_proven_old: u64,
     /// Subgraphs skipped because the old state retains them.
     pub pruned_retained: u64,
     /// References skipped because they were yielded already.
@@ -435,12 +441,22 @@ pub struct StructuralDelta<'a, S> {
     stacks: [Vec<Task>; 3],
     parked: Vec<Task>,
     emitted: HashSet<ObjectId>,
+    /// Objects pruned because the old side had the same ID at the same place. They
+    /// are in the old closure wherever else they turn up: one radix node can sit in
+    /// two collections, and its pair there may have a different shape.
+    proven_old: HashSet<ObjectId>,
     radix_walked: HashSet<(ObjectId, Role, KeyPath)>,
     old_state: Option<OldState>,
     retained_cache: HashMap<(usize, ObjectId), bool>,
     /// New view → the old view it pairs with.
     counterparts: HashMap<ViewId, Option<ViewId>>,
     old_views: HashMap<ViewId, Option<wheat_core::ViewRecord>>,
+    /// New view → the last change in its order; `None` for the base view or when
+    /// the view is not here yet.
+    new_last: HashMap<ViewId, Option<ChangeId>>,
+    /// Old view → its old children by their last change; `None` when it has more than
+    /// `max_old_children` or they can't be read.
+    old_children: HashMap<ViewId, Option<HashMap<ChangeId, ViewId>>>,
     /// Edits of old retained revisions, and which revisions have been looked at.
     old_edits: HashSet<ObjectId>,
     old_revisions_learned: HashSet<RevisionId>,
@@ -466,11 +482,14 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             stacks: Default::default(),
             parked: Vec::new(),
             emitted: HashSet::new(),
+            proven_old: HashSet::new(),
             radix_walked: HashSet::new(),
             old_state: None,
             retained_cache: HashMap::new(),
             counterparts: HashMap::new(),
             old_views: HashMap::new(),
+            new_last: HashMap::new(),
+            old_children: HashMap::new(),
             old_edits: HashSet::new(),
             old_revisions_learned: HashSet::new(),
             parent_of: HashMap::new(),
@@ -551,10 +570,25 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         Ok(())
     }
 
+    /// Notes that `id` was skipped as the same as its old counterpart.
+    fn prune_aligned(&mut self, id: ObjectId) {
+        self.stats.pruned_aligned += 1;
+        self.proven_old.insert(id);
+    }
+
+    /// Whether `id` was proven old at another place; counts the skip if so.
+    fn prune_proven_old(&mut self, id: ObjectId) -> bool {
+        let proven = self.proven_old.contains(&id);
+        if proven {
+            self.stats.pruned_proven_old += 1;
+        }
+        proven
+    }
+
     /// Pushes a reference unless it is the same as its old counterpart.
     fn push_paired(&mut self, task: Task, old: Option<ObjectId>) -> Result<()> {
         if old == Some(task.id()) {
-            self.stats.pruned_aligned += 1;
+            self.prune_aligned(task.id());
             return Ok(());
         }
         if self.emitted.contains(&task.id()) {
@@ -715,7 +749,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             let (role, old) = match site {
                 StateSite::BaseView => {
                     if old_field(|state| state.base_view.into()) == Some(id) {
-                        self.stats.pruned_aligned += 1;
+                        self.prune_aligned(id);
                         return Ok(());
                     }
                     return self.push_entity(id, Entity::View, false);
@@ -758,7 +792,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         parent: Option<ViewId>,
     ) -> Result<()> {
         if old == Some(id) {
-            self.stats.pruned_aligned += 1;
+            self.prune_aligned(id);
             return Ok(());
         }
         self.push(Task::Radix {
@@ -797,6 +831,9 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             self.stats.pruned_emitted += 1;
             return Ok(None);
         }
+        if self.prune_proven_old(task.id()) {
+            return Ok(None);
+        }
         let Some(stored) = self.read_new(&task, "tree", &[ObjectKind::Tree]).await? else {
             return Ok(None);
         };
@@ -829,6 +866,9 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         else {
             unreachable!()
         };
+        if self.prune_proven_old(id) {
+            return Ok(None);
+        }
         if !self.radix_walked.insert((id, role, path)) {
             self.stats.pruned_emitted += 1;
             return Ok(None);
@@ -883,7 +923,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                         OldRadix::At(old, skip) if *skip == old.prefix.len() => {
                             match old.children.iter().find(|(old_edge, _)| *old_edge == edge) {
                                 Some(&(_, old_child)) if old_child == target => {
-                                    self.stats.pruned_aligned += 1;
+                                    self.prune_aligned(target);
                                     continue;
                                 }
                                 Some(&(_, old_child)) => OldRadix::Id(old_child),
@@ -1056,7 +1096,13 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
     }
 
     /// The old view whose structures a new view `view` is best compared with: `view`
-    /// itself if the old state retains it, else its nearest old lineage ancestor.
+    /// itself if the old state retains it, else the old view it replaces, else its
+    /// nearest old lineage ancestor.
+    ///
+    /// A new view replaces the old child of its parent's counterpart that ends in the
+    /// same change: revising a change, or resolving its conflict, recomposes the views
+    /// from that change up, and each new one mostly shares its maps with the old one
+    /// in its place rather than with the views below it.
     ///
     /// Answers are remembered for every view on the way up, so a long line of new
     /// views costs one climb, not one per view. A climb longer than
@@ -1067,7 +1113,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         }
         let mut climbed = Vec::new();
         let mut current = view;
-        let found = loop {
+        let mut found = loop {
             if let Some(&known) = self.counterparts.get(&current) {
                 break known;
             }
@@ -1083,10 +1129,94 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                 None => break None,
             }
         };
-        for view in climbed {
+        // Back down the climb, from the view just above `found` to `view`.
+        for view in climbed.into_iter().rev() {
+            if let Some(parent) = found
+                && let Some(replaced) = self.replaced_old_view(parent, view).await?
+            {
+                found = Some(replaced);
+            }
             self.counterparts.insert(view, found);
         }
         Ok(found)
+    }
+
+    /// The old child of `parent` whose last change is the new view `view`'s.
+    async fn replaced_old_view(&mut self, parent: ViewId, view: ViewId) -> Result<Option<ViewId>> {
+        let Some(last) = self.new_last_change(view).await? else {
+            return Ok(None);
+        };
+        if !self.old_children.contains_key(&parent) {
+            let children = self.old_children_by_last(parent).await?;
+            self.old_children.insert(parent, children);
+        }
+        Ok(self.old_children[&parent]
+            .as_ref()
+            .and_then(|children| children.get(&last).copied()))
+    }
+
+    /// The last change of the new view `view`, read without parking: a view that is
+    /// not here yet just pairs with its ancestor.
+    async fn new_last_change(&mut self, view: ViewId) -> Result<Option<ChangeId>> {
+        if let Some(&last) = self.new_last.get(&view) {
+            return Ok(last);
+        }
+        self.stats.new_reads += 1;
+        let last = match self.objects.get(view.into()).await {
+            Ok(stored) if stored.kind == ObjectKind::View => {
+                decode(&stored, wheat_core::decode_view_record)?.order.last
+            }
+            Ok(_) | Err(ObjectStoreError::Missing(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        self.new_last.insert(view, last);
+        Ok(last)
+    }
+
+    /// The old children of `parent` by their last change, or `None` when there are
+    /// more than `max_old_children` or they can't all be read.
+    async fn old_children_by_last(
+        &mut self,
+        parent: ViewId,
+    ) -> Result<Option<HashMap<ChangeId, ViewId>>> {
+        let Some(root) = self.old_lineage_children(parent).await? else {
+            return Ok(Some(HashMap::new()));
+        };
+        let sets = RetainedSetStore::new(self.objects);
+        let mut ids = Vec::new();
+        let listed = async {
+            let mut cursor = sets
+                .cursor(RetainedSetId::from_digest(*root.as_bytes()))
+                .await?;
+            while let Some(child) = cursor.next().await? {
+                if ids.len() == self.limits.max_old_children {
+                    return Ok(false);
+                }
+                ids.push(child);
+            }
+            Ok(true)
+        }
+        .await;
+        match listed {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(CollectionError::Store(ObjectStoreError::Missing(_))) => {
+                self.stats.old_missing += 1;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let mut children = HashMap::new();
+        for id in ids {
+            let child = ViewId::from_digest(*id.as_bytes());
+            let Some(record) = self.old_view(Some(child)).await? else {
+                return Ok(None);
+            };
+            if let Some(last) = record.order.last {
+                children.entry(last).or_insert(child);
+            }
+        }
+        Ok(Some(children))
     }
 
     async fn old_view(&mut self, view: Option<ViewId>) -> Result<Option<wheat_core::ViewRecord>> {
@@ -1141,6 +1271,9 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             self.stats.pruned_emitted += 1;
             return Ok(None);
         }
+        if self.prune_proven_old(id) {
+            return Ok(None);
+        }
         if !known_new && self.old_retains(entity, id).await?
             || entity == Entity::Edit && self.old_edits.contains(&id)
         {
@@ -1175,9 +1308,9 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
 
     async fn follow_view(&mut self, stored: &StoredObject) -> Result<()> {
         let view = decode(stored, wheat_core::decode_view_record)?;
-        let counterpart = self
-            .old_counterpart(ViewId::from_digest(*stored.id.as_bytes()))
-            .await?;
+        let id = ViewId::from_digest(*stored.id.as_bytes());
+        self.new_last.insert(id, view.order.last);
+        let counterpart = self.old_counterpart(id).await?;
         let old = self.old_view(counterpart).await?;
         let old_field = |pick: fn(wheat_core::ViewRecord) -> ObjectId| old.map(pick);
         object_graph::view(&view, |reference| {
@@ -1338,10 +1471,21 @@ mod tests {
         old: Option<RetainedSetId>,
         new: RetainedSetId,
     ) -> (HashSet<ObjectId>, HashSet<ObjectId>) {
+        walk_sets(objects, &[(Role::RetainedViews, old, new)]).await
+    }
+
+    /// [`walk_set`] over several sets, walked in order.
+    async fn walk_sets(
+        objects: &LooseObjectStore,
+        sets: &[(Role, Option<RetainedSetId>, RetainedSetId)],
+    ) -> (HashSet<ObjectId>, HashSet<ObjectId>) {
         let nothing = RepositoryEnvelopeId::from_digest([0; 32]);
         let mut walk = StructuralDelta::new(objects, Some(nothing), nothing, Default::default());
-        walk.push_radix_root(new.into(), Role::RetainedViews, old.map(Into::into), None)
-            .unwrap();
+        // Tasks run last pushed first.
+        for &(role, old, new) in sets.iter().rev() {
+            walk.push_radix_root(new.into(), role, old.map(Into::into), None)
+                .unwrap();
+        }
         let mut yielded = HashSet::new();
         while let Some(step) = walk.next().await.unwrap() {
             match step {
@@ -1400,6 +1544,42 @@ mod tests {
         let (yielded, unproven) = walk_set(&objects, None, root).await;
         assert_eq!(unproven, keys.into());
         assert_eq!(yielded, [root.into(), children[0].1].into());
+    }
+
+    /// One node can sit in two collections. Once the walk of one pairs it with the
+    /// same ID, the walk of the other skips it too, though its old side there is a
+    /// node of another shape.
+    #[tokio::test]
+    async fn a_node_proven_old_in_one_collection_is_skipped_in_another() {
+        let (_dir, objects) = store();
+        let near = [key(&[2, 5, 5, 5, 1]), key(&[2, 5, 5, 5, 2])];
+        let views_old = set(&objects, &[near[0], near[1], key(&[1])]).await;
+        let views_new = set(&objects, &[near[0], near[1], key(&[1]), key(&[3])]).await;
+        let children_old = set(&objects, &near).await;
+        let children_new = set(&objects, &[near[0], near[1], key(&[4])]).await;
+
+        let edge_two = |node: RadixNode| {
+            node.children
+                .iter()
+                .find(|(edge, _)| *edge == 2)
+                .map(|&(_, child)| child)
+        };
+        let shared = edge_two(node(&objects, views_new).await).unwrap();
+        assert_eq!(edge_two(node(&objects, views_old).await), Some(shared));
+        assert_eq!(edge_two(node(&objects, children_new).await), Some(shared));
+        // The old set of children holds `near` in its root, so `shared` has no pair there.
+        assert!(node(&objects, children_old).await.children.is_empty());
+
+        let (yielded, unproven) = walk_sets(
+            &objects,
+            &[
+                (Role::RetainedViews, Some(views_old), views_new),
+                (Role::LineageChildren, Some(children_old), children_new),
+            ],
+        )
+        .await;
+        assert_eq!(yielded, [views_new.into(), children_new.into()].into());
+        assert_eq!(unproven, [key(&[3]), key(&[4])].into());
     }
 
     #[tokio::test]

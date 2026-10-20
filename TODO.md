@@ -38,16 +38,6 @@ for `wheat labels` here; incremental-validation step 9):
   IDs are UUIDv5, so the log is in effectively random order, and it prints every
   change with its whole message, with no limit or paging. Order by the view's
   canonical order (or time), newest first, with a count limit.
-- `[ ]` **`structural_delta::one_step_forward_yields_little_more_than_the_difference`
-  fails about 1 run in 20** (failed CI on 37d047f). Change IDs are UUIDv7, so the
-  radix maps' shape depends on which millisecond each change was made in. When two keys
-  straddle a byte boundary, a new view's map splits a node that its old counterpart
-  keeps whole (prefix `01a156ea5b`, inline entries). The split-off child node is in
-  the old closure only through another old view, so the walk, which compares against
-  one counterpart, sends it again: one or two extra `RevisionMapNode`/`ApplicationMapNode`/
-  `RetainedSetNode` per fetch. That's sound, just not minimal. Needs a decision:
-  fixed IDs in the test history, a test that allows this case, or pairing a split
-  node with the old entries at its position.
 
 ## Found while scoping the Scion lessons (2026-10-15)
 
@@ -232,15 +222,6 @@ budget passes, but by only about 0.7 s.
   other IDs with their derived `Serialize`, so `--format json` prints 32 numbers
   where the human output and every other document print the hex ID.
   `frontier list` had the same problem and now uses `command_output::display_id`.
-- `[ ]` **`one_step_forward_yields_little_more_than_the_difference` fails about one
-  run in twelve (2026-09-26).** `crates/wheat-store/tests/structural_delta.rs`, step 5
-  (revising `a` under `b` and `c`): the walk yields one old `RevisionMapNode`. Likely
-  cause, not yet proven: change IDs are UUIDv7, so whether two changes share a
-  millisecond, and so a map node, varies per run. The revise makes new views in
-  between whose nearest old ancestor is the base view (an empty map), so an
-  unchanged node shared with an old map is sent again. That is extra data, not
-  missing data. Options: fixed change IDs in the test, better pairing for such
-  views, or a looser test.
 - `[ ]` **Fetch pushes whole objects, even when the client has the old version
   (2026-09-26).** The push sends every object the walk finds in full. Some objects
   grow with the repository and change with every view: a content-set snapshot is
