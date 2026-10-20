@@ -2721,8 +2721,7 @@ fn native_clone(
 
     let rt = runtime()?;
     let (remote_state, label_name, fetched, content_count) = rt.block_on(async {
-        let mut session = remote::connect(&parsed, &token).await?;
-        let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
+        let (mut session, state) = remote::open(&parsed, &token).await?;
 
         // Fetch all structural objects.
         let staged = remote::staged(&objects);
@@ -2855,8 +2854,7 @@ fn native_fetch(
     let rt = runtime()?;
     let staged = remote::staged(&local.objects);
     let (remote_state, since, fetched, content) = rt.block_on(async {
-        let mut session = remote::connect(&parsed, &token).await?;
-        let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
+        let (mut session, state) = remote::open(&parsed, &token).await?;
 
         if state.generation == last_fetched.generation && state.envelope == last_fetched.envelope {
             remote::close(&mut session).await?;
@@ -3074,8 +3072,7 @@ fn native_publish(
     let rt = runtime()?;
     let staged = remote::staged(&local.objects);
     let (outcome, joined) = rt.block_on(async {
-        let mut session = remote::connect(&parsed, &token).await?;
-        let state = remote::open_repository(&mut session, &parsed.repo_name).await?;
+        let (mut session, state) = remote::open(&parsed, &token).await?;
 
         // The server joins this publish with whatever was published since the head
         // it names, so that is the last head fetched or published here. A first

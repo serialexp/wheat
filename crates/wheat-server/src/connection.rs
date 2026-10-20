@@ -2,8 +2,9 @@
 //!
 //! Drives the WebSocket through: handshake → repository open → fetch/publish.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use futures::StreamExt;
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_hdr_async_with_config;
@@ -48,7 +49,7 @@ pub async fn handle_connection(
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_MESSAGE_SIZE));
-    let ws = match accept_hdr_async_with_config(stream, check_origin, Some(limits)).await {
+    let mut ws = match accept_hdr_async_with_config(stream, check_origin, Some(limits)).await {
         Ok(ws) => ws,
         Err(e) => {
             warn!(peer = %peer, error = %e, "WebSocket handshake failed");
@@ -56,10 +57,30 @@ pub async fn handle_connection(
         }
     };
 
-    if let Err(e) = run_session(ws, &registry, &config, &peer).await {
+    if let Err(e) = run_session(&mut ws, &registry, &config, &peer).await {
         info!(peer = %peer, error = %e, "session ended with error");
     } else {
         debug!(peer = %peer, "session closed cleanly");
+    }
+    finish(&mut ws).await;
+}
+
+/// How long [`finish`] waits for the client to answer the closing handshake.
+const CLOSE_WAIT: Duration = Duration::from_secs(10);
+
+/// Ends the connection with a closing handshake, reading and dropping what the
+/// client sent after the server stopped listening: a request sent without waiting
+/// for the session, or the rest of a push. Closing the socket with those bytes
+/// unread resets the connection, and the client can lose the reply that says why
+/// it ended.
+async fn finish(ws: &mut WebSocketStream<TcpStream>) {
+    // The client closed first: tungstenite has answered it already.
+    if ws.close(None).await.is_err() {
+        return;
+    }
+    let drain = async { while let Some(Ok(_)) = ws.next().await {} };
+    if tokio::time::timeout(CLOSE_WAIT, drain).await.is_err() {
+        debug!("client did not finish the closing handshake");
     }
 }
 
@@ -121,7 +142,7 @@ async fn send_forbidden(
 
 /// The main session loop.
 async fn run_session(
-    mut ws: WebSocketStream<TcpStream>,
+    ws: &mut WebSocketStream<TcpStream>,
     registry: &Registry,
     config: &ServerConfig,
     peer: &str,
@@ -130,7 +151,7 @@ async fn run_session(
 
     // 1. Send ServerHello.
     send(
-        &mut ws,
+        ws,
         &WheatProtocolMessage::ServerHello(ServerHelloOutput {
             message_type: 0x01,
             protocol_version_min: 1,
@@ -142,11 +163,11 @@ async fn run_session(
     .await?;
 
     // 2. Receive ClientHello.
-    let client_hello = match recv(&mut ws).await? {
+    let client_hello = match recv(ws).await? {
         WheatProtocolMessage::ClientHello(ch) => ch,
         _other => {
             send_error(
-                &mut ws,
+                ws,
                 0,
                 1,
                 connection_error_scope(),
@@ -160,7 +181,7 @@ async fn run_session(
 
     if client_hello.selected_version != 1 {
         send(
-            &mut ws,
+            ws,
             &WheatProtocolMessage::SessionEstablished(SessionEstablishedOutput {
                 message_type: 0x03,
                 selected_version: client_hello.selected_version,
@@ -196,7 +217,7 @@ async fn run_session(
         Err(message) => {
             info!(peer = %peer, "session refused: {message}");
             send(
-                &mut ws,
+                ws,
                 &WheatProtocolMessage::SessionEstablished(SessionEstablishedOutput {
                     message_type: 0x03,
                     selected_version: 1,
@@ -217,7 +238,7 @@ async fn run_session(
 
     // 4. Send SessionEstablished.
     send(
-        &mut ws,
+        ws,
         &WheatProtocolMessage::SessionEstablished(SessionEstablishedOutput {
             message_type: 0x03,
             selected_version: 1,
@@ -235,7 +256,7 @@ async fn run_session(
 
     // --- Repository open ---
 
-    let (entry, repository) = match recv(&mut ws).await? {
+    let (entry, repository) = match recv(ws).await? {
         WheatProtocolMessage::RepositoryOpen(ro) => {
             // A repository the principal may not read looks the same as one that
             // does not exist, so its existence does not leak.
@@ -273,7 +294,7 @@ async fn run_session(
                     let truncated = labels_manifest.labels.len() > 10_000;
 
                     send(
-                        &mut ws,
+                        ws,
                         &WheatProtocolMessage::RepositoryState(RepositoryStateOutput {
                             message_type: 0x11,
                             head_generation: head.generation,
@@ -291,7 +312,7 @@ async fn run_session(
                 }
                 None => {
                     send_error(
-                        &mut ws,
+                        ws,
                         0,
                         NOT_FOUND,
                         operation_error_scope(),
@@ -305,7 +326,7 @@ async fn run_session(
         }
         _ => {
             send_error(
-                &mut ws,
+                ws,
                 0,
                 1,
                 connection_error_scope(),
@@ -323,7 +344,7 @@ async fn run_session(
     // revoked right stops the next operation.
 
     loop {
-        let msg = match recv(&mut ws).await {
+        let msg = match recv(ws).await {
             Ok(msg) => msg,
             Err(ConnectionError::Closed) => break,
             Err(e) => return Err(e),
@@ -335,22 +356,22 @@ async fn run_session(
                     .await?
                     .is_none()
                 {
-                    send_forbidden(&mut ws, req.op_id, Access::Read, &repository).await?;
+                    send_forbidden(ws, req.op_id, Access::Read, &repository).await?;
                     continue;
                 }
                 // The client names the envelope it wants (the head it saw), so a
                 // publish in between does not change what it gets.
-                crate::fetch::handle_fetch(&mut ws, &entry, req).await?;
+                crate::fetch::handle_fetch(ws, &entry, req).await?;
             }
             WheatProtocolMessage::ContentFetchRequest(req) => {
                 if repository_access(config, &principal, &repository)
                     .await?
                     .is_none()
                 {
-                    send_forbidden(&mut ws, req.op_id, Access::Read, &repository).await?;
+                    send_forbidden(ws, req.op_id, Access::Read, &repository).await?;
                     continue;
                 }
-                crate::fetch::handle_content_fetch(&mut ws, &entry, req).await?;
+                crate::fetch::handle_content_fetch(ws, &entry, req).await?;
             }
             WheatProtocolMessage::PublishRequest(req) => {
                 let needed = if req.force {
@@ -362,7 +383,7 @@ async fn run_session(
                 let allowed = granted.is_some_and(|granted| granted >= needed);
                 // The client pushes before it hears anything back, so the push is
                 // read even for a publish refused here; it is not kept.
-                let pushed = crate::publish::receive_push(&mut ws, req.op_id, allowed).await?;
+                let pushed = crate::publish::receive_push(ws, req.op_id, allowed).await?;
                 // Read head fresh for each publish attempt.
                 let head = entry
                     .heads
@@ -372,7 +393,7 @@ async fn run_session(
                     // Refuse before anything uploaded is kept.
                     info!(peer = %peer, principal = %principal.name, repo = %repository, %needed, "publish refused");
                     send(
-                        &mut ws,
+                        ws,
                         &publish_result(
                             req.op_id,
                             publish_rejected_status(),
@@ -386,7 +407,7 @@ async fn run_session(
                     .await?;
                     continue;
                 }
-                crate::publish::handle_publish(&mut ws, &entry, &head, req, pushed).await?;
+                crate::publish::handle_publish(ws, &entry, &head, req, pushed).await?;
             }
             _ => {
                 warn!(peer = %peer, "unexpected message in command loop");

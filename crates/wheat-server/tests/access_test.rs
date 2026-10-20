@@ -262,6 +262,61 @@ async fn unknown_empty_and_oversized_tokens_are_refused() {
     }
 }
 
+/// A client sends `RepositoryOpen` with its `ClientHello`, without waiting for the
+/// session. When the token is refused, that request is still unread: the server
+/// must close the connection with a closing handshake, not reset it, or the client
+/// can lose the refusal.
+#[tokio::test]
+async fn a_refused_session_ends_cleanly_with_a_request_behind_it() {
+    let server = start(token_file()).await;
+    for _ in 0..20 {
+        let (mut ws, _) = connect_async(format!("ws://{}", server.addr))
+            .await
+            .unwrap();
+        send_msg(
+            &mut ws,
+            &WheatProtocolMessage::ClientHello(ClientHelloOutput {
+                message_type: 0x02,
+                selected_version: 1,
+                auth_token: b"not-a-token".to_vec(),
+                receive_window_bytes: 16 * 1024 * 1024,
+                receive_window_messages: 256,
+            }),
+        )
+        .await;
+        send_msg(
+            &mut ws,
+            &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
+                message_type: 0x10,
+                name: REPO.to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(
+            recv_msg(&mut ws).await,
+            WheatProtocolMessage::ServerHello(_)
+        ));
+        match recv_msg(&mut ws).await {
+            WheatProtocolMessage::SessionEstablished(se) => assert!(
+                matches!(
+                    se.status,
+                    SessionEstablishedStatus::SessionStatusAuthFailed(_)
+                ),
+                "{se:?}"
+            ),
+            other => panic!("expected SessionEstablished, got {other:?}"),
+        }
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                other => panic!("expected the closing handshake, got {other:?}"),
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_repository_without_access_looks_missing() {
     let server = start(token_file()).await;

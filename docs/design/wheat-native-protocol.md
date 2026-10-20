@@ -607,12 +607,12 @@ Client                          Server
   │                               │  server_id, capabilities
   ├─ ClientHello ────────────────>│  selected_version, auth_token,
   │                               │  receive_window
+  ├─ RepositoryOpen ─────────────>│  repo_name (sent with ClientHello,
+  │                               │  without waiting for the session)
   │                               │
   │<──── SessionEstablished ─────┤  selected_version, receive_window,
   │                               │  status: ok | version_mismatch |
   │                               │          auth_failed
-  │                               │
-  ├─ RepositoryOpen ─────────────>│  repo_name or repo_id
   │<──── RepositoryState ────────┤  head: {generation, envelope},
   │                               │  labels: [{name, view_id}, ...]
   │                               │
@@ -620,6 +620,14 @@ Client                          Server
   │                               │
   ├─ Close ──────────────────────>│
 ```
+
+**Pipelined open:** The client sends `RepositoryOpen` right behind
+`ClientHello`, so opening a repository costs one round trip after the
+WebSocket upgrade. A refused session leaves the open unread. The server ends
+every connection with a closing handshake and reads and drops what the client
+sent after it stopped listening, for up to 10 seconds, because closing a socket
+with bytes unread resets the connection, and the client could lose the reply
+that says why it ended.
 
 **Version negotiation:** `ServerHello` advertises a version range.
 `ClientHello` selects one version within that range. `SessionEstablished`

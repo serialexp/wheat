@@ -104,16 +104,16 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     clone.add(cloned, &proxy);
     clone.record(&mut recorder, "clone");
 
-    // Opening the session takes three round trips (the WebSocket upgrade,
-    // `ClientHello`, `RepositoryOpen`) and closing it one. The publish pushes its
+    // Opening the session takes two round trips (the WebSocket upgrade, then
+    // `ClientHello` with `RepositoryOpen`) and closing it one. The publish pushes its
     // difference with the request, so the walk needs no rounds: one trip carries the
     // push, one the commit. A blob over the push threshold adds its content round.
-    recorder.at_most("small.publish.round_trips", 6.0, "count");
-    recorder.at_most("large.publish.round_trips", 7.0, "count");
+    recorder.at_most("small.publish.round_trips", 5.0, "count");
+    recorder.at_most("large.publish.round_trips", 6.0, "count");
     // A fetch or a clone takes the server's push with one trip and its content with
     // another.
     for step in ["small.fetch", "large.fetch", "clone"] {
-        recorder.at_most(&format!("{step}.round_trips"), 6.0, "count");
+        recorder.at_most(&format!("{step}.round_trips"), 5.0, "count");
     }
 
     proxy.stop()?;

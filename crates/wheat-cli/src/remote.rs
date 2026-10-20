@@ -375,9 +375,14 @@ fn content_id_to_digest(id: ContentId) -> Digest256 {
 // Connect and handshake
 // ---------------------------------------------------------------------------
 
-/// Connect to a wheat-server and perform the session handshake, sending
-/// `token` (empty for none) as the bearer token.
-pub async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
+/// Connect to a wheat-server, sending `token` (empty for none) as the bearer token,
+/// and open the repository `url` names. Returns the session and the repository's
+/// state.
+///
+/// `RepositoryOpen` goes out with `ClientHello`, without waiting for the session,
+/// so opening costs one round trip after the WebSocket upgrade instead of two. A
+/// refused session ends with the open unread; the server reads and drops it.
+pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteRepoState)> {
     let ws_url = url.ws_url.as_str();
     // Refuse an oversized message while it arrives, not after it is in memory.
     let limits = WebSocketConfig::default()
@@ -405,7 +410,6 @@ pub async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
         other => bail!("expected ServerHello, got {other:?}"),
     }
 
-    // Send ClientHello.
     send_msg(
         &mut ws,
         &WheatProtocolMessage::ClientHello(ClientHelloOutput {
@@ -417,8 +421,15 @@ pub async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
         }),
     )
     .await?;
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
+            message_type: 0x10,
+            name: url.repo_name.clone(),
+        }),
+    )
+    .await?;
 
-    // Receive SessionEstablished.
     let established = recv_msg(&mut ws).await?;
     match &established {
         WheatProtocolMessage::SessionEstablished(se) => match &se.status {
@@ -445,25 +456,16 @@ pub async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
         other => bail!("expected SessionEstablished, got {other:?}"),
     }
 
-    Ok(WheatSession { ws })
+    let state = repository_state(&mut ws, &url.repo_name).await?;
+    Ok((WheatSession { ws }, state))
 }
 
-// ---------------------------------------------------------------------------
-// Repository open
-// ---------------------------------------------------------------------------
-
-/// Open a repository on the server, returning its current state.
-pub async fn open_repository(session: &mut WheatSession, name: &str) -> Result<RemoteRepoState> {
-    send_msg(
-        &mut session.ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: name.to_string(),
-        }),
-    )
-    .await?;
-
-    let msg = recv_msg(&mut session.ws).await?;
+/// Reads the reply to `RepositoryOpen` for the repository `name`.
+async fn repository_state(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    name: &str,
+) -> Result<RemoteRepoState> {
+    let msg = recv_msg(ws).await?;
     match msg {
         WheatProtocolMessage::RepositoryState(rs) => {
             let envelope = digest_to_envelope_id(&rs.head_envelope)?;
@@ -1315,7 +1317,7 @@ mod connect_tests {
 
         // A generous bound: this asserts the client stops waiting, not how fast.
         let connected =
-            tokio::time::timeout(std::time::Duration::from_secs(30), connect(&url, b"")).await;
+            tokio::time::timeout(std::time::Duration::from_secs(30), open(&url, b"")).await;
         server.abort();
         let Ok(connected) = connected else {
             panic!("the client kept waiting for the rest of the message");
