@@ -2,14 +2,21 @@ use std::collections::BTreeMap;
 use wheat_core::edit_application::{
     ApplicationError, ApplicationLimits, ApplicationOutcome, apply_edits,
 };
-use wheat_core::{ContentId, EditOperation, EditRecord, FileKind, FileValue, Tree};
+use wheat_core::{
+    ContentId, EditOperation, EditRecord, FileKind, FileValue, Tree, VerifiedContent,
+};
 
-fn fixture(source: &[u8], kind: FileKind) -> (Tree, EditRecord, BTreeMap<ContentId, Vec<u8>>) {
+fn blob(bytes: &[u8]) -> (ContentId, VerifiedContent) {
+    let content = VerifiedContent::new(bytes.to_vec());
+    (content.id(), content)
+}
+
+fn fixture(
+    source: &[u8],
+    kind: FileKind,
+) -> (Tree, EditRecord, BTreeMap<ContentId, VerifiedContent>) {
     let parts = [source, b"", b"old", b"new"];
-    let blobs = parts
-        .into_iter()
-        .map(|b| (ContentId::of(b), b.to_vec()))
-        .collect();
+    let blobs = parts.into_iter().map(blob).collect();
     let tree = [(
         "f".into(),
         FileValue {
@@ -98,7 +105,7 @@ fn untouched_missing_content_is_not_resolved_and_iterator_is_bounded() {
     let result = apply_edits(
         &tree,
         [],
-        |_| -> Result<Vec<u8>, &str> { panic!("untouched content resolved") },
+        |_| -> Result<VerifiedContent, &str> { panic!("untouched content resolved") },
         ApplicationLimits::default(),
     )
     .unwrap();
@@ -112,7 +119,7 @@ fn untouched_missing_content_is_not_resolved_and_iterator_is_bounded() {
         apply_edits(
             &Tree::new(),
             std::iter::repeat((edit.id(), edit)),
-            |_| Ok::<_, &str>(Vec::new()),
+            |_| Ok::<_, &str>(VerifiedContent::new(Vec::new())),
             limits
         ),
         Err(ApplicationError::TooManyEdits {
@@ -180,7 +187,7 @@ fn resolved_byte_limit_is_scoped_to_one_path_group() {
         },
     )
     .unwrap();
-    let blobs = BTreeMap::from([(first, first_bytes), (second, second_bytes)]);
+    let blobs = BTreeMap::from([blob(&first_bytes), blob(&second_bytes)]);
     let limits = ApplicationLimits {
         max_resolved_bytes: 4,
         ..ApplicationLimits::default()
@@ -225,7 +232,11 @@ fn one_path_group_cannot_exceed_resolved_byte_limit() {
         apply_edits(
             &Tree::new(),
             [(edit.id(), edit)],
-            |id| (id == content).then(|| bytes.clone()).ok_or("missing"),
+            |id| {
+                (id == content)
+                    .then(|| VerifiedContent::new(bytes.clone()))
+                    .ok_or("missing")
+            },
             limits,
         ),
         Err(ApplicationError::ByteLimitExceeded {
@@ -245,7 +256,7 @@ fn mismatched_edit_id_is_rejected_before_resolution() {
         apply_edits(
             &tree,
             [(supplied, edit.clone())],
-            |_| -> Result<Vec<u8>, &str> { panic!("mismatched edit resolved content") },
+            |_| -> Result<VerifiedContent, &str> { panic!("mismatched edit resolved content") },
             ApplicationLimits::default(),
         ),
         Err(ApplicationError::EditIdMismatch { supplied: got, actual })
@@ -256,7 +267,7 @@ fn mismatched_edit_id_is_rejected_before_resolution() {
 #[test]
 fn shrinking_changed_output_over_generated_allowance_is_rejected() {
     let (tree, _, mut blobs) = fixture(b"old-tail", FileKind::Regular);
-    blobs.insert(ContentId::of(b"x"), b"x".to_vec());
+    blobs.extend([blob(b"x")]);
     let edit = EditRecord::new(
         "f",
         EditOperation::GuardedText {

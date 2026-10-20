@@ -111,7 +111,7 @@ pub enum ApplicationError {
 pub fn apply_edits<E>(
     target: &Tree,
     edit_iter: impl IntoIterator<Item = (EditId, EditRecord)>,
-    mut resolve: impl FnMut(ContentId) -> Result<Vec<u8>, E>,
+    mut resolve: impl FnMut(ContentId) -> Result<VerifiedContent, E>,
     limits: ApplicationLimits,
 ) -> Result<ApplicationResult, ApplicationError>
 where
@@ -189,17 +189,17 @@ where
         let mut cache = BTreeMap::<ContentId, Vec<u8>>::new();
         let mut resolved_total = 0usize;
         for id in needed {
-            let value = resolve(id).map_err(|error| ApplicationError::Resolve {
+            let content = resolve(id).map_err(|error| ApplicationError::Resolve {
                 id,
                 message: error.to_string(),
             })?;
-            let actual = ContentId::of(&value);
-            if actual != id {
+            if content.id() != id {
                 return Err(ApplicationError::CorruptContent {
                     expected: id,
-                    actual,
+                    actual: content.id(),
                 });
             }
+            let value = content.into_inner();
             resolved_total = resolved_total.checked_add(value.len()).ok_or(
                 ApplicationError::ByteLimitExceeded {
                     generated: false,

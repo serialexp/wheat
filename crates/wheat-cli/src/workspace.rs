@@ -7,9 +7,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use wheat_core::{
-    ApplicationResultRecord, ChangeId, ContentIo, EditId, EditOperation, EditRecord,
-    EditSubsumption, EditTransition, RevisionEdits, RevisionId, RevisionMetadata, RevisionRequest,
-    TreeId, VerifiedContent, ViewId,
+    ApplicationResultRecord, ChangeId, EditId, EditOperation, EditRecord, EditSubsumption,
+    EditTransition, RevisionEdits, RevisionId, RevisionMetadata, RevisionRequest, TreeId,
+    VerifiedContent, ViewId,
     edit_capture::{FileSnapshot, capture_edit},
     edit_placement::LaterEdit,
     guarded::{GuardedEdit, Limits, authoring},
@@ -187,10 +187,10 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore, P: Publicatio
             let b = b.unwrap();
             let w = file.as_ref().unwrap();
             let authored_bytes = store
-                .resolve(a.content)
+                .get(a.content)
                 .context("cannot resolve authored file")?;
             let baseline_bytes = store
-                .resolve(b.content)
+                .get(b.content)
                 .context("cannot resolve applied baseline file")?;
             let mut definitions = Vec::with_capacity(old_on_path.len());
             for (_, record) in old_on_path {
@@ -230,7 +230,7 @@ pub(crate) async fn author_from_workspace<O: ImmutableObjectStore, P: Publicatio
             }
         } else {
             let before_bytes = a
-                .map(|v| store.resolve(v.content))
+                .map(|v| store.get(v.content))
                 .transpose()
                 .context("cannot resolve authored file")?;
             let captured = capture_edit(
@@ -499,10 +499,10 @@ fn resolve_guard(record: &EditRecord, store: &ContentStore) -> Result<GuardedEdi
         bail!("expected guarded edit")
     };
     Ok(GuardedEdit {
-        before: store.resolve(before)?,
-        expected: store.resolve(expected)?,
-        replacement: store.resolve(replacement)?,
-        after: store.resolve(after)?,
+        before: store.get(before)?,
+        expected: store.get(expected)?,
+        replacement: store.get(replacement)?,
+        after: store.get(after)?,
         start_anchor,
         end_anchor,
     })

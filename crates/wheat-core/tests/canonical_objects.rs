@@ -29,8 +29,9 @@ struct TestContent(RefCell<BTreeMap<ContentId, Vec<u8>>>);
 impl ContentIo for TestContent {
     type Error = &'static str;
 
-    fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
-        self.0.borrow().get(&id).cloned().ok_or("missing content")
+    fn resolve(&self, id: ContentId) -> Result<VerifiedContent, Self::Error> {
+        let bytes = self.0.borrow().get(&id).cloned().ok_or("missing content")?;
+        VerifiedContent::check(id, bytes).map_err(|_| "corrupt content")
     }
 
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {

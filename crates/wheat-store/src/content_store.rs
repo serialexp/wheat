@@ -207,7 +207,7 @@ pub(crate) fn resolve_delta_chain(
     id: ContentId,
     max: usize,
     fetch: impl Fn(ContentId) -> Result<StoredContent, ContentStoreError>,
-) -> Result<Vec<u8>, ContentStoreError> {
+) -> Result<VerifiedContent, ContentStoreError> {
     use crate::delta;
 
     // Each link carries the ID and envelope-declared target length that must be
@@ -239,7 +239,7 @@ pub(crate) fn resolve_delta_chain(
         }
 
         let base = match stored {
-            StoredContent::Verified(content) => content.into_inner(),
+            StoredContent::Verified(content) => content,
             StoredContent::Envelope(header, payload) => {
                 match codec::decode_payload(
                     header.codec,
@@ -252,7 +252,7 @@ pub(crate) fn resolve_delta_chain(
                     // The terminal base is content-addressed too. Verify it before
                     // trusting it as input to any patch in the chain.
                     codec::DecodedPayload::Content(bytes) => {
-                        VerifiedContent::check(current_id, bytes)?.into_inner()
+                        VerifiedContent::check(current_id, bytes)?
                     }
                     codec::DecodedPayload::Delta { base_id, patch, .. } => {
                         if depth == MAX_DELTA_CHAIN_DEPTH {
@@ -273,20 +273,12 @@ pub(crate) fn resolve_delta_chain(
             } else {
                 codec::HARD_LOGICAL_RECORD_BYTES
             };
-            result =
-                delta::apply_delta(&result, patch, *expected_size, result_limit).map_err(|e| {
-                    ContentStoreError::DeltaResolution {
-                        id: *target_id,
-                        reason: e.to_string(),
-                    }
+            let bytes = delta::apply_delta(result.bytes(), patch, *expected_size, result_limit)
+                .map_err(|e| ContentStoreError::DeltaResolution {
+                    id: *target_id,
+                    reason: e.to_string(),
                 })?;
-            let actual = ContentId::of(&result);
-            if actual != *target_id {
-                return Err(ContentStoreError::Corrupt {
-                    expected: *target_id,
-                    actual,
-                });
-            }
+            result = VerifiedContent::check(*target_id, bytes)?;
         }
         return Ok(result);
     }
@@ -608,6 +600,12 @@ impl ContentStore {
         self.get_bounded(id, usize::MAX)
     }
 
+    /// Reads content as [`Self::get`] does, keeping the identity the read proved.
+    #[tracing::instrument(name = "content_get", level = "debug", skip_all)]
+    pub fn get_verified(&self, id: ContentId) -> Result<VerifiedContent, ContentStoreError> {
+        resolve_delta_chain(id, usize::MAX, |current_id| self.stored(current_id))
+    }
+
     /// Reads and verifies content while refusing to allocate more than `max` bytes for it.
     ///
     /// Transparently resolves delta chains: if the envelope uses a delta codec,
@@ -617,6 +615,7 @@ impl ContentStore {
     /// base fetches.
     pub fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         resolve_delta_chain(id, max, |current_id| self.stored(current_id))
+            .map(VerifiedContent::into_inner)
     }
 
     /// Read a local envelope file and return (header, raw stored payload).
@@ -855,6 +854,7 @@ mod tests {
                 .map(StoredContent::from)
                 .ok_or(ContentStoreError::Missing(current_id))
         })
+        .map(VerifiedContent::into_inner)
     }
 
     #[test]

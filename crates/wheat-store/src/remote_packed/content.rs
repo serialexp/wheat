@@ -329,6 +329,7 @@ impl ContentBackend for RemoteContentBackend {
 
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
         crate::content_store::resolve_delta_chain(id, max, |current_id| self.get_stored(current_id))
+            .map(VerifiedContent::into_inner)
     }
 
     fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {

@@ -8,8 +8,9 @@ use wheat_core::*;
 struct Memory(RefCell<BTreeMap<ContentId, Vec<u8>>>);
 impl ContentIo for Memory {
     type Error = &'static str;
-    fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
-        self.0.borrow().get(&id).cloned().ok_or("missing")
+    fn resolve(&self, id: ContentId) -> Result<VerifiedContent, Self::Error> {
+        let bytes = self.0.borrow().get(&id).cloned().ok_or("missing")?;
+        VerifiedContent::check(id, bytes).map_err(|_| "corrupt")
     }
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
         self.0

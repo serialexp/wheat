@@ -6,7 +6,7 @@
 //! the bytes again. Bytes read back from disk or a remote store are hashed by the
 //! reader, which is a check of its own.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use crate::ContentId;
 
@@ -109,6 +109,15 @@ impl<B: AsRef<[u8]> + Into<Vec<u8>>> VerifiedContent<B> {
     }
 }
 
+impl<'a> From<VerifiedContent> for VerifiedContent<Cow<'a, [u8]>> {
+    fn from(content: VerifiedContent) -> Self {
+        Self {
+            id: content.id,
+            bytes: Cow::Owned(content.bytes),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +131,8 @@ mod tests {
         assert_eq!(verified, VerifiedContent::new(bytes.clone()));
         assert_eq!(verified.borrowed(), VerifiedContent::new(bytes.as_slice()));
         assert_eq!(verified.borrowed().into_owned(), verified);
+        let shared: VerifiedContent<Cow<'_, [u8]>> = verified.clone().into();
+        assert_eq!((shared.id(), shared.bytes()), (id, bytes.as_slice()));
 
         let other = ContentId::of(b"other");
         assert_eq!(

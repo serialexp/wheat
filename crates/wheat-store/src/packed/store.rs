@@ -1350,7 +1350,8 @@ impl ContentBackend for PackedEngine {
         if generation.generation != 0 || generation.manifest != [0; 32] {
             return crate::content_store::resolve_delta_chain(id, max, |current_id| {
                 self.get_stored(current_id)
-            });
+            })
+            .map(VerifiedContent::into_inner);
         }
         let value = self
             .catalog
@@ -1375,7 +1376,8 @@ impl ContentBackend for PackedEngine {
             // delta stored loose can reference a base in a packed segment.
             let bytes = crate::content_store::resolve_delta_chain(id, max, |current_id| {
                 self.get_stored(current_id)
-            })?;
+            })?
+            .into_inner();
             if let Some(trace) = &self.trace {
                 trace.content_get(bytes.len());
             }

@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use wheat_core::{
-    ChangeId, ContentId, ContentIo, EditId, EditRecord, FileKind, FileValue, Tree,
+    ChangeId, ContentId, EditId, EditRecord, FileKind, FileValue, Tree, VerifiedContent,
     edit_application::{ApplicationLimits, ApplicationOutcome, apply_edits},
     edit_placement::{
         LaterEdit, Lines, MoveNotice, PlacementInput, WholeFileReason, attribute, place,
@@ -65,7 +65,7 @@ pub(crate) fn place_path(
 ) -> Result<PathPlacement> {
     let resolve = |value: Option<FileValue>| -> Result<Option<Vec<u8>>> {
         value
-            .map(|value| store.resolve(value.content))
+            .map(|value| store.get(value.content))
             .transpose()
             .map_err(Into::into)
     };
@@ -172,9 +172,17 @@ fn replay(
     failed_before: &BTreeSet<LaterEdit>,
     reauthored: &BTreeSet<ChangeId>,
 ) -> Result<Replay> {
-    // The value travels with the bytes, so a step hashes only the content it generates.
-    let mut file: Option<(FileValue, Cow<'_, [u8]>)> =
-        placed.map(|file| (file.value(), Cow::Borrowed(file.bytes.as_slice())));
+    // The bytes travel verified, so a step hashes only the content it generates.
+    let mut file: Option<(FileKind, VerifiedContent<Cow<'_, [u8]>>)> = placed.map(|file| {
+        (
+            file.kind,
+            VerifiedContent::new(Cow::Borrowed(file.bytes.as_slice())),
+        )
+    });
+    let value_of = |(kind, content): &(FileKind, VerifiedContent<Cow<'_, [u8]>>)| FileValue {
+        content: content.id(),
+        kind: *kind,
+    };
     let mut no_longer_fit = BTreeSet::new();
     for step in &history.steps {
         let later = |edit: EditId| LaterEdit {
@@ -192,7 +200,7 @@ fn replay(
         }
         let reapplied = !reauthored.contains(&step.change);
         let mut target = Tree::new();
-        let value = file.as_ref().map(|(value, _)| *value);
+        let value = file.as_ref().map(value_of);
         if let Some(value) = value {
             target.insert(path.to_owned(), value);
         }
@@ -200,8 +208,8 @@ fn replay(
             &target,
             edits,
             |id| match &file {
-                Some((value, bytes)) if id == value.content => Ok(bytes.to_vec()),
-                _ => store.resolve(id).map_err(|error| error.to_string()),
+                Some((_, content)) if id == content.id() => Ok(content.borrowed().into_owned()),
+                _ => store.get_verified(id).map_err(|error| error.to_string()),
             },
             ApplicationLimits {
                 allow_already_satisfied: reapplied,
@@ -234,15 +242,15 @@ fn replay(
             None => None,
             Some(next) if Some(next) == value => file,
             Some(next) => {
-                let bytes = match result.generated_content.remove(&next.content) {
-                    Some(content) => content.into_inner(),
-                    None => store.resolve(next.content)?,
+                let content = match result.generated_content.remove(&next.content) {
+                    Some(content) => content,
+                    None => store.get_verified(next.content)?,
                 };
-                Some((next, Cow::Owned(bytes)))
+                Some((next.kind, content.into()))
             }
         };
     }
-    Ok(Replay::Reached(file.map(|(value, _)| value)))
+    Ok(Replay::Reached(file.as_ref().map(value_of)))
 }
 
 /// Asks before moving edits out of later changes into `change`. Without anyone to ask, it

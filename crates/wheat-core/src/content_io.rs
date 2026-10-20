@@ -4,13 +4,13 @@ use crate::{ContentId, VerifiedContent, edit_application::ApplicationLimits};
 
 /// Resolves authenticated content and durably stores generated canonical bytes.
 ///
-/// Implementations may treat storing an already-present identical object as success. The
-/// repository verifies resolved identities independently; generated content arrives
+/// Implementations may treat storing an already-present identical object as success.
+/// Resolved content comes back verified by whoever read it, and generated content arrives
 /// verified, hashed once where it was generated.
 pub trait ContentIo {
     type Error: std::fmt::Display;
 
-    fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error>;
+    fn resolve(&self, id: ContentId) -> Result<VerifiedContent, Self::Error>;
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error>;
 }
 

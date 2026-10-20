@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
 use wheat_core::edit_application::{ApplicationLimits, ApplicationOutcome, apply_edits};
-use wheat_core::{ContentId, EditOperation, EditRecord, FileKind, FileValue, Tree};
+use wheat_core::{
+    ContentId, EditOperation, EditRecord, FileKind, FileValue, Tree, VerifiedContent,
+};
 
-fn blob(bytes: &[u8]) -> (ContentId, Vec<u8>) {
-    (ContentId::of(bytes), bytes.to_vec())
+fn blob(bytes: &[u8]) -> (ContentId, VerifiedContent) {
+    let content = VerifiedContent::new(bytes.to_vec());
+    (content.id(), content)
 }
 
 #[test]
@@ -65,6 +68,58 @@ fn independent_moved_guards_apply_against_original() {
     assert_eq!(output, b"header\nONE\nmiddle\nTWO\nfooter\n");
 }
 
+/// Resolved content arrives verified, so applying edits hashes only what it generates.
+#[test]
+fn application_hashes_only_generated_content() {
+    let (source_id, source) = blob(&b"line\n".repeat(256));
+    let blobs: BTreeMap<_, _> = [
+        (source_id, source),
+        blob(b""),
+        blob(b"line\n"),
+        blob(b"LINE\n"),
+    ]
+    .into();
+    let edit = EditRecord::new(
+        "f",
+        EditOperation::GuardedText {
+            kind: FileKind::Regular,
+            before: ContentId::of(b""),
+            expected: ContentId::of(b"line\n"),
+            replacement: ContentId::of(b"LINE\n"),
+            after: ContentId::of(b""),
+            start_anchor: true,
+            end_anchor: false,
+        },
+    )
+    .unwrap();
+    let tree: Tree = [(
+        "f".into(),
+        FileValue {
+            content: source_id,
+            kind: FileKind::Regular,
+        },
+    )]
+    .into();
+
+    let before = wheat_core::content_bytes_hashed();
+    let result = apply_edits(
+        &tree,
+        [(edit.id(), edit)],
+        |id| blobs.get(&id).cloned().ok_or("missing"),
+        ApplicationLimits::default(),
+    )
+    .unwrap();
+    let hashed = wheat_core::content_bytes_hashed() - before;
+
+    let generated = result
+        .generated_content
+        .values()
+        .map(|content| content.len() as u64)
+        .sum::<u64>();
+    assert_eq!(generated, 256 * 5);
+    assert_eq!(hashed, generated);
+}
+
 #[test]
 fn exact_mode_only_change_and_corrupt_content() {
     let (id, bytes) = blob(b"same\n");
@@ -97,7 +152,7 @@ fn exact_mode_only_change_and_corrupt_content() {
     let error = apply_edits(
         &tree,
         [(edit.id(), edit)],
-        |_| Ok::<_, &str>(b"wrong".to_vec()),
+        |_| Ok::<_, &str>(VerifiedContent::new(b"wrong".to_vec())),
         ApplicationLimits::default(),
     )
     .unwrap_err();
@@ -238,8 +293,7 @@ fn aggregate_work_budget_is_shared_across_paths() {
     let source = b"abc";
     let source_id = ContentId::of(source);
     let replacement = b"x";
-    let mut blobs: BTreeMap<_, _> = [blob(source), blob(b"a"), blob(replacement)].into();
-    blobs.insert(ContentId::of(b""), Vec::new());
+    let blobs: BTreeMap<_, _> = [blob(source), blob(b"a"), blob(replacement), blob(b"")].into();
     let make = |path: &str, anchored| {
         EditRecord::new(
             path,
@@ -296,8 +350,8 @@ fn aggregate_work_budget_is_shared_across_paths() {
 fn interference_ids_and_outcome_order_are_canonical() {
     let source = b"abc";
     let source_id = ContentId::of(source);
-    let mut blobs: BTreeMap<_, _> = [blob(source), blob(b"a"), blob(b"ab"), blob(b"x")].into();
-    blobs.insert(ContentId::of(b""), Vec::new());
+    let blobs: BTreeMap<_, _> =
+        [blob(source), blob(b"a"), blob(b"ab"), blob(b"x"), blob(b"")].into();
     let make = |expected: &[u8]| {
         EditRecord::new(
             "f",

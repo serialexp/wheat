@@ -930,16 +930,16 @@ impl Repository {
                         .map_err(|e| RepositoryError::ContentIo(e.to_string()))
                 })
                 .transpose()?;
-            let before = before_value.zip(before_bytes.as_deref()).map(|(v, bytes)| {
+            let before = before_value.zip(before_bytes.as_ref()).map(|(v, content)| {
                 crate::edit_capture::FileSnapshot {
                     kind: v.kind,
-                    bytes,
+                    bytes: content.bytes(),
                 }
             });
-            let after = after_value.zip(after_bytes.as_deref()).map(|(v, bytes)| {
+            let after = after_value.zip(after_bytes.as_ref()).map(|(v, content)| {
                 crate::edit_capture::FileSnapshot {
                     kind: v.kind,
-                    bytes,
+                    bytes: content.bytes(),
                 }
             });
             let captured = crate::edit_capture::capture_edit(

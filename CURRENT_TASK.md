@@ -62,8 +62,14 @@ Progress:
   `a_packed_content_read_hashes_its_bytes_once`,
   `content_reads_beside_a_content_generation_hash_once`,
   `staged_content_reads_back_without_hashing`.
-- Next: `ContentIo::resolve` returns `VerifiedContent` so `apply_edits` stops re-hashing
-  resolved content (`edit_application.rs:196`); `resolve_delta_chain` would return it.
+- Stage 5, resolve: `ContentIo::resolve` and `apply_edits`'s resolver return
+  `VerifiedContent`; `apply_edits` compares ids instead of re-hashing, so it hashes only
+  the content it generates. `resolve_delta_chain` returns `VerifiedContent`, exposed as
+  `ContentStore::get_verified` (used by the store `ContentIo`, repository verify, the Git
+  importer and `wheat move` replay). Contract: core
+  `application_hashes_only_generated_content`. Still hashed per call: `FileBytes::value`
+  in `edit_move.rs`.
+- Remaining: run `just bench` once the tree is quiet and commit the results file.
 - Objects (not content) are still validated twice on remote_packed seal (at
   `put_if_absent` and again via `CheckedRecord::check` in `seal`). That's out of
   scope; it's noted here.

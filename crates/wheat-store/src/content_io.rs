@@ -7,8 +7,8 @@ use crate::{ContentStore, ContentStoreError};
 impl ContentIo for ContentStore {
     type Error = ContentStoreError;
 
-    fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
-        self.get(id)
+    fn resolve(&self, id: ContentId) -> Result<VerifiedContent, Self::Error> {
+        self.get_verified(id)
     }
 
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {

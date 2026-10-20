@@ -384,16 +384,16 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 })
                 .transpose()?;
             let before = before_value
-                .zip(before_bytes.as_deref())
-                .map(|(value, bytes)| wheat_core::edit_capture::FileSnapshot {
+                .zip(before_bytes.as_ref())
+                .map(|(value, content)| wheat_core::edit_capture::FileSnapshot {
                     kind: value.kind,
-                    bytes,
+                    bytes: content.bytes(),
                 });
             let after = after_value
-                .zip(after_bytes.as_deref())
-                .map(|(value, bytes)| wheat_core::edit_capture::FileSnapshot {
+                .zip(after_bytes.as_ref())
+                .map(|(value, content)| wheat_core::edit_capture::FileSnapshot {
                     kind: value.kind,
-                    bytes,
+                    bytes: content.bytes(),
                 });
             let captured = wheat_core::edit_capture::capture_edit(
                 path,

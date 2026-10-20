@@ -17,9 +17,10 @@ impl Io {
 }
 impl ContentIo for Io {
     type Error = &'static str;
-    fn resolve(&self, id: ContentId) -> Result<Vec<u8>, Self::Error> {
+    fn resolve(&self, id: ContentId) -> Result<VerifiedContent, Self::Error> {
         self.resolves.set(self.resolves.get() + 1);
-        self.objects.borrow().get(&id).cloned().ok_or("missing")
+        let bytes = self.objects.borrow().get(&id).cloned().ok_or("missing")?;
+        VerifiedContent::check(id, bytes).map_err(|_| "corrupt")
     }
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
         self.stores.set(self.stores.get() + 1);
@@ -114,7 +115,7 @@ fn guarded_edit_moves_with_unique_context() {
         .unwrap();
     let value = repo.view(outcome.resulting_view).unwrap().tree["f"];
     assert_eq!(
-        io.resolve(value.content).unwrap(),
+        io.resolve(value.content).unwrap().bytes(),
         b"prefix\na\nb\nc\nd\ne\nhead\nnew\ntail\nf\ng\nh\ni\nj\n"
     );
 }
