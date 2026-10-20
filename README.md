@@ -32,13 +32,6 @@ and `wheat-server` into `~/.local/bin`:
 curl -fsSL https://raw.githubusercontent.com/serialexp/wheat/main/install.sh | sh
 ```
 
-While the repository is private, fetch the script with a logged-in `gh`, which the
-script then uses for the download too (or set `GH_TOKEN`):
-
-```sh
-gh api -H "Accept: application/vnd.github.raw" repos/serialexp/wheat/contents/install.sh | sh
-```
-
 `WHEAT_VERSION=v0.2.0` picks a release, `WHEAT_INSTALL_DIR` another directory. On
 an older glibc or musl, build from source with `just install`. The CLI runs only on
 Linux: on macOS and Windows it refuses every command.
