@@ -77,7 +77,7 @@ land and move completed bullets from Outstanding to Done.
   `PublishRequest` the client runs the server's walk from the expected head and sends
   the objects, then the new blobs up to 256 KiB each, at most 32 MiB in all, closed by
   `PublishPushEnd`. The server takes what its walk needs from the push and asks only
-  for the rest; `PublishCommit` stays. The `publish_latency` case puts a 30 ms
+  for the rest; `PublishCommit` stays. The `remote_latency` case puts a 30 ms
   round-trip proxy between the CLI and the server. There a small publish went from 19
   round trips and 0.61 s to 6 round trips and 0.19 s. One with a 1 MiB file, over the
   push threshold, went from 20 round trips and 0.62 s to 7 and 0.23 s. Contract rules
