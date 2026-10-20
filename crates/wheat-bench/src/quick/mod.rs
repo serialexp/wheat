@@ -19,6 +19,7 @@ mod deep_stack;
 mod fetch_incremental;
 mod git;
 mod git_export_notes;
+mod head_receipts;
 mod history;
 mod import_resume_wide;
 mod latency_proxy;
@@ -69,6 +70,7 @@ pub const CASES: &[&str] = &[
     materialize_wide::NAME,
     publish_contention::NAME,
     remote_latency::NAME,
+    head_receipts::NAME,
 ];
 
 /// How big the cases are.
@@ -220,6 +222,7 @@ pub fn run_case(
         materialize_wide::NAME => materialize_wide::run(&context),
         publish_contention::NAME => publish_contention::run(&context),
         remote_latency::NAME => remote_latency::run(&context),
+        head_receipts::NAME => head_receipts::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

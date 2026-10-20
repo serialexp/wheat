@@ -7006,6 +7006,7 @@ impl From<ContentGenerationShardV1Input> for ContentGenerationShardV1Output {
 pub struct RepositoryHeadV1Input {
     pub generation: u64,
     pub envelope: Digest256,
+    pub receipts: Vec<PublishReceiptV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7014,6 +7015,7 @@ pub struct RepositoryHeadV1Output {
     pub version: u16,
     pub generation: u64,
     pub envelope: Digest256,
+    pub receipts: Vec<PublishReceiptV1>,
 }
 
 pub type RepositoryHeadV1 = RepositoryHeadV1Output;
@@ -7030,6 +7032,10 @@ impl RepositoryHeadV1Input {
         encoder.write_u16_be(1);
         encoder.write_u64_be(self.generation);
         self.envelope.encode_into(encoder)?;
+        encoder.write_u16_be(self.receipts.len() as u16);
+        for item in &self.receipts {
+            item.encode_into(encoder)?;
+        }
         Ok(())
     }
 }
@@ -7057,11 +7063,18 @@ impl RepositoryHeadV1Output {
         }
         let generation = decoder.read_u64_be()?;
         let envelope = Digest256::decode_with_decoder(decoder)?;
+        let length = decoder.read_u16_be()? as usize;
+        let mut receipts = Vec::with_capacity(decoder.capacity_hint_sized(length, 96));
+        for _ in 0..length {
+            let item = PublishReceiptV1::decode_with_decoder(decoder)?;
+            receipts.push(item);
+        }
         Ok(Self {
             magic,
             version,
             generation,
             envelope,
+            receipts,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -7077,6 +7090,7 @@ impl From<RepositoryHeadV1Output> for RepositoryHeadV1Input {
         Self {
             generation: o.generation,
             envelope: o.envelope,
+            receipts: o.receipts,
         }
     }
 }
@@ -7088,7 +7102,177 @@ impl From<RepositoryHeadV1Input> for RepositoryHeadV1Output {
             version: 1u16,
             generation: i.generation,
             envelope: i.envelope,
+            receipts: i.receipts,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishReceiptV1 {
+    pub key: Uuid128,
+    pub request: Uuid128,
+    pub receipt: Uuid128,
+    pub generation: u64,
+    pub envelope: Digest256,
+    pub recorded_at: u64,
+}
+
+impl PublishReceiptV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.key.encode_into(encoder)?;
+        self.request.encode_into(encoder)?;
+        self.receipt.encode_into(encoder)?;
+        encoder.write_u64_be(self.generation);
+        self.envelope.encode_into(encoder)?;
+        encoder.write_u64_be(self.recorded_at);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let key = Uuid128::decode_with_decoder(decoder)?;
+        let request = Uuid128::decode_with_decoder(decoder)?;
+        let receipt = Uuid128::decode_with_decoder(decoder)?;
+        let generation = decoder.read_u64_be()?;
+        let envelope = Digest256::decode_with_decoder(decoder)?;
+        let recorded_at = decoder.read_u64_be()?;
+        Ok(Self {
+            key,
+            request,
+            receipt,
+            generation,
+            envelope,
+            recorded_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishKeyInputV1 {
+    pub principal: Vec<u8>,
+    pub key: Uuid128,
+}
+
+impl PublishKeyInputV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.principal.len() as u32);
+        for item in &self.principal {
+            encoder.write_byte(*item);
+        }
+        self.key.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let principal = decoder.read_bytes_vec(length)?;
+        let key = Uuid128::decode_with_decoder(decoder)?;
+        Ok(Self { principal, key })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishRequestInputV1 {
+    pub envelope: Digest256,
+    pub expected_generation: u64,
+    pub expected_envelope: Digest256,
+    pub force: bool,
+}
+
+impl PublishRequestInputV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.envelope.encode_into(encoder)?;
+        encoder.write_u64_be(self.expected_generation);
+        self.expected_envelope.encode_into(encoder)?;
+        encoder.write_byte(if self.force { 1 } else { 0 });
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let envelope = Digest256::decode_with_decoder(decoder)?;
+        let expected_generation = decoder.read_u64_be()?;
+        let expected_envelope = Digest256::decode_with_decoder(decoder)?;
+        let force = decoder.read_byte()? != 0;
+        Ok(Self {
+            envelope,
+            expected_generation,
+            expected_envelope,
+            force,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishReceiptIdInputV1 {
+    pub key: Uuid128,
+    pub request: Uuid128,
+    pub generation: u64,
+    pub envelope: Digest256,
+}
+
+impl PublishReceiptIdInputV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.key.encode_into(encoder)?;
+        self.request.encode_into(encoder)?;
+        encoder.write_u64_be(self.generation);
+        self.envelope.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let key = Uuid128::decode_with_decoder(decoder)?;
+        let request = Uuid128::decode_with_decoder(decoder)?;
+        let generation = decoder.read_u64_be()?;
+        let envelope = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            key,
+            request,
+            generation,
+            envelope,
+        })
     }
 }
 

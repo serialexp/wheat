@@ -288,12 +288,27 @@ pub enum PublishOutcome {
 // Wire helpers (client-side WebSocket type differs from server-side)
 // ---------------------------------------------------------------------------
 
+/// The connection broke without the server ending the session: what was sent last
+/// may or may not have arrived. A server that ends a session closes it instead.
+#[derive(Debug, thiserror::Error)]
+#[error("connection lost: {0}")]
+pub struct ConnectionLost(String);
+
+/// Whether `error` is, or was caused by, a [`ConnectionLost`].
+pub fn is_connection_lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ConnectionLost>())
+}
+
+fn lost(error: tokio_tungstenite::tungstenite::Error) -> ConnectionLost {
+    ConnectionLost(error.to_string())
+}
+
 async fn send_msg(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     msg: &WheatProtocolMessage,
 ) -> Result<()> {
     let bytes = encode_message(msg)?;
-    ws.send(Message::Binary(bytes.into())).await?;
+    ws.send(Message::Binary(bytes.into())).await.map_err(lost)?;
     Ok(())
 }
 
@@ -304,11 +319,12 @@ async fn recv_msg(
         let msg = ws
             .next()
             .await
-            .context("connection closed unexpectedly")??;
+            .ok_or_else(|| ConnectionLost("the connection closed unexpectedly".into()))?
+            .map_err(lost)?;
         match msg {
             Message::Binary(bytes) => return Ok(decode_message(&bytes)?),
             Message::Ping(data) => {
-                ws.send(Message::Pong(data)).await?;
+                ws.send(Message::Pong(data)).await.map_err(lost)?;
             }
             Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(_) => bail!("server closed connection"),
@@ -839,9 +855,13 @@ pub async fn fetch_content<S: RepositoryStore + ?Sized>(
 ///
 /// Sends the local envelope and all objects/content the server is missing,
 /// then commits. Returns the outcome.
+///
+/// The same publish sent again with the same `publish_key`, after its connection was
+/// lost, is not published twice: the server answers it as it did the first sending.
 pub async fn publish<O: ImmutableObjectStore>(
     session: &mut WheatSession,
     op_id: u32,
+    publish_key: [u8; 16],
     objects: &O,
     content: &ContentStore,
     local_envelope: RepositoryEnvelopeId,
@@ -855,7 +875,7 @@ pub async fn publish<O: ImmutableObjectStore>(
             message_type: 0x40,
             op_id,
             publish_key: Uuid128 {
-                bytes: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                bytes: publish_key.to_vec(),
             },
             envelope_id: envelope_id_to_digest(local_envelope),
             expected_generation: expected_remote.generation,

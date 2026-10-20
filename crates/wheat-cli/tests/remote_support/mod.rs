@@ -4,9 +4,13 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::net::SocketAddr;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use serde_json::Value;
 use wheat_server::registry::Registry;
@@ -99,6 +103,7 @@ pub fn git(cwd: &Path, args: &[&str]) {
 /// this is dropped.
 pub struct Server {
     pub url: String,
+    pub addr: SocketAddr,
     _runtime: tokio::runtime::Runtime,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -133,7 +138,102 @@ pub fn serve(root: &Path, config: &Path) -> Server {
     let addr: SocketAddr = runtime.block_on(ready_rx).unwrap();
     Server {
         url: format!("wheat://{addr}/team/repo"),
+        addr,
         _runtime: runtime,
         _shutdown: shutdown,
+    }
+}
+
+/// A TCP proxy in front of a [`Server`] that, the first time the server answers a
+/// publish, drops the connection instead of passing the `PublishResult` on: the
+/// publish went through, and the client never hears so.
+pub struct LosesFirstPublishResult {
+    pub url: String,
+    dropped: Arc<AtomicBool>,
+}
+
+impl LosesFirstPublishResult {
+    pub fn start(server: &Server) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("wheat://{}/team/repo", listener.local_addr().unwrap());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let upstream = server.addr;
+        let flag = dropped.clone();
+        thread::spawn(move || {
+            for client in listener.incoming() {
+                let client = client.unwrap();
+                let server = TcpStream::connect(upstream).unwrap();
+                let (mut up_from, mut up_to) =
+                    (client.try_clone().unwrap(), server.try_clone().unwrap());
+                thread::spawn(move || {
+                    let _ = io::copy(&mut up_from, &mut up_to);
+                    let _ = up_to.shutdown(Shutdown::Write);
+                });
+                let flag = flag.clone();
+                thread::spawn(move || forward_server_frames(server, client, &flag));
+            }
+        });
+        Self { url, dropped }
+    }
+
+    /// Whether a `PublishResult` was dropped.
+    pub fn dropped(&self) -> bool {
+        self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+/// Passes the server's upgrade response and then its frames on to the client, unless
+/// a frame is the first `PublishResult`: then both connections are shut down.
+fn forward_server_frames(mut server: TcpStream, mut client: TcpStream, dropped: &AtomicBool) {
+    let shut = |server: &TcpStream, client: &TcpStream| {
+        let _ = server.shutdown(Shutdown::Both);
+        let _ = client.shutdown(Shutdown::Both);
+    };
+    // The upgrade response ends at the first blank line.
+    let mut response = Vec::new();
+    let mut byte = [0; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        if server.read_exact(&mut byte).is_err() {
+            return shut(&server, &client);
+        }
+        response.push(byte[0]);
+    }
+    if client.write_all(&response).is_err() {
+        return shut(&server, &client);
+    }
+    loop {
+        // A server frame is unmasked: two header bytes, then any extended length.
+        let mut frame = vec![0; 2];
+        if server.read_exact(&mut frame).is_err() {
+            return shut(&server, &client);
+        }
+        let extended = match frame[1] & 0x7f {
+            126 => 2,
+            127 => 8,
+            _ => 0,
+        };
+        frame.resize(2 + extended, 0);
+        if server.read_exact(&mut frame[2..]).is_err() {
+            return shut(&server, &client);
+        }
+        let length = match extended {
+            0 => u64::from(frame[1] & 0x7f),
+            _ => frame[2..]
+                .iter()
+                .fold(0, |length, &byte| length << 8 | u64::from(byte)),
+        };
+        let header = frame.len();
+        frame.resize(header + length as usize, 0);
+        if server.read_exact(&mut frame[header..]).is_err() {
+            return shut(&server, &client);
+        }
+        let binary = frame[0] & 0x0f == 2;
+        let publish_result = binary && frame.get(header) == Some(&0x49);
+        if publish_result && !dropped.swap(true, Ordering::SeqCst) {
+            return shut(&server, &client);
+        }
+        if client.write_all(&frame).is_err() {
+            return shut(&server, &client);
+        }
     }
 }

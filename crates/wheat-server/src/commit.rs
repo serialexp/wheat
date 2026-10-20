@@ -6,18 +6,26 @@
 //! the publishes after it join onto its head (the tentative head), read its objects
 //! from memory, and form the next batch. A batch that fails also fails the batch
 //! built on it.
+//!
+//! The head records each publish's receipt in the write that publishes it. A publish
+//! sent again with its key (see [`crate::receipt`]) is not accepted a second time: it
+//! gets the receipt, or waits for the batch the first sending is in.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use tokio::sync::{Mutex, oneshot};
 use tracing::{Instrument as _, debug_span, warn};
-use wheat_core::RepositoryEnvelopeId;
+use wheat_core::{PublishReceiptRecord, RepositoryEnvelopeId};
 use wheat_store::{
     ImmutableObjectStore, PendingPublications, PublicationError, PublicationStore, RepositoryHead,
     RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
     RepositoryStoreError, RepositoryUnionError, StagedPublication, TransitionValidationOptions,
 };
 
+use crate::receipt::{PublishKey, Recorded};
 use crate::registry::RepositoryEntry;
 
 /// Times a batch retries its compare-and-swap when another process sharing the
@@ -68,6 +76,9 @@ struct CommitState {
     tentative: Option<RepositoryEnvelopeId>,
     /// The batch being written, readable meanwhile.
     writing: PendingPublications,
+    /// The keys of that batch's publishes, and who waits for it.
+    writing_keys: Vec<PublishKey>,
+    writing_members: Vec<oneshot::Sender<CommitOutcome>>,
     /// Publishes accepted since that batch was taken.
     next: Option<Batch>,
     /// Whether a committer task is running.
@@ -82,26 +93,70 @@ struct Batch {
     /// Whether a forced publish is in the batch, so it must not be re-joined.
     forced: bool,
     publications: PendingPublications,
+    /// The keys of the batch's publishes, whose receipts the head records.
+    keys: Vec<PublishKey>,
+    /// Who waits for the batch: its publishes, and any of them sent again.
     members: Vec<oneshot::Sender<CommitOutcome>>,
 }
 
-/// A publish accepted into a batch.
+/// A publish accepted into a batch, or one sent again and answered as the first
+/// sending was.
 pub struct Accepted {
-    receiver: oneshot::Receiver<CommitOutcome>,
+    answer: Answer,
+    repeated: bool,
+}
+
+enum Answer {
+    Waiting(oneshot::Receiver<CommitOutcome>),
+    Published(RepositoryHead),
 }
 
 impl Accepted {
+    fn waiting(receiver: oneshot::Receiver<CommitOutcome>, repeated: bool) -> Self {
+        Self {
+            answer: Answer::Waiting(receiver),
+            repeated,
+        }
+    }
+
+    /// Whether the publish was sent before with its key, so this is the first
+    /// sending's answer.
+    pub fn repeated(&self) -> bool {
+        self.repeated
+    }
+
     /// Waits for the publish's batch: the head it published, or why it did not.
     pub async fn durable(self) -> CommitOutcome {
-        self.receiver
-            .instrument(debug_span!("publish_durable_wait"))
-            .await
-            .unwrap_or_else(|_| {
-                Err(CommitFailure::Internal(
-                    "publish: the group commit stopped".into(),
-                ))
-            })
+        match self.answer {
+            Answer::Published(head) => Ok(head),
+            Answer::Waiting(receiver) => receiver
+                .instrument(debug_span!("publish_durable_wait"))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(CommitFailure::Internal(
+                        "publish: the group commit stopped".into(),
+                    ))
+                }),
+        }
     }
+}
+
+/// The answer to a publish sent before with `key`, if it was: the head it was
+/// published in, by the `durable` head's `receipts`, or the batch it waits in.
+/// Checked before the publish's transfer, so a retry after the head moved is not
+/// refused as stale and sends nothing again.
+///
+/// The head may be read before this is called. A first sending published since then
+/// is no longer waiting in a batch, so it is not found here; [`accept`] reads the
+/// head again and finds it.
+pub async fn previous(
+    entry: &Arc<RepositoryEntry>,
+    durable: RepositoryHead,
+    receipts: &[PublishReceiptRecord],
+    key: &PublishKey,
+) -> Result<Option<Accepted>, CommitFailure> {
+    let mut turn = entry.commit.state.lock().await;
+    turn.previous(receipts, durable, key).transpose()
 }
 
 /// Joins `proposed`, built on `expected`, with whatever was accepted since, and
@@ -112,10 +167,14 @@ impl Accepted {
 /// recorded differently on each side, refuses the publish as stale. A forced publish
 /// is never joined: it replaces exactly the head it names. Refusals report the
 /// durable head, the one the client can fetch.
+///
+/// A publish whose key was accepted meanwhile, by another session sending it again,
+/// is answered as that one is instead.
 #[tracing::instrument(name = "publish_accept", level = "debug", skip_all)]
 pub async fn accept<S: RepositoryStore + ?Sized>(
     entry: &Arc<RepositoryEntry>,
     staged: &RepositoryStage<'_, S>,
+    key: PublishKey,
     expected: RepositoryEnvelopeId,
     proposed: RepositoryEnvelopeId,
     force: bool,
@@ -126,7 +185,10 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
         .lock()
         .instrument(debug_span!("publish_commit_wait"))
         .await;
-    let durable = read_head(entry)?;
+    let (durable, receipts) = read_receipts(entry)?;
+    if let Some(previous) = turn.previous(&receipts, durable, &key) {
+        return previous;
+    }
     let current = turn.tentative.unwrap_or(durable.envelope);
     let pending = turn.pending();
     let view = pending.over(staged);
@@ -160,9 +222,32 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
     })?;
     // Nothing above changed the state, so a publish dropped while joining (its client
     // went away) leaves no trace.
-    Ok(Accepted {
-        receiver: turn.accept(entry, current, joined, force, publication),
-    })
+    let receiver = turn.accept(entry, key, current, joined, force, publication);
+    Ok(Accepted::waiting(receiver, false))
+}
+
+/// The refusal of a publish whose key was used for a different one.
+fn reused(head: RepositoryHead) -> CommitFailure {
+    CommitFailure::Rejected {
+        head,
+        message: "this publish key was used for a different publish".to_string(),
+    }
+}
+
+/// The answer to `key` if a publish in `keys`, whose batch `members` wait for, has it.
+fn wait_in(
+    keys: &[PublishKey],
+    members: &mut Vec<oneshot::Sender<CommitOutcome>>,
+    key: &PublishKey,
+    durable: RepositoryHead,
+) -> Option<Result<Accepted, CommitFailure>> {
+    let first = keys.iter().find(|other| other.same_key(key))?;
+    if !first.same_request(key) {
+        return Some(Err(reused(durable)));
+    }
+    let (sender, receiver) = oneshot::channel();
+    members.push(sender);
+    Some(Ok(Accepted::waiting(receiver, true)))
 }
 
 /// Why `head` and a publish could not be joined.
@@ -179,6 +264,31 @@ fn join_failure(error: RepositoryUnionError, head: RepositoryHead) -> CommitFail
 }
 
 impl CommitState {
+    /// The answer to a publish sent before with `key`: from the durable head's
+    /// `receipts`, or by waiting for the batch the first sending is in.
+    fn previous(
+        &mut self,
+        receipts: &[PublishReceiptRecord],
+        durable: RepositoryHead,
+        key: &PublishKey,
+    ) -> Option<Result<Accepted, CommitFailure>> {
+        match key.find(receipts) {
+            Some(Recorded::Published(head)) => {
+                return Some(Ok(Accepted {
+                    answer: Answer::Published(head),
+                    repeated: true,
+                }));
+            }
+            Some(Recorded::Reused) => return Some(Err(reused(durable))),
+            None => {}
+        }
+        if let Some(answer) = wait_in(&self.writing_keys, &mut self.writing_members, key, durable) {
+            return Some(answer);
+        }
+        let next = self.next.as_mut()?;
+        wait_in(&next.keys, &mut next.members, key, durable)
+    }
+
     /// The accepted publications not yet durable, to read beneath a publish's stage.
     fn pending(&self) -> PendingPublications {
         let mut pending = self.writing.clone();
@@ -194,6 +304,7 @@ impl CommitState {
     fn accept(
         &mut self,
         entry: &Arc<RepositoryEntry>,
+        key: PublishKey,
         built_on: RepositoryEnvelopeId,
         joined: RepositoryEnvelopeId,
         forced: bool,
@@ -206,11 +317,13 @@ impl CommitState {
             target: joined,
             forced: false,
             publications: PendingPublications::default(),
+            keys: Vec::new(),
             members: Vec::new(),
         });
         batch.target = joined;
         batch.forced |= forced;
         batch.publications.push(publication);
+        batch.keys.push(key);
         batch.members.push(sender);
         self.tentative = Some(joined);
         if !self.committing {
@@ -232,20 +345,25 @@ async fn commit_batches(entry: Arc<RepositoryEntry>) {
     loop {
         let batch = {
             let mut state = entry.commit.state.lock().await;
-            let Some(batch) = state.next.take() else {
+            let Some(mut batch) = state.next.take() else {
                 *state = CommitState::default();
                 abandoned.0 = None;
                 return;
             };
             state.writing = batch.publications.clone();
+            state.writing_keys = batch.keys.clone();
+            state.writing_members = std::mem::take(&mut batch.members);
             batch
         };
         let outcome = commit_batch(&entry, &batch)
-            .instrument(debug_span!("group_commit", publishes = batch.members.len()))
+            .instrument(debug_span!("group_commit", publishes = batch.keys.len()))
             .await;
+        let mut state = entry.commit.state.lock().await;
+        // Once published, the head's receipts answer a publish sent again.
+        state.writing_keys.clear();
+        let members = std::mem::take(&mut state.writing_members);
         if let Err(failure) = &outcome {
             // The next batch joined onto this one's head, so it fails too.
-            let mut state = entry.commit.state.lock().await;
             state.writing = PendingPublications::default();
             state.tentative = None;
             if let Some(next) = state.next.take() {
@@ -263,7 +381,8 @@ async fn commit_batches(entry: Arc<RepositoryEntry>) {
                 }
             }
         }
-        for member in batch.members {
+        drop(state);
+        for member in members {
             // A publish whose client went away no longer waits.
             let _ = member.send(outcome.clone());
         }
@@ -346,8 +465,17 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> CommitOutcome {
             generation: head.generation + 1,
             envelope: target,
         };
-        let advanced =
-            debug_span!("publish_cas").in_scope(|| entry.heads.compare_and_advance(head, new_head));
+        let now = unix_seconds();
+        let receipts: Vec<_> = batch
+            .keys
+            .iter()
+            .map(|key| key.receipt(new_head, now))
+            .collect();
+        let advanced = debug_span!("publish_cas").in_scope(|| {
+            entry
+                .heads
+                .compare_and_advance_with_receipts(head, new_head, &receipts, now)
+        });
         match advanced {
             Ok(()) => return Ok(new_head),
             Err(PublicationError::Stale { .. }) => continue,
@@ -406,6 +534,23 @@ fn read_head(entry: &RepositoryEntry) -> Result<RepositoryHead, CommitFailure> {
         .heads
         .read()
         .map_err(|e| CommitFailure::Internal(format!("publish: read the head: {e}")))
+}
+
+fn read_receipts(
+    entry: &RepositoryEntry,
+) -> Result<(RepositoryHead, Vec<PublishReceiptRecord>), CommitFailure> {
+    entry
+        .heads
+        .read_with_receipts()
+        .map_err(|e| CommitFailure::Internal(format!("publish: read the head: {e}")))
+}
+
+/// Seconds since the Unix epoch, which receipts are recorded at. A clock before the
+/// epoch counts as the epoch: the receipts then expire early, never late.
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// Checks that `to` may follow `from`. The outer error is a failure to read either

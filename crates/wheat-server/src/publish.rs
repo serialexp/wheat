@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
+use wheat_core::{ContentId, ObjectId, PublishReceiptRecord, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
     DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryHead,
@@ -15,12 +15,13 @@ use wheat_store::{
     StructuralDeltaLimits, TreeDiffLimits,
 };
 
-use crate::commit::{self, CommitFailure};
+use crate::commit::{self, Accepted, CommitFailure};
 use crate::connection::ConnectionError;
+use crate::receipt::PublishKey;
 use crate::registry::RepositoryEntry;
 use crate::wire::{
     connection_error_scope, digest_to_content_id, digest_to_object_id, publish_error_status,
-    publish_ok_status, publish_rejected_status, publish_result, publish_stale_status, recv, send,
+    publish_published, publish_rejected_status, publish_result, publish_stale_status, recv, send,
     send_error,
 };
 
@@ -116,19 +117,29 @@ async fn read_push(
 
 const OVER_PUSH_LIMIT: &str = "a publish pushed more than MAX_PUSHED_BYTES";
 
-/// Handle a publish request whose push has been read. Returns the new head if
-/// publication succeeded.
+/// Handle a publish request whose push has been read, against `current_head` and the
+/// `receipts` it holds. Returns the new head if publication succeeded.
 #[tracing::instrument(name = "publish", level = "debug", skip_all)]
 pub async fn handle_publish(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &Arc<RepositoryEntry>,
     current_head: &RepositoryHead,
+    receipts: &[PublishReceiptRecord],
     req: PublishRequestOutput,
+    key: PublishKey,
     mut pushed: Pushed,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
     let op_id = req.op_id;
     let force = req.force;
     debug!(op_id, force, "publish: starting");
+
+    // A publish sent again, after the connection it was first sent on was lost, gets
+    // the first sending's answer, and nothing is transferred again.
+    match commit::previous(entry, *current_head, receipts, &key).await {
+        Ok(None) => {}
+        Ok(Some(previous)) => return answer(ws, op_id, key, Ok(previous)).await,
+        Err(failure) => return answer(ws, op_id, key, Err(failure)).await,
+    }
 
     // The head the client last saw. A forced publish replaces the head, so it must
     // be exactly this one. Any other publish is joined with whatever was published
@@ -354,6 +365,7 @@ pub async fn handle_publish(
         entry,
         &staged,
         op_id,
+        key,
         expected,
         proposed_envelope_id,
         force,
@@ -374,31 +386,38 @@ async fn commit(
     entry: &Arc<RepositoryEntry>,
     staged: &Staged<'_>,
     op_id: u32,
+    key: PublishKey,
     expected: RepositoryHead,
     proposed: RepositoryEnvelopeId,
     force: bool,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
-    let outcome = match commit::accept(entry, staged, expected.envelope, proposed, force).await {
-        Ok(accepted) => accepted.durable().await,
-        Err(refused) => Err(refused),
+    let accepted = commit::accept(entry, staged, key, expected.envelope, proposed, force).await;
+    answer(ws, op_id, key, accepted).await
+}
+
+/// Tells the client how its publish ended: the head it was published in, or why it
+/// was not.
+async fn answer(
+    ws: &mut WebSocketStream<TcpStream>,
+    op_id: u32,
+    key: PublishKey,
+    accepted: Result<Accepted, CommitFailure>,
+) -> Result<Option<RepositoryHead>, ConnectionError> {
+    let (repeated, outcome) = match accepted {
+        Ok(accepted) => (accepted.repeated(), accepted.durable().await),
+        Err(refused) => (false, Err(refused)),
     };
     match outcome {
         Ok(head) => {
             info!(
                 op_id,
                 generation = head.generation,
-                joined = head.envelope != proposed,
+                repeated,
                 "publish: committed"
             );
             send(
                 ws,
-                &publish_result(
-                    op_id,
-                    publish_ok_status(),
-                    head.generation,
-                    head.envelope.as_bytes(),
-                    "",
-                ),
+                &publish_published(op_id, repeated, key.receipt_id(head), head),
             )
             .await?;
             Ok(Some(head))

@@ -509,7 +509,19 @@ per principal + repository) for cross-session idempotency. If the CAS
 succeeds but the reply is lost, retrying with the same `publish_key`
 returns the original receipt rather than `stale_head`. Retries with the
 same `publish_key` but different envelope or expected head are rejected.
-The server retains publish keys for a bounded window (default: 24h).
+
+The server binds each key to the principal that sent it, and records the
+receipts in the repository head, in the same write that moves the head, so
+a receipt survives a restart and is seen by every server sharing the store.
+The head keeps receipts for 24 hours and at most 1024 of them, dropping the
+oldest first; a retry later than that is published again. A retry is
+answered `already_committed` with the head the publish went into, whatever
+the head is now. One that arrives while the first sending is still being
+made durable waits for it. The check comes before the push is used, so a
+retry transfers nothing again.
+
+`wheat publish` sends a publish once more, over a new connection, when the
+connection is lost before the answer arrives.
 
 **Bounded delta validation.** The server does not re-verify the entire
 retained history (757s on a representative repo). Instead it validates only

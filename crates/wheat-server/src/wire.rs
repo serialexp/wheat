@@ -9,6 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use wheat_core::{ContentId, ObjectId};
 use wheat_protocol::*;
+use wheat_store::RepositoryHead;
 
 use crate::connection::ConnectionError;
 
@@ -125,7 +126,8 @@ pub fn digest_to_content_id(d: &Digest256) -> Result<ContentId, ConnectionError>
     Ok(ContentId::from_digest(bytes))
 }
 
-/// Build a PublishResult message.
+/// Build a PublishResult message for a publish that was not published, which has no
+/// receipt.
 pub fn publish_result(
     op_id: u32,
     status: PublishResultStatus,
@@ -133,10 +135,48 @@ pub fn publish_result(
     envelope: &[u8; 32],
     message: &str,
 ) -> WheatProtocolMessage {
+    result_with_receipt(op_id, status, [0; 16], generation, envelope, message)
+}
+
+/// Build the PublishResult of a publish published in `head`: `already_committed` when
+/// it was published by an earlier sending with the same key.
+pub fn publish_published(
+    op_id: u32,
+    repeated: bool,
+    receipt: [u8; 16],
+    head: RepositoryHead,
+) -> WheatProtocolMessage {
+    let status = if repeated {
+        PublishResultStatus::PublishStatusAlreadyCommitted(PublishStatusAlreadyCommittedOutput {
+            code: 3,
+        })
+    } else {
+        publish_ok_status()
+    };
+    result_with_receipt(
+        op_id,
+        status,
+        receipt,
+        head.generation,
+        head.envelope.as_bytes(),
+        "",
+    )
+}
+
+fn result_with_receipt(
+    op_id: u32,
+    status: PublishResultStatus,
+    receipt: [u8; 16],
+    generation: u64,
+    envelope: &[u8; 32],
+    message: &str,
+) -> WheatProtocolMessage {
     WheatProtocolMessage::PublishResult(PublishResultOutput {
         message_type: 0x49,
         op_id,
-        receipt_id: Uuid128 { bytes: vec![0; 16] },
+        receipt_id: Uuid128 {
+            bytes: receipt.to_vec(),
+        },
         status,
         new_generation: generation,
         new_envelope: Digest256 {

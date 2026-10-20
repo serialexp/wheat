@@ -11,6 +11,7 @@ pub mod config;
 pub mod connection;
 pub mod fetch;
 pub mod publish;
+pub mod receipt;
 pub mod registry;
 pub mod server;
 pub mod wire;

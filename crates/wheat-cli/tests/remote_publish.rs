@@ -8,7 +8,7 @@ mod remote_support;
 
 use std::path::{Path, PathBuf};
 
-use remote_support::{Server, fails, ok, ok_json, serve, write_config};
+use remote_support::{LosesFirstPublishResult, Server, fails, ok, ok_json, serve, write_config};
 
 /// Clones of one server, each with a store home of its own.
 struct Clients {
@@ -31,13 +31,18 @@ impl Clients {
 
     /// Clones the server into workspace `name`; returns it and its store home.
     fn clone(&self, name: &str) -> (PathBuf, PathBuf) {
+        self.clone_from(&self.server.url, name)
+    }
+
+    /// Clones `url` into workspace `name`; returns it and its store home.
+    fn clone_from(&self, url: &str, name: &str) -> (PathBuf, PathBuf) {
         let stores = self.root.join(format!("{name}-stores"));
         let workspace = self.root.join(name);
         ok(
             &self.root,
             &stores,
             &self.config,
-            &["clone", &self.server.url, workspace.to_str().unwrap()],
+            &["clone", url, workspace.to_str().unwrap()],
         );
         (workspace, stores)
     }
@@ -109,6 +114,30 @@ fn a_publish_behind_the_remote_is_joined_with_it() {
     assert_eq!(fetched["kept_local"], false, "{fetched}");
     ok(&first.0, &first.1, &clients.config, &["validate"]);
     assert_eq!(clients.frontiers(&first), joined);
+}
+
+/// The connection drops after the server published but before the writer heard. The
+/// writer sends the publish again with its key, and the server answers it as
+/// published, rather than publishing it twice or refusing it as stale.
+#[test]
+fn a_publish_whose_answer_is_lost_is_sent_again_and_published_once() {
+    let root = tempfile::tempdir().unwrap();
+    let clients = Clients::new(root.path());
+    let proxy = LosesFirstPublishResult::start(&clients.server);
+    let writer = clients.clone_from(&proxy.url, "writer");
+
+    clients.add_change(&writer, "one");
+    let published = clients.json(&writer, &["publish"]);
+    assert!(proxy.dropped(), "the first answer reached the writer");
+    assert_eq!(published["generation"], 1, "{published}");
+    assert_eq!(published["joined"], false, "{published}");
+    ok(&writer.0, &writer.1, &clients.config, &["validate"]);
+    let again = clients.json(&writer, &["fetch"]);
+    assert_eq!(again["up_to_date"], true, "{again}");
+
+    // The server holds the change once.
+    let reader = clients.clone("reader");
+    assert_eq!(clients.frontiers(&reader), clients.frontiers(&writer));
 }
 
 /// A label both writers moved cannot be joined: the publish is sent back as stale

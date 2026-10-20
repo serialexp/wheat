@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Notify, Semaphore};
 use wheat_core::{ApplicationContext, ContentId, ObjectId, Repository, RepositoryEnvelopeId, Tree};
+use wheat_protocol::{Digest256, PublishRequestOutput, Uuid128};
+use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
+use wheat_server::receipt::PublishKey;
 use wheat_server::registry::RepositoryEntry;
 use wheat_store::{
     ContentItem, ContentStore, ImmutableObjectStore, LocalPublicationStore, ObjectStoreError,
@@ -186,6 +189,30 @@ async fn propose<'a>(
     (stage, publication.proposed().envelope)
 }
 
+/// The key of a publish of `proposed` sent with the client key `seed`.
+fn key(seed: u8, proposed: RepositoryEnvelopeId) -> PublishKey {
+    let request = PublishRequestOutput {
+        message_type: 0x40,
+        op_id: 1,
+        publish_key: Uuid128 {
+            bytes: vec![seed; 16],
+        },
+        envelope_id: Digest256 {
+            bytes: proposed.as_bytes().to_vec(),
+        },
+        expected_generation: 0,
+        expected_envelope: Digest256 { bytes: vec![0; 32] },
+        force: false,
+    };
+    PublishKey::new(
+        &Principal {
+            name: "test".into(),
+        },
+        &request,
+    )
+    .unwrap()
+}
+
 fn proposal(title: &str, value: &[u8]) -> wheat_core::ChangeProposal {
     let at = wheat_core::Timestamp {
         seconds: 1_000_000,
@@ -240,10 +267,16 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
     let (a_stage, a) = propose(&server, initial, "a.txt").await;
     let (b_stage, b) = propose(&server, initial, "b.txt").await;
 
-    let first_accepted =
-        commit::accept(&server.entry, &first_stage, initial.envelope, first, false)
-            .await
-            .unwrap();
+    let first_accepted = commit::accept(
+        &server.entry,
+        &first_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+    )
+    .await
+    .unwrap();
     // The first batch is being written: everything accepted now forms the next one.
     server.gate.arrived.notified().await;
 
@@ -256,12 +289,26 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
     );
 
     // Both join onto the first publish, reading it from memory.
-    let a_accepted = commit::accept(&server.entry, &a_stage, initial.envelope, a, false)
-        .await
-        .unwrap();
-    let b_accepted = commit::accept(&server.entry, &b_stage, initial.envelope, b, false)
-        .await
-        .unwrap();
+    let a_accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(2, a),
+        initial.envelope,
+        a,
+        false,
+    )
+    .await
+    .unwrap();
+    let b_accepted = commit::accept(
+        &server.entry,
+        &b_stage,
+        key(3, b),
+        initial.envelope,
+        b,
+        false,
+    )
+    .await
+    .unwrap();
 
     server.gate.permits.add_permits(2);
     let first_head = first_accepted.durable().await.unwrap();
@@ -297,14 +344,27 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
     let (a_stage, a) = propose(&server, initial, "a.txt").await;
 
     server.gate.failures.store(1, Ordering::SeqCst);
-    let first_accepted =
-        commit::accept(&server.entry, &first_stage, initial.envelope, first, false)
-            .await
-            .unwrap();
+    let first_accepted = commit::accept(
+        &server.entry,
+        &first_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+    )
+    .await
+    .unwrap();
     server.gate.arrived.notified().await;
-    let a_accepted = commit::accept(&server.entry, &a_stage, initial.envelope, a, false)
-        .await
-        .unwrap();
+    let a_accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(2, a),
+        initial.envelope,
+        a,
+        false,
+    )
+    .await
+    .unwrap();
     server.gate.permits.add_permits(1);
 
     match first_accepted.durable().await {
@@ -325,9 +385,16 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
 
     // The next publish starts again from the durable head.
     let (c_stage, c) = propose(&server, initial, "c.txt").await;
-    let c_accepted = commit::accept(&server.entry, &c_stage, initial.envelope, c, false)
-        .await
-        .unwrap();
+    let c_accepted = commit::accept(
+        &server.entry,
+        &c_stage,
+        key(4, c),
+        initial.envelope,
+        c,
+        false,
+    )
+    .await
+    .unwrap();
     server.gate.permits.add_permits(1);
     assert_eq!(
         c_accepted.durable().await.unwrap(),
@@ -346,14 +413,27 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
     let (a_stage, a) = propose(&server, initial, "a.txt").await;
 
     server.gate.panics.store(1, Ordering::SeqCst);
-    let first_accepted =
-        commit::accept(&server.entry, &first_stage, initial.envelope, first, false)
-            .await
-            .unwrap();
+    let first_accepted = commit::accept(
+        &server.entry,
+        &first_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+    )
+    .await
+    .unwrap();
     server.gate.arrived.notified().await;
-    let a_accepted = commit::accept(&server.entry, &a_stage, initial.envelope, a, false)
-        .await
-        .unwrap();
+    let a_accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(2, a),
+        initial.envelope,
+        a,
+        false,
+    )
+    .await
+    .unwrap();
     server.gate.permits.add_permits(1);
 
     for accepted in [first_accepted, a_accepted] {
@@ -368,9 +448,16 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
 
     // A new committer takes the next publish, built on the durable head.
     let (c_stage, c) = propose(&server, initial, "c.txt").await;
-    let c_accepted = commit::accept(&server.entry, &c_stage, initial.envelope, c, false)
-        .await
-        .unwrap();
+    let c_accepted = commit::accept(
+        &server.entry,
+        &c_stage,
+        key(4, c),
+        initial.envelope,
+        c,
+        false,
+    )
+    .await
+    .unwrap();
     server.gate.permits.add_permits(1);
     assert_eq!(
         c_accepted.durable().await.unwrap(),
@@ -387,9 +474,16 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
     let initial = server.initial;
     let (a_stage, a) = propose(&server, initial, "a.txt").await;
 
-    let a_accepted = commit::accept(&server.entry, &a_stage, initial.envelope, a, false)
-        .await
-        .unwrap();
+    let a_accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(2, a),
+        initial.envelope,
+        a,
+        false,
+    )
+    .await
+    .unwrap();
     server.gate.arrived.notified().await;
 
     // Another process sharing the store publishes while the batch is written.
@@ -422,4 +516,181 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
         joined(&server, initial.envelope, other.envelope, a).await
     );
     assert_eq!(server.entry.heads.read().unwrap(), head);
+}
+
+/// A stage with nothing in it, as a publish sent again has before its transfer.
+fn empty(server: &Server) -> Stage<'_> {
+    Stage::new(&*server.entry.store, 65_536, 64 * 1024 * 1024)
+}
+
+/// The answer to a publish sent again with `key`, checked as a connection does
+/// before the transfer: against the head it reads first.
+async fn previous(
+    server: &Server,
+    key: &PublishKey,
+) -> Result<Option<commit::Accepted>, CommitFailure> {
+    let (head, receipts) = server.entry.heads.read_with_receipts().unwrap();
+    commit::previous(&server.entry, head, &receipts, key).await
+}
+
+#[tokio::test]
+async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_once() {
+    let server = server().await;
+    let initial = server.initial;
+    let (first_stage, first) = propose(&server, initial, "first.txt").await;
+    let (a_stage, a) = propose(&server, initial, "a.txt").await;
+
+    let first_accepted = commit::accept(
+        &server.entry,
+        &first_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+    )
+    .await
+    .unwrap();
+    server.gate.arrived.notified().await;
+    // `a` waits in the next batch while the first is written.
+    let a_accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(2, a),
+        initial.envelope,
+        a,
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Each is sent again: before its transfer, and when it is accepted.
+    let first_again = previous(&server, &key(1, first))
+        .await
+        .unwrap()
+        .expect("the first publish is being written");
+    let empty_stage = empty(&server);
+    let a_again = commit::accept(
+        &server.entry,
+        &empty_stage,
+        key(2, a),
+        initial.envelope,
+        a,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(first_again.repeated() && a_again.repeated());
+    assert!(!first_accepted.repeated() && !a_accepted.repeated());
+
+    server.gate.permits.add_permits(2);
+    let first_head = first_accepted.durable().await.unwrap();
+    assert_eq!(first_again.durable().await.unwrap(), first_head);
+    let a_head = a_accepted.durable().await.unwrap();
+    assert_eq!(a_again.durable().await.unwrap(), a_head);
+    // One advance each, not two.
+    assert_eq!(a_head.generation, initial.generation + 2);
+    assert_eq!(server.entry.heads.read().unwrap(), a_head);
+}
+
+#[tokio::test]
+async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
+    let server = server().await;
+    let initial = server.initial;
+    let (first_stage, first) = propose(&server, initial, "first.txt").await;
+    let accepted = commit::accept(
+        &server.entry,
+        &first_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+    )
+    .await
+    .unwrap();
+    server.gate.permits.add_permits(1);
+    let first_head = accepted.durable().await.unwrap();
+
+    // Another publish moves the head on.
+    let (a_stage, a) = propose(&server, first_head, "a.txt").await;
+    let accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(2, a),
+        first_head.envelope,
+        a,
+        false,
+    )
+    .await
+    .unwrap();
+    server.gate.permits.add_permits(1);
+    let a_head = accepted.durable().await.unwrap();
+
+    // Sent again, the first is answered with the head it was published in rather
+    // than refused as stale, and the head stays.
+    let again = previous(&server, &key(1, first))
+        .await
+        .unwrap()
+        .expect("the first publish has a receipt");
+    assert!(again.repeated());
+    assert_eq!(again.durable().await.unwrap(), first_head);
+    let empty_stage = empty(&server);
+    let again = commit::accept(
+        &server.entry,
+        &empty_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.durable().await.unwrap(), first_head);
+    assert_eq!(server.entry.heads.read().unwrap(), a_head);
+}
+
+#[tokio::test]
+async fn a_publish_key_used_for_a_different_publish_is_refused() {
+    let server = server().await;
+    let initial = server.initial;
+    let (first_stage, first) = propose(&server, initial, "first.txt").await;
+    let (a_stage, a) = propose(&server, initial, "a.txt").await;
+    let accepted = commit::accept(
+        &server.entry,
+        &first_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+    )
+    .await
+    .unwrap();
+    server.gate.arrived.notified().await;
+
+    // While the first is written, and once it is published.
+    let refused = |answer: Result<Option<commit::Accepted>, CommitFailure>| match answer {
+        Err(CommitFailure::Rejected { message, .. }) => {
+            assert!(message.contains("publish key was used"), "{message}")
+        }
+        Err(other) => panic!("expected a refusal, got {other:?}"),
+        Ok(other) => panic!(
+            "expected a refusal, got repeated={:?}",
+            other.map(|a| a.repeated())
+        ),
+    };
+    refused(previous(&server, &key(1, a)).await);
+    server.gate.permits.add_permits(1);
+    let first_head = accepted.durable().await.unwrap();
+    refused(
+        commit::accept(
+            &server.entry,
+            &a_stage,
+            key(1, a),
+            initial.envelope,
+            a,
+            false,
+        )
+        .await
+        .map(Some),
+    );
+    assert_eq!(server.entry.heads.read().unwrap(), first_head);
 }

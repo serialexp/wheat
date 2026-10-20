@@ -54,10 +54,6 @@ for `wheat labels` here; incremental-validation step 9):
 See `docs/design/wheat-lessons-from-scion.md` for the planned work; these are gaps
 between `wheat-native-protocol.md` and the code.
 
-- `[ ]` **The server ignores `publish_key`.** The client sends one
-  (`crates/wheat-cli/src/remote.rs`), but `wheat-server` never reads it, so a publish
-  whose CAS succeeded but whose reply was lost comes back `stale` on retry instead of
-  returning the original receipt.
 - `[ ]` **Content fetch checks no reachability.** `handle_content_fetch`
   (`crates/wheat-server/src/fetch.rs`) serves any `ContentId` in the repository
   entry's content store. The design says content is served only when the client's

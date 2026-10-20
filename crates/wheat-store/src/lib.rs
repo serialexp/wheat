@@ -114,7 +114,10 @@ pub use object_store_adapter::{
     ObjectStoreAdapter, ObjectStoreAdapterBuildError, S3ObjectStoreConfig,
 };
 pub use provenance::{LaterEdits, PathHistory, PathStep};
-pub use publication::{LocalPublicationStore, PublicationError, PublicationStore, RepositoryHead};
+pub use publication::{
+    LocalPublicationStore, PUBLISH_RECEIPT_RETENTION_SECONDS, PublicationError, PublicationStore,
+    RepositoryHead,
+};
 pub use repository_mutation::{
     AuthoringSession, PersistedConflictResolution, PersistedRepositoryMutator,
     PreparedRepositoryMutation, RepositoryMutationError,

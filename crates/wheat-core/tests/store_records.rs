@@ -9,11 +9,23 @@ fn inventory(ids: &[u8]) -> Vec<InventoryRecord> {
         .collect()
 }
 
+fn receipt(seed: u8) -> PublishReceiptRecord {
+    PublishReceiptRecord {
+        key: [seed; 16],
+        request: [seed.wrapping_add(1); 16],
+        receipt: [seed.wrapping_add(2); 16],
+        generation: u64::from(seed) << 33,
+        envelope: RepositoryEnvelopeId::from_digest([seed.wrapping_add(3); 32]),
+        recorded_at: 1_800_000_000 + u64::from(seed),
+    }
+}
+
 #[test]
 fn repository_head_round_trips_at_its_fixed_size() {
     let head = RepositoryHeadRecord {
         generation: 1 << 40,
         envelope: RepositoryEnvelopeId::from_digest([6; 32]),
+        receipts: Vec::new(),
     };
     let mut bytes = encode_repository_head(&head).unwrap();
     assert_eq!(bytes.len(), REPOSITORY_HEAD_ENCODED_SIZE);
@@ -24,6 +36,79 @@ fn repository_head_round_trips_at_its_fixed_size() {
         Err(StoreRecordError::NonCanonicalEncoding)
     );
     assert!(decode_repository_head(&[0; REPOSITORY_HEAD_ENCODED_SIZE]).is_err());
+}
+
+#[test]
+fn repository_head_round_trips_with_receipts_in_order() {
+    let head = RepositoryHeadRecord {
+        generation: 7,
+        envelope: RepositoryEnvelopeId::from_digest([6; 32]),
+        receipts: vec![receipt(9), receipt(1), receipt(5)],
+    };
+    let mut bytes = encode_repository_head(&head).unwrap();
+    assert_eq!(
+        bytes.len(),
+        REPOSITORY_HEAD_ENCODED_SIZE + 3 * PUBLISH_RECEIPT_ENCODED_SIZE
+    );
+    assert_eq!(decode_repository_head(&bytes).unwrap(), head);
+    // A count that disagrees with the bytes after it does not decode.
+    bytes.truncate(bytes.len() - PUBLISH_RECEIPT_ENCODED_SIZE);
+    assert!(decode_repository_head(&bytes).is_err());
+}
+
+#[test]
+fn every_field_of_a_publish_digest_input_changes_the_digest() {
+    let key = |principal: &[u8], key| publish_key_digest(principal, key).unwrap();
+    assert_ne!(key(b"alice", [1; 16]), key(b"bob", [1; 16]));
+    assert_ne!(key(b"alice", [1; 16]), key(b"alice", [2; 16]));
+
+    let envelope = |seed| RepositoryEnvelopeId::from_digest([seed; 32]);
+    let request = publish_request_digest(envelope(1), 2, envelope(3), false);
+    for other in [
+        publish_request_digest(envelope(9), 2, envelope(3), false),
+        publish_request_digest(envelope(1), 9, envelope(3), false),
+        publish_request_digest(envelope(1), 2, envelope(9), false),
+        publish_request_digest(envelope(1), 2, envelope(3), true),
+    ] {
+        assert_ne!(request, other);
+    }
+
+    let receipt = publish_receipt_id([1; 16], [2; 16], 3, envelope(4));
+    for other in [
+        publish_receipt_id([9; 16], [2; 16], 3, envelope(4)),
+        publish_receipt_id([1; 16], [9; 16], 3, envelope(4)),
+        publish_receipt_id([1; 16], [2; 16], 9, envelope(4)),
+        publish_receipt_id([1; 16], [2; 16], 3, envelope(9)),
+    ] {
+        assert_ne!(receipt, other);
+    }
+    // The three are hashed under different tags.
+    assert_ne!(key(b"", [1; 16]), receipt);
+}
+
+#[test]
+fn repository_head_holds_at_most_max_publish_receipts() {
+    let mut head = RepositoryHeadRecord {
+        generation: 7,
+        envelope: RepositoryEnvelopeId::from_digest([6; 32]),
+        receipts: (0..MAX_PUBLISH_RECEIPTS)
+            .map(|i| receipt(i as u8))
+            .collect(),
+    };
+    let full = encode_repository_head(&head).unwrap();
+    assert_eq!(decode_repository_head(&full).unwrap(), head);
+    head.receipts.push(receipt(0));
+    assert_eq!(
+        encode_repository_head(&head),
+        Err(StoreRecordError::InvalidCount)
+    );
+    // A forged count past the limit is refused before decoding.
+    let mut forged = full;
+    forged.extend_from_slice(&[0; PUBLISH_RECEIPT_ENCODED_SIZE]);
+    assert_eq!(
+        decode_repository_head(&forged),
+        Err(StoreRecordError::InvalidCount)
+    );
 }
 
 #[test]
@@ -188,6 +273,7 @@ fn store_records_are_not_interchangeable() {
     let head = encode_repository_head(&RepositoryHeadRecord {
         generation: 1,
         envelope: RepositoryEnvelopeId::from_digest([1; 32]),
+        receipts: Vec::new(),
     })
     .unwrap();
     let envelope = encode_content_envelope_header(&ContentEnvelopeHeaderRecord {

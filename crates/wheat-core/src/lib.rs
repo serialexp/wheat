@@ -97,12 +97,14 @@ pub use semantic_records::{
 pub use store_records::{
     CONTENT_ENVELOPE_HEADER_ENCODED_SIZE, ContentEnvelopeHeaderRecord,
     INVENTORY_ENTRY_ENCODED_SIZE, InventoryRecord, MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE,
-    MaterializationProgressFields, REPOSITORY_HEAD_ENCODED_SIZE, RepositoryHeadRecord,
+    MAX_PUBLISH_RECEIPTS, MaterializationProgressFields, PUBLISH_RECEIPT_ENCODED_SIZE,
+    PublishReceiptRecord, REPOSITORY_HEAD_ENCODED_SIZE, RepositoryHeadRecord,
     SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE, SnapshotManifestRecord, StoreRecordError,
     decode_content_envelope_header, decode_materialization_progress_record, decode_repository_head,
     decode_snapshot_manifest, encode_content_envelope_header, encode_git_import_source,
     encode_materialization_progress_fields, encode_materialization_progress_record,
     encode_ownership_manifest, encode_repository_head, encode_snapshot_manifest,
+    publish_key_digest, publish_receipt_id, publish_request_digest,
 };
 pub use wire::{
     CanonicalObjectError, CanonicalObjectKind, decode_application_map_node, decode_change_map_node,

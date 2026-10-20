@@ -880,11 +880,52 @@
     // Store control records. Like the physical records above, none of these are
     // WheatObject variants.
 
-    // `repository.head`: the published generation and its repository envelope.
+    // `repository.head`: the published generation and its repository envelope, and
+    // the receipts of recent remote publishes, oldest first.
     RepositoryHeadV1: {
       sequence: [
         { name: "magic", type: "uint32", const: 0x57485248 },
         { name: "version", type: "uint16", const: 1 },
+        { name: "generation", type: "uint64" },
+        { name: "envelope", type: "Digest256" },
+        { name: "receipts", type: "array", kind: "length_prefixed", length_type: "uint16", items: { type: "PublishReceiptV1" } },
+      ],
+    },
+    // A publish the server made durable, so a retry with the same key gets the same
+    // answer. `key` is the client's publish key bound to its principal, `request` a
+    // digest of what the publish asked for, and `head` the head it was published in.
+    // `recorded_at` is in seconds since the Unix epoch.
+    PublishReceiptV1: {
+      sequence: [
+        { name: "key", type: "Uuid128" },
+        { name: "request", type: "Uuid128" },
+        { name: "receipt", type: "Uuid128" },
+        { name: "generation", type: "uint64" },
+        { name: "envelope", type: "Digest256" },
+        { name: "recorded_at", type: "uint64" },
+      ],
+    },
+    // What a publish receipt's `key`, `request` and `receipt` cover: each hashed
+    // after its domain tag ("wheat-publish-key-v1\0", "wheat-publish-request-v1\0",
+    // "wheat-publish-receipt-v1\0") and cut to its first 16 bytes, never stored.
+    PublishKeyInputV1: {
+      sequence: [
+        { name: "principal", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "key", type: "Uuid128" },
+      ],
+    },
+    PublishRequestInputV1: {
+      sequence: [
+        { name: "envelope", type: "Digest256" },
+        { name: "expected_generation", type: "uint64" },
+        { name: "expected_envelope", type: "Digest256" },
+        { name: "force", type: "bool" },
+      ],
+    },
+    PublishReceiptIdInputV1: {
+      sequence: [
+        { name: "key", type: "Uuid128" },
+        { name: "request", type: "Uuid128" },
         { name: "generation", type: "uint64" },
         { name: "envelope", type: "Digest256" },
       ],

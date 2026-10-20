@@ -82,6 +82,12 @@ land and move completed bullets from Outstanding to Done.
   round trips and 0.61 s to 6 round trips and 0.19 s. One with a 1 MiB file, over the
   push threshold, went from 20 round trips and 0.62 s to 7 and 0.23 s. Contract rules
   hold both counts.
+- [x] **Resumable — publish keys (2026-10-20).** The server records each publish's
+  receipt, keyed by its `publish_key` and principal, in the repository head in the
+  write that moves it, for 24 hours and at most 1024 receipts. A retry is answered
+  with the first sending's head, or waits for it while it is still being written.
+  `wheat publish` sends the publish once more over a new connection when the
+  connection is lost.
 
 ### Outstanding
 - [ ] **Defer unless the contention benchmark shows the server merge as the
@@ -92,8 +98,8 @@ land and move completed bullets from Outstanding to Done.
   connection.
 - [ ] **Resumable — content offsets.** Per-blob start offsets in
   `ContentFetchRequest` and `ContentNeeded`; the server keeps partial uploads.
-- [ ] **Resumable — publish.** Server-side `publish_key` storage, and remote
-  publishes that keep received objects across a dropped connection.
+- [ ] **Resumable — publish objects.** Remote publishes that keep received objects
+  across a dropped connection.
 - [ ] **Defer — resumable structural fetch.** A pending-fetch record in
   `remote.json` and pull-only retry or a have-hint on `FetchRequest`. Structural
   objects are small at the target size, so restarting the structural walk is
@@ -522,8 +528,8 @@ server, or refuse in sparse mode.
   skipped and stored in 64 MiB batches; publish content the server has is skipped;
   the local packed store writes batches to disk as they arrive. A retried fetch
   still receives the whole push, a partly received chunked blob is lost,
-  `RemotePackedStore` only seals at commit so a dropped publish loses its objects,
-  and the server ignores `publish_key`.
+  and `RemotePackedStore` only seals at commit so a dropped publish loses its
+  objects. (The server ignored `publish_key` too, until 2026-10-20.)
 - **`ServerHello.capabilities`** exists but is sent empty, and `ClientHello` has no
   capability list. `Credit` and `ContentRedirect` exist in the schema unused.
 
@@ -590,10 +596,10 @@ content, and most of a clone is old content that agents and CI never read. So:
 - **Lazy structure and per-label heads are deferred.** They stay in the checklist
   as "Defer" so they are not forgotten if the target changes.
 
-Two things in `wheat-native-protocol.md` disagree with the code: "Resumable large
+Two things in `wheat-native-protocol.md` disagreed with the code: "Resumable large
 transfers" is listed as resolved with resume from the last received chunk, which
-does not exist, and `publish_key` idempotency is described but not implemented. Both
-are tracked in `TODO.md`.
+does not exist (tracked in `TODO.md`), and `publish_key` idempotency was described
+but not implemented (implemented 2026-10-20).
 
 ## Derived data and server queries
 

@@ -13,6 +13,16 @@ Finished items, moved here from `TODO.md` under the same headings.
   hold, so the hand-read count checks before decoding are gone.
   `crates/wheat-core/tests/no_hand_rolled_encodings.rs` fails on any new
   `to_/from_*_bytes` or `byteorder` use outside generated code and tests.
+- `[x]` **The server ignores `publish_key`.** A publish whose CAS succeeded but whose
+  reply was lost came back `stale` on retry. Now (2026-10-20) the repository head
+  records each publish's receipt, keyed by `publish_key` and principal, in the write
+  that moves it (24 hours, at most 1024). A retry gets `already_committed` with the
+  first sending's head, or waits for it while it is written; a key reused for a
+  different publish is refused. `wheat publish` resends once over a new connection
+  when the connection is lost. Tests: `group_commit_test` (retries during and after
+  the write, a reused key), and `remote_publish`
+  `a_publish_whose_answer_is_lost_is_sent_again_and_published_once` (a proxy drops the
+  first `PublishResult`).
 
 ## Security and performance scan (2026-09-26)
 

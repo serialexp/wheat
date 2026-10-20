@@ -3088,16 +3088,37 @@ fn native_publish(
             last_fetched
         };
 
-        let result = remote::publish(
-            &mut session,
-            1,
-            &local.objects,
-            &local.content,
-            local_head.envelope,
-            &expected,
-            arguments.force,
-        )
-        .await?;
+        // If the connection is lost, the publish is sent once more over a new one,
+        // with the same key and the same expected head: the server answers it as it
+        // did the first sending, so a publish that went through is not refused as stale.
+        let publish_key = *uuid::Uuid::new_v4().as_bytes();
+        let mut result = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                session = remote::open(&parsed, &token).await?.0;
+            }
+            match remote::publish(
+                &mut session,
+                1,
+                publish_key,
+                &local.objects,
+                &local.content,
+                local_head.envelope,
+                &expected,
+                arguments.force,
+            )
+            .await
+            {
+                Err(error) if attempt == 0 && remote::is_connection_lost(&error) => {
+                    tracing::info!(%error, "publish: connection lost, sending it again");
+                }
+                answer => {
+                    result = Some(answer?);
+                    break;
+                }
+            }
+        }
+        let result = result.expect("the second attempt always answers");
 
         // A head the server joined holds others' work too. Fetch it from what was
         // just published, which the server now holds, so the store keeps the whole
