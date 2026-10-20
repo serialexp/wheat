@@ -7,7 +7,9 @@ use tracing::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use wheat_core::{ContentId, ObjectId, PublishReceiptRecord, RepositoryEnvelopeId};
+use wheat_core::{
+    ContentId, ObjectId, PublishReceiptRecord, RepositoryEnvelopeId, VerifiedContent,
+};
 use wheat_protocol::*;
 use wheat_store::{
     DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryHead,
@@ -243,12 +245,12 @@ pub async fn handle_publish(
                 asked.push(id);
                 continue;
             };
-            if ContentId::of(&data) != id {
+            let Ok(content) = VerifiedContent::check(id, data) else {
                 return reject(ws, op_id, current_head, "content identity mismatch").await;
-            }
+            };
             let base = base_map.get(&id).copied();
             staged
-                .put_content([(id, data, base)])
+                .put_content([(content, base)])
                 .await
                 .map_err(|e| ConnectionError::Internal(format!("failed to store content: {e}")))?;
         }
@@ -310,12 +312,16 @@ pub async fn handle_publish(
                         Vec::new()
                     }
                 };
-                if received.iter().any(|(id, data)| ContentId::of(data) != *id) {
+                let Ok(received) = received
+                    .into_iter()
+                    .map(|(id, data)| VerifiedContent::check(id, data))
+                    .collect::<Result<Vec<_>, _>>()
+                else {
                     return reject(ws, op_id, current_head, "content identity mismatch").await;
-                }
-                let blobs = received.into_iter().map(|(id, data)| {
-                    let base = base_map.get(&id).copied();
-                    (id, data, base)
+                };
+                let blobs = received.into_iter().map(|content| {
+                    let base = base_map.get(&content.id()).copied();
+                    (content, base)
                 });
                 staged.put_content(blobs).await.map_err(|e| {
                     ConnectionError::Internal(format!("failed to store content batch: {e}"))

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore as BackendObjectStore, ObjectStoreExt, path::Path};
-use wheat_core::ContentId;
+use wheat_core::{ContentId, VerifiedContent};
 
 use crate::content_store::ContentBackend;
 use crate::{ContentStoreError, codec};
@@ -299,32 +299,22 @@ impl RemoteContentBackend {
 }
 
 impl ContentBackend for RemoteContentBackend {
-    fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError> {
+    fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError> {
         // ContentBackend is synchronous, but the S3 backend is async.
         // Use a blocking runtime handle to bridge.
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|e| ContentStoreError::Io(std::io::Error::other(e)))?;
 
-        // Validate all identity claims up front.
-        for (id, bytes) in contents {
-            let actual = ContentId::of(bytes);
-            if actual != *id {
-                return Err(ContentStoreError::Corrupt {
-                    expected: *id,
-                    actual,
-                });
-            }
-        }
-
         // Each PUT is independent, but bound both request fan-out and the number
         // of encoded envelopes retained while S3 is slower than compression.
         tokio::task::block_in_place(|| {
             rt.block_on(async {
-                stream::iter(contents.iter().map(|(id, bytes)| async move {
-                    let encoded = codec::encode_envelope(bytes)
-                        .map_err(|error| codec_error(*id, usize::MAX, error))?;
+                stream::iter(contents.iter().map(|content| async move {
+                    let id = content.id();
+                    let encoded = codec::encode_envelope(content.bytes())
+                        .map_err(|error| codec_error(id, usize::MAX, error))?;
                     self.backend
-                        .put(&self.path(*id), object_store::PutPayload::from(encoded))
+                        .put(&self.path(id), object_store::PutPayload::from(encoded))
                         .await
                         .map_err(|error| ContentStoreError::Io(std::io::Error::other(error)))?;
                     Ok::<(), ContentStoreError>(())

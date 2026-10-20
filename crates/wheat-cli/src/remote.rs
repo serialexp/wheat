@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use url::{Host, Url};
 
-use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, ViewId};
+use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, VerifiedContent, ViewId};
 use wheat_protocol::*;
 use wheat_store::{
     ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead, RepositoryReader,
@@ -776,10 +776,11 @@ pub async fn fetch_content<S: RepositoryStore + ?Sized>(
     }
 
     let total = missing.len();
-    // The stage checks that each blob matches its ID.
+    // Each blob is checked against its ID here, once; the stage takes the check.
     let stage_blob = async |id, data| {
+        let content = VerifiedContent::check(id, data).context("fetched content")?;
         stage
-            .put_content([(id, data, None)])
+            .put_content([(content, None)])
             .await
             .context("storing fetched content")
     };

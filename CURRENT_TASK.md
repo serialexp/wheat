@@ -1,5 +1,54 @@
 # Current task
 
+## 2026-10-20: hash content once (@calm-lynx)
+
+Bart, on the protocol follow-ups: "use publish key and batching small files is a free
+win here. We should probably hash content only once if possible." Batching is done
+(65bb956) and so is `publish_key` (3d15d42). For hash-once, Bart chose a **verified
+type**: a `VerifiedContent` made where bytes come in (server upload, client fetch,
+local capture), carried through stage, validation and store, none of which re-hash
+it. Keep every hash that is the only guard (bytes read from disk or S3, delta
+reconstruction, external snapshots).
+
+Measured map (Explore agent, 2026-10-20): a server-published blob is hashed 5–6
+times before it is durable, a fetched blob 4, a `wheat add` file about 7; every
+packed read is hashed twice (`verify_logical`, then `catalog.rs:1423`); transition
+validation (`repository_transition.rs:161`) reads and hashes each new blob only to
+check it exists. `ContentItem` (`repository_store.rs:23`) already carries content
+into every backend.
+
+Plan, one commit per stage:
+1. A content-hash counter and a contract that counts bytes hashed per published
+   byte; record the baseline.
+2. Write path: `VerifiedContent` in wheat-core; stage, `ContentItem`, packed
+   `put_publication`/`content_records`/`validate_record`, loose and S3 puts take it.
+3. Validation checks existence, not a full read.
+4. Local capture (`edit_capture` → `ContentWriteBatch` → `put_many`).
+5. Read side: the second hash on packed reads, and seal/repack re-hashing records a
+   verified lookup just read.
+
+Progress:
+- Stages 1–3 are done (one commit): a published blob goes from 6× to 1× on a loose
+  server. `VerifiedContent<B = Vec<u8>>` (owned or `&[u8]`); `ContentItem { content,
+  base }` now lives in content_store.rs; `ContentBackend::put_many` and every
+  `ContentStore` put take verified content; the packed catalog takes `CheckedRecord`
+  (made by `check`, `content` or `object`); `ContentStore::contains` on a backend and
+  step-5 validation use `logical_length` (metadata only). Contracts:
+  `a_published_blob_is_hashed_once`, `verified_content_is_stored_without_hashing_it_again`.
+- There's no end-to-end count for the client fetch: CLI tests run the client as a
+  subprocess, so the in-process counter can't see it. The fetch mints one
+  `VerifiedContent::check` per blob (remote.rs `stage_blob`), and the store contract
+  covers the rest.
+- Not benched yet. When I tried, @lucky-raven had an in-flight `structural_delta.rs`
+  change (publish path), so the bench would have measured their code too. Run
+  `just bench` once the tree is quiet and commit the results file.
+- The Git importer still hashes `capture_edit`'s replacement fragments a second time
+  (`VerifiedContent::new` in wheat-git lib.rs `edits_between`). Stage 4 fixes this by
+  making `CapturedEdit::content` verified.
+- Objects (not content) are still validated twice on remote_packed seal (at
+  `put_if_absent` and again via `CheckedRecord::check` in `seal`). That's out of
+  scope; it's noted here.
+
 ## 2026-10-09: integration (pull) — Bart: "clean up those small items. Then pick up
 integration, since nobody can use the thing without it."
 

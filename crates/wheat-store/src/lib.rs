@@ -60,8 +60,8 @@ mod repository_publication;
 mod repository_reader;
 mod repository_store;
 pub use repository_store::{
-    ContentItem, PendingPublications, PendingView, RepositoryStage, RepositoryStore,
-    RepositoryStoreError, SeparateRepositoryStore, StagedPublication, put_separately,
+    PendingPublications, PendingView, RepositoryStage, RepositoryStore, RepositoryStoreError,
+    SeparateRepositoryStore, StagedPublication, put_separately,
 };
 mod repository_rewrite;
 mod repository_transition;
@@ -140,7 +140,7 @@ pub use view_lineage::{
 };
 
 mod content_store;
-pub use content_store::{ContentStore, ContentStoreError};
+pub use content_store::{ContentItem, ContentStore, ContentStoreError};
 
 /// Read-only segment and loose-object access for analysis tools (e.g.
 /// `wheat store analyze`).
@@ -264,7 +264,7 @@ pub mod packed_segment_test_helpers {
     use wheat_core::{CanonicalObject, validate_canonical_object};
 
     use crate::packed::segment::{
-        METADATA_NAMESPACE, SegmentBuilder, SegmentRecord, prepare_record,
+        CheckedRecord, METADATA_NAMESPACE, SegmentBuilder, SegmentRecord, prepare_record,
     };
 
     /// Build a segment from canonical closure objects (with block compression)
@@ -282,7 +282,7 @@ pub mod packed_segment_test_helpers {
                 bytes: &object.bytes,
             };
             builder
-                .push_prepared(prepare_record(record).unwrap())
+                .push_prepared(prepare_record(CheckedRecord::check(record).unwrap()).unwrap())
                 .unwrap();
         }
         let sealed = builder.seal().unwrap();

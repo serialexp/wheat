@@ -3263,10 +3263,9 @@ mod tests {
             .collect::<String>();
         let target = format!("{base}one more line\n");
         let base_id = content.put(base.as_bytes()).unwrap();
-        let target_id = wheat_core::ContentId::of(target.as_bytes());
-        content
-            .put_with_base(target_id, target.as_bytes(), base_id)
-            .unwrap();
+        let target = wheat_core::VerifiedContent::new(target.as_bytes());
+        let target_id = target.id();
+        content.put_with_base(target, base_id).unwrap();
         std::fs::remove_file(content.path(base_id)).unwrap();
         let regular = |content| FileValue {
             content,

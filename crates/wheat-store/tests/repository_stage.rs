@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use wheat_core::{ContentId, DirectoryNode, ObjectId};
+use wheat_core::{ContentId, DirectoryNode, ObjectId, VerifiedContent};
 use wheat_store::*;
 
 fn object() -> (ObjectId, Vec<u8>) {
@@ -33,8 +33,8 @@ async fn staged_objects_and_content_read_as_stored_and_flush_appends_once() {
     stage.put_if_absent(object_id, &object_bytes).await.unwrap();
     stage
         .put_content([
-            (whole_id, whole.clone(), None),
-            (changed_id, changed.clone(), Some(base)),
+            (VerifiedContent::new(whole.clone()), None),
+            (VerifiedContent::new(changed.clone()), Some(base)),
         ])
         .await
         .unwrap();
@@ -91,7 +91,7 @@ async fn taken_stages_read_beneath_another_stage_and_store_in_one_append() {
     first.put_if_absent(object_id, &object_bytes).await.unwrap();
     let second = RepositoryStage::new(&store, 16, 1 << 20);
     second
-        .put_content([(blob_id, blob_bytes.clone(), None)])
+        .put_content([(VerifiedContent::new(blob_bytes.clone()), None)])
         .await
         .unwrap();
     let mut pending = PendingPublications::default();
@@ -124,6 +124,52 @@ async fn taken_stages_read_beneath_another_stage_and_store_in_one_append() {
     assert_eq!(content.get(blob_id).unwrap(), blob_bytes);
 }
 
+/// Content is hashed where it comes in, which makes it a [`VerifiedContent`]; nothing
+/// on its way into a store hashes it again. That holds for a flushed stage and for
+/// pending publications, into a packed store (durable or deferred, in a segment or,
+/// past the loose threshold, as a loose file) and into a loose content store.
+#[tokio::test]
+async fn verified_content_is_stored_without_hashing_it_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let durable = PackedObjectStore::open(dir.path().join("durable")).unwrap();
+    let deferred = PackedObjectStore::open_deferred(dir.path().join("deferred")).unwrap();
+    let separate = SeparateRepositoryStore::new(
+        LooseObjectStore::new(dir.path().join("objects")),
+        ContentStore::new(dir.path().join("content")),
+    );
+    let stores: [&dyn RepositoryStore; 3] = [&durable, &deferred, &separate];
+    for store in stores {
+        let blobs = |seed: u8| {
+            [
+                VerifiedContent::new(vec![seed; 1024]),
+                VerifiedContent::new(vec![seed; 256 * 1024]),
+            ]
+        };
+        let (flushed, pending) = (blobs(1), blobs(2));
+        let before = wheat_core::content_bytes_hashed();
+
+        let stage = RepositoryStage::new(store, 16, 1 << 20);
+        stage
+            .put_content(flushed.iter().map(|content| (content.clone(), None)))
+            .await
+            .unwrap();
+        stage.flush().await.unwrap();
+        let taken = RepositoryStage::new(store, 16, 1 << 20);
+        taken
+            .put_content(pending.iter().map(|content| (content.clone(), None)))
+            .await
+            .unwrap();
+        let mut publications = PendingPublications::default();
+        publications.push(taken.take().await.unwrap());
+        publications.store(store).await.unwrap();
+
+        assert_eq!(wheat_core::content_bytes_hashed(), before);
+        for content in flushed.iter().chain(&pending) {
+            assert!(store.content_store().contains(content.id()));
+        }
+    }
+}
+
 #[tokio::test]
 async fn content_reaching_the_byte_limit_is_stored_with_the_staged_objects() {
     let dir = tempfile::tempdir().unwrap();
@@ -136,31 +182,20 @@ async fn content_reaching_the_byte_limit_is_stored_with_the_staged_objects() {
 
     let stage = RepositoryStage::new(&store, 16, 16);
     stage.put_if_absent(object_id, &object_bytes).await.unwrap();
-    stage.put_content([(small_id, small, None)]).await.unwrap();
+    stage
+        .put_content([(VerifiedContent::new(small), None)])
+        .await
+        .unwrap();
     assert!(!content.contains(small_id));
-    stage.put_content([(large_id, large, None)]).await.unwrap();
+    stage
+        .put_content([(VerifiedContent::new(large), None)])
+        .await
+        .unwrap();
 
     assert_eq!(durable_appends(&trace), before + 1);
     assert!(content.contains(small_id));
     assert!(content.contains(large_id));
     assert!(store.get(object_id).await.is_ok());
-}
-
-#[tokio::test]
-async fn content_with_a_wrong_id_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = PackedObjectStore::open(dir.path()).unwrap();
-    let stage = RepositoryStage::new(&store, 16, 1 << 20);
-    let (_, bytes) = blob("content");
-    let error = stage
-        .put_content([(ContentId::from_digest([7; 32]), bytes, None)])
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        RepositoryStoreError::Content(ContentStoreError::Corrupt { .. })
-    ));
-    assert!(!stage.content().contains(ContentId::from_digest([7; 32])));
 }
 
 struct FailingObjects {
@@ -201,7 +236,7 @@ async fn a_failed_flush_keeps_everything_staged_for_a_retry() {
     let stage = RepositoryStage::new(&store, 16, 1 << 20);
     stage.put_if_absent(object_id, &object_bytes).await.unwrap();
     stage
-        .put_content([(content_id, bytes.clone(), None)])
+        .put_content([(VerifiedContent::new(bytes.clone()), None)])
         .await
         .unwrap();
 

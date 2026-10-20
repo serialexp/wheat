@@ -5,21 +5,17 @@ use rusqlite::{Connection, params};
 use super::active::ActiveError;
 use super::catalog::*;
 use super::segment::{
-    CONTENT_NAMESPACE, SegmentError, SegmentRecord, test_content_map_kind, test_content_map_root,
+    CONTENT_NAMESPACE, CheckedRecord, SegmentError, SegmentRecord, test_content_map_kind,
+    test_content_map_root,
 };
 
 const LOCATOR_FILE: &str = "catalog-locator.sqlite3";
 
-fn record(bytes: &'static [u8]) -> SegmentRecord<'static> {
-    SegmentRecord {
-        namespace: CONTENT_NAMESPACE,
-        kind: 0,
-        digest: *wheat_core::ContentId::of(bytes).as_bytes(),
-        bytes,
-    }
+fn record(bytes: &[u8]) -> CheckedRecord<'_> {
+    CheckedRecord::content(wheat_core::VerifiedContent::new(bytes))
 }
 
-fn assert_value(store: &mut PackedCatalog, value: SegmentRecord<'_>) {
+fn assert_value(store: &mut PackedCatalog, value: CheckedRecord<'_>) {
     assert_eq!(
         store.get(CONTENT_NAMESPACE, value.digest).unwrap().unwrap(),
         (value.kind, value.bytes.to_vec())
@@ -387,20 +383,7 @@ fn compressed_records_use_stored_bytes_for_rollover_and_logical_read_limits() {
     let root = tempfile::tempdir().unwrap();
     let first_bytes = vec![b'a'; 8 * 1024];
     let second_bytes = vec![b'b'; 8 * 1024];
-    let values = [
-        SegmentRecord {
-            namespace: CONTENT_NAMESPACE,
-            kind: 0,
-            digest: *wheat_core::ContentId::of(&first_bytes).as_bytes(),
-            bytes: &first_bytes,
-        },
-        SegmentRecord {
-            namespace: CONTENT_NAMESPACE,
-            kind: 0,
-            digest: *wheat_core::ContentId::of(&second_bytes).as_bytes(),
-            bytes: &second_bytes,
-        },
-    ];
+    let values = [record(&first_bytes), record(&second_bytes)];
     let stored = crate::codec::prepare(&first_bytes).unwrap().bytes.len() as u64;
     assert!(stored < first_bytes.len() as u64);
 
@@ -427,8 +410,10 @@ fn compressed_records_use_stored_bytes_for_rollover_and_logical_read_limits() {
 fn deferred_duplicate_is_idempotent_and_conflict_is_rejected() {
     let root = tempfile::tempdir().unwrap();
     let original = record(b"same digest authority");
-    let mut conflicting = original;
-    conflicting.bytes = b"different bytes";
+    let conflicting = CheckedRecord::unchecked(SegmentRecord {
+        bytes: b"different bytes",
+        ..original.record()
+    });
     let mut store = PackedCatalog::open(root.path(), crate::Durability::Deferred).unwrap();
     store.put_records(&[original, original]).unwrap();
     assert_eq!(store.test_counts().unwrap().0, 1);
@@ -1164,7 +1149,7 @@ fn reads_proceed_beside_an_append_and_see_only_published_records() {
         std::thread::spawn({
             let shared = Arc::clone(&shared);
             move || {
-                let read = |value: SegmentRecord<'_>| {
+                let read = |value: CheckedRecord<'_>| {
                     (
                         shared.get(CONTENT_NAMESPACE, value.digest).unwrap(),
                         shared
@@ -1212,15 +1197,18 @@ fn content_map_history(count: usize) -> Vec<([u8; 32], Vec<u8>)> {
         .collect()
 }
 
-fn metadata_records(history: &[([u8; 32], Vec<u8>)]) -> Vec<SegmentRecord<'_>> {
+fn metadata_records(history: &[([u8; 32], Vec<u8>)]) -> Vec<CheckedRecord<'_>> {
     let kind = test_content_map_kind();
     history
         .iter()
-        .map(|(digest, bytes)| SegmentRecord {
-            namespace: super::segment::METADATA_NAMESPACE,
-            kind,
-            digest: *digest,
-            bytes,
+        .map(|(digest, bytes)| {
+            CheckedRecord::check(SegmentRecord {
+                namespace: super::segment::METADATA_NAMESPACE,
+                kind,
+                digest: *digest,
+                bytes,
+            })
+            .unwrap()
         })
         .collect()
 }

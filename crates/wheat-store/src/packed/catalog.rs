@@ -31,9 +31,9 @@ use super::{
     active::{ActiveError, ActivePublishedState, ActiveSegment, ActiveWrite, ActiveWritten},
     bulk::{BulkSegment, FinalizedBulk},
     segment::{
-        MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE, PreparedSegmentRecord, SealedSegment,
-        SegmentBuilder, SegmentError, SegmentReader, SegmentRecord, prepare_delta_record,
-        prepare_record, verify_logical,
+        CheckedRecord, MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE, PreparedSegmentRecord,
+        SealedSegment, SegmentBuilder, SegmentError, SegmentReader, SegmentRecord,
+        prepare_delta_record, prepare_record, verify_logical,
     },
     trace::PackedStoreTraceCounters,
 };
@@ -340,7 +340,7 @@ impl SharedCatalog {
     }
 
     /// See [`PackedCatalog::put_records`].
-    pub(crate) fn put_records(&self, records: &[SegmentRecord<'_>]) -> Result<(), CatalogError> {
+    pub(crate) fn put_records(&self, records: &[CheckedRecord<'_>]) -> Result<(), CatalogError> {
         let mut exclusive = self.exclusive()?;
         if exclusive.durability == Durability::Deferred {
             return exclusive.put_records(records);
@@ -797,7 +797,7 @@ impl PackedCatalog {
     /// tail when it rolls or this catalog is consumed by `close`.
     pub(crate) fn put_records(
         &mut self,
-        records: &[SegmentRecord<'_>],
+        records: &[CheckedRecord<'_>],
     ) -> Result<(), CatalogError> {
         if self.durability == Durability::Deferred {
             return self.put_records_deferred(records);
@@ -805,7 +805,7 @@ impl PackedCatalog {
         self.put_records_durable(records)
     }
 
-    fn put_records_durable(&mut self, records: &[SegmentRecord<'_>]) -> Result<(), CatalogError> {
+    fn put_records_durable(&mut self, records: &[CheckedRecord<'_>]) -> Result<(), CatalogError> {
         let mut put = self.begin_durable_put(records)?;
         while let Some(job) = self.next_append(&mut put)? {
             let outcome = job.run();
@@ -814,11 +814,10 @@ impl PackedCatalog {
         Ok(())
     }
 
-    /// Validates `records` and prepares the ones this catalog lacks, for
-    /// [`Self::next_append`].
+    /// Prepares the `records` this catalog lacks, for [`Self::next_append`].
     fn begin_durable_put<'a>(
         &mut self,
-        records: &[SegmentRecord<'a>],
+        records: &[CheckedRecord<'a>],
     ) -> Result<DurablePut<'a>, CatalogError> {
         if self.poisoned {
             return Err(CatalogError::Poisoned);
@@ -830,12 +829,13 @@ impl PackedCatalog {
         }
         // Resolve and deduplicate keys before projecting the active size. A
         // duplicate-heavy batch must not cause a false pre-seal.
-        let mut pending = Vec::with_capacity(records.len());
-        let mut pending_by_key = HashMap::with_capacity(records.len());
-        for record in records {
-            super::segment::validate_record(*record)?;
+        let mut pending: Vec<CheckedRecord<'a>> = Vec::with_capacity(records.len());
+        let mut pending_by_key: HashMap<(u8, [u8; 32]), usize> =
+            HashMap::with_capacity(records.len());
+        for checked in records {
+            let record = checked.record();
             if let Some(&index) = pending_by_key.get(&(record.namespace, record.digest)) {
-                let previous: SegmentRecord<'_> = pending[index];
+                let previous: SegmentRecord<'_> = pending[index].record();
                 if previous.kind != record.kind || previous.bytes != record.bytes {
                     return Err(CatalogError::Corrupt(
                         "duplicate batch key has conflicting bytes",
@@ -851,7 +851,7 @@ impl PackedCatalog {
                 }
             } else {
                 pending_by_key.insert((record.namespace, record.digest), pending.len());
-                pending.push(*record);
+                pending.push(*checked);
             }
         }
         // Prepare every new logical record exactly once. Partitioning and all
@@ -1020,14 +1020,15 @@ impl PackedCatalog {
         Ok(())
     }
 
-    fn put_records_deferred(&mut self, records: &[SegmentRecord<'_>]) -> Result<(), CatalogError> {
+    fn put_records_deferred(&mut self, records: &[CheckedRecord<'_>]) -> Result<(), CatalogError> {
         if self.poisoned {
             return Err(CatalogError::Poisoned);
         }
         if let Some(trace) = &self.trace {
             trace.deferred_put(records.len());
         }
-        for record in records {
+        for checked in records {
+            let record = checked.record();
             if let Some((kind, bytes)) = self.get(record.namespace, record.digest)? {
                 if let Some(trace) = &self.trace {
                     trace.deferred_duplicate();
@@ -1039,7 +1040,7 @@ impl PackedCatalog {
                 }
                 continue;
             }
-            let prepared = prepare_record(*record)?;
+            let prepared = prepare_record(*checked)?;
             let record_length = prepared.stored_length();
             if self.bulk.is_none() {
                 self.create_bulk()?;
@@ -1631,7 +1632,7 @@ impl PackedCatalog {
                 digest: entry.digest,
                 bytes: &bytes,
             };
-            builder.push_prepared(prepare_record(record)?)?;
+            builder.push_prepared(prepare_record(CheckedRecord::check(record)?)?)?;
         }
         Ok(builder.seal()?)
     }
@@ -1929,7 +1930,7 @@ impl PackedCatalog {
                 digest: record.digest,
                 bytes: &bytes,
             };
-            let whole = prepare_record(logical)?;
+            let whole = prepare_record(CheckedRecord::check(logical)?)?;
             let mut resident = if previous.is_some() { 2 } else { 1 };
             // A planned base is usable only while it is in the open segment
             // with room for one more link.

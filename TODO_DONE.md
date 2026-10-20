@@ -272,6 +272,18 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **Uploaded content is hashed four or five times on the server (2026-09-26).**
+  Measured at six times on a loose server. Done 2026-10-20: content is hashed where
+  it comes in, which makes it a `VerifiedContent` (wheat-core). The stage,
+  `ContentItem`, every `ContentStore` put and the content backends take it and don't
+  hash it again; the packed catalog takes a `CheckedRecord` and no longer validates
+  each record twice. Transition validation checks that new content exists from stored
+  metadata instead of reading and hashing it, and `ContentStore::contains` on a
+  backend no longer reads the content at all. No blob above the loose threshold is
+  cloned on its way into a packed store. Contracts: `a_published_blob_is_hashed_once`
+  (wheat-server) and `verified_content_is_stored_without_hashing_it_again`
+  (wheat-store), counting `content_bytes_hashed()`.
+
 - `[x]` **`wheat integrate` refuses a frontier that revises its label's view
   (2026-10-09).** Done 2026-10-15. Integrate now starts the joined view below the
   lowest revised change on the label's composition path and composes the label's

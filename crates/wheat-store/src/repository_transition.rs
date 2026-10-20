@@ -146,7 +146,9 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                 .map_err(|_| invalid("publication drops view lineage"))?;
         }
 
-        // 5. Delta the content set — verify new content entries exist.
+        // 5. Delta the content set — verify new content entries exist. Existence is
+        //    read from stored metadata: content was checked against its ID when it
+        //    was stored, and reading it checks it again.
         if baseline.required_content != proposed.required_content {
             let delta = ContentSetStore::new(self.objects)
                 .delta(
@@ -158,7 +160,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             for entry in delta {
                 match entry {
                     crate::sets::ContentSetDelta::Added(content_id) => {
-                        match self.content.get(content_id) {
+                        match self.content.logical_length(content_id) {
                             Ok(_) => {}
                             Err(ContentStoreError::Missing(_)) => {
                                 return Err(RepositoryPublicationError::MissingContent(content_id));

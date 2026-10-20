@@ -1,7 +1,14 @@
 use std::fs;
 
-use wheat_core::ContentId;
-use wheat_store::{ContentStore, ContentStoreError};
+use wheat_core::{ContentId, VerifiedContent};
+use wheat_store::{ContentItem, ContentStore, ContentStoreError};
+
+/// Stores `bytes` with `base` as its delta base hint and returns their ID.
+fn put_with_base(store: &ContentStore, bytes: &[u8], base: ContentId) -> ContentId {
+    let content = VerifiedContent::new(bytes);
+    store.put_with_base(content, base).unwrap();
+    content.id()
+}
 
 // ---------------------------------------------------------------------------
 // Delta compression tests
@@ -29,10 +36,7 @@ fn delta_round_trip_through_content_store() {
     let base_id = store.put(base_bytes).unwrap();
 
     // Store the target with delta hint.
-    let target_id = ContentId::of(target_bytes);
-    store
-        .put_with_base(target_id, target_bytes, base_id)
-        .unwrap();
+    let target_id = put_with_base(&store, target_bytes, base_id);
 
     // Read it back — should reconstruct correctly through delta resolution.
     let read_back = store.get(target_id).unwrap();
@@ -64,13 +68,11 @@ fn delta_chain_resolution() {
 
     let v2 = v1.replace("line 10: original content", "line 10: modified in v2");
     let v2_bytes = v2.as_bytes();
-    let v2_id = ContentId::of(v2_bytes);
-    store.put_with_base(v2_id, v2_bytes, v1_id).unwrap();
+    let v2_id = put_with_base(&store, v2_bytes, v1_id);
 
     let v3 = v2.replace("line 20: original content", "line 20: modified in v3");
     let v3_bytes = v3.as_bytes();
-    let v3_id = ContentId::of(v3_bytes);
-    store.put_with_base(v3_id, v3_bytes, v2_id).unwrap();
+    let v3_id = put_with_base(&store, v3_bytes, v2_id);
 
     // Read all versions — they should all reconstruct correctly.
     assert_eq!(store.get(v1_id).unwrap(), v1_bytes);
@@ -89,8 +91,7 @@ fn sixteen_link_delta_chain_resolves_and_seventeenth_falls_back_full() {
     let mut ids = vec![previous];
     for version in 1u64..=17 {
         bytes[100..108].copy_from_slice(&version.to_be_bytes());
-        let id = ContentId::of(&bytes);
-        store.put_with_base(id, &bytes, previous).unwrap();
+        let id = put_with_base(&store, &bytes, previous);
         ids.push(id);
         previous = id;
     }
@@ -119,10 +120,7 @@ fn delta_falls_back_to_raw_for_unrelated_content() {
     // The delta would be larger than the raw content, so it should
     // fall back to raw storage.
     let target_bytes = b"completely different content, nothing in common at all xyz";
-    let target_id = ContentId::of(target_bytes);
-    store
-        .put_with_base(target_id, target_bytes, base_id)
-        .unwrap();
+    let target_id = put_with_base(&store, target_bytes, base_id);
 
     // Should still read back correctly.
     assert_eq!(store.get(target_id).unwrap(), target_bytes);
@@ -140,10 +138,7 @@ fn logical_length_of_a_delta_reads_only_its_header() {
     }
     let target = format!("{base}fn extra() {{}}\n");
     let base_id = store.put(base.as_bytes()).unwrap();
-    let target_id = ContentId::of(target.as_bytes());
-    store
-        .put_with_base(target_id, target.as_bytes(), base_id)
-        .unwrap();
+    let target_id = put_with_base(&store, target.as_bytes(), base_id);
     assert!(fs::metadata(store.path(target_id)).unwrap().len() < target.len() as u64 / 2);
 
     fs::remove_file(store.path(base_id)).unwrap();
@@ -168,10 +163,7 @@ fn delta_falls_back_when_base_is_missing() {
     // Try to store with a base that doesn't exist.
     let fake_base_id = ContentId::of(b"nonexistent base");
     let target_bytes = b"some target content that should be stored raw";
-    let target_id = ContentId::of(target_bytes);
-    store
-        .put_with_base(target_id, target_bytes, fake_base_id)
-        .unwrap();
+    let target_id = put_with_base(&store, target_bytes, fake_base_id);
 
     // Should store raw and still read back correctly.
     assert_eq!(store.get(target_id).unwrap(), target_bytes);
@@ -190,10 +182,7 @@ fn delta_bounded_read_applies_max_to_final_output() {
     let target = format!("{base}extra line at the end\n");
 
     let base_id = store.put(base.as_bytes()).unwrap();
-    let target_id = ContentId::of(target.as_bytes());
-    store
-        .put_with_base(target_id, target.as_bytes(), base_id)
-        .unwrap();
+    let target_id = put_with_base(&store, target.as_bytes(), base_id);
 
     // Bounded read with max < target size should fail.
     assert!(matches!(
@@ -221,10 +210,7 @@ fn delta_base_larger_than_target() {
     let target = base[..base.len() / 2].to_string();
 
     let base_id = store.put(base.as_bytes()).unwrap();
-    let target_id = ContentId::of(target.as_bytes());
-    store
-        .put_with_base(target_id, target.as_bytes(), base_id)
-        .unwrap();
+    let target_id = put_with_base(&store, target.as_bytes(), base_id);
 
     // Should reconstruct correctly even though the base is larger.
     // The max bound (target.len()) should work since we only apply
@@ -249,22 +235,22 @@ fn put_many_with_bases_mixes_delta_and_raw() {
 
     // Prepare two items: one with a delta base, one raw.
     let modified = base.replace("function_50()", "function_50_v2()");
-    let modified_id = ContentId::of(modified.as_bytes());
-    let raw_bytes = b"brand new file with no base";
-    let raw_id = ContentId::of(raw_bytes.as_slice());
+    let modified = VerifiedContent::new(modified.as_bytes());
+    let raw = VerifiedContent::new(b"brand new file with no base".as_slice());
+    let (modified_id, raw_id) = (modified.id(), raw.id());
 
     store
         .put_many_with_bases(
-            vec![
-                (modified_id, modified.as_bytes().to_vec(), Some(base_id)),
-                (raw_id, raw_bytes.to_vec(), None),
+            &[
+                ContentItem::new(modified, Some(base_id)),
+                ContentItem::new(raw, None),
             ],
             4,
         )
         .unwrap();
 
-    assert_eq!(store.get(modified_id).unwrap(), modified.as_bytes());
-    assert_eq!(store.get(raw_id).unwrap(), raw_bytes);
+    assert_eq!(store.get(modified_id).unwrap(), modified.bytes());
+    assert_eq!(store.get(raw_id).unwrap(), raw.bytes());
 }
 
 #[test]
@@ -365,30 +351,13 @@ fn bounded_read_still_reports_missing_and_corrupt_loose_content() {
 }
 
 #[test]
-fn batch_retention_is_parallel_deduplicated_and_integrity_checked() {
+fn batch_retention_is_parallel_and_deduplicated() {
     let directory = tempfile::tempdir().unwrap();
     let store = ContentStore::new(directory.path());
-    let first = ContentId::of(b"first");
-    let second = ContentId::of(b"second");
+    let first = VerifiedContent::new(b"first".as_slice());
+    let second = VerifiedContent::new(b"second".as_slice());
 
-    store
-        .put_many(
-            [
-                (first, b"first".to_vec()),
-                (second, b"second".to_vec()),
-                (first, b"first".to_vec()),
-            ],
-            4,
-        )
-        .unwrap();
-    assert_eq!(store.get(first).unwrap(), b"first");
-    assert_eq!(store.get(second).unwrap(), b"second");
-
-    let error = store
-        .put_many([(first, b"not first".to_vec())], 2)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        ContentStoreError::Corrupt { expected, .. } if expected == first
-    ));
+    store.put_many(&[first, second, first], 4).unwrap();
+    assert_eq!(store.get(first.id()).unwrap(), b"first");
+    assert_eq!(store.get(second.id()).unwrap(), b"second");
 }

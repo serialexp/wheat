@@ -1,7 +1,7 @@
 //! Explicit bounded content staging; ordinary content puts remain durable.
 use std::collections::BTreeMap;
 
-use wheat_core::ContentId;
+use wheat_core::{ContentId, VerifiedContent};
 
 use crate::{ContentStore, ContentStoreError};
 
@@ -12,7 +12,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Full batches are made durable automatically; dropping discards only the pending tail.
 pub struct ContentWriteBatch<'a> {
     store: &'a ContentStore,
-    pending: BTreeMap<ContentId, Vec<u8>>,
+    pending: BTreeMap<ContentId, VerifiedContent>,
     bytes: usize,
 }
 
@@ -26,18 +26,20 @@ impl<'a> ContentWriteBatch<'a> {
     }
 
     pub fn put(&mut self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
-        let id = ContentId::of(bytes);
+        let content = VerifiedContent::new(bytes);
+        let id = content.id();
         if self.pending.contains_key(&id) {
             return Ok(id);
         }
         if bytes.len() > MAX_BYTES {
             self.commit()?;
-            return self.store.put(bytes);
+            self.store.put_many(&[content], 1)?;
+            return Ok(id);
         }
         if self.pending.len() == MAX_OBJECTS || self.bytes + bytes.len() > MAX_BYTES {
             self.commit()?;
         }
-        self.pending.insert(id, bytes.to_vec());
+        self.pending.insert(id, content.into_owned());
         self.bytes += bytes.len();
         Ok(id)
     }
@@ -52,13 +54,14 @@ impl<'a> ContentWriteBatch<'a> {
         bytes: &[u8],
         base_id: ContentId,
     ) -> Result<ContentId, ContentStoreError> {
-        let id = ContentId::of(bytes);
+        let content = VerifiedContent::new(bytes);
+        let id = content.id();
         if self.pending.contains_key(&id) {
             return Ok(id);
         }
         // Flush pending first so the base (if it's pending) is durable.
         self.commit()?;
-        self.store.put_with_base(id, bytes, base_id)?;
+        self.store.put_with_base(content, base_id)?;
         Ok(id)
     }
 
@@ -68,10 +71,12 @@ impl<'a> ContentWriteBatch<'a> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        self.store.put_many(
-            self.pending.iter().map(|(id, bytes)| (*id, bytes.clone())),
-            1,
-        )?;
+        let pending = self
+            .pending
+            .values()
+            .map(VerifiedContent::borrowed)
+            .collect::<Vec<_>>();
+        self.store.put_many(&pending, 1)?;
         self.pending.clear();
         self.bytes = 0;
         Ok(())

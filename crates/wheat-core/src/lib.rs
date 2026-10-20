@@ -26,6 +26,7 @@ mod segment_records;
 mod semantic_records;
 mod store_records;
 pub mod text_capture;
+mod verified_content;
 mod wire;
 
 pub use branch_records::{
@@ -55,7 +56,7 @@ pub use id::{
     ApplicationId, ApplicationMapId, ChangeId, ChangeMapId, ChangeObjectId, ConflictId,
     ConflictSetId, ContentId, ContentMapId, ContentSetId, EditId, ObjectId, ParseContentIdError,
     ParseDigestIdError, RepositoryEnvelopeId, RepositoryStateId, RetainedSetId, RevisionId,
-    RevisionMapId, TreeId, ViewId, ViewLabelManifestId, ViewLineageMapId,
+    RevisionMapId, TreeId, ViewId, ViewLabelManifestId, ViewLineageMapId, content_bytes_hashed,
 };
 pub use model::{
     Actor, Application, ApplicationOrder, ApplicationResult, AppliedEditEvidence, ByteRange,
@@ -106,6 +107,7 @@ pub use store_records::{
     encode_ownership_manifest, encode_repository_head, encode_snapshot_manifest,
     publish_key_digest, publish_receipt_id, publish_request_digest,
 };
+pub use verified_content::{ContentMismatch, VerifiedContent};
 pub use wire::{
     CanonicalObjectError, CanonicalObjectKind, decode_application_map_node, decode_change_map_node,
     decode_conflict_set_node, decode_content_map_node, decode_content_set_node,

@@ -8,9 +8,34 @@ use std::{
 };
 
 use thiserror::Error;
-use wheat_core::ContentId;
+use wheat_core::{ContentId, ContentMismatch, VerifiedContent};
 
 use crate::{Durability, codec};
+
+/// Content to store, with the content it is likely a small change of.
+#[derive(Clone, Copy, Debug)]
+pub struct ContentItem<'a> {
+    pub content: VerifiedContent<&'a [u8]>,
+    /// Content to try storing `content` as a delta against.
+    pub base: Option<ContentId>,
+}
+
+impl<'a> ContentItem<'a> {
+    #[must_use]
+    pub fn new(content: VerifiedContent<&'a [u8]>, base: Option<ContentId>) -> Self {
+        Self { content, base }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> ContentId {
+        self.content.id()
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &'a [u8] {
+        self.content.into_inner()
+    }
+}
 
 fn codec_error(id: ContentId, max: usize, error: codec::CodecError) -> ContentStoreError {
     match error {
@@ -73,8 +98,18 @@ pub enum ContentStoreError {
     DeltaResolution { id: ContentId, reason: String },
 }
 
+impl From<ContentMismatch> for ContentStoreError {
+    fn from(mismatch: ContentMismatch) -> Self {
+        Self::Corrupt {
+            expected: mismatch.claimed,
+            actual: mismatch.actual,
+        }
+    }
+}
+
 pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
-    fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError>;
+    /// Stores `contents`, which arrive verified and are not hashed again.
+    fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError>;
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError>;
 
     /// Read the raw envelope for a content ID: header + stored payload bytes.
@@ -299,47 +334,30 @@ impl ContentStore {
 
     #[tracing::instrument(name = "content_put", level = "debug", skip_all, fields(bytes = bytes.len()))]
     pub fn put(&self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
-        let id = ContentId::of(bytes);
-        self.put_with_id(id, bytes)?;
-        Ok(id)
+        let content = VerifiedContent::new(bytes);
+        self.put_one(content)?;
+        Ok(content.id())
     }
 
-    /// Retains already-addressed content with bounded parallel durability work.
-    /// Every claimed ID is verified before publication.
+    /// Retains verified content with bounded parallel durability work.
     pub fn put_many(
         &self,
-        contents: impl IntoIterator<Item = (ContentId, Vec<u8>)>,
+        contents: &[VerifiedContent<&[u8]>],
         concurrency: usize,
     ) -> Result<(), ContentStoreError> {
-        let mut deduplicated = std::collections::BTreeMap::new();
-        for (id, bytes) in contents {
-            let actual = ContentId::of(&bytes);
-            if actual != id {
-                return Err(ContentStoreError::Corrupt {
-                    expected: id,
-                    actual,
-                });
-            }
-            if let Some(previous) = deduplicated.get(&id) {
-                if previous != &bytes {
-                    return Err(ContentStoreError::Corrupt {
-                        expected: id,
-                        actual,
-                    });
-                }
-            } else {
-                deduplicated.insert(id, bytes);
-            }
-        }
+        let deduplicated = contents
+            .iter()
+            .map(|content| (content.id(), *content))
+            .collect::<std::collections::BTreeMap<_, _>>();
         if deduplicated.is_empty() {
             return Ok(());
         }
         if let Some(backend) = &self.backend {
-            return backend.put_many(&deduplicated.into_iter().collect::<Vec<_>>());
+            return backend.put_many(&deduplicated.into_values().collect::<Vec<_>>());
         }
         let workers = concurrency.max(1).min(deduplicated.len());
         let (sender, receiver) = mpsc::channel();
-        for content in deduplicated {
+        for content in deduplicated.into_values() {
             sender.send(content).expect("receiver remains alive");
         }
         drop(sender);
@@ -351,10 +369,10 @@ impl ContentStore {
                     scope.spawn(move || -> Result<(), ContentStoreError> {
                         loop {
                             let next = receiver.lock().expect("worker mutex poisoned").recv();
-                            let Ok((id, bytes)) = next else {
+                            let Ok(content) = next else {
                                 return Ok(());
                             };
-                            self.put_with_id(id, &bytes)?;
+                            self.put_one(content)?;
                         }
                     })
                 })
@@ -370,27 +388,20 @@ impl ContentStore {
     ///
     /// If `base_id` refers to content already in this store, and a delta
     /// against it is smaller than the raw content, stores the delta envelope
-    /// instead. Otherwise falls back to raw storage. The identity of `bytes`
-    /// must match `id`; this is always verified.
+    /// instead. Otherwise falls back to raw storage.
     pub fn put_with_base(
         &self,
-        id: ContentId,
-        bytes: &[u8],
+        content: VerifiedContent<&[u8]>,
         base_id: ContentId,
     ) -> Result<(), ContentStoreError> {
-        if ContentId::of(bytes) != id {
-            return Err(ContentStoreError::Corrupt {
-                expected: id,
-                actual: ContentId::of(bytes),
-            });
-        }
+        let id = content.id();
         // Skip delta if the content already exists.
         if self.contains(id) {
             return Ok(());
         }
-        match self.delta_envelope(id, bytes, base_id)? {
+        match self.delta_envelope(id, content.bytes(), base_id)? {
             Some(envelope) => self.put_raw_envelope(id, envelope),
-            None => self.put_with_id(id, bytes),
+            None => self.put_one(content),
         }
     }
 
@@ -437,34 +448,26 @@ impl ContentStore {
 
     /// Store content from a batch, with optional delta base hints.
     ///
-    /// Each item is `(content_id, content_bytes, optional_base_id)`. Items
-    /// with a base hint attempt delta encoding; items without store raw.
+    /// Items with a base hint attempt delta encoding; items without store raw.
     pub fn put_many_with_bases(
         &self,
-        contents: impl IntoIterator<Item = (ContentId, Vec<u8>, Option<ContentId>)>,
+        contents: &[ContentItem<'_>],
         concurrency: usize,
     ) -> Result<(), ContentStoreError> {
         // Split into delta-eligible and raw items.
         let mut raw_items = Vec::new();
-        for (id, bytes, base_id) in contents {
-            let actual = ContentId::of(&bytes);
-            if actual != id {
-                return Err(ContentStoreError::Corrupt {
-                    expected: id,
-                    actual,
-                });
-            }
-            if let Some(base) = base_id {
+        for item in contents {
+            if let Some(base) = item.base {
                 // Try delta — fall back to raw on failure.
-                if let Err(_e) = self.put_with_base(id, &bytes, base) {
-                    raw_items.push((id, bytes));
+                if let Err(_e) = self.put_with_base(item.content, base) {
+                    raw_items.push(item.content);
                 }
             } else {
-                raw_items.push((id, bytes));
+                raw_items.push(item.content);
             }
         }
         if !raw_items.is_empty() {
-            self.put_many(raw_items, concurrency)?;
+            self.put_many(&raw_items, concurrency)?;
         }
         Ok(())
     }
@@ -530,16 +533,11 @@ impl ContentStore {
         Ok(())
     }
 
-    fn put_with_id(&self, id: ContentId, bytes: &[u8]) -> Result<(), ContentStoreError> {
-        if ContentId::of(bytes) != id {
-            return Err(ContentStoreError::Corrupt {
-                expected: id,
-                actual: ContentId::of(bytes),
-            });
-        }
+    fn put_one(&self, content: VerifiedContent<&[u8]>) -> Result<(), ContentStoreError> {
         if let Some(backend) = &self.backend {
-            return backend.put_many(&[(id, bytes.to_vec())]);
+            return backend.put_many(&[content]);
         }
+        let (id, bytes) = (content.id(), content.into_inner());
         let path = self.path(id);
         let parent = path.parent().expect("content path has parent");
         fs::create_dir_all(parent)?;
@@ -649,10 +647,12 @@ impl ContentStore {
             .map_err(|error| envelope_file_error(id, error))
     }
 
+    /// Whether `id` is stored, from stored metadata alone: like
+    /// [`Self::logical_length`], it reads no payload and does not check the content.
     #[must_use]
     pub fn contains(&self, id: ContentId) -> bool {
         if let Some(backend) = &self.backend {
-            return backend.get_bounded(id, usize::MAX).is_ok();
+            return backend.logical_length(id).is_ok();
         }
         self.path(id).is_file()
     }

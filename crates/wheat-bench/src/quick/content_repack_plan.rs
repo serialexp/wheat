@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use wheat_core::ContentId;
+use wheat_core::VerifiedContent;
 use wheat_store::{
     ContentHistoryPair, ContentRepackInput, ContentRepackLimits, ContentRepackPlan, ContentStore,
     Durability, plan_content_repack, prepare_content_repack,
@@ -42,17 +42,21 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         let mut batch = Vec::with_capacity(versions);
         for version in 0..versions {
             write_body(&mut body, file, version);
-            batch.push((ContentId::of(&body), body.clone()));
+            batch.push(VerifiedContent::new(body.clone()));
         }
         for pair in batch.windows(2) {
             history.push(ContentHistoryPair {
-                older: pair[0].0,
-                newer: pair[1].0,
+                older: pair[0].id(),
+                newer: pair[1].id(),
             });
         }
-        tips.extend(batch.last().map(|(id, _)| *id));
-        content_ids.extend(batch.iter().map(|(id, _)| *id));
-        store.put_many(batch, 1)?;
+        tips.extend(batch.last().map(VerifiedContent::id));
+        content_ids.extend(batch.iter().map(VerifiedContent::id));
+        let batch = batch
+            .iter()
+            .map(VerifiedContent::borrowed)
+            .collect::<Vec<_>>();
+        store.put_many(&batch, 1)?;
     }
     recorder.wall("write", started.elapsed().as_secs_f64());
     recorder.peak_rss("write", peak.take()?);

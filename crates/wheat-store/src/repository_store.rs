@@ -8,24 +8,15 @@ use std::{
 
 use async_trait::async_trait;
 use thiserror::Error;
-use wheat_core::{ContentId, ObjectId};
+use wheat_core::{ContentId, ObjectId, VerifiedContent};
 
 use crate::{
     BatchObjectStore, ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError,
     StoredObject,
     batch::stored_object,
     codec::{Codec, EnvelopeHeader},
-    content_store::ContentBackend,
+    content_store::{ContentBackend, ContentItem},
 };
-
-/// Content to store, with the content it is likely a small change of.
-#[derive(Clone, Copy, Debug)]
-pub struct ContentItem<'a> {
-    pub id: ContentId,
-    pub bytes: &'a [u8],
-    /// Content to try storing `bytes` as a delta against.
-    pub base: Option<ContentId>,
-}
 
 #[derive(Debug, Error)]
 pub enum RepositoryStoreError {
@@ -65,12 +56,7 @@ pub async fn put_separately<O: ImmutableObjectStore + ?Sized>(
     content: &[ContentItem<'_>],
 ) -> Result<(), RepositoryStoreError> {
     if !content.is_empty() {
-        content_store.put_many_with_bases(
-            content
-                .iter()
-                .map(|item| (item.id, item.bytes.to_vec(), item.base)),
-            WRITE_CONCURRENCY,
-        )?;
+        content_store.put_many_with_bases(content, WRITE_CONCURRENCY)?;
     }
     if !objects.is_empty() {
         objects_store.put_batch(objects, WRITE_CONCURRENCY).await?;
@@ -233,24 +219,16 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
         &self.content
     }
 
-    /// Stages content, checking each blob's identity. Stores everything staged
-    /// once the content reaches the byte limit.
+    /// Stages content, each blob with the content it is likely a small change of.
+    /// Stores everything staged once the content reaches the byte limit.
     pub async fn put_content(
         &self,
-        items: impl IntoIterator<Item = (ContentId, Vec<u8>, Option<ContentId>)>,
+        items: impl IntoIterator<Item = (VerifiedContent, Option<ContentId>)>,
     ) -> Result<(), RepositoryStoreError> {
         let full = {
             let mut blobs = self.staged.lock()?;
-            for (id, bytes, base) in items {
-                let actual = ContentId::of(&bytes);
-                if actual != id {
-                    return Err(ContentStoreError::Corrupt {
-                        expected: id,
-                        actual,
-                    }
-                    .into());
-                }
-                blobs.insert(id, bytes, base);
+            for (content, base) in items {
+                blobs.insert(content, base);
             }
             blobs.bytes >= self.max_content_bytes
         };
@@ -273,11 +251,7 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
         }
         let items = content
             .iter()
-            .map(|(id, blob)| ContentItem {
-                id: *id,
-                bytes: &blob.bytes,
-                base: blob.base,
-            })
+            .map(|(_, blob)| blob.item())
             .collect::<Vec<_>>();
         self.store.put_publication(&objects, &items).await?;
         pending.written();
@@ -350,12 +324,8 @@ impl PendingPublications {
             .map(|(id, bytes)| (*id, bytes.clone()))
             .collect::<Vec<_>>();
         let content = content
-            .into_iter()
-            .map(|(id, blob)| ContentItem {
-                id: *id,
-                bytes: &blob.bytes,
-                base: blob.base,
-            })
+            .into_values()
+            .map(|blob| blob.item())
             .collect::<Vec<_>>();
         store.put_publication(&objects, &content).await
     }
@@ -476,30 +446,38 @@ impl<S: RepositoryStore + ?Sized> ImmutableObjectStore for RepositoryStage<'_, S
 
 #[derive(Debug)]
 struct StagedBlob {
-    bytes: Vec<u8>,
+    content: VerifiedContent,
     base: Option<ContentId>,
 }
 
 impl StagedBlob {
+    fn item(&self) -> ContentItem<'_> {
+        ContentItem::new(self.content.borrowed(), self.base)
+    }
+
+    fn len(&self) -> usize {
+        self.content.len()
+    }
+
     fn bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
-        if self.bytes.len() > max {
+        if self.len() > max {
             return Err(ContentStoreError::TooLarge {
                 id,
                 max,
-                minimum: self.bytes.len(),
+                minimum: self.len(),
             });
         }
-        Ok(self.bytes.clone())
+        Ok(self.content.bytes().to_vec())
     }
 
     fn raw_envelope(&self) -> (EnvelopeHeader, Vec<u8>) {
         (
             EnvelopeHeader {
                 codec: Codec::Raw,
-                stored_length: self.bytes.len() as u64,
-                logical_length: self.bytes.len() as u64,
+                stored_length: self.len() as u64,
+                logical_length: self.len() as u64,
             },
-            self.bytes.clone(),
+            self.content.bytes().to_vec(),
         )
     }
 }
@@ -511,12 +489,14 @@ struct StagedBlobs {
 }
 
 impl StagedBlobs {
-    fn insert(&mut self, id: ContentId, bytes: Vec<u8>, base: Option<ContentId>) {
+    fn insert(&mut self, content: VerifiedContent, base: Option<ContentId>) {
+        let id = content.id();
         if self.blobs.contains_key(&id) {
             return;
         }
-        self.bytes += bytes.len();
-        self.blobs.insert(id, Arc::new(StagedBlob { bytes, base }));
+        self.bytes += content.len();
+        self.blobs
+            .insert(id, Arc::new(StagedBlob { content, base }));
     }
 
     fn get(&self, id: ContentId) -> Option<Arc<StagedBlob>> {
@@ -533,7 +513,7 @@ impl StagedBlobs {
     fn written(&mut self, ids: impl IntoIterator<Item = ContentId>) {
         for id in ids {
             if let Some(blob) = self.blobs.remove(&id) {
-                self.bytes -= blob.bytes.len();
+                self.bytes -= blob.len();
             }
         }
     }
@@ -560,9 +540,8 @@ impl StagedContent {
 }
 
 impl ContentBackend for StagedContent {
-    fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError> {
-        self.stored
-            .put_many(contents.iter().cloned(), WRITE_CONCURRENCY)
+    fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError> {
+        self.stored.put_many(contents, WRITE_CONCURRENCY)
     }
 
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
@@ -584,7 +563,7 @@ impl ContentBackend for StagedContent {
 
     fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
         match self.staged(id)? {
-            Some(blob) => Ok(blob.bytes.len() as u64),
+            Some(blob) => Ok(blob.len() as u64),
             None => self.stored.logical_length(id),
         }
     }
@@ -630,9 +609,8 @@ impl PendingContent {
 }
 
 impl ContentBackend for PendingContent {
-    fn put_many(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), ContentStoreError> {
-        self.below
-            .put_many(contents.iter().cloned(), WRITE_CONCURRENCY)
+    fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError> {
+        self.below.put_many(contents, WRITE_CONCURRENCY)
     }
 
     fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
@@ -654,7 +632,7 @@ impl ContentBackend for PendingContent {
 
     fn logical_length(&self, id: ContentId) -> Result<u64, ContentStoreError> {
         match self.pending(id) {
-            Some(blob) => Ok(blob.bytes.len() as u64),
+            Some(blob) => Ok(blob.len() as u64),
             None => self.below.logical_length(id),
         }
     }

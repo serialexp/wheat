@@ -248,11 +248,6 @@ budget passes, but by only about 0.7 s.
   benchmark: one change pushes 6 KiB after 10 changes but 44 KiB after 200. Send
   such objects as deltas against their aligned old counterpart, which the client
   has. Then add a bytes budget to `fetch_incremental`.
-- `[ ]` **Uploaded content is hashed four or five times on the server (2026-09-26).**
-  Publish checks each blob's ID, then `put_many_with_bases`, `ContentStore::put_many`,
-  the packed `put_many` and the loose writer hash it again; the packed `put_many` also
-  clones every blob above the loose threshold. Hash once and pass verified content
-  down.
 - `[ ]` **The size limits for one file disagree (2026-09-26).** `wheat add` refuses
   files over 16 MiB (`DEFAULT_MAX_INPUT_BYTES`), Git import takes up to 64 MiB
   (`MAX_IMPORT_FILE_BYTES`), materialization up to 256 MiB, and the store and protocol

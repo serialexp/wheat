@@ -7,8 +7,8 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{
     ContentId, INVENTORY_ENTRY_ENCODED_SIZE, InventoryRecord, ObjectId, RepositoryEnvelopeId,
-    SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE, StoreRecordError, decode_snapshot_manifest,
-    encode_snapshot_manifest,
+    SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE, StoreRecordError, VerifiedContent,
+    decode_snapshot_manifest, encode_snapshot_manifest,
 };
 
 use crate::{
@@ -852,8 +852,8 @@ pub async fn restore_snapshot_from<
         let end = inventory_batch_end(&manifest.contents, start, limits)?;
         let inventory = &manifest.contents[start..end];
         let batch = source.read_contents(inventory).await?;
-        validate_content_batch(&batch, inventory, limits)?;
-        content.put_many(batch, 16)?;
+        let verified = validate_content_batch(&batch, inventory, limits)?;
+        content.put_many(&verified, 16)?;
         start = end;
     }
     let reader = RepositoryReader::new(objects, content);
@@ -971,16 +971,19 @@ fn validate_object_batch(
     Ok(())
 }
 
-fn validate_content_batch(
-    batch: &[(ContentId, Vec<u8>)],
+fn validate_content_batch<'b>(
+    batch: &'b [(ContentId, Vec<u8>)],
     inventory: &[InventoryEntry<ContentId>],
     limits: SnapshotLimits,
-) -> Result<(), SnapshotError> {
+) -> Result<Vec<VerifiedContent<&'b [u8]>>, SnapshotError> {
     validate_batch_shape(batch, inventory, limits)?;
-    if batch.iter().any(|(id, bytes)| ContentId::of(bytes) != *id) {
-        return Err(SnapshotError::InventoryMismatch);
-    }
-    Ok(())
+    batch
+        .iter()
+        .map(|(id, bytes)| {
+            VerifiedContent::check(*id, bytes.as_slice())
+                .map_err(|_| SnapshotError::InventoryMismatch)
+        })
+        .collect()
 }
 
 fn inventory_batch_end<I>(

@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::{Notify, Semaphore};
-use wheat_core::{ApplicationContext, ContentId, ObjectId, Repository, RepositoryEnvelopeId, Tree};
+use wheat_core::{
+    ApplicationContext, ObjectId, Repository, RepositoryEnvelopeId, Tree, VerifiedContent,
+};
 use wheat_protocol::{Digest256, PublishRequestOutput, Uuid128};
 use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
@@ -171,7 +173,7 @@ async fn propose<'a>(
     let stage = Stage::new(&*server.entry.store, 65_536, 64 * 1024 * 1024);
     let value = path.as_bytes().to_vec();
     stage
-        .put_content([(ContentId::of(&value), value.clone(), None)])
+        .put_content([(VerifiedContent::new(value.clone()), None)])
         .await
         .unwrap();
     let reader = RepositoryReader::new(&stage, stage.content());

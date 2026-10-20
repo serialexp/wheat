@@ -477,6 +477,45 @@ async fn a_publish_pushed_whole_needs_no_rounds() {
     publishing.assert_server_complete(proposed).await;
 }
 
+/// The server hashes each blob it receives once, where it comes in: the stage, the
+/// validation and the store take the checked bytes as they are.
+#[tokio::test]
+async fn a_published_blob_is_hashed_once() {
+    let mut publishing = Publishing::start().await;
+    let files: Vec<(String, Vec<u8>)> = (0..4u8)
+        .map(|n| (format!("big/{n}.bin"), vec![n; 64 * 1024]))
+        .collect();
+    let proposed = publishing.propose(&files).await;
+    let difference = publishing.difference(proposed).await;
+    let ids: Vec<ContentId> = files
+        .iter()
+        .map(|(_, value)| ContentId::of(value))
+        .collect();
+    let blob_bytes: u64 = files.iter().map(|(_, value)| value.len() as u64).sum();
+
+    // Only the server hashes content from here on: the test pushes known IDs, and
+    // pushes every blob, so it reads none back to answer a round.
+    let before = wheat_core::content_bytes_hashed();
+    let mut ws = publishing.request_pushing(proposed).await;
+    let objects = difference.len() as u32;
+    send_whole(&mut ws, difference).await;
+    let blobs = ids.iter().copied().zip(values(&files));
+    send_msg(&mut ws, &content_batch(OP, blobs)).await;
+    send_msg(&mut ws, &push_end(OP, objects, files.len() as u32)).await;
+    let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
+    assert!(rounds.is_empty(), "{rounds:?}");
+    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let hashed = wheat_core::content_bytes_hashed() - before;
+
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_published(&result, proposed);
+    assert_eq!(
+        hashed, blob_bytes,
+        "content bytes hashed for {blob_bytes} published"
+    );
+    publishing.assert_server_complete(proposed).await;
+}
+
 #[tokio::test]
 async fn the_server_asks_only_for_what_the_push_left_out() {
     let mut publishing = Publishing::start().await;

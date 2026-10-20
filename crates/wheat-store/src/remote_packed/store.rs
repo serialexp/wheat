@@ -15,8 +15,8 @@ use super::content::RemoteContentBackend;
 use super::segment_cache::SegmentCache;
 use crate::object_store_adapter::S3ObjectStoreConfig;
 use crate::packed::segment::{
-    MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE, PreparedSegmentRecord,
-    SegmentBuilder, SegmentError, SegmentRecord, prepare_record,
+    CheckedRecord, MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE,
+    PreparedSegmentRecord, SegmentBuilder, SegmentError, SegmentRecord, prepare_record,
 };
 use crate::{
     ContentItem, ContentStore, Durability, ImmutableObjectStore, ObjectKind, ObjectStoreError,
@@ -405,7 +405,9 @@ impl ImmutableObjectStore for RemotePackedStore {
                     digest: *object.id.as_bytes(),
                     bytes: &object.canonical_bytes,
                 };
-                let record = prepare_record(record).map_err(segment_integrity)?;
+                let record = CheckedRecord::check(record)
+                    .and_then(prepare_record)
+                    .map_err(segment_integrity)?;
                 let next_payload = stored_payload
                     .checked_add(record.stored_length())
                     .ok_or_else(|| segment_integrity(SegmentError::TooLarge))?;

@@ -40,11 +40,11 @@ use uuid::Uuid;
 use wheat_core::{
     Actor, ApplicationContext, ChangeId, ChangeMetadata, ChangeProposal, ContentId, EditTransition,
     FileKind, FileValue, Repository, RevisionEdits, RevisionMetadata, SourceProvenance, Timestamp,
-    Tree, ViewId,
+    Tree, VerifiedContent, ViewId,
     edit_capture::{FileSnapshot, capture_edit},
     guarded,
 };
-use wheat_store::{ContentStore, ContentStoreError};
+use wheat_store::{ContentItem, ContentStore, ContentStoreError};
 
 const GIT_IMPORT_NAMESPACE: Uuid = Uuid::from_u128(0xc245_a89b_519f_5a4b_9b36_d62b_78f5_2901);
 
@@ -348,12 +348,11 @@ pub fn import_open_repository_with_limits(
         commit_changes.insert(oid_bytes, change_id);
     }
 
-    content.put_many_with_bases(
-        pending_content
-            .into_iter()
-            .map(|(id, bytes)| (id, bytes, base_hints.get(&id).copied())),
-        16,
-    )?;
+    let pending_content = pending_content
+        .iter()
+        .map(|(id, content)| ContentItem::new(content.borrowed(), base_hints.get(id).copied()))
+        .collect::<Vec<_>>();
+    content.put_many_with_bases(&pending_content, 16)?;
     if profile {
         eprintln!(
             "prepare_ms={:.3}",
@@ -545,7 +544,7 @@ fn materialize_commit_tree(
     unique_content: &mut BTreeSet<ContentId>,
     tree_cache: &mut BTreeMap<Vec<u8>, Tree>,
     blob_cache: &mut BTreeMap<(Vec<u8>, bool), ContentId>,
-    pending_content: &mut BTreeMap<ContentId, Vec<u8>>,
+    pending_content: &mut BTreeMap<ContentId, VerifiedContent>,
     accounting: &mut ImportAccounting,
     limits: ImportLimits,
 ) -> Result<Tree, ImportError> {
@@ -574,7 +573,7 @@ fn flatten_tree(
     unique_content: &mut BTreeSet<ContentId>,
     tree_cache: &mut BTreeMap<Vec<u8>, Tree>,
     blob_cache: &mut BTreeMap<(Vec<u8>, bool), ContentId>,
-    pending_content: &mut BTreeMap<ContentId, Vec<u8>>,
+    pending_content: &mut BTreeMap<ContentId, VerifiedContent>,
     accounting: &mut ImportAccounting,
     limits: ImportLimits,
 ) -> Result<Tree, ImportError> {
@@ -633,8 +632,8 @@ fn flatten_tree(
                     .map_err(git_error)?
                     .try_into_blob()
                     .map_err(git_error)?;
-                let captured = capture_blob(&blob.data, kind);
-                let id = ContentId::of(&captured);
+                let captured = VerifiedContent::new(capture_blob(&blob.data, kind));
+                let id = captured.id();
                 if let std::collections::btree_map::Entry::Vacant(entry) = pending_content.entry(id)
                 {
                     accounting.content(captured.len(), limits)?;
@@ -670,7 +669,7 @@ fn capture_blob(bytes: &[u8], kind: FileKind) -> Cow<'_, [u8]> {
 fn edits_between(
     parent: &Tree,
     current: &Tree,
-    content: &mut BTreeMap<ContentId, Vec<u8>>,
+    content: &mut BTreeMap<ContentId, VerifiedContent>,
     accounting: &mut ImportAccounting,
     limits: ImportLimits,
 ) -> Result<RevisionEdits, ImportError> {
@@ -686,13 +685,13 @@ fn edits_between(
             content
                 .get(&value.content)
                 .expect("materialized Git content is retained before edit capture")
-                .as_slice()
+                .bytes()
         });
         let after_bytes = after.map(|value| {
             content
                 .get(&value.content)
                 .expect("materialized Git content is retained before edit capture")
-                .as_slice()
+                .bytes()
         });
         let captured = capture_edit(
             path,
@@ -713,7 +712,7 @@ fn edits_between(
                 // Guarded capture may retain replacement fragments in addition to
                 // tree blobs; charge them before copying into the pending map.
                 accounting.content(bytes.len(), limits)?;
-                entry.insert(bytes);
+                entry.insert(VerifiedContent::new(bytes));
             }
         }
     }

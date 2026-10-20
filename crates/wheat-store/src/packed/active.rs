@@ -26,7 +26,7 @@ use wheat_core::{
 };
 
 #[cfg(test)]
-use super::segment::prepare_record;
+use super::segment::{CheckedRecord, prepare_record};
 use super::segment::{
     MAX_SEGMENT_ENTRIES, MAX_SEGMENT_PAYLOAD_BYTES, SegmentError, SegmentRecord, key,
 };
@@ -409,7 +409,7 @@ impl ActiveSegment {
         let prepared = records
             .iter()
             .copied()
-            .map(prepare_record)
+            .map(|record| prepare_record(CheckedRecord::check(record)?))
             .collect::<Result<Vec<_>, _>>()?;
         self.prepare_prepared_append(prepared, intended_generation)
     }

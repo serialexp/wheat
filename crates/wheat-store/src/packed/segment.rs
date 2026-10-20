@@ -19,14 +19,15 @@ use wheat_core::{
     SEGMENT_FOOTER_ENCODED_SIZE, SEGMENT_INDEX_ENTRY_ENCODED_SIZE, SEGMENT_MAX_DELTA_DEPTH,
     SEGMENT_NAMESPACE_CONTENT, SEGMENT_NAMESPACE_METADATA, SEGMENT_PREFIX_ENCODED_SIZE,
     SegmentDirectory, SegmentDirectoryEntry, SegmentFooter, SegmentId, SegmentIndexEntry,
-    SegmentIndexKey, SegmentIndexPage, SegmentRecordError, decode_segment_directory,
-    decode_segment_footer, decode_segment_index_page, decode_segment_prefix,
-    encode_segment_directory, encode_segment_footer, encode_segment_index_page,
-    validate_canonical_object,
+    SegmentIndexKey, SegmentIndexPage, SegmentRecordError, VerifiedContent,
+    decode_segment_directory, decode_segment_footer, decode_segment_index_page,
+    decode_segment_prefix, encode_segment_directory, encode_segment_footer,
+    encode_segment_index_page, validate_canonical_object,
 };
 
 use crate::codec::{self, Codec, PhysicalPayload};
 use crate::delta;
+use crate::{ObjectKind, ObjectStoreError};
 
 const _: () = assert!(
     SEGMENT_MAX_DELTA_DEPTH as usize == crate::content_store::MAX_DELTA_CHAIN_DEPTH,
@@ -54,6 +55,67 @@ pub(crate) struct SegmentRecord<'a> {
     pub kind: u16,
     pub digest: [u8; 32],
     pub bytes: &'a [u8],
+}
+
+/// A record whose digest is known to address its bytes, and whose metadata bytes are
+/// known to be a canonical object of its kind. [`Self::check`] makes one by checking
+/// a record; [`Self::content`] and [`Self::object`] make one from content verified
+/// already or an object checked as it is made. Preparing and appending it checks
+/// nothing again.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckedRecord<'a>(SegmentRecord<'a>);
+
+impl<'a> CheckedRecord<'a> {
+    pub(crate) fn check(record: SegmentRecord<'a>) -> Result<Self, SegmentError> {
+        validate_record(record)?;
+        Ok(Self(record))
+    }
+
+    pub(crate) fn content(content: VerifiedContent<&'a [u8]>) -> Self {
+        Self(SegmentRecord {
+            namespace: CONTENT_NAMESPACE,
+            kind: 0,
+            digest: *content.id().as_bytes(),
+            bytes: content.into_inner(),
+        })
+    }
+
+    /// Checks that `bytes` are a canonical object addressed by `id`.
+    pub(crate) fn object(id: ObjectId, bytes: &'a [u8]) -> Result<Self, ObjectStoreError> {
+        let kind: ObjectKind = validate_canonical_object(bytes)?.into();
+        let actual = ObjectId::of_canonical_bytes(bytes);
+        if actual != id {
+            return Err(ObjectStoreError::Corrupt {
+                expected: id,
+                actual,
+            });
+        }
+        Ok(Self(SegmentRecord {
+            namespace: METADATA_NAMESPACE,
+            kind: kind as u16,
+            digest: *id.as_bytes(),
+            bytes,
+        }))
+    }
+
+    /// `record` taken as checked without checking it, for tests of what the catalog
+    /// does with a record no checked one could be.
+    #[cfg(test)]
+    pub(crate) fn unchecked(record: SegmentRecord<'a>) -> Self {
+        Self(record)
+    }
+
+    pub(crate) fn record(&self) -> SegmentRecord<'a> {
+        self.0
+    }
+}
+
+impl<'a> std::ops::Deref for CheckedRecord<'a> {
+    type Target = SegmentRecord<'a>;
+
+    fn deref(&self) -> &SegmentRecord<'a> {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -141,9 +203,9 @@ pub(super) fn key(entry: &SegmentIndexEntry) -> (u8, [u8; 32]) {
 }
 
 pub(crate) fn prepare_record(
-    record: SegmentRecord<'_>,
+    record: CheckedRecord<'_>,
 ) -> Result<PreparedSegmentRecord<'_>, SegmentError> {
-    validate_record(record)?;
+    let record = record.record();
     Ok(PreparedSegmentRecord {
         logical: record,
         physical: codec::prepare(record.bytes)?,
@@ -337,7 +399,7 @@ impl SegmentBuilder {
 
     #[cfg(test)]
     pub(crate) fn push(&mut self, record: SegmentRecord<'_>) -> Result<(), SegmentError> {
-        self.push_prepared(prepare_record(record)?)
+        self.push_prepared(prepare_record(CheckedRecord::check(record)?)?)
     }
 
     pub(crate) fn push_prepared(

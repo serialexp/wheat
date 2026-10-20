@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -147,9 +151,20 @@ object_id_from!(
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ContentId([u8; 32]);
 
+/// Bytes this process has hashed with [`ContentId::of`].
+static CONTENT_BYTES_HASHED: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes this process has hashed into content IDs so far: the work a contract counts
+/// to show content is hashed once, not once per layer it passes through.
+#[must_use]
+pub fn content_bytes_hashed() -> u64 {
+    CONTENT_BYTES_HASHED.load(Ordering::Relaxed)
+}
+
 impl ContentId {
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
+        CONTENT_BYTES_HASHED.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Self(*blake3::hash(bytes).as_bytes())
     }
 
