@@ -69,7 +69,12 @@ Progress:
   importer and `wheat move` replay). Contract: core
   `application_hashes_only_generated_content`. Still hashed per call: `FileBytes::value`
   in `edit_move.rs`.
-- Remaining: run `just bench` once the tree is quiet and commit the results file.
+- Benched at e0705d4 (`20261020-040238-e0705d419805.tsv`, all 16 cases, none failed).
+  No full-suite run exists from before the hash-once work; the only cases shared with
+  65bb956 (head_receipts, publish_contention, remote_latency) didn't regress, and
+  1–2-writer server CPU per publish fell ~20%. A full baseline at 65bb956 needs a
+  `git init` in a scratch export (wheat-bench stamps with `git rev-parse`); I asked
+  Bart and got no answer.
 - Objects (not content) are still validated twice on remote_packed seal (at
   `put_if_absent` and again via `CheckedRecord::check` in `seal`). That's out of
   scope; it's noted here.
