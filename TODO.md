@@ -34,6 +34,16 @@ for `wheat labels` here; incremental-validation step 9):
   IDs are UUIDv5, so the log is in effectively random order, and it prints every
   change with its whole message, with no limit or paging. Order by the view's
   canonical order (or time), newest first, with a count limit.
+- `[ ]` **`structural_delta::one_step_forward_yields_little_more_than_the_difference`
+  fails about 1 run in 20** (failed CI on 37d047f). Change IDs are UUIDv7, so the
+  radix maps' shape depends on which millisecond each change was made in. When two keys
+  straddle a byte boundary, a new view's map splits a node that its old counterpart
+  keeps whole (prefix `01a156ea5b`, inline entries). The split-off child node is in
+  the old closure only through another old view, so the walk, which compares against
+  one counterpart, sends it again: one or two extra `RevisionMapNode`/`ApplicationMapNode`/
+  `RetainedSetNode` per fetch. That's sound, just not minimal. Needs a decision:
+  fixed IDs in the test history, a test that allows this case, or pairing a split
+  node with the old entries at its position.
 
 ## Found while scoping the Scion lessons (2026-10-15)
 
