@@ -74,6 +74,13 @@ pub(crate) fn run_helper(helper: &str, url: &WheatUrl) -> Result<Vec<u8>> {
         .context("credential.helper has no stdout")?
         .take(MAX_HELPER_OUTPUT_BYTES + 1)
         .read_to_end(&mut output);
+    // Too much output is the error to report, whatever the helper's status: closing
+    // its stdout early may have killed it with SIGPIPE, or it may still be writing.
+    if output.len() as u64 > MAX_HELPER_OUTPUT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("credential.helper printed more than {MAX_HELPER_OUTPUT_BYTES} bytes");
+    }
     let status = child
         .wait()
         .context("could not wait for credential.helper")?;
@@ -82,10 +89,6 @@ pub(crate) fn run_helper(helper: &str, url: &WheatUrl) -> Result<Vec<u8>> {
         status.success(),
         "credential.helper failed ({status}) for {}",
         url.authority
-    );
-    ensure!(
-        output.len() as u64 <= MAX_HELPER_OUTPUT_BYTES,
-        "credential.helper printed more than {MAX_HELPER_OUTPUT_BYTES} bytes"
     );
     parse_token(&output)
 }
@@ -191,6 +194,11 @@ mod tests {
         let error = run_helper("head -c 70000 /dev/zero #", &url())
             .unwrap_err()
             .to_string();
+        assert!(error.contains("more than"), "{error}");
+
+        // A helper that never stops writing dies when its stdout closes; the error is
+        // still about the output, not its exit status.
+        let error = run_helper("yes #", &url()).unwrap_err().to_string();
         assert!(error.contains("more than"), "{error}");
 
         let long = "a".repeat(MAX_TOKEN_BYTES + 1);
