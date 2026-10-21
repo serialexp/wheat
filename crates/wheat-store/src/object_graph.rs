@@ -24,7 +24,10 @@ use crate::{
     content_map::ContentMapCollection,
     radix::{self, Collection, Key as _, Node},
     revision_map::RevisionCollection,
-    sets::{ConflictCollection, ContentCollection, ProjectedCommitCollection, RetainedCollection},
+    sets::{
+        ChangeSetCollection, ConflictCollection, ContentCollection, ProjectedCommitCollection,
+        RetainedCollection,
+    },
     view_lineage::ViewLineageCollection,
 };
 
@@ -106,8 +109,8 @@ pub(crate) fn state<E>(
     Ok(())
 }
 
-/// The fields of a view. The revisions, applications and unresolved conflicts are
-/// roots of radix collections.
+/// The fields of a view. The revisions, applications, unresolved conflicts, content
+/// and tips are roots of radix collections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ViewSite {
     Tree,
@@ -115,6 +118,7 @@ pub(crate) enum ViewSite {
     Applications,
     UnresolvedConflicts,
     RequiredContent,
+    Tips,
 }
 
 pub(crate) fn view<E>(
@@ -130,6 +134,7 @@ pub(crate) fn view<E>(
             record.unresolved_conflicts.into(),
         ),
         (ViewSite::RequiredContent, record.required_content.into()),
+        (ViewSite::Tips, record.tips.into()),
     ] {
         f(Ref::Object(site, id))?;
     }
@@ -358,6 +363,8 @@ pub(crate) enum RadixKind {
     /// Git commit ‖ the application projecting as it. The application is retained,
     /// so a member refers to nothing the retained sets do not.
     ProjectedCommitSet,
+    /// A view's tips: change IDs, which name no object.
+    ChangeSet,
 }
 
 impl RadixKind {
@@ -372,6 +379,7 @@ impl RadixKind {
             Self::ContentMap => ObjectKind::ContentMapNode,
             Self::ContentSet => ObjectKind::ContentSetNode,
             Self::ProjectedCommitSet => ObjectKind::ProjectedCommitSetNode,
+            Self::ChangeSet => ObjectKind::ChangeSetNode,
         }
     }
 
@@ -386,6 +394,7 @@ impl RadixKind {
             Self::ContentMap => <ContentMapCollection as Collection>::Key::LEN,
             Self::ContentSet => <ContentCollection as Collection>::Key::LEN,
             Self::ProjectedCommitSet => <ProjectedCommitCollection as Collection>::Key::LEN,
+            Self::ChangeSet => <ChangeSetCollection as Collection>::Key::LEN,
         }
     }
 
@@ -400,6 +409,7 @@ impl RadixKind {
             Self::ContentMap => uniform::<ContentMapCollection>(bytes),
             Self::ContentSet => uniform::<ContentCollection>(bytes),
             Self::ProjectedCommitSet => uniform::<ProjectedCommitCollection>(bytes),
+            Self::ChangeSet => uniform::<ChangeSetCollection>(bytes),
         }
     }
 
@@ -410,12 +420,13 @@ impl RadixKind {
     }
 
     /// Whether keys refer to anything. A content collection's keys are blobs, which
-    /// walks gather from the trees, edits and conflicts that name them, and a
-    /// projected commit's application is retained, so only their children are listed.
+    /// walks gather from the trees, edits and conflicts that name them, a projected
+    /// commit's application is retained, and a change ID names no object, so only
+    /// their children are listed.
     fn keys_are_references(self) -> bool {
         !matches!(
             self,
-            Self::ContentMap | Self::ContentSet | Self::ProjectedCommitSet
+            Self::ContentMap | Self::ContentSet | Self::ProjectedCommitSet | Self::ChangeSet
         )
     }
 }
@@ -608,7 +619,8 @@ where
                     ViewSite::RequiredContent
                     | ViewSite::Revisions
                     | ViewSite::Applications
-                    | ViewSite::UnresolvedConflicts => Reference::RadixRoot(id),
+                    | ViewSite::UnresolvedConflicts
+                    | ViewSite::Tips => Reference::RadixRoot(id),
                 },
                 Ref::Content(id) => Reference::Content(id),
             })
@@ -649,6 +661,7 @@ where
         ObjectKind::ProjectedCommitSetNode => {
             follow_radix(RadixKind::ProjectedCommitSet, stored, radix_path, f)
         }
+        ObjectKind::ChangeSetNode => follow_radix(RadixKind::ChangeSet, stored, radix_path, f),
     }
 }
 

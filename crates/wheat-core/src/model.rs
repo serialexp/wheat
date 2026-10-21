@@ -751,13 +751,23 @@ pub struct RepositoryView {
     pub unresolved_conflicts: BTreeSet<ConflictId>,
     /// Each blob the tree names, with the number of tree entries naming it.
     pub required_content: BTreeMap<ContentId, u32>,
+    /// The selected changes no other selected change depends on.
+    pub tips: BTreeSet<ChangeId>,
     pub order: ViewOrder,
 }
 
 impl RepositoryView {
+    /// A view with no applications, conflicts or tips, as the base is.
     #[must_use]
     pub fn new(tree: Tree, frontier: BTreeMap<ChangeId, RevisionId>, order: ViewOrder) -> Self {
-        Self::from_manifest(tree, frontier, BTreeMap::new(), BTreeSet::new(), order)
+        Self::from_manifest(
+            tree,
+            frontier,
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            order,
+        )
     }
 
     #[must_use]
@@ -766,6 +776,7 @@ impl RepositoryView {
         frontier: BTreeMap<ChangeId, RevisionId>,
         applications: BTreeMap<ChangeId, ApplicationId>,
         unresolved_conflicts: BTreeSet<ConflictId>,
+        tips: BTreeSet<ChangeId>,
         order: ViewOrder,
     ) -> Self {
         let mut required_content = BTreeMap::new();
@@ -779,10 +790,28 @@ impl RepositoryView {
             applications,
             unresolved_conflicts,
             required_content,
+            tips,
             order,
         };
         view.id = ViewId::of_canonical_bytes(&crate::wire::view_bytes(&view));
         view
+    }
+
+    /// The tips after applying `change`, whose revision depends on `dependencies`, onto
+    /// this view: the change is one, and its dependencies no longer are. Nothing already
+    /// selected depends on the change, since dependencies come first in the order.
+    #[must_use]
+    pub fn tips_after(
+        &self,
+        change: ChangeId,
+        dependencies: &BTreeSet<ChangeId>,
+    ) -> BTreeSet<ChangeId> {
+        let mut tips = self.tips.clone();
+        for dependency in dependencies {
+            tips.remove(dependency);
+        }
+        tips.insert(change);
+        tips
     }
 
     #[must_use]

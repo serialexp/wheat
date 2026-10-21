@@ -1098,6 +1098,7 @@ impl Repository {
                 frontier,
                 applications,
                 conflicts,
+                target.tips_after(proposal.id, &proposal.dependencies),
                 order_after(&target, proposal.id, revision.generation)?,
             );
 
@@ -1289,6 +1290,7 @@ impl Repository {
             frontier,
             applications,
             conflicts,
+            target.tips_after(change, &revision.dependencies),
             order,
         );
         self.applications.insert(application.id, application);

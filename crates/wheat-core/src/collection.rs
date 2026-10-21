@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApplicationId, ApplicationMapId, CanonicalObjectError, ChangeMapId, ChangeObjectId,
-    ConflictSetId, ContentMapId, ContentSetId, ProjectedCommitSetId, RetainedSetId,
+    ChangeSetId, ConflictSetId, ContentMapId, ContentSetId, ProjectedCommitSetId, RetainedSetId,
     ViewLineageMapId,
 };
 
@@ -23,6 +23,7 @@ child!(ContentMapChild, ContentMapId);
 child!(ContentSetChild, ContentSetId);
 child!(RetainedSetChild, RetainedSetId);
 child!(ProjectedCommitSetChild, ProjectedCommitSetId);
+child!(ChangeSetChild, ChangeSetId);
 child!(ViewLineageMapChild, ViewLineageMapId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -250,4 +251,11 @@ set_node!(
     ProjectedCommitSetId,
     validate_projected_commit_set_node,
     projected_commit_set_node_bytes
+);
+set_node!(
+    ChangeSetNode,
+    ChangeSetChild,
+    ChangeSetId,
+    validate_change_set_node,
+    change_set_node_bytes
 );

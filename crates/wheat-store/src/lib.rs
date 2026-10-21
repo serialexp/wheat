@@ -137,10 +137,10 @@ pub use revision_map::{
     RevisionMapCursor, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore,
 };
 pub use sets::{
-    CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetDelta,
-    ContentSetDeltaLimits, ContentSetStore, ProjectedCommitSetCursor, ProjectedCommitSetDelta,
-    ProjectedCommitSetStore, RetainedSetCursor, RetainedSetDelta, RetainedSetDeltaLimits,
-    RetainedSetStore,
+    ChangeSetCursor, ChangeSetStore, CollectionError, ConflictSetCursor, ConflictSetStore,
+    ContentSetCursor, ContentSetDelta, ContentSetDeltaLimits, ContentSetStore,
+    ProjectedCommitSetCursor, ProjectedCommitSetDelta, ProjectedCommitSetStore, RetainedSetCursor,
+    RetainedSetDelta, RetainedSetDeltaLimits, RetainedSetStore,
 };
 pub use view_lineage::{
     ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,

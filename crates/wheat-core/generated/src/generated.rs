@@ -31,6 +31,7 @@ pub enum WheatObject {
     ChangeMapNodeV1(ChangeMapNodeV1Output),
     ViewLineageMapNodeV1(ViewLineageMapNodeV1Output),
     ProjectedCommitSetNodeV1(ProjectedCommitSetNodeV1Output),
+    ChangeSetNodeV1(ChangeSetNodeV1Output),
 }
 
 impl WheatObject {
@@ -117,6 +118,7 @@ impl WheatObject {
                 v.applications.encode_into(encoder)?;
                 v.unresolved_conflicts.encode_into(encoder)?;
                 v.required_content.encode_into(encoder)?;
+                v.tips.encode_into(encoder)?;
                 encoder.write_uint64(v.size, Endianness::BigEndian);
                 encoder.write_uint32(v.last.len() as u32, Endianness::BigEndian);
                 for item in &v.last {
@@ -316,6 +318,22 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
             }
+            WheatObject::ChangeSetNodeV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint8(if v.present { 1 } else { 0 });
+                encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
+                for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
+            }
         }
         Ok(())
     }
@@ -403,6 +421,10 @@ impl WheatObject {
         } else if value == 0x1301 {
             Ok(WheatObject::ProjectedCommitSetNodeV1(
                 ProjectedCommitSetNodeV1Output::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x1401 {
+            Ok(WheatObject::ChangeSetNodeV1(
+                ChangeSetNodeV1Output::decode_with_decoder(decoder)?,
             ))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
@@ -930,6 +952,34 @@ pub struct ProjectedCommitSetId {
 }
 
 impl ProjectedCommitSetId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self { digest })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeSetId {
+    pub digest: Digest256,
+}
+
+impl ChangeSetId {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3166,6 +3216,7 @@ pub struct ViewV1Input {
     pub applications: ApplicationMapId,
     pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentMapId,
+    pub tips: ChangeSetId,
     pub size: u64,
     pub last: Vec<ChangeId>,
     pub weight: u64,
@@ -3179,6 +3230,7 @@ pub struct ViewV1Output {
     pub applications: ApplicationMapId,
     pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentMapId,
+    pub tips: ChangeSetId,
     pub size: u64,
     pub last: Vec<ChangeId>,
     pub weight: u64,
@@ -3200,6 +3252,7 @@ impl ViewV1Input {
         self.applications.encode_into(encoder)?;
         self.unresolved_conflicts.encode_into(encoder)?;
         self.required_content.encode_into(encoder)?;
+        self.tips.encode_into(encoder)?;
         encoder.write_u64_be(self.size);
         encoder.write_u32_be(self.last.len() as u32);
         for item in &self.last {
@@ -3229,6 +3282,7 @@ impl ViewV1Output {
         let applications = ApplicationMapId::decode_with_decoder(decoder)?;
         let unresolved_conflicts = ConflictSetId::decode_with_decoder(decoder)?;
         let required_content = ContentMapId::decode_with_decoder(decoder)?;
+        let tips = ChangeSetId::decode_with_decoder(decoder)?;
         let size = decoder.read_u64_be()?;
         let length = decoder.read_u32_be()? as usize;
         let mut last = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
@@ -3244,6 +3298,7 @@ impl ViewV1Output {
             applications,
             unresolved_conflicts,
             required_content,
+            tips,
             size,
             last,
             weight,
@@ -3265,6 +3320,7 @@ impl From<ViewV1Output> for ViewV1Input {
             applications: o.applications,
             unresolved_conflicts: o.unresolved_conflicts,
             required_content: o.required_content,
+            tips: o.tips,
             size: o.size,
             last: o.last,
             weight: o.weight,
@@ -3281,6 +3337,7 @@ impl From<ViewV1Input> for ViewV1Output {
             applications: i.applications,
             unresolved_conflicts: i.unresolved_conflicts,
             required_content: i.required_content,
+            tips: i.tips,
             size: i.size,
             last: i.last,
             weight: i.weight,
@@ -4795,6 +4852,150 @@ impl ProjectedCommitSetChildV1 {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let edge = decoder.read_byte()?;
         let child = ProjectedCommitSetId::decode_with_decoder(decoder)?;
+        Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeSetNodeV1Input {
+    pub prefix: Vec<u8>,
+    pub present: bool,
+    pub children: Vec<ChangeSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeSetNodeV1Output {
+    pub wire_tag: u16,
+    pub prefix: Vec<u8>,
+    pub present: bool,
+    pub children: Vec<ChangeSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
+}
+
+pub type ChangeSetNodeV1 = ChangeSetNodeV1Output;
+
+impl ChangeSetNodeV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(5121);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_byte(if self.present { 1 } else { 0 });
+        encoder.write_u32_be(self.children.len() as u32);
+        for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ChangeSetNodeV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 5121u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 5121, got {}",
+                wire_tag
+            )));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let prefix = decoder.read_bytes_vec(length)?;
+        let present = decoder.read_byte()? != 0;
+        let length = decoder.read_u32_be()? as usize;
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
+        for _ in 0..length {
+            let item = ChangeSetChildV1::decode_with_decoder(decoder)?;
+            children.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
+        for _ in 0..length {
+            let item = SetEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            prefix,
+            present,
+            children,
+            entries,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ChangeSetNodeV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ChangeSetNodeV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ChangeSetNodeV1Output> for ChangeSetNodeV1Input {
+    fn from(o: ChangeSetNodeV1Output) -> Self {
+        Self {
+            prefix: o.prefix,
+            present: o.present,
+            children: o.children,
+            entries: o.entries,
+        }
+    }
+}
+
+impl From<ChangeSetNodeV1Input> for ChangeSetNodeV1Output {
+    fn from(i: ChangeSetNodeV1Input) -> Self {
+        Self {
+            wire_tag: 5121u16,
+            prefix: i.prefix,
+            present: i.present,
+            children: i.children,
+            entries: i.entries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeSetChildV1 {
+    pub edge: u8,
+    pub child: ChangeSetId,
+}
+
+impl ChangeSetChildV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.edge);
+        self.child.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edge = decoder.read_byte()?;
+        let child = ChangeSetId::decode_with_decoder(decoder)?;
         Ok(Self { edge, child })
     }
 }

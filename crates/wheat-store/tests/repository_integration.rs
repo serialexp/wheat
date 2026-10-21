@@ -701,7 +701,7 @@ async fn a_joined_change_that_sorts_below_the_basis_is_kept_by_later_revisions()
 #[tokio::test]
 async fn integration_reads_what_the_frontiers_add() {
     let mut reads = Vec::new();
-    for history in [24, 192] {
+    for history in HISTORIES {
         let fixture = Fixture::new().await;
         let mut basis = fixture.base;
         for index in 0..history {
@@ -721,10 +721,7 @@ async fn integration_reads_what_the_frontiers_add() {
         assert_eq!(outcome.composed.len(), 2);
         reads.push(fixture.objects.reads.load(Ordering::Relaxed));
     }
-    assert!(
-        reads[1] <= reads[0] + 16,
-        "reads grew with the history: {reads:?}"
-    );
+    assert_reads_far_below_history(&reads);
 }
 
 /// Joining a revision of a change near the top of the basis reads the changes from it
@@ -732,7 +729,7 @@ async fn integration_reads_what_the_frontiers_add() {
 #[tokio::test]
 async fn integrating_a_revised_basis_change_reads_from_the_change_up() {
     let mut reads = Vec::new();
-    for history in [24, 192] {
+    for history in HISTORIES {
         let fixture = Fixture::new().await;
         let mut below = fixture.base;
         for index in 0..history {
@@ -755,8 +752,21 @@ async fn integrating_a_revised_basis_change_reads_from_the_change_up() {
         assert_eq!(outcome.reapplied.len(), 1);
         reads.push(fixture.objects.reads.load(Ordering::Relaxed));
     }
+    assert_reads_far_below_history(&reads);
+}
+
+/// The histories the read-count tests build below the changes they join.
+const HISTORIES: [usize; 2] = [24, 192];
+
+/// The reads of joining over the longer history grew by far less than one per change
+/// it adds. Reading the history below costs at least one read per change; the radix
+/// collections indexed by hashes (retained objects, view lineage) and the order index's
+/// skip chain deepen with its logarithm, by an amount that depends on how the hashes
+/// fall, so the bound is a fraction of the added history rather than a fixed slack.
+fn assert_reads_far_below_history(reads: &[usize]) {
+    let added = HISTORIES[1] - HISTORIES[0];
     assert!(
-        reads[1] <= reads[0] + 16,
+        reads[1] < reads[0] + added / 4,
         "reads grew with the history: {reads:?}"
     );
 }

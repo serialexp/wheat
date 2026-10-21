@@ -5,10 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ApplicationMapDelta, ApplicationMapDeltaLimits, ApplicationMapStore, ConflictSetStore,
-    ContentMapDelta, ContentMapError, ContentMapStore, ImmutableObjectStore, MerkleTreeStore,
-    RepositoryPublicationError, RepositoryReader, RevisionMapDelta, RevisionMapDeltaLimits,
-    RevisionMapStore, TreeDiffLimits, verification_scratch::VerificationScratch,
+    ApplicationMapDelta, ApplicationMapDeltaLimits, ApplicationMapStore, ChangeSetStore,
+    CollectionError, ConflictSetStore, ContentMapDelta, ContentMapError, ContentMapStore,
+    ImmutableObjectStore, MerkleTreeStore, RepositoryPublicationError, RepositoryReader,
+    RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapStore, TreeDiffLimits, radix,
+    verification_scratch::VerificationScratch,
 };
 use wheat_core::*;
 
@@ -662,7 +663,12 @@ where
             .await?
             .next()
             .await?;
-        if revisions.is_some() || applications.is_some() || conflicts.is_some() {
+        let tips = ChangeSetStore::new(self.reader.objects)
+            .cursor(view.tips)
+            .await?
+            .next()
+            .await?;
+        if revisions.is_some() || applications.is_some() || conflicts.is_some() || tips.is_some() {
             return Err(invalid("base view selects changes"));
         }
         Ok(())
@@ -671,11 +677,13 @@ where
     /// Checks I1 for a view other than the base: it is its composition parent `T` (the
     /// target of its last change `k`'s application `A`) with `A` added. There is an edge
     /// `T → view` (`has_edge_from(T)`), its maps are `T`'s plus `k` and nothing else,
-    /// `k`'s revision is `A`'s and of change `k`, its tree is `A`'s result, and its size,
-    /// last change and weight follow `T`'s. The caller checks the conflicts and the
+    /// `k`'s revision is `A`'s and of change `k`, its tree is `A`'s result, its size,
+    /// last change and weight follow `T`'s, and its tips are `T`'s without the
+    /// revision's dependencies and with `k`. The caller checks the conflicts and the
     /// content map.
     ///
-    /// The map diffs stop at a second difference, so each reads the path to `k`.
+    /// The map diffs stop at a second difference, so each reads the path to `k`; the
+    /// tips diff stops past the revision's dependencies and `k`.
     pub(crate) async fn composition(
         &self,
         view: &ViewRecord,
@@ -764,11 +772,53 @@ where
         {
             return Err(not_composed());
         }
+        self.tips(&parent, view, change, &revision.dependencies)
+            .await?;
         Ok(Composition {
             parent,
             application_id,
             application,
         })
+    }
+
+    /// The tips rule for the edge `parent → view`, adding `change` whose revision
+    /// depends on `dependencies`: the view's tips are the parent's, less each dependency
+    /// that was a tip, plus `change`. One membership lookup per dependency, then a diff
+    /// that stops past the expected differences.
+    async fn tips(
+        &self,
+        parent: &ViewRecord,
+        view: &ViewRecord,
+        change: ChangeId,
+        dependencies: &BTreeSet<ChangeId>,
+    ) -> Result<()> {
+        let sets = ChangeSetStore::new(self.reader.objects);
+        let mut expected = vec![radix::DiffEntry::Added(change, ())];
+        for dependency in dependencies {
+            if sets.contains(parent.tips, *dependency).await? {
+                expected.push(radix::DiffEntry::Removed(*dependency, ()));
+            }
+        }
+        // The paired walk doesn't yield in key order, so both sides are sorted.
+        let key = |entry: &radix::DiffEntry<ChangeId, ()>| match entry {
+            radix::DiffEntry::Added(key, ()) | radix::DiffEntry::Removed(key, ()) => *key,
+            radix::DiffEntry::Changed(key, ..) => *key,
+        };
+        expected.sort_by_key(key);
+        let actual = match sets.delta(parent.tips, view.tips, expected.len()).await {
+            Err(CollectionError::DeltaChangeLimitExceeded { .. }) => None,
+            delta => {
+                let mut delta = delta?;
+                delta.sort_by_key(key);
+                Some(delta)
+            }
+        };
+        if actual.as_deref() != Some(expected.as_slice()) {
+            return Err(invalid(
+                "view tips are not its composition parent's with its last change on top",
+            ));
+        }
+        Ok(())
     }
 
     /// The view's content map counts exactly the tree entries naming each blob, all in
@@ -1029,6 +1079,7 @@ mod content_map_tests {
             revisions: RevisionMapId::from_digest([0; 32]),
             applications: ApplicationMapId::from_digest([0; 32]),
             unresolved_conflicts: ConflictSetId::from_digest([0; 32]),
+            tips: ChangeSetId::from_digest([0; 32]),
             required_content,
             order: ViewOrder::BASE,
         }
@@ -1170,6 +1221,37 @@ mod content_map_tests {
                     .await
                     .is_err()
             );
+        })
+        .await;
+    }
+
+    /// The base view selects nothing, so it has no tips either.
+    #[tokio::test]
+    async fn the_base_view_has_no_tips() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::new(dir.path());
+        let tips = ChangeSetStore::new(&objects);
+        let empty = tips.empty_root().await.unwrap();
+        let base = ViewRecord {
+            revisions: RevisionMapStore::new(&objects).empty_root().await.unwrap(),
+            applications: ApplicationMapStore::new(&objects)
+                .empty_root()
+                .await
+                .unwrap(),
+            unresolved_conflicts: ConflictSetStore::new(&objects).empty_root().await.unwrap(),
+            tips: empty,
+            ..view(tree(&objects, &[]).await, map(&objects, &[]).await)
+        };
+        let tipped = ViewRecord {
+            tips: tips
+                .insert(empty, ChangeId::from_bytes([1; 16]))
+                .await
+                .unwrap(),
+            ..base
+        };
+        with_checks(&objects, async |checks, _| {
+            checks.base(&base).await.unwrap();
+            assert!(checks.base(&tipped).await.is_err());
         })
         .await;
     }

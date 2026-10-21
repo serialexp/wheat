@@ -7,12 +7,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ApplicationId, ApplicationMapChild, ApplicationMapId, ApplicationMapNode, CanonicalObject,
-    ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ConflictId,
-    ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentMapChild, ContentMapId,
-    ContentMapNode, ContentSetChild, ContentSetId, ContentSetNode, ObjectId, ProjectedCommit,
-    ProjectedCommitSetChild, ProjectedCommitSetId, ProjectedCommitSetNode, RetainedSetChild,
-    RetainedSetId, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapId, RevisionMapNode,
-    ViewId, ViewLineageMapChild, ViewLineageMapId, ViewLineageMapNode,
+    ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ChangeSetChild,
+    ChangeSetId, ChangeSetNode, ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode,
+    ContentId, ContentMapChild, ContentMapId, ContentMapNode, ContentSetChild, ContentSetId,
+    ContentSetNode, ObjectId, ProjectedCommit, ProjectedCommitSetChild, ProjectedCommitSetId,
+    ProjectedCommitSetNode, RetainedSetChild, RetainedSetId, RetainedSetNode, RevisionId,
+    RevisionMapChild, RevisionMapId, RevisionMapNode, ViewId, ViewLineageMapChild,
+    ViewLineageMapId, ViewLineageMapNode,
 };
 
 trait RadixShape {
@@ -324,6 +325,13 @@ set_shape!(
     RetainedSetChild
 );
 set_shape!(
+    ChangeSetShape,
+    ChangeId,
+    ChangeSetId,
+    ChangeSetNode,
+    ChangeSetChild
+);
+set_shape!(
     ProjectedCommitShape,
     ProjectedCommit,
     ProjectedCommitSetId,
@@ -419,6 +427,7 @@ macro_rules! set_builder {
 }
 
 set_builder!(build_conflict_set, ConflictId, ConflictSetId, ConflictShape);
+set_builder!(build_change_set, ChangeId, ChangeSetId, ChangeSetShape);
 set_builder!(build_content_set, ContentId, ContentSetId, ContentSetShape);
 
 /// Builds a canonical content map: each blob with the number of tree entries naming

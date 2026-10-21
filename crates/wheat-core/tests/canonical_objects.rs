@@ -241,7 +241,7 @@ fn canonical_revision_has_a_pinned_encoding_and_id() {
 
     assert_eq!(
         hex(&revision.canonical_bytes()),
-        "030101890f2d3c4b7a689abcdef0123456780000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048024dc114434a502c17cfc9fa047f0515a932ecfd4b8b91c13fcd5d15debf3600000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
+        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005cbd0c6ba0145f6989c7c51e548e22aecf242ad1224b12f11ff0dba43491f48f00000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
     );
     // Revision ID is BLAKE3 of the canonical bytes above.
     let expected_id = wheat_core::RevisionId::of_canonical_bytes(&revision.canonical_bytes());
@@ -308,6 +308,7 @@ fn revision_parents_and_view_order_are_checked_on_decode() {
         applications: wheat_core::ApplicationMapId::from_digest([7; 32]),
         unresolved_conflicts: wheat_core::ConflictSetId::from_digest([8; 32]),
         required_content: wheat_core::ContentMapId::from_digest([9; 32]),
+        tips: wheat_core::ChangeSetId::from_digest([10; 32]),
         order: ViewOrder::BASE,
     };
     let change = ChangeId::from_bytes([2; 16]);
@@ -526,6 +527,7 @@ fn conflict_edits_are_canonicalized_before_identity() {
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeSet::from([conflict_id]),
+        BTreeSet::new(),
         ViewOrder::BASE,
     );
     assert_ne!(view.id, manifested.id);

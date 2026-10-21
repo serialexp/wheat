@@ -803,58 +803,69 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let mut view = self.prefix_view(active, prefix).await?;
         let mut authored = BTreeMap::new();
         for change in order.into_iter().skip(prefix) {
-            let (revision_id, generation, edits) = if let Some(revision) = pending.remove(&change) {
-                let (authored_against, tree) = match authored_at.get(&change) {
-                    Some(position) => *position,
-                    None => {
-                        let preliminary = self
-                            .apply(&view, &revision.edits.edits, fresh, Replay::Author)
-                            .await?;
-                        (view.id(), preliminary.clean_tree(&revision.edits.edits)?)
-                    }
+            let (revision_id, generation, dependencies, edits) =
+                if let Some(revision) = pending.remove(&change) {
+                    let (authored_against, tree) = match authored_at.get(&change) {
+                        Some(position) => *position,
+                        None => {
+                            let preliminary = self
+                                .apply(&view, &revision.edits.edits, fresh, Replay::Author)
+                                .await?;
+                            (view.id(), preliminary.clean_tree(&revision.edits.edits)?)
+                        }
+                    };
+                    let generation = match revision.predecessor {
+                        None => 0,
+                        Some(predecessor) => {
+                            let parent = match active.revisions.get(&change) {
+                                Some((id, record)) if *id == predecessor => record.generation,
+                                _ => {
+                                    RepositoryReader::new(self.objects, self.content)
+                                        .revision(predecessor)
+                                        .await?
+                                        .generation
+                                }
+                            };
+                            generation_after([parent])?
+                        }
+                    };
+                    let record = RevisionRecord {
+                        change_id: change,
+                        metadata: revision.metadata,
+                        predecessor: revision.predecessor,
+                        combines: BTreeSet::new(),
+                        generation,
+                        dependencies: revision.dependencies,
+                        authored_against,
+                        edits: revision.edits.edits.keys().copied().collect(),
+                        transition: revision.edits.transition,
+                        resulting_tree: tree,
+                    };
+                    self.persist_edits(&revision.edits.edits, fresh).await?;
+                    let revision_id = self.put_revision(&record, fresh).await?;
+                    let dependencies = record.dependencies.clone();
+                    active.revisions.insert(change, (revision_id, record));
+                    authored.insert(change, revision_id);
+                    (revision_id, generation, dependencies, revision.edits.edits)
+                } else {
+                    let (revision_id, revision) = &active.revisions[&change];
+                    (
+                        *revision_id,
+                        revision.generation,
+                        revision.dependencies.clone(),
+                        self.load_edits(revision).await?,
+                    )
                 };
-                let generation = match revision.predecessor {
-                    None => 0,
-                    Some(predecessor) => {
-                        let parent = match active.revisions.get(&change) {
-                            Some((id, record)) if *id == predecessor => record.generation,
-                            _ => {
-                                RepositoryReader::new(self.objects, self.content)
-                                    .revision(predecessor)
-                                    .await?
-                                    .generation
-                            }
-                        };
-                        generation_after([parent])?
-                    }
-                };
-                let record = RevisionRecord {
-                    change_id: change,
-                    metadata: revision.metadata,
-                    predecessor: revision.predecessor,
-                    combines: BTreeSet::new(),
-                    generation,
-                    dependencies: revision.dependencies,
-                    authored_against,
-                    edits: revision.edits.edits.keys().copied().collect(),
-                    transition: revision.edits.transition,
-                    resulting_tree: tree,
-                };
-                self.persist_edits(&revision.edits.edits, fresh).await?;
-                let revision_id = self.put_revision(&record, fresh).await?;
-                active.revisions.insert(change, (revision_id, record));
-                authored.insert(change, revision_id);
-                (revision_id, generation, revision.edits.edits)
-            } else {
-                let (revision_id, revision) = &active.revisions[&change];
-                (
-                    *revision_id,
-                    revision.generation,
-                    self.load_edits(revision).await?,
-                )
-            };
             view = self
-                .apply_step(view, change, revision_id, generation, &edits, fresh)
+                .apply_step(
+                    view,
+                    change,
+                    revision_id,
+                    generation,
+                    &dependencies,
+                    &edits,
+                    fresh,
+                )
                 .await?;
         }
         active.rebuild_graph();
@@ -884,8 +895,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok(reader.view(application.target_view).await?)
     }
 
-    /// Applies one change's revision, of `generation`, onto `view` and records the
-    /// resulting view.
+    /// Applies one change's revision, of `generation` and depending on `dependencies`,
+    /// onto `view` and records the resulting view.
     #[tracing::instrument(level = "debug", skip_all, fields(change = %change))]
     pub(crate) async fn apply_step(
         &self,
@@ -893,6 +904,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         change: ChangeId,
         revision_id: RevisionId,
         generation: u64,
+        dependencies: &BTreeSet<ChangeId>,
         edits: &BTreeMap<EditId, EditRecord>,
         fresh: &mut Fresh,
     ) -> Result<ViewRecord> {
@@ -939,6 +951,9 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let content = self
             .update_visible_content(view.required_content, edits, tree, &view, fresh)
             .await?;
+        let tips = crate::ChangeSetStore::new(self.objects)
+            .after(view.tips, change, dependencies)
+            .await?;
         let parent = view.id();
         let next = ViewRecord {
             tree,
@@ -946,6 +961,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             applications: application_root,
             unresolved_conflicts: conflict_root,
             required_content: content,
+            tips,
             order,
         };
         self.put_view(&next, fresh).await?;

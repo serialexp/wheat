@@ -129,6 +129,39 @@ fn bulk_import_materializes_each_commit_view_and_the_combined_working_view() {
 }
 
 #[test]
+fn a_views_tips_are_the_changes_nothing_in_it_depends_on() {
+    let io = Memory::default();
+    let ctx = ApplicationContext::new(&io);
+    let mut repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    assert!(repository.base_view().tips.is_empty());
+    let (root, child, other) = (ChangeId::new(), ChangeId::new(), ChangeId::new());
+    let mut effective = base;
+    for (change, dependencies, path, tips) in [
+        (root, vec![], "root", vec![root]),
+        (child, vec![root], "child", vec![child]),
+        (other, vec![], "other", vec![child, other]),
+    ] {
+        effective = repository
+            .create_change_with_id(
+                base,
+                effective,
+                change,
+                dependencies,
+                exact(&io, path, None, Some(path)),
+                ctx,
+            )
+            .unwrap()
+            .resulting_view;
+        assert_eq!(
+            repository.view(effective).unwrap().tips,
+            BTreeSet::from_iter(tips),
+            "after {path}"
+        );
+    }
+}
+
+#[test]
 fn failed_bulk_import_rolls_back_the_whole_batch() {
     let io = Memory::default();
     let mut repository = Repository::new(Tree::new());
@@ -512,6 +545,7 @@ fn view_identity_covers_the_application_and_conflict_manifest() {
         frontier,
         BTreeMap::from([(change, application.id)]),
         BTreeSet::from([conflict.id]),
+        BTreeSet::from([change]),
         order,
     );
     assert_ne!(plain.id, manifested.id);

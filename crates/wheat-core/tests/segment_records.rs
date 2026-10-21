@@ -150,7 +150,7 @@ fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
     );
 
     // 19 and 20 were the removed content-set snapshot and delta kinds.
-    for kind in [0, 19, 20, 22, u16::MAX] {
+    for kind in [0, 19, 20, 23, u16::MAX] {
         let invalid = SegmentIndexPage {
             entries: vec![SegmentIndexEntry {
                 namespace: SEGMENT_NAMESPACE_METADATA,

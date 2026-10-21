@@ -243,6 +243,7 @@ async fn missing_revision_selection_is_rejected() {
         applications: original.applications,
         unresolved_conflicts: original.unresolved_conflicts,
         required_content: original.required_content,
+        tips: original.tips,
         order: original.order,
     };
 
@@ -318,6 +319,7 @@ async fn mismatched_revision_selection_is_rejected() {
         applications: original.applications,
         unresolved_conflicts: original.unresolved_conflicts,
         required_content: original.required_content,
+        tips: original.tips,
         order: original.order,
     };
 
@@ -445,6 +447,7 @@ async fn conflict_evidence_does_not_leak_between_views() {
         applications: clean_record.applications,
         unresolved_conflicts: conflicted_record.unresolved_conflicts,
         required_content: clean_record.required_content,
+        tips: clean_record.tips,
         order: clean_record.order,
     };
 

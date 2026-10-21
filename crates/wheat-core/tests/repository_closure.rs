@@ -127,11 +127,12 @@ fn empty_repository_closure_contains_root_state_view_tree_and_content_roots() {
         .map(|object| validate_canonical_object(&object.bytes).unwrap())
         .collect::<Vec<_>>();
 
-    // Three semantic objects, four empty view collections (the content map among
-    // them), the empty aggregate content set, the empty change lookup, an empty
+    // Three semantic objects, five empty view collections (the content map and the
+    // tips among them), the empty aggregate content set, the empty change lookup, an empty
     // view-lineage map, an empty retained root, one compressed retained leaf
     // naming the base view, and the empty projected-commit set.
-    assert_eq!(closure.objects.len(), 13);
+    assert_eq!(closure.objects.len(), 14);
+    assert!(kinds.contains(&CanonicalObjectKind::ChangeSetNode));
     assert!(kinds.contains(&CanonicalObjectKind::ProjectedCommitSetNode));
     assert!(kinds.contains(&CanonicalObjectKind::RepositoryState));
     assert!(kinds.contains(&CanonicalObjectKind::View));

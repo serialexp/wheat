@@ -58,13 +58,15 @@ Out: snapshot import (already fully validated); Git import (local code, trusted)
 Written down here because the validator proves them per increment and local commands
 rely on them:
 
-- **I1 Composition.** The base view has empty maps, no conflicts, and a required
-  content map equal to its tree's content. Every other view `V` is `T + A`: one
-  application `A` of change `k`'s revision on a parent view `T`, where `V`'s revision
-  and application maps are `T`'s plus key `k`, `V.tree` is `A`'s result tree,
-  `V`'s conflicts are `T`'s plus `A`'s conflict if any, and `V`'s required content is
-  `T`'s adjusted by the tree change. The revision is `k`'s and its dependencies are in
-  `T`.
+- **I1 Composition.** The base view has empty maps, no conflicts, no tips, and a
+  required content map equal to its tree's content. Every other view `V` is `T + A`:
+  one application `A` of change `k`'s revision on a parent view `T`, where `V`'s
+  revision and application maps are `T`'s plus key `k`, `V.tree` is `A`'s result
+  tree, `V`'s conflicts are `T`'s plus `A`'s conflict if any, `V`'s required content
+  is `T`'s adjusted by the tree change, and `V`'s tips are `T`'s without `k`'s
+  dependencies and with `k`. The revision is `k`'s and its dependencies are in `T`.
+  So a view's tips are its changes that none of its other changes depend on: what a
+  new change on top of it depends on.
 - **I2 Canonical order.** In I1, `k` is last in the canonical order (topological by
   dependencies, ties by lowest ChangeId) of `T`'s changes plus `k`. Equivalently:
   every change of `T` that comes after `k`'s last dependency in `T`'s canonical order
@@ -303,6 +305,9 @@ updater give the same root as building the final entries from scratch.
      ContentId; `V.required_content` must equal `T`'s plus those (map diff, same
      size as the tree diff); every ContentId whose count goes from 0 to positive is
      in the aggregate (I7).
+   - Tips: the set diff `T.tips → V.tips` is exactly `k` added and each of `k`'s
+     dependencies that is in `T.tips` removed (contains lookups, and a diff that
+     stops past that many entries).
    - I2 via the order index.
 6. **Lineage (I3):** from the lineage map diff, every added or changed lineage-map
    key is retained by `new` and its child set is non-empty (review 3, item 4: an
@@ -553,6 +558,10 @@ content it needs anyway; close or keep per Bart.
    after 40 changes read 65 objects, after 400 changes 100 (radix depth on each
    collection, and the order index's skip chain). The read contract in step 10 needs
    restating as logarithmic.
+   Tips on views (`ViewRecord.tips`, a `ChangeSetNode` radix set of ChangeIds): the
+   changes nothing else in the view depends on, kept by every composition step and
+   checked by the shared composition check as above, so a new change on top of a view
+   finds its dependencies without loading the view's history. Done.
 7. Forced fallback, bootstrap mode, budgets.
 8. Server publish (`commit`, including joined publishes); client fetch, clone and
    the joined-state fetch after a publish.

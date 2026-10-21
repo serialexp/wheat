@@ -880,6 +880,10 @@ async fn applied_after_y(
             .unwrap(),
         unresolved_conflicts: target.unresolved_conflicts,
         required_content: both.required_content,
+        tips: ChangeSetStore::new(&history.objects)
+            .insert(target.tips, change)
+            .await
+            .unwrap(),
         order: target.order.then(change, 0).unwrap(),
     };
     history.put(view.id().into(), &view.canonical_bytes()).await;
@@ -927,4 +931,64 @@ async fn a_view_out_of_canonical_order_is_refused() {
             .is_some_and(|reason| reason.contains("canonical order")),
         "{reason:?}"
     );
+}
+
+async fn tips(history: &History, view: ViewId) -> Vec<ChangeId> {
+    let view = history.reader().view(view).await.unwrap();
+    let mut cursor = ChangeSetStore::new(&history.objects)
+        .cursor(view.tips)
+        .await
+        .unwrap();
+    let mut tips = Vec::new();
+    while let Some(change) = cursor.next().await.unwrap() {
+        tips.push(change);
+    }
+    tips
+}
+
+/// A view's tips are the changes nothing else in it depends on: `k` replaces its
+/// dependency `z`, and `y` stays.
+#[tokio::test]
+async fn a_view_carries_the_changes_nothing_in_it_depends_on() {
+    let chain = Chain::new().await;
+    let history = &chain.history;
+    assert!(tips(history, history.base).await.is_empty());
+    assert_eq!(tips(history, chain.with_y).await, [chain.y]);
+    let with_yz = history
+        .application_in(chain.with_yzk, chain.k)
+        .await
+        .target_view;
+    assert_eq!(tips(history, with_yz).await, [chain.y, chain.z]);
+    assert_eq!(tips(history, chain.with_yzk).await, [chain.k, chain.y]);
+}
+
+/// Tips missing the last change, keeping a dependency it replaced, or dropping a tip
+/// it did not depend on, are refused by full and incremental validation alike.
+#[tokio::test]
+async fn a_view_with_other_tips_is_refused() {
+    let chain = Chain::new().await;
+    let history = &chain.history;
+    let reader = history.reader();
+    let sets = ChangeSetStore::new(&history.objects);
+    let made = reader.view(chain.with_yzk).await.unwrap();
+    let parent = history
+        .application_in(chain.with_yzk, chain.k)
+        .await
+        .target_view;
+    let forged_tips = [
+        sets.remove(made.tips, chain.k).await.unwrap(),
+        sets.insert(made.tips, chain.z).await.unwrap(),
+        sets.remove(made.tips, chain.y).await.unwrap(),
+    ];
+    for tips in forged_tips {
+        let forged = ViewRecord { tips, ..made };
+        let state = history.retaining_view(&forged, parent).await;
+        let reason = history.refusal(state).await;
+        assert!(
+            reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("view tips")),
+            "{reason:?}"
+        );
+    }
 }

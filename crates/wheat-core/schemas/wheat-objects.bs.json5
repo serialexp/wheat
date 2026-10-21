@@ -39,6 +39,7 @@
         { type: "ChangeMapNodeV1", when: "value == 0x1101" },
         { type: "ViewLineageMapNodeV1", when: "value == 0x1201" },
         { type: "ProjectedCommitSetNodeV1", when: "value == 0x1301" },
+        { type: "ChangeSetNodeV1", when: "value == 0x1401" },
       ],
     },
 
@@ -78,6 +79,7 @@
     ContentSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RetainedSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ProjectedCommitSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ChangeSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewLineageMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RepositoryStateId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewLabelManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
@@ -355,6 +357,9 @@
         { name: "unresolved_conflicts", type: "ConflictSetId" },
         // The blobs the tree names, each with the number of tree entries naming it.
         { name: "required_content", type: "ContentMapId" },
+        // The changes in `revisions` no other change in `revisions` depends on: what a
+        // new change on the frontier depends on.
+        { name: "tips", type: "ChangeSetId" },
         // The number of changes in `revisions`.
         { name: "size", type: "uint64" },
         {
@@ -571,6 +576,23 @@
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "ProjectedCommitSetId" },
+      ],
+    },
+
+    // Radix set of ChangeIds: a view's tips.
+    ChangeSetNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x1401 },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "present", type: "bool" },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
+      ],
+    },
+    ChangeSetChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ChangeSetId" },
       ],
     },
 

@@ -1,5 +1,41 @@
 # Current task
 
+## 2026-10-21: mutations proportional to what they touch (@lucky-raven)
+
+Incremental validation step 6 is done (7be8dc0). Benchmarking it (new case
+`crates/wheat-bench/src/quick/increment_validate.rs`, uncommitted) showed the
+validator at ~1 ms for a one-change increment at 2,000 changes, but **creating** a
+change linear in the history: `open_repository` reads every revision the effective
+view selects and `descends` one application per change (3 ms per create at 100
+changes, 73 ms at 2,000, ~450 ms at 10,000). Bart: "new changes are fast, searching
+back through history is slow ... this is fine because new changes are the operation
+you do often." Imported change IDs stay UUIDv5 (deterministic across imports).
+
+Plan, Bart chose (a) for the frontier:
+1. `Active` holds only the changes from the mutation's spot upward. `open` reads
+   state and the effective view; each operation finds the lowest position it
+   touches and loads the changes above it (walking composition parents down from
+   the effective view). Create: the order index gives the spot (first position after
+   the last dependency whose change ID is higher), so a v7 change on top loads
+   nothing. Revise/resolve/rebase/rewrite: from the lowest touched change. Duplicate
+   and dependency checks become revision-map lookups.
+2. `descends` walks composition parents from the effective view down to the basis's
+   weight: cost = changes since the basis.
+3. Store the dependency frontier ("tips": selected changes no other selected change
+   depends on) on each view as a new radix set (format change in place, modelled on
+   `ProjectedCommitSet` in 9b5794e). `apply_step`: tips' = tips - deps + {change}.
+   Validated in the composition check (I1) by a set delta, full and incremental.
+   `create_on_frontier` reads it instead of building the whole graph.
+   **Format and validation done** (`ViewRecord.tips`, `ChangeSetNode` kind 22; tests
+   in `view_order_validation.rs`, `workflow.rs`, `semantic_checks.rs`). The two
+   read-count tests in `repository_integration.rs` now bound growth at a quarter
+   read per added change: the new view IDs reshaped the hash-keyed radix sets
+   (retained, lineage), which grow with log of history, and tipped a fixed +16 slack
+   (89 → 107 reads at 24 → 192 changes, 136 at 1,536; tips themselves read 3 at
+   both). `create_on_frontier` still builds the graph: next.
+4. Bench `increment_validate` uses `create_on_frontier` like the CLI, records create
+   and validate cost at 1k/10k/100k; release run, results committed.
+
 ## 2026-10-21: Git push/pull round trip (@calm-lynx)
 
 Bart: "start out building a test case for git based push/pull workflow so that we

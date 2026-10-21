@@ -114,6 +114,7 @@ digest_id!(ConflictSetId);
 digest_id!(ContentSetId);
 digest_id!(RetainedSetId);
 digest_id!(ProjectedCommitSetId);
+digest_id!(ChangeSetId);
 digest_id!(ViewLineageMapId);
 
 /// A member of a [`ProjectedCommitSetId`] set: application `application` projects as
@@ -194,6 +195,7 @@ object_id_from!(
     ContentSetId,
     RetainedSetId,
     ProjectedCommitSetId,
+    ChangeSetId,
     ViewLineageMapId,
 );
 

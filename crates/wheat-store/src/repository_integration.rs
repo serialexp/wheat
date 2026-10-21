@@ -183,8 +183,9 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         let mut conflicted = Vec::new();
         let mut combined = BTreeMap::new();
         for change in &order {
-            let (revision, generation, edits) = match joined.remove(change).expect("ordered change")
-            {
+            let joining = joined.remove(change).expect("ordered change");
+            let dependencies = joining.dependencies().clone();
+            let (revision, generation, edits) = match joining {
                 Joined::Existing(revision, record) => {
                     (revision, record.generation, self.load_edits(&record).await?)
                 }
@@ -198,7 +199,15 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
                 }
             };
             let next = self
-                .apply_step(view, *change, revision, generation, &edits, &mut fresh)
+                .apply_step(
+                    view,
+                    *change,
+                    revision,
+                    generation,
+                    &dependencies,
+                    &edits,
+                    &mut fresh,
+                )
                 .await?;
             if next.unresolved_conflicts != view.unresolved_conflicts {
                 conflicted.push(*change);

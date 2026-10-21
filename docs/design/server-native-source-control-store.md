@@ -1304,8 +1304,13 @@ ViewV1 {
   applications: ApplicationMapId,
   unresolved_conflicts: ConflictIndexId,
   required_content: ContentManifestId,
+  tips: ChangeSetId,
 }
 ```
+
+`tips` is the set of the view's changes that none of its other changes depend on,
+so a change created on top of the view depends on exactly those without reading the
+view's history.
 
 Each root names an immutable Merkle collection. Trees are directory nodes (with
 deterministic shards for exceptionally wide directories), so changing

@@ -12,6 +12,7 @@ pub fn build_view_record(
         crate::build_application_map(view.applications.iter().map(|(k, v)| (*k, *v)), &mut *sink);
     let unresolved_conflicts =
         crate::build_conflict_set(view.unresolved_conflicts.iter().copied(), &mut *sink);
+    let tips = crate::build_change_set(view.tips.iter().copied(), &mut *sink);
     let required_content = crate::build_content_map(
         view.required_content
             .iter()
@@ -24,6 +25,7 @@ pub fn build_view_record(
         applications,
         unresolved_conflicts,
         required_content,
+        tips,
         order: view.order,
     }
 }

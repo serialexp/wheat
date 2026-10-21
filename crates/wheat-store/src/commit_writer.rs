@@ -11,10 +11,10 @@ use wheat_core::{
 };
 
 use crate::{
-    ApplicationMapError, ApplicationMapStore, CollectionError, ConflictSetStore, ContentMapError,
-    ContentMapStore, ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError,
-    MerkleTreeStore, ObjectKind, ObjectStoreError, RevisionMapError, RevisionMapStore, TreeEdit,
-    merkle_tree::TreePathShape,
+    ApplicationMapError, ApplicationMapStore, ChangeSetStore, CollectionError, ConflictSetStore,
+    ContentMapError, ContentMapStore, ContentStore, ContentStoreError, ImmutableObjectStore,
+    MerkleTreeError, MerkleTreeStore, ObjectKind, ObjectStoreError, RevisionMapError,
+    RevisionMapStore, TreeEdit, merkle_tree::TreePathShape,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,12 +100,14 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         let applications = ApplicationMapStore::new(self.objects).empty_root().await?;
         let unresolved_conflicts = ConflictSetStore::new(self.objects).empty_root().await?;
         let required_content = ContentMapStore::new(self.objects).empty_root().await?;
+        let tips = ChangeSetStore::new(self.objects).empty_root().await?;
         let view = ViewRecord {
             tree,
             revisions,
             applications,
             unresolved_conflicts,
             required_content,
+            tips,
             order: ViewOrder::BASE,
         };
         self.put(view.id().into(), &view.canonical_bytes()).await?;
@@ -298,12 +300,16 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
                 .map(|path| (target.get(path).copied(), output.tree.get(path).copied())),
         )
         .await?;
+        let tips = ChangeSetStore::new(self.objects)
+            .after(parent_record.tips, proposal.id, &revision.dependencies)
+            .await?;
         let view = ViewRecord {
             tree: resulting_tree,
             revisions: revision_root,
             applications: application_root,
             unresolved_conflicts: parent_record.unresolved_conflicts,
             required_content,
+            tips,
             order: parent_record
                 .order
                 .then(proposal.id, revision.generation)

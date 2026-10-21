@@ -1,9 +1,10 @@
 use thiserror::Error;
 use wheat_core::{
-    ApplicationId, ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId,
-    ContentSetChild, ContentSetId, ContentSetNode, ObjectId, ProjectedCommit,
-    ProjectedCommitSetChild, ProjectedCommitSetId, ProjectedCommitSetNode, RetainedSetChild,
-    RetainedSetId, RetainedSetNode, decode_conflict_set_node, decode_content_set_node,
+    ApplicationId, ChangeId, ChangeSetChild, ChangeSetId, ChangeSetNode, ConflictId,
+    ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentSetChild, ContentSetId,
+    ContentSetNode, ObjectId, ProjectedCommit, ProjectedCommitSetChild, ProjectedCommitSetId,
+    ProjectedCommitSetNode, RetainedSetChild, RetainedSetId, RetainedSetNode,
+    decode_change_set_node, decode_conflict_set_node, decode_content_set_node,
     decode_projected_commit_set_node, decode_retained_set_node,
 };
 
@@ -185,6 +186,15 @@ set_collection!(
     decode_conflict_set_node
 );
 set_collection!(
+    ChangeSetCollection,
+    ChangeSetId,
+    ChangeId,
+    ChangeSetNode,
+    ChangeSetChild,
+    ChangeSetNode,
+    decode_change_set_node
+);
+set_collection!(
     ContentCollection,
     ContentSetId,
     ContentId,
@@ -348,6 +358,57 @@ impl<S: ImmutableObjectStore> ConflictSetStore<'_, S> {
                 },
             )
             .await?)
+    }
+}
+
+set_api!(
+    ChangeSetStore,
+    ChangeSetCursor,
+    ChangeSetCollection,
+    ChangeSetId,
+    ChangeId,
+    ChangeSetNode
+);
+
+impl<S: ImmutableObjectStore> ChangeSetStore<'_, S> {
+    /// The changes `new` adds to `old` and removes from it, stopping at more than
+    /// `max_changes` differences. Equal subtrees are pruned by identity.
+    pub(crate) async fn delta(
+        &self,
+        old: ChangeSetId,
+        new: ChangeSetId,
+        max_changes: usize,
+    ) -> Result<Vec<radix::DiffEntry<ChangeId, ()>>, CollectionError> {
+        Ok(self
+            .inner
+            .paired_diff(
+                old,
+                new,
+                radix::DiffLimits {
+                    max_changes,
+                    ..radix::DiffLimits::default()
+                },
+            )
+            .await?)
+    }
+
+    /// The tips after applying `change`, whose revision depends on `dependencies`,
+    /// onto a view whose tips are `root`: the change is one, and its dependencies no
+    /// longer are.
+    pub(crate) async fn after(
+        &self,
+        root: ChangeSetId,
+        change: ChangeId,
+        dependencies: &std::collections::BTreeSet<ChangeId>,
+    ) -> Result<ChangeSetId, CollectionError> {
+        self.update_batch(
+            root,
+            dependencies
+                .iter()
+                .map(|dependency| (*dependency, false))
+                .chain([(change, true)]),
+        )
+        .await
     }
 }
 

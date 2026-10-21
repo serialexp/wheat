@@ -182,6 +182,8 @@ enum Role {
     AggregateContent,
     /// The state's projected Git commits.
     ProjectedCommits,
+    /// A view's tips.
+    Tips,
 }
 
 impl Role {
@@ -200,6 +202,7 @@ impl Role {
             Self::ViewContent => RadixKind::ContentMap,
             Self::AggregateContent => RadixKind::ContentSet,
             Self::ProjectedCommits => RadixKind::ProjectedCommitSet,
+            Self::Tips => RadixKind::ChangeSet,
         }
     }
 
@@ -211,7 +214,11 @@ impl Role {
     fn state_level(self) -> bool {
         !matches!(
             self,
-            Self::RevisionMap | Self::ApplicationMap | Self::ConflictSet | Self::ViewContent
+            Self::RevisionMap
+                | Self::ApplicationMap
+                | Self::ConflictSet
+                | Self::ViewContent
+                | Self::Tips
         )
     }
 
@@ -1058,10 +1065,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Role::ChangeMap => self.push_entity(target, Entity::Change, false),
             Role::RevisionMap => self.push_entity(target, Entity::Revision, false),
             Role::ApplicationMap => self.push_entity(target, Entity::Application, false),
-            // Content keys are blobs and projected commits name retained applications,
-            // and object_graph lists neither as references.
-            Role::ViewContent | Role::AggregateContent | Role::ProjectedCommits => {
-                unreachable!("content and projected commit keys are not references")
+            // Content keys are blobs, projected commits name retained applications and
+            // tips are change IDs, and object_graph lists none of them as references.
+            Role::ViewContent | Role::AggregateContent | Role::ProjectedCommits | Role::Tips => {
+                unreachable!("content, projected commit and tip keys are not references")
             }
         }
     }
@@ -1357,6 +1364,9 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                     old_field(|old| old.required_content.into()),
                     None,
                 ),
+                ViewSite::Tips => {
+                    self.push_radix_root(id, Role::Tips, old_field(|old| old.tips.into()), None)
+                }
             }
         })
     }
