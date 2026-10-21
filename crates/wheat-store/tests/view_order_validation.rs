@@ -1,4 +1,4 @@
-//! Full validation of revision generations, view orders, the lineage weight rule, the
+//! Full validation of revision generations and transitions, view orders, the lineage weight rule, the
 //! application order index and canonical order: states forged from a valid one by one
 //! record each, refused for that record.
 
@@ -284,6 +284,44 @@ async fn a_revision_with_the_wrong_generation_is_refused() {
             .refusal(forged)
             .await
             .is_some_and(|reason| reason.contains("generation")),
+    );
+}
+
+/// A revision's transition partitions its predecessor's edits exactly: each is
+/// preserved or removed.
+#[tokio::test]
+async fn a_transition_that_loses_a_predecessor_edit_is_refused() {
+    let history = History::new().await;
+    let revised = history.reader().revision(history.revised).await.unwrap();
+    let first = history.reader().revision(history.first).await.unwrap();
+    assert!(!first.edits.is_empty());
+    assert_eq!(revised.transition.preserved, first.edits);
+    // The same revision under another message, so it is another object, validates.
+    let copy = |transition| RevisionRecord {
+        metadata: RevisionMetadata {
+            message: "copy".into(),
+            ..revised.metadata.clone()
+        },
+        transition,
+        ..revised.clone()
+    };
+    let control = history
+        .retaining_revision(&copy(revised.transition.clone()))
+        .await;
+    assert_eq!(history.refusal(control).await, None);
+    // Every edit called added, the predecessor's too: the edits and the replay are
+    // the same, but the predecessor's edit is neither preserved nor removed.
+    let forged = history
+        .retaining_revision(&copy(EditTransition {
+            added: revised.edits.clone(),
+            ..EditTransition::default()
+        }))
+        .await;
+    assert!(
+        history
+            .refusal(forged)
+            .await
+            .is_some_and(|reason| reason.contains("partition")),
     );
 }
 

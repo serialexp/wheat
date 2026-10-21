@@ -521,7 +521,9 @@ content it needs anyway; close or keep per Bart.
    position is refused on decode, so a walk never indexes past its end. The index
    entries are references in the object graph.
 5. Full validation tightened (partition equality, I1 for every view, composition
-   edges by maps). Composition edges by maps is done: an application's edge goes to
+   edges by maps). Partition equality is done: a predecessor's edits are exactly the
+   transition's preserved and removed edits, so an edit can no longer be called added
+   when its predecessor had it. Composition edges by maps is done: an application's edge goes to
    the target's child whose `last` is its change and which selects it, in full
    validation and in rewrite's `produced_view`. By tree, a join's edge over two
    changes, the second conflicted and leaving the tree as it was, also matched, so a

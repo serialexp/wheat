@@ -1129,9 +1129,15 @@ where
             } else {
                 BTreeSet::new()
             };
-            if !transition.preserved.is_subset(&predecessor_edits)
-                || !transition.removed.is_subset(&predecessor_edits)
-                || !transition.preserved.is_disjoint(&transition.removed)
+            // Every predecessor edit is preserved or removed, none both (I5). Decoding
+            // checked `added` disjoint from both, so it holds only new edits.
+            if !transition.preserved.is_disjoint(&transition.removed)
+                || transition
+                    .preserved
+                    .union(&transition.removed)
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    != predecessor_edits
             {
                 return Err(invalid("transition predecessor partition mismatch"));
             }
