@@ -26,6 +26,10 @@ pub enum RepositoryPublicationError {
     MissingObject(ObjectId),
     #[error("invalid persisted references: {0}")]
     InvalidReferences(&'static str),
+    #[error(
+        "checking the increment needs more than the {allowance} object reads its budget allows"
+    )]
+    OverBudget { allowance: u64 },
     #[error(transparent)]
     Collection(#[from] crate::CollectionError),
     #[error(transparent)]

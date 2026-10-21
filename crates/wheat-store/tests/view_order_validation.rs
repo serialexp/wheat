@@ -245,7 +245,7 @@ impl History {
         self.put(envelope.id().into(), &envelope.canonical_bytes())
             .await;
         let incremental = reader
-            .validate_increment(published, envelope.id())
+            .validate_increment(published, envelope.id(), IncrementBudget::STANDARD)
             .await
             .err()
             .map(|error| error.to_string());
@@ -253,6 +253,16 @@ impl History {
             full.is_some(),
             incremental.is_some(),
             "full validation: {full:?}, incremental: {incremental:?}"
+        );
+        let bootstrap = reader
+            .validate_bootstrap(envelope.id())
+            .await
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            full.is_some(),
+            bootstrap.is_some(),
+            "full validation: {full:?}, bootstrap: {bootstrap:?}"
         );
         full
     }

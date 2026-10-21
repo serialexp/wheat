@@ -12,6 +12,7 @@
 //! checked.
 
 mod add_scale;
+mod bootstrap_validate;
 mod checkpoint_stack;
 mod content_repack_plan;
 mod cpus;
@@ -61,6 +62,7 @@ pub const CASES: &[&str] = &[
     add_scale::NAME,
     transition_validate::NAME,
     increment_validate::NAME,
+    bootstrap_validate::NAME,
     packed_append::NAME,
     content_repack_plan::NAME,
     sharded_manifest::NAME,
@@ -215,6 +217,7 @@ pub fn run_case(
         add_scale::NAME => add_scale::run(&context),
         transition_validate::NAME => transition_validate::run(&context),
         increment_validate::NAME => increment_validate::run(&context),
+        bootstrap_validate::NAME => bootstrap_validate::run(&context),
         packed_append::NAME => packed_append::run(&context),
         content_repack_plan::NAME => content_repack_plan::run(&context),
         sharded_manifest::NAME => sharded_manifest::run(&context),

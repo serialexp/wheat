@@ -743,6 +743,9 @@ fn classify(error: &Error) -> Classification {
                 RepositoryPublicationError::InvalidReferences(_) => {
                     class("integrity", "corrupt_repository", false, 6)
                 }
+                RepositoryPublicationError::OverBudget { .. } => {
+                    class("limit", "validation_budget_exceeded", false, 5)
+                }
                 _ => continue,
             };
         }

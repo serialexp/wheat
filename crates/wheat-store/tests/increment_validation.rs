@@ -190,13 +190,17 @@ impl History {
         let envelope = self.envelope(published, state).await;
         let reader = self.reader();
         let reason = reader
-            .validate_increment(published, envelope)
+            .validate_increment(published, envelope, IncrementBudget::STANDARD)
             .await
             .expect_err("the increment is refused")
             .to_string();
         assert!(
             reader.validate_complete(state.id()).await.is_err(),
             "full validation accepts what the increment refuses ({reason})"
+        );
+        assert!(
+            reader.validate_bootstrap(envelope).await.is_err(),
+            "bootstrap accepts what the increment refuses ({reason})"
         );
         reason
     }
@@ -334,10 +338,19 @@ async fn every_publication_of_a_built_history_is_a_valid_increment() {
     let history = &built.history;
     let reader = history.reader();
     for step in history.envelopes.windows(2) {
-        reader.validate_increment(step[0], step[1]).await.unwrap();
+        reader
+            .validate_increment(step[0], step[1], IncrementBudget::STANDARD)
+            .await
+            .unwrap();
+    }
+    for envelope in &history.envelopes {
+        reader.validate_bootstrap(*envelope).await.unwrap();
     }
     let (first, last) = (history.envelopes[0], *history.envelopes.last().unwrap());
-    let report = reader.validate_increment(first, last).await.unwrap();
+    let report = reader
+        .validate_increment(first, last, IncrementBudget::STANDARD)
+        .await
+        .unwrap();
     assert!(report.views >= 8 && report.applications >= 8, "{report:?}");
     assert_eq!(report.changes, 4);
     reader
@@ -357,9 +370,16 @@ async fn a_created_change_reports_what_it_added() {
         .await;
     let report = history
         .reader()
-        .validate_increment(history.envelopes[0], history.envelopes[1])
+        .validate_increment(
+            history.envelopes[0],
+            history.envelopes[1],
+            IncrementBudget::STANDARD,
+        )
         .await
         .unwrap();
+    // Six objects, and the one edit replayed by the revision and the application.
+    assert_eq!(report.budget_units, 8);
+    assert!(report.budget_spent <= report.budget_allowance, "{report:?}");
     assert_eq!(
         report,
         IncrementReport {
@@ -370,6 +390,9 @@ async fn a_created_change_reports_what_it_added() {
             edges: 1,
             content: 1,
             labels: 0,
+            budget_units: 8,
+            budget_allowance: report.budget_allowance,
+            budget_spent: report.budget_spent,
         }
     );
 }
@@ -481,7 +504,7 @@ async fn an_increment_that_drops_history_is_refused() {
         let envelope = history.envelope(published, forged).await;
         let reason = history
             .reader()
-            .validate_increment(published, envelope)
+            .validate_increment(published, envelope, IncrementBudget::STANDARD)
             .await
             .unwrap_err()
             .to_string();
@@ -511,13 +534,17 @@ async fn creation_with(
     let envelope = history.envelope(before, forged).await;
     let reader = history.reader();
     let reason = reader
-        .validate_increment(before, envelope)
+        .validate_increment(before, envelope, IncrementBudget::STANDARD)
         .await
         .expect_err("the forged increment is refused")
         .to_string();
     assert!(
         reader.validate_complete(forged.id()).await.is_err(),
         "full validation accepts what the increment refuses ({reason})"
+    );
+    assert!(
+        reader.validate_bootstrap(envelope).await.is_err(),
+        "bootstrap accepts what the increment refuses ({reason})"
     );
     reason
 }
@@ -637,7 +664,10 @@ async fn labels_name_retained_views() {
     let reader = history.reader();
     let before = with_labels(history, &[("main", history.base), ("kept", history.base)]).await;
     let moved = with_labels(history, &[("main", built.with_p), ("kept", history.base)]).await;
-    let report = reader.validate_increment(before, moved).await.unwrap();
+    let report = reader
+        .validate_increment(before, moved, IncrementBudget::STANDARD)
+        .await
+        .unwrap();
     assert_eq!(report.labels, 1);
     let unretained = ViewId::from_digest([7; 32]);
     for forged in [
@@ -653,12 +683,70 @@ async fn labels_name_retained_views() {
         .await,
     ] {
         let reason = reader
-            .validate_increment(before, forged)
+            .validate_increment(before, forged, IncrementBudget::STANDARD)
             .await
             .unwrap_err()
             .to_string();
         assert!(reason.contains("label target not retained"), "{reason}");
     }
+}
+
+/// Integrating a change of `WIDE` edits with a small one ordered before it applies
+/// the wide change's revision anew: the increment adds one application, but checking it replays every
+/// one of those edits. The budget grows by them, so the increment fits the standard
+/// budget; with no reads allowed per unit it is refused for its budget.
+#[tokio::test]
+async fn an_old_revision_replayed_anew_is_paid_for_by_its_edits() {
+    const WIDE: usize = 300;
+    let mut history = History::new().await;
+    history.content.put(b"w").unwrap();
+    history.content.put(b"s").unwrap();
+    let base = history.base;
+    let paths: Vec<String> = (0..WIDE).map(|index| format!("w/{index:03}")).collect();
+    let writes: Vec<Write<'_>> = paths
+        .iter()
+        .map(|path| (path.as_str(), None, &b"w"[..]))
+        .collect();
+    let (wide, _) = history
+        .create(base, change(0x20), &[], files(&writes))
+        .await;
+    let (small, _) = history
+        .create(base, change(0x10), &[], files(&[("s", None, b"s")]))
+        .await;
+    let before = history.head().envelope;
+    let (prepared, _) = history
+        .mutator()
+        .integrate(history.head(), base, &[wide, small])
+        .await
+        .unwrap();
+    history.publish(prepared).await;
+    let after = history.head().envelope;
+    let reader = history.reader();
+
+    let report = reader
+        .validate_increment(before, after, IncrementBudget::STANDARD)
+        .await
+        .unwrap();
+    assert!(report.budget_units > WIDE as u64, "{report:?}");
+    assert!(report.budget_spent > WIDE as u64, "{report:?}");
+
+    let refused = reader
+        .validate_increment(
+            before,
+            after,
+            IncrementBudget {
+                objects_per_unit: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            RepositoryPublicationError::OverBudget { allowance: 0 }
+        ),
+        "{refused}"
+    );
 }
 
 /// The validator's future can move between threads, as the server's tasks need.
@@ -670,5 +758,5 @@ fn validation_is_send() {
     let content = ContentStore::new(dir.path().join("content"));
     let reader = RepositoryReader::new(&objects, &content);
     let id = RepositoryEnvelopeId::from_digest([0; 32]);
-    send(&reader.validate_increment(id, id));
+    send(&reader.validate_increment(id, id, IncrementBudget::STANDARD));
 }

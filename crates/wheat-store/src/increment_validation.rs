@@ -11,20 +11,26 @@
 //! validation's ([`crate::semantic_checks`]), so the two prove the same invariants.
 //! See `docs/design/wheat-incremental-validation.md`.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use async_trait::async_trait;
 
 use wheat_core::{
     ApplicationId, ApplicationResultRecord, ChangeId, ChangeObjectId, ContentId, ObjectId,
     RepositoryEnvelopeId, RepositoryStateRecord, RevisionId, ViewId, ViewLabelManifestId,
-    ViewRecord,
+    ViewLabelManifestRecord, ViewRecord,
 };
 
 use crate::{
     ChangeMapDelta, ChangeMapDeltaLimits, ChangeMapStore, CollectionError, ConflictSetStore,
     ContentSetDelta, ContentSetDeltaLimits, ContentSetStore, ContentStoreError,
-    ImmutableObjectStore, ProjectedCommitSetDelta, ProjectedCommitSetStore,
+    ImmutableObjectStore, ObjectStoreError, ProjectedCommitSetDelta, ProjectedCommitSetStore,
     RepositoryPublicationError, RepositoryReader, RetainedSetDelta, RetainedSetDeltaLimits,
-    RetainedSetStore, ViewLineageMapStore, radix,
+    RetainedSetStore, StoredObject, ViewLineageMapStore, radix,
+    repository_verify::CachedObjects,
     semantic_checks::{Checks, Membership, Retained, invalid},
     verification_scratch::VerificationScratch,
 };
@@ -42,6 +48,123 @@ pub struct IncrementReport {
     pub content: usize,
     /// Labels created or moved.
     pub labels: usize,
+    /// The units the budget was sized from (see [`IncrementBudget`]), the object reads
+    /// it allowed, and the reads checking the increment took. Zero when unmetered.
+    pub budget_units: u64,
+    pub budget_allowance: u64,
+    pub budget_spent: u64,
+}
+
+/// How many object reads checking an increment may take, relative to what it adds.
+///
+/// A unit is one object the increment adds (change, view, revision, application,
+/// lineage edge, content member) or one edit that a new revision, or a new
+/// application's revision, replays. Each unit may take `objects_per_unit` reads per bit
+/// of the history's size (the largest new view's change count), since lookups in the
+/// history's collections deepen with its logarithm. An application replaying a large
+/// old revision is paid for by that revision's edits; a small increment can't make
+/// validation read much of the history. Finding what was added is not metered: it
+/// reads in proportion to what was added.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncrementBudget {
+    pub objects_per_unit: u64,
+}
+
+impl IncrementBudget {
+    /// The budget for increments from other processes: about eight times what a
+    /// one-change publication reads (82, 86 and 110 reads for its 8 units after 1,000,
+    /// 10,000 and 100,000 changes, near one per unit and bit; bench
+    /// `increment_validate`).
+    pub const STANDARD: Self = Self {
+        objects_per_unit: 8,
+    };
+
+    /// History sizes below this many bits are treated as this many: a small history's
+    /// collections are shallow, but not shallower than a few levels.
+    const MIN_DEPTH: u64 = 8;
+
+    fn allowance(self, units: u64, history_size: u64) -> u64 {
+        let depth = u64::from(u64::BITS - history_size.leading_zeros()).max(Self::MIN_DEPTH);
+        self.objects_per_unit
+            .saturating_mul(units)
+            .saturating_mul(depth)
+    }
+}
+
+/// What a state adds to a trusted one, found from the differences of their collections.
+struct StateDelta {
+    changes: HashSet<ObjectId>,
+    /// The new views' records, read while finding the delta.
+    views: HashMap<ViewId, ViewRecord>,
+    revisions: Vec<ObjectId>,
+    applications: Vec<ObjectId>,
+    content: Vec<ContentId>,
+    edges: BTreeSet<(ViewId, ViewId)>,
+}
+
+impl StateDelta {
+    /// The most changes a new view selects: the history's size, for the budget.
+    fn history_size(&self) -> u64 {
+        self.views
+            .values()
+            .map(|view| view.order.size)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// An object store refusing reads past an allowance. Once refused, the validation fails
+/// and its caller reports the budget, not the read error.
+struct Metered<'a, O> {
+    inner: &'a O,
+    allowance: u64,
+    spent: AtomicU64,
+}
+
+impl<'a, O> Metered<'a, O> {
+    fn new(inner: &'a O, allowance: u64) -> Self {
+        Self {
+            inner,
+            allowance,
+            spent: AtomicU64::new(0),
+        }
+    }
+
+    /// Reads taken, counting any refused.
+    fn spent(&self) -> u64 {
+        self.spent.load(Ordering::Relaxed)
+    }
+
+    fn exceeded(&self) -> bool {
+        self.spent() > self.allowance
+    }
+}
+
+#[async_trait]
+impl<O: ImmutableObjectStore> ImmutableObjectStore for Metered<'_, O> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        bytes: &[u8],
+    ) -> std::result::Result<(), ObjectStoreError> {
+        self.inner.put_if_absent(id, bytes).await
+    }
+
+    async fn get(&self, id: ObjectId) -> std::result::Result<StoredObject, ObjectStoreError> {
+        if self.spent.fetch_add(1, Ordering::Relaxed) >= self.allowance {
+            return Err(ObjectStoreError::Backend(
+                "increment validation budget exceeded".into(),
+            ));
+        }
+        self.inner.get(id).await
+    }
+
+    async fn exists_many(
+        &self,
+        ids: &[ObjectId],
+    ) -> std::result::Result<Vec<bool>, ObjectStoreError> {
+        self.inner.exists_many(ids).await
+    }
 }
 
 const UNBOUNDED_RETAINED: RetainedSetDeltaLimits = RetainedSetDeltaLimits {
@@ -107,12 +230,14 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
     /// Validates what envelope `new` adds to the trusted envelope `old`: its history only
     /// grows, and every change, revision, application, view, lineage edge, content
     /// member and label it adds keeps the store's invariants. The work follows what was
-    /// added, not the size of the history.
+    /// added, not the size of the history, and an increment needing more reads than
+    /// `budget` allows for what it adds is refused.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn validate_increment(
         &self,
         old: RepositoryEnvelopeId,
         new: RepositoryEnvelopeId,
+        budget: IncrementBudget,
     ) -> Result<IncrementReport> {
         let old = self.envelope(old).await?;
         let new = self.envelope(new).await?;
@@ -120,7 +245,9 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         let new_state = self.state(new.state).await?;
         let mut report = IncrementReport::default();
         if old.state != new.state {
-            report = self.validate_state_increment(&old_state, new_state).await?;
+            report = self
+                .validate_state_increment(&old_state, new_state, Some(budget))
+                .await?;
         }
         report.labels = self
             .validate_label_increment(old.labels, new.labels, &new_state)
@@ -128,18 +255,143 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         Ok(report)
     }
 
+    /// Validates envelope `new` with no trusted envelope before it, as a clone does:
+    /// the increment from a state holding only `new`'s base view, so every other
+    /// retained object is new and checked by the same steps as an ordinary increment.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn validate_bootstrap(&self, new: RepositoryEnvelopeId) -> Result<IncrementReport> {
+        // Every object is new, so radix nodes are read many times over, as in full
+        // validation; read through the same per-run cache.
+        let cached = CachedObjects::for_validation(self.objects);
+        RepositoryReader::new(&cached, self.content)
+            .bootstrap(new)
+            .await
+    }
+
+    async fn bootstrap(&self, new: RepositoryEnvelopeId) -> Result<IncrementReport> {
+        let new = self.envelope(new).await?;
+        let new_state = self.state(new.state).await?;
+        let sets = RetainedSetStore::new(self.objects);
+        let empty_set = sets.empty_root().await?;
+        let empty = RepositoryStateRecord {
+            base_view: new_state.base_view,
+            changes: ChangeMapStore::new(self.objects).empty_root().await?,
+            view_lineage: ViewLineageMapStore::new(self.objects)
+                .empty_root()
+                .await
+                .map_err(|_| invalid("invalid view lineage"))?,
+            required_content: ContentSetStore::new(self.objects).empty_root().await?,
+            retained_changes: empty_set,
+            retained_views: empty_set,
+            retained_revisions: empty_set,
+            retained_applications: empty_set,
+            projected_commits: ProjectedCommitSetStore::new(self.objects)
+                .empty_root()
+                .await?,
+        };
+        if !sets
+            .contains(new_state.retained_views, new_state.base_view.into())
+            .await?
+        {
+            return Err(invalid("base view not retained"));
+        }
+        let mut report = self
+            .validate_state_increment(&empty, new_state, None)
+            .await?;
+        let no_labels = ViewLabelManifestRecord {
+            labels: BTreeMap::new(),
+        };
+        report.labels = self
+            .validate_labels_against(&no_labels, new.labels, &new_state)
+            .await?;
+        Ok(report)
+    }
+
+    /// Finds what `new` adds to `old`, then checks it. Finding it reads in proportion
+    /// to what was added and is not metered; with a `budget`, checking it reads through
+    /// a [`Metered`] store sized from what was found. Without one (bootstrapping) the
+    /// check is unmetered.
     async fn validate_state_increment(
         &self,
         old: &RepositoryStateRecord,
         new: RepositoryStateRecord,
+        budget: Option<IncrementBudget>,
     ) -> Result<IncrementReport> {
-        // Step 1: the history only grows.
+        let delta = self.state_delta(old, &new).await?;
+        let mut report = IncrementReport {
+            changes: delta.changes.len(),
+            views: delta.views.len(),
+            revisions: delta.revisions.len(),
+            applications: delta.applications.len(),
+            edges: delta.edges.len(),
+            content: delta.content.len(),
+            ..IncrementReport::default()
+        };
+        let Some(budget) = budget else {
+            self.check_state_delta(&new, &delta).await?;
+            return Ok(report);
+        };
+        let units = self.budget_units(&delta).await?;
+        let allowance = budget.allowance(units, delta.history_size());
+        let metered = Metered::new(self.objects, allowance);
+        let checked = RepositoryReader::new(&metered, self.content)
+            .check_state_delta(&new, &delta)
+            .await;
+        report.budget_units = units;
+        report.budget_allowance = allowance;
+        report.budget_spent = metered.spent();
+        if metered.exceeded() {
+            return Err(RepositoryPublicationError::OverBudget { allowance });
+        }
+        checked?;
+        Ok(report)
+    }
+
+    /// The units an increment's budget is sized from: one per object it adds, and one
+    /// per edit each new revision and each new application's revision replays.
+    async fn budget_units(&self, delta: &StateDelta) -> Result<u64> {
+        let objects = delta.changes.len()
+            + delta.views.len()
+            + delta.revisions.len()
+            + delta.applications.len()
+            + delta.edges.len()
+            + delta.content.len();
+        let mut units = u64::try_from(objects).unwrap_or(u64::MAX);
+        let mut edits = |revision: &wheat_core::RevisionRecord| {
+            units = units.saturating_add(u64::try_from(revision.edits.len()).unwrap_or(u64::MAX));
+        };
+        for id in &delta.revisions {
+            edits(
+                &self
+                    .revision(RevisionId::from_digest(*id.as_bytes()))
+                    .await?,
+            );
+        }
+        for id in &delta.applications {
+            let application = self
+                .application(ApplicationId::from_digest(*id.as_bytes()))
+                .await?;
+            edits(&self.revision(application.revision_id).await?);
+        }
+        Ok(units)
+    }
+
+    /// What `new` adds to `old`: the retained objects, aggregate content and lineage
+    /// edges, with the history only growing (step 1), the change map gaining exactly the
+    /// new changes (step 2) and new projected commits naming retained applications.
+    async fn state_delta(
+        &self,
+        old: &RepositoryStateRecord,
+        new: &RepositoryStateRecord,
+    ) -> Result<StateDelta> {
         if old.base_view != new.base_view {
             return Err(invalid("publication changes repository base view"));
         }
-        let changes = self
+        let changes: HashSet<ObjectId> = self
             .added_retained(old.retained_changes, new.retained_changes)
-            .await?;
+            .await?
+            .into_iter()
+            .collect();
         let views = self
             .added_retained(old.retained_views, new.retained_views)
             .await?;
@@ -149,41 +401,65 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         let applications = self
             .added_retained(old.retained_applications, new.retained_applications)
             .await?;
-        let content = self.added_content(old, &new).await?;
-        self.validate_projected_commits(old, &new).await?;
+        let content = self.added_content(old, new).await?;
+        self.validate_projected_commits(old, new).await?;
+        self.validate_new_changes(old, new, &changes).await?;
+        let edges = self.new_lineage_edges(old, new).await?;
+        let mut records = HashMap::with_capacity(views.len());
+        for id in &views {
+            let id = ViewId::from_digest(*id.as_bytes());
+            records.insert(id, self.view(id).await?);
+        }
+        Ok(StateDelta {
+            changes,
+            views: records,
+            revisions,
+            applications,
+            content,
+            edges,
+        })
+    }
+
+    /// Checks every view, lineage edge, revision and application the increment adds,
+    /// against the new state `new` (steps 3 to 6).
+    async fn check_state_delta(
+        &self,
+        new: &RepositoryStateRecord,
+        delta: &StateDelta,
+    ) -> Result<()> {
         let state = NewState {
             objects: self.objects,
-            state: new,
-            changes: changes.iter().copied().collect(),
-            views: views.iter().copied().collect(),
-            revisions: revisions.iter().copied().collect(),
-            applications: applications.iter().copied().collect(),
-            content: content.iter().copied().collect(),
+            state: *new,
+            changes: delta.changes.clone(),
+            views: delta.views.keys().map(|&id| id.into()).collect(),
+            revisions: delta.revisions.iter().copied().collect(),
+            applications: delta.applications.iter().copied().collect(),
+            content: delta.content.iter().copied().collect(),
         };
         let checks = Checks {
             reader: self,
             membership: &state,
         };
-
-        self.validate_new_changes(old, &new, &state.changes).await?;
-        let edges = self.new_lineage_edges(old, &new).await?;
+        let records = &delta.views;
+        let edges = &delta.edges;
 
         // Step 5: each new view is its composition parent plus one application (I1).
         // No order is needed: the result stands only once every check has passed.
-        let mut records = HashMap::with_capacity(views.len());
-        let mut composed = HashSet::with_capacity(views.len());
+        let mut composed = HashSet::with_capacity(records.len());
         let mut scratch = None;
-        for id in &views {
-            let id = ViewId::from_digest(*id.as_bytes());
-            let view = self.view(id).await?;
-            self.validate_new_view(&checks, id, &view, &edges, &mut composed, &mut scratch)
+        for (&id, view) in records {
+            if id == new.base_view {
+                // New only when bootstrapping: it selects nothing (I1's base rule).
+                checks.base(view).await?;
+                continue;
+            }
+            self.validate_new_view(&checks, id, view, edges, &mut composed, &mut scratch)
                 .await?;
-            records.insert(id, view);
         }
 
         // Step 6: every new edge joins retained views and increases the weight (I3),
         // so the lineage stays acyclic whatever valid state it is joined with.
-        for (parent, child) in &edges {
+        for (parent, child) in edges {
             for view in [parent, child] {
                 if !state.views.contains(&(*view).into())
                     && !RetainedSetStore::new(self.objects)
@@ -193,13 +469,13 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                     return Err(invalid("lineage edge names an unretained view"));
                 }
             }
-            if self.weight(&records, *child).await? <= self.weight(&records, *parent).await? {
+            if self.weight(records, *child).await? <= self.weight(records, *parent).await? {
                 return Err(invalid("lineage edge does not increase view weight"));
             }
         }
 
         // Step 3: revisions (I5).
-        for id in &revisions {
+        for id in &delta.revisions {
             let revision = self
                 .revision(RevisionId::from_digest(*id.as_bytes()))
                 .await?;
@@ -207,7 +483,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         }
 
         // Step 4: applications (I6, I2), each composing a new view.
-        for id in &applications {
+        for id in &delta.applications {
             let id = ApplicationId::from_digest(*id.as_bytes());
             let application = self.application(id).await?;
             let context = checks.application(&application).await?;
@@ -218,16 +494,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                 return Err(invalid("new application composes no retained view"));
             }
         }
-
-        Ok(IncrementReport {
-            changes: changes.len(),
-            views: views.len(),
-            revisions: revisions.len(),
-            applications: applications.len(),
-            edges: edges.len(),
-            content: content.len(),
-            labels: 0,
-        })
+        Ok(())
     }
 
     /// The members `new` adds to the retained set `old`, refusing any it drops.
@@ -490,6 +757,17 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             return Ok(0);
         }
         let old = self.view_label_manifest(old).await?;
+        self.validate_labels_against(&old, new, state).await
+    }
+
+    /// The labels of manifest `new` that are absent from or moved since `old`, each
+    /// checked to name a view `state` retains.
+    async fn validate_labels_against(
+        &self,
+        old: &ViewLabelManifestRecord,
+        new: ViewLabelManifestId,
+        state: &RepositoryStateRecord,
+    ) -> Result<usize> {
         let new = self.view_label_manifest(new).await?;
         let mut changed = 0;
         for (name, label) in &new.labels {

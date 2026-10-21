@@ -52,7 +52,10 @@ impl RepositoryValidationPhase {
     }
 }
 
-struct CachedObjects<'a, O> {
+/// A store caching the objects read through it, for one validation run. It trusts
+/// nothing across runs, and its fixed bounds keep its memory independent of the
+/// repository's size.
+pub(crate) struct CachedObjects<'a, O> {
     inner: &'a O,
     max_entries: usize,
     max_bytes: usize,
@@ -60,6 +63,12 @@ struct CachedObjects<'a, O> {
 }
 
 impl<'a, O> CachedObjects<'a, O> {
+    /// The cache a whole-repository validation reads through: it covers the active
+    /// radix DAG of a medium repository.
+    pub(crate) fn for_validation(inner: &'a O) -> Self {
+        Self::new(inner, 262_144, 128 * 1024 * 1024)
+    }
+
     fn new(inner: &'a O, max_entries: usize, max_bytes: usize) -> Self {
         Self {
             inner,
@@ -816,7 +825,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         // Fixed entry bound keeps memory independent of repository size while
         // covering the active radix DAG for medium repositories. A disk-backed
         // decoded-node cache is still needed before truly large qualification.
-        let cached = CachedObjects::new(self.objects, 262_144, 128 * 1024 * 1024);
+        let cached = CachedObjects::for_validation(self.objects);
         let reader = RepositoryReader::new(&cached, self.content);
         Verifier {
             reader: &reader,

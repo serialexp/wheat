@@ -14,24 +14,16 @@
 //! history. What matters is the wall time: a one-change publication after
 //! [`LARGEST`] changes validates within [`VALIDATE_BUDGET_SECONDS`].
 
-use std::{
-    collections::VecDeque,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+use std::{collections::VecDeque, path::Path, time::Instant};
 
 use anyhow::Result;
-use async_trait::async_trait;
-use wheat_core::{ChangeId, ChangeMetadata, ChangeProposal, ObjectId, RevisionMetadata};
 use wheat_store::{
-    ImmutableObjectStore, LocalPublicationStore, ObjectStoreError, PackedObjectStore,
-    PersistedRepositoryMutator, RepositoryReader, StoredObject,
+    IncrementBudget, LocalPublicationStore, PersistedRepositoryMutator, RepositoryReader,
 };
 
 use super::{
     CaseContext, CaseOutput, Recorder,
-    history::{Scratch, author, rewrite},
+    history::{Counting, Scratch, create_spread},
 };
 use crate::measure;
 
@@ -68,58 +60,6 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     Ok(recorder.finish())
 }
 
-/// An object store counting the objects and bytes read through it.
-struct Counting {
-    inner: PackedObjectStore,
-    reads: AtomicU64,
-    bytes: AtomicU64,
-}
-
-impl Counting {
-    /// The reads and bytes since the last call.
-    fn take(&self) -> (u64, u64) {
-        (
-            self.reads.swap(0, Ordering::Relaxed),
-            self.bytes.swap(0, Ordering::Relaxed),
-        )
-    }
-}
-
-#[async_trait]
-impl ImmutableObjectStore for Counting {
-    async fn put_if_absent(
-        &self,
-        id: ObjectId,
-        canonical_bytes: &[u8],
-    ) -> Result<(), ObjectStoreError> {
-        self.inner.put_if_absent(id, canonical_bytes).await
-    }
-
-    async fn put_batch(
-        &self,
-        objects: &[(ObjectId, Vec<u8>)],
-        concurrency: usize,
-    ) -> Result<(), ObjectStoreError> {
-        self.inner.put_batch(objects, concurrency).await
-    }
-
-    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
-        let object = self.inner.get(id).await?;
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        self.bytes
-            .fetch_add(object.canonical_bytes.len() as u64, Ordering::Relaxed);
-        Ok(object)
-    }
-
-    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
-        self.inner.exists_many(ids).await
-    }
-
-    async fn seal(&self) -> Result<(), ObjectStoreError> {
-        self.inner.seal().await
-    }
-}
-
 async fn measure_history(
     root: &Path,
     checkpoints: &[usize],
@@ -127,11 +67,7 @@ async fn measure_history(
 ) -> Result<()> {
     let scratch = Scratch::open(root)?;
     let (base, mut head) = scratch.initialize().await?;
-    let objects = Counting {
-        inner: scratch.objects,
-        reads: AtomicU64::new(0),
-        bytes: AtomicU64::new(0),
-    };
+    let objects = Counting::new(scratch.objects);
     let mutator = PersistedRepositoryMutator::<_, LocalPublicationStore>::new(
         &objects,
         &scratch.content,
@@ -145,37 +81,9 @@ async fn measure_history(
     let started = Instant::now();
     for index in 0..largest {
         let created = Instant::now();
-        let path = format!(
-            "d{:02x}/d{:02x}/f{index}.txt",
-            index & 0xff,
-            (index >> 8) & 0xff
-        );
-        let (_, edits) = rewrite(&scratch.content, &path, path.as_bytes(), None)?;
-        let (prepared, outcome) = mutator
-            .create_on_frontier(
-                head,
-                base,
-                effective,
-                ChangeProposal {
-                    id: ChangeId::new(),
-                    metadata: ChangeMetadata {
-                        title: format!("Change {index}"),
-                        creator: author(),
-                        ..ChangeMetadata::default()
-                    },
-                    dependencies: Default::default(),
-                    revision_metadata: RevisionMetadata {
-                        author: author(),
-                        committer: author(),
-                        ..RevisionMetadata::default()
-                    },
-                    edits,
-                },
-            )
-            .await?;
         let previous = head.envelope;
-        head = mutator.publish(prepared).await?;
-        effective = outcome.resulting_view;
+        (head, effective) =
+            create_spread(&mutator, &scratch.content, head, base, effective, index).await?;
         if creates.len() == CREATE_WINDOW {
             creates.pop_front();
         }
@@ -197,7 +105,9 @@ async fn measure_history(
 
         objects.take();
         let first = Instant::now();
-        reader.validate_increment(previous, head.envelope).await?;
+        let report = reader
+            .validate_increment(previous, head.envelope, IncrementBudget::STANDARD)
+            .await?;
         recorder.wall(
             &format!("{step}.validate_first"),
             first.elapsed().as_secs_f64(),
@@ -205,10 +115,27 @@ async fn measure_history(
         let (reads, bytes) = objects.take();
         recorder.value(&format!("{step}.validate.reads"), reads as f64, "count");
         recorder.value(&format!("{step}.validate.bytes"), bytes as f64, "bytes");
+        recorder.value(
+            &format!("{step}.budget.units"),
+            report.budget_units as f64,
+            "count",
+        );
+        recorder.value(
+            &format!("{step}.budget.allowance"),
+            report.budget_allowance as f64,
+            "count",
+        );
+        recorder.value(
+            &format!("{step}.budget.spent"),
+            report.budget_spent as f64,
+            "count",
+        );
         let mut walls = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let sample = Instant::now();
-            reader.validate_increment(previous, head.envelope).await?;
+            reader
+                .validate_increment(previous, head.envelope, IncrementBudget::STANDARD)
+                .await?;
             walls.push(sample.elapsed().as_secs_f64());
         }
         objects.take();
