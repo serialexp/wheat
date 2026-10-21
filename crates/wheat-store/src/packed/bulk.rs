@@ -54,6 +54,9 @@ pub(crate) struct FinalizedBulk {
     pub path: PathBuf,
     pub id: wheat_core::SegmentId,
     pub metadata: SegmentMetadata,
+    /// The entries of records stored in compressed blocks, whose locations
+    /// [`BulkSegment::append_prepared`] returned as placeholders.
+    pub block_entries: Vec<SegmentIndexEntry>,
 }
 
 impl BulkSegment {
@@ -324,10 +327,16 @@ impl BulkSegment {
         )?;
         self.file.flush()?;
         drop(self.file);
+        let block_entries = self
+            .entries
+            .into_iter()
+            .filter(|entry| entry.codec == Codec::ZstdBlock.to_byte())
+            .collect();
         Ok(FinalizedBulk {
             path: self.path,
             id: footer.segment_id(),
             metadata: super::segment::metadata(&footer),
+            block_entries,
         })
     }
 }

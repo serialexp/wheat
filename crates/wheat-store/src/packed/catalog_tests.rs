@@ -384,6 +384,41 @@ fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
 }
 
 #[test]
+fn a_finalized_bulk_pack_locates_its_block_records_without_a_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    // Small enough to be stored in a compressed block.
+    let history: Vec<_> = (1..=8).map(test_content_map_root).collect();
+    let records = metadata_records(&history);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.bytes.len() < crate::codec::RAW_THRESHOLD)
+    );
+    let mut store = PackedCatalog::open_with_test_threshold(
+        root.path(),
+        crate::Durability::Deferred,
+        1024 * 1024,
+    )
+    .unwrap();
+    store.put_records(&records).unwrap();
+    store.finalize_bulk().unwrap();
+    // A rebuild deletes every locator row, which this makes fail.
+    store
+        .test_reject_locator_rewrite(records[0].digest)
+        .unwrap();
+    for record in &records {
+        let payload = store
+            .get(super::segment::METADATA_NAMESPACE, record.digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kind_and_bytes(payload),
+            (record.kind, record.bytes.to_vec())
+        );
+    }
+}
+
+#[test]
 fn compressed_records_use_stored_bytes_for_rollover_and_logical_read_limits() {
     let root = tempfile::tempdir().unwrap();
     let first_bytes = vec![b'a'; 8 * 1024];

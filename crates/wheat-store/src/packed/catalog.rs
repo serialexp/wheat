@@ -1169,6 +1169,9 @@ impl PackedCatalog {
             "UPDATE physical_source SET path=?1 WHERE path=?2",
             params![new_source, old_source],
         )?;
+        // Records buffered into compressed blocks were indexed with placeholder
+        // locations when they were put; their places are known only now.
+        insert_source_entries(&transaction, &new_source, &finalized.block_entries)?;
         write_checkpoint(
             &transaction,
             Some((generation, digest)),
