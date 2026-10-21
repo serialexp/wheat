@@ -13,6 +13,26 @@ own pushed commits come back as the same changes (same store), not duplicates.
   commit yet"; it goes in with the pull implementation). Everything up to the pull
   passes; it fails at `wheat pull <path>` (no positional URL; pull only speaks
   `wheat://`).
+- B1 (push dropping changes before a reused anchor) fixed in 6d46522.
+- Bart's decisions (2026-10-21): conflicts while reapplying are **durable
+  conflicts**; merges are **first parent only** (one change per first-parent
+  commit, edits vs first parent); commits this store pushed are found through new
+  **reverse refs** written by push (commit-keyed, O(log P)); the **label stays**
+  where it was imported and the workspace selects the new frontier; a rebased root's
+  dependencies are **only the new tip**; rebased metadata is **like git rebase**
+  (author kept, committer = puller, now); the branch is the **label's Git ref**
+  (`original_git_ref`) with a `--from` override, refused for native labels without
+  it; and pull **requires a single frontier** (integrate first). Mine, Bart may
+  override: a rebased revision is authored at its old spot (one path, valid when it
+  conflicts); a pushed commit's tree is re-hashed and compared as push does; a known
+  commit off the workspace's path is refused.
+- Plan (from a planning pass): wheat-store `repository_rebase.rs`
+  (`append_and_reapply` via `compose_authoring`, with `PendingRevision` gaining an
+  `authored: Option<(ViewId, TreeId)>`, plus `ensure_continuation_edge` so the old
+  frontier stops being a leaf); wheat-git `pull.rs` (`prepare_pull`: lock, observe,
+  fetch, bounded first-parent walk to a known commit, proposals built with
+  `tree_diff::tree_edits`/`metadata`); wheat-cli `git_pull.rs` and URL dispatch in
+  `Command::Pull`; bench case `git_pull_incremental`.
 - Investigation findings (all in `TODO.md`, "Found while dogfooding"): import
   rebuilds a fresh state and is bound to a source snapshot; the Wheat→Git mapping
   is only the store's `projections/git.git` refs; imported changes depend on the

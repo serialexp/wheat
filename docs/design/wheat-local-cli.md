@@ -980,7 +980,21 @@ know yet, walking back from the remote tip to a known commit: one imported earli
 so Wheat's own pushed changes come back as the same changes. Unpushed Wheat
 changes are then reapplied on top of the new Git commits, as `git pull --rebase`
 would, so the next push fast-forwards and leaves the other commits exactly as
-they were pushed.
+they were pushed. Bart's further choices:
+
+- the branch is the active label's Git ref from the import, overridable with
+  `--from <ref>`; a native label without one needs `--from`;
+- the label stays where it was imported; the workspace selects the new frontier,
+  as native pull does. Pull requires the label to have a single frontier;
+- merges are imported first parent only: one change per first-parent commit, with
+  edits against the first parent, so the merge commit itself round-trips;
+- commits this store pushed are recognised through commit-keyed reverse refs that
+  push writes beside `refs/wheat/applications/*`; the Wheat tree is re-hashed and
+  compared with the commit's, as push does;
+- a reapplied change keeps its ID and gets a new revision depending only on the new
+  tip, with the author kept and the puller as committer (like `git rebase`). It is
+  authored at its old position, so it stays valid, and a reapplication that no
+  longer fits is recorded as a durable conflict.
 
 ## Repository discovery
 
