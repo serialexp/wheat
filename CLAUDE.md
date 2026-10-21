@@ -46,6 +46,13 @@ skip_all)]` (or a `debug_span!`) on the step, then run with
 `WHEAT_TRACE_SUMMARY=1` for a span tree or `WHEAT_TRACE=trace.json` for a Perfetto
 timeline. Only spans whose target starts with `wheat` are recorded.
 
+## Desktop client design
+
+The Claude Design project for the Wheat desktop client is
+`0dfb95ac-9975-4817-99e6-a7cf09ceae27`; the comp is `Wheat Client.dc.html`
+(https://claude.ai/design/p/0dfb95ac-9975-4817-99e6-a7cf09ceae27?file=Wheat+Client.dc.html).
+The brief it was made from is `docs/wheat-gui-design-brief.md`.
+
 ## Commits
 
 Conventional Commits: `type(scope): description`, lowercase, imperative, no trailing
