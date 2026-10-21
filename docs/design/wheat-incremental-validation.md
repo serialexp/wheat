@@ -562,7 +562,25 @@ content it needs anyway; close or keep per Bart.
    changes nothing else in the view depends on, kept by every composition step and
    checked by the shared composition check as above, so a new change on top of a view
    finds its dependencies without loading the view's history. Done.
-7. Forced fallback, bootstrap mode, budgets.
+7. Forced fallback, bootstrap mode, budgets. Budgets done (3a518b6):
+   `validate_increment(old, new, budget)`. Finding what was added (the retained, map
+   and lineage deltas and the new view records) is unmetered, since it reads in
+   proportion to what was added; checking it reads through a store that refuses reads
+   past `objects_per_unit × units × bits(history size)`, at least 8 bits. A unit is an
+   added object or an edit that a new revision, or a new application's revision,
+   replays, so an application replaying a large old revision pays with its edits.
+   `IncrementBudget::STANDARD` (8 per unit and bit) is about eight times what a
+   one-change publication reads (82 to 110 reads for 8 units after 1,000 to 100,000
+   changes). Over budget: `RepositoryPublicationError::OverBudget`. Bytes and
+   content reads are not metered.
+   Forced needs no new validator: `validate_envelope` is full validation plus every
+   label. Bootstrap was tried both ways (bench `bootstrap_validate`, release, same
+   per-run object cache): full validation 0.99 / 14.1 / 66.8 s at 1,000 / 10,000 /
+   30,000 changes, `validate_bootstrap` (the incremental steps from a state holding
+   only the base view) 0.49 / 6.6 / 24.4 s, with about the same reads and peak memory.
+   Which one clone uses is Bart's call. Both grow faster than the history (1.8 M reads,
+   3.2 GB at 30,000), partly the bench's shape: its top directories gain an entry per
+   256 changes, so a view's tree diff reads larger directory records.
 8. Server publish (`commit`, including joined publishes); client fetch, clone and
    the joined-state fetch after a publish.
 9. Drop full validation from the local read paths.

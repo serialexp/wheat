@@ -56,8 +56,15 @@ Plan, Bart chose (a) for the frontier:
    put probing every sealed segment (TODO.md, "Every packed put probes every sealed
    segment", options for Bart), and ~100–150 KB stored per one-file change (TODO.md).
 
-Next: Bart's pick for the put probe; then incremental-validation steps 7–10 and
-plan 2 (label moves).
+Bart: the put-probe numbers are fine as they are (2026-10-22); the TODO entry stays.
+
+Step 7 (2026-10-22): budgets done (3a518b6, see the design doc's order of work).
+Forced is `validate_envelope`. Bootstrap: Bart asked to try the incremental
+validator from an empty state before deciding; `validate_bootstrap` exists and is
+2–2.7× faster than full validation at the same reads and memory (bench
+`bootstrap_validate`). Waiting on Bart's pick; the mode API (which call a clone, a
+forced publish and an ordinary one make) follows from it and lands with step 8,
+which wires the server publish and client fetch/clone.
 
 ## 2026-10-21: Git push/pull round trip (@calm-lynx)
 
