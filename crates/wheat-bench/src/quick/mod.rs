@@ -23,6 +23,7 @@ mod git_pull_incremental;
 mod head_receipts;
 mod history;
 mod import_resume_wide;
+mod increment_validate;
 mod latency_proxy;
 mod materialize_wide;
 mod packed_append;
@@ -59,6 +60,7 @@ pub const CASES: &[&str] = &[
     deep_stack::NAME,
     add_scale::NAME,
     transition_validate::NAME,
+    increment_validate::NAME,
     packed_append::NAME,
     content_repack_plan::NAME,
     sharded_manifest::NAME,
@@ -212,6 +214,7 @@ pub fn run_case(
         deep_stack::NAME => deep_stack::run(&context),
         add_scale::NAME => add_scale::run(&context),
         transition_validate::NAME => transition_validate::run(&context),
+        increment_validate::NAME => increment_validate::run(&context),
         packed_append::NAME => packed_append::run(&context),
         content_repack_plan::NAME => content_repack_plan::run(&context),
         sharded_manifest::NAME => sharded_manifest::run(&context),

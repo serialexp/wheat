@@ -4033,6 +4033,7 @@ name = "wheat-bench"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "gix",
