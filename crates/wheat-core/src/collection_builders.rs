@@ -9,7 +9,8 @@ use crate::{
     ApplicationId, ApplicationMapChild, ApplicationMapId, ApplicationMapNode, CanonicalObject,
     ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ConflictId,
     ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentMapChild, ContentMapId,
-    ContentMapNode, ContentSetChild, ContentSetId, ContentSetNode, ObjectId, RetainedSetChild,
+    ContentMapNode, ContentSetChild, ContentSetId, ContentSetNode, ObjectId, ProjectedCommit,
+    ProjectedCommitSetChild, ProjectedCommitSetId, ProjectedCommitSetNode, RetainedSetChild,
     RetainedSetId, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapId, RevisionMapNode,
     ViewId, ViewLineageMapChild, ViewLineageMapId, ViewLineageMapNode,
 };
@@ -322,6 +323,13 @@ set_shape!(
     RetainedSetNode,
     RetainedSetChild
 );
+set_shape!(
+    ProjectedCommitShape,
+    ProjectedCommit,
+    ProjectedCommitSetId,
+    ProjectedCommitSetNode,
+    ProjectedCommitSetChild
+);
 
 /// Builds a canonical revision map. If a change occurs more than once, its last
 /// revision in iteration order wins.
@@ -427,3 +435,9 @@ pub fn build_content_map(
     build_sorted::<ContentMapShape, _>(entries, emit)
 }
 set_builder!(build_retained_set, ObjectId, RetainedSetId, RetainedShape);
+set_builder!(
+    build_projected_commit_set,
+    ProjectedCommit,
+    ProjectedCommitSetId,
+    ProjectedCommitShape
+);

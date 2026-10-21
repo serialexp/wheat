@@ -13,9 +13,9 @@ use wheat_core::{
 };
 use wheat_store::{
     CollectionError, CommitWriterError, ContentMapStore, ContentSetStore, ContentStore,
-    ImmutableObjectStore, ObjectKind, ObjectStoreError, PublicationStore, RepositoryHead,
-    RepositoryPublicationError, RepositoryPublisher, RepositoryReader, RetainedSetStore,
-    ViewLineageMapStore,
+    ImmutableObjectStore, ObjectKind, ObjectStoreError, ProjectedCommitSetStore, PublicationStore,
+    RepositoryHead, RepositoryPublicationError, RepositoryPublisher, RepositoryReader,
+    RetainedSetStore, ViewLineageMapStore,
 };
 
 use crate::{
@@ -376,6 +376,8 @@ where
     let lineage = ViewLineageMapStore::new(objects);
     let view_lineage = lineage.empty_root().await?;
     let view_lineage = lineage.insert_edges(view_lineage, view_edges).await?;
+    // Imported commits are known by their provenance; nothing has been pushed yet.
+    let projected_commits = ProjectedCommitSetStore::new(objects).empty_root().await?;
     let state = RepositoryStateRecord {
         base_view: empty,
         changes,
@@ -385,6 +387,7 @@ where
         retained_views,
         retained_revisions,
         retained_applications,
+        projected_commits,
     };
     objects
         .put_if_absent(state.id().into(), &state.canonical_bytes())

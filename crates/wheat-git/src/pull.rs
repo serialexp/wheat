@@ -4,10 +4,11 @@
 //! from its tip along first parents to the newest commit the workspace's view already
 //! holds. A commit is known either as one the repository imported (its change is the
 //! one the importer derives from the commit ID, and its revision records the commit as
-//! provenance) or as one this store pushed (the projection's commit-keyed refs name the
-//! application). Either way it must be on the view's own path: the application found
-//! must be the one the view holds for that change. Git IDs only recognise commits;
-//! which changes the repository holds is decided by its own records.
+//! provenance) or as one a push projected (the repository state's projected commits
+//! name the application, whichever store pushed it). Either way it must be on the
+//! view's own path: the application found must be the one the view holds for that
+//! change. Git IDs only recognise commits; which changes the repository holds is
+//! decided by its own records.
 //!
 //! The commits above the known one become change proposals, oldest first, exactly as
 //! the importer would write them: one change per first-parent commit, with its edits
@@ -21,21 +22,19 @@ use std::path::Path;
 
 use thiserror::Error;
 use wheat_core::{
-    ApplicationId, ApplicationResultRecord, ChangeId, ChangeProposal, ViewId,
+    ApplicationId, ApplicationResultRecord, ChangeId, ChangeProposal, ProjectedCommitSetId, ViewId,
     edit_application::ApplicationLimits,
 };
 use wheat_store::{
-    ApplicationMapError, ApplicationMapStore, ContentStore, ImmutableObjectStore,
-    RepositoryPublicationError, RepositoryReader, RevisionMapError, RevisionMapStore,
+    ApplicationMapError, ApplicationMapStore, CollectionError, ContentStore, ImmutableObjectStore,
+    ProjectedCommitSetStore, RepositoryPublicationError, RepositoryReader, RevisionMapError,
+    RevisionMapStore,
 };
 
 use crate::{
     StagedImportError,
-    bridge::{
-        BridgeError, ProjectionLock, index_projected_commits, open_or_initialize_bare,
-        projected_applications,
-    },
-    export::{ExportError, ExportLimits, project_tree},
+    bridge::{BridgeError, ProjectionLock, open_or_initialize_bare},
+    export::commit_key,
     push::{PushError, RemoteState, cache_observed_ref, observe_remote_ref},
     staged_import::{commit_proposal, import_application_limits, import_change_id},
 };
@@ -45,14 +44,12 @@ pub struct PullLimits {
     /// New commits one pull imports. Walking past this many without reaching a known
     /// commit is refused.
     pub max_commits: usize,
-    pub export: ExportLimits,
 }
 
 impl Default for PullLimits {
     fn default() -> Self {
         Self {
             max_commits: 10_000,
-            export: ExportLimits::default(),
         }
     }
 }
@@ -62,7 +59,7 @@ impl Default for PullLimits {
 pub enum KnownBy {
     /// The repository imported it.
     Import,
-    /// This store pushed it as `ApplicationId`.
+    /// A push projected `ApplicationId` as it.
     Push(ApplicationId),
 }
 
@@ -91,10 +88,10 @@ pub enum PullError {
     Transport(#[from] PushError),
     #[error("reading the pulled Git commits failed")]
     Import(#[from] StagedImportError),
-    #[error("projecting a pushed Wheat tree failed")]
-    Export(#[from] ExportError),
     #[error("reading the Wheat repository failed")]
     Repository(#[from] RepositoryPublicationError),
+    #[error("reading the Wheat repository failed")]
+    ProjectedCommits(#[from] CollectionError),
     #[error("reading the Wheat repository failed")]
     RevisionMap(#[from] RevisionMapError),
     #[error("reading the Wheat repository failed")]
@@ -122,25 +119,18 @@ pub enum PullError {
          elsewhere in its history; pull into a workspace on the history the commit came from"
     )]
     KnownCommitOffPath { commit: String, change: ChangeId },
-    #[error(
-        "Git commit {commit} was pushed for Wheat application {application}, which holds \
-         tree {expected}, but the commit has tree {actual}"
-    )]
-    MismatchedProjectedTree {
-        commit: String,
-        application: ApplicationId,
-        expected: String,
-        actual: String,
-    },
 }
 
 /// Fetches `branch` from `remote_url` and finds the commits `effective` lacks; see the
-/// module documentation. `projection_path` is the store's Git projection.
+/// module documentation. `projected_commits` is the pinned repository state's, and
+/// `projection_path` the store's Git projection.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn prepare_pull<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
     effective: ViewId,
+    projected_commits: ProjectedCommitSetId,
     projection_path: &Path,
     remote_url: &str,
     branch: &str,
@@ -162,16 +152,14 @@ pub async fn prepare_pull<O: ImmutableObjectStore>(
         .in_scope(|| cache_observed_ref(projection_path, remote_url, branch, &remote_state))?;
     // Open it again after the fetch so its new packs are visible.
     let git = open_or_initialize_bare(projection_path)?;
-    tracing::debug_span!("index_projected_commits").in_scope(|| index_projected_commits(&git))?;
 
     let reader = RepositoryReader::new(objects, content);
     let view = reader.view(effective).await?;
     let known = Known {
         objects,
         content,
-        git: &git,
+        projected_commits,
         view: &view,
-        limits,
     };
     let mut new_commits = Vec::new();
     let mut commit = remote_tip;
@@ -228,9 +216,8 @@ fn find_commit(git: &gix::Repository, commit: gix::ObjectId) -> Result<gix::Comm
 struct Known<'a, O> {
     objects: &'a O,
     content: &'a ContentStore,
-    git: &'a gix::Repository,
+    projected_commits: ProjectedCommitSetId,
     view: &'a wheat_core::ViewRecord,
-    limits: PullLimits,
 }
 
 impl<O: ImmutableObjectStore> Known<'_, O> {
@@ -290,12 +277,17 @@ impl<O: ImmutableObjectStore> Known<'_, O> {
         Ok(Some(change))
     }
 
-    /// The change this store pushed `commit` for, when the view holds that application.
+    /// The change a push projected as `commit`, when the view holds that application.
     async fn pushed(
         &self,
         commit: gix::ObjectId,
     ) -> Result<Option<(ChangeId, KnownBy)>, PullError> {
-        let candidates = projected_applications(self.git, commit)?;
+        let Some(key) = commit_key(commit) else {
+            return Ok(None);
+        };
+        let candidates = ProjectedCommitSetStore::new(self.objects)
+            .applications(self.projected_commits, key)
+            .await?;
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -305,36 +297,11 @@ impl<O: ImmutableObjectStore> Known<'_, O> {
         for candidate in candidates {
             let application = reader.application(candidate).await?;
             let change = reader.revision(application.revision_id).await?.change_id;
-            if applications.get(self.view.applications, change).await? != Some(candidate) {
+            if applications.get(self.view.applications, change).await? != Some(candidate)
+                || !matches!(application.result, ApplicationResultRecord::Clean { .. })
+            {
                 elsewhere.get_or_insert(change);
                 continue;
-            }
-            let ApplicationResultRecord::Clean { tree } = application.result else {
-                elsewhere.get_or_insert(change);
-                continue;
-            };
-            let expected = project_tree(
-                self.objects,
-                self.content,
-                self.git,
-                tree,
-                self.limits.export,
-            )
-            .await?;
-            let actual = find_commit(self.git, commit)?
-                .tree_id()
-                .map_err(|error| PullError::Git {
-                    commit: commit.to_string(),
-                    message: error.to_string(),
-                })?
-                .detach();
-            if actual != expected {
-                return Err(PullError::MismatchedProjectedTree {
-                    commit: commit.to_string(),
-                    application: candidate,
-                    expected: expected.to_string(),
-                    actual: actual.to_string(),
-                });
             }
             return Ok(Some((change, KnownBy::Push(candidate))));
         }

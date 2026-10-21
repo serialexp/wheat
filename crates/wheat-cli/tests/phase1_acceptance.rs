@@ -832,9 +832,11 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     assert!(git(Some(&clone), &["ls-files", "-s", "current"]).starts_with("120000 "));
 
     // A fresh process discovers the workspace from a descendant and preserves its exact pin,
-    // authority head, selected change, metadata, and tracked filesystem state.
+    // authority head, selected change, metadata, and tracked filesystem state. The push
+    // above recorded the commits it wrote, advancing the repository one publication past
+    // the workspace's pin.
     let expected_reopened = harness.json_ok(&harness.workspace, &["status"]);
-    assert_eq!(expected_reopened["result"]["authority_advanced"], false);
+    assert_eq!(expected_reopened["result"]["authority_advanced"], true);
     assert_eq!(
         expected_reopened["result"]["changes"],
         serde_json::json!([])
@@ -899,8 +901,13 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         reopened["result"]["effective_view"]
     );
     assert_eq!(
-        reopened["result"]["materialized_head_generation"],
+        reopened["result"]["materialized_head_generation"]
+            .as_u64()
+            .unwrap()
+            + 1,
         reopened["result"]["current_head_generation"]
+            .as_u64()
+            .unwrap()
     );
     assert_eq!(fs::read(&head_path).unwrap(), expected_head);
     assert_eq!(

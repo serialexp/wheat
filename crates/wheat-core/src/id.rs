@@ -113,7 +113,55 @@ digest_id!(ApplicationMapId);
 digest_id!(ConflictSetId);
 digest_id!(ContentSetId);
 digest_id!(RetainedSetId);
+digest_id!(ProjectedCommitSetId);
 digest_id!(ViewLineageMapId);
+
+/// A member of a [`ProjectedCommitSetId`] set: application `application` projects as
+/// the Git SHA-1 commit `commit`. The commit leads, so the members for one commit are
+/// adjacent and a lookup by commit is a short range read.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProjectedCommit([u8; ProjectedCommit::LEN]);
+
+impl ProjectedCommit {
+    /// Bytes of a Git SHA-1 commit ID.
+    pub const COMMIT_LEN: usize = 20;
+    /// Bytes of a member: the commit, then the application.
+    pub const LEN: usize = Self::COMMIT_LEN + 32;
+
+    #[must_use]
+    pub fn new(commit: [u8; Self::COMMIT_LEN], application: ApplicationId) -> Self {
+        let mut bytes = [0; Self::LEN];
+        bytes[..Self::COMMIT_LEN].copy_from_slice(&commit);
+        bytes[Self::COMMIT_LEN..].copy_from_slice(application.as_bytes());
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; Self::LEN] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn commit(&self) -> [u8; Self::COMMIT_LEN] {
+        self.0[..Self::COMMIT_LEN]
+            .try_into()
+            .expect("a member starts with a commit")
+    }
+
+    #[must_use]
+    pub fn application(&self) -> ApplicationId {
+        ApplicationId::from_digest(
+            self.0[Self::COMMIT_LEN..]
+                .try_into()
+                .expect("a member ends with an application"),
+        )
+    }
+}
 
 macro_rules! object_id_from {
     ($($name:ident),+ $(,)?) => {
@@ -145,6 +193,7 @@ object_id_from!(
     ConflictSetId,
     ContentSetId,
     RetainedSetId,
+    ProjectedCommitSetId,
     ViewLineageMapId,
 );
 

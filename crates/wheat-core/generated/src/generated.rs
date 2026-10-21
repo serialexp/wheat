@@ -30,6 +30,7 @@ pub enum WheatObject {
     EditV1(EditV1Output),
     ChangeMapNodeV1(ChangeMapNodeV1Output),
     ViewLineageMapNodeV1(ViewLineageMapNodeV1Output),
+    ProjectedCommitSetNodeV1(ProjectedCommitSetNodeV1Output),
 }
 
 impl WheatObject {
@@ -152,6 +153,7 @@ impl WheatObject {
                 v.retained_views.encode_into(encoder)?;
                 v.retained_revisions.encode_into(encoder)?;
                 v.retained_applications.encode_into(encoder)?;
+                v.projected_commits.encode_into(encoder)?;
             }
             WheatObject::RevisionMapNodeV1(v) => {
                 encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
@@ -298,6 +300,22 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
             }
+            WheatObject::ProjectedCommitSetNodeV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_uint32(v.prefix.len() as u32, Endianness::BigEndian);
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint8(if v.present { 1 } else { 0 });
+                encoder.write_uint32(v.children.len() as u32, Endianness::BigEndian);
+                for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_uint32(v.entries.len() as u32, Endianness::BigEndian);
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
+            }
         }
         Ok(())
     }
@@ -381,6 +399,10 @@ impl WheatObject {
         } else if value == 0x1201 {
             Ok(WheatObject::ViewLineageMapNodeV1(
                 ViewLineageMapNodeV1Output::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x1301 {
+            Ok(WheatObject::ProjectedCommitSetNodeV1(
+                ProjectedCommitSetNodeV1Output::decode_with_decoder(decoder)?,
             ))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
@@ -880,6 +902,34 @@ pub struct RetainedSetId {
 }
 
 impl RetainedSetId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self { digest })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedCommitSetId {
+    pub digest: Digest256,
+}
+
+impl ProjectedCommitSetId {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4606,6 +4656,150 @@ impl RetainedSetChildV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedCommitSetNodeV1Input {
+    pub prefix: Vec<u8>,
+    pub present: bool,
+    pub children: Vec<ProjectedCommitSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedCommitSetNodeV1Output {
+    pub wire_tag: u16,
+    pub prefix: Vec<u8>,
+    pub present: bool,
+    pub children: Vec<ProjectedCommitSetChildV1>,
+    pub entries: Vec<SetEntryV1>,
+}
+
+pub type ProjectedCommitSetNodeV1 = ProjectedCommitSetNodeV1Output;
+
+impl ProjectedCommitSetNodeV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(4865);
+        encoder.write_u32_be(self.prefix.len() as u32);
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_byte(if self.present { 1 } else { 0 });
+        encoder.write_u32_be(self.children.len() as u32);
+        for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.entries.len() as u32);
+        for item in &self.entries {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ProjectedCommitSetNodeV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 4865u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 4865, got {}",
+                wire_tag
+            )));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let prefix = decoder.read_bytes_vec(length)?;
+        let present = decoder.read_byte()? != 0;
+        let length = decoder.read_u32_be()? as usize;
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
+        for _ in 0..length {
+            let item = ProjectedCommitSetChildV1::decode_with_decoder(decoder)?;
+            children.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
+        for _ in 0..length {
+            let item = SetEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            prefix,
+            present,
+            children,
+            entries,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ProjectedCommitSetNodeV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ProjectedCommitSetNodeV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ProjectedCommitSetNodeV1Output> for ProjectedCommitSetNodeV1Input {
+    fn from(o: ProjectedCommitSetNodeV1Output) -> Self {
+        Self {
+            prefix: o.prefix,
+            present: o.present,
+            children: o.children,
+            entries: o.entries,
+        }
+    }
+}
+
+impl From<ProjectedCommitSetNodeV1Input> for ProjectedCommitSetNodeV1Output {
+    fn from(i: ProjectedCommitSetNodeV1Input) -> Self {
+        Self {
+            wire_tag: 4865u16,
+            prefix: i.prefix,
+            present: i.present,
+            children: i.children,
+            entries: i.entries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedCommitSetChildV1 {
+    pub edge: u8,
+    pub child: ProjectedCommitSetId,
+}
+
+impl ProjectedCommitSetChildV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.edge);
+        self.child.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edge = decoder.read_byte()?;
+        let child = ProjectedCommitSetId::decode_with_decoder(decoder)?;
+        Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SetEntryV1 {
     pub suffix: Vec<u8>,
 }
@@ -4647,6 +4841,7 @@ pub struct RepositoryStateV1Input {
     pub retained_views: RetainedSetId,
     pub retained_revisions: RetainedSetId,
     pub retained_applications: RetainedSetId,
+    pub projected_commits: ProjectedCommitSetId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4660,6 +4855,7 @@ pub struct RepositoryStateV1Output {
     pub retained_views: RetainedSetId,
     pub retained_revisions: RetainedSetId,
     pub retained_applications: RetainedSetId,
+    pub projected_commits: ProjectedCommitSetId,
 }
 
 pub type RepositoryStateV1 = RepositoryStateV1Output;
@@ -4681,6 +4877,7 @@ impl RepositoryStateV1Input {
         self.retained_views.encode_into(encoder)?;
         self.retained_revisions.encode_into(encoder)?;
         self.retained_applications.encode_into(encoder)?;
+        self.projected_commits.encode_into(encoder)?;
         Ok(())
     }
 }
@@ -4707,6 +4904,7 @@ impl RepositoryStateV1Output {
         let retained_views = RetainedSetId::decode_with_decoder(decoder)?;
         let retained_revisions = RetainedSetId::decode_with_decoder(decoder)?;
         let retained_applications = RetainedSetId::decode_with_decoder(decoder)?;
+        let projected_commits = ProjectedCommitSetId::decode_with_decoder(decoder)?;
         Ok(Self {
             wire_tag,
             base_view,
@@ -4717,6 +4915,7 @@ impl RepositoryStateV1Output {
             retained_views,
             retained_revisions,
             retained_applications,
+            projected_commits,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -4738,6 +4937,7 @@ impl From<RepositoryStateV1Output> for RepositoryStateV1Input {
             retained_views: o.retained_views,
             retained_revisions: o.retained_revisions,
             retained_applications: o.retained_applications,
+            projected_commits: o.projected_commits,
         }
     }
 }
@@ -4754,6 +4954,7 @@ impl From<RepositoryStateV1Input> for RepositoryStateV1Output {
             retained_views: i.retained_views,
             retained_revisions: i.retained_revisions,
             retained_applications: i.retained_applications,
+            projected_commits: i.projected_commits,
         }
     }
 }

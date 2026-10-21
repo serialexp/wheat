@@ -648,6 +648,18 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
         let view_lineage = lineage
             .insert_edges(lineage.empty_root().await?, edges)
             .await?;
+        // A dropped application's commit is no longer recognised: a pull imports it.
+        let projected = crate::ProjectedCommitSetStore::new(self.objects);
+        let mut kept = Vec::new();
+        let mut members = projected.cursor(old.projected_commits).await?;
+        while let Some(member) = members.next().await? {
+            if applications.contains(&member.application()) {
+                kept.push((member, true));
+            }
+        }
+        let projected_commits = projected
+            .update_batch(projected.empty_root().await?, kept)
+            .await?;
         Ok(RepositoryStateRecord {
             base_view: old.base_view,
             changes: old.changes,
@@ -657,6 +669,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
             retained_views,
             retained_revisions,
             retained_applications,
+            projected_commits,
         })
     }
 }

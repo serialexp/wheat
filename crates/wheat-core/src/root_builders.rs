@@ -61,6 +61,10 @@ pub fn build_repository_state_record(
                 .iter()
                 .copied()
                 .map(ObjectId::from),
+            &mut *sink,
+        ),
+        projected_commits: crate::build_projected_commit_set(
+            state.projected_commits.iter().copied(),
             sink,
         ),
     }

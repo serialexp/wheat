@@ -56,6 +56,7 @@ mod repository_hydration;
 mod repository_integration;
 pub use repository_integration::IntegrationOutcome;
 mod repository_mutation;
+mod repository_projected_commits;
 mod repository_publication;
 mod repository_rebase;
 pub use repository_rebase::RebaseOutcome;
@@ -134,8 +135,9 @@ pub use revision_map::{
 };
 pub use sets::{
     CollectionError, ConflictSetCursor, ConflictSetStore, ContentSetCursor, ContentSetDelta,
-    ContentSetDeltaLimits, ContentSetStore, RetainedSetCursor, RetainedSetDelta,
-    RetainedSetDeltaLimits, RetainedSetStore,
+    ContentSetDeltaLimits, ContentSetStore, ProjectedCommitSetCursor, ProjectedCommitSetDelta,
+    ProjectedCommitSetStore, RetainedSetCursor, RetainedSetDelta, RetainedSetDeltaLimits,
+    RetainedSetStore,
 };
 pub use view_lineage::{
     ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,

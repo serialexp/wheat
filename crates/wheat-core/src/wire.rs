@@ -8,9 +8,10 @@ use crate::{
     ChangeId, ChangeMapChild, ChangeMapNode, ChangeMetadata, ChangeRevision, Conflict,
     ConflictSetChild, ConflictSetNode, ContentId, ContentMapChild, ContentMapId, ContentMapNode,
     ContentSetChild, ContentSetId, ContentSetNode, DirectoryEntry, DirectoryNode, EditOperation,
-    EditRecord, FileKind, FileValue, RepositoryState, RepositoryView, RetainedSetChild,
-    RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapNode, RevisionMetadata,
-    SourceProvenance, Timestamp, Tree, TreeId, ViewLineageMapChild, ViewLineageMapNode,
+    EditRecord, FileKind, FileValue, ProjectedCommitSetChild, ProjectedCommitSetNode,
+    RepositoryState, RepositoryView, RetainedSetChild, RetainedSetNode, RevisionId,
+    RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId,
+    ViewLineageMapChild, ViewLineageMapNode,
 };
 
 const BLAKE3_256: u8 = 1;
@@ -58,6 +59,7 @@ pub enum CanonicalObjectKind {
     ContentSetNode,
     RetainedSetNode,
     ViewLineageMapNode,
+    ProjectedCommitSetNode,
 }
 
 pub fn validate_canonical_object(
@@ -161,6 +163,9 @@ pub fn decode_repository_state_record(
         retained_views: retained(&v.retained_views)?,
         retained_revisions: retained(&v.retained_revisions)?,
         retained_applications: retained(&v.retained_applications)?,
+        projected_commits: crate::ProjectedCommitSetId::from_digest(digest_domain(
+            &v.projected_commits.digest,
+        )?),
     })
 }
 
@@ -478,6 +483,14 @@ decode_set_node!(
     RetainedSetChild,
     crate::RetainedSetId
 );
+decode_set_node!(
+    decode_projected_commit_set_node,
+    ProjectedCommitSetNodeV1,
+    ProjectedCommitSetNode,
+    ProjectedCommitSetNode,
+    ProjectedCommitSetChild,
+    crate::ProjectedCommitSetId
+);
 
 pub fn decode_content_map_node(bytes: &[u8]) -> Result<ContentMapNode, CanonicalObjectError> {
     let object = decode_validated(bytes)?;
@@ -738,6 +751,23 @@ pub(crate) fn validate_retained_set_node(
         "retained set node",
     )
 }
+pub(crate) fn validate_projected_commit_set_node(
+    node: &ProjectedCommitSetNode,
+) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|suffix| suffix.first().copied())
+        .collect();
+    validate_radix_node(
+        &node.prefix,
+        node.present,
+        &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
+        crate::ProjectedCommit::LEN,
+        "projected commit set node",
+    )
+}
 
 pub(crate) fn view_lineage_map_node_bytes(node: &ViewLineageMapNode) -> Vec<u8> {
     validate_view_lineage_map_node(node)
@@ -877,6 +907,15 @@ set_node_bytes!(
     RetainedSetChildV1,
     retained_set_id,
     RetainedSetNode
+);
+set_node_bytes!(
+    projected_commit_set_node_bytes,
+    validate_projected_commit_set_node,
+    ProjectedCommitSetNodeV1,
+    ProjectedCommitSetNodeV1Input,
+    ProjectedCommitSetChildV1,
+    projected_commit_set_id,
+    ProjectedCommitSetNode
 );
 
 pub(crate) fn directory_node_bytes(node: &DirectoryNode) -> Vec<u8> {
@@ -1205,6 +1244,7 @@ pub(crate) fn repository_state_record_bytes(record: &crate::RepositoryStateRecor
             retained_views: retained_set_id(record.retained_views),
             retained_revisions: retained_set_id(record.retained_revisions),
             retained_applications: retained_set_id(record.retained_applications),
+            projected_commits: projected_commit_set_id(record.projected_commits),
         }
         .into(),
     ))
@@ -1615,6 +1655,21 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "view lineage map node",
             )?;
         }
+        wire::WheatObject::ProjectedCommitSetNodeV1(node) => {
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
+            validate_radix_node(
+                &node.prefix,
+                node.present,
+                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
+                crate::ProjectedCommit::LEN,
+                "projected commit set node",
+            )?;
+        }
         wire::WheatObject::RepositoryStateV1(_) | wire::WheatObject::RepositoryEnvelopeV1(_) => {}
         wire::WheatObject::ViewLabelManifestV1(manifest) => {
             validate_sorted_unique_by(
@@ -1655,6 +1710,9 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ContentSetNodeV1(_) => CanonicalObjectKind::ContentSetNode,
         wire::WheatObject::RetainedSetNodeV1(_) => CanonicalObjectKind::RetainedSetNode,
         wire::WheatObject::ViewLineageMapNodeV1(_) => CanonicalObjectKind::ViewLineageMapNode,
+        wire::WheatObject::ProjectedCommitSetNodeV1(_) => {
+            CanonicalObjectKind::ProjectedCommitSetNode
+        }
     }
 }
 
@@ -1952,6 +2010,11 @@ wire_digest_id!(
 wire_digest_id!(conflict_set_id, crate::ConflictSetId, ConflictSetId);
 wire_digest_id!(content_set_id, ContentSetId, ContentSetId);
 wire_digest_id!(retained_set_id, crate::RetainedSetId, RetainedSetId);
+wire_digest_id!(
+    projected_commit_set_id,
+    crate::ProjectedCommitSetId,
+    ProjectedCommitSetId
+);
 wire_digest_id!(
     view_lineage_map_id,
     crate::ViewLineageMapId,

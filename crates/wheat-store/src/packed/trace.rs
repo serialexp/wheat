@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-const OBJECT_KIND_COUNT: usize = 20;
+use crate::loose::ObjectKind;
+
+const OBJECT_KIND_COUNT: usize = ObjectKind::HIGHEST_CODE as usize;
 
 /// Cumulative packed-store activity captured with bounded, constant-memory counters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

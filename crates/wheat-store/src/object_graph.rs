@@ -24,7 +24,7 @@ use crate::{
     content_map::ContentMapCollection,
     radix::{self, Collection, Key as _, Node},
     revision_map::RevisionCollection,
-    sets::{ConflictCollection, ContentCollection, RetainedCollection},
+    sets::{ConflictCollection, ContentCollection, ProjectedCommitCollection, RetainedCollection},
     view_lineage::ViewLineageCollection,
 };
 
@@ -77,6 +77,7 @@ pub(crate) enum StateSite {
     RetainedRevisions,
     RetainedApplications,
     RequiredContent,
+    ProjectedCommits,
 }
 
 pub(crate) fn state<E>(
@@ -98,6 +99,7 @@ pub(crate) fn state<E>(
             record.retained_applications.into(),
         ),
         (StateSite::RequiredContent, record.required_content.into()),
+        (StateSite::ProjectedCommits, record.projected_commits.into()),
     ] {
         f(Ref::Object(site, id))?;
     }
@@ -353,6 +355,9 @@ pub(crate) enum RadixKind {
     ContentMap,
     /// The state's aggregate: every blob a retained tree, edit or conflict names.
     ContentSet,
+    /// Git commit ‖ the application projecting as it. The application is retained,
+    /// so a member refers to nothing the retained sets do not.
+    ProjectedCommitSet,
 }
 
 impl RadixKind {
@@ -366,6 +371,7 @@ impl RadixKind {
             Self::ViewLineage => ObjectKind::ViewLineageMapNode,
             Self::ContentMap => ObjectKind::ContentMapNode,
             Self::ContentSet => ObjectKind::ContentSetNode,
+            Self::ProjectedCommitSet => ObjectKind::ProjectedCommitSetNode,
         }
     }
 
@@ -379,6 +385,7 @@ impl RadixKind {
             Self::ViewLineage => <ViewLineageCollection as Collection>::Key::LEN,
             Self::ContentMap => <ContentMapCollection as Collection>::Key::LEN,
             Self::ContentSet => <ContentCollection as Collection>::Key::LEN,
+            Self::ProjectedCommitSet => <ProjectedCommitCollection as Collection>::Key::LEN,
         }
     }
 
@@ -392,6 +399,7 @@ impl RadixKind {
             Self::ViewLineage => uniform::<ViewLineageCollection>(bytes),
             Self::ContentMap => uniform::<ContentMapCollection>(bytes),
             Self::ContentSet => uniform::<ContentCollection>(bytes),
+            Self::ProjectedCommitSet => uniform::<ProjectedCommitCollection>(bytes),
         }
     }
 
@@ -402,12 +410,18 @@ impl RadixKind {
     }
 
     /// Whether keys refer to anything. A content collection's keys are blobs, which
-    /// walks gather from the trees, edits and conflicts that name them, so only its
-    /// children are listed.
+    /// walks gather from the trees, edits and conflicts that name them, and a
+    /// projected commit's application is retained, so only their children are listed.
     fn keys_are_references(self) -> bool {
-        !matches!(self, Self::ContentMap | Self::ContentSet)
+        !matches!(
+            self,
+            Self::ContentMap | Self::ContentSet | Self::ProjectedCommitSet
+        )
     }
 }
+
+/// The longest key of any radix collection: a projected commit's.
+pub(crate) const MAX_KEY_LEN: usize = wheat_core::ProjectedCommit::LEN;
 
 /// A radix value as an object reference, if it is one.
 trait RadixValue {
@@ -580,7 +594,8 @@ where
                         | StateSite::RetainedChanges
                         | StateSite::RetainedViews
                         | StateSite::RetainedRevisions
-                        | StateSite::RetainedApplications => Reference::RadixRoot(id),
+                        | StateSite::RetainedApplications
+                        | StateSite::ProjectedCommits => Reference::RadixRoot(id),
                     },
                     Ref::Content(id) => Reference::Content(id),
                 })
@@ -631,6 +646,9 @@ where
         }
         ObjectKind::ContentMapNode => follow_radix(RadixKind::ContentMap, stored, radix_path, f),
         ObjectKind::ContentSetNode => follow_radix(RadixKind::ContentSet, stored, radix_path, f),
+        ObjectKind::ProjectedCommitSetNode => {
+            follow_radix(RadixKind::ProjectedCommitSet, stored, radix_path, f)
+        }
     }
 }
 
@@ -648,7 +666,7 @@ where
     };
     let node = kind.decode(&stored.canonical_bytes)?;
     // Key bytes above each child: `above`, the node's prefix, the edge.
-    let mut path = [0; 32];
+    let mut path = [0; MAX_KEY_LEN];
     let base = above.len() + node.prefix.len();
     radix(kind, stored.id, &node, above, |reference| match reference {
         Ref::Object(RadixSite::Key { .. }, id) => f(if kind == RadixKind::ViewLineage {

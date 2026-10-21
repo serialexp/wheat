@@ -976,8 +976,8 @@ Pulling from Git (2026-10-21; acceptance test
 `crates/wheat-cli/tests/git_round_trip.rs`). Bart chose `wheat pull <git-url>`:
 the explicit reconciliation above. It imports only the commits the store doesn't
 know yet, walking back from the remote tip to a known commit: one imported earlier
-(its recorded Git provenance) or one this store pushed (its projection mapping),
-so Wheat's own pushed changes come back as the same changes. Unpushed Wheat
+(its recorded Git provenance) or one a push recorded (see below), so Wheat's own
+pushed changes come back as the same changes. Unpushed Wheat
 changes are then reapplied on top of the new Git commits, as `git pull --rebase`
 would, so the next push fast-forwards and leaves the other commits exactly as
 they were pushed. Bart's further choices:
@@ -988,9 +988,25 @@ they were pushed. Bart's further choices:
   as native pull does. Pull requires the label to have a single frontier;
 - merges are imported first parent only: one change per first-parent commit, with
   edits against the first parent, so the merge commit itself round-trips;
-- commits this store pushed are recognised through commit-keyed reverse refs that
-  push writes beside `refs/wheat/applications/*`; the Wheat tree is re-hashed and
-  compared with the commit's, as push does;
+- pushed commits are recognised through the repository state's projected commits
+  (2026-10-21, replacing reverse refs in the projection). Bart chose to record them
+  in the Wheat store, in the state, as "application A projects as commit C": a set
+  of 52-byte members, the 20-byte Git commit then the application ID, so the
+  applications of one commit are a range read. Push records each native commit it
+  writes before Git has it; export is deterministic, so a failed push records
+  nothing false. Every member's application must be retained (full and transition
+  validation check it), a union joins both sides' members, a squash drops the
+  members of the applications it drops, and removing a member is non-monotonic.
+  The record travels with the state over `wheat://`, so losing the disposable
+  projection, or pulling in another store, neither duplicates pushed changes nor
+  rewrites them on the next push. The projection keeps no reverse refs and nothing
+  re-hashes trees. Only SHA-1 Git commits are recorded; SHA-256 repositories are
+  not supported. Recording advances the repository head, so `wheat status` reports
+  the repository advanced after a push. An export patches each tree it writes from a
+  seed: first the nearest projected commit at or below the anchor, then the commit
+  it just wrote. Shared subtrees and files keep the seed's Git entries, so a push
+  reads only the paths changed since that commit. Imported commits never seed: import
+  normalises CRLF and modes, so their trees aren't what an export writes;
 - a reapplied change keeps its ID and gets a new revision depending only on the new
   tip, with the author kept and the puller as committer (like `git rebase`). It is
   authored at its old position, so it stays valid, and a reapplication that no

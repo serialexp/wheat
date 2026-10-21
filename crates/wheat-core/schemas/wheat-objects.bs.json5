@@ -38,6 +38,7 @@
         { type: "EditV1", when: "value == 0x1001" },
         { type: "ChangeMapNodeV1", when: "value == 0x1101" },
         { type: "ViewLineageMapNodeV1", when: "value == 0x1201" },
+        { type: "ProjectedCommitSetNodeV1", when: "value == 0x1301" },
       ],
     },
 
@@ -76,6 +77,7 @@
     ConflictSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ContentSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RetainedSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    ProjectedCommitSetId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewLineageMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RepositoryStateId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewLabelManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
@@ -552,6 +554,26 @@
       ],
     },
 
+    // Radix set of 52-byte members: a Git SHA-1 commit ID followed by the
+    // ApplicationId it projects. An application's export is deterministic, so a
+    // member records that the application projects as that commit, wherever and
+    // whenever it is pushed.
+    ProjectedCommitSetNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x1301 },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "present", type: "bool" },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ProjectedCommitSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
+      ],
+    },
+    ProjectedCommitSetChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "ProjectedCommitSetId" },
+      ],
+    },
+
     // Shared inline entry type for set nodes (no value, just suffix).
     SetEntryV1: {
       sequence: [
@@ -571,6 +593,9 @@
         { name: "retained_views", type: "RetainedSetId" },
         { name: "retained_revisions", type: "RetainedSetId" },
         { name: "retained_applications", type: "RetainedSetId" },
+        // The Git commit each pushed application projects as; every member's
+        // application is retained.
+        { name: "projected_commits", type: "ProjectedCommitSetId" },
       ],
     },
 

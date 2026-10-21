@@ -118,10 +118,13 @@ pub fn serve(root: &Path, config: &Path) -> Server {
         config,
         &["init", source.to_str().unwrap()],
     );
-    let store = workspace_store(&source);
+    serve_store(&workspace_store(&source))
+}
 
+/// Serves the repository in `store` as `team/repo`.
+pub fn serve_store(store: &Path) -> Server {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let registry = Registry::single_named("team/repo".to_owned(), &store).unwrap();
+    let registry = Registry::single_named("team/repo".to_owned(), store).unwrap();
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {

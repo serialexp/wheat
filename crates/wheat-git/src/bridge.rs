@@ -6,7 +6,7 @@ use std::{
 };
 
 use thiserror::Error;
-use wheat_core::{ChangeMapId, LabelAnnotation, ViewId};
+use wheat_core::{ChangeMapId, LabelAnnotation, ProjectedCommitSetId, ViewId};
 use wheat_store::{ContentStore, ImmutableObjectStore};
 
 use crate::{
@@ -84,14 +84,19 @@ pub enum BridgeError {
 
 /// Prepare a deterministic Git projection without changing the remote.
 ///
-/// `changes` is the pinned repository state's logical-change map, from which each
-/// commit's message is built.
+/// `changes` and `projected_commits` are the pinned repository state's logical-change
+/// map, from which each commit's message is built, and its projected commits, which
+/// recognise a remote tip this or another store pushed. The caller records the
+/// commits of [`ExportResult::projected`] before publishing them.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn prepare_push<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
     selected: ViewId,
     base: ViewId,
     changes: ChangeMapId,
+    projected_commits: ProjectedCommitSetId,
     projection_path: &Path,
     remote_url: &str,
     destination: &str,
@@ -103,7 +108,7 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
     cache_observed_ref(projection_path, remote_url, destination, &remote_state)?;
 
     let mut options = ExportOptions {
-        projected_anchors: read_projected_anchors(&git)?,
+        projected_commits: Some(projected_commits),
         ..ExportOptions::default()
     };
     if let RemoteState::Present(oid) = &remote_state {
@@ -148,10 +153,6 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         path: projection_path.into(),
         message: error.to_string(),
     })?;
-    index_projected_commits(&git)?;
-    for (application, oid) in &export.applications {
-        record_projection(&git, *application, *oid)?;
-    }
 
     Ok(PreparedPush {
         projection_path: projection_path.into(),
@@ -293,119 +294,6 @@ pub fn publish_prepared(prepared: PreparedPush) -> Result<PushReport, BridgeErro
         }));
     }
     Ok(report)
-}
-
-fn read_projected_anchors(
-    git: &gix::Repository,
-) -> Result<std::collections::BTreeMap<wheat_core::ApplicationId, gix::ObjectId>, BridgeError> {
-    let mut mappings = std::collections::BTreeMap::new();
-    let platform = git.references().map_err(|error| BridgeError::Initialize {
-        path: git.path().into(),
-        message: error.to_string(),
-    })?;
-    let references =
-        platform
-            .prefixed(APPLICATION_REFS)
-            .map_err(|error| BridgeError::Initialize {
-                path: git.path().into(),
-                message: error.to_string(),
-            })?;
-    for reference in references {
-        let reference = reference.map_err(|error| BridgeError::Initialize {
-            path: git.path().into(),
-            message: error.to_string(),
-        })?;
-        let name = reference.name().as_bstr().to_string();
-        let Some(application) = name.strip_prefix(APPLICATION_REFS) else {
-            continue;
-        };
-        let Ok(application) = application.parse() else {
-            continue;
-        };
-        let target = reference.target();
-        let Some(oid) = target.try_id() else {
-            continue;
-        };
-        let oid = oid.to_owned();
-        if git.find_commit(oid).is_ok() {
-            mappings.insert(application, oid);
-        }
-    }
-    Ok(mappings)
-}
-
-/// Records that `application` was projected as `commit`, under both keys: the
-/// application ref push anchors on, and a commit-keyed ref a pull looks a remote commit
-/// up by, `refs/wheat/commits/<commit>/<application>`. Several applications may project
-/// to one commit, since commits are deterministic.
-fn record_projection(
-    git: &gix::Repository,
-    application: wheat_core::ApplicationId,
-    commit: gix::ObjectId,
-) -> Result<(), BridgeError> {
-    for name in [
-        format!("{APPLICATION_REFS}{application}"),
-        format!("{COMMIT_REFS}{commit}/{application}"),
-    ] {
-        git.reference(
-            name,
-            commit,
-            gix::refs::transaction::PreviousValue::Any,
-            "record Wheat application projection",
-        )
-        .map_err(|error| BridgeError::Initialize {
-            path: git.path().into(),
-            message: error.to_string(),
-        })?;
-    }
-    Ok(())
-}
-
-const APPLICATION_REFS: &str = "refs/wheat/applications/";
-const COMMIT_REFS: &str = "refs/wheat/commits/";
-
-/// Adds the commit-keyed refs to a projection written before they existed: once, when
-/// it has application refs but no commit refs, at the cost of one pass over them.
-pub(crate) fn index_projected_commits(git: &gix::Repository) -> Result<(), BridgeError> {
-    if has_reference(git, COMMIT_REFS)? || !has_reference(git, APPLICATION_REFS)? {
-        return Ok(());
-    }
-    for (application, commit) in read_projected_anchors(git)? {
-        record_projection(git, application, commit)?;
-    }
-    Ok(())
-}
-
-fn has_reference(git: &gix::Repository, prefix: &str) -> Result<bool, BridgeError> {
-    let error = |error: &dyn std::fmt::Display| BridgeError::Initialize {
-        path: git.path().into(),
-        message: error.to_string(),
-    };
-    let platform = git.references().map_err(|e| error(&e))?;
-    let mut references = platform.prefixed(prefix).map_err(|e| error(&e))?;
-    Ok(references.next().is_some())
-}
-
-/// The applications this projection pushed as `commit`.
-pub(crate) fn projected_applications(
-    git: &gix::Repository,
-    commit: gix::ObjectId,
-) -> Result<Vec<wheat_core::ApplicationId>, BridgeError> {
-    let error = |error: &dyn std::fmt::Display| BridgeError::Initialize {
-        path: git.path().into(),
-        message: error.to_string(),
-    };
-    let prefix = format!("{COMMIT_REFS}{commit}/");
-    let platform = git.references().map_err(|e| error(&e))?;
-    let mut applications = Vec::new();
-    for reference in platform.prefixed(prefix.as_str()).map_err(|e| error(&e))? {
-        let reference = reference.map_err(|e| error(&e))?;
-        let name = reference.name().as_bstr().to_string();
-        if let Some(application) = name.strip_prefix(&prefix).and_then(|id| id.parse().ok()) {
-            applications.push(application);
-        }
-    }
-    Ok(applications)
 }
 
 #[derive(Debug)]

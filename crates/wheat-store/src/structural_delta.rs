@@ -180,6 +180,8 @@ enum Role {
     ViewContent,
     /// The state's aggregate content set.
     AggregateContent,
+    /// The state's projected Git commits.
+    ProjectedCommits,
 }
 
 impl Role {
@@ -197,6 +199,7 @@ impl Role {
             Self::ConflictSet => RadixKind::ConflictSet,
             Self::ViewContent => RadixKind::ContentMap,
             Self::AggregateContent => RadixKind::ContentSet,
+            Self::ProjectedCommits => RadixKind::ProjectedCommitSet,
         }
     }
 
@@ -221,13 +224,13 @@ impl Role {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct KeyPath {
     len: u8,
-    bytes: [u8; 32],
+    bytes: [u8; object_graph::MAX_KEY_LEN],
 }
 
 impl KeyPath {
     const ROOT: Self = Self {
         len: 0,
-        bytes: [0; 32],
+        bytes: [0; object_graph::MAX_KEY_LEN],
     };
 
     fn extended(&self, tail: &[u8]) -> Self {
@@ -238,8 +241,11 @@ impl KeyPath {
         next
     }
 
+    /// The whole key of a collection with 32-byte keys.
     fn full(&self) -> [u8; 32] {
-        self.bytes
+        self.bytes[..32]
+            .try_into()
+            .expect("a key path holds 32 bytes")
     }
 }
 
@@ -778,6 +784,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                     (Role::Lineage, old_field(|state| state.view_lineage.into()))
                 }
                 StateSite::Changes => (Role::ChangeMap, old_field(|state| state.changes.into())),
+                StateSite::ProjectedCommits => (
+                    Role::ProjectedCommits,
+                    old_field(|state| state.projected_commits.into()),
+                ),
             };
             self.push_radix_root(id, role, old, None)
         })?;
@@ -1048,9 +1058,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Role::ChangeMap => self.push_entity(target, Entity::Change, false),
             Role::RevisionMap => self.push_entity(target, Entity::Revision, false),
             Role::ApplicationMap => self.push_entity(target, Entity::Application, false),
-            // Content keys are blobs, which object_graph does not list as references.
-            Role::ViewContent | Role::AggregateContent => {
-                unreachable!("content collection keys are not references")
+            // Content keys are blobs and projected commits name retained applications,
+            // and object_graph lists neither as references.
+            Role::ViewContent | Role::AggregateContent | Role::ProjectedCommits => {
+                unreachable!("content and projected commit keys are not references")
             }
         }
     }

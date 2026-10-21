@@ -70,9 +70,11 @@ fn pushed_and_pulled_git_history_round_trips() {
     );
 
     // Pulling what Wheat just pushed changes nothing.
+    // The push recorded the commits it wrote, which advanced the repository past the
+    // workspace's materialization; the up-to-date pull leaves the workspace alone.
     team.pull();
     assert_eq!(team.change_titles().len(), 5);
-    team.assert_clean();
+    assert_eq!(team.assert_no_work()["authority_advanced"], true);
     team.push();
     assert_eq!(team.remote_history().len(), 5);
 }

@@ -1,6 +1,6 @@
 use crate::{
-    ApplicationMapId, ChangeMapId, ConflictSetId, ContentMapId, ContentSetId, RepositoryStateId,
-    RetainedSetId, RevisionMapId, TreeId, ViewId, ViewLineageMapId, ViewOrder,
+    ApplicationMapId, ChangeMapId, ConflictSetId, ContentMapId, ContentSetId, ProjectedCommitSetId,
+    RepositoryStateId, RetainedSetId, RevisionMapId, TreeId, ViewId, ViewLineageMapId, ViewOrder,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +36,9 @@ pub struct RepositoryStateRecord {
     pub retained_views: RetainedSetId,
     pub retained_revisions: RetainedSetId,
     pub retained_applications: RetainedSetId,
+    /// The Git commit each pushed application projects as. Every member's application
+    /// is in `retained_applications`.
+    pub projected_commits: ProjectedCommitSetId,
 }
 
 impl RepositoryStateRecord {

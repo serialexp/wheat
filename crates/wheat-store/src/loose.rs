@@ -38,9 +38,13 @@ pub enum ObjectKind {
     Edit = 16,
     ChangeMapNode = 17,
     ViewLineageMapNode = 18,
+    ProjectedCommitSetNode = 21,
 }
 
 impl ObjectKind {
+    /// The highest code a kind has; tables indexed by code are this long.
+    pub const HIGHEST_CODE: u8 = Self::ProjectedCommitSetNode as u8;
+
     pub fn from_code(code: u16) -> Option<Self> {
         Some(match code {
             1 => Self::Tree,
@@ -61,6 +65,7 @@ impl ObjectKind {
             16 => Self::Edit,
             17 => Self::ChangeMapNode,
             18 => Self::ViewLineageMapNode,
+            21 => Self::ProjectedCommitSetNode,
             _ => return None,
         })
     }
@@ -87,6 +92,7 @@ impl From<CanonicalObjectKind> for ObjectKind {
             CanonicalObjectKind::Edit => Self::Edit,
             CanonicalObjectKind::ChangeMapNode => Self::ChangeMapNode,
             CanonicalObjectKind::ViewLineageMapNode => Self::ViewLineageMapNode,
+            CanonicalObjectKind::ProjectedCommitSetNode => Self::ProjectedCommitSetNode,
         }
     }
 }

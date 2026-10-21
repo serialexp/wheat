@@ -106,6 +106,7 @@ async fn extend_state(
         retained_views: state.retained_views.clone(),
         retained_revisions: revisions,
         retained_applications: applications,
+        projected_commits: state.projected_commits.clone(),
     };
     let record = build_repository_state_record(&replacement, &mut |object| emitted.push(object));
     for object in emitted {

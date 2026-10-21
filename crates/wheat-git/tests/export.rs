@@ -8,16 +8,17 @@ use gix::bstr::ByteSlice;
 use wheat_core::{
     Actor, Change, ChangeId, ChangeMapId, ChangeMetadata, ChangeObjectId, ChangeProposal, Conflict,
     EditId, EditOperation, EditRecord, EditTransition, FileKind, FileValue, LabelAnnotation,
-    Repository, RevisionEdits, RevisionMetadata, RevisionOutcome, SourceProvenance, Timestamp,
-    Tree, ViewId, ViewRecord,
+    ProjectedCommit, Repository, RevisionEdits, RevisionMetadata, RevisionOutcome,
+    SourceProvenance, Timestamp, Tree, ViewId, ViewRecord,
 };
 use wheat_git::export::{
-    ExportAnchor, ExportError, ExportLimit, ExportOptions, export_revision_history, write_tag,
+    ExportAnchor, ExportError, ExportLimit, ExportOptions, ExportWork, export_revision_history,
+    write_tag,
 };
 use wheat_store::{
     ChangeMapStore, ConflictSetStore, ContentStore, ImmutableObjectStore, LocalPublicationStore,
     LooseObjectStore, PersistedCommit, PersistedCommitWriter, PersistedRepositoryMutator,
-    RepositoryPublisher, RepositoryReader,
+    ProjectedCommitSetStore, RepositoryPublisher, RepositoryReader,
 };
 
 struct Fixture {
@@ -592,7 +593,7 @@ async fn a_tag_object_depends_only_on_commit_name_and_annotation() {
 }
 
 #[tokio::test]
-async fn rejects_a_projected_anchor_whose_tree_does_not_match_its_application() {
+async fn reuses_a_native_anchor_only_when_the_projected_commits_name_it() {
     let fixture = Fixture::new();
     let (base, first, second) = two_revisions(&fixture).await;
     let changes = default_changes(&fixture, &[1, 2]).await;
@@ -608,61 +609,208 @@ async fn rejects_a_projected_anchor_whose_tree_does_not_match_its_application() 
     )
     .await
     .unwrap();
-    assert!(initial.applications.contains_key(&first.application_id));
-    let wrong_tree = git_repo
-        .write_object(&gix::objs::Tree {
-            entries: Vec::new(),
-        })
-        .unwrap()
-        .detach();
-    let signature = gix::actor::Signature {
-        name: "Forged".into(),
-        email: "forged@example.invalid".into(),
-        time: gix::date::Time {
-            seconds: 1_700_000_000,
-            offset: 0,
+    let pushed = initial.applications[&first.application_id];
+    let sets = ProjectedCommitSetStore::new(&fixture.objects);
+    let empty = sets.empty_root().await.unwrap();
+    let recorded = sets
+        .insert(
+            empty,
+            ProjectedCommit::new(pushed.as_bytes().try_into().unwrap(), first.application_id),
+        )
+        .await
+        .unwrap();
+    let export = |projected_commits| {
+        let git_repo = &git_repo;
+        let fixture = &fixture;
+        async move {
+            export_revision_history(
+                &fixture.objects,
+                &fixture.content,
+                second.resulting_view,
+                base,
+                changes,
+                git_repo,
+                &ExportOptions {
+                    anchor: ExportAnchor::Commit(pushed),
+                    projected_commits: Some(projected_commits),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+    };
+
+    let reused = export(recorded).await.unwrap();
+    assert!(reused.projected[0].reused_anchor);
+    assert_eq!(reused.projected[0].application_id, first.application_id);
+    assert_eq!(reused.projected.len(), 2);
+    // Exports are deterministic, so the commit above the anchor is the one written
+    // before.
+    assert_eq!(reused.tip, initial.tip);
+
+    // A native commit no record names is not this history's.
+    assert!(matches!(
+        export(empty).await.unwrap_err(),
+        ExportError::UnmatchedAnchor(anchor) if anchor == pushed
+    ));
+}
+
+#[tokio::test]
+async fn a_projected_anchor_seeds_the_next_tree_so_only_changed_paths_are_read() {
+    const DIRECTORIES: usize = 16;
+    const FILES: usize = 8;
+    let fixture = Fixture::new();
+    let writer = PersistedCommitWriter::new(&fixture.objects, &fixture.content);
+    let base = writer.empty_view().await.unwrap();
+    let mut edits = BTreeMap::new();
+    for directory in 0..DIRECTORIES {
+        for file in 0..FILES {
+            let path = format!("d{directory}/f{file}.txt");
+            let replacement = value(
+                &fixture.content,
+                format!("{path}\n").as_bytes(),
+                FileKind::Regular,
+            );
+            let edit = EditRecord::new(
+                &path,
+                EditOperation::ExactFile {
+                    expected: None,
+                    replacement: Some(replacement),
+                },
+            )
+            .unwrap();
+            edits.insert(edit.id(), edit);
+        }
+    }
+    let added = edits.keys().copied().collect();
+    let wide = ChangeProposal {
+        id: ChangeId::from_bytes([1; 16]),
+        metadata: Default::default(),
+        dependencies: BTreeSet::new(),
+        revision_metadata: metadata("many files\n", 1_700_000_000),
+        edits: RevisionEdits {
+            edits,
+            transition: EditTransition {
+                added,
+                ..Default::default()
+            },
         },
     };
-    let forged = git_repo
-        .write_object(&gix::objs::Commit {
-            tree: wrong_tree,
-            parents: Default::default(),
-            author: signature.clone(),
-            committer: signature,
-            encoding: None,
-            message: "forged mapping\n".into(),
-            extra_headers: Vec::new(),
-        })
-        .unwrap()
-        .detach();
-
-    let error = export_revision_history(
+    let first = writer.write(base, wide).await.unwrap();
+    let changed = "d3/f5.txt";
+    let second = writer
+        .write(
+            first.resulting_view,
+            proposal(
+                2,
+                Some(first.change_id),
+                changed,
+                Some(value(
+                    &fixture.content,
+                    format!("{changed}\n").as_bytes(),
+                    FileKind::Regular,
+                )),
+                Some(value(&fixture.content, b"changed\n", FileKind::Regular)),
+                metadata("one file\n", 1_700_000_100),
+            ),
+        )
+        .await
+        .unwrap();
+    let changes = default_changes(&fixture, &[1, 2]).await;
+    let (_complete_dir, complete_repo) = bare();
+    let complete = export_revision_history(
         &fixture.objects,
         &fixture.content,
         second.resulting_view,
         base,
         changes,
-        &git_repo,
+        &complete_repo,
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    let pushed = complete.applications[&first.application_id];
+    let sets = ProjectedCommitSetStore::new(&fixture.objects);
+    let recorded = sets
+        .insert(
+            sets.empty_root().await.unwrap(),
+            ProjectedCommit::new(pushed.as_bytes().try_into().unwrap(), first.application_id),
+        )
+        .await
+        .unwrap();
+    // A projection holding only the pushed commit, as one fetched from the remote.
+    let (_seeded_dir, seeded_repo) = bare();
+    git(
+        seeded_repo.path(),
+        &[
+            "fetch",
+            complete_repo.path().to_str().unwrap(),
+            &format!("{pushed}:refs/heads/pushed"),
+        ],
+    );
+
+    let seeded = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        second.resulting_view,
+        base,
+        changes,
+        &seeded_repo,
         &ExportOptions {
-            anchor: ExportAnchor::Commit(forged),
-            projected_anchors: BTreeMap::from([(first.application_id, forged)]),
+            anchor: ExportAnchor::Commit(pushed),
+            projected_commits: Some(recorded),
             ..Default::default()
         },
     )
     .await
+    .unwrap();
+
+    // The commit is the one a complete export writes, read from the changed directory
+    // and the root, each with the seed's, and the changed file: not from every
+    // directory and file.
+    assert_eq!(seeded.tip, complete.tip);
+    assert_eq!(
+        seeded.work,
+        ExportWork {
+            trees_read: 4,
+            contents_read: 1,
+        }
+    );
+    // The first commit of a complete export has no seed: every file is read.
+    assert_eq!(complete.work.contents_read, DIRECTORIES * FILES + 1);
+    assert_eq!(
+        git(seeded_repo.path(), &["fsck", "--strict", "--no-dangling"]),
+        ""
+    );
+}
+
+#[tokio::test]
+async fn a_base_the_selected_view_does_not_descend_from_is_disconnected() {
+    let fixture = Fixture::new();
+    let (_, first, second) = two_revisions(&fixture).await;
+    let changes = default_changes(&fixture, &[1, 2]).await;
+    let (_git_dir, git_repo) = bare();
+
+    let error = export_revision_history(
+        &fixture.objects,
+        &fixture.content,
+        first.resulting_view,
+        second.resulting_view,
+        changes,
+        &git_repo,
+        &ExportOptions::default(),
+    )
+    .await
     .unwrap_err();
-    assert!(matches!(
-        error,
-        ExportError::MismatchedProjectedAnchor {
-            application,
-            anchor,
-            actual_tree,
-            expected_tree,
-        } if application == first.application_id
-            && anchor == forged
-            && actual_tree == wrong_tree
-            && expected_tree != wrong_tree
-    ));
+
+    assert!(
+        matches!(
+            error,
+            ExportError::Disconnected { selected, base }
+                if selected == first.resulting_view && base == second.resulting_view
+        ),
+        "{error}"
+    );
 }
 
 #[tokio::test]

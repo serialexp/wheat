@@ -1071,6 +1071,19 @@ where
             .await?;
         self.index_retained(RETAINED_APPLICATIONS, state.retained_applications)
             .await?;
+        // A projected commit names the application it projects; its Git half is
+        // Git's to vouch for.
+        let mut projected = crate::ProjectedCommitSetStore::new(self.reader.objects)
+            .cursor(state.projected_commits)
+            .await?;
+        while let Some(member) = projected.next().await? {
+            if !self
+                .scratch
+                .contains_retained(RETAINED_APPLICATIONS, member.application().into())?
+            {
+                return Err(invalid("projected commit names a non-retained application"));
+            }
+        }
 
         // Verify and index the aggregate once. Subsequent checks are SQL membership only,
         // and raw content is read exactly once for this run.

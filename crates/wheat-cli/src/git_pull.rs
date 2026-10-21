@@ -67,32 +67,33 @@ pub(crate) fn pull(
             )));
         }
     };
+    let (original_git_ref, projected_commits) = runtime.block_on(async {
+        let reader = RepositoryReader::new(&repository.objects, &repository.content);
+        let envelope = reader.envelope(expected.envelope).await?;
+        let labels = reader.view_label_manifest(envelope.labels).await?;
+        let state = reader.state(envelope.state).await?;
+        Ok::<_, anyhow::Error>((
+            labels
+                .labels
+                .get(&label)
+                .and_then(|label| label.original_git_ref.clone()),
+            state.projected_commits,
+        ))
+    })?;
     let branch = match from {
         Some(branch) => branch.to_owned(),
-        None => runtime
-            .block_on(async {
-                let reader = RepositoryReader::new(&repository.objects, &repository.content);
-                let envelope = reader.envelope(expected.envelope).await?;
-                let labels = reader.view_label_manifest(envelope.labels).await?;
-                Ok::<_, anyhow::Error>(
-                    labels
-                        .labels
-                        .get(&label)
-                        .and_then(|label| label.original_git_ref.clone()),
-                )
-            })?
-            .ok_or_else(|| {
-                CliFailure::invalid(format!(
-                    "label {label} was not imported from Git; name the branch to pull with \
-                     --from"
-                ))
-            })?,
+        None => original_git_ref.ok_or_else(|| {
+            CliFailure::invalid(format!(
+                "label {label} was not imported from Git; name the branch to pull with --from"
+            ))
+        })?,
     };
 
     let mut prepared = runtime.block_on(prepare_pull(
         &repository.objects,
         &repository.content,
         effective,
+        projected_commits,
         &projection_path(&context.store_root)?,
         url,
         &branch,

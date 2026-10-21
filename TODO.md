@@ -16,16 +16,17 @@ for `wheat labels` here; incremental-validation step 9):
 - `[ ]` **`wheat push --force-with-lease` counts every exported commit as pushed.**
   Its report says "pushed N commits" for the whole exported chain, not the commits
   the remote lacked.
-- `[ ]` **Git push and pull re-project a whole tree each time (2026-10-21).** Push
-  checks its reused anchor, and pull a commit it recognises as pushed, by writing the
-  Wheat tree into the projection again (`export.rs` `project_tree`/anchor check), so
-  each reads every file of the tree once: O(files), not O(changes). A persisted
-  Wheat-tree → Git-tree map in the projection would make both O(changed paths).
-  `git_pull_incremental` records the cost.
-- `[ ]` **Losing the Git projection duplicates pushed changes on the next pull
-  (2026-10-21).** The commit refs in `projections/git.git` are the only record of
-  which Git commit a native change was pushed as, so a store without them imports
-  its own pushed commits as new changes beside the originals.
+- `[ ]` **A Git push still walks the whole application chain (2026-10-21).**
+  `export.rs` `reconstruct_chain` steps from the selected view down to the base, about
+  11 object reads per change (136 ms at 2,000 changes), before finding the anchor. It
+  could stop at the first view whose application the projected commits name for the
+  remote tip. Push's full validation (`validate_envelope`, 1.8 s there) costs more
+  until incremental-validation step 9.
+- `[ ]` **The first push after an import reads every file (2026-10-21).** With no
+  projected commit in the history there is no seed to patch from, so the first
+  pushed commit's tree is written from scratch (2,001 contents in
+  `git_pull_incremental`). Imported commits can't seed it: import turns CRLF into LF
+  and modes like 100664 into 100644, so their trees aren't what an export writes.
 - `[ ]` **A rebased change the pulled commits already contain is kept as an empty
   change (2026-10-21).** Pull moves every local change above the pulled commits; one
   whose edits are already there (the same fix made in Git) is not dropped as

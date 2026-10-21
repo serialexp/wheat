@@ -6,12 +6,13 @@ use gix::bstr::BString;
 use thiserror::Error;
 use wheat_core::{
     Actor, ApplicationId, ApplicationResultRecord, ChangeId, ChangeMapId, DirectoryEntry, FileKind,
-    RevisionId, Timestamp, TreeId, ViewId,
+    ProjectedCommitSetId, RevisionId, Timestamp, TreeId, ViewId,
     message::{fold_messages, strip_title_line},
 };
 use wheat_store::{
-    ApplicationMapError, ApplicationMapStore, ChangeMapError, ChangeMapStore, ConflictSetStore,
-    ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
+    ApplicationMapDelta, ApplicationMapDeltaLimits, ApplicationMapError, ApplicationMapStore,
+    ChangeMapError, ChangeMapStore, ConflictSetStore, ContentStore, ContentStoreError,
+    ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, ProjectedCommitSetStore,
     RepositoryPublicationError, RepositoryReader,
 };
 
@@ -80,8 +81,10 @@ pub struct ExportOptions {
     pub fallback: ExportFallbackMetadata,
     /// Which already-present Git commit, if any, stands in for the start of the chain.
     pub anchor: ExportAnchor,
-    /// Previously verified projection mappings held outside Wheat's canonical store.
-    pub projected_anchors: BTreeMap<ApplicationId, gix::ObjectId>,
+    /// The repository state's projected commits: the Git commit each pushed
+    /// application projects as. An anchor found here needs no further check, since the
+    /// export that recorded it checked the history below it.
+    pub projected_commits: Option<ProjectedCommitSetId>,
 }
 
 /// The Git commit an export reuses instead of writing the chain up to it.
@@ -108,6 +111,8 @@ pub struct ExportedApplication {
     pub resulting_view: ViewId,
     pub commit_oid: gix::ObjectId,
     pub reused_anchor: bool,
+    /// The applied revision was imported from Git: its provenance names its commit.
+    pub imported: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,6 +122,17 @@ pub struct ExportResult {
     pub revisions: BTreeMap<RevisionId, gix::ObjectId>,
     pub views: BTreeMap<ViewId, gix::ObjectId>,
     pub projected: Vec<ExportedApplication>,
+    pub work: ExportWork,
+}
+
+/// What writing the commits' trees read, which grows with the paths they change rather
+/// than with the tree when the export starts from a projected commit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExportWork {
+    /// Wheat tree nodes read, the seed's included.
+    pub trees_read: usize,
+    /// File contents read to write as Git blobs.
+    pub contents_read: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,8 +167,6 @@ pub enum ExportError {
     Disconnected { selected: ViewId, base: ViewId },
     #[error("application chain contains a cycle at view {0}")]
     Cycle(ViewId),
-    #[error("view {view} has {count} possible producing applications")]
-    AmbiguousApplication { view: ViewId, count: usize },
     #[error("application {application} is inconsistent with view {view}")]
     InconsistentApplication {
         view: ViewId,
@@ -168,15 +182,8 @@ pub enum ExportError {
     MissingAnchor(gix::ObjectId),
     #[error("Git anchor {0} is not the history of the selected chain")]
     UnmatchedAnchor(gix::ObjectId),
-    #[error(
-        "projected Git anchor {anchor} has tree {actual_tree}, expected {expected_tree} for application {application}"
-    )]
-    MismatchedProjectedAnchor {
-        application: ApplicationId,
-        anchor: gix::ObjectId,
-        actual_tree: gix::ObjectId,
-        expected_tree: gix::ObjectId,
-    },
+    #[error("projected-commit read failed")]
+    ProjectedCommits(#[source] wheat_store::CollectionError),
     #[error("Git export failed: {0}")]
     Git(String),
 }
@@ -200,6 +207,7 @@ struct ChainEntry {
 /// One commit is written per projected change application. Its message is
 /// described by [`commit_message`]; author and committer come from the applied
 /// revision.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn export_revision_history<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
@@ -228,24 +236,42 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
             .find_map(|entry| imported_commit(&entry.revision).transpose())
             .transpose()?,
     };
+    let projected = Projected {
+        store: ProjectedCommitSetStore::new(objects),
+        root: options.projected_commits,
+    };
+    // The newest projected commit at or below the anchor seeds the first tree written.
+    let mut seed = None;
     let anchor_index = if let Some(anchor) = anchor {
-        let anchor_commit = git
+        let mut commit = git
             .find_commit(anchor)
             .map_err(|_| ExportError::MissingAnchor(anchor))?;
-        let known = |entry: &ChainEntry, oid: gix::ObjectId| {
-            provenance_matches(&entry.revision, oid)
-                || options.projected_anchors.get(&entry.application) == Some(&oid)
-        };
+        let projected_as_anchor = projected.applications(anchor).await?;
         let index = chain
             .iter()
-            .position(|entry| known(entry, anchor))
+            .position(|entry| {
+                provenance_matches(&entry.revision, anchor)
+                    || projected_as_anchor.contains(&entry.application)
+            })
             .ok_or(ExportError::UnmatchedAnchor(anchor))?;
         // Reusing the anchor stands in for every application before it, so they must
         // be exactly the anchor's first-parent history. Otherwise an application
-        // ordered before an imported commit would silently go unpushed.
-        let mut commit = anchor_commit.clone();
+        // ordered before an imported commit would silently go unpushed. A projected
+        // commit's history was checked by the export that recorded it.
         for position in (0..=index).rev() {
-            if !known(&chain[position], commit.id) {
+            let entry = &chain[position];
+            if projected
+                .applications(commit.id)
+                .await?
+                .contains(&entry.application)
+            {
+                seed = Some(TreeSeed {
+                    wheat: reader.view(entry.result).await?.tree,
+                    git: commit.tree_id().map_err(git_error)?.detach(),
+                });
+                break;
+            }
+            if !provenance_matches(&entry.revision, commit.id) {
                 return Err(ExportError::UnmatchedAnchor(anchor));
             }
             if position > 0 {
@@ -259,29 +285,6 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
                     .map_err(|_| ExportError::UnmatchedAnchor(anchor))?;
             }
         }
-        if options.projected_anchors.get(&chain[index].application) == Some(&anchor) {
-            let view = reader.view(chain[index].result).await?;
-            let mut verification_cache = ObjectCache::default();
-            let expected_tree = write_tree(
-                objects,
-                content,
-                git,
-                view.tree,
-                options.limits,
-                &mut verification_cache,
-                0,
-            )
-            .await?;
-            let actual_tree = anchor_commit.tree_id().map_err(git_error)?.detach();
-            if actual_tree != expected_tree {
-                return Err(ExportError::MismatchedProjectedAnchor {
-                    application: chain[index].application,
-                    anchor,
-                    actual_tree,
-                    expected_tree,
-                });
-            }
-        }
         Some(index)
     } else {
         None
@@ -293,6 +296,7 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
         revisions: BTreeMap::new(),
         views: BTreeMap::new(),
         projected: Vec::new(),
+        work: ExportWork::default(),
     };
     let mut parent = anchor;
     let mut object_cache = ObjectCache::default();
@@ -314,11 +318,16 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
                 content,
                 git,
                 view.tree,
+                seed,
                 options.limits,
                 &mut object_cache,
                 0,
             )
             .await?;
+            seed = Some(TreeSeed {
+                wheat: view.tree,
+                git: tree,
+            });
             let message = messages
                 .commit_message(&reader, entry.change, &entry.revision)
                 .await?;
@@ -332,6 +341,7 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
             )?
         };
         parent = Some(oid);
+        let imported = imported_commit(&entry.revision)?.is_some();
         output.applications.insert(entry.application, oid);
         output.revisions.insert(entry.revision.id(), oid);
         output.views.insert(entry.result, oid);
@@ -343,9 +353,11 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
             resulting_view: entry.result,
             commit_oid: oid,
             reused_anchor,
+            imported,
         });
     }
     output.tip = parent;
+    output.work = object_cache.work;
     Ok(output)
 }
 
@@ -364,6 +376,7 @@ async fn ensure_clean<O: ImmutableObjectStore>(
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn reconstruct_chain<O: ImmutableObjectStore>(
     reader: &RepositoryReader<'_, O>,
     objects: &O,
@@ -387,58 +400,38 @@ async fn reconstruct_chain<O: ImmutableObjectStore>(
         }
         ensure_clean(reader, objects, current).await?;
         let view = reader.view(current).await?;
-        let mut cursor = ApplicationMapStore::new(objects)
-            .cursor(view.applications)
-            .await?;
-        let mut candidates = Vec::new();
-        while let Some((change, application_id)) = cursor.next().await? {
-            let application = reader.application(application_id).await?;
-            if let ApplicationResultRecord::Clean { tree } = application.result
-                && tree == view.tree
-            {
-                let target = reader.view(application.target_view).await?;
-                if application_map_is_predecessor(
-                    objects,
-                    target.applications,
-                    view.applications,
-                    change,
-                    application_id,
-                    limits.max_applications,
-                )
-                .await?
-                {
-                    candidates.push((change, application_id, application));
-                }
-            }
-        }
-        if candidates.len() != 1 {
-            if candidates.is_empty() {
-                return Err(ExportError::Disconnected { selected, base });
-            }
-            return Err(ExportError::AmbiguousApplication {
-                view: current,
-                count: candidates.len(),
-            });
-        }
-        let (change, application_id, application) = candidates.pop().expect("one candidate");
-        let target = reader.view(application.target_view).await?;
-        if ApplicationMapStore::new(objects)
+        // A view is the target of its last change's application with that application
+        // added, so the chain steps from each view to that target.
+        let Some(change) = view.order.last else {
+            return Err(ExportError::Disconnected { selected, base });
+        };
+        let application_id = ApplicationMapStore::new(objects)
             .get(view.applications, change)
             .await?
-            != Some(application_id)
-            || target.tree == view.tree && application.target_view == current
+            .ok_or(ExportError::Disconnected { selected, base })?;
+        let inconsistent = || ExportError::InconsistentApplication {
+            view: current,
+            application: application_id,
+        };
+        let application = reader.application(application_id).await?;
+        if application.result != (ApplicationResultRecord::Clean { tree: view.tree }) {
+            return Err(inconsistent());
+        }
+        let target = reader.view(application.target_view).await?;
+        if !application_map_is_predecessor(
+            objects,
+            target.applications,
+            view.applications,
+            change,
+            application_id,
+        )
+        .await?
         {
-            return Err(ExportError::InconsistentApplication {
-                view: current,
-                application: application_id,
-            });
+            return Err(inconsistent());
         }
         let revision = reader.revision(application.revision_id).await?;
         if revision.change_id != change {
-            return Err(ExportError::InconsistentApplication {
-                view: current,
-                application: application_id,
-            });
+            return Err(inconsistent());
         }
         reverse.push(ChainEntry {
             change,
@@ -453,43 +446,34 @@ async fn reconstruct_chain<O: ImmutableObjectStore>(
     Ok(reverse)
 }
 
+/// Whether `result_root` is `target_root` with only `added_change` added, as
+/// `added_application`. The diff stops at a second difference, so it reads the path to
+/// that change rather than either map.
 async fn application_map_is_predecessor<O: ImmutableObjectStore>(
     objects: &O,
     target_root: wheat_core::ApplicationMapId,
     result_root: wheat_core::ApplicationMapId,
     added_change: ChangeId,
     added_application: ApplicationId,
-    maximum: usize,
 ) -> Result<bool, ExportError> {
-    let maps = ApplicationMapStore::new(objects);
-    if maps.get(target_root, added_change).await?.is_some() {
-        return Ok(false);
+    let delta = ApplicationMapStore::new(objects)
+        .delta(
+            target_root,
+            result_root,
+            ApplicationMapDeltaLimits {
+                max_changes: 1,
+                ..ApplicationMapDeltaLimits::default()
+            },
+        )
+        .await;
+    match delta {
+        Err(ApplicationMapError::DeltaChangeLimitExceeded { .. }) => Ok(false),
+        delta => Ok(delta?
+            == [ApplicationMapDelta::Added {
+                change: added_change,
+                application: added_application,
+            }]),
     }
-    let mut target = maps.cursor(target_root).await?;
-    let mut result = maps.cursor(result_root).await?;
-    let mut left = target.next().await?;
-    let mut right = result.next().await?;
-    let mut seen = 0usize;
-    while left.is_some() || right.is_some() {
-        seen = seen.saturating_add(1);
-        if seen > maximum.saturating_add(1) {
-            return Err(ExportError::LimitExceeded {
-                limit: ExportLimit::Applications,
-                actual: seen,
-                maximum,
-            });
-        }
-        if right == Some((added_change, added_application)) {
-            right = result.next().await?;
-            continue;
-        }
-        if left != right {
-            return Ok(false);
-        }
-        left = target.next().await?;
-        right = result.next().await?;
-    }
-    Ok(true)
 }
 
 /// The original Git commit of an imported revision, or `None` for a native one.
@@ -514,6 +498,32 @@ fn imported_commit(
         })
 }
 
+/// The state's projected commits, when the caller has them.
+struct Projected<'a, O> {
+    store: ProjectedCommitSetStore<'a, O>,
+    root: Option<ProjectedCommitSetId>,
+}
+
+impl<O: ImmutableObjectStore> Projected<'_, O> {
+    /// The applications that project as `commit`.
+    async fn applications(&self, commit: gix::ObjectId) -> Result<Vec<ApplicationId>, ExportError> {
+        let (Some(root), Some(commit)) = (self.root, commit_key(commit)) else {
+            return Ok(Vec::new());
+        };
+        self.store
+            .applications(root, commit)
+            .await
+            .map_err(ExportError::ProjectedCommits)
+    }
+}
+
+/// The projected-commit key of `commit`; only SHA-1 commits are recorded.
+pub(crate) fn commit_key(
+    commit: gix::ObjectId,
+) -> Option<[u8; wheat_core::ProjectedCommit::COMMIT_LEN]> {
+    commit.as_bytes().try_into().ok()
+}
+
 fn provenance_matches(revision: &wheat_core::RevisionRecord, oid: gix::ObjectId) -> bool {
     revision
         .metadata
@@ -528,34 +538,68 @@ struct ObjectCache {
     contents: BTreeMap<wheat_core::ContentId, gix::ObjectId>,
     entries: usize,
     content_bytes: usize,
+    work: ExportWork,
 }
 
-/// The Git tree `tree` projects to, written into `git`: what a commit holding it would
-/// name. It costs the tree's size, like the anchor check in [`export_revision_history`].
-pub(crate) async fn project_tree<O: ImmutableObjectStore>(
-    objects: &O,
-    content: &ContentStore,
-    git: &gix::Repository,
-    tree: TreeId,
-    limits: ExportLimits,
-) -> Result<gix::ObjectId, ExportError> {
-    write_tree(
-        objects,
-        content,
-        git,
-        tree,
-        limits,
-        &mut ObjectCache::default(),
-        0,
-    )
-    .await
+/// A Wheat tree and the Git tree an export wrote for it. Every subtree and file the
+/// two Wheat trees share keeps the Git entry written for it, so writing a tree reads
+/// only the paths that differ from the seed's.
+///
+/// Only an export's own output is a seed: an imported commit's tree is Git's, and
+/// import normalises text and modes, so its entries need not be what an export
+/// writes.
+#[derive(Clone, Copy)]
+struct TreeSeed {
+    wheat: TreeId,
+    git: gix::ObjectId,
 }
 
+/// The seed's entries for one directory: the Wheat node, and the Git tree's entries
+/// by name.
+struct SeedEntries {
+    wheat: BTreeMap<String, DirectoryEntry>,
+    git: BTreeMap<Vec<u8>, (gix::objs::tree::EntryMode, gix::ObjectId)>,
+}
+
+impl SeedEntries {
+    async fn read<O: ImmutableObjectStore>(
+        objects: &O,
+        git: &gix::Repository,
+        seed: TreeSeed,
+    ) -> Result<Self, ExportError> {
+        let wheat = MerkleTreeStore::new(objects)
+            .read_node(seed.wheat)
+            .await?
+            .entries;
+        let tree = git.find_tree(seed.git).map_err(git_error)?;
+        let git = tree
+            .decode()
+            .map_err(git_error)?
+            .entries
+            .iter()
+            .map(|entry| (entry.filename.to_vec(), (entry.mode, entry.oid.to_owned())))
+            .collect();
+        Ok(Self { wheat, git })
+    }
+
+    /// The seed's Wheat entry and Git entry named `name`.
+    fn get(
+        &self,
+        name: &str,
+    ) -> Option<(&DirectoryEntry, gix::objs::tree::EntryMode, gix::ObjectId)> {
+        let wheat = self.wheat.get(name)?;
+        let (mode, oid) = self.git.get(name.as_bytes())?;
+        Some((wheat, *mode, *oid))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_tree<'a, O: ImmutableObjectStore>(
     objects: &'a O,
     content: &'a ContentStore,
     git: &'a gix::Repository,
     tree_id: TreeId,
+    seed: Option<TreeSeed>,
     limits: ExportLimits,
     cache: &'a mut ObjectCache,
     depth: usize,
@@ -563,6 +607,12 @@ fn write_tree<'a, O: ImmutableObjectStore>(
     Box::pin(async move {
         if let Some(oid) = cache.trees.get(&tree_id) {
             return Ok(*oid);
+        }
+        if let Some(seed) = seed
+            && seed.wheat == tree_id
+        {
+            cache.trees.insert(tree_id, seed.git);
+            return Ok(seed.git);
         }
         if depth > limits.max_tree_depth {
             return Err(ExportError::LimitExceeded {
@@ -572,6 +622,14 @@ fn write_tree<'a, O: ImmutableObjectStore>(
             });
         }
         let node = MerkleTreeStore::new(objects).read_node(tree_id).await?;
+        cache.work.trees_read += 1;
+        let seeded = match seed {
+            Some(seed) => {
+                cache.work.trees_read += 1;
+                Some(SeedEntries::read(objects, git, seed).await?)
+            }
+            None => None,
+        };
         let mut entries = Vec::with_capacity(node.entries.len());
         for (name, value) in node.entries {
             cache.entries = cache.entries.saturating_add(1);
@@ -582,16 +640,38 @@ fn write_tree<'a, O: ImmutableObjectStore>(
                     maximum: limits.max_tree_entries,
                 });
             }
+            let seeded = seeded.as_ref().and_then(|seeded| seeded.get(&name));
             let (mode, oid) = match value {
-                DirectoryEntry::Directory(child) => (
-                    gix::objs::tree::EntryKind::Tree.into(),
-                    write_tree(objects, content, git, child, limits, cache, depth + 1).await?,
-                ),
+                DirectoryEntry::Directory(child) => {
+                    let seed = match seeded {
+                        Some((DirectoryEntry::Directory(wheat), mode, git)) if mode.is_tree() => {
+                            Some(TreeSeed { wheat: *wheat, git })
+                        }
+                        _ => None,
+                    };
+                    (
+                        gix::objs::tree::EntryKind::Tree.into(),
+                        write_tree(objects, content, git, child, seed, limits, cache, depth + 1)
+                            .await?,
+                    )
+                }
                 DirectoryEntry::File(file) => {
-                    let oid = if let Some(oid) = cache.contents.get(&file.content) {
+                    let mode: gix::objs::tree::EntryMode = match file.kind {
+                        FileKind::Regular => gix::objs::tree::EntryKind::Blob,
+                        FileKind::Executable => gix::objs::tree::EntryKind::BlobExecutable,
+                        FileKind::Symlink => gix::objs::tree::EntryKind::Link,
+                    }
+                    .into();
+                    let oid = if let Some((DirectoryEntry::File(seeded), seeded_mode, oid)) = seeded
+                        && *seeded == file
+                        && seeded_mode == mode
+                    {
+                        oid
+                    } else if let Some(oid) = cache.contents.get(&file.content) {
                         *oid
                     } else {
                         let bytes = content.get(file.content)?;
+                        cache.work.contents_read += 1;
                         cache.content_bytes = cache.content_bytes.saturating_add(bytes.len());
                         if cache.content_bytes > limits.max_content_bytes {
                             return Err(ExportError::LimitExceeded {
@@ -607,12 +687,7 @@ fn write_tree<'a, O: ImmutableObjectStore>(
                         cache.contents.insert(file.content, oid);
                         oid
                     };
-                    let mode = match file.kind {
-                        FileKind::Regular => gix::objs::tree::EntryKind::Blob,
-                        FileKind::Executable => gix::objs::tree::EntryKind::BlobExecutable,
-                        FileKind::Symlink => gix::objs::tree::EntryKind::Link,
-                    };
-                    (mode.into(), oid)
+                    (mode, oid)
                 }
             };
             entries.push(gix::objs::tree::Entry {

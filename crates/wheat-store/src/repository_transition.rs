@@ -203,6 +203,37 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             }
         }
 
+        // 7. Delta the projected commits — a new member names a retained application.
+        //    Members leave only with their applications, when history is rewritten.
+        if baseline.projected_commits != proposed.projected_commits {
+            let delta = crate::ProjectedCommitSetStore::new(self.objects)
+                .delta(
+                    baseline.projected_commits,
+                    proposed.projected_commits,
+                    limits,
+                )
+                .await?;
+            for entry in delta {
+                match entry {
+                    crate::ProjectedCommitSetDelta::Added(member) => {
+                        if !retained
+                            .contains(proposed.retained_applications, member.application().into())
+                            .await?
+                        {
+                            return Err(invalid(
+                                "projected commit names a non-retained application",
+                            ));
+                        }
+                    }
+                    crate::ProjectedCommitSetDelta::Removed(_) => {
+                        if !options.allow_non_monotonic {
+                            return Err(invalid("publication drops projected commits"));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }

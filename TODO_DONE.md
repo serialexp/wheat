@@ -46,6 +46,33 @@ Finished items, moved here from `TODO.md` under the same headings.
   `git_round_trip.rs`, `git_pull.rs`; bench case `git_pull_incremental`; design in
   `docs/design/wheat-local-cli.md`, "Pulling from Git".
 
+- `[x]` **Losing the Git projection duplicates pushed changes on the next pull
+  (2026-10-21).** The commit refs in `projections/git.git` were the only record of
+  which Git commit a native change was pushed as. Done 2026-10-21: Bart chose to
+  record "application A projects as commit C" in the repository state, as a
+  `ProjectedCommitSet` (20-byte SHA-1 commit then application ID). Push records the
+  commits before pushing them. The set travels over `wheat://`, is unioned, validated
+  against the retained applications, and filtered by squash. The projection's
+  `refs/wheat/applications/*` and `refs/wheat/commits/*` are gone, and so are the tree
+  re-hash checks. SHA-256 Git repositories are not supported. Tests:
+  `wheat-store/tests/projected_commits.rs`,
+  `pushed_commits_are_recognised_after_the_projection_is_lost`,
+  `another_store_recognises_commits_pushed_from_the_store_it_cloned`.
+
+- `[x]` **Git push and pull re-project a whole tree each time (2026-10-21).** Push
+  checked its reused anchor, and pull a commit it recognised as pushed, by writing the
+  Wheat tree into the projection again, which read every file. Done 2026-10-21. The
+  projected commits replace both checks. The first tree an export writes is patched
+  from the nearest projected commit at or below the anchor, and each later one from
+  the commit before it: unchanged subtrees and files keep their Git entries, so it
+  reads only the paths changed since. The chain walk follows each view's last change
+  instead of scanning every application of every view, which was O(n²). On
+  `git_pull_incremental`'s 2,000-commit side, a push after a pull went from 17.0 s to
+  2.1 s, mostly full validation, and read 21 contents and 6 tree nodes instead of
+  2,001 contents. Push's JSON reports `export.trees_read` and
+  `export.contents_read`; the bench budgets them. Test:
+  `a_projected_anchor_seeds_the_next_tree_so_only_changed_paths_are_read`.
+
 ## Found while scoping the Scion lessons (2026-10-15)
 
 - `[x]` **`catalog.head` and `repack.intent` are hand-encoded.** Both are BinSchema

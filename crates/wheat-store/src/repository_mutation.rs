@@ -94,6 +94,22 @@ impl PreparedRepositoryMutation {
     pub fn content_count(&self) -> usize {
         self.content
     }
+
+    /// A transition to `state` that adds no view: the caller stays on `view`.
+    pub(crate) fn state_only(
+        expected: RepositoryHead,
+        state: RepositoryStateId,
+        view: ViewId,
+    ) -> Self {
+        Self {
+            expected,
+            state,
+            resulting_view: view,
+            objects: 1,
+            content: 0,
+            _sealed: (),
+        }
+    }
 }
 
 pub struct PersistedRepositoryMutator<'a, O, P> {
@@ -1315,6 +1331,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             retained_views,
             retained_revisions,
             retained_applications,
+            projected_commits: old.projected_commits,
         };
         self.objects
             .put_if_absent(state.id().into(), &state.canonical_bytes())

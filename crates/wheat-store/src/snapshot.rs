@@ -526,9 +526,9 @@ struct Visit {
     radix_path: Option<RadixPath>,
 }
 
-/// Key bytes above a radix node. Full keys are 32 bytes, so no path is longer.
+/// Key bytes above a radix node. No path is longer than the longest key.
 struct RadixPath {
-    bytes: [u8; 32],
+    bytes: [u8; crate::object_graph::MAX_KEY_LEN],
     len: usize,
 }
 
@@ -551,8 +551,8 @@ fn encode_place(place: &mut Vec<u8>, radix_path: Option<&[u8]>) {
 fn decode_place(place: &[u8]) -> Result<Option<RadixPath>, SnapshotError> {
     match place {
         [] => Ok(None),
-        [1, path @ ..] if path.len() <= 32 => {
-            let mut bytes = [0; 32];
+        [1, path @ ..] if path.len() <= crate::object_graph::MAX_KEY_LEN => {
+            let mut bytes = [0; crate::object_graph::MAX_KEY_LEN];
             bytes[..path.len()].copy_from_slice(path);
             Ok(Some(RadixPath {
                 bytes,

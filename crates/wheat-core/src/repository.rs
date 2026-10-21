@@ -434,6 +434,8 @@ impl Repository {
             retained_views: self.views.keys().copied().collect(),
             retained_revisions: self.revisions.keys().copied().collect(),
             retained_applications: self.applications.keys().copied().collect(),
+            // A core repository is never pushed; the store records projections.
+            projected_commits: BTreeSet::new(),
         };
         crate::build_repository_state_record(&state, &mut |object: CanonicalObject| {
             insert_canonical_object(&mut objects, object.id, object.bytes);

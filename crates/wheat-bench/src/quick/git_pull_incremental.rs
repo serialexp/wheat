@@ -6,14 +6,20 @@
 //! sides each import a Git history of one-file commits, `early` and `history` long,
 //! make a local change, and pull `pulled` new commits: first onto the imported
 //! history, then, after pushing the local change, onto the pushed commit, which pull
-//! recognises from the projection. The records each pull adds to the store, per
-//! pulled commit, must not grow much from the short history to the long one.
+//! recognises from the commits the push recorded in the repository state. The records
+//! each pull adds to the store, per pulled commit, must not grow much from the short
+//! history to the long one.
 //!
-//! Recognising the pushed commit re-projects its whole tree, as push does for its
-//! anchor, so that pull also reads every file once: `files` files. And, like every
-//! local command until incremental-validation step 9, pull validates the whole
-//! history first (`frontier_service::list`): 2.7 of the long side's 3.2 s on
-//! 2026-10-21, so its wall time is recorded without a budget.
+//! Then a second local change is pushed onto the pulled commits. Its tree is written by
+//! patching the tree of the commit the first push recorded, below them, so it reads
+//! only what changed since: the pulled commits' files and the local one, never the
+//! whole tree. The first push has no recorded commit to start from and reads every
+//! file, which is recorded without a budget.
+//!
+//! Like every local command until incremental-validation step 9, pull validates the
+//! whole history first (`frontier_service::list`): 2.7 of the long side's 3.2 s on
+//! 2026-10-21, and push does too (`validate_envelope`): 1.8 of its 2.4 s. So their wall
+//! times are recorded without a budget.
 
 use std::{fmt::Write as _, fs};
 
@@ -104,10 +110,34 @@ fn pull_side(
     recorder.timing(&format!("{side}.pull"), onto_import.timing);
 
     // Onto the pushed local change.
-    workspace.ok(&["push", url, "--to", "refs/heads/main"])?;
+    let first_push = push(&workspace, url)?;
+    recorder.timing(&format!("{side}.push"), first_push.timing);
+    recorder.value(
+        &format!("{side}.push.contents_read"),
+        first_push.contents_read,
+        "count",
+    );
     fast_import(&source, &commit_stream(commits + pulled, pulled, files))?;
     let onto_push = pull(&workspace, url, pulled, 0)?;
     recorder.timing(&format!("{side}.pull_after_push"), onto_push.timing);
+
+    // Onto the pulled commits.
+    workspace.ok(&["change", "new", "--message", "more local work"])?;
+    workspace.write("more.txt", "more\n")?;
+    workspace.ok(&["add", "more.txt"])?;
+    let after_pull = push(&workspace, url)?;
+    recorder.timing(&format!("{side}.push_after_pull"), after_pull.timing);
+    // Each pulled commit changes one file, and the local change adds one.
+    let changed = pulled + 1;
+    let contents = format!("{side}.push_after_pull.contents_read");
+    recorder.value(&contents, after_pull.contents_read, "count");
+    recorder.at_most(&contents, changed as f64, "count");
+    // Each changed file is under the root, `src` and its own directory, each read with
+    // the seed's.
+    let trees = format!("{side}.push_after_pull.trees_read");
+    recorder.value(&trees, after_pull.trees_read, "count");
+    recorder.at_most(&trees, (2 * (2 + changed)) as f64, "count");
+
     workspace.ok(&["validate"])?;
     ensure!(
         workspace.read("local.txt")? == "local\n",
@@ -149,6 +179,29 @@ fn pull(workspace: &Workspace, url: &str, pulled: usize, rebased: usize) -> Resu
     Ok(Pulled {
         timing: captured.timing,
         records: after - before,
+    })
+}
+
+struct Pushed {
+    timing: crate::measure::Timing,
+    contents_read: f64,
+    trees_read: f64,
+}
+
+/// Pushes the workspace to `url`'s `main` and reports what writing its trees read.
+fn push(workspace: &Workspace, url: &str) -> Result<Pushed> {
+    let captured = workspace.ok(&["--format=json", "push", url, "--to", "refs/heads/main"])?;
+    let document: Value = serde_json::from_slice(&captured.stdout)?;
+    let export = &document["result"]["export"];
+    let count = |field: &str| {
+        export[field]
+            .as_f64()
+            .with_context(|| format!("push reports no export.{field}"))
+    };
+    Ok(Pushed {
+        timing: captured.timing,
+        contents_read: count("contents_read")?,
+        trees_read: count("trees_read")?,
     })
 }
 

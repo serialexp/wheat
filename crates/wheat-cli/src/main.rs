@@ -14,8 +14,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
     ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditFailure, EditTransition,
-    FileKind, FileValue, ObjectId, RepositoryError, RevisionEdits, RevisionId, ViewId,
-    guarded::Limits,
+    FileKind, FileValue, ObjectId, ProjectedCommit, RepositoryError, RevisionEdits, RevisionId,
+    ViewId, guarded::Limits,
 };
 use wheat_store::{
     ApplicationMapStore, BatchObjectStore, ImmutableObjectStore, MerkleTreeStore,
@@ -2285,7 +2285,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
     let _operation = rewrite_transaction::StoreOperationGuard::acquire(root, &local)?;
     let expected = local.heads.read()?;
     let runtime = runtime()?;
-    let (base, selected, changes) = runtime.block_on(async {
+    let (base, selected, state) = runtime.block_on(async {
         let reader = RepositoryReader::new(&local.objects, &local.content);
         let envelope = reader.validate_envelope(expected.envelope).await?;
         let state = reader.state(envelope.state).await?;
@@ -2303,24 +2303,49 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
                 .with_context(|| format!("unknown Wheat label {name}"))?,
             PushSource::View(view) => *view,
         };
-        Ok::<_, anyhow::Error>((state.base_view, selected, state.changes))
+        Ok::<_, anyhow::Error>((state.base_view, selected, state))
     })?;
     let prepared = runtime.block_on(wheat_git::bridge::prepare_push(
         &local.objects,
         &local.content,
         selected,
         base,
-        changes,
+        state.changes,
+        state.projected_commits,
         &projection_path(root)?,
         &arguments.remote,
         &destination,
         arguments.force_with_lease,
     ))?;
-    let actual = local.heads.read()?;
-    if actual != expected {
+    if local.heads.read()? != expected {
         return Err(CliFailure::stale(
             "Wheat repository changed while preparing the Git projection; retry the push",
         ));
+    }
+    // Record how each native application projects before Git has it, so that whatever
+    // happens to the push, a pull recognises the commits wherever this state reaches.
+    let members = prepared
+        .export
+        .projected
+        .iter()
+        .filter(|application| !application.reused_anchor && !application.imported)
+        .filter_map(|application| {
+            let commit = application.commit_oid.as_bytes().try_into().ok()?;
+            Some(ProjectedCommit::new(commit, application.application_id))
+        })
+        .collect::<Vec<_>>();
+    let mutator = PersistedRepositoryMutator::new(&local.objects, &local.content, &local.heads);
+    if let Some(mutation) =
+        runtime.block_on(mutator.record_projected_commits(expected, selected, members))?
+    {
+        let publication = runtime.block_on(prepare_mutation_publication(
+            &local.objects,
+            &local.content,
+            &local.heads,
+            expected,
+            mutation,
+        ))?;
+        finalize_mutation_publication(&local.heads, publication)?;
     }
     let projected = prepared
         .export
@@ -2332,6 +2357,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         .export
         .tip
         .context("projection did not produce a Git commit")?;
+    let work = prepared.export.work;
     let report = wheat_git::bridge::publish_prepared(prepared)?;
     let outcome = report.refs.first().context("git returned no ref status")?;
     let up_to_date = matches!(outcome.status, wheat_git::push::RefStatus::UpToDate);
@@ -2350,6 +2376,10 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
             "tip": tip.to_string(),
             "projected_commits": projected,
             "up_to_date": up_to_date,
+            "export": {
+                "trees_read": work.trees_read,
+                "contents_read": work.contents_read,
+            },
         }),
         human,
     )

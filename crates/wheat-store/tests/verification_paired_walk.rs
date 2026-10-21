@@ -170,6 +170,7 @@ async fn replace_view_in_state<O: ImmutableObjectStore>(
         retained_views: new_retained_views,
         retained_revisions: state.retained_revisions,
         retained_applications: state.retained_applications,
+        projected_commits: state.projected_commits,
     };
     objects
         .put_if_absent(new_state.id().into(), &new_state.canonical_bytes())

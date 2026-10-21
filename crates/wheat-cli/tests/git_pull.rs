@@ -4,10 +4,12 @@
 //! refuses.
 
 mod git_team;
+mod remote_support;
 
 use std::{fmt::Write as _, io::Write as _};
 
 use git_team::{Team, git};
+use remote_support::{serve_store, workspace_store};
 
 /// The newest `wheat log` entry titled `title`.
 fn log_entry(team: &Team, title: &str) -> serde_json::Value {
@@ -174,26 +176,14 @@ fn from_pulls_another_branch() {
     assert_eq!(team.read("f.txt"), "feature\n");
 }
 
-/// The commit refs of a projection pushed before they existed are rebuilt from its
-/// application refs.
+/// The store records which commits its pushes wrote, so losing the Git projection
+/// neither duplicates pushed changes on a pull nor rewrites them on the next push.
 #[test]
-fn pushed_commits_are_recognised_in_a_projection_without_commit_refs() {
+fn pushed_commits_are_recognised_after_the_projection_is_lost() {
     let team = Team::new();
     team.wheat_change("wheat: three", "a.txt", "one\ntwo\nthree\n");
     team.push();
-    let projection = team.projection();
-    let commit_refs = || {
-        git(
-            Some(&projection),
-            &["for-each-ref", "--format=%(refname)", "refs/wheat/commits/"],
-        )
-    };
-    let written = commit_refs();
-    assert!(!written.is_empty());
-    for name in written.lines() {
-        git(Some(&projection), &["update-ref", "-d", name]);
-    }
-    assert_eq!(commit_refs(), "");
+    std::fs::remove_dir_all(team.projection()).unwrap();
     team.bob_commits("bob: add b", "b.txt", "bob\n");
 
     team.pull();
@@ -202,7 +192,74 @@ fn pushed_commits_are_recognised_in_a_projection_without_commit_refs() {
         team.change_titles(),
         ["bob: add b", "first", "second", "wheat: three"]
     );
-    assert_eq!(commit_refs(), written);
+    let pulled = team.remote_main();
+    std::fs::remove_dir_all(team.projection()).unwrap();
+    team.wheat_change("wheat: four", "c.txt", "c\n");
+
+    team.push();
+
+    assert_eq!(
+        git(Some(&team.remote), &["rev-parse", "refs/heads/main^"]),
+        pulled
+    );
+    assert_eq!(
+        team.remote_history(),
+        [
+            "wheat: four",
+            "bob: add b",
+            "wheat: three",
+            "second",
+            "first"
+        ]
+    );
+}
+
+/// A store that got a push's state over wheat:// recognises the pushed commits without
+/// ever having held the projection that wrote them.
+#[test]
+fn another_store_recognises_commits_pushed_from_the_store_it_cloned() {
+    let team = Team::new();
+    team.wheat_change("wheat: three", "a.txt", "one\ntwo\nthree\n");
+    team.push();
+    let pushed = team.remote_main();
+    let server = serve_store(&workspace_store(&team.workspace));
+    let clone = team.root.path().join("clone");
+    team.wheat_ok_in(
+        team.root.path(),
+        &["clone", &server.url, clone.to_str().unwrap()],
+    );
+    drop(server);
+    let bob = team.bob_commits("bob: add b", "b.txt", "bob\n");
+
+    team.wheat_ok_in(&clone, &["pull", team.remote_url()]);
+
+    let log = team.wheat_ok_in(&clone, &["--format=json", "log"]);
+    let log: serde_json::Value = serde_json::from_str(&log).unwrap();
+    let mut titles = log["result"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["change"]["title"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    titles.sort();
+    assert_eq!(titles, ["bob: add b", "first", "second", "wheat: three"]);
+    std::fs::write(clone.join("c.txt"), "c\n").unwrap();
+    team.wheat_ok_in(&clone, &["change", "new", "--message", "clone: add c"]);
+    team.wheat_ok_in(&clone, &["add", "c.txt"]);
+
+    team.wheat_ok_in(
+        &clone,
+        &["push", team.remote_url(), "--to", "refs/heads/main"],
+    );
+
+    assert_eq!(
+        git(Some(&team.remote), &["rev-parse", "refs/heads/main^"]),
+        bob
+    );
+    assert_eq!(
+        git(Some(&team.remote), &["rev-parse", "refs/heads/main^^"]),
+        pushed
+    );
 }
 
 #[test]
@@ -219,39 +276,6 @@ fn a_pushed_commit_revised_since_is_refused() {
     assert_eq!(code, Some(3), "{error:#}");
     assert_eq!(error["code"], "git_history_off_path");
     assert_eq!(team.change_titles(), ["first", "second", "wheat: three"]);
-}
-
-#[test]
-fn a_commit_ref_naming_a_different_tree_is_refused() {
-    let team = Team::new();
-    team.wheat_change("wheat: three", "a.txt", "one\ntwo\nthree\n");
-    team.push();
-    let projection = team.projection();
-    let pushed = team.remote_main();
-    let written = git(
-        Some(&projection),
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            &format!("refs/wheat/commits/{pushed}/"),
-        ],
-    );
-    let application = written.rsplit('/').next().unwrap().to_owned();
-    let bob = team.bob_commits("bob: add b", "b.txt", "bob\n");
-    git(Some(&projection), &["fetch", team.remote_url(), "main"]);
-    git(
-        Some(&projection),
-        &[
-            "update-ref",
-            &format!("refs/wheat/commits/{bob}/{application}"),
-            &bob,
-        ],
-    );
-
-    let (code, error) = team.wheat_error(&["pull", team.remote_url()]);
-
-    assert_eq!(code, Some(6), "{error:#}");
-    assert_eq!(error["code"], "corrupt_git_projection");
 }
 
 #[test]

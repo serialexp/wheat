@@ -51,6 +51,7 @@ fn kind_name(kind: u16) -> &'static str {
             ObjectKind::Edit => "Edit",
             ObjectKind::ChangeMapNode => "ChangeMapNode",
             ObjectKind::ViewLineageMapNode => "ViewLineageMapNode",
+            ObjectKind::ProjectedCommitSetNode => "ProjectedCommitSetNode",
         })
         .unwrap_or("Unknown")
 }

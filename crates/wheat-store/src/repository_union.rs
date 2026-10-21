@@ -17,8 +17,8 @@ use wheat_core::{
 
 use crate::{
     ChangeMapError, ChangeMapStore, CollectionError, ContentSetStore, ImmutableObjectStore,
-    ObjectStoreError, RepositoryPublicationError, RepositoryReader, RetainedSetStore,
-    ViewLineageError, ViewLineageMapStore,
+    ObjectStoreError, ProjectedCommitSetStore, RepositoryPublicationError, RepositoryReader,
+    RetainedSetStore, ViewLineageError, ViewLineageMapStore,
 };
 
 #[derive(Debug, Error)]
@@ -138,6 +138,11 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         let required_content = ContentSetStore::new(self.objects)
             .union(here.required_content, there.required_content)
             .await?;
+        // Each side's members name its own retained applications, so the union's
+        // name the union's.
+        let projected_commits = ProjectedCommitSetStore::new(self.objects)
+            .union(here.projected_commits, there.projected_commits)
+            .await?;
 
         let state = RepositoryStateRecord {
             base_view: here.base_view,
@@ -148,6 +153,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             retained_views,
             retained_revisions,
             retained_applications,
+            projected_commits,
         };
         self.objects
             .put_if_absent(state.id().into(), &state.canonical_bytes())

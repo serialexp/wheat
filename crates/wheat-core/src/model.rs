@@ -802,6 +802,7 @@ pub struct RepositoryState {
     pub retained_views: BTreeSet<ViewId>,
     pub retained_revisions: BTreeSet<RevisionId>,
     pub retained_applications: BTreeSet<ApplicationId>,
+    pub projected_commits: BTreeSet<crate::ProjectedCommit>,
 }
 
 impl RepositoryState {

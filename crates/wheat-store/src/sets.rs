@@ -1,8 +1,10 @@
 use thiserror::Error;
 use wheat_core::{
-    ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId, ContentSetChild,
-    ContentSetId, ContentSetNode, ObjectId, RetainedSetChild, RetainedSetId, RetainedSetNode,
-    decode_conflict_set_node, decode_content_set_node, decode_retained_set_node,
+    ApplicationId, ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode, ContentId,
+    ContentSetChild, ContentSetId, ContentSetNode, ObjectId, ProjectedCommit,
+    ProjectedCommitSetChild, ProjectedCommitSetId, ProjectedCommitSetNode, RetainedSetChild,
+    RetainedSetId, RetainedSetNode, decode_conflict_set_node, decode_content_set_node,
+    decode_projected_commit_set_node, decode_retained_set_node,
 };
 
 use crate::{ImmutableObjectStore, ObjectKind, ObjectStoreError, radix};
@@ -121,6 +123,16 @@ digest_key!(ConflictId);
 digest_key!(ContentId);
 digest_key!(ObjectId);
 
+impl radix::Key for ProjectedCommit {
+    const LEN: usize = ProjectedCommit::LEN;
+    fn bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self::from_bytes(bytes.try_into().expect("radix key length is fixed"))
+    }
+}
+
 macro_rules! set_collection {
     ($collection:ident,$id:ty,$key:ty,$node:ty,$child:ident,$kind:ident,$decode:ident) => {
         pub(crate) struct $collection;
@@ -189,6 +201,15 @@ set_collection!(
     RetainedSetChild,
     RetainedSetNode,
     decode_retained_set_node
+);
+set_collection!(
+    ProjectedCommitCollection,
+    ProjectedCommitSetId,
+    ProjectedCommit,
+    ProjectedCommitSetNode,
+    ProjectedCommitSetChild,
+    ProjectedCommitSetNode,
+    decode_projected_commit_set_node
 );
 
 macro_rules! set_api {
@@ -377,6 +398,74 @@ set_api!(
     ObjectId,
     RetainedSetNode
 );
+
+set_api!(
+    ProjectedCommitSetStore,
+    ProjectedCommitSetCursor,
+    ProjectedCommitCollection,
+    ProjectedCommitSetId,
+    ProjectedCommit,
+    ProjectedCommitSetNode
+);
+
+/// One authenticated membership difference between two projected-commit sets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectedCommitSetDelta {
+    Added(ProjectedCommit),
+    Removed(ProjectedCommit),
+}
+
+impl<S: ImmutableObjectStore> ProjectedCommitSetStore<'_, S> {
+    /// The applications that project as `commit`, in order. Members lead with the
+    /// commit, so only the nodes on the path to it and its own members are read.
+    pub async fn applications(
+        &self,
+        root: ProjectedCommitSetId,
+        commit: [u8; ProjectedCommit::COMMIT_LEN],
+    ) -> Result<Vec<ApplicationId>, CollectionError> {
+        let lowest = ProjectedCommit::new(commit, ApplicationId::from_digest([0; 32]));
+        let mut cursor = self.inner.cursor_from(root, &lowest).await?;
+        let mut applications = Vec::new();
+        while let Some((member, ())) = cursor.next().await? {
+            if member.commit() != commit {
+                break;
+            }
+            applications.push(member.application());
+        }
+        Ok(applications)
+    }
+
+    /// Compare two sets without writing derived collection nodes. Equal subtrees are
+    /// pruned by identity.
+    pub async fn delta(
+        &self,
+        old: ProjectedCommitSetId,
+        new: ProjectedCommitSetId,
+        limits: RetainedSetDeltaLimits,
+    ) -> Result<Vec<ProjectedCommitSetDelta>, CollectionError> {
+        Ok(self
+            .inner
+            .paired_diff(
+                old,
+                new,
+                radix::DiffLimits {
+                    max_changes: limits.max_changes,
+                    max_nodes: limits.max_nodes,
+                    max_pending: limits.max_pending,
+                },
+            )
+            .await?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                radix::DiffEntry::Added(member, ()) => Some(ProjectedCommitSetDelta::Added(member)),
+                radix::DiffEntry::Removed(member, ()) => {
+                    Some(ProjectedCommitSetDelta::Removed(member))
+                }
+                radix::DiffEntry::Changed(_, (), ()) => None,
+            })
+            .collect())
+    }
+}
 
 impl<S: ImmutableObjectStore> RetainedSetStore<'_, S> {
     /// Compare two retained-object sets without writing derived collection nodes.

@@ -84,6 +84,11 @@ impl Team {
     }
 
     pub fn wheat(&self, arguments: &[&str]) -> Output {
+        self.wheat_in(&self.workspace, arguments)
+    }
+
+    /// Runs `wheat` in another workspace of the team's store home.
+    pub fn wheat_in(&self, workspace: &Path, arguments: &[&str]) -> Output {
         let config_home = self.root.path().join("wheat-config");
         std::fs::create_dir_all(config_home.join("wheat")).unwrap();
         std::fs::write(
@@ -93,7 +98,7 @@ impl Team {
         .unwrap();
         Command::new(env!("CARGO_BIN_EXE_wheat"))
             .arg("--workspace")
-            .arg(&self.workspace)
+            .arg(workspace)
             .args(arguments)
             .env("WHEAT_STORE_HOME", self.root.path().join("stores"))
             .env("XDG_CONFIG_HOME", config_home)
@@ -103,7 +108,11 @@ impl Team {
     }
 
     pub fn wheat_ok(&self, arguments: &[&str]) -> String {
-        let output = self.wheat(arguments);
+        self.wheat_ok_in(&self.workspace, arguments)
+    }
+
+    pub fn wheat_ok_in(&self, workspace: &Path, arguments: &[&str]) -> String {
+        let output = self.wheat_in(workspace, arguments);
         assert!(
             output.status.success(),
             "wheat {arguments:?} failed:\n{}{}",
@@ -202,8 +211,15 @@ impl Team {
         std::fs::read_to_string(self.workspace.join(path)).unwrap()
     }
 
-    /// Asserts the workspace holds no uncaptured work.
+    /// Asserts the workspace holds no uncaptured work and was materialized at the
+    /// repository's current head.
     pub fn assert_clean(&self) {
+        let status = self.assert_no_work();
+        assert_eq!(status["authority_advanced"], false, "{status:#}");
+    }
+
+    /// Asserts the workspace holds no uncaptured work, and returns its status.
+    pub fn assert_no_work(&self) -> serde_json::Value {
         let status = self.wheat_json(&["status"]);
         assert_eq!(status["changes"], serde_json::json!([]), "{status:#}");
         let untracked = status["untracked"].as_array().cloned().unwrap_or_default();
@@ -211,6 +227,6 @@ impl Team {
             untracked.iter().all(|entry| entry["ignored"] == true),
             "{status:#}"
         );
-        assert_eq!(status["authority_advanced"], false, "{status:#}");
+        status
     }
 }

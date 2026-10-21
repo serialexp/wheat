@@ -560,10 +560,8 @@ fn classify(error: &Error) -> Classification {
                     class("input", "disconnected_history", false, 2)
                 }
                 ExportError::Cycle(_)
-                | ExportError::AmbiguousApplication { .. }
                 | ExportError::InconsistentApplication { .. }
-                | ExportError::UnknownChange(_)
-                | ExportError::MismatchedProjectedAnchor { .. } => {
+                | ExportError::UnknownChange(_) => {
                     class("integrity", "corrupt_repository", false, 6)
                 }
                 ExportError::Git(_) => class("io", "git_projection_io", true, 8),
@@ -571,6 +569,7 @@ fn classify(error: &Error) -> Classification {
                 | ExportError::ApplicationMap(_)
                 | ExportError::ChangeMap(_)
                 | ExportError::ConflictSet(_)
+                | ExportError::ProjectedCommits(_)
                 | ExportError::Tree(_)
                 | ExportError::Content(_) => continue,
             };
@@ -606,14 +605,11 @@ fn classify(error: &Error) -> Classification {
                 PullError::KnownCommitOffPath { .. } => {
                     class("state", "git_history_off_path", false, 3)
                 }
-                PullError::MismatchedProjectedTree { .. } => {
-                    class("integrity", "corrupt_git_projection", false, 6)
-                }
                 PullError::Git { .. } => class("io", "git_projection_io", true, 8),
                 PullError::Bridge(_)
                 | PullError::Transport(_)
                 | PullError::Import(_)
-                | PullError::Export(_)
+                | PullError::ProjectedCommits(_)
                 | PullError::Repository(_)
                 | PullError::RevisionMap(_)
                 | PullError::ApplicationMap(_) => continue,
