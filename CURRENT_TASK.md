@@ -48,6 +48,16 @@ Plan, Bart chose (a) for the frontier:
    both). `create_on_frontier` reads the tips (done).
 4. Bench `increment_validate` uses `create_on_frontier` like the CLI, records create
    and validate cost at 1k/10k/100k; release run, results committed.
+   **Done** (2d39460, results 02727d3 and 2048232). Validate: ~1 ms and 117/126/151
+   reads at 1k/10k/100k. Building to 100k took 1,073 s; a profile showed full locator
+   rebuilds, because deferred bulk packs left placeholder locator rows for
+   block-compressed records. Fixed in 7ac9690: 438 s now. Mean create is still 2.3 ms
+   at 10k and 6.6 ms at 100k, with spikes up to 0.7 s. What remains is every packed
+   put probing every sealed segment (TODO.md, "Every packed put probes every sealed
+   segment", options for Bart), and ~100–150 KB stored per one-file change (TODO.md).
+
+Next: Bart's pick for the put probe; then incremental-validation steps 7–10 and
+plan 2 (label moves).
 
 ## 2026-10-21: Git push/pull round trip (@calm-lynx)
 
