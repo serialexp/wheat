@@ -52,9 +52,10 @@ jobs:
           if-no-files-found: ignore
 
   # Everything must build for Windows, though workspace file operations refuse to run
-  # there (`just check-windows`).
+  # there (`just check-windows`). Ubuntu 24.04's MinGW-w64 (11) has the Windows
+  # headers mimalloc's C code needs; 22.04's (8) lacks ERROR_COMMITMENT_MINIMUM.
   check-windows:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
