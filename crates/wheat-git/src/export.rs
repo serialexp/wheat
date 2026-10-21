@@ -530,6 +530,27 @@ struct ObjectCache {
     content_bytes: usize,
 }
 
+/// The Git tree `tree` projects to, written into `git`: what a commit holding it would
+/// name. It costs the tree's size, like the anchor check in [`export_revision_history`].
+pub(crate) async fn project_tree<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    git: &gix::Repository,
+    tree: TreeId,
+    limits: ExportLimits,
+) -> Result<gix::ObjectId, ExportError> {
+    write_tree(
+        objects,
+        content,
+        git,
+        tree,
+        limits,
+        &mut ObjectCache::default(),
+        0,
+    )
+    .await
+}
+
 fn write_tree<'a, O: ImmutableObjectStore>(
     objects: &'a O,
     content: &'a ContentStore,

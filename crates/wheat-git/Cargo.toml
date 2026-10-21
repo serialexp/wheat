@@ -10,6 +10,7 @@ libc = { workspace = true }
 lru = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-store = { path = "../wheat-store" }

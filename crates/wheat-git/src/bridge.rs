@@ -61,7 +61,10 @@ pub enum BridgeError {
     Initialize { path: PathBuf, message: String },
     #[error("cannot lock Git projection at {path}: {message}")]
     Lock { path: PathBuf, message: String },
-    #[error("remote {destination} points at unknown commit {oid}; refusing to rewrite it")]
+    #[error(
+        "remote {destination} points at unknown commit {oid}; refusing to rewrite it. If \
+         others pushed to it, `wheat pull` brings their commits in first"
+    )]
     UnknownRemoteTip { destination: String, oid: String },
     #[error("selected Wheat view has no revision applications to project")]
     EmptyProjection,
@@ -145,17 +148,9 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         path: projection_path.into(),
         message: error.to_string(),
     })?;
+    index_projected_commits(&git)?;
     for (application, oid) in &export.applications {
-        git.reference(
-            format!("refs/wheat/applications/{application}"),
-            *oid,
-            gix::refs::transaction::PreviousValue::Any,
-            "record Wheat application projection",
-        )
-        .map_err(|error| BridgeError::Initialize {
-            path: projection_path.into(),
-            message: error.to_string(),
-        })?;
+        record_projection(&git, *application, *oid)?;
     }
 
     Ok(PreparedPush {
@@ -308,19 +303,20 @@ fn read_projected_anchors(
         path: git.path().into(),
         message: error.to_string(),
     })?;
-    let references = platform
-        .prefixed("refs/wheat/applications/")
-        .map_err(|error| BridgeError::Initialize {
-            path: git.path().into(),
-            message: error.to_string(),
-        })?;
+    let references =
+        platform
+            .prefixed(APPLICATION_REFS)
+            .map_err(|error| BridgeError::Initialize {
+                path: git.path().into(),
+                message: error.to_string(),
+            })?;
     for reference in references {
         let reference = reference.map_err(|error| BridgeError::Initialize {
             path: git.path().into(),
             message: error.to_string(),
         })?;
         let name = reference.name().as_bstr().to_string();
-        let Some(application) = name.strip_prefix("refs/wheat/applications/") else {
+        let Some(application) = name.strip_prefix(APPLICATION_REFS) else {
             continue;
         };
         let Ok(application) = application.parse() else {
@@ -338,13 +334,87 @@ fn read_projected_anchors(
     Ok(mappings)
 }
 
+/// Records that `application` was projected as `commit`, under both keys: the
+/// application ref push anchors on, and a commit-keyed ref a pull looks a remote commit
+/// up by, `refs/wheat/commits/<commit>/<application>`. Several applications may project
+/// to one commit, since commits are deterministic.
+fn record_projection(
+    git: &gix::Repository,
+    application: wheat_core::ApplicationId,
+    commit: gix::ObjectId,
+) -> Result<(), BridgeError> {
+    for name in [
+        format!("{APPLICATION_REFS}{application}"),
+        format!("{COMMIT_REFS}{commit}/{application}"),
+    ] {
+        git.reference(
+            name,
+            commit,
+            gix::refs::transaction::PreviousValue::Any,
+            "record Wheat application projection",
+        )
+        .map_err(|error| BridgeError::Initialize {
+            path: git.path().into(),
+            message: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+const APPLICATION_REFS: &str = "refs/wheat/applications/";
+const COMMIT_REFS: &str = "refs/wheat/commits/";
+
+/// Adds the commit-keyed refs to a projection written before they existed: once, when
+/// it has application refs but no commit refs, at the cost of one pass over them.
+pub(crate) fn index_projected_commits(git: &gix::Repository) -> Result<(), BridgeError> {
+    if has_reference(git, COMMIT_REFS)? || !has_reference(git, APPLICATION_REFS)? {
+        return Ok(());
+    }
+    for (application, commit) in read_projected_anchors(git)? {
+        record_projection(git, application, commit)?;
+    }
+    Ok(())
+}
+
+fn has_reference(git: &gix::Repository, prefix: &str) -> Result<bool, BridgeError> {
+    let error = |error: &dyn std::fmt::Display| BridgeError::Initialize {
+        path: git.path().into(),
+        message: error.to_string(),
+    };
+    let platform = git.references().map_err(|e| error(&e))?;
+    let mut references = platform.prefixed(prefix).map_err(|e| error(&e))?;
+    Ok(references.next().is_some())
+}
+
+/// The applications this projection pushed as `commit`.
+pub(crate) fn projected_applications(
+    git: &gix::Repository,
+    commit: gix::ObjectId,
+) -> Result<Vec<wheat_core::ApplicationId>, BridgeError> {
+    let error = |error: &dyn std::fmt::Display| BridgeError::Initialize {
+        path: git.path().into(),
+        message: error.to_string(),
+    };
+    let prefix = format!("{COMMIT_REFS}{commit}/");
+    let platform = git.references().map_err(|e| error(&e))?;
+    let mut applications = Vec::new();
+    for reference in platform.prefixed(prefix.as_str()).map_err(|e| error(&e))? {
+        let reference = reference.map_err(|e| error(&e))?;
+        let name = reference.name().as_bstr().to_string();
+        if let Some(application) = name.strip_prefix(&prefix).and_then(|id| id.parse().ok()) {
+            applications.push(application);
+        }
+    }
+    Ok(applications)
+}
+
 #[derive(Debug)]
-struct ProjectionLock {
+pub(crate) struct ProjectionLock {
     file: File,
 }
 
 impl ProjectionLock {
-    fn acquire(projection: &Path) -> Result<Self, BridgeError> {
+    pub(crate) fn acquire(projection: &Path) -> Result<Self, BridgeError> {
         let file_name = projection.file_name().ok_or_else(|| BridgeError::Lock {
             path: projection.into(),
             message: "projection path has no file name".into(),
@@ -384,7 +454,7 @@ impl Drop for ProjectionLock {
     }
 }
 
-fn open_or_initialize_bare(path: &Path) -> Result<gix::Repository, BridgeError> {
+pub(crate) fn open_or_initialize_bare(path: &Path) -> Result<gix::Repository, BridgeError> {
     if path.exists() {
         return gix::open(path).map_err(|error| BridgeError::Initialize {
             path: path.into(),

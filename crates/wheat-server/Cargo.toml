@@ -12,6 +12,7 @@ async-trait = "0.1"
 blake3 = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+mimalloc = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "io-util"] }
 tokio-tungstenite = "0.28"

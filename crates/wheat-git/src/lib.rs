@@ -7,6 +7,7 @@
 pub mod bridge;
 pub mod export;
 pub mod journal;
+pub mod pull;
 pub mod push;
 mod staged_import;
 pub use staged_import::{

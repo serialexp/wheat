@@ -35,7 +35,7 @@ struct Entry {
 /// Captured content is put in the content store as soon as it is derived. Equal subtree IDs are
 /// skipped without opening the subtree, and only the two directories at the current recursion
 /// depth are materialized at once.
-pub(super) fn tree_edits(
+pub(crate) fn tree_edits(
     git: &gix::Repository,
     commit: &gix::Commit<'_>,
     commit_oid: &[u8],

@@ -35,7 +35,7 @@ pub use atomic::{
 pub use finalize::{
     FinalizeImportError, FinalizePhase, finalize_import, finalize_import_with_observer,
 };
-mod tree_diff;
+pub(crate) mod tree_diff;
 
 // These limits keep cache memory per invocation bounded while accommodating the
 // shared collection nodes seen during staged-import resume.
@@ -56,7 +56,38 @@ const MAX_IMPORT_FILE_BYTES: usize = 64 * 1024 * 1024;
 /// lock file's size. Ordinary source files remain guarded.
 const MAX_IMPORT_GUARDED_LINES: usize = 10_000;
 
-fn import_application_limits() -> ApplicationLimits {
+/// The change a Git commit is imported as: the same in every store.
+pub(crate) fn import_change_id(commit: &[u8]) -> ChangeId {
+    ChangeId::from_import_identity(NAMESPACE, commit)
+}
+
+/// Git commit `commit` as a new change depending on `previous` (its first parent's
+/// change), exactly as the importer writes it: its edits against the first parent, and
+/// its metadata with the commit as provenance. Its content is stored on the way.
+pub(crate) fn commit_proposal(
+    git: &gix::Repository,
+    commit: gix::ObjectId,
+    previous: ChangeId,
+    content: &ContentStore,
+) -> Result<ChangeProposal, StagedImportError> {
+    let object = git.find_commit(commit).map_err(git_error_local)?;
+    let edits = tree_diff::tree_edits(git, &object, commit.as_bytes(), content)?;
+    let parents = object
+        .parent_ids()
+        .map(|parent| parent.detach())
+        .collect::<Vec<_>>();
+    let (metadata, revision_metadata) =
+        metadata(&object, commit.as_bytes(), &parents).map_err(convert_import_error)?;
+    Ok(ChangeProposal {
+        id: import_change_id(commit.as_bytes()),
+        metadata,
+        dependencies: [previous].into(),
+        revision_metadata,
+        edits,
+    })
+}
+
+pub(crate) fn import_application_limits() -> ApplicationLimits {
     ApplicationLimits {
         // Exact replacement replay may authenticate the target plus both old and
         // new identities in one path group. Duplicate IDs are resolved only once.
@@ -284,7 +315,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
         let parents = commit.parent_ids().map(|p| p.detach()).collect::<Vec<_>>();
         let (change_metadata, revision_metadata) =
             metadata(&commit, &work.oid, &parents).map_err(convert_import_error)?;
-        let change_id = ChangeId::from_import_identity(NAMESPACE, &work.oid);
+        let change_id = import_change_id(&work.oid);
         let dependencies = parent_native.map(|p| p.change_id).into_iter().collect();
         let persisted = writer
             .write(
