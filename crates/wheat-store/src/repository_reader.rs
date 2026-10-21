@@ -108,6 +108,37 @@ impl<'a, O: ImmutableObjectStore> RepositoryReader<'a, O> {
         Ok(order)
     }
 
+    /// The application at canonical `position` of `view`'s composition, none when
+    /// `view` has no change there: O(log n) application reads along the skip chain.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn application_at(
+        &self,
+        view: &ViewRecord,
+        position: u64,
+    ) -> Result<Option<(ApplicationId, ApplicationRecord)>> {
+        if position >= view.order.size {
+            return Ok(None);
+        }
+        let mut next = self.producing_application(view).await?;
+        while let Some(id) = next {
+            let record = self.application(id).await?;
+            let Some(gap) = record.order.position.checked_sub(position) else {
+                return Err(order_index_mismatch());
+            };
+            if gap == 0 {
+                return Ok(Some((id, record)));
+            }
+            next = Some(
+                *record
+                    .order
+                    .skip
+                    .get(gap.ilog2() as usize)
+                    .ok_or_else(order_index_mismatch)?,
+            );
+        }
+        Err(order_index_mismatch())
+    }
+
     /// The highest ChangeId at `view`'s canonical positions `from` onwards, none when
     /// there are none: O(log n) application reads.
     #[tracing::instrument(level = "debug", skip_all)]

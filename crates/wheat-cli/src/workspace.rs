@@ -47,7 +47,7 @@ pub(crate) struct AddTarget<'a, 'm, O, P> {
     pub(crate) objects: &'a O,
     pub(crate) store: &'a ContentStore,
     pub(crate) mutator: &'a PersistedRepositoryMutator<'m, O, P>,
-    pub(crate) session: &'a AuthoringSession,
+    pub(crate) session: &'a mut AuthoringSession,
     pub(crate) effective_view: ViewId,
     /// The tree the workspace was materialized from, if any.
     pub(crate) pinned: Option<TreeId>,
@@ -55,7 +55,7 @@ pub(crate) struct AddTarget<'a, 'm, O, P> {
 
 #[tracing::instrument(level = "debug", skip_all, fields(paths = paths.len()))]
 pub(crate) async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>(
-    target: &AddTarget<'_, '_, O, P>,
+    target: &mut AddTarget<'_, '_, O, P>,
     change: ChangeId,
     predecessor: RevisionId,
     paths: &[String],
@@ -370,7 +370,7 @@ struct Placed {
 /// when a move adds such a change, every path is placed again with it.
 #[tracing::instrument(level = "debug", skip_all)]
 async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
-    target: &AddTarget<'_, '_, O, P>,
+    target: &mut AddTarget<'_, '_, O, P>,
     effective_tree: TreeId,
     change: ChangeId,
     selected: &BTreeSet<String>,
@@ -380,7 +380,7 @@ async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
     let (root, store) = (target.root, target.store);
     let later = target
         .mutator
-        .later_edits(target.session, change, selected)
+        .later_edits(&mut *target.session, change, selected)
         .await?;
     let edited = later
         .paths

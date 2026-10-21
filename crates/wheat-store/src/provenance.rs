@@ -13,7 +13,7 @@ use wheat_core::{
 };
 
 use crate::{
-    ApplicationMapStore, AuthoringSession, ContentStore, ImmutableObjectStore, MerkleTreeStore,
+    AuthoringSession, ContentStore, ImmutableObjectStore, MerkleTreeStore,
     PersistedRepositoryMutator, PublicationStore, RepositoryMutationError, RepositoryReader,
 };
 
@@ -127,46 +127,42 @@ impl PathHistory {
 impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_, O, P> {
     /// The edits every change after `change` in canonical order made to `paths`.
     ///
-    /// Only the later changes' applications are read, and an edit record only when its recorded
+    /// The session loads the changes from `change` up, which a revision of `change` in the
+    /// same session then reuses. Beyond those, an edit record is read only when its recorded
     /// target matches the current value of a selected path, so the cost follows the changes
     /// above `change` and the edits that could touch the paths. With `change` on top it reads
     /// nothing beyond the change's own result.
     #[tracing::instrument(level = "debug", skip_all, fields(paths = paths.len()))]
     pub async fn later_edits(
         &self,
-        session: &AuthoringSession,
+        session: &mut AuthoringSession,
         change: ChangeId,
         paths: &BTreeSet<String>,
     ) -> Result<LaterEdits> {
-        let active = &session.active;
-        let order = &active.persisted_order;
-        let position = order
-            .iter()
-            .position(|id| *id == change)
+        let position = self
+            .position_of(&session.active, change)
+            .await?
             .ok_or(RepositoryError::UnknownChange(change))?;
+        self.load_from(&mut session.active, position).await?;
+        let active = &session.active;
+        let mut placed = active
+            .placed
+            .iter()
+            .skip(usize::try_from(position - active.from).unwrap_or(usize::MAX));
+        let own = placed
+            .next()
+            .ok_or(RepositoryError::InvalidRepositoryState(
+                "effective view lacks canonical application",
+            ))?;
         let reader = RepositoryReader::new(self.objects, self.content);
-        let applications = ApplicationMapStore::new(self.objects);
         let trees = MerkleTreeStore::new(self.objects);
         let sorted = paths.iter().map(String::as_str).collect::<Vec<_>>();
 
-        let application = |change: ChangeId| {
-            let applications = &applications;
-            let reader = &reader;
-            async move {
-                let id = applications
-                    .get(active.effective.applications, change)
-                    .await?
-                    .ok_or(RepositoryError::InvalidRepositoryState(
-                        "effective view lacks canonical application",
-                    ))?;
-                Ok::<_, RepositoryMutationError>(reader.application(id).await?)
-            }
-        };
         let resulting_tree = |result: &ApplicationResultRecord| match result {
             ApplicationResultRecord::Clean { tree } => *tree,
             ApplicationResultRecord::Conflicted { partial_tree, .. } => *partial_tree,
         };
-        let below: TreeId = resulting_tree(&application(change).await?.result);
+        let below: TreeId = resulting_tree(&own.application.result);
         let mut history = paths
             .iter()
             .cloned()
@@ -186,8 +182,8 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             .map(|(path, history)| (path.clone(), history.below))
             .collect::<BTreeMap<_, _>>();
 
-        for later in &order[position + 1..] {
-            let record = application(*later).await?;
+        for later in placed {
+            let record = &later.application;
             let values = current.values().copied().collect::<BTreeSet<_>>();
             let failed = match record.result {
                 ApplicationResultRecord::Conflicted { conflict, .. } => {
@@ -238,7 +234,7 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
                     .expect("selected path")
                     .steps
                     .push(PathStep {
-                        change: *later,
+                        change: later.change,
                         revision: record.revision_id,
                         edits,
                         applied,

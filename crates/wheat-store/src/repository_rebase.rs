@@ -24,6 +24,7 @@ use wheat_core::{
 
 use crate::{
     ApplicationMapStore, ImmutableObjectStore, PublicationStore, RepositoryReader,
+    RevisionMapStore,
     repository_mutation::{
         AuthoringSession, Fresh, PendingRevision, PersistedRepositoryMutator,
         PreparedRepositoryMutation, RepositoryMutationError, descendants, topological,
@@ -65,16 +66,22 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             expected,
             mut active,
         } = session;
-        let Some(position) = active.persisted_order.iter().position(|id| *id == onto) else {
+        let Some(position) = self.position_of(&active, onto).await? else {
             return Err(RepositoryError::UnknownChange(onto).into());
         };
         let Some(tip) = appended.last().map(|proposal| proposal.id) else {
             return Err(RepositoryMutationError::NothingToAppend);
         };
+        let selected = RevisionMapStore::new(self.objects);
         let mut previous = onto;
         let mut seen = BTreeSet::new();
         for proposal in &appended {
-            if active.revisions.contains_key(&proposal.id) || !seen.insert(proposal.id) {
+            if !seen.insert(proposal.id)
+                || selected
+                    .get(active.effective.revisions, proposal.id)
+                    .await?
+                    .is_some()
+            {
                 return Err(RepositoryError::DuplicateChange(proposal.id).into());
             }
             if proposal.dependencies != BTreeSet::from([previous]) {
@@ -84,10 +91,9 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             previous = proposal.id;
         }
 
-        let moved = active.persisted_order[position + 1..]
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
+        // Everything above `onto` moves, so it is composed again from there.
+        self.load_from(&mut active, position + 1).await?;
+        let moved = active.order_from(position + 1).collect::<BTreeSet<_>>();
         let roots = moved
             .iter()
             .copied()

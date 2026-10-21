@@ -157,10 +157,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> RepositoryRewriter<'a, O,
                 Err(RepositoryRewriteError::UnexpectedMetadata)
             };
         }
-        let mut active =
-            PersistedRepositoryMutator::new(self.objects, self.content, self.publications)
-                .open(expected, basis_view, effective_view)
-                .await?;
+        // A squash checks and rewrites against the whole selection, so it loads all of it.
+        let opener = PersistedRepositoryMutator::new(self.objects, self.content, self.publications);
+        let mut active = opener.open(expected, basis_view, effective_view).await?;
+        opener.load_from(&mut active, 0).await?;
         let actual: BTreeMap<ChangeId, RevisionId> = active
             .revisions
             .iter()

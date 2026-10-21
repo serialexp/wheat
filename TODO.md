@@ -206,6 +206,13 @@ budget passes, but by only about 0.7 s.
   basis. The lineage only stores parent → children links. Mutations no longer do this
   (see TODO_DONE.md); a fix here likely needs parent links or a frontier index stored
   with the label (option B from the mutation fix, a format change).
+- `[ ]` **The core reference model and `initialize` grow faster than linearly
+  (2026-10-21).** In the debug test profile, building a 32-change chain with
+  `Repository::create_change_with_id` takes 0.3 s, a 256-change chain 35 s; publishing
+  them with `RepositoryPublisher::initialize` takes 2 s and 22 s. Tests that need a
+  long history build it with the mutator instead (`creating_on_top_reads_no_revision_below_it`).
+  Find what in core recomputes the whole history per change, and what `initialize`
+  does per object.
 - `[ ]` **`checkpoint_stack` warm-up (2026-09-26).** A new store's revisions get
   slower over the first ~400 (single change: 1.5 → 2.6 ms, deep: 4.2 → 6.5 ms), then
   stay flat. The profile shows zstd decoding and malloc in the packed store; the cause

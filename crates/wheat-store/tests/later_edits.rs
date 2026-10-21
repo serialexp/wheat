@@ -153,9 +153,9 @@ async fn later_edits_follow_every_change_above_and_skip_the_rest() {
     let d1 = create(d, d_edits.clone()).await;
 
     let paths = BTreeSet::from(["f".to_owned()]);
-    let session = mutator.open_authoring(head, base, effective).await.unwrap();
+    let mut session = mutator.open_authoring(head, base, effective).await.unwrap();
     objects.watch(c_edits.edits.keys().map(|id| (*id).into()).collect());
-    let later = mutator.later_edits(&session, a, &paths).await.unwrap();
+    let later = mutator.later_edits(&mut session, a, &paths).await.unwrap();
     assert_eq!(objects.watched_reads.load(Ordering::Relaxed), 0);
     let history = &later.paths["f"];
     assert_eq!(
@@ -220,7 +220,7 @@ async fn later_edits_follow_every_change_above_and_skip_the_rest() {
         .flat_map(|edits| edits.edits.keys().map(|id| (*id).into()))
         .collect();
     objects.watch(all_edits);
-    let later = mutator.later_edits(&session, d, &paths).await.unwrap();
+    let later = mutator.later_edits(&mut session, d, &paths).await.unwrap();
     assert!(later.paths["f"].steps.is_empty());
     assert_eq!(objects.watched_reads.load(Ordering::Relaxed), 0);
     assert!(objects.reads.load(Ordering::Relaxed) <= 8);

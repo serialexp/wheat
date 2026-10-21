@@ -19,8 +19,21 @@ Plan, Bart chose (a) for the frontier:
    the last dependency whose change ID is higher), so a v7 change on top loads
    nothing. Revise/resolve/rebase/rewrite: from the lowest touched change. Duplicate
    and dependency checks become revision-map lookups.
+   **Done**: `Active` holds `placed` (change + composing application) from `from` up,
+   loaded by `PersistedRepositoryMutator::load_from` along `ApplicationOrder.previous`.
+   Create loads nothing when `highest_change_from(effective, above deps)` is below
+   the new ID, else from above its dependencies; revise from the lowest revised
+   change; rebase from above `onto`; resolve loads nothing (its revise does); squash
+   loads all. `later_edits` takes the session `&mut` and loads from the change, which
+   the revise in the same session reuses. Tests in `repository_mutation.rs`
+   (`creating_on_top_reads_no_revision_below_it` and two more).
 2. `descends` walks composition parents from the effective view down to the basis's
    weight: cost = changes since the basis.
+   **Done, cheaper than planned**: the view the effective view was composed through
+   at the basis's size is the target of the application at that position, found by
+   `RepositoryReader::application_at` along the skip chain (O(log n)); every
+   composition parent has a lineage edge (I1), so no path check. `follows_path` is
+   gone. Fallback is the forward search, as before.
 3. Store the dependency frontier ("tips": selected changes no other selected change
    depends on) on each view as a new radix set (format change in place, modelled on
    `ProjectedCommitSet` in 9b5794e). `apply_step`: tips' = tips - deps + {change}.
@@ -32,7 +45,7 @@ Plan, Bart chose (a) for the frontier:
    read per added change: the new view IDs reshaped the hash-keyed radix sets
    (retained, lineage), which grow with log of history, and tipped a fixed +16 slack
    (89 → 107 reads at 24 → 192 changes, 136 at 1,536; tips themselves read 3 at
-   both). `create_on_frontier` still builds the graph: next.
+   both). `create_on_frontier` reads the tips (done).
 4. Bench `increment_validate` uses `create_on_frontier` like the CLI, records create
    and validate cost at 1k/10k/100k; release run, results committed.
 

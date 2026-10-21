@@ -460,37 +460,10 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
         Ok(())
     }
 
-    /// Whether every two consecutive views in `path` are the same view or joined by a
-    /// lineage edge, which proves the last view descends from (or is) the first.
-    ///
-    /// One map lookup and one child-set lookup per hop, so the cost follows the path's
-    /// length rather than the size of the lineage. A `false` only means this path is not
-    /// in the lineage; another path may still connect the two ends.
-    pub async fn follows_path(
-        &self,
-        root: ViewLineageMapId,
-        path: &[ViewId],
-    ) -> Result<bool, ViewLineageError> {
-        for hop in path.windows(2) {
-            let (parent, child) = (hop[0], hop[1]);
-            if parent == child {
-                continue;
-            }
-            let Some(children) = self.inner.get(root, parent).await? else {
-                return Ok(false);
-            };
-            if !self.retained.contains(children, child.into()).await? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     /// Whether `descendant` is reachable from `ancestor` by a forward search.
     ///
     /// The search visits every view below `ancestor` in the worst case, so its cost grows
-    /// with the history under `ancestor`. Prefer [`Self::follows_path`] when a candidate
-    /// path is known.
+    /// with the history under `ancestor`.
     pub async fn is_descendant(
         &self,
         root: ViewLineageMapId,

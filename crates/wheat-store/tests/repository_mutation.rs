@@ -1056,3 +1056,225 @@ async fn a_mutation_refuses_an_effective_view_outside_the_basis_lineage() {
     }
     assert_eq!(heads.read().unwrap(), head);
 }
+
+/// A published chain of changes, each depending on the one before.
+struct PublishedChain {
+    _dir: tempfile::TempDir,
+    objects: CountingStore,
+    content: ContentStore,
+    heads: LocalPublicationStore,
+    reference: Repository,
+    base: ViewId,
+    effective: ViewId,
+    head: RepositoryHead,
+    /// Each change in canonical order, with its revision and its one edit.
+    changes: Vec<(ChangeId, RevisionId, EditId)>,
+}
+
+/// The ID of the chain's change at `position`: `2, 4, 6, ...`, so that a change can be
+/// given an ID between any two.
+fn chain_id(position: usize) -> ChangeId {
+    ChangeId::from_bytes((2 * (position as u128 + 1)).to_be_bytes())
+}
+
+async fn published_chain(length: usize) -> PublishedChain {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = CountingStore::new(LooseObjectStore::new(dir.path().join("objects")));
+    let content = ContentStore::new(dir.path().join("content"));
+    let heads = LocalPublicationStore::new(dir.path().join("head"));
+    let mut reference = Repository::new(Tree::new());
+    let base = reference.base_view().id;
+    let mut effective = base;
+    let mut changes = Vec::with_capacity(length);
+    let mut previous = None;
+    for position in 0..length {
+        let change = chain_id(position);
+        let bytes = format!("value-{position}").into_bytes();
+        content.put(&bytes).unwrap();
+        let edits = exact(&format!("file-{position}"), None, &bytes);
+        let edit = *edits.edits.keys().next().unwrap();
+        let outcome = reference
+            .create_change_with_id(
+                base,
+                effective,
+                change,
+                previous,
+                edits,
+                ApplicationContext::new(&content),
+            )
+            .unwrap();
+        effective = outcome.resulting_view;
+        changes.push((change, outcome.revision_id, edit));
+        previous = Some(change);
+    }
+    let head = RepositoryPublisher::new(&objects, &content, &heads)
+        .initialize(&reference)
+        .await
+        .unwrap();
+    PublishedChain {
+        _dir: dir,
+        objects,
+        content,
+        heads,
+        reference,
+        base,
+        effective,
+        head,
+        changes,
+    }
+}
+
+impl PublishedChain {
+    fn mutator(&self) -> PersistedRepositoryMutator<'_, CountingStore, LocalPublicationStore> {
+        PersistedRepositoryMutator::new(&self.objects, &self.content, &self.heads)
+    }
+
+    /// Resets the counts, and counts reads of the revisions of the changes below
+    /// `position` as forbidden.
+    fn forbid_revisions_below(&self, position: usize) {
+        self.objects.reset(
+            self.changes[..position]
+                .iter()
+                .map(|(_, revision, _)| (*revision).into())
+                .collect(),
+        );
+    }
+
+    fn forbidden_reads(&self) -> usize {
+        self.objects.forbidden_reads.load(Ordering::Relaxed)
+    }
+}
+
+/// The history lengths the read-count test compares.
+const HISTORIES: [usize; 2] = [32, 256];
+
+/// Creating a change on the frontier reads none of the revisions below it, and its other
+/// reads (radix paths, the order index's skip chain) grow by far less than one per change
+/// of history: reading the history would cost at least one per change.
+#[tokio::test]
+async fn creating_on_top_reads_no_revision_below_it() {
+    let mut reads = Vec::new();
+    for length in HISTORIES {
+        // Hundreds of publications: defer the syncs, which only cost time here.
+        let dir = tempfile::tempdir().unwrap();
+        let objects = CountingStore::new(LooseObjectStore::with_durability(
+            dir.path().join("objects"),
+            Durability::Deferred,
+        ));
+        let content =
+            ContentStore::with_durability(dir.path().join("content"), Durability::Deferred);
+        let heads =
+            LocalPublicationStore::with_durability(dir.path().join("head"), Durability::Deferred);
+        let stack = spread_history(&objects, &content, &heads, length, 1).await;
+        let reader = RepositoryReader::new(&objects, &content);
+        let mut history = BTreeSet::new();
+        let mut revisions = RevisionMapStore::new(&objects)
+            .cursor(reader.view(stack.effective).await.unwrap().revisions)
+            .await
+            .unwrap();
+        while let Some((_, revision)) = revisions.next().await.unwrap() {
+            history.insert(revision.into());
+        }
+        assert_eq!(history.len(), length);
+        content.put(b"top").unwrap();
+        objects.reset(history);
+        let (_, outcome) = PersistedRepositoryMutator::new(&objects, &content, &heads)
+            .create_on_frontier(
+                stack.head,
+                stack.base,
+                stack.effective,
+                proposal(ChangeId::new(), [], exact("top", None, b"top")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(objects.forbidden_reads.load(Ordering::Relaxed), 0);
+        reads.push(objects.reads.load(Ordering::Relaxed));
+        let created = reader.revision(outcome.revision_id).await.unwrap();
+        assert_eq!(created.dependencies, BTreeSet::from([stack.top]));
+    }
+    assert!(
+        reads[1] < reads[0] + (HISTORIES[1] - HISTORIES[0]) / 4,
+        "reads grew with the history: {reads:?}"
+    );
+}
+
+/// Revising a change reads the revisions from it up, none below.
+#[tokio::test]
+async fn revising_a_change_reads_no_revision_below_it() {
+    let mut chain = published_chain(64).await;
+    let (change, predecessor, edit) = chain.changes[48];
+    chain.content.put(b"revised").unwrap();
+    let edits = revision("file-48", None, b"revised", edit);
+    let expected = chain
+        .reference
+        .revise_change(
+            chain.base,
+            chain.effective,
+            change,
+            predecessor,
+            edits.clone(),
+            ApplicationContext::new(&chain.content),
+        )
+        .unwrap();
+    chain.forbid_revisions_below(48);
+    let (prepared, actual) = chain
+        .mutator()
+        .revise(
+            chain.head,
+            chain.base,
+            chain.effective,
+            change,
+            predecessor,
+            RevisionMetadata::default(),
+            edits,
+        )
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        prepared.state(),
+        chain.reference.canonical_closure().state.id
+    );
+    assert_eq!(chain.forbidden_reads(), 0);
+}
+
+/// A change whose ID sorts below later changes goes between them, at the first change
+/// above its dependency with a higher ID. The changes from its dependency up are read and
+/// those above its spot composed again; none below its dependency is read.
+#[tokio::test]
+async fn a_change_sorting_below_later_changes_reads_from_its_dependency_up() {
+    let mut chain = published_chain(32).await;
+    // Between the changes at positions 19 and 20, depending on the one at 10.
+    let inserted = ChangeId::from_bytes(41u128.to_be_bytes());
+    let dependency = chain.changes[10].0;
+    chain.content.put(b"inserted").unwrap();
+    let edits = exact("inserted", None, b"inserted");
+    let expected = chain
+        .reference
+        .create_change_with_id(
+            chain.base,
+            chain.effective,
+            inserted,
+            [dependency],
+            edits.clone(),
+            ApplicationContext::new(&chain.content),
+        )
+        .unwrap();
+    chain.forbid_revisions_below(11);
+    let (prepared, actual) = chain
+        .mutator()
+        .create(
+            chain.head,
+            chain.base,
+            chain.effective,
+            proposal(inserted, [dependency], edits),
+        )
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        prepared.state(),
+        chain.reference.canonical_closure().state.id
+    );
+    assert_eq!(chain.forbidden_reads(), 0);
+}

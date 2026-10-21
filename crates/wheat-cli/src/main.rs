@@ -1234,18 +1234,18 @@ fn execute(cli: Cli) -> Result<Success> {
                 false,
             )?;
             let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
-            let session = runtime.block_on(mutator.open_authoring(
+            let mut session = runtime.block_on(mutator.open_authoring(
                 expected,
                 context.workspace.basis,
                 context.workspace.effective_view(),
             ))?;
             let authored = runtime.block_on(workspace::author_from_workspace(
-                &workspace::AddTarget {
+                &mut workspace::AddTarget {
                     root: &context.root,
                     objects: &objects,
                     store: &local.content,
                     mutator: &mutator,
-                    session: &session,
+                    session: &mut session,
                     effective_view: context.workspace.effective_view(),
                     pinned: context
                         .workspace

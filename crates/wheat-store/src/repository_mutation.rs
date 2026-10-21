@@ -1,8 +1,10 @@
 //! Copy-on-write repository mutation directly over persisted Merkle roots.
 //!
-//! Mutation deliberately does not reconstruct [`wheat_core::Repository`].  The active revision
-//! records are small and are the only history records read eagerly; trees are inspected one edited
-//! path at a time and all tree/map/set updates are copy-on-write.
+//! Mutation deliberately does not reconstruct [`wheat_core::Repository`]. It reads only the top of
+//! the effective view's canonical order, from the lowest position the mutation touches: a change
+//! created on top reads none of the history below it, and revising a change reads the changes from
+//! it up. Trees are inspected one edited path at a time and all tree/map/set updates are
+//! copy-on-write.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -140,14 +142,35 @@ pub struct AuthoringSession {
     pub(crate) active: Active,
 }
 
+/// A repository opened for mutation: its state, the effective view, and the top of the
+/// effective view's canonical order, loaded down to position `from` by
+/// [`PersistedRepositoryMutator::load_from`].
 pub(crate) struct Active {
     pub(crate) state: RepositoryStateRecord,
     pub(crate) effective: ViewRecord,
+    /// The canonical position of `placed[0]`; the effective view's size when nothing is loaded.
+    pub(crate) from: u64,
+    /// The effective view's changes at positions `from` up, in canonical order, each with the
+    /// application that composed it.
+    pub(crate) placed: Vec<Placed>,
+    /// The revision of each loaded change, then of each change the mutation adds or revises.
     pub(crate) revisions: BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
-    /// The revision identities and canonical order represented by `effective` before this mutation.
-    persisted_revisions: BTreeMap<ChangeId, RevisionId>,
-    pub(crate) persisted_order: Vec<ChangeId>,
+    /// The loaded changes that depend on each loaded change.
     pub(crate) reverse_dependencies: BTreeMap<ChangeId, BTreeSet<ChangeId>>,
+}
+
+/// A change of the effective view's composition and the application that placed it there.
+pub(crate) struct Placed {
+    pub(crate) change: ChangeId,
+    pub(crate) application: ApplicationRecord,
+}
+
+impl Active {
+    /// The loaded changes at canonical positions `position` up.
+    pub(crate) fn order_from(&self, position: u64) -> impl Iterator<Item = ChangeId> + '_ {
+        let skip = usize::try_from(position.saturating_sub(self.from)).unwrap_or(usize::MAX);
+        self.placed.iter().skip(skip).map(|placed| placed.change)
+    }
 }
 
 /// How [`PersistedRepositoryMutator::apply`] replays a revision's edits.
@@ -249,8 +272,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
 
     /// Create a change on the current graph frontier.
     ///
-    /// The proposal must not provide explicit dependencies. Its dependencies are derived from the
-    /// current persisted graph as every active change with no dependents. This makes the new change
+    /// The proposal must not provide explicit dependencies. Its dependencies are the effective
+    /// view's tips: every change no other change in it depends on. This makes the new change
     /// follow the complete active graph while keeping its direct dependency set to the frontier.
     pub async fn create_on_frontier(
         &self,
@@ -263,11 +286,12 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         if !proposal.dependencies.is_empty() {
             return Err(RepositoryMutationError::FrontierDependencies);
         }
-        proposal.dependencies = active
-            .reverse_dependencies
-            .iter()
-            .filter_map(|(change, dependents)| dependents.is_empty().then_some(*change))
-            .collect();
+        let mut tips = crate::ChangeSetStore::new(self.objects)
+            .cursor(active.effective.tips)
+            .await?;
+        while let Some(tip) = tips.next().await? {
+            proposal.dependencies.insert(tip);
+        }
         self.create_opened(expected, active, proposal).await
     }
 
@@ -277,15 +301,32 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         mut active: Active,
         proposal: ChangeProposal,
     ) -> Result<(PreparedRepositoryMutation, RevisionOutcome)> {
-        if active.revisions.contains_key(&proposal.id) {
+        if RevisionMapStore::new(self.objects)
+            .get(active.effective.revisions, proposal.id)
+            .await?
+            .is_some()
+        {
             return Err(RepositoryError::DuplicateChange(proposal.id).into());
         }
+        let mut above_dependencies = 0;
         for dependency in &proposal.dependencies {
-            if !active.revisions.contains_key(dependency) {
+            let Some(position) = self.position_of(&active, *dependency).await? else {
                 return Err(RepositoryError::UnknownDependency(*dependency).into());
-            }
+            };
+            above_dependencies = above_dependencies.max(position + 1);
         }
         validate_initial(&proposal.edits)?;
+        // Canonical order places the change at the first position above its dependencies
+        // whose change sorts after it, and on top when none does. Only then are the changes
+        // from its dependencies up composed again.
+        let reader = RepositoryReader::new(self.objects, self.content);
+        if reader
+            .highest_change_from(&active.effective, above_dependencies)
+            .await?
+            .is_some_and(|highest| highest > proposal.id)
+        {
+            self.load_from(&mut active, above_dependencies).await?;
+        }
         let mut fresh = Fresh::default();
         let pending = BTreeMap::from([(
             proposal.id,
@@ -341,13 +382,16 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let reader = RepositoryReader::new(self.objects, self.content);
         let revision = reader.revision(resolution.conflict_revision).await?;
         let change = revision.change_id;
-        let Some((current, predecessor)) = active.revisions.get(&change) else {
+        let Some(current) = RevisionMapStore::new(self.objects)
+            .get(active.effective.revisions, change)
+            .await?
+        else {
             return Err(RepositoryError::UnknownChange(change).into());
         };
-        if *current != resolution.conflict_revision {
+        if current != resolution.conflict_revision {
             return Err(RepositoryError::StaleRevision(change).into());
         }
-        let predecessor_edits = self.load_edits(predecessor).await?;
+        let predecessor_edits = self.load_edits(&revision).await?;
 
         let applications = ApplicationMapStore::new(self.objects);
         let current_application = applications
@@ -563,6 +607,16 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             expected,
             mut active,
         } = session;
+        // A revised change keeps its place, so the changes from the lowest one up are
+        // composed again.
+        let mut lowest = active.from;
+        for change in requests.keys() {
+            let Some(position) = self.position_of(&active, *change).await? else {
+                return Err(RepositoryError::UnknownChange(*change).into());
+            };
+            lowest = lowest.min(position);
+        }
+        self.load_from(&mut active, lowest).await?;
         let mut pending = BTreeMap::new();
         for (change, request) in requests {
             let Some((current, old)) = active.revisions.get(&change) else {
@@ -671,90 +725,113 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             }
         }
         let effective = reader.view(effective_view).await?;
-        let mut revisions = BTreeMap::new();
-        let mut cursor = RevisionMapStore::new(self.objects)
-            .cursor(effective.revisions)
-            .await?;
-        while let Some((change, id)) = cursor.next().await? {
-            let record = reader.revision(id).await?;
-            if record.change_id != change {
-                return Err(RepositoryPublicationError::InvalidReferences(
-                    "revision-map change mismatch",
-                )
-                .into());
-            }
-            revisions.insert(change, (id, record));
-        }
-        let persisted_revisions = revisions
-            .iter()
-            .map(|(change, (revision, _))| (*change, *revision))
-            .collect();
-        let mut active = Active {
-            state,
-            effective,
-            revisions,
-            persisted_revisions,
-            persisted_order: Vec::new(),
-            reverse_dependencies: BTreeMap::new(),
-        };
-        active.rebuild_graph();
-        active.persisted_order = topological(
-            &active.revisions,
-            &active.revisions.keys().copied().collect(),
-        )?;
-        if effective_view != basis_view && !self.descends(&active, basis_view).await? {
+        if effective_view != basis_view && !self.descends(&state, &effective, basis_view).await? {
             return Err(RepositoryPublicationError::InvalidReferences(
                 "effective view does not descend from basis view",
             )
             .into());
         }
-        Ok(active)
+        Ok(Active {
+            state,
+            effective,
+            from: effective.order.size,
+            placed: Vec::new(),
+            revisions: BTreeMap::new(),
+            reverse_dependencies: BTreeMap::new(),
+        })
     }
 
-    /// Whether `active.effective` descends from `basis` in the view lineage.
+    /// Whether `effective` descends from `basis` in the view lineage.
     ///
-    /// The effective view records, for each applied change, the view that change was
-    /// applied onto. In canonical order those views are the path the effective view was
-    /// composed along. When the basis is on that path and every later hop is a lineage
-    /// edge, descent is proven with one edge lookup per change, whatever the size of the
-    /// history. Anything else (say, a view reached another way) falls back to the forward
-    /// search, which is exact but visits the history under the basis.
-    #[tracing::instrument(level = "debug", skip_all, fields(changes = active.persisted_order.len()))]
-    async fn descends(&self, active: &Active, basis: ViewId) -> Result<bool> {
-        let lineage = crate::ViewLineageMapStore::new(self.objects);
+    /// Every view has a lineage edge from its composition parent (I1), so the views
+    /// `effective` was composed through are its ancestors. The one of the basis's size is
+    /// the target of the application at that position, found in O(log n) application
+    /// reads along the order index's skip chain, whatever the size of the history.
+    /// Anything else (say, a view reached another way) falls back to the forward search,
+    /// which is exact but visits the history under the basis.
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn descends(
+        &self,
+        state: &RepositoryStateRecord,
+        effective: &ViewRecord,
+        basis: ViewId,
+    ) -> Result<bool> {
         let reader = RepositoryReader::new(self.objects, self.content);
-        let mut applications = BTreeMap::new();
-        let mut cursor = ApplicationMapStore::new(self.objects)
-            .cursor(active.effective.applications)
-            .await?;
-        while let Some((change, application)) = cursor.next().await? {
-            applications.insert(change, application);
+        let size = reader.view(basis).await?.order.size;
+        if let Some((_, application)) = reader.application_at(effective, size).await?
+            && application.target_view == basis
+        {
+            return Ok(true);
         }
-        let mut path = Vec::with_capacity(active.persisted_order.len() + 1);
-        for change in &active.persisted_order {
-            let Some(application) = applications.get(change) else {
-                path.clear();
-                break;
-            };
-            path.push(reader.application(*application).await?.target_view);
-        }
-        if let Some(start) = path.iter().position(|view| *view == basis) {
-            path.push(active.effective.id());
-            if lineage
-                .follows_path(active.state.view_lineage, &path[start..])
-                .await?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(lineage
+        Ok(crate::ViewLineageMapStore::new(self.objects)
             .is_descendant(
-                active.state.view_lineage,
+                state.view_lineage,
                 basis,
-                active.effective.id(),
+                effective.id(),
                 crate::ViewLineageLimits::default(),
             )
             .await?)
+    }
+
+    /// Loads the effective view's changes from canonical position `position` up, with
+    /// their revisions, walking the composition down from the lowest change loaded so
+    /// far: one application and one revision read per change not yet loaded.
+    #[tracing::instrument(level = "debug", skip_all, fields(position, loaded = active.placed.len()))]
+    pub(crate) async fn load_from(&self, active: &mut Active, position: u64) -> Result<()> {
+        if position >= active.from {
+            return Ok(());
+        }
+        let reader = RepositoryReader::new(self.objects, self.content);
+        let mut next = match active.placed.first() {
+            Some(placed) => placed.application.order.previous,
+            None => reader.producing_application(&active.effective).await?,
+        };
+        let mut loaded = Vec::with_capacity(usize::try_from(active.from - position).unwrap_or(0));
+        while active.from > position {
+            let id = next.ok_or(RepositoryError::InvalidRepositoryState(
+                "effective view's composition ends early",
+            ))?;
+            let application = reader.application(id).await?;
+            if application.order.position + 1 != active.from {
+                return Err(RepositoryError::InvalidRepositoryState(
+                    "application position does not follow its composition",
+                )
+                .into());
+            }
+            let revision = reader.revision(application.revision_id).await?;
+            next = application.order.previous;
+            let change = revision.change_id;
+            active
+                .revisions
+                .insert(change, (application.revision_id, revision));
+            loaded.push(Placed {
+                change,
+                application,
+            });
+            active.from -= 1;
+        }
+        loaded.reverse();
+        loaded.append(&mut active.placed);
+        active.placed = loaded;
+        active.rebuild_graph();
+        Ok(())
+    }
+
+    /// The canonical position of `change` in the effective view, none when it doesn't
+    /// select it.
+    pub(crate) async fn position_of(
+        &self,
+        active: &Active,
+        change: ChangeId,
+    ) -> Result<Option<u64>> {
+        let Some(application) = ApplicationMapStore::new(self.objects)
+            .get(active.effective.applications, change)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let reader = RepositoryReader::new(self.objects, self.content);
+        Ok(Some(reader.application(application).await?.order.position))
     }
 
     /// Authors every pending revision at its change's spot while composing all active changes.
@@ -764,6 +841,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     /// keep theirs, so the order of the others is unchanged. Each authored revision's edits must
     /// apply cleanly at its spot. Returns the composed view and the new revision of each pending
     /// change, which also replaces it in `active`.
+    ///
+    /// Only the loaded changes are ordered again, so every pending change's spot must be at or
+    /// above `active.from`. Canonical order picks the changes below that position as before, and
+    /// from there orders the rest as if the ones below were all there is.
     pub(crate) async fn compose_authoring(
         &self,
         active: &mut Active,
@@ -872,27 +953,19 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok((view, authored))
     }
 
-    /// The view after the first `prefix` changes of the persisted canonical order.
+    /// The view below the loaded change at index `prefix`, or the effective view when
+    /// `prefix` is past them.
     ///
-    /// The target of the next persisted application is precisely that intermediate view, so no
-    /// edit or tree in the prefix needs to be read. That holds for an empty prefix too: the
-    /// basis may itself hold changes, such as a label's view, and is then not the view below
-    /// them.
+    /// The target of that change's application is precisely that intermediate view, so no
+    /// edit or tree below it needs to be read.
     #[tracing::instrument(level = "debug", skip_all, fields(prefix))]
     async fn prefix_view(&self, active: &Active, prefix: usize) -> Result<ViewRecord> {
-        if prefix == active.persisted_order.len() {
-            return Ok(active.effective);
+        match active.placed.get(prefix) {
+            None => Ok(active.effective),
+            Some(placed) => Ok(RepositoryReader::new(self.objects, self.content)
+                .view(placed.application.target_view)
+                .await?),
         }
-        let next = active.persisted_order[prefix];
-        let application = ApplicationMapStore::new(self.objects)
-            .get(active.effective.applications, next)
-            .await?
-            .ok_or(RepositoryError::InvalidRepositoryState(
-                "effective view lacks canonical application",
-            ))?;
-        let reader = RepositoryReader::new(self.objects, self.content);
-        let application = reader.application(application).await?;
-        Ok(reader.view(application.target_view).await?)
     }
 
     /// Applies one change's revision, of `generation` and depending on `dependencies`,
@@ -1418,7 +1491,7 @@ impl Active {
     }
 }
 
-/// The number of leading changes in `order` that the persisted composition already applied with
+/// The number of leading changes in `order` that the loaded composition already applied with
 /// the same revision at the same position. Pending changes are never part of it.
 fn unchanged_prefix(
     active: &Active,
@@ -1427,12 +1500,12 @@ fn unchanged_prefix(
 ) -> usize {
     order
         .iter()
-        .zip(&active.persisted_order)
+        .zip(&active.placed)
         .take_while(|(new, old)| {
-            new == old
+            **new == old.change
                 && !pending.contains_key(new)
-                && active.persisted_revisions.get(new)
-                    == active.revisions.get(new).map(|(revision, _)| revision)
+                && active.revisions.get(new).map(|(revision, _)| revision)
+                    == Some(&old.application.revision_id)
         })
         .count()
 }
