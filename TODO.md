@@ -33,7 +33,12 @@ for `wheat labels` here; incremental-validation step 9):
 - `[ ]` **`wheat add <directory>` adds nothing (2026-10-20).** With `many/00/1.txt`
   and `many/00/2.txt` untracked, `wheat add many` reports "added 1 path(s)" and makes
   a revision, but `status` still lists every file under `many/` as untracked. Either
-  add the directory's files or refuse a directory by name.
+  add the directory's files or refuse a directory by name. Found with it
+  (2026-10-21): the revision holds only the predecessor's edits (`preserved=1
+  added=0`); any add that changes nothing (a missing path, an unchanged file) still
+  publishes a revision; "added N path(s)" counts the arguments, not captured paths;
+  and `wheat add .` / `wheat add many/` fail as an internal error (`invalid directory
+  component`), because `lookup_many` runs before the paths are validated.
 - `[ ]` **`wheat log` lists changes in ChangeId order.** For imported history the
   IDs are UUIDv5, so the log is in effectively random order, and it prints every
   change with its whole message, with no limit or paging. Order by the view's
