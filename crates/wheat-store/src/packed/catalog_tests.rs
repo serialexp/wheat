@@ -359,12 +359,14 @@ fn deferred_rollover_publishes_full_packs_and_close_publishes_final_tail() {
         store.put_records(&[value]).unwrap();
         assert_value(&mut store, value);
     }
-    let first_pack = fs::read_dir(root.path().join("segments"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    // A published pack: close() renames the mutable `bulk-` tail.
+    let first_pack = root.path().join("segments").join(
+        publication_names(root.path())
+            .0
+            .into_iter()
+            .find(|name| !name.starts_with("bulk-"))
+            .unwrap(),
+    );
     #[cfg(unix)]
     let first_pack_inode = fs::metadata(&first_pack).unwrap().ino();
     let first_pack_bytes = fs::read(&first_pack).unwrap();
