@@ -348,6 +348,12 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **Full validation and the mutator disagree on conflict resolutions
+  (2026-10-21).** A resolution had to name exactly the conflict's failed edits in
+  full validation, but only some of them in the mutator and wheat-core, and full
+  validation didn't check that the resolved application is the predecessor
+  revision's. Bart's rule (2026-10-21): some of the failed edits, of the
+  predecessor's application. Full validation now checks both, as the other two did.
 - `[x]` **`one_step_forward_yields_little_more_than_the_difference` fails about one
   run in twelve (2026-09-26).** The same flake, found again on 2026-10-19 and fixed
   on 2026-10-20 by better pairing; see "Found while dogfooding (2026-10-19)".

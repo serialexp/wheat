@@ -27,6 +27,34 @@ fn exact(path: &str, replacement: &[u8]) -> RevisionEdits {
     }
 }
 
+fn file(bytes: &[u8]) -> FileValue {
+    FileValue {
+        content: ContentId::of(bytes),
+        kind: FileKind::Regular,
+    }
+}
+
+/// A file write: path, the content expected there (`None`: no file), replacement.
+type Write<'a> = (&'a str, Option<&'a [u8]>, &'a [u8]);
+
+/// Edits making each write, all added.
+fn files(entries: &[Write<'_>]) -> RevisionEdits {
+    let mut edits = RevisionEdits::default();
+    for (path, expected, replacement) in entries {
+        let edit = EditRecord::new(
+            *path,
+            EditOperation::ExactFile {
+                expected: expected.map(file),
+                replacement: Some(file(replacement)),
+            },
+        )
+        .unwrap();
+        edits.transition.added.insert(edit.id());
+        edits.edits.insert(edit.id(), edit);
+    }
+    edits
+}
+
 /// Base, then `a` and `b` each created on the base, then `a` revised.
 struct History {
     _dir: tempfile::TempDir,
@@ -116,6 +144,18 @@ impl History {
         bytes: &[u8],
     ) -> (ViewId, RevisionId) {
         self.content.put(bytes).unwrap();
+        self.create_edits(effective, change, dependencies, exact(path, bytes))
+            .await
+    }
+
+    /// Creates `change` with `edits`, their content already stored.
+    async fn create_edits(
+        &self,
+        effective: ViewId,
+        change: ChangeId,
+        dependencies: &[ChangeId],
+        edits: RevisionEdits,
+    ) -> (ViewId, RevisionId) {
         let (prepared, outcome) = self
             .mutator()
             .create(
@@ -127,13 +167,40 @@ impl History {
                     metadata: ChangeMetadata::default(),
                     dependencies: dependencies.iter().copied().collect(),
                     revision_metadata: RevisionMetadata::default(),
-                    edits: exact(path, bytes),
+                    edits,
                 },
             )
             .await
             .unwrap();
         self.mutator().publish(prepared).await.unwrap();
         (outcome.resulting_view, outcome.revision_id)
+    }
+
+    /// Revises `change` from `predecessor` to `edits` alone, removing every edit the
+    /// predecessor had.
+    async fn replace(
+        &self,
+        effective: ViewId,
+        change: ChangeId,
+        predecessor: RevisionId,
+        mut edits: RevisionEdits,
+    ) -> ViewId {
+        edits.transition.removed = self.reader().revision(predecessor).await.unwrap().edits;
+        let (prepared, outcome) = self
+            .mutator()
+            .revise(
+                self.head(),
+                self.base,
+                effective,
+                change,
+                predecessor,
+                RevisionMetadata::default(),
+                edits,
+            )
+            .await
+            .unwrap();
+        self.mutator().publish(prepared).await.unwrap();
+        outcome.resulting_view
     }
 
     fn mutator(&self) -> PersistedRepositoryMutator<'_, LooseObjectStore, LocalPublicationStore> {
@@ -339,6 +406,181 @@ async fn a_transition_that_loses_a_predecessor_edit_is_refused() {
             .refusal(forged)
             .await
             .is_some_and(|reason| reason.contains("partition")),
+    );
+}
+
+/// `p` writes `f` and `g`, and `c` on top rewrites both. Revising `p` makes `c`
+/// conflict on both edits; `c` is resolved, and revising `p` again makes the resolved
+/// revision conflict too.
+struct Resolved {
+    history: History,
+    /// The revision that resolves `c`'s first conflict.
+    resolving: RevisionId,
+    /// The application of `resolving` that conflicts after `p`'s second revision.
+    conflicted_again: ApplicationRecord,
+}
+
+impl Resolved {
+    async fn new() -> Self {
+        let history = History::new().await;
+        for bytes in [
+            b"f0", b"g0", b"cf", b"cg", b"f1", b"g1", b"f2", b"g2", b"rf", b"rg",
+        ] {
+            history.content.put(bytes).unwrap();
+        }
+        let (p, c) = (
+            ChangeId::from_bytes([0x40; 16]),
+            ChangeId::from_bytes([0x50; 16]),
+        );
+        let (with_p, p1) = history
+            .create_edits(
+                history.base,
+                p,
+                &[],
+                files(&[("f", None, b"f0"), ("g", None, b"g0")]),
+            )
+            .await;
+        let (with_c, _) = history
+            .create_edits(
+                with_p,
+                c,
+                &[],
+                files(&[("f", Some(b"f0"), b"cf"), ("g", Some(b"g0"), b"cg")]),
+            )
+            .await;
+        let conflicted = history
+            .replace(
+                with_c,
+                p,
+                p1,
+                files(&[("f", None, b"f1"), ("g", None, b"g1")]),
+            )
+            .await;
+        let first_conflict = history.application_in(conflicted, c).await;
+        let (prepared, resolved) = history
+            .mutator()
+            .resolve_conflict(
+                history.head(),
+                history.base,
+                conflicted,
+                PersistedConflictResolution {
+                    conflict_revision: first_conflict.revision_id,
+                    application: first_conflict.id(),
+                    resolved: [
+                        ("f".to_owned(), Some(file(b"rf"))),
+                        ("g".to_owned(), Some(file(b"rg"))),
+                    ]
+                    .into(),
+                },
+            )
+            .await
+            .unwrap();
+        history.mutator().publish(prepared).await.unwrap();
+        let p2 = history.application_in(resolved.resulting_view, p).await;
+        let again = history
+            .replace(
+                resolved.resulting_view,
+                p,
+                p2.revision_id,
+                files(&[("f", None, b"f2"), ("g", None, b"g2")]),
+            )
+            .await;
+        let conflicted_again = history.application_in(again, c).await;
+        assert_eq!(conflicted_again.revision_id, resolved.revision_id);
+        assert!(matches!(
+            conflicted_again.result,
+            ApplicationResultRecord::Conflicted { .. }
+        ));
+        assert_eq!(history.refusal(history.state().await).await, None);
+        Self {
+            history,
+            resolving: resolved.revision_id,
+            conflicted_again,
+        }
+    }
+
+    /// The resolving revision, under another message so it is another object, with
+    /// its resolution changed by `change`.
+    async fn forged(&self, change: impl FnOnce(&mut ConflictResolutionEvidence)) -> RevisionRecord {
+        let revision = self
+            .history
+            .reader()
+            .revision(self.resolving)
+            .await
+            .unwrap();
+        let mut transition = revision.transition.clone();
+        change(&mut transition.resolutions[0]);
+        RevisionRecord {
+            metadata: RevisionMetadata {
+                message: "forged".into(),
+                ..revision.metadata.clone()
+            },
+            transition,
+            ..revision
+        }
+    }
+}
+
+/// A resolution may name some of its conflict's failed edits, not only all of them.
+#[tokio::test]
+async fn a_resolution_of_some_failed_edits_validates() {
+    let resolved = Resolved::new().await;
+    let partial = resolved
+        .forged(|evidence| {
+            assert_eq!(evidence.conflicted_edits.len(), 2);
+            evidence.conflicted_edits.pop_first();
+        })
+        .await;
+    let state = resolved.history.retaining_revision(&partial).await;
+    assert_eq!(resolved.history.refusal(state).await, None);
+    // An edit the conflict doesn't have is refused.
+    let foreign = resolved
+        .forged(|evidence| {
+            evidence.conflicted_edits = [EditId::from_digest([7; 32])].into();
+        })
+        .await;
+    let state = resolved.history.retaining_revision(&foreign).await;
+    assert!(
+        resolved
+            .history
+            .refusal(state)
+            .await
+            .is_some_and(|reason| reason.contains("resolution conflict evidence")),
+    );
+}
+
+/// A revision resolves a conflict of its predecessor's application: naming a
+/// conflicted application of the revision itself is refused.
+#[tokio::test]
+async fn a_resolution_of_another_revisions_application_is_refused() {
+    let resolved = Resolved::new().await;
+    let ApplicationResultRecord::Conflicted { conflict, .. } = resolved.conflicted_again.result
+    else {
+        unreachable!("checked in Resolved::new");
+    };
+    let failed = resolved
+        .history
+        .reader()
+        .conflict(conflict)
+        .await
+        .unwrap()
+        .edits
+        .keys()
+        .copied()
+        .collect();
+    let forged = resolved
+        .forged(|evidence| {
+            evidence.application = resolved.conflicted_again.id();
+            evidence.conflicted_edits = failed;
+        })
+        .await;
+    let state = resolved.history.retaining_revision(&forged).await;
+    assert!(
+        resolved
+            .history
+            .refusal(state)
+            .await
+            .is_some_and(|reason| reason.contains("predecessor's")),
     );
 }
 

@@ -213,14 +213,6 @@ budget passes, but by only about 0.7 s.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
-- `[ ]` **Full validation and the mutator disagree on conflict resolutions
-  (2026-10-21).** A resolution must name exactly the conflict's failed edits in full
-  validation (`repository_verify.rs`, `!=`), but only some of them in
-  `Repository::validate_edit_transition` (`wheat-core` `repository.rs`, `is_subset`).
-  Full validation also doesn't check that the resolved application is one of the
-  predecessor revision's, which both the mutator and wheat-core require. Bart to pick
-  the rule; then make all three agree before incremental
-  validation step 3 copies full validation's.
 - `[ ]` **Workspace reads keep their own libc module (2026-10-05).** wheat-cli's
   other operating-system calls now go through `sys.rs`, but `workspace_files.rs` still
   has a `#[cfg(unix)] mod platform` that calls `openat`, `fstatat` and `readlinkat`

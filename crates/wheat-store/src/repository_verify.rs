@@ -1257,6 +1257,11 @@ where
                     return Err(invalid("invalid conflict resolution reference"));
                 }
                 let application = self.reader.application(resolution.application).await?;
+                // A revision resolves a conflict of its predecessor's application, as
+                // the mutator requires when it is authored.
+                if Some(application.revision_id) != revision.predecessor {
+                    return Err(invalid("resolution application is not its predecessor's"));
+                }
                 let conflict = match application.result {
                     ApplicationResultRecord::Conflicted { conflict, .. } => {
                         self.reader.conflict(conflict).await?
@@ -1265,7 +1270,12 @@ where
                         return Err(invalid("resolution references clean application"));
                     }
                 };
-                if resolution.conflicted_edits != conflict.edits.keys().copied().collect() {
+                // It may resolve some of the conflict's failed edits, not only all.
+                if !resolution
+                    .conflicted_edits
+                    .iter()
+                    .all(|edit| conflict.edits.contains_key(edit))
+                {
                     return Err(invalid("resolution conflict evidence mismatch"));
                 }
             }
