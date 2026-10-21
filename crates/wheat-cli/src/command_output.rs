@@ -470,7 +470,9 @@ fn unwrap_mutation<'a>(
         | RepositoryMutationError::FrontierDependencies
         | RepositoryMutationError::NoFrontiers
         | RepositoryMutationError::RevisionsDoNotCombine { .. }
-        | RepositoryMutationError::TooManyRevisions { .. } => cause,
+        | RepositoryMutationError::TooManyRevisions { .. }
+        | RepositoryMutationError::NothingToAppend
+        | RepositoryMutationError::AppendedChain(_) => cause,
     }
 }
 

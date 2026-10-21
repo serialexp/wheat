@@ -59,6 +59,10 @@ pub enum RepositoryMutationError {
         wheat_core::MAX_COMBINES + 1
     )]
     TooManyRevisions { change: ChangeId, count: usize },
+    #[error("a rebase needs at least one change to append")]
+    NothingToAppend,
+    #[error("appended change {0} must depend exactly on the change before it")]
+    AppendedChain(ChangeId),
 }
 
 type Result<T> = std::result::Result<T, RepositoryMutationError>;
@@ -96,6 +100,7 @@ pub struct PersistedRepositoryMutator<'a, O, P> {
     pub(crate) objects: &'a O,
     pub(crate) content: &'a ContentStore,
     pub(crate) publications: &'a P,
+    application_limits: wheat_core::edit_application::ApplicationLimits,
 }
 
 /// A conflict-resolution intent over the paths whose edits failed in one exact application.
@@ -126,7 +131,7 @@ pub(crate) struct Active {
     /// The revision identities and canonical order represented by `effective` before this mutation.
     persisted_revisions: BTreeMap<ChangeId, RevisionId>,
     pub(crate) persisted_order: Vec<ChangeId>,
-    reverse_dependencies: BTreeMap<ChangeId, BTreeSet<ChangeId>>,
+    pub(crate) reverse_dependencies: BTreeMap<ChangeId, BTreeSet<ChangeId>>,
 }
 
 /// How [`PersistedRepositoryMutator::apply`] replays a revision's edits.
@@ -199,7 +204,20 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             objects,
             content,
             publications,
+            application_limits: Default::default(),
         }
+    }
+
+    /// Replays edits under `limits` instead of the defaults, for history from elsewhere
+    /// (a Git pull) whose files the defaults may refuse. Whether an already satisfied
+    /// edit counts as applied is still decided per replay.
+    #[must_use]
+    pub fn with_application_limits(
+        mut self,
+        limits: wheat_core::edit_application::ApplicationLimits,
+    ) -> Self {
+        self.application_limits = limits;
+        self
     }
 
     pub async fn create(
@@ -730,11 +748,27 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     /// keep theirs, so the order of the others is unchanged. Each authored revision's edits must
     /// apply cleanly at its spot. Returns the composed view and the new revision of each pending
     /// change, which also replaces it in `active`.
-    #[tracing::instrument(level = "debug", skip_all, fields(pending = pending.len()))]
     pub(crate) async fn compose_authoring(
         &self,
         active: &mut Active,
+        pending: BTreeMap<ChangeId, PendingRevision>,
+        fresh: &mut Fresh,
+    ) -> Result<(ViewRecord, BTreeMap<ChangeId, RevisionId>)> {
+        self.compose_authoring_at(active, pending, &BTreeMap::new(), fresh)
+            .await
+    }
+
+    /// [`Self::compose_authoring`], except that a pending revision named in `authored_at`
+    /// is authored where it was before rather than at its new spot: against that view,
+    /// with that resulting tree. Its edits are unchanged, so it still replays cleanly
+    /// there, and its application at the new spot may record a conflict like any
+    /// reapplied revision's.
+    #[tracing::instrument(level = "debug", skip_all, fields(pending = pending.len()))]
+    pub(crate) async fn compose_authoring_at(
+        &self,
+        active: &mut Active,
         mut pending: BTreeMap<ChangeId, PendingRevision>,
+        authored_at: &BTreeMap<ChangeId, (ViewId, TreeId)>,
         fresh: &mut Fresh,
     ) -> Result<(ViewRecord, BTreeMap<ChangeId, RevisionId>)> {
         let all = active
@@ -754,10 +788,15 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let mut authored = BTreeMap::new();
         for change in order.into_iter().skip(prefix) {
             let (revision_id, generation, edits) = if let Some(revision) = pending.remove(&change) {
-                let preliminary = self
-                    .apply(&view, &revision.edits.edits, fresh, Replay::Author)
-                    .await?;
-                let tree = preliminary.clean_tree(&revision.edits.edits)?;
+                let (authored_against, tree) = match authored_at.get(&change) {
+                    Some(position) => *position,
+                    None => {
+                        let preliminary = self
+                            .apply(&view, &revision.edits.edits, fresh, Replay::Author)
+                            .await?;
+                        (view.id(), preliminary.clean_tree(&revision.edits.edits)?)
+                    }
+                };
                 let generation = match revision.predecessor {
                     None => 0,
                     Some(predecessor) => {
@@ -780,7 +819,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                     combines: BTreeSet::new(),
                     generation,
                     dependencies: revision.dependencies,
-                    authored_against: view.id(),
+                    authored_against,
                     edits: revision.edits.edits.keys().copied().collect(),
                     transition: revision.edits.transition,
                     resulting_tree: tree,
@@ -908,7 +947,11 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     /// even below the basis when a change the basis holds is revised, which would leave the result
     /// outside the basis's descendants and the old effective view an orphaned leaf. This explicit
     /// continuation edge connects the two, maintaining a single-frontier chain.
-    fn ensure_continuation_edge(active: &Active, resulting: &ViewRecord, fresh: &mut Fresh) {
+    pub(crate) fn ensure_continuation_edge(
+        active: &Active,
+        resulting: &ViewRecord,
+        fresh: &mut Fresh,
+    ) {
         let effective_id = active.effective.id();
         let resulting_id = resulting.id();
         if effective_id != resulting_id {
@@ -951,7 +994,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let before = flat.clone();
         let limits = wheat_core::edit_application::ApplicationLimits {
             allow_already_satisfied: replay.allows_already_satisfied(),
-            ..Default::default()
+            ..self.application_limits
         };
         let output = wheat_core::edit_application::apply_edits(
             &flat,
@@ -1287,7 +1330,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     }
 }
 
-fn validate_initial(edits: &RevisionEdits) -> Result<()> {
+pub(crate) fn validate_initial(edits: &RevisionEdits) -> Result<()> {
     edits
         .validate()
         .map_err(|_| RepositoryError::InvalidEditTransition("invalid local edit selection"))?;
@@ -1370,7 +1413,7 @@ pub(crate) fn generation_after(parents: impl IntoIterator<Item = u64>) -> Result
     )
 }
 
-fn topological(
+pub(crate) fn topological(
     records: &BTreeMap<ChangeId, (RevisionId, RevisionRecord)>,
     selected: &BTreeSet<ChangeId>,
 ) -> Result<Vec<ChangeId>> {
@@ -1418,7 +1461,7 @@ pub(crate) fn topological_by<'a>(
     Ok(ordered)
 }
 
-fn descendants(
+pub(crate) fn descendants(
     root: ChangeId,
     reverse: &BTreeMap<ChangeId, BTreeSet<ChangeId>>,
 ) -> BTreeSet<ChangeId> {

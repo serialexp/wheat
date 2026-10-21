@@ -57,6 +57,8 @@ mod repository_integration;
 pub use repository_integration::IntegrationOutcome;
 mod repository_mutation;
 mod repository_publication;
+mod repository_rebase;
+pub use repository_rebase::RebaseOutcome;
 mod repository_reader;
 mod repository_store;
 pub use repository_store::{
