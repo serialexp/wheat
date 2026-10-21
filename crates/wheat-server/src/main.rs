@@ -13,6 +13,9 @@
 //! Without a config file that has an `[auth]` table, the server lets anyone in
 //! and so refuses to listen on anything but a loopback address.
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;

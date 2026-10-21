@@ -1,5 +1,10 @@
 //! `wheat-bench`: runs Wheat's benchmark profiles. See the library docs.
 
+// The same allocator as `wheat` and `wheat-server`, so the work the cases run in
+// this process is measured as it runs there.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("wheat-bench measures with Linux-only interfaces (wait4, /proc)");

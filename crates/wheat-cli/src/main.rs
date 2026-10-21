@@ -1,3 +1,6 @@
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{
     fmt::Write as _,
     io::{BufRead as _, IsTerminal as _, Read as _, Write as _},
