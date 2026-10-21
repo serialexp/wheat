@@ -274,7 +274,11 @@ document.
 - Keep local and future remote modes semantically aligned: latency and transport
   may differ, but the user-visible operations and stale-state outcomes must not.
 - Keep Git import/export at the compatibility boundary. Git refs, indexes,
-  commit OIDs, and config must not become hidden native authority.
+  commit OIDs, and config must not become hidden native authority. Bart
+  (2026-10-21): that "doesn't mean we cannot use them to see if git still
+  considers something the same thing". A commit ID may tell Wheat that a Git
+  commit is one it imported or exported, so it isn't imported again; what the
+  Wheat state contains is still decided only by native records.
 
 ## Non-goals
 
@@ -967,6 +971,16 @@ A configured compatibility remote may remove repetitive URL/ref arguments later,
 but configuration must identify it as a Git projection endpoint. Receiving
 changes from it remains an explicit import/reconciliation operation; a changed
 Git ref must not silently redefine canonical Wheat state.
+
+Pulling from Git (2026-10-21, in progress; acceptance test
+`crates/wheat-cli/tests/git_round_trip.rs`). Bart chose `wheat pull <git-url>`:
+the explicit reconciliation above. It imports only the commits the store doesn't
+know yet, walking back from the remote tip to a known commit: one imported earlier
+(its recorded Git provenance) or one this store pushed (its projection mapping),
+so Wheat's own pushed changes come back as the same changes. Unpushed Wheat
+changes are then reapplied on top of the new Git commits, as `git pull --rebase`
+would, so the next push fast-forwards and leaves the other commits exactly as
+they were pushed.
 
 ## Repository discovery
 
