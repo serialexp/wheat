@@ -1,6 +1,7 @@
 //! Full validation of revision generations and transitions, view orders, the lineage weight rule, the
 //! application order index and canonical order: states forged from a valid one by one
-//! record each, refused for that record.
+//! record each, refused for that record. Each is also validated as an increment on the
+//! published state, which must refuse exactly what full validation refuses.
 
 use wheat_core::*;
 use wheat_store::*;
@@ -225,14 +226,35 @@ impl History {
         self.objects.put_if_absent(id, bytes).await.unwrap();
     }
 
-    /// Validates `state` in full and returns the reason it is refused, if it is.
+    /// Validates `state` in full, and as an increment on the published envelope, and
+    /// returns the reason full validation refuses it, if it does. The two must agree on
+    /// whether it is refused.
     async fn refusal(&self, state: RepositoryStateRecord) -> Option<String> {
         self.put(state.id().into(), &state.canonical_bytes()).await;
-        self.reader()
+        let reader = self.reader();
+        let full = reader
             .validate_complete(state.id())
             .await
             .err()
-            .map(|error| error.to_string())
+            .map(|error| error.to_string());
+        let published = self.head().envelope;
+        let envelope = RepositoryEnvelopeRecord {
+            state: state.id(),
+            labels: reader.envelope(published).await.unwrap().labels,
+        };
+        self.put(envelope.id().into(), &envelope.canonical_bytes())
+            .await;
+        let incremental = reader
+            .validate_increment(published, envelope.id())
+            .await
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            full.is_some(),
+            incremental.is_some(),
+            "full validation: {full:?}, incremental: {incremental:?}"
+        );
+        full
     }
 
     /// The published state with `revision` also retained.

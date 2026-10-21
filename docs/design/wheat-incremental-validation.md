@@ -534,7 +534,25 @@ content it needs anyway; close or keep per Bart.
    two changes, the second conflicted and leaving the tree as it was, also matched,
    so a fetched join failed validation.
 6. `increment_validation.rs`: steps 1, 2, 6-8 and the lineage map diff; then steps
-   3-5; forgery and equivalence tests.
+   3-5; forgery and equivalence tests. Done, as `validate_increment(old, new)`
+   without modes or a budget yet (step 7). The per-object checks (replay, revision,
+   application, placement, composition, content maps) live in `semantic_checks.rs`
+   and are shared with full validation, behind a `Membership` trait: full validation
+   answers it from its scratch index, the increment from the new state's collections.
+   The validator is all-or-nothing, so new views are checked in any order: each
+   against its composition parent, old or new, whose own check stands independently.
+   Every forgery in `view_order_validation.rs` runs against both validators and must
+   get the same verdict; `increment_validation.rs` checks every step of a built
+   history (conflicts, resolve, revise, integrate) and the increment-only forgeries
+   (history dropped, change-map entries rewritten or misfiled, an application
+   composing no view, labels on unretained views). `MAX_LABELS` (10,000) moved into
+   core and is enforced on decode, and a union over it is refused, so step 8 never
+   reads an unbounded manifest. The scratch index sits behind a mutex so validation
+   futures are `Send` for the server.
+   Measured read counts grow logarithmically, not by ≤ 1.25×: a one-change increment
+   after 40 changes read 65 objects, after 400 changes 100 (radix depth on each
+   collection, and the order index's skip chain). The read contract in step 10 needs
+   restating as logarithmic.
 7. Forced fallback, bootstrap mode, budgets.
 8. Server publish (`commit`, including joined publishes); client fetch, clone and
    the joined-state fetch after a publish.

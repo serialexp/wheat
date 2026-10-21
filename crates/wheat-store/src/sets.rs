@@ -328,6 +328,29 @@ set_api!(
     ConflictSetNode
 );
 
+impl<S: ImmutableObjectStore> ConflictSetStore<'_, S> {
+    /// The conflicts `new` adds to `old` and removes from it, stopping at more than
+    /// `max_changes` differences. Equal subtrees are pruned by identity.
+    pub(crate) async fn delta(
+        &self,
+        old: ConflictSetId,
+        new: ConflictSetId,
+        max_changes: usize,
+    ) -> Result<Vec<radix::DiffEntry<ConflictId, ()>>, CollectionError> {
+        Ok(self
+            .inner
+            .paired_diff(
+                old,
+                new,
+                radix::DiffLimits {
+                    max_changes,
+                    ..radix::DiffLimits::default()
+                },
+            )
+            .await?)
+    }
+}
+
 set_api!(
     ContentSetStore,
     ContentSetCursor,

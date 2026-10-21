@@ -29,6 +29,8 @@ pub use codec::HARD_LOGICAL_RECORD_BYTES;
 mod content_io;
 mod delta;
 mod durability;
+mod increment_validation;
+pub use increment_validation::IncrementReport;
 mod loose;
 mod merkle_tree;
 mod metadata_repack;
@@ -75,6 +77,7 @@ pub use repository_verify::{RepositoryValidationPhase, TransitionValidationOptio
 mod verification_scratch;
 pub use repository_reader::RepositoryReader;
 mod revision_map;
+mod semantic_checks;
 mod sets;
 mod snapshot;
 pub use snapshot::{

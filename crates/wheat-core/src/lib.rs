@@ -30,8 +30,8 @@ mod verified_content;
 mod wire;
 
 pub use branch_records::{
-    LabelAnnotation, MAX_LABEL_ANNOTATION_MESSAGE_BYTES, RepositoryEnvelopeRecord, ViewLabel,
-    ViewLabelManifestRecord,
+    LabelAnnotation, MAX_LABEL_ANNOTATION_MESSAGE_BYTES, MAX_LABELS, RepositoryEnvelopeRecord,
+    ViewLabel, ViewLabelManifestRecord,
 };
 pub use collection::{
     ApplicationMapChild, ApplicationMapNode, ChangeMapChild, ChangeMapNode, ConflictSetChild,

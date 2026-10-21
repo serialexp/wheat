@@ -33,6 +33,11 @@ pub enum RepositoryUnionError {
     DivergentChanges(Vec<ChangeId>),
     #[error("labels were moved differently on each side: {}", .0.join(", "))]
     DivergentLabels(Vec<String>),
+    #[error(
+        "the joined repository would have {0} labels, more than the {max} a repository may hold",
+        max = wheat_core::MAX_LABELS
+    )]
+    TooManyLabels(usize),
     #[error(transparent)]
     Repository(#[from] RepositoryPublicationError),
     #[error(transparent)]
@@ -194,6 +199,9 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             &self.view_label_manifest(there.labels).await?,
         )
         .map_err(RepositoryUnionError::DivergentLabels)?;
+        if labels.labels.len() > wheat_core::MAX_LABELS {
+            return Err(RepositoryUnionError::TooManyLabels(labels.labels.len()));
+        }
         self.objects
             .put_if_absent(labels.id().into(), &labels.canonical_bytes())
             .await?;

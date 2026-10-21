@@ -1,3 +1,5 @@
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use rusqlite::{Connection, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -58,8 +60,12 @@ pub enum VerificationScratchError {
 }
 
 /// A fresh, bounded-cache, automatically deleted index for one verification run.
+///
+/// The connection sits behind a mutex so a validation future holding `&self` across
+/// an await is `Send`, as the server's tasks need. One run uses it from one task, so
+/// the lock is never contended.
 pub(crate) struct VerificationScratch {
-    connection: Connection,
+    connection: Mutex<Connection>,
     _file: NamedTempFile,
 }
 
@@ -69,9 +75,17 @@ impl VerificationScratch {
         let connection = Connection::open(file.path())?;
         connection.execute_batch(SCHEMA)?;
         Ok(Self {
-            connection,
+            connection: Mutex::new(connection),
             _file: file,
         })
+    }
+
+    /// The connection. A panic mid-statement leaves nothing half-done that a later
+    /// statement could misread, so a poisoned lock is taken as is.
+    fn connection(&self) -> MutexGuard<'_, Connection> {
+        self.connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn insert_change(
@@ -80,7 +94,7 @@ impl VerificationScratch {
         object: ChangeObjectId,
     ) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(INSERT_CHANGE)?
             .execute(params![
                 logical.as_bytes().as_slice(),
@@ -91,13 +105,13 @@ impl VerificationScratch {
 
     pub(crate) fn contains_change(&self, id: ChangeId) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_CHANGE)?
             .query_row([id.as_bytes().as_slice()], |row| row.get(0))?)
     }
 
     pub(crate) fn insert_content(&self, id: ContentId) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .prepare_cached(INSERT_CONTENT)?
             .execute([id.as_bytes().as_slice()])?;
         Ok(())
@@ -105,7 +119,7 @@ impl VerificationScratch {
 
     pub(crate) fn contains_content(&self, id: ContentId) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_CONTENT)?
             .query_row([id.as_bytes().as_slice()], |row| row.get(0))?)
     }
@@ -115,7 +129,7 @@ impl VerificationScratch {
         family: u8,
         id: ObjectId,
     ) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .prepare_cached(INSERT_RETAINED)?
             .execute(params![family, id.as_bytes().as_slice()])?;
         Ok(())
@@ -127,7 +141,7 @@ impl VerificationScratch {
         id: ObjectId,
     ) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_RETAINED)?
             .query_row(params![family, id.as_bytes().as_slice()], |row| row.get(0))?)
     }
@@ -137,7 +151,7 @@ impl VerificationScratch {
         tree: TreeId,
     ) -> Result<Option<usize>, VerificationScratchError> {
         match self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_TREE_AUTH)?
             .query_row([tree.as_bytes().as_slice()], |row| row.get(0))
         {
@@ -152,7 +166,7 @@ impl VerificationScratch {
         tree: TreeId,
         height: usize,
     ) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .prepare_cached(INSERT_TREE_AUTH)?
             .execute(params![tree.as_bytes().as_slice(), height])?;
         Ok(())
@@ -164,7 +178,7 @@ impl VerificationScratch {
         aggregate: ContentSetId,
     ) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_TREE_SEMANTICS)?
             .query_row(
                 params![tree.as_bytes().as_slice(), aggregate.as_bytes().as_slice()],
@@ -177,7 +191,7 @@ impl VerificationScratch {
         tree: TreeId,
         aggregate: ContentSetId,
     ) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .prepare_cached(INSERT_TREE_SEMANTICS)?
             .execute(params![
                 tree.as_bytes().as_slice(),
@@ -187,7 +201,7 @@ impl VerificationScratch {
     }
 
     pub(crate) fn clear_tree_content_counts(&self) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .execute("DELETE FROM tree_content_counts", [])?;
         Ok(())
     }
@@ -195,7 +209,7 @@ impl VerificationScratch {
     /// The number of distinct contents with a positive count.
     pub(crate) fn tree_content_entries(&self) -> Result<u64, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(COUNT_TREE_CONTENTS)?
             .query_row([], |row| row.get(0))?)
     }
@@ -213,15 +227,15 @@ impl VerificationScratch {
             return Err(VerificationScratchError::TreeContentCountUnderflow { content });
         }
         if next == 0 {
-            self.connection
+            self.connection()
                 .prepare_cached(DELETE_TREE_CONTENT_COUNT)?
                 .execute([content.as_bytes().as_slice()])?;
         } else if count == 0 {
-            self.connection
+            self.connection()
                 .prepare_cached(INSERT_TREE_CONTENT_COUNT)?
                 .execute(params![content.as_bytes().as_slice(), next])?;
         } else {
-            self.connection
+            self.connection()
                 .prepare_cached(UPDATE_TREE_CONTENT_COUNT)?
                 .execute(params![content.as_bytes().as_slice(), delta])?;
         }
@@ -233,7 +247,7 @@ impl VerificationScratch {
         content: ContentId,
     ) -> Result<u64, VerificationScratchError> {
         match self
-            .connection
+            .connection()
             .prepare_cached(CONTENT_COUNT)?
             .query_row([content.as_bytes().as_slice()], |row| row.get(0))
         {
@@ -254,7 +268,7 @@ impl VerificationScratch {
         prefix: &[u8],
     ) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_RADIX_NODE)?
             .query_row(
                 params![kind as u8, context, node.as_bytes().as_slice(), prefix],
@@ -269,7 +283,7 @@ impl VerificationScratch {
         node: ObjectId,
         prefix: &[u8],
     ) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .prepare_cached(INSERT_RADIX_NODE)?
             .execute(params![
                 kind as u8,
@@ -291,7 +305,7 @@ impl VerificationScratch {
         conflicts: ConflictSetId,
     ) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_MAP_PAIR)?
             .query_row(
                 params![
@@ -317,7 +331,7 @@ impl VerificationScratch {
         retained: RetainedSetId,
         conflicts: ConflictSetId,
     ) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .prepare_cached(INSERT_MAP_PAIR)?
             .execute(params![
                 application.as_bytes().as_slice(),
@@ -334,7 +348,7 @@ impl VerificationScratch {
     /// Start collecting conflict-production evidence for one view. Evidence must
     /// never flow between views that happen to share the same conflict-set root.
     pub(crate) fn clear_produced_conflicts(&self) -> Result<(), VerificationScratchError> {
-        self.connection.execute(DELETE_PRODUCED_CONFLICTS, [])?;
+        self.connection().execute(DELETE_PRODUCED_CONFLICTS, [])?;
         Ok(())
     }
 
@@ -343,7 +357,7 @@ impl VerificationScratch {
         root: ConflictSetId,
         conflict: ConflictId,
     ) -> Result<(), VerificationScratchError> {
-        self.connection
+        self.connection()
             .prepare_cached(INSERT_PRODUCED_CONFLICT)?
             .execute(params![
                 root.as_bytes().as_slice(),
@@ -358,7 +372,7 @@ impl VerificationScratch {
         conflict: ConflictId,
     ) -> Result<bool, VerificationScratchError> {
         Ok(self
-            .connection
+            .connection()
             .prepare_cached(CONTAINS_PRODUCED_CONFLICT)?
             .query_row(
                 params![root.as_bytes().as_slice(), conflict.as_bytes().as_slice()],

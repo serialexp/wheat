@@ -68,6 +68,10 @@ impl From<ViewId> for ViewLabel {
     }
 }
 
+/// The most labels a repository holds. A manifest with more is refused when it is
+/// built or decoded, so whoever receives one can read it whole.
+pub const MAX_LABELS: usize = 10_000;
+
 /// Canonical mapping from native labels to repository views.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewLabelManifestRecord {
@@ -75,7 +79,8 @@ pub struct ViewLabelManifestRecord {
 }
 
 impl ViewLabelManifestRecord {
-    /// Builds a manifest, rejecting duplicate or invalid labels and provenance refs.
+    /// Builds a manifest, rejecting duplicate or invalid labels and provenance refs, and
+    /// more than [`MAX_LABELS`] labels.
     pub fn new<I, S, V>(labels: I) -> Result<Self, CanonicalObjectError>
     where
         I: IntoIterator<Item = (S, V)>,
@@ -96,6 +101,11 @@ impl ViewLabelManifestRecord {
             if canonical.insert(name, label).is_some() {
                 return Err(CanonicalObjectError::InvalidCollection(
                     "duplicate view label manifest entry",
+                ));
+            }
+            if canonical.len() > MAX_LABELS {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "view label manifest has more labels than a repository may hold",
                 ));
             }
         }

@@ -349,6 +349,20 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
         Ok(self.inner.update_batch(left, edits).await?)
     }
 
+    /// The parents whose child sets differ between `old` and `new`, with both sides'
+    /// child sets. Subtrees the roots share are skipped by identity, so the cost follows
+    /// how many parents changed.
+    pub(crate) async fn parent_delta(
+        &self,
+        old: ViewLineageMapId,
+        new: ViewLineageMapId,
+    ) -> Result<Vec<radix::DiffEntry<ViewId, RetainedSetId>>, ViewLineageError> {
+        self.inner
+            .paired_diff(old, new, radix::DiffLimits::unbounded())
+            .await
+            .map_err(|error| ViewLineageError::from(error.into_unbounded()))
+    }
+
     /// Authenticates the complete map and all referenced child sets.
     pub async fn validate(
         &self,

@@ -5,7 +5,7 @@ use std::{fmt::Write as _, str::FromStr};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use wheat_core::{
-    LabelAnnotation, RepositoryEnvelopeId, ViewId, ViewLabel, ViewLabelManifestRecord,
+    LabelAnnotation, MAX_LABELS, RepositoryEnvelopeId, ViewId, ViewLabel, ViewLabelManifestRecord,
 };
 use wheat_store::{PublicationStore, RepositoryHead, RepositoryPublisher, RepositoryReader};
 
@@ -15,8 +15,6 @@ use crate::{
     local::LocalRepository,
     runtime,
 };
-
-const MAX_LABELS: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct LabelEntry {
@@ -181,11 +179,6 @@ async fn load(repository: &LocalRepository) -> Result<LabelList> {
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
     let envelope = reader.validate_envelope(head.envelope).await?;
     let manifest = reader.view_label_manifest(envelope.labels).await?;
-    if manifest.labels.len() > MAX_LABELS {
-        return Err(CliFailure::limit(format!(
-            "repository has more than {MAX_LABELS} labels"
-        )));
-    }
     let labels = manifest
         .labels
         .iter()
@@ -219,11 +212,6 @@ where
         let reader = RepositoryReader::new(&repository.objects, &repository.content);
         let envelope = reader.validate_envelope(expected.envelope).await?;
         let manifest = reader.view_label_manifest(envelope.labels).await?;
-        if manifest.labels.len() > MAX_LABELS {
-            return Err(CliFailure::limit(format!(
-                "repository has more than {MAX_LABELS} labels"
-            )));
-        }
         let mut labels = manifest.labels;
         let entry = change(&mut labels)?;
         let manifest = ViewLabelManifestRecord::new(labels)

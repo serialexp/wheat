@@ -1,7 +1,8 @@
 use wheat_core::{
-    CanonicalObjectError, CanonicalObjectKind, RepositoryEnvelopeRecord, RepositoryStateId, ViewId,
-    ViewLabel, ViewLabelManifestRecord, decode_repository_envelope_record,
-    decode_view_label_manifest_record, validate_canonical_object,
+    CanonicalObjectError, CanonicalObjectKind, MAX_LABELS, RepositoryEnvelopeRecord,
+    RepositoryStateId, ViewId, ViewLabel, ViewLabelManifestRecord,
+    decode_repository_envelope_record, decode_view_label_manifest_record,
+    validate_canonical_object,
 };
 
 fn view(byte: u8) -> ViewId {
@@ -60,6 +61,30 @@ fn manifest_rejects_duplicate_and_invalid_names() {
             Err(CanonicalObjectError::InvalidViewLabel(_))
         ));
     }
+}
+
+/// A manifest holds at most `MAX_LABELS` labels, whether built or decoded.
+#[test]
+fn manifest_holds_at_most_the_label_cap() {
+    let labels = |count: usize| (0..count).map(|index| (format!("label-{index}"), view(1)));
+    let full = ViewLabelManifestRecord::new(labels(MAX_LABELS)).unwrap();
+    assert_eq!(
+        decode_view_label_manifest_record(&full.canonical_bytes()),
+        Ok(full)
+    );
+    assert!(matches!(
+        ViewLabelManifestRecord::new(labels(MAX_LABELS + 1)),
+        Err(CanonicalObjectError::InvalidCollection(_))
+    ));
+    let over = ViewLabelManifestRecord {
+        labels: labels(MAX_LABELS + 1)
+            .map(|(name, view)| (name, ViewLabel::from(view)))
+            .collect(),
+    };
+    assert!(matches!(
+        decode_view_label_manifest_record(&over.canonical_bytes()),
+        Err(CanonicalObjectError::InvalidCollection(_))
+    ));
 }
 
 #[test]

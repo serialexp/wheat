@@ -353,6 +353,42 @@ async fn a_label_both_sides_moved_differently_is_refused() {
     );
 }
 
+/// Each side within the label cap, but not the two together: refused.
+#[tokio::test]
+async fn a_union_over_the_label_cap_is_refused() {
+    let diverged = diverged(1).await;
+    let reader = diverged.stores.reader();
+    let heads = LocalPublicationStore::new(diverged.stores.dir.path().join("unused.head"));
+    let publisher =
+        RepositoryPublisher::new(&diverged.stores.objects, &diverged.stores.content, &heads);
+    let mut sides = Vec::new();
+    for (side, view) in [
+        (diverged.local, diverged.local_view),
+        (diverged.remote, diverged.remote_view),
+    ] {
+        let labels = ViewLabelManifestRecord::new(
+            (0..=MAX_LABELS / 2).map(|index| (format!("{view}/{index}"), view)),
+        )
+        .unwrap();
+        sides.push(
+            publisher
+                .prepare_envelope(side.state, &labels)
+                .await
+                .unwrap(),
+        );
+    }
+
+    let error = reader
+        .union_envelopes(Some(diverged.base.id), sides[0], sides[1])
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, RepositoryUnionError::TooManyLabels(count) if count > MAX_LABELS),
+        "{error}"
+    );
+}
+
 #[test]
 fn labels_merge_three_ways() {
     let view = |n: u8| ViewId::from_digest([n; 32]);
