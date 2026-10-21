@@ -1,5 +1,25 @@
 # Current task
 
+## 2026-10-21: Git push/pull round trip (@calm-lynx)
+
+Bart: "start out building a test case for git based push/pull workflow so that we
+know the happy path works and stays working ... It's fine if the test fails." His
+choices: the command is `wheat pull <git-url>` (a Git remote recognised and imported
+incrementally, then integrated); unpushed Wheat changes end up **on top of** the new
+Git commits (like `git pull --rebase`), so the next push fast-forwards; and Wheat's
+own pushed commits come back as the same changes (same store), not duplicates.
+
+- `crates/wheat-cli/tests/git_round_trip.rs`, **uncommitted on purpose** (Bart: "Don't
+  commit yet"; it goes in with the pull implementation). Everything up to the pull
+  passes; it fails at `wheat pull <path>` (no positional URL; pull only speaks
+  `wheat://`).
+- Investigation findings (all in `TODO.md`, "Found while dogfooding"): import
+  rebuilds a fresh state and is bound to a source snapshot; the Wheat→Git mapping
+  is only the store's `projections/git.git` refs; imported changes depend on the
+  first parent only; and push skips applications before a provenance-matched tip
+  without a tree check (`export.rs:238/282`, the B1 bug), which an integrate-based
+  pull would hit as soon as the native change sorts first.
+
 ## 2026-10-20: hash content once (@calm-lynx)
 
 Bart, on the protocol follow-ups: "use publish key and batching small files is a free
