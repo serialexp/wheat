@@ -6,13 +6,15 @@
 # Settings, all optional:
 #   WHEAT_VERSION        release tag to install, e.g. v0.2.0 (default: the latest)
 #   WHEAT_INSTALL_DIR    where the binaries go (default: ~/.local/bin)
+#   WHEAT_LIBC           gnu or musl (default: gnu on glibc 2.39 or newer, else musl)
 #   WHEAT_REPO           GitHub repository (default: serialexp/wheat)
 #   WHEAT_DOWNLOAD_BASE  fetch archives from this URL instead of GitHub
 #                        (expects <base>/<archive> and <base>/SHA256SUMS)
 #   GH_TOKEN, GITHUB_TOKEN  token for a private repository; otherwise a logged-in
 #                        `gh` is used when present, else an anonymous download
 #
-# The wheat CLI runs only on Linux (x86_64 and aarch64, glibc 2.35 or newer).
+# The wheat CLI runs only on Linux (x86_64 and aarch64). The glibc build needs glibc
+# 2.39 or newer (Ubuntu 24.04 and later); the musl build is static and runs anywhere.
 
 set -eu
 
@@ -34,17 +36,26 @@ case $(uname -m) in
     aarch64 | arm64) arch=aarch64 ;;
     *) fail "no wheat build for $(uname -m); build from source with \`just install\`" ;;
 esac
-glibc=$(getconf GNU_LIBC_VERSION 2> /dev/null || true)
-case $glibc in
-    "glibc "*) ;;
-    *) fail "the release binaries need glibc; build from source with \`just install\`" ;;
+# Whether this system's C library runs the glibc build: glibc 2.39 or newer.
+modern_glibc() {
+    glibc=$(getconf GNU_LIBC_VERSION 2> /dev/null || true)
+    case $glibc in
+        "glibc 2."*) ;;
+        *) return 1 ;;
+    esac
+    glibc_minor=$(printf '%s\n' "${glibc#glibc 2.}" | cut -d. -f1)
+    case $glibc_minor in
+        "" | *[!0-9]*) return 1 ;;
+    esac
+    [ "$glibc_minor" -ge 39 ]
+}
+case ${WHEAT_LIBC:-} in
+    gnu | musl) libc=$WHEAT_LIBC ;;
+    "") if modern_glibc; then libc=gnu; else libc=musl; fi ;;
+    *) fail "WHEAT_LIBC must be gnu or musl, not $WHEAT_LIBC" ;;
 esac
-glibc_minor=$(printf '%s\n' "${glibc#glibc }" | cut -d. -f2)
-if [ "${glibc#glibc 2.}" = "$glibc" ] || [ "$glibc_minor" -lt 35 ]; then
-    fail "the release binaries need glibc 2.35 or newer (this is ${glibc#glibc }); build from source with \`just install\`"
-fi
 
-target=$arch-unknown-linux-gnu
+target=$arch-unknown-linux-$libc
 archive=wheat-$target.tar.gz
 
 if have curl; then

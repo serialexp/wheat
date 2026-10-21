@@ -29,13 +29,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux builds on the oldest supported Ubuntu, so the binaries need only
-          # glibc 2.35. aarch64 is cross-compiled; arm64 hosted runners are not
-          # available to every private repository.
+          # The glibc builds are for current distributions: built on Ubuntu 24.04,
+          # they need glibc 2.39 or newer. The musl builds are static and run on any
+          # Linux, for older distributions and musl ones such as Alpine. aarch64 is
+          # cross-compiled; zig is the C compiler and linker for musl.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
           - target: aarch64-apple-darwin
             os: macos-14
           # Cross-compiled on Apple silicon: the SDK covers both architectures.
@@ -57,6 +64,23 @@ jobs:
             echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
           } >> "$GITHUB_ENV"
 
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          curl -fsSL --retry 3 -o zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/zig"
+          tar -xJf zig.tar.xz -C "$HOME/zig" --strip-components 1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version "${ZIGBUILD_VERSION}"
+        env:
+          ZIG_VERSION: 0.17.0
+          ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+          ZIGBUILD_VERSION: 0.23.4
+
       # aws-lc-sys (S3 support) assembles with NASM on Windows; use its prebuilt
       # objects instead of installing NASM.
       - name: Use prebuilt NASM objects
@@ -75,7 +99,8 @@ jobs:
       - name: Build
         shell: bash
         run: >-
-          cargo build --release --locked --target ${{ matrix.target }}
+          cargo ${{ matrix.zig && 'zigbuild' || 'build' }}
+          --release --locked --target ${{ matrix.target }}
           -p wheat-cli -p wheat-server --bin wheat --bin wheat-server
 
       - name: Smoke test
@@ -84,9 +109,19 @@ jobs:
           dir=target/${{ matrix.target }}/release
           case "${{ matrix.target }}" in
             aarch64-unknown-linux-gnu) run="qemu-aarch64 -L /usr/aarch64-linux-gnu" ;;
+            aarch64-unknown-linux-musl) run="qemu-aarch64" ;;
             *) run="" ;;
           esac
           $run "$dir/wheat-server" --version
+          if [ "${{ matrix.zig }}" = true ]; then
+            # A musl build must not need a dynamic loader, or it is not portable.
+            for binary in wheat wheat-server; do
+              if readelf -l "$dir/$binary" | grep -q INTERP; then
+                echo "$binary is dynamically linked" >&2
+                exit 1
+              fi
+            done
+          fi
           if [ "${{ runner.os }}" = Linux ]; then
             $run "$dir/wheat" --version
           else
@@ -154,4 +189,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "wheat $GITHUB_REF_NAME" \
-            --notes "Install on Linux with install.sh (see README). The wheat CLI runs only on Linux; the macOS and Windows archives are for wheat-server and refuse CLI commands."
+            --notes "Install on Linux with install.sh (see README): it picks the glibc build on glibc 2.39 or newer (Ubuntu 24.04 and later), else the static musl build. The wheat CLI runs only on Linux; the macOS and Windows archives are for wheat-server and refuse CLI commands."

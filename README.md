@@ -25,16 +25,17 @@ Storage records are BinSchema-generated binary only. The schemas live in
 
 ## Install
 
-Release builds for Linux (x86_64 and aarch64, glibc 2.35 or newer) install `wheat`
-and `wheat-server` into `~/.local/bin`:
+Release builds for Linux (x86_64 and aarch64) install `wheat` and `wheat-server` into
+`~/.local/bin`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/serialexp/wheat/main/install.sh | sh
 ```
 
-`WHEAT_VERSION=v0.2.0` picks a release, `WHEAT_INSTALL_DIR` another directory. On
-an older glibc or musl, build from source with `just install`. The CLI runs only on
-Linux: on macOS and Windows it refuses every command.
+On glibc 2.39 or newer (Ubuntu 24.04 and later) it installs the glibc build; on an
+older glibc or a musl system such as Alpine, a static musl build. `WHEAT_LIBC=gnu` or
+`musl` picks one, `WHEAT_VERSION=v0.2.0` a release, `WHEAT_INSTALL_DIR` another
+directory. The CLI runs only on Linux: on macOS and Windows it refuses every command.
 
 Releases come from `.github/workflows/release.yml`: push a tag `v<version>` matching
 the workspace version in `Cargo.toml`, and it builds Linux, macOS and Windows
