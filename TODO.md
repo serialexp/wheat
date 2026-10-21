@@ -39,6 +39,19 @@ for `wheat labels` here; incremental-validation step 9):
   refuses ("changed from its exact observed value") and `status` keeps listing the
   file as modified until `wheat restore` of that path. Options: resolve from the
   workspace file, and treat a workspace file equal to the new view's as unchanged.
+  Root causes (2026-10-21): `resolve` publishes a new view but never moves the
+  materialized pin (`add` does, through `capture_settlement::settle`), so `status`
+  compares with the old side; `materialize` refuses only when the bytes match neither
+  side, which `--value "$(cat f)"` causes by stripping the trailing newline; and
+  `restore` then brings back the old side, not the resolution.
+- `[ ]` **Resolving one path of a multi-path conflict drops the rest (2026-10-21).**
+  `resolve_conflict` removes every failed edit of the conflict
+  (`crates/wheat-store/src/repository_mutation.rs:415`, core `repository.rs:963`), and
+  the CLI takes a single `--path`, so the change's edits on its other conflicted paths
+  vanish silently and those files keep the other side's value.
+- `[ ]` **Resolution revisions have no author or date (2026-10-21).** They use
+  `RevisionMetadata::default()` (`repository_mutation.rs:445`), so `wheat log` shows
+  `author  <> 1970-01-01T00:00:00Z`; integrate's combine-by-date order may see it too.
 - `[ ]` **`wheat conflicts` prints Rust debug output.** The human rendering shows
   `target=Some(FileValue { content: ContentId([210, 80, ...]), kind: Regular })` and
   `reason=NoMatch`; and it names the conflict and revision by ID only, not by change
