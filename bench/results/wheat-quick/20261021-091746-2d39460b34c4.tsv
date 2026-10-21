@@ -1,0 +1,36 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261021-091746
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	false
+# increment_validate	{"checkpoints":[1000,10000,100000],"samples":5}
+# release	true
+# rev	2d39460b34c4
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+increment_validate.total.wall	1075.212136932	s
+increment_validate.total.peak_rss	1149665280	bytes
+increment_validate.n1000.build.wall	1.761955291	s
+increment_validate.n1000.create_mean.wall	0.00204965257	s
+increment_validate.n1000.validate_first.wall	0.001339342	s
+increment_validate.n1000.validate.reads	118	count
+increment_validate.n1000.validate.bytes	321683	bytes
+increment_validate.n1000.validate.wall	0.001024339	s
+increment_validate.n10000.build.wall	24.415445896	s
+increment_validate.n10000.create_mean.wall	0.0023826425999999993	s
+increment_validate.n10000.validate_first.wall	0.001085945	s
+increment_validate.n10000.validate.reads	121	count
+increment_validate.n10000.validate.bytes	359112	bytes
+increment_validate.n10000.validate.wall	0.000941072	s
+increment_validate.n100000.build.wall	1073.304447964	s
+increment_validate.n100000.create_mean.wall	0.006414241389999997	s
+increment_validate.n100000.validate_first.wall	0.001480918	s
+increment_validate.n100000.validate.reads	154	count
+increment_validate.n100000.validate.bytes	531248	bytes
+increment_validate.n100000.validate.wall	0.001339843	s
+run.total_time	1075.219158343	s
+process.peak_rss	1149665280	bytes
+suite.cases	1	count
+suite.case_failures	0	count
