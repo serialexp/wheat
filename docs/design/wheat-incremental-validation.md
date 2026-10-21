@@ -521,13 +521,18 @@ content it needs anyway; close or keep per Bart.
    position is refused on decode, so a walk never indexes past its end. The index
    entries are references in the object graph.
 5. Full validation tightened (partition equality, I1 for every view, composition
-   edges by maps). Partition equality is done: a predecessor's edits are exactly the
+   edges by maps). Done. Partition equality: a predecessor's edits are exactly the
    transition's preserved and removed edits, so an edit can no longer be called added
-   when its predecessor had it. Composition edges by maps is done: an application's edge goes to
-   the target's child whose `last` is its change and which selects it, in full
-   validation and in rewrite's `produced_view`. By tree, a join's edge over two
-   changes, the second conflicted and leaving the tree as it was, also matched, so a
-   fetched join failed validation.
+   when its predecessor had it. I1: the base selects nothing, and every other view
+   has an edge from its composition parent, its last application's result tree, and
+   maps that differ from the parent's by exactly its last change (two map diffs that
+   stop at a second difference). Before, a view could select changes beyond its
+   parent's and its last, and a view reached only through another parent was never
+   checked against its last application. Composition edges by maps: an application's
+   edge goes to the target's child whose `last` is its change and which selects it,
+   in full validation and in rewrite's `produced_view`. By tree, a join's edge over
+   two changes, the second conflicted and leaving the tree as it was, also matched,
+   so a fetched join failed validation.
 6. `increment_validation.rs`: steps 1, 2, 6-8 and the lineage map diff; then steps
    3-5; forgery and equivalence tests.
 7. Forced fallback, bootstrap mode, budgets.

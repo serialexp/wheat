@@ -9,10 +9,11 @@ use async_trait::async_trait;
 use lru::LruCache;
 
 use crate::{
-    ApplicationMapStore, ConflictSetStore, ContentMapDelta, ContentMapError, ContentMapStore,
-    ContentSetStore, ContentStoreError, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError,
-    RepositoryPublicationError, RepositoryReader, RetainedSetStore, RevisionMapStore, StoredObject,
-    TreeDiffLimits,
+    ApplicationMapDelta, ApplicationMapDeltaLimits, ApplicationMapStore, ConflictSetStore,
+    ContentMapDelta, ContentMapError, ContentMapStore, ContentSetStore, ContentStoreError,
+    ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryPublicationError,
+    RepositoryReader, RetainedSetStore, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapStore,
+    StoredObject, TreeDiffLimits,
     application_map::ApplicationCollection,
     radix::{ContextWalkStep, DiffLimits, PairedContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
@@ -759,22 +760,46 @@ where
         })
     }
 
-    /// Checks `view`'s size, last change and weight against its composition parent: the
-    /// target of its last change's application, with that change's revision applied.
-    /// The base has none. With every view's maps those of its composition parent plus
-    /// its last change, this proves each view's order from its maps, one view at a time.
-    async fn verify_view_order(
+    /// Checks I1 for `view`: the base has no changes, and every other view is its
+    /// composition parent `T` (the target of its last change `k`'s application `A`)
+    /// with `A` added. There is an edge `T → view`, `view`'s maps are `T`'s plus `k`
+    /// and nothing else, its tree is `A`'s result, and its size, last change and weight
+    /// follow `T`'s. Its conflicts are those its applications produce, and its content
+    /// map its tree's, both checked elsewhere. By induction from the base, every view
+    /// is its lineage's applications in canonical order (I2, per application).
+    ///
+    /// The map diffs stop at a second difference, so each reads the path to `k`.
+    /// `children` lists each view's lineage children, each list in ID order.
+    async fn verify_composition(
         &self,
         state: &RepositoryStateRecord,
         id: ViewId,
         view: &ViewRecord,
+        children: &BTreeMap<ViewId, Vec<ViewId>>,
     ) -> Result<()> {
         if id == state.base_view {
-            return if view.order == ViewOrder::BASE {
-                Ok(())
-            } else {
-                Err(invalid("base view has changes in its order"))
-            };
+            if view.order != ViewOrder::BASE {
+                return Err(invalid("base view has changes in its order"));
+            }
+            let revisions = RevisionMapStore::new(self.reader.objects)
+                .cursor(view.revisions)
+                .await?
+                .next()
+                .await?;
+            let applications = ApplicationMapStore::new(self.reader.objects)
+                .cursor(view.applications)
+                .await?
+                .next()
+                .await?;
+            let conflicts = ConflictSetStore::new(self.reader.objects)
+                .cursor(view.unresolved_conflicts)
+                .await?
+                .next()
+                .await?;
+            if revisions.is_some() || applications.is_some() || conflicts.is_some() {
+                return Err(invalid("base view selects changes"));
+            }
+            return Ok(());
         }
         let change = view
             .order
@@ -796,6 +821,72 @@ where
         let parent = self.reader.view(application.target_view).await?;
         if parent.order.then(change, revision.generation) != Some(view.order) {
             return Err(invalid("view order does not follow its composition parent"));
+        }
+        if children
+            .get(&application.target_view)
+            .is_none_or(|children| children.binary_search(&id).is_err())
+        {
+            return Err(invalid(
+                "view lacks a lineage edge from its composition parent",
+            ));
+        }
+        let result_tree = match application.result {
+            ApplicationResultRecord::Clean { tree } => tree,
+            ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
+        };
+        if view.tree != result_tree {
+            return Err(invalid(
+                "view tree is not the result of its last application",
+            ));
+        }
+        let not_composed = || invalid("view maps are not its composition parent's plus one change");
+        let revisions = match RevisionMapStore::new(self.reader.objects)
+            .delta(
+                parent.revisions,
+                view.revisions,
+                RevisionMapDeltaLimits {
+                    max_selections: 1,
+                    ..RevisionMapDeltaLimits::default()
+                },
+            )
+            .await
+        {
+            Err(crate::RevisionMapError::DeltaSelectionLimitExceeded { .. }) => {
+                return Err(not_composed());
+            }
+            delta => delta?,
+        };
+        if revisions
+            != [RevisionMapDelta::Added {
+                change,
+                revision: revision_id,
+            }]
+        {
+            return Err(not_composed());
+        }
+        let applications = match ApplicationMapStore::new(self.reader.objects)
+            .delta(
+                parent.applications,
+                view.applications,
+                ApplicationMapDeltaLimits {
+                    max_changes: 1,
+                    ..ApplicationMapDeltaLimits::default()
+                },
+            )
+            .await
+        {
+            Err(crate::ApplicationMapError::DeltaChangeLimitExceeded { .. }) => {
+                return Err(not_composed());
+            }
+            delta => delta?,
+        };
+        if applications
+            != [ApplicationMapDelta::Added {
+                change,
+                application: application_id,
+            }]
+        {
+            return Err(not_composed());
         }
         Ok(())
     }
@@ -869,13 +960,17 @@ where
                 children_by_parent.entry(*parent).or_default().push(child);
             }
         }
+        for children in children_by_parent.values_mut() {
+            children.sort_unstable();
+        }
         let mut weights = BTreeMap::new();
         for view in &retained_views {
             if *view != state.base_view && incoming.get(view).copied().unwrap_or_default() == 0 {
                 return Err(invalid("retained non-base view lacks incoming lineage"));
             }
             let record = self.reader.view(*view).await?;
-            self.verify_view_order(state, *view, &record).await?;
+            self.verify_composition(state, *view, &record, &children_by_parent)
+                .await?;
             weights.insert(*view, record.order.weight);
         }
         // Every edge increases the weight, so the lineage has no cycle, whatever other
@@ -909,13 +1004,10 @@ where
             self.verify_application_order(&application, &revision, &parent)
                 .await?;
             // The application's composition edge goes to the child that has its change
-            // last and selects it. Other children may select it too, through an edge
-            // spanning several changes, and one whose later changes leave the tree as
-            // it was has the same tree, so the tree does not tell them apart.
-            let result_tree = match application.result {
-                ApplicationResultRecord::Clean { tree } => tree,
-                ApplicationResultRecord::Conflicted { partial_tree, .. } => partial_tree,
-            };
+            // last and selects it, whose tree `verify_composition` checked. Other
+            // children may select it too, through an edge spanning several changes, and
+            // one whose later changes leave the tree as it was has the same tree, so the
+            // tree does not tell them apart.
             let mut matches = 0usize;
             for child in children_by_parent
                 .get(&application.target_view)
@@ -929,11 +1021,6 @@ where
                         .await?
                         == Some(application_id)
                 {
-                    if view.tree != result_tree {
-                        return Err(invalid(
-                            "view tree is not the result of its last application",
-                        ));
-                    }
                     matches += 1;
                 }
             }

@@ -199,6 +199,23 @@ impl History {
         }
     }
 
+    /// The published state with `view` also retained, as a lineage child of `parent`.
+    async fn retaining_view(&self, view: &ViewRecord, parent: ViewId) -> RepositoryStateRecord {
+        self.put(view.id().into(), &view.canonical_bytes()).await;
+        let state = self.state().await;
+        RepositoryStateRecord {
+            retained_views: RetainedSetStore::new(&self.objects)
+                .insert(state.retained_views, view.id().into())
+                .await
+                .unwrap(),
+            view_lineage: ViewLineageMapStore::new(&self.objects)
+                .insert_edges(state.view_lineage, [(parent, view.id())])
+                .await
+                .unwrap(),
+            ..state
+        }
+    }
+
     /// The application of `change` in `view`.
     async fn application_in(&self, view: ViewId, change: ChangeId) -> ApplicationRecord {
         let view = self.reader().view(view).await.unwrap();
@@ -382,7 +399,6 @@ async fn a_lineage_edge_that_does_not_increase_the_weight_is_refused() {
 #[tokio::test]
 async fn a_view_with_the_wrong_weight_is_refused() {
     let history = History::new().await;
-    let state = history.state().await;
     let view = history.reader().view(history.with_b).await.unwrap();
     let forged_view = ViewRecord {
         order: ViewOrder {
@@ -391,25 +407,89 @@ async fn a_view_with_the_wrong_weight_is_refused() {
         },
         ..view
     };
-    history
-        .put(forged_view.id().into(), &forged_view.canonical_bytes())
-        .await;
-    let forged = RepositoryStateRecord {
-        retained_views: RetainedSetStore::new(&history.objects)
-            .insert(state.retained_views, forged_view.id().into())
-            .await
-            .unwrap(),
-        view_lineage: ViewLineageMapStore::new(&history.objects)
-            .insert_edges(state.view_lineage, [(history.base, forged_view.id())])
-            .await
-            .unwrap(),
-        ..state
-    };
+    let forged = history.retaining_view(&forged_view, history.base).await;
     assert!(
         history
             .refusal(forged)
             .await
             .is_some_and(|reason| reason.contains("view order")),
+    );
+}
+
+/// A view's maps are its composition parent's plus its last change and nothing else
+/// (I1): `a`'s view also selecting `b`, with `a`'s order, tree and edge, is refused.
+#[tokio::test]
+async fn a_view_selecting_more_than_its_parent_and_last_change_is_refused() {
+    let history = History::new().await;
+    let b = ChangeId::from_bytes([2; 16]);
+    let with_b = history.reader().view(history.with_b).await.unwrap();
+    let b_revision = RevisionMapStore::new(&history.objects)
+        .get(with_b.revisions, b)
+        .await
+        .unwrap()
+        .unwrap();
+    let b_application = history.application_in(history.with_b, b).await.id();
+    let view = history.reader().view(history.with_a).await.unwrap();
+    let forged_view = ViewRecord {
+        revisions: RevisionMapStore::new(&history.objects)
+            .insert(view.revisions, b, b_revision)
+            .await
+            .unwrap(),
+        applications: ApplicationMapStore::new(&history.objects)
+            .insert(view.applications, b, b_application)
+            .await
+            .unwrap(),
+        ..view
+    };
+    let forged = history.retaining_view(&forged_view, history.base).await;
+    assert!(
+        history
+            .refusal(forged)
+            .await
+            .is_some_and(|reason| reason.contains("composition parent's plus one change")),
+    );
+}
+
+/// A view's tree is its last application's result (I1).
+#[tokio::test]
+async fn a_view_whose_tree_is_not_its_last_applications_result_is_refused() {
+    let history = History::new().await;
+    let with_b = history.reader().view(history.with_b).await.unwrap();
+    let view = history.reader().view(history.with_a).await.unwrap();
+    let forged_view = ViewRecord {
+        tree: with_b.tree,
+        required_content: with_b.required_content,
+        ..view
+    };
+    let forged = history.retaining_view(&forged_view, history.base).await;
+    assert!(
+        history
+            .refusal(forged)
+            .await
+            .is_some_and(|reason| reason.contains("result of its last application")),
+    );
+}
+
+/// A view has a lineage edge from its composition parent (I1). `k`'s view with
+/// another tree, reached only from `y`'s view two changes below, is refused for the
+/// missing edge before anything else about it.
+#[tokio::test]
+async fn a_view_without_an_edge_from_its_composition_parent_is_refused() {
+    let chain = Chain::new().await;
+    let history = &chain.history;
+    let view = history.reader().view(chain.with_yzk).await.unwrap();
+    let with_y = history.reader().view(chain.with_y).await.unwrap();
+    let forged_view = ViewRecord {
+        tree: with_y.tree,
+        required_content: with_y.required_content,
+        ..view
+    };
+    let forged = history.retaining_view(&forged_view, chain.with_y).await;
+    assert!(
+        history
+            .refusal(forged)
+            .await
+            .is_some_and(|reason| reason.contains("lineage edge from its composition parent")),
     );
 }
 
