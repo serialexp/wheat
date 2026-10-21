@@ -6,7 +6,8 @@
 //! before: the first run (nothing of it read yet in this process) and the median of
 //! [`SAMPLES`] more, with the objects and bytes the validator read. The mean
 //! create-and-publish time of the [`CREATE_WINDOW`] changes up to each checkpoint is
-//! recorded too.
+//! recorded too, and the slowest single one since the checkpoint before, which shows
+//! store work that only some publications pay.
 //!
 //! The validator reads a root-to-leaf path in each collection a change touches and
 //! walks the order index's skip chain, so its reads grow with the logarithm of the
@@ -140,6 +141,7 @@ async fn measure_history(
     let largest = checkpoints.iter().copied().max().unwrap_or(0);
     let mut effective = base;
     let mut creates = VecDeque::with_capacity(CREATE_WINDOW);
+    let mut slowest = 0.0_f64;
     let started = Instant::now();
     for index in 0..largest {
         let created = Instant::now();
@@ -177,7 +179,9 @@ async fn measure_history(
         if creates.len() == CREATE_WINDOW {
             creates.pop_front();
         }
-        creates.push_back(created.elapsed().as_secs_f64());
+        let create = created.elapsed().as_secs_f64();
+        creates.push_back(create);
+        slowest = slowest.max(create);
         let size = index + 1;
         if !checkpoints.contains(&size) {
             continue;
@@ -188,6 +192,8 @@ async fn measure_history(
             &format!("{step}.create_mean"),
             creates.iter().sum::<f64>() / creates.len() as f64,
         );
+        recorder.wall(&format!("{step}.create_max"), slowest);
+        slowest = 0.0;
 
         objects.take();
         let first = Instant::now();

@@ -213,6 +213,22 @@ budget passes, but by only about 0.7 s.
   long history build it with the mutator instead (`creating_on_top_reads_no_revision_below_it`).
   Find what in core recomputes the whole history per change, and what `initialize`
   does per object.
+- `[ ]` **Every packed put probes every sealed segment (2026-10-21).** In
+  `increment_validate` (release, after 7ac9690) a create-and-publish takes 2.3 ms at
+  10,000 changes and 6.6–7.4 ms at 100,000. A profile at about 60,000 changes (75
+  sealed segments of 127 MB) puts 47% of the time in `SegmentReader::lookup_entry_bounded`
+  and `lookup_authority`, 96% of it from `put_records_deferred`'s existence check:
+  a locator miss makes `read_keyed` (`packed/catalog.rs`) search every sealed segment
+  before trusting the miss, although `read_authoritative_location`'s comment says a
+  miss under a matching checkpoint is authoritative. The cost grows with the number of
+  segments, so creates keep slowing as the store grows. Options for Bart: check only
+  the locator on puts (a damaged locator then costs a duplicate copy, not a wrong
+  answer); trust a miss everywhere once the checkpoint matches; per-segment in-memory
+  filters so a probe is one memory access; fewer, larger segments through repack.
+- `[ ]` **A one-file change stores about 100–150 KB (2026-10-21).** The same run had
+  9.4 GB of segments at about 60,000 changes, each change adding one file two
+  directories deep. Find which records make up a change's bytes (tree and radix paths,
+  sets, state) and whether any of it grows with the history.
 - `[ ]` **`checkpoint_stack` warm-up (2026-09-26).** A new store's revisions get
   slower over the first ~400 (single change: 1.5 → 2.6 ms, deep: 4.2 → 6.5 ms), then
   stay flat. The profile shows zstd decoding and malloc in the packed store; the cause
