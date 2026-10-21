@@ -126,7 +126,19 @@ Performance, most serious first:
   `apply_revision`'s `content_commit` 1.2 s, `capture_path` 0.7 s with six
   `content_get`s per path, and each `apply_edits` reads every content blob again
   (60,000 `content_get`s, twice). Bench `add_scale` adds its second round to a new
-  change, so it doesn't measure this.
+  change, so it doesn't measure this. Since 2026-10-20 (01013f1) `apply_edits` no
+  longer re-hashes what it resolves, but it still reads every blob; not re-measured.
+- `[ ]` **Content hashed twice where hash-once didn't reach (2026-10-20).** Left over
+  from the hash-once work (`CURRENT_TASK.md`):
+  - the packed catalog's duplicate-put check re-reads and re-hashes the record
+    already stored;
+  - remote_packed seal validates objects (not content) twice: at `put_if_absent` and
+    again through `CheckedRecord::check` in `seal`;
+  - `FileBytes::value` in `crates/wheat-cli/src/edit_move.rs` hashes on every call
+    during `wheat move` replay.
+
+  Not a defect: `wheat add` hashes raw file bytes in the scan and canonical
+  (newline-normalized) bytes in capture, which can differ.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 
