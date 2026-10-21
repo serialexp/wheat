@@ -166,7 +166,7 @@ pub enum ExportError {
     },
     #[error("Git anchor {0} is not present in the destination repository")]
     MissingAnchor(gix::ObjectId),
-    #[error("Git anchor {0} does not match provenance in the selected chain")]
+    #[error("Git anchor {0} is not the history of the selected chain")]
     UnmatchedAnchor(gix::ObjectId),
     #[error(
         "projected Git anchor {anchor} has tree {actual_tree}, expected {expected_tree} for application {application}"
@@ -232,13 +232,33 @@ pub async fn export_revision_history<O: ImmutableObjectStore>(
         let anchor_commit = git
             .find_commit(anchor)
             .map_err(|_| ExportError::MissingAnchor(anchor))?;
+        let known = |entry: &ChainEntry, oid: gix::ObjectId| {
+            provenance_matches(&entry.revision, oid)
+                || options.projected_anchors.get(&entry.application) == Some(&oid)
+        };
         let index = chain
             .iter()
-            .position(|entry| {
-                provenance_matches(&entry.revision, anchor)
-                    || options.projected_anchors.get(&entry.application) == Some(&anchor)
-            })
+            .position(|entry| known(entry, anchor))
             .ok_or(ExportError::UnmatchedAnchor(anchor))?;
+        // Reusing the anchor stands in for every application before it, so they must
+        // be exactly the anchor's first-parent history. Otherwise an application
+        // ordered before an imported commit would silently go unpushed.
+        let mut commit = anchor_commit.clone();
+        for position in (0..=index).rev() {
+            if !known(&chain[position], commit.id) {
+                return Err(ExportError::UnmatchedAnchor(anchor));
+            }
+            if position > 0 {
+                let parent = commit
+                    .parent_ids()
+                    .next()
+                    .ok_or(ExportError::UnmatchedAnchor(anchor))?
+                    .detach();
+                commit = git
+                    .find_commit(parent)
+                    .map_err(|_| ExportError::UnmatchedAnchor(anchor))?;
+            }
+        }
         if options.projected_anchors.get(&chain[index].application) == Some(&anchor) {
             let view = reader.view(chain[index].result).await?;
             let mut verification_cache = ObjectCache::default();

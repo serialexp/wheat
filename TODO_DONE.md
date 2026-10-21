@@ -21,6 +21,19 @@ Finished items, moved here from `TODO.md` under the same headings.
   stress of the random test passes. `fetch_incremental` gained a revise step: 9.5
   instead of 11.5 objects per recomposed view, for 19.0 instead of 17.6 store reads.
 
+- `[x]` **`wheat push` silently drops changes ordered before an imported tip
+  (2026-10-21).** After an import, a `wheat change new --independent` change sorts
+  before the imported ones (UUIDv7 below UUIDv5), so the view is ordered
+  `independent, first, second`. Push matched the remote tip to `second` by its
+  recorded Git ID and reused it, skipping every application before it, printed
+  "already at ...", and recorded the reused commit for the new application, so the
+  next push failed as `corrupt_repository`. The export now reuses an anchor only
+  when the chain up to it is exactly the anchor's first-parent history (each entry
+  known by provenance or this store's projection mapping); otherwise it is
+  `UnmatchedAnchor`, and push exports afresh and refuses to rewrite the remote.
+  This applies to tag pushes too. Test:
+  `a_change_ordered_before_imported_history_is_never_dropped_from_a_push`.
+
 ## Found while scoping the Scion lessons (2026-10-15)
 
 - `[x]` **`catalog.head` and `repack.intent` are hand-encoded.** Both are BinSchema

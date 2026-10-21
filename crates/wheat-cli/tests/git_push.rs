@@ -266,6 +266,78 @@ fn imported_history_pushes_native_revision_as_a_fast_forward_and_reopens() {
 }
 
 #[test]
+fn a_change_ordered_before_imported_history_is_never_dropped_from_a_push() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let remote = root.path().join("remote.git");
+    let wheat_repository = root.path().join("wheat");
+    git(None, &["init", "-b", "main", source.to_str().unwrap()]);
+    for name in ["first", "second"] {
+        std::fs::write(source.join(name), name).unwrap();
+        git(Some(&source), &["add", name]);
+        git(Some(&source), &["commit", "-m", name]);
+    }
+    git(None, &["init", "--bare", remote.to_str().unwrap()]);
+    git(
+        Some(&source),
+        &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"],
+    );
+    let imported_tip = git(Some(&remote), &["rev-parse", "refs/heads/main"]);
+    let imported = wheat(
+        &wheat_repository,
+        &[
+            "import",
+            remote.to_str().unwrap(),
+            wheat_repository.to_str().unwrap(),
+            "--branch",
+            "refs/heads/main",
+        ],
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    // A root change sorts before the imported changes (UUIDv7 below UUIDv5), so the
+    // view is ordered `independent, first, second`: Git can't show that without
+    // rewriting the two imported commits.
+    let created = wheat(
+        &wheat_repository,
+        &[
+            "change",
+            "new",
+            "--independent",
+            "--path",
+            "independent",
+            "--value",
+            "independent",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    for attempt in 0..2 {
+        let pushed = wheat(
+            &wheat_repository,
+            &["push", remote.to_str().unwrap(), "--to", "refs/heads/main"],
+        );
+        let stderr = String::from_utf8_lossy(&pushed.stderr);
+        assert_eq!(pushed.status.code(), Some(3), "attempt {attempt}: {stderr}");
+        assert!(
+            stderr.contains("refusing to rewrite it"),
+            "attempt {attempt}: {stderr}"
+        );
+        assert_eq!(
+            git(Some(&remote), &["rev-parse", "refs/heads/main"]),
+            imported_tip
+        );
+    }
+}
+
+#[test]
 fn unknown_remote_tip_is_rejected_without_force_with_lease() {
     let root = tempfile::tempdir().unwrap();
     let repository = root.path().join("repository");

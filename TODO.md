@@ -21,17 +21,6 @@ for `wheat labels` here; incremental-validation step 9):
   incremental import of new Git commits onto a label, or Git only as an export.
   Also: the refusal is reported as `retryable: true` (`command_output.rs:578`), and
   the `--force-with-lease` fallback counts every exported commit as pushed.
-- `[ ]` **`wheat push` silently drops changes ordered before an imported tip
-  (2026-10-21).** After an import, `wheat change new --independent` plus `wheat add`
-  gives a view ordered `independent, first, second` (UUIDv7 sorts before the
-  imported UUIDv5 IDs). `wheat push` then prints "already at f6f509d" and pushes
-  nothing; the next push fails as `corrupt_repository` ("projected Git anchor ... has
-  tree ..., expected ..."). When the remote tip matches an imported commit by its
-  recorded Git ID (`provenance_matches`, `crates/wheat-git/src/export.rs:238`), every
-  application before it is skipped (`:282`) without checking the tree (only a
-  projection-mapping match is checked, `:242`), and `bridge.rs:148` records the
-  reused commit for the new application, poisoning `projections/git.git`. Any
-  integrate-based Git import would hit this routinely.
 - `[ ]` **Resolving a conflict is awkward.** The workspace shows only one side of a
   conflicted file, with no markers, and `wheat resolve` takes the whole resolved
   file as `--value` on the command line (bounded by the argument size limit). After
