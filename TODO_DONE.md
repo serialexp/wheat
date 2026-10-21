@@ -51,6 +51,11 @@ Finished items, moved here from `TODO.md` under the same headings.
   2,000 small files went from 2,016 messages to 17. Contract in bench
   `remote_latency`. Streaming large blobs to disk stays open in `TODO.md`.
 
+- `[x]` **Transition validation reads every added blob in full (2026-10-05).**
+  `repository_transition.rs` (step 5) now asks `ContentStore::logical_length` whether
+  each added content ID exists, without reading or hashing it (2026-10-20, 1b3c962):
+  content is checked against its ID when it is stored.
+
 - `[x]` **Content manifests are full snapshots, so comparing two still reads both
   (2026-10-05).** Publish and fetch now look up only the content the old head lacks,
   but finding it decodes both manifests' snapshots (about 3.3 MB each at 100,000

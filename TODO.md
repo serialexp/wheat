@@ -85,10 +85,6 @@ Performance, most serious first:
   only, 2026-10-05).** `ContentStore::existing_ids` (`content_store.rs`) uses
   `list_ids` whenever the backend has it, so a publish of one file lists every blob.
   Choose per-item checks below some count.
-- `[ ]` **Transition validation reads every added blob in full (2026-10-05).**
-  `repository_transition.rs` (step 5) calls `content.get` for each added content ID
-  only to see that it exists; `contains` would do, unless the read is meant to check
-  the bytes.
 - `[ ]` **Read-only commands still sync (2026-10-05).**
   `PackedCatalog::open_with_target` (`packed/catalog.rs`) calls
   `sync_created_ancestors` on each open, which syncs every directory from
