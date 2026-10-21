@@ -1,0 +1,36 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261021-033448
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# git_pull_incremental	{"early":50,"files":2000,"history":2000,"pulled":20}
+# release	true
+# rev	036e0e3332bf
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+git_pull_incremental.total.wall	35.665044996	s
+git_pull_incremental.total.peak_rss	103989248	bytes
+git_pull_incremental.early.import.wall	0.256412049	s
+git_pull_incremental.early.import.peak_rss	21520384	bytes
+git_pull_incremental.early.pull.wall	0.267784384	s
+git_pull_incremental.early.pull.peak_rss	19718144	bytes
+git_pull_incremental.early.pull_after_push.wall	0.26102737	s
+git_pull_incremental.early.pull_after_push.peak_rss	19607552	bytes
+git_pull_incremental.early.pull.records_per_commit	17.3	count
+git_pull_incremental.early.pull_after_push.records_per_commit	16.9	count
+git_pull_incremental.late.import.wall	7.114556258	s
+git_pull_incremental.late.import.peak_rss	103989248	bytes
+git_pull_incremental.late.pull.wall	2.79253848	s
+git_pull_incremental.late.pull.peak_rss	99704832	bytes
+git_pull_incremental.late.pull_after_push.wall	2.485672139	s
+git_pull_incremental.late.pull_after_push.peak_rss	100028416	bytes
+git_pull_incremental.late.pull.records_per_commit	31.95	count
+git_pull_incremental.late.pull_after_push.records_per_commit	31.4	count
+git_pull_incremental.pull.record_growth	184.68208092485548	percent
+git_pull_incremental.pull_after_push.record_growth	185.79881656804736	percent
+run.total_time	35.665482891	s
+process.peak_rss	103989248	bytes
+suite.cases	1	count
+suite.case_failures	0	count

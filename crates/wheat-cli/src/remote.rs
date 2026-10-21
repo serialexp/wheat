@@ -54,6 +54,16 @@ impl WheatUrl {
     }
 }
 
+/// Whether `input` names a Wheat server rather than a Git remote. Whether it is a
+/// valid one is [`parse_wheat_url`]'s to decide.
+pub fn is_wheat_url(input: &str) -> bool {
+    ["wheat://", "wheat+tls://"].iter().any(|scheme| {
+        input
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    })
+}
+
 /// Parse a `wheat://` or `wheat+tls://` URL into a strict canonical identity.
 ///
 /// No default port is currently part of the Wheat protocol contract, so an

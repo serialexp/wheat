@@ -34,6 +34,18 @@ Finished items, moved here from `TODO.md` under the same headings.
   This applies to tag pushes too. Test:
   `a_change_ordered_before_imported_history_is_never_dropped_from_a_push`.
 
+- `[x]` **Git is one-way after the import.** Commits pushed to the Git remote by
+  anyone else could not be brought into an existing Wheat repository, and `wheat
+  push` then refused. Done 2026-10-21: `wheat pull <git-url>` (`--from <ref>`,
+  default the label's imported Git ref) walks back along first parents from the
+  remote tip to the newest commit the workspace holds, imported or pushed by this
+  store (new commit-keyed refs in the projection), appends the commits above it as
+  the importer would, and moves local work above them like `git pull --rebase`, with
+  conflicts kept as durable conflicts. The next push fast-forwards. The push refusal
+  now says to pull and is `git_remote_diverged`, `retryable: false`. Tests:
+  `git_round_trip.rs`, `git_pull.rs`; bench case `git_pull_incremental`; design in
+  `docs/design/wheat-local-cli.md`, "Pulling from Git".
+
 ## Found while scoping the Scion lessons (2026-10-15)
 
 - `[x]` **`catalog.head` and `repack.intent` are hand-encoded.** Both are BinSchema

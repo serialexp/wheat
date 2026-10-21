@@ -218,6 +218,27 @@ fn uncaptured_edits_block_integrate() {
     assert_eq!(frontier_count(&sides.reader, &sides.config), 2);
 }
 
+/// A Git pull appends above one line of history, so it refuses until the frontiers
+/// are joined.
+#[test]
+fn a_git_pull_waits_for_integrate() {
+    let (sides, _server) = diverged([("remote.txt", "remote"), ("local.txt", "local")]);
+    let (reader, stores) = &sides.reader;
+
+    let refused = fails(
+        reader,
+        stores,
+        &sides.config,
+        &["pull", "/nonexistent/repo.git", "--from", "refs/heads/main"],
+    );
+
+    assert!(
+        refused.contains("join them with `wheat integrate` before pulling"),
+        "{refused}"
+    );
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 2);
+}
+
 /// An untracked file where the joined view has one stops the workspace switch, not the
 /// join: the error says how to switch once the file is out of the way.
 #[test]

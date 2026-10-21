@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use chrono::{Local, Offset as _};
 use serde::Serialize;
 use wheat_core::{ChangeId, ObjectId, RevisionId, Timestamp, ViewId};
 use wheat_store::{
@@ -81,7 +80,7 @@ pub(crate) fn execute(
     let expected = local.heads.read()?;
     let remote = RemoteConfig::read(&context.store_root)?;
     let actor = authoring_metadata::actor(&context.store_root)?;
-    let now = now_timestamp()?;
+    let now = authoring_metadata::now()?;
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
     let planned = runtime()?.block_on(plan(
         &context.store_root,
@@ -524,16 +523,6 @@ fn map_workspace(
             pending.proposed_head = proposed.into();
         }
     }
-}
-
-fn now_timestamp() -> Result<Timestamp> {
-    let now = Local::now().fixed_offset();
-    let seconds = now.offset().fix().local_minus_utc();
-    ensure!(seconds % 60 == 0, "local UTC offset is not minute-aligned");
-    Ok(Timestamp {
-        seconds: now.timestamp(),
-        offset_minutes: i16::try_from(seconds / 60)?,
-    })
 }
 
 fn report(

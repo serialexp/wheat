@@ -124,6 +124,7 @@ async fn resolve_at_head<O: wheat_store::ImmutableObjectStore>(
     })
 }
 
+#[tracing::instrument(name = "frontier_list", level = "debug", skip_all)]
 pub(crate) async fn list(repository: &LocalRepository, label: &str) -> Result<FrontierList> {
     let head = repository.heads.read()?;
     let reader = RepositoryReader::new(&repository.objects, &repository.content);

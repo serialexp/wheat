@@ -246,6 +246,11 @@ pub(crate) fn metadata(
     Ok((change, revision))
 }
 
+/// The current local time, as revision metadata records it.
+pub(crate) fn now() -> Result<Timestamp> {
+    parse_timestamp(None, Local::now().fixed_offset(), "the local time")
+}
+
 fn message_title(message: &str) -> Result<&str> {
     let title = message.lines().next().unwrap_or_default().trim();
     ensure!(

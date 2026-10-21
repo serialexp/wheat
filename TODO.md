@@ -13,14 +13,31 @@ Besides labels never moving (`docs/design/wheat-label-moves.md`), plain-text
 `wheat://` (TLS item below) and read-only commands paying a full validation (1.4 s
 for `wheat labels` here; incremental-validation step 9):
 
-- `[ ]` **Git is one-way after the import.** `wheat import` only creates a fresh
-  repository and `wheat fetch` speaks only the native protocol, so commits pushed to
-  the Git remote by anyone else cannot be brought into an existing Wheat repository,
-  and `wheat push` to that branch then refuses ("points at unknown commit ...;
-  refusing to rewrite it"); `--force-with-lease` would drop those commits. Needs a decision:
-  incremental import of new Git commits onto a label, or Git only as an export.
-  Also: the refusal is reported as `retryable: true` (`command_output.rs:578`), and
-  the `--force-with-lease` fallback counts every exported commit as pushed.
+- `[ ]` **`wheat push --force-with-lease` counts every exported commit as pushed.**
+  Its report says "pushed N commits" for the whole exported chain, not the commits
+  the remote lacked.
+- `[ ]` **Git push and pull re-project a whole tree each time (2026-10-21).** Push
+  checks its reused anchor, and pull a commit it recognises as pushed, by writing the
+  Wheat tree into the projection again (`export.rs` `project_tree`/anchor check), so
+  each reads every file of the tree once: O(files), not O(changes). A persisted
+  Wheat-tree → Git-tree map in the projection would make both O(changed paths).
+  `git_pull_incremental` records the cost.
+- `[ ]` **Losing the Git projection duplicates pushed changes on the next pull
+  (2026-10-21).** The commit refs in `projections/git.git` are the only record of
+  which Git commit a native change was pushed as, so a store without them imports
+  its own pushed commits as new changes beside the originals.
+- `[ ]` **A rebased change the pulled commits already contain is kept as an empty
+  change (2026-10-21).** Pull moves every local change above the pulled commits; one
+  whose edits are already there (the same fix made in Git) is not dropped as
+  `git rebase` would, so the next push projects it as an empty commit. Untested.
+- `[ ]` **`wheat status --format=json` prints view IDs as byte arrays (2026-10-21).**
+  `basis`, `effective_view` and the other view fields serialize as 32-number arrays;
+  every other command prints them as hex.
+- `[ ]` **A native pull or fetch without `remote.json` is an internal error
+  (2026-10-21).** `resolve_remote` (`main.rs`) fails with plain context ("no
+  remote.json found; use wheat clone or pass --remote"), so `wheat pull wheat://...`
+  in an imported store reports `internal / unexpected_failure`, and the advice to
+  pass `--remote` doesn't help: an explicit remote also needs `remote.json`.
 - `[ ]` **Resolving a conflict is awkward.** The workspace shows only one side of a
   conflicted file, with no markers, and `wheat resolve` takes the whole resolved
   file as `--value` on the command line (bounded by the argument size limit). After
@@ -195,6 +212,14 @@ budget passes, but by only about 0.7 s.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[ ]` **Full validation and the mutator disagree on conflict resolutions
+  (2026-10-21).** A resolution must name exactly the conflict's failed edits in full
+  validation (`repository_verify.rs`, `!=`), but only some of them in
+  `Repository::validate_edit_transition` (`wheat-core` `repository.rs`, `is_subset`).
+  Full validation also doesn't check that the resolved application is one of the
+  predecessor revision's, which both the mutator and wheat-core require. Bart to pick
+  the rule; then make all three agree before incremental
+  validation step 3 copies full validation's.
 - `[ ]` **Workspace reads keep their own libc module (2026-10-05).** wheat-cli's
   other operating-system calls now go through `sys.rs`, but `workspace_files.rs` still
   has a `#[cfg(unix)] mod platform` that calls `openat`, `fstatat` and `readlinkat`

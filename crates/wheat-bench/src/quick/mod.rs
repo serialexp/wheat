@@ -19,6 +19,7 @@ mod deep_stack;
 mod fetch_incremental;
 mod git;
 mod git_export_notes;
+mod git_pull_incremental;
 mod head_receipts;
 mod history;
 mod import_resume_wide;
@@ -62,6 +63,7 @@ pub const CASES: &[&str] = &[
     content_repack_plan::NAME,
     sharded_manifest::NAME,
     git_export_notes::NAME,
+    git_pull_incremental::NAME,
     checkpoint_stack::NAME,
     publish_content::NAME,
     fetch_incremental::NAME,
@@ -214,6 +216,7 @@ pub fn run_case(
         content_repack_plan::NAME => content_repack_plan::run(&context),
         sharded_manifest::NAME => sharded_manifest::run(&context),
         git_export_notes::NAME => git_export_notes::run(&context),
+        git_pull_incremental::NAME => git_pull_incremental::run(&context),
         checkpoint_stack::NAME => checkpoint_stack::run(&context),
         publish_content::NAME => publish_content::run(&context),
         fetch_incremental::NAME => fetch_incremental::run(&context),

@@ -972,7 +972,7 @@ but configuration must identify it as a Git projection endpoint. Receiving
 changes from it remains an explicit import/reconciliation operation; a changed
 Git ref must not silently redefine canonical Wheat state.
 
-Pulling from Git (2026-10-21, in progress; acceptance test
+Pulling from Git (2026-10-21; acceptance test
 `crates/wheat-cli/tests/git_round_trip.rs`). Bart chose `wheat pull <git-url>`:
 the explicit reconciliation above. It imports only the commits the store doesn't
 know yet, walking back from the remote tip to a known commit: one imported earlier
@@ -995,6 +995,13 @@ they were pushed. Bart's further choices:
   tip, with the author kept and the puller as committer (like `git rebase`). It is
   authored at its old position, so it stays valid, and a reapplication that no
   longer fits is recorded as a durable conflict.
+
+Pull refuses, without publishing anything, a dirty workspace, a label with several
+frontiers, a branch the remote lacks, a branch sharing no first-parent commit with
+the workspace, more than 10,000 new commits, and a recognised commit the workspace
+holds elsewhere than on its own path (a pushed change revised since, for one): Git
+IDs only recognise commits, and which changes the repository holds stays its own
+records' to decide. A `wheat://` or `wheat+tls://` URL is a native pull.
 
 ## Repository discovery
 

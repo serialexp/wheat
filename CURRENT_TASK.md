@@ -9,10 +9,16 @@ incrementally, then integrated); unpushed Wheat changes end up **on top of** the
 Git commits (like `git pull --rebase`), so the next push fast-forwards; and Wheat's
 own pushed commits come back as the same changes (same store), not duplicates.
 
-- `crates/wheat-cli/tests/git_round_trip.rs`, **uncommitted on purpose** (Bart: "Don't
-  commit yet"; it goes in with the pull implementation). Everything up to the pull
-  passes; it fails at `wheat pull <path>` (no positional URL; pull only speaks
-  `wheat://`).
+- **Done 2026-10-21**: `wheat pull <git-url>` is implemented and
+  `crates/wheat-cli/tests/git_round_trip.rs` passes. Pieces: wheat-store
+  `repository_rebase.rs` (036e0e3); wheat-git `pull.rs` and the projection's commit
+  refs (`bridge.rs`); wheat-cli `git_pull.rs` and the URL dispatch; tests
+  `git_pull.rs` (15) and `integrate.rs` `a_git_pull_waits_for_integrate`; bench case
+  `git_pull_incremental` (results `bench/results/wheat-quick/20261021-033448-*`).
+  Profiling found pull paying full validation twice; the label lookup no longer
+  validates, and the remaining one (`frontier_service::list`, 2.7 of 3.2 s at 2,000
+  commits) goes with incremental-validation step 9. Follow-ups are in `TODO.md`
+  ("Found while dogfooding").
 - B1 (push dropping changes before a reused anchor) fixed in 6d46522.
 - Bart's decisions (2026-10-21): conflicts while reapplying are **durable
   conflicts**; merges are **first parent only** (one change per first-parent

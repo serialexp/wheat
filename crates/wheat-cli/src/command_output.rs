@@ -9,7 +9,7 @@ use thiserror::Error;
 use wheat_core::RepositoryError;
 use wheat_git::{
     AtomicImportError, ImportError, StagedImportError, bridge::BridgeError, export::ExportError,
-    push::PushError,
+    pull::PullError, push::PushError,
 };
 use wheat_store::{
     ContentStoreError, ObjectStoreError, PublicationError, RepositoryMutationError,
@@ -577,9 +577,12 @@ fn classify(error: &Error) -> Classification {
         }
         if let Some(bridge) = cause.downcast_ref::<BridgeError>() {
             return match bridge {
-                BridgeError::UnknownRemoteTip { .. } | BridgeError::Rejected(_) => {
-                    class("state", "git_projection_rejected", true, 3)
+                // Retrying changes nothing: the remote holds commits this repository
+                // lacks until a pull brings them in.
+                BridgeError::UnknownRemoteTip { .. } => {
+                    class("state", "git_remote_diverged", false, 3)
                 }
+                BridgeError::Rejected(_) => class("state", "git_projection_rejected", true, 3),
                 BridgeError::TagCommitNotOnRemoteBranch { .. } => {
                     class("state", "tag_commit_not_on_remote_branch", false, 3)
                 }
@@ -589,6 +592,31 @@ fn classify(error: &Error) -> Classification {
                     class("io", "git_projection_io", true, 8)
                 }
                 BridgeError::Export(_) | BridgeError::Push(_) => continue,
+            };
+        }
+        if let Some(pull) = cause.downcast_ref::<PullError>() {
+            return match pull {
+                PullError::RemoteBranchAbsent { .. } => {
+                    class("input", "remote_branch_absent", false, 2)
+                }
+                PullError::NoCommonCommit { .. } => {
+                    class("input", "disconnected_history", false, 2)
+                }
+                PullError::TooManyCommits { .. } => class("limit", "limit_exceeded", false, 5),
+                PullError::KnownCommitOffPath { .. } => {
+                    class("state", "git_history_off_path", false, 3)
+                }
+                PullError::MismatchedProjectedTree { .. } => {
+                    class("integrity", "corrupt_git_projection", false, 6)
+                }
+                PullError::Git { .. } => class("io", "git_projection_io", true, 8),
+                PullError::Bridge(_)
+                | PullError::Transport(_)
+                | PullError::Import(_)
+                | PullError::Export(_)
+                | PullError::Repository(_)
+                | PullError::RevisionMap(_)
+                | PullError::ApplicationMap(_) => continue,
             };
         }
         if let Some(push) = cause.downcast_ref::<PushError>() {

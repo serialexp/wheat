@@ -30,6 +30,7 @@ mod discovery;
 mod dot_git;
 mod edit_move;
 mod frontier_service;
+mod git_pull;
 mod ignore_import;
 mod import_trace;
 mod inspection;
@@ -160,7 +161,8 @@ enum Command {
     /// Fetch updates from a wheat-server via the native protocol.
     Fetch(NativeFetchArgs),
     /// Fetch, then join the active label's frontiers and switch the workspace to the
-    /// result: `wheat fetch` followed by `wheat integrate`.
+    /// result: `wheat fetch` followed by `wheat integrate`. Given a Git URL or path,
+    /// append the Git branch's new commits and move local work above them instead.
     Pull(NativePullArgs),
     /// Publish local state to a wheat-server via the native protocol.
     Publish(NativePublishArgs),
@@ -623,6 +625,13 @@ struct NativeFetchArgs {
 
 #[derive(Debug, Args)]
 struct NativePullArgs {
+    /// A Git URL or path to pull from, or a wheat:// URL to pull natively.
+    #[arg(conflicts_with = "remote")]
+    url: Option<String>,
+    /// The Git branch to pull. Defaults to the Git ref the active label was
+    /// imported from.
+    #[arg(long, requires = "url")]
+    from: Option<String>,
     /// Override the remote URL (wheat://host:port/owner/repo).
     #[arg(long)]
     remote: Option<String>,
@@ -1627,12 +1636,28 @@ fn execute(cli: Cli) -> Result<Success> {
         }
         Command::Pull(arguments) => {
             let dot_git = arguments.dot_git.gate(format);
-            native_pull(
-                &requested_workspace,
-                cli.store.as_deref(),
-                arguments.remote,
-                dot_git,
-            )
+            match arguments.url {
+                Some(url) if !remote::is_wheat_url(&url) => git_pull::pull(
+                    &requested_workspace,
+                    cli.store.as_deref(),
+                    &url,
+                    arguments.from.as_deref(),
+                    dot_git,
+                ),
+                url => {
+                    if arguments.from.is_some() {
+                        return Err(CliFailure::invalid(
+                            "--from names a Git branch; a native pull takes the label's own",
+                        ));
+                    }
+                    native_pull(
+                        &requested_workspace,
+                        cli.store.as_deref(),
+                        url.or(arguments.remote),
+                        dot_git,
+                    )
+                }
+            }
         }
         Command::Publish(arguments) => {
             native_publish(&requested_workspace, cli.store.as_deref(), arguments)
