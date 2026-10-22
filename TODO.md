@@ -345,6 +345,14 @@ budget passes, but by only about 0.7 s.
   the suite's runtime. Lead (2026-09-26): profiling a 20,000-revision in-memory build
   showed most time in `String`/`BTreeMap<String, FileValue>` and `Change` clones, so the
   in-memory `Repository` seems to copy the whole tree and change set per revision.
+- `[ ]` **A change in a large directory reads and writes the whole directory
+  (2026-10-22).** A directory is one tree record, so adding a file to a directory of
+  10,000 reads and rewrites all its entries: in `increment_validate`'s flat history,
+  validating a one-change publication read 5.0 MB (16 ms) at 10,000 files against
+  0.66 MB at 1,000, and a create took 21 ms against 3 ms. Directories spread over
+  levels, as in source trees, stay cheap (0.54 MB at 100,000 changes). Chunking large
+  directories (a radix layout for directory entries) would make this logarithmic too;
+  a format change, Bart's call.
 - `[ ]` **Tighten the quick contract rules.** The budgets came from debug builds (for
   example `deep_stack.*_overhead ≤ 1.5 s`, measured 0.35–0.47 s in release, and
   `add_scale.*.wall ≤ 30 s`, measured at most 5.5 s). Set them from a few `pt-default`

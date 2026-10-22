@@ -1,7 +1,8 @@
 # Wheat incremental validation at trust boundaries — plan
 
-Status: proposed (2026-10-15), revised after Codex reviews 1 and 2; for review
-before implementation. Prerequisite of `wheat-label-moves.md` (its decision 13).
+Status: implemented (2026-10-22; steps 1-10 under "Order of work"). Proposed
+2026-10-15, revised after Codex reviews 1 and 2. Prerequisite of
+`wheat-label-moves.md` (its decision 13).
 Owner: bart
 
 ## Why
@@ -505,10 +506,11 @@ snapshots and deltas).
 
 ## TODO.md
 
-Closed by this: "Content manifests are full snapshots"; "Read-only `wheat` commands
-cost a full validation" (partly: store open still re-reads the content pack; that
-stays open). "Transition validation reads every added blob in full": replay reads the
-content it needs anyway; close or keep per Bart.
+Closed by this: "Content manifests are full snapshots" (step 2); "Read-only `wheat`
+commands cost a full validation" (step 9; its store-open half stays open as "Opening
+a packed store costs O(store)"). "Transition validation reads every added blob in
+full" was closed separately (1b3c962). Opened: "A change in a large directory reads
+and writes the whole directory".
 
 ## Order of work
 
@@ -615,4 +617,21 @@ content it needs anyway; close or keep per Bart.
    `remote_fetch.rs` `a_clone_validates_once_and_local_commands_trust_the_store`
    counts it: zero for frontier list, label list and create, and switch after a
    clone, which itself runs one `validate_bootstrap`.
-10. Benchmarks, docs, TODO bookkeeping.
+10. Benchmarks, docs, TODO bookkeeping. Done 2026-10-22. The read contract is
+    `increment_validate`'s, restated as logarithmic: object reads per bit of history
+    size (log2 of the change count), from 1,000 to 100,000 changes, may grow by at
+    most 125%, for validating a one-change publication and for creating it (the
+    create covers `apply_step`'s order-index walk); bytes per bit by at most 150%,
+    since this shape's directory records grow with the history. Measured (release,
+    `20261022-014329-790411673081.tsv`): validation 114 / 124 / 152 reads at 1,000 /
+    10,000 / 100,000 changes (80% per bit), 269 / 408 / 542 KB (121%), 0.9 to 1.4 ms;
+    a create 68 / 79 / 103 reads (91%). A flat history (every file in one directory)
+    is recorded without a contract: a directory is one record, so validation read
+    0.66 MB at 1,000 files and 5.0 MB (16 ms) at 10,000 (TODO.md). `transition_validate`
+    stays as it was: it measures `validate_transition`, which no boundary calls now.
+    `git_pull_incremental` records `wheat labels` and `wheat frontier list`: 14 / 12 ms
+    at 50 commits, 52 / 44 ms at 2,000 (`20261022-014839-4b00e8e7ed10.tsv`; the growth is
+    not profiled). Docs: `wheat-native-protocol.md` (what publish, fetch and clone
+    validate, forced publishes), `server-native-source-control-store.md` (the
+    validation model), `wheat-storage-efficiency.md` (`validate_increment` keeps the
+    O(Δ) requirement).

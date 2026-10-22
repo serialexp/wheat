@@ -106,9 +106,14 @@ unchanged.
 Step 9 (2026-10-22): done in 314e786; the Git push part (`push`, `push_tag` in
 `crates/wheat-cli/src/main.rs`) went in with @calm-lynx's f8a96ae. Release
 `git_pull_incremental` (with the push hunks): late pull 2.1 → 0.27 s, late push
-2.1 → 0.24 s (results `20261022-012352-d9b1799c7754.tsv`). Next: step 10
-(benchmarks, docs, TODO bookkeeping; restate the read contract as logarithmic),
-then plan 2 (label moves).
+2.1 → 0.24 s (results `20261022-012352-d9b1799c7754.tsv`).
+
+Step 10 (2026-10-22): done; incremental validation is complete (details in the
+design doc's order of work). `increment_validate` now has logarithmic contracts
+(reads per bit of history ≤ 125% growth for validate and create, bytes ≤ 150%) and
+a flat-directory shape without a contract, which found "A change in a large
+directory reads and writes the whole directory" (TODO.md). Next: plan 2, label
+moves (`docs/design/wheat-label-moves.md`).
 
 ## 2026-10-21: Git push/pull round trip (@calm-lynx)
 

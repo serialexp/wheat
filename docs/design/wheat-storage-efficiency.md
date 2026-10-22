@@ -148,8 +148,9 @@ This document designs the fixes for all three layers.
   delta chain traversal for the most recent version of each file.
 - Maintain the existing `ContentStore` API (`get`, `put`, `get_bounded`)
   — delta resolution is internal to the store.
-- Preserve O(Δ) `validate_transition` — publication validation must
-  remain proportional to the change size, not the repository size.
+- Preserve O(Δ) publication validation (`validate_increment`, which replaced
+  `validate_transition` at the boundaries) — it must remain proportional to the
+  change size, not the repository size.
 
 ## Non-goals (v1)
 
@@ -314,8 +315,8 @@ A leaf node with a one-byte prefix and no children is ~12 bytes of data
 + 60 bytes of index entry = ~72 bytes. Across ~700–800 trie nodes in a
 50-change repository, that's roughly 50–60 KB of trie overhead.
 
-The trie structure is not gratuitous — `validate_transition` uses
-`paired_diff` to compare two trie versions in O(Δ) by skipping
+The trie structure is not gratuitous — publication validation
+(`validate_increment`) uses `paired_diff` to compare two trie versions in O(Δ) by skipping
 subtrees with identical hashes. **Any compaction strategy must preserve
 this property.**
 
@@ -352,7 +353,7 @@ For a 50-change repository:
 - Object count reduction: **~70–85%** of trie nodes eliminated
 - Size reduction: **~40–50 KB saved** in index entries alone
 
-The structural sharing property is preserved, so `validate_transition`
+The structural sharing property is preserved, so publication validation
 remains O(Δ). The O(N) cumulative growth is unchanged — it was already
 O(N) with the trie, it stays O(N) with higher-fanout nodes.
 
@@ -774,6 +775,7 @@ destructive reachability GC.
 - `crates/wheat-core/src/collection_builders.rs` — radix trie builders
 - `crates/wheat-core/src/collection.rs` — trie node types
 - `crates/wheat-store/src/closure.rs` — structural closure computation
-- `crates/wheat-store/src/repository_transition.rs` — O(Δ) validation
+- `crates/wheat-store/src/increment_validation.rs` — O(Δ) validation at the trust
+  boundaries (`repository_transition.rs` holds the older transition check)
 - `crates/wheat-store/src/radix.rs` — `paired_diff` implementation
 - `gix-pack` crate — pure-Rust git pack delta format

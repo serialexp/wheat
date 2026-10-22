@@ -29,6 +29,8 @@ top of them.
   monotonicity and lineage extension checks. Benchmarked at 500 baseline
   changes + 5 delta: 64ms (transition) vs 410ms (complete), 6.4× speedup.
   Tests: 6 retained-set delta tests, 4 transition validation tests, 1 bench.
+  (2026-10-22: superseded at the boundaries by `validate_increment`, see
+  `wheat-incremental-validation.md`.)
 - [x] **Phase 1 — standalone wheat server.** `wheat-server` binary with
   WebSocket listener, per-connection session setup (ServerHello → ClientHello →
   SessionEstablished), repository open with label manifest, fetch (push of
@@ -532,13 +534,26 @@ the *transition*:
 - The proposed envelope references a valid state whose views, changes,
   revisions, and applications form a complete closure — all referenced
   ObjectIds exist in the store (pre-existing or newly uploaded).
-- The transition from the current head's envelope to the published one (the
-  proposed envelope, or the joined one) satisfies monotonicity: no retained
-  changes/views are removed (append-only for non-GC transitions).
+- The published envelope (the proposed one, or the joined one) is validated as
+  an increment on the current head's (`validate_increment`, see
+  `wheat-incremental-validation.md`): history only grows, and every change,
+  revision, application, view, lineage edge, content member and label it adds
+  keeps the store's invariants, checked against what it extends. Its reads are
+  capped in proportion to what it adds (`IncrementBudget`); over that, the
+  publish is refused as `validation_budget_exceeded`.
 - Generation is exactly the current head's generation + 1.
 
-This is O(delta) not O(repository). A background audit can run full
-`validate_complete` periodically without blocking publication latency.
+This grows with the increment and the logarithm of the history, not with the
+repository. A forced publish may remove history, so nothing unchanged can be
+trusted to still hold: it runs full validation (`validate_envelope`), and its
+cost is the repository's size.
+
+The client validates what it receives the same way, before it keeps it:
+`wheat fetch` checks the remote head as an increment on the last envelope it
+fetched (or as a whole, with `--force`), `wheat clone` checks the whole head as an
+increment from the base view (`validate_bootstrap`), and the joined head a
+publish returns is checked as an increment on the client's own. Local commands
+then trust the store.
 
 **Staging and cleanup.** Objects uploaded during a publication attempt are
 staged (not yet indexed in the catalog) until `PublishResult` confirms
@@ -1269,10 +1284,10 @@ All initial open questions have been settled:
   flag) transitions. Force-publish allows removing retained changes,
   rewriting labels, and non-descendant transitions — necessary for secret
   removal and repository administration. Force-publish requires elevated
-  authorization (server-side permission check) and is logged/audited. Delta
-  validation enforces monotonicity by default; force-publish skips the
-  monotonicity check but still validates object well-formedness and closure
-  completeness.
+  authorization (server-side permission check) and is logged/audited.
+  Increment validation enforces monotonicity by default; a force-publish is
+  validated in full instead (every invariant, every label), so it may drop
+  history but cannot publish an invalid state.
 
 ## References
 

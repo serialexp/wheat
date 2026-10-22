@@ -113,6 +113,17 @@ described here.
   appends sustained roughly 39–49 objects/second on the qualification host, reinforcing that bulk
   ingestion must use bounded batches or the deferred writer rather than treating per-object fsync as
   a throughput path.
+- [x] **Validation at the trust boundaries (2026-10-22).** The store's invariants (I1–I9 in
+  `wheat-incremental-validation.md`: composition, canonical order, acyclic weighted lineage,
+  one object per logical change, revision and application replay, content membership, labels
+  on retained views, canonical radix nodes) are proven when a head arrives, not by every
+  command that reads it. A publish or fetch validates what the new head adds to a trusted one,
+  in reads proportional to what it adds and the logarithm of the history, and within a budget
+  sized from it; a clone validates the whole head as an increment from its base view; a
+  forced publish or fetch runs full validation. Full and incremental validation share their
+  checks (`semantic_checks`), so they prove the same invariants. Local commands then trust
+  the store and check only what they use; `wheat validate` remains the complete check for a
+  store edited by hand or written by an older build.
 
 ### Outstanding
 
