@@ -101,11 +101,16 @@ fetch after a publish call it (details in the design doc's order of work). Relea
 `20261022-005122-c4387e0fcfad.tsv`. Against 20261021-054251 (ten commits earlier,
 format changes in between, so not this change alone): server CPU per publish
 unchanged, catch-up fetch 74 → 102 ms, revise fetch 96 → 114 ms, one-change fetches
-unchanged. `just fmt-check` and `just check-windows` fail on @calm-lynx's
-in-progress `crates/wheat-desktop` (no `main.rs` yet); both pass on the other
-crates. Next: step 9, dropping full validation from the local read paths
-(`frontier_service`, `label_service`, `materialization`, Git push), which
-@calm-lynx's wheat-client move will touch: coordinate first.
+unchanged.
+
+Step 9 (2026-10-22): done in 314e786, except the Git push hunks in
+`crates/wheat-cli/src/main.rs` (`push`, `push_tag`: `envelope` + `retained_view`
+instead of `validate_envelope`). They sit in the working tree beside @calm-lynx's
+uncommitted main.rs edits; @calm-lynx commits main.rs whole. Release
+`git_pull_incremental` (with the push hunks): late pull 2.1 → 0.27 s, late push
+2.1 → 0.24 s (results `20261022-012352-d9b1799c7754.tsv`). Next: step 10
+(benchmarks, docs, TODO bookkeeping; restate the read contract as logarithmic),
+then plan 2 (label moves).
 
 ## 2026-10-21: Git push/pull round trip (@calm-lynx)
 
