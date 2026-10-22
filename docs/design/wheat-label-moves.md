@@ -1,7 +1,8 @@
 # Wheat label moves — plan
 
-Status: proposed (2026-10-15), revised after Codex reviews 1–3; blocked on the
-prerequisite validation project (decision 13)
+Status: proposed (2026-10-15), revised after Codex reviews 1–3; references refreshed
+2026-10-22 after the prerequisite validation project (decision 13) landed, then revised
+after review 4 (Codex and Antigravity, 2026-10-22); step 1 in progress
 Owner: bart
 
 ## Why
@@ -42,19 +43,44 @@ decision.
     its own plan, landed first (review 3, items 4 and 8). This plan assumes it: views
     a store holds were checked when they arrived, so local commands may trust them.
 
+## Bart's decisions (2026-10-22, after review 4)
+
+14. Squash stops at branch points: it never collapses a revision another line
+    descends from, so a squash cannot erase the removal evidence a later merge with
+    that line needs (review 4, item 2).
+15. Merge work in validation has its own meter, `MergeBudget`, separate from the
+    prerequisite's `IncrementBudget` object-read meter; bootstrap and full validation
+    run under it too (review 4, item 5).
+16. `wheat label move` rebinds this workspace only when the target is its effective
+    view; otherwise the workspace keeps its basis, observed binding and selection and
+    shows drift until refresh or integrate (review 4, item 8).
+
 ## Revision ancestry
 
 ### The bug this fixes (exists today)
 
-`join_revisions` (`crates/wheat-store/src/repository_integration.rs:337-420`) finds
-the nearest revision on every candidate's predecessor chain and does a three-way
-edit merge against it. A combined revision records only the earliest candidate as
-predecessor, and a candidate that already holds the merged edits is reused
-(`Joined::Existing`) with no record at all, so later merges forget what went in.
-Examples: S = {}; A adds `a`, B adds `b`; integrate makes J = {a, b} with
-predecessor A; B is revised to B2, removing `b`; integrating J with B2 merges against
-S, keeps `b`, and B2's removal is lost. The same happens with A = {a, b}, B = {b},
-where the join reuses A (review 2, item 1).
+`join_revisions` (`crates/wheat-store/src/repository_integration.rs:355-447`) walks
+every ancestor of every candidate (`revision_ancestors`, breadth-first over
+predecessors and `combines`, linear in the change's history), takes the first of the
+earliest-sorted line's ancestors that the other lines share, and does a three-way edit
+merge against it.
+
+The examples review 2 (item 1) found are fixed by the prerequisite, because a combined
+revision now records every input in `combines` and is always authored: S = {}; A adds
+`a`, B adds `b`; integrate makes J = {a, b} combining A and B; B is revised to B2,
+removing `b`; integrating J with B2 now finds B and keeps the removal. They stay as
+regression tests (review 4). What still fails today:
+
+- Three or more inputs merged against one shared base. S = {}; M = S + `e`; X revises
+  M, removing `e` (X = {}); Y revises M, adding `y` (Y = {e, y}); Z revises S, adding
+  `z` (Z = {z}). The only ancestor all three share is S, which lacks `e`, so `e` is
+  kept from Y and X's removal is lost. Pairwise, X and Y merge over M to {y}, and
+  that with Z over S to {y, z}.
+- Criss-cross histories, where the first shared ancestor found is not a best common
+  ancestor (example under "Merge base").
+- Decision 12's case (under "Definitions").
+- Cost: `revision_ancestors` walks every ancestor of every input before anything else,
+  linear in the change's history, and the ancestor pruning uses it too.
 
 ### Format (from the prerequisite)
 
@@ -62,8 +88,12 @@ The prerequisite (`wheat-incremental-validation.md`) adds `combines` (the other
 inputs of a combined revision, at most 64) and `generation` (1 + the largest parent
 generation) to revisions, makes `join_revisions` always author one combined revision
 for incomparable inputs, replays combined revisions with reapplication rules, and
-validates all of it. This plan uses those fields for merge bases and the forward
-check. `generation` orders ancestry walks, as Git's commit-graph generation numbers
+validates all of it. All of that has landed: the prerequisite's `join_revisions` now
+always authors a combined revision (predecessor = earliest by `committed_at`,
+`combines` = the rest) and `semantic_checks.rs` `revision()` checks parents and
+`generation`. What is still today's is the merge rule itself (the single
+nearest-shared-ancestor base above), so the J/B2 bug still reproduces. This plan uses
+those fields for merge bases and the forward check. `generation` orders ancestry walks, as Git's commit-graph generation numbers
 do.
 
 Parents of a revision are its predecessor and its `combines`. Ancestors are parents,
@@ -91,7 +121,7 @@ transitively; `anc*(r)` includes `r`.
   history can walk most of this change's revision history. That is still
   independent of other changes and of repository size. Virtual bases are memoized
   per command (keyed by the sorted parent set). Bounded by
-  `MergeLimits { max_revision_reads, max_recursion_depth, max_edits }`; over budget
+  `MergeBudget { max_revision_reads, max_recursion_depth, max_edits }`; over budget
   is an error naming the change, not a wrong merge.
 
 ### Edit merge
@@ -113,34 +143,71 @@ Without decision 12 this is today's `join_revisions` rule with a correct base.
 
 ### `join_revisions`
 
-- Drop inputs that are ancestors of another input, over the DAG (the prerequisite
-  only follows `combines` for this; this plan adds the merge base).
+- Drop inputs that are ancestors of another input, with a generation-bounded walk
+  that shares the merge's budget and memo, replacing `revision_ancestors` (review 4,
+  item 6). The prerequisite already follows predecessor and `combines` here, but over
+  the whole history.
 - One left: it is the result (`Existing`).
 - Several: the prerequisite already authors one combined revision (predecessor = the
   earliest input, `combines` = the others, at most 64). This plan changes only its
   edits: the pairwise in-memory merge above, against correct merge bases, instead of
   today's rule. The virtual intermediates of the pairwise merge are never persisted.
+- Virtual nodes (review 4, item 7): merge-base walks run over a node type that is
+  either a stored revision or an in-memory virtual one (the pairwise intermediates and
+  memoized virtual bases). A virtual node has parents (its two inputs, or the bases
+  it merges), generation 1 + the largest parent generation, its edits, and the edits
+  it removed (`R`). It has no `RevisionId`; it is identified within the command by its
+  sorted parent set. For a virtual base, `anc*(b)` is the union of `anc*` of the bases
+  it merges.
+- Ordering, so the authoring client and a validating server merge identically: inputs
+  sort by `(committed_at.seconds, RevisionId bytes)`; the first is the predecessor.
 
 ### Squash
 
 `crates/wheat-store/src/repository_rewrite.rs`, `crates/wheat-client/src/squash.rs`:
 
-- Squash never collapses a combined revision (review 3, items 3 and 10). It collapses
-  only the plain revisions after the boundary, which is the latest of: the basis's
-  revision of the change, the first remotely retained revision, and the last
-  revision with `combines` on the primary chain. So every revision with `combines`
+- Squash never collapses a combined revision (review 3, items 3 and 10), nor a
+  revision another line descends from (decision 14). It collapses only the plain
+  revisions after the boundary, which is the latest of: the basis's revision of the
+  change, the first remotely retained revision, the last revision with `combines` on
+  the primary chain, and the latest branch point.
+- Branch point: a suffix revision that a revision of this change held by another
+  frontier or labeled view descends from (not counting the squashed view's own
+  line). Every line that branched off survives in some frontier or label, because
+  views never drop changes and a combination descends from its inputs. For each such
+  revision not already on the squashed line, a generation-bounded ancestry walk stops
+  once it passes below the suffix's lowest generation. Cost: the frontiers and labels,
+  times the walk; `descendant_frontiers`' follow-up below applies. So every revision with `combines`
   is exactly the merge of its parents, which validation relies on, and the
   replacement's only parent is the boundary.
-- A squash that collapses a revision some other view or label still holds makes a
-  move from that view non-forward, which is correct: that history was rewritten.
+- A squash may still collapse a revision only this view's own line holds. Its
+  replacement has the same edits, so a move from the old revision is still forward
+  (edit-equal, decision 6), which is correct: nothing was lost (review 4 corrected the
+  earlier claim that it becomes non-forward).
 
 ### Validation (added to the prerequisite's checks)
 
 The prerequisite follows `combines` everywhere predecessor is followed and validates
 parents, `generation` and the exact transition partition. This plan adds, for each
-revision with `combines` (full validation and `validate_increment`): its edits equal
-the merge of its parents (recomputed with `merge_base`), so a forged merge parent
-cannot "remove" edits. Cost: one merge per new combined revision, within the budget.
+revision with `combines` (full, bootstrap and incremental validation):
+
+- Its parents (predecessor and `combines`) are pairwise incomparable: none is an
+  ancestor of another (review 4, item 1). Without this, a forged C with predecessor
+  P = {e} and `combines` = {Q}, Q a descendant of P that removed `e`, equals its
+  parents' merge yet lets a later R = {e} on Q's line look removed again.
+- Its predecessor is the first of its parents in the order above.
+- Its edits equal the merge of its parents (recomputed with `merge_base`), so a forged
+  merge parent cannot "remove" edits.
+
+Cost: one merge per new combined revision. Merge work (revision reads for the
+merge-base walks, edits compared, virtual-base recursion) is metered by `MergeBudget`
+(decision 15), not by `IncrementBudget`'s object-read meter, so an honest merge with a
+distant base does not exhaust the increment's allowance. Reads the merge makes do not
+pass through `Metered`. One `MergeBudget` covers a whole validation run, under every
+arrival mode (incremental, bootstrap, forced/full); its limits are constants
+(`MergeBudget::STANDARD`), set from the step 1 benchmark's slopes, and over budget is an
+error naming the change. Memory is bounded by the same limits (the walk's queue and
+the memo hold at most `max_revision_reads` entries).
 
 ## Definitions
 
@@ -175,7 +242,8 @@ New `crates/wheat-store/src/label_move.rs`:
 ```rust
 pub enum NotForward {
     Missing { change: ChangeId },
-    Diverged { change: ChangeId, edits_added: usize, edits_restored: usize },
+    // The merge of `o` into `n` would add edits `n` lacks, or drop edits `n` holds.
+    Diverged { change: ChangeId, edits_added: usize, edits_dropped: usize },
 }
 impl RepositoryReader {
     pub async fn forward(&self, from: ViewId, to: ViewId, limits: &mut MergeBudget)
@@ -190,6 +258,8 @@ impl RepositoryReader {
 - Reads: revision records only; edit sets come from the records.
 - `MergeBudget` is shared by every check of one command or publish (review 2,
   item 11): revision reads, edits compared, map-diff entries, recursion depth.
+- The revision-map diff is the existing `RevisionMapStore::delta`
+  (`revision_map.rs:223`), which already runs over `radix::paired_diff`.
 
 ### Integrate: frontiers that lack label changes
 
@@ -244,22 +314,36 @@ remotely leaves nothing behind.
 
 ### Publish validation (server trust boundary)
 
-The prerequisite's `validate_increment` already checks new revisions, views and
-labels (retained views, `MAX_LABELS`). This plan adds to its label step:
+The prerequisite's `validate_arrival` checks new revisions, views and labels
+(retained views, `MAX_LABELS`); the merge check for combined revisions (above) goes
+there, for every arrival mode.
 
-- Each moved label: `forward(old, new)` unless `force_labels`. No left-behind check
-  on the server: frontiers are a client notion.
-- The merge check for combined revisions (above).
-- One `MergeBudget` per publish covers both, alongside the prerequisite's
-  `IncrementBudget`. Over budget: rejected with a reason.
+Label authorization is separate from arrival validation (review 4, item 3), because
+arrival validation also runs on fetch, where a remote label move that was forced on
+the server must still arrive, and because a forced publish (`Arrival::Forced`) runs
+full validation with no old envelope to compare labels against:
+
+- `crates/wheat-server/src/commit.rs`, on every publish (forced or not, on acceptance
+  and on cross-process rejoin): compare the labels of the head being replaced with
+  the labels of the head being written. Each moved label: `forward(old, new)` unless
+  that request's `force_labels`. No left-behind check on the server: frontiers are a
+  client notion. The permission belongs to one request, not to the others joined in
+  its batch.
+- The server's envelope union (`union_envelopes`, used at `commit.rs:205` and `:506`)
+  does not use fetch's "neither forward → remote" row (review 4, item 4). A label the
+  proposal moves and the server's head moved differently refuses the publish as stale
+  (decision 5), so the client pulls and integrates. `merge_labels` takes the policy as
+  a parameter: `Fetch` or `Publish`.
+- One `MergeBudget` per publish covers the label checks.
 
 ## CLI (`wheat-cli`)
 
 ### Authoring on label-held changes (decision 9)
 
-- `wheat add`, `change select` and `stack squash` accept any change in the
-  workspace's effective view (`active_changes.rs:92-98`, `main.rs:1193-1197`,
-  `squash.rs:219-245`). "Active" stays the name for changes revised since the
+- `wheat add`, `change select`, `change squash` and `stack squash` accept any change in the
+  workspace's effective view (the "is not active in this workspace" refusals in
+  `crates/wheat-client/src/authoring.rs:138,410` and `squash.rs:245`, fed by
+  `active_changes::inspect`). "Active" stays the name for changes revised since the
   basis, used in listings. Capture, conflict resolution, status and
   `create_on_frontier` already work over the effective view (review 2, item 9).
 - Revising a label-held change makes the result a frontier that revises a basis
@@ -274,10 +358,17 @@ labels (retained views, `MAX_LABELS`). This plan adds to its label step:
   behind (listing them); `--force` skips both.
 - CAS envelope mutation without full validation: it checks the target view is
   retained in the current state, then the checks above.
-- Moving the workspace's active label rebinds this workspace: `basis` and
-  `observed_label_binding` become the new view; `selected_frontier` becomes `None`
-  when it equals the new view. Materialization is unchanged at the default target.
-  With `--view` elsewhere, the workspace keeps its view and shows drift.
+- Moving the workspace's active label to the workspace's effective view rebinds this
+  workspace (decision 16): `basis` and `observed_label_binding` become the new view
+  and `selected_frontier` becomes `None`. Materialization is unchanged. With `--view`
+  elsewhere, the workspace keeps its basis, observed binding and selection, and shows
+  drift until `refresh` or `integrate`.
+- Crash safety (review 4, item 9): the rebind is a recoverable intent, like
+  `selection_recovery.rs`: the complete old and new workspace binding (basis,
+  observed binding, selected frontier) is staged before the CAS and finished after
+  it, with the workspace registry pins reconciled. A crash on either side of the CAS
+  leaves a workspace the next command completes or rolls back, never a half rebind.
+  Tests cover the crash points around the CAS and the metadata write.
 
 ### `integrate`, `pull` and `refresh`
 
@@ -299,7 +390,7 @@ labels (retained views, `MAX_LABELS`). This plan adds to its label step:
 
 Its `basis` and `observed_label_binding` still name the old view and are consistent
 with each other; only the label changed. Authoring (`add`) keeps working against the
-old basis (`repository_mutation.rs:645-648` checks the selection against the
+old basis (`repository_mutation.rs:719-733`, `open`, checks the selection against the
 workspace's basis, not the label); the result is a frontier of the old view, which
 the next integrate joins. Only `refresh`, `integrate`, `pull` and `switch` re-read
 the label.
@@ -307,13 +398,13 @@ the label.
 Two things change for this to hold (review 3, item 5):
 
 - `materialize` stops re-resolving the label (`materialize_active_workspace`,
-  `main.rs:1928-1943`, calls `frontier_service::resolve`). It materializes the
+  `crates/wheat-cli/src/main.rs:1520-1560`, calls `frontier_service::resolve`). It materializes the
   workspace's pinned basis and selected frontier, checking only that they are
   retained in the current head.
 - The materialization journal's `authenticate_target`
-  (`materialization.rs:1125-1148`) stops requiring the label in the journal's target
+  (`crates/wheat-client/src/materialization.rs:1135-1166`) stops requiring the label in the journal's target
   head to name the workspace's binding. Capture settlement advances the journal's
-  pinned head to the new publication head (`capture_settlement.rs:231-237`), whose
+  pinned head to the new publication head (`capture_settlement.rs:231-240`), whose
   label may already name another view, so that check would fail. It checks instead
   that `basis == observed_label_binding` within the journal and that the views it
   names are retained in the target head. The journal still pins a head, so recovery
@@ -334,23 +425,20 @@ Two things change for this to hold (review 3, item 5):
 
 ### Removing full validation from the paths these commands take
 
-`frontier_service::list` and `::resolve` (`frontier_service.rs:44-47,127-131`) and
-`materialization::authenticate_target` (`materialization.rs:1125-1128`) call
-`validate_envelope`, which verifies all retained history. Once the prerequisite
-project (decision 13) validates every view as it enters the store (publish on the
-server, fetch on the client), they change to check only what they use: the envelope
-and label manifest decode, and the views they name are retained. Doing this before
-that project lands would let a forged view (a copied revision map over an empty
-application map and tree) reach materialization (review 3, item 4). Without it the
-benchmark contract below cannot hold (review 2, item 11). `wheat validate` keeps full
-validation.
+Done by the prerequisite (its step 9): `frontier_service`, `label_service` and
+`materialization::authenticate_target` read the envelope and check the views they use
+with `RepositoryReader::retained_view`; views are validated when they arrive (publish
+on the server, clone and fetch on the client). `wheat validate` keeps full validation.
 
 ## Protocol
 
 `PublishRequest` (`crates/wheat-core/schemas/wheat-protocol.bs.json5`) gains
 `force_labels: bool`; regenerate (`just protocol-gen-schema`), update
 `crates/wheat-protocol/tests/{round_trip,forged_lengths}.rs`, `remote::publish`, and
-`crates/wheat-server/src/publish.rs` passes it to validation.
+`crates/wheat-server/src/publish.rs` passes it to validation. The flag is part of the
+publish request's identity (review 4, item 10): it joins the request-digest input in
+`wheat-objects.bs.json5` and `publish_request_digest` (`receipt.rs:56`), so a retry
+key reused with a different `force_labels` is a different request.
 
 ## Git bridge (`wheat-git`)
 
@@ -379,17 +467,28 @@ validation.
 
 Store (`crates/wheat-store/tests/`):
 
-- Regressions that fail today: J/B2 keeps B2's removal; A = {a,b}, B = {b} reused
-  join followed by B2 keeps the removal.
+- Regressions (fixed by the prerequisite, kept): J/B2 keeps B2's removal;
+  A = {a,b}, B = {b} join followed by B2 keeps the removal.
+- Failing today: the S/M/X/Y/Z three-input case; criss-cross; decision 12.
 - `merge_base`: linear; two inputs; three inputs; criss-cross gives the recursive
   virtual base (X/Y example); a redundant common ancestor dropped; no common
   ancestor.
-- Edit merge: X/Y/Z from review 3 keeps Y's removal, in every input order; decision
-  12's O/R/N case.
-- Validation (full and incremental): a combined revision whose edits differ from its
-  parents' merge (forged parent) is refused.
-- Squash stops at the last combined revision, the basis's revision, and the first
-  remotely retained one, whichever is latest.
+- Edit merge: S/M/X/Y/Z keeps X's removal, in every input order; decision 12's O/R/N
+  case; equal `committed_at.seconds` orders by revision id.
+- Integration read counts: a join with a dominated input and a two-way divergence
+  after 10 vs 100 revisions of the change reads the same (the whole operation, not
+  just `merge_base`); more than `MAX_COMBINES` + 1 incomparable inputs is refused
+  before reading their history.
+- Validation (full, bootstrap and incremental): refused are a combined revision whose
+  edits differ from its parents' merge; one with a parent that is an ancestor of
+  another (the forged C above); one whose predecessor is not its first parent.
+- Squash stops at the last combined revision, the basis's revision, the first
+  remotely retained one and the latest branch point, whichever is latest; the
+  removal-evidence case (B, M = {e}, N = {}, sibling O = {e} off M in another frontier)
+  merges the same before and after the squash (the client's `squash.rs` picks only one
+  of the last two today); the store's `validate_boundary` refuses a boundary with a
+  combined revision after it; squashing a change whose latest revision is combined
+  does nothing and says so.
 - `forward`: equal; descendant; descendant that removed an edit; sibling lacking an
   addition; sibling keeping a removed edit; same edits on an unrelated line
   (forward); combined from each input; missing change; extra changes.
@@ -404,7 +503,8 @@ Store (`crates/wheat-store/tests/`):
 CLI (`crates/wheat-cli/tests/`):
 
 - `label move`: forward, refused backward, `--force`, refused when leaving a frontier
-  behind, workspace rebind.
+  behind, workspace rebind to its effective view; `--view` elsewhere leaves the
+  workspace's binding and selection as they were (selected and unselected).
 - integrate/pull/refresh move the label; `--keep-label`; explicit `--frontier` subset
   refuses the move; one-frontier shortcut only when covered.
 - publish moves the label and the remote sees it; refused when not forward or leaving
@@ -416,9 +516,13 @@ CLI (`crates/wheat-cli/tests/`):
   publishes (remote → D); Bob's publish refused; Bob pulls: fetch takes D, integrate
   joins D and C, label → result; Bob publishes; Alice pulls and has both.
 - Fetch refusing a label change or deletion that would hide an unselected frontier.
+- Fetch accepting a remote label move the server took with `force_labels`.
 
 Server (`crates/wheat-server/tests/`): backward move rejected, accepted with
-`force_labels`; forward accepted; forged combined revision rejected.
+`force_labels`; forward accepted; forged combined revision rejected; the four
+combinations of `force` and `force_labels`; a label moved differently on the server
+refuses the publish as stale, on acceptance and on cross-process rejoin; a retry key
+reused with a different `force_labels` refused.
 
 Benchmark (Rule 20), `crates/wheat-bench` case `label_move`: `wheat publish` with a
 move, `wheat pull` integrating one change, `wheat label move`, `wheat refresh` — at
@@ -444,8 +548,8 @@ size for `just test`; release run; results under `bench/results/`.
    merge check in validation; squash's boundary. Regression tests first.
 2. `forward` + tests + read counts.
 3. Integrate with lacking frontiers and the basis lineage edge.
-4. (Full validation leaves the read paths in the prerequisite.) Materialize from the
-   pinned basis; the journal's binding check.
+4. Materialize from the pinned basis; the journal's binding check. (Full validation
+   already left the read paths in the prerequisite.)
 5. Label move in mutation publication; `label move`; workspace rebind.
 6. Authoring on label-held changes.
 7. integrate/pull/refresh move the label; `--keep-label`; one-frontier rule.
