@@ -2,6 +2,7 @@
 //! remotes and Git, shared by the `wheat` command and the desktop client.
 
 pub mod active_changes;
+pub mod authoring;
 pub mod authoring_metadata;
 pub mod capture_settlement;
 pub mod conflict_inspection;

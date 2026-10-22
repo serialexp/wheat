@@ -25,6 +25,13 @@ the same commit.
 - [ ] wgpu-gameui gaps: `Button` has no icon, `Checkbox` has no mixed state (the
   "All tracked" box) and its painter isn't public (file rows draw a checkbox
   through a throwaway `DrawContext`), and there is no commit-graph widget.
+- [ ] Flaky under load: `phase1_acceptance::phase_one_routine_single_target_workflow_across_processes`
+  asserts a diff isn't `truncated`, but `DiffLimits::deadline` is 250 ms of wall
+  clock, so a busy machine truncates it (seen once in a full `just test`, passes
+  alone). Tests need a count-based way to rule out truncation (Rule 22).
+- [ ] CLI tests that run `wheat init` without `WHEAT_STORE_HOME` leave stores in
+  `~/.local/share/wheat/stores` (881 there on 2026-10-22), e.g. `tests/active_changes.rs`.
+  Point every test at a temp store home and clean out the leaked ones.
 
 ## Found while dogfooding (2026-10-19)
 
@@ -34,7 +41,7 @@ Import, Git push (incremental, fast-forward), clone, publish, fetch, pull and
 resolve worked; a fetched join with a conflict failed validation (fixed in 3485b1e).
 Besides labels never moving (`docs/design/wheat-label-moves.md`), plain-text
 `wheat://` (TLS item below) and read-only commands paying a full validation (1.4 s
-for `wheat labels` here; incremental-validation step 9):
+for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
 
 - `[ ]` **`wheat push --force-with-lease` counts every exported commit as pushed.**
   Its report says "pushed N commits" for the whole exported chain, not the commits
@@ -43,8 +50,8 @@ for `wheat labels` here; incremental-validation step 9):
   `export.rs` `reconstruct_chain` steps from the selected view down to the base, about
   11 object reads per change (136 ms at 2,000 changes), before finding the anchor. It
   could stop at the first view whose application the projected commits name for the
-  remote tip. Push's full validation (`validate_envelope`, 1.8 s there) costs more
-  until incremental-validation step 9.
+  remote tip. (Push's full validation, 1.8 s there, went with
+  incremental-validation step 9.)
 - `[ ]` **The first push after an import reads every file (2026-10-21).** With no
   projected commit in the history there is no seed to patch from, so the first
   pushed commit's tree is written from scratch (2,001 contents in

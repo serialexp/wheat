@@ -10,6 +10,7 @@ fn ok(root: &Path, config: &Path, args: &[&str]) -> std::process::Output {
     let output = Command::new(env!("CARGO_BIN_EXE_wheat"))
         .current_dir(root)
         .env("XDG_CONFIG_HOME", config)
+        .env("WHEAT_STORE_HOME", config.join("stores"))
         .args(args)
         .output()
         .unwrap();

@@ -13,9 +13,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
-    ApplicationResultRecord, ChangeId, ChangeProposal, ContentId, EditFailure, EditTransition,
-    FileKind, FileValue, ObjectId, ProjectedCommit, RepositoryError, RevisionEdits, RevisionId,
-    ViewId, guarded::Limits,
+    ApplicationResultRecord, ChangeId, ContentId, EditFailure, EditTransition, FileKind, FileValue,
+    ObjectId, ProjectedCommit, RepositoryError, RevisionEdits, RevisionId, ViewId, guarded::Limits,
 };
 use wheat_store::{
     ApplicationMapStore, Arrival, BatchObjectStore, ImmutableObjectStore, MerkleTreeStore,
@@ -36,13 +35,12 @@ use local::{content_store, initialize, open, projection_path, revision_with_edit
 use materialization::materialize_resolved;
 use wheat_client::outcome::{CliFailure, OutputFormat, Success};
 use wheat_client::{
-    active_changes, authoring_metadata, capture_settlement, conflict_inspection, credential,
-    diff_render, discovery, dot_git, edit_move, frontier_service, git_pull, ignore_import,
-    import_trace, inspection, label_service, local, log_inspection, materialization, prompt,
-    remote, remote_config, repack, rewrite_transaction, selection_recovery, squash,
-    squash_attribution, store_analyze, store_lookup, workspace, workspace_clone, workspace_diff,
-    workspace_lifecycle, workspace_metadata, workspace_registry_service, workspace_scan,
-    workspace_status,
+    active_changes, authoring, authoring_metadata, conflict_inspection, credential, diff_render,
+    discovery, dot_git, edit_move, frontier_service, git_pull, ignore_import, import_trace,
+    inspection, label_service, local, log_inspection, materialization, prompt, remote,
+    remote_config, repack, rewrite_transaction, selection_recovery, squash, squash_attribution,
+    store_analyze, store_lookup, workspace, workspace_clone, workspace_diff, workspace_lifecycle,
+    workspace_metadata, workspace_registry_service, workspace_scan, workspace_status,
 };
 use workspace_lifecycle::{ensure_fresh_workspace, initialize_workspace_directory};
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
@@ -790,7 +788,7 @@ fn execute(cli: Cli) -> Result<Success> {
             Success::new("frontier.list", &document, human)
         }
         Command::Restore(arguments) => {
-            let restored = restore_workspace(
+            let restored = authoring::restore(
                 &requested_workspace,
                 cli.store.as_deref(),
                 &arguments.paths,
@@ -1051,75 +1049,23 @@ fn execute(cli: Cli) -> Result<Success> {
                     "at least one workspace path is required; use --all to capture all modified tracked paths",
                 ));
             }
-            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let local = open(&context.store_root)?;
-            // Store admission precedes the workspace lock. Holding both across planning and
-            // publication prevents either a staged rewrite or another head mutation from
-            // interleaving before the compare-and-swap.
-            let _operation =
-                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
-            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
-            context.workspace = WorkspaceMetadata::read(&context.root)?;
-            let runtime = runtime()?;
-            runtime.block_on(materialization::recover(
-                &context.root,
-                &local,
-                &mut context.workspace,
-            ))?;
-            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
-
-            // Resolve paths: --all discovers modified/deleted tracked paths via scan.
             let paths = if arguments.all {
-                let scan = workspace_scan::scan_locked(
-                    &context.root,
-                    &local,
-                    &context.workspace,
-                    0,
-                    &wheat_store::TreePathFilter::default(),
-                )?;
-                let resolved: Vec<String> = scan.changes.iter().map(|c| c.path.clone()).collect();
-                if resolved.is_empty() {
-                    return Err(CliFailure::invalid(
-                        "no modified or deleted tracked paths; workspace is clean",
-                    ));
-                }
-                resolved
+                authoring::AddPaths::Modified
             } else {
-                arguments.paths
+                authoring::AddPaths::Listed(arguments.paths)
             };
-
-            let expected = local.heads.read()?;
-            let basis = context.workspace.basis;
-            let active = runtime.block_on(active_changes::inspect(
-                &local,
-                expected,
-                basis,
-                context.workspace.effective_view(),
-                context.workspace.selected_change,
-            ))?;
             let change = arguments
                 .change
                 .as_deref()
                 .map(ChangeId::from_str)
                 .transpose()
-                .context("invalid change ID")?
-                .or(context.workspace.selected_change)
-                .context(
-                    "workspace has no selected change; run `wheat change new` or pass --change",
-                )?;
-            let destination = active
-                .changes
-                .iter()
-                .find(|candidate| candidate.change == change)
-                .with_context(|| format!("change {change} is not active in this workspace"))?;
+                .context("invalid change ID")?;
             let predecessor = arguments
                 .predecessor
                 .as_deref()
                 .map(RevisionId::from_str)
                 .transpose()
-                .context("invalid predecessor revision ID")?
-                .unwrap_or(destination.revision);
-            let title = destination.title.clone();
+                .context("invalid predecessor revision ID")?;
             let mut guards = std::collections::BTreeMap::new();
             for guard in arguments.guards {
                 guards
@@ -1127,154 +1073,47 @@ fn execute(cli: Cli) -> Result<Success> {
                     .or_insert_with(Vec::new)
                     .push(guard.range);
             }
-            let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
-            let (_, revision_metadata) = authoring_metadata::metadata(
-                &context.store_root,
-                authoring_metadata::MetadataArgs {
+            let force = arguments.force;
+            let added = authoring::add(
+                &requested_workspace,
+                cli.store.as_deref(),
+                authoring::AddRequest {
+                    paths,
+                    change,
+                    predecessor,
+                    guards,
                     message: arguments.metadata.message.unwrap_or_default(),
-                    description: None,
-                    created_at: None,
                     authored_at: arguments.metadata.authored_at,
                     committed_at: arguments.metadata.committed_at,
                 },
-                false,
-            )?;
-            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
-            let mut session = runtime.block_on(mutator.open_authoring(
-                expected,
-                context.workspace.basis,
-                context.workspace.effective_view(),
-            ))?;
-            let authored = runtime.block_on(workspace::author_from_workspace(
-                &mut workspace::AddTarget {
-                    root: &context.root,
-                    objects: &objects,
-                    store: &local.content,
-                    mutator: &mutator,
-                    session: &mut session,
-                    effective_view: context.workspace.effective_view(),
-                    pinned: context
-                        .workspace
-                        .materialized
-                        .as_ref()
-                        .map(|pinned| pinned.tree),
+                |change, moves| {
+                    if force {
+                        return Ok(());
+                    }
+                    prompt::with_terminal(format, |io| edit_move::confirm(change, moves, io))
                 },
-                change,
-                predecessor,
-                &paths,
-                &guards,
-                revision_metadata,
-            ))?;
-            if !authored.moves.is_empty() && !arguments.force {
-                prompt::with_terminal(format, |io| {
-                    edit_move::confirm(change, &authored.moves, io)
-                })?;
-            }
-            let (prepared, outcome) =
-                runtime.block_on(mutator.revise_changes_in(session, authored.requests))?;
-            let revision_id = outcome.revisions[&change];
-            let resulting_frontier = prepared.resulting_view();
-            let publication = runtime.block_on(prepare_mutation_publication(
-                &objects,
-                &local.content,
-                &local.heads,
-                expected,
-                prepared,
-            ))?;
-            // Settle the materialized pin before anything is published, so a settlement
-            // failure leaves the repository and workspace metadata unchanged. Its tree
-            // nodes join the batch flushed below.
-            let settlement = context
-                .workspace
-                .materialized
-                .as_ref()
-                .map(|pinned| {
-                    runtime.block_on(capture_settlement::settle(
-                        &context.root,
-                        &objects,
-                        &local.content,
-                        pinned,
-                        publication.proposed(),
-                        resulting_frontier,
-                        change,
-                        &paths,
-                    ))
-                })
-                .transpose()?;
-            context.workspace.pending_repository_operation = Some(PendingRepositoryOperation {
-                expected_head: publication.expected().into(),
-                proposed_head: publication.proposed().into(),
-                resulting_frontier,
-                selected_change: context.workspace.selected_change,
-            });
-            match &settlement {
-                // Root the settled pin before metadata can reference it. If the
-                // publication is interrupted, recovery keeps the previous pin and the
-                // next reconciliation releases this root.
-                Some(settlement) => workspace_registry_service::transition_materialization(
-                    &context.root,
-                    &context.store_root,
-                    &context.workspace,
-                    settlement.materialized.repository_head.into(),
-                    settlement.materialized.view,
-                    settlement.materialized.tree,
-                )?,
-                None => workspace_registry_service::reconcile(
-                    &context.root,
-                    &context.store_root,
-                    &context.workspace,
-                )?,
-            }
-            context
-                .workspace
-                .replace_prepared(&context.root)?
-                .publish()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            runtime.block_on(objects.flush())?;
-            finalize_mutation_publication(&local.heads, publication)?;
-            context.workspace.selected_frontier =
-                (resulting_frontier != context.workspace.basis).then_some(resulting_frontier);
-            context.workspace.pending_repository_operation = None;
-            if let Some(settlement) = &settlement {
-                context.workspace.materialized = Some(settlement.materialized.clone());
-            }
-            context
-                .workspace
-                .replace_prepared(&context.root)?
-                .publish()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            workspace_registry_service::reconcile(
-                &context.root,
-                &context.store_root,
-                &context.workspace,
             )?;
-            let path_count = paths.len();
             let mut output = String::new();
             writeln!(
                 output,
-                "added {path_count} path(s) to change {change} — {title}",
+                "added {} path(s) to change {} — {}",
+                added.paths, added.change, added.title
             )?;
-            writeln!(output, "revision {revision_id}")?;
-            for line in &authored.moves {
+            writeln!(output, "revision {}", added.revision)?;
+            for line in &added.moves {
                 writeln!(output, "moved {line}")?;
             }
-            if arguments.change.is_some()
-                && context.workspace.selected_change != Some(change)
-                && let Some(selected) = context.workspace.selected_change
+            if change.is_some()
+                && added.selected != Some(added.change)
+                && let Some(selected) = added.selected
             {
                 writeln!(output, "selected change remains {selected}")?;
             }
-            print_reapplied(&mut output, &outcome.reapplied)?;
-            let materialize_required = settlement
-                .as_ref()
-                .is_none_or(|settlement| !settlement.complete);
-            let diverged = settlement
-                .as_ref()
-                .map_or(&[][..], |settlement| settlement.diverged.as_slice());
-            for path in diverged {
+            print_reapplied(&mut output, &added.reapplied)?;
+            for path in &added.diverged {
                 writeln!(output, "diverged {path}")?;
             }
-            if materialize_required {
+            if added.materialize_required {
                 writeln!(
                     output,
                     "lineage changed: the working view includes changes this workspace has not materialized; run `wheat materialize` to update it",
@@ -1283,18 +1122,18 @@ fn execute(cli: Cli) -> Result<Success> {
             Success::new(
                 "add",
                 json!({
-                    "change": change.to_string(),
-                    "revision": revision_id.to_string(),
-                    "paths": path_count,
-                    "moved": authored.moved.iter().map(|moved| json!({
+                    "change": added.change.to_string(),
+                    "revision": added.revision.to_string(),
+                    "paths": added.paths,
+                    "moved": added.moved.iter().map(|moved| json!({
                         "path": moved.path,
                         "from": moved.from.to_string(),
-                        "revision": outcome.revisions[&moved.from].to_string(),
+                        "revision": moved.revision.to_string(),
                         "edit": moved.edit.to_string(),
                     })).collect::<Vec<_>>(),
-                    "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    "materialize_required": materialize_required,
-                    "diverged": diverged,
+                    "reapplied": added.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "materialize_required": added.materialize_required,
+                    "diverged": added.diverged,
                 }),
                 output,
             )
@@ -1314,38 +1153,12 @@ fn execute(cli: Cli) -> Result<Success> {
             Success::raw("cat", result, bytes)
         }
         Command::Change(ChangeCommand::New(arguments)) => {
-            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let local = open(&context.store_root)?;
-            let _operation =
-                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
-            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
-            context.workspace = WorkspaceMetadata::read(&context.root)?;
-            let runtime = runtime()?;
-            runtime.block_on(materialization::recover(
-                &context.root,
-                &local,
-                &mut context.workspace,
-            ))?;
-            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
-            let expected = local.heads.read()?;
             let dependencies = arguments
                 .dependencies
                 .iter()
                 .map(|value| ChangeId::from_str(value).context("invalid dependency change ID"))
                 .collect::<Result<std::collections::BTreeSet<_>>>()?;
-            let use_frontier = dependencies.is_empty() && !arguments.independent;
             let message = change_message(arguments.metadata.message, format)?;
-            let (change_metadata, revision_metadata) = authoring_metadata::metadata(
-                &context.store_root,
-                authoring_metadata::MetadataArgs {
-                    message,
-                    description: arguments.metadata.description,
-                    created_at: arguments.metadata.created_at,
-                    authored_at: arguments.metadata.authored_at,
-                    committed_at: arguments.metadata.committed_at,
-                },
-                true,
-            )?;
             let edit = arguments.edit;
             let has_edit = edit.path.is_some()
                 || edit.expected.is_some()
@@ -1354,128 +1167,53 @@ fn execute(cli: Cli) -> Result<Success> {
                 || edit.replacement_kind.is_some()
                 || edit.delete;
             let expected_given = edit.expected.is_some();
-            let edits = if has_edit {
-                capture_initial_edit(&local.content, edit)?
-            } else {
-                RevisionEdits::default()
-            };
-            let change = ChangeId::new();
-            let proposal = ChangeProposal {
-                id: change,
-                metadata: change_metadata.expect("new change metadata requested"),
-                dependencies,
-                revision_metadata,
-                edits,
-            };
-            let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
-            let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
-            let basis = context.workspace.basis;
-            let effective = context.workspace.effective_view();
-            let created = if use_frontier {
-                runtime.block_on(mutator.create_on_frontier(expected, basis, effective, proposal))
-            } else {
-                runtime.block_on(mutator.create(expected, basis, effective, proposal))
-            };
-            let (prepared, outcome) =
-                created.map_err(|error| explain_initial_edit(error.into(), expected_given))?;
-            let resulting_frontier = prepared.resulting_view();
-            let publication = runtime.block_on(prepare_mutation_publication(
-                &objects,
-                &local.content,
-                &local.heads,
-                expected,
-                prepared,
-            ))?;
-            context.workspace.pending_repository_operation = Some(PendingRepositoryOperation {
-                expected_head: publication.expected().into(),
-                proposed_head: publication.proposed().into(),
-                resulting_frontier,
-                selected_change: Some(change),
-            });
-            workspace_registry_service::reconcile(
-                &context.root,
-                &context.store_root,
-                &context.workspace,
-            )?;
-            context
-                .workspace
-                .replace_prepared(&context.root)?
-                .publish()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            runtime.block_on(objects.flush())?;
-            finalize_mutation_publication(&local.heads, publication)?;
-            context.workspace.selected_frontier =
-                (resulting_frontier != context.workspace.basis).then_some(resulting_frontier);
-            context.workspace.selected_change = Some(change);
-            context.workspace.pending_repository_operation = None;
-            context
-                .workspace
-                .replace_prepared(&context.root)?
-                .publish()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            workspace_registry_service::reconcile(
-                &context.root,
-                &context.store_root,
-                &context.workspace,
-            )?;
+            let created = authoring::create_change(
+                &requested_workspace,
+                cli.store.as_deref(),
+                authoring::NewChange {
+                    dependencies,
+                    independent: arguments.independent,
+                    metadata: authoring_metadata::MetadataArgs {
+                        message,
+                        description: arguments.metadata.description,
+                        created_at: arguments.metadata.created_at,
+                        authored_at: arguments.metadata.authored_at,
+                        committed_at: arguments.metadata.committed_at,
+                    },
+                },
+                |content| {
+                    if has_edit {
+                        capture_initial_edit(content, edit)
+                    } else {
+                        Ok(RevisionEdits::default())
+                    }
+                },
+            )
+            .map_err(|error| explain_initial_edit(error, expected_given))?;
+            let change = created.change;
             let mut output = String::new();
             writeln!(output, "change {change}")?;
-            writeln!(output, "revision {}", outcome.revision_id)?;
-            print_reapplied(&mut output, &outcome.reapplied)?;
+            writeln!(output, "revision {}", created.revision)?;
+            print_reapplied(&mut output, &created.reapplied)?;
             Success::new(
                 "change.new",
                 json!({
                     "change": change.to_string(),
-                    "revision": outcome.revision_id.to_string(),
-                    "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "revision": created.revision.to_string(),
+                    "reapplied": created.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 }),
                 output,
             )
         }
         Command::Change(ChangeCommand::Select { change }) => {
-            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let change = ChangeId::from_str(&change)
                 .map_err(|_| CliFailure::invalid("invalid change ID"))?;
-            let local = open(&context.store_root)?;
-            let _operation =
-                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
-            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
-            context.workspace = WorkspaceMetadata::read(&context.root)?;
-            runtime()?.block_on(materialization::recover_locked(
-                &context.root,
-                &local,
-                &mut context.workspace,
-            ))?;
-            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
-            let basis = context.workspace.basis;
-            let head = local.heads.read()?;
-            let active = runtime()?.block_on(active_changes::inspect(
-                &local,
-                head,
-                basis,
-                context.workspace.effective_view(),
-                context.workspace.selected_change,
-            ))?;
-            let selected = active
-                .changes
-                .iter()
-                .find(|candidate| candidate.change == change)
-                .with_context(|| format!("change {change} is not active in this workspace"))?;
-            context.workspace.selected_change = Some(change);
-            context
-                .workspace
-                .replace_prepared(&context.root)?
-                .publish()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            workspace_registry_service::reconcile(
-                &context.root,
-                &context.store_root,
-                &context.workspace,
-            )?;
+            let title =
+                authoring::select_change(&requested_workspace, cli.store.as_deref(), change)?;
             Success::new(
                 "change.select",
-                json!({ "change": change.to_string(), "title": selected.title }),
-                format!("selected change {change} — {}\n", selected.title),
+                json!({ "change": change.to_string(), "title": title }),
+                format!("selected change {change} — {title}\n"),
             )
         }
         Command::Change(ChangeCommand::Squash { change, options }) => squash::execute(
@@ -2035,26 +1773,6 @@ fn parse_optional_view(value: Option<String>) -> Result<Option<ViewId>> {
     value
         .map(|value| ViewId::from_str(&value).context("invalid frontier view ID"))
         .transpose()
-}
-
-fn restore_workspace(
-    workspace: &Path,
-    explicit_store: Option<&Path>,
-    paths: &[String],
-    dot_git: dot_git::DotGitGate,
-) -> Result<usize> {
-    let mut context = resolve_context(workspace, explicit_store)?;
-    let repository = open(&context.store_root)?;
-    let _operation =
-        rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
-    let restored = runtime()?.block_on(materialization::restore(
-        &context.root,
-        &repository,
-        &mut context.workspace,
-        paths,
-        dot_git,
-    ))?;
-    Ok(restored)
 }
 
 fn clone_remote_for_import(remote: &str) -> Result<tempfile::TempDir> {
