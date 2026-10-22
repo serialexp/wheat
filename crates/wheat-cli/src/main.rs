@@ -31,7 +31,7 @@ use discovery::{
     allocate_store_root, canonical_store_path, discover_workspace, resolve_context,
     resolve_store_root, store_home,
 };
-use local::{content_store, initialize, open, projection_path, revision_with_edits, runtime};
+use local::{content_store, open, projection_path, revision_with_edits, runtime};
 use materialization::materialize_resolved;
 use wheat_client::outcome::{CliFailure, OutputFormat, Success};
 use wheat_client::{
@@ -733,7 +733,6 @@ fn execute(cli: Cli) -> Result<Success> {
                 .as_deref()
                 .unwrap_or(&requested_workspace),
             cli.store.as_deref(),
-            format,
         ),
         Command::Materialize(dot_git) => materialize_active_workspace(
             &requested_workspace,
@@ -1479,46 +1478,17 @@ fn import(
     )
 }
 
-fn init_workspace(
-    workspace_root: &Path,
-    explicit_store: Option<&Path>,
-    format: OutputFormat,
-) -> Result<Success> {
-    ensure_fresh_workspace(workspace_root)?;
-    let store_root = explicit_store
-        .map(Path::to_path_buf)
-        .unwrap_or(allocate_store_root()?);
-    initialize(&store_root)?;
-    let store = StoreMetadata::create(&store_root)?;
-    let canonical_store = canonical_store_path(&store_root)?;
-    let repository = open(&store_root)?;
-    let resolved = runtime()?.block_on(frontier_service::resolve(&repository, "main", None))?;
-    drop(repository);
-    initialize_workspace_directory(workspace_root)?;
-    let workspace = WorkspaceMetadata::new(
-        canonical_store,
-        store.store_id,
-        "main".into(),
-        resolved.basis,
-    );
-    workspace_registry_service::reconcile(workspace_root, &store_root, &workspace)?;
-    workspace.initialize(workspace_root)?;
-    // A new repository is empty, so there is never a `.git` path to ask about.
-    let (view, materialized_root) = materialize_resolved(
-        workspace_root,
-        Some(&store_root),
-        "main".into(),
-        resolved,
-        dot_git::DotGitGate::for_command(format, false),
-    )?;
+fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Success> {
+    let initialized = workspace_lifecycle::init(workspace_root, explicit_store)?;
+    let view = initialized.view;
     Success::new(
         "init",
         json!({ "view": view.to_string() }),
         format!(
             "materialized view {view} in {}\ninitialized Wheat workspace at {}\nstore {}\n",
-            materialized_root.display(),
+            initialized.materialized_root.display(),
             workspace_root.display(),
-            store_root.display(),
+            initialized.store_root.display(),
         ),
     )
 }

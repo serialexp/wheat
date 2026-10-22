@@ -25,8 +25,9 @@ pub struct HistoryEntry {
     pub title: String,
     pub creator: Actor,
     pub revision: RevisionId,
-    /// The current revision's message.
+    /// The current revision's message and author.
     pub message: String,
+    pub author: Actor,
     /// The current revision's generation: 0 for a change's first revision, one more
     /// for each revision along its predecessors (and combined revisions).
     pub generation: u64,
@@ -91,6 +92,7 @@ pub fn read(workspace: &Path, explicit_store: Option<&Path>) -> Result<Vec<Histo
                 creator: change.metadata.creator,
                 revision: revision_id,
                 message: revision.metadata.message.clone(),
+                author: revision.metadata.author.clone(),
                 generation: revision.generation,
                 dependencies: revision.dependencies.iter().copied().collect(),
                 committed_at: revision.metadata.committed_at,

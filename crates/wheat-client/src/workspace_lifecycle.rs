@@ -19,6 +19,57 @@ const OWNED_CONTROL_ENTRIES: &[&str] = &[
     "materialization-transactions",
 ];
 
+/// A repository `init` created.
+pub struct Initialized {
+    pub store_root: std::path::PathBuf,
+    /// The view the workspace materialized: the empty base.
+    pub view: wheat_core::ViewId,
+    pub materialized_root: std::path::PathBuf,
+}
+
+/// Creates a store (at `explicit_store`, or a new one under the store home) and a
+/// workspace on its `main` label at `workspace_root`, which must not be a workspace
+/// yet.
+pub fn init(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Initialized> {
+    ensure_fresh_workspace(workspace_root)?;
+    let store_root = match explicit_store {
+        Some(store) => store.to_path_buf(),
+        None => crate::discovery::allocate_store_root()?,
+    };
+    crate::local::initialize(&store_root)?;
+    let store = StoreMetadata::create(&store_root)?;
+    let canonical_store = canonical_store_path(&store_root)?;
+    let repository = crate::local::open(&store_root)?;
+    let resolved = crate::local::runtime()?.block_on(crate::frontier_service::resolve(
+        &repository,
+        "main",
+        None,
+    ))?;
+    drop(repository);
+    initialize_workspace_directory(workspace_root)?;
+    let workspace = WorkspaceMetadata::new(
+        canonical_store,
+        store.store_id,
+        "main".into(),
+        resolved.basis,
+    );
+    crate::workspace_registry_service::reconcile(workspace_root, &store_root, &workspace)?;
+    workspace.initialize(workspace_root)?;
+    // A new repository is empty, so there is never a `.git` path to ask about.
+    let (view, materialized_root) = crate::materialization::materialize_resolved(
+        workspace_root,
+        Some(&store_root),
+        "main".into(),
+        resolved,
+        crate::dot_git::DotGitGate::Refuse,
+    )?;
+    Ok(Initialized {
+        store_root,
+        view,
+        materialized_root,
+    })
+}
+
 /// A workspace registered with the store.
 #[derive(Clone, Debug)]
 pub struct WorkspaceEntry {

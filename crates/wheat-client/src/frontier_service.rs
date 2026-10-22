@@ -157,3 +157,15 @@ pub async fn list(repository: &LocalRepository, label: &str) -> Result<FrontierL
         frontiers,
     })
 }
+
+/// The frontiers of `workspace`'s active label.
+pub fn read(
+    workspace: &std::path::Path,
+    explicit_store: Option<&std::path::Path>,
+) -> Result<FrontierList> {
+    let context = crate::discovery::resolve_context(workspace, explicit_store)?;
+    let repository = crate::local::open(&context.store_root)?;
+    let _operation =
+        crate::rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
+    crate::local::runtime()?.block_on(list(&repository, &context.workspace.active_label))
+}

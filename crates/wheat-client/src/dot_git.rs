@@ -5,7 +5,8 @@
 //! that is also a git checkout can plant hooks or config that git later runs.
 //! So materialization lists every such path it is about to write and asks a
 //! [`DotGitGate`] first: `--allow-dot-git` lets them through, a person at the
-//! terminal is asked, and anything else is refused before a file is written.
+//! terminal is asked, and anything else (a window, or nobody at the terminal) is
+//! refused before a file is written.
 
 use anyhow::{Result, bail};
 
@@ -30,6 +31,8 @@ pub enum DotGitGate {
     /// Ask on this process's terminal when there is something to ask; refuse
     /// when nobody can answer. The terminal is only locked while asking.
     Terminal(OutputFormat),
+    /// Nobody can be asked, as in a window with no terminal: refuse.
+    Refuse,
 }
 
 impl DotGitGate {
@@ -44,12 +47,18 @@ impl DotGitGate {
 
     /// Returns `Ok` when the `.git` paths among `paths` may be written.
     pub fn check<'p>(self, paths: impl IntoIterator<Item = &'p str>) -> Result<()> {
-        let DotGitGate::Terminal(format) = self else {
-            return Ok(());
-        };
-        ask_about(paths, |dot_git| {
-            prompt::with_terminal(format, |io| confirm(dot_git, io))
-        })
+        match self {
+            DotGitGate::Allow => Ok(()),
+            DotGitGate::Terminal(format) => ask_about(paths, |dot_git| {
+                prompt::with_terminal(format, |io| confirm(dot_git, io))
+            }),
+            DotGitGate::Refuse => ask_about(paths, |dot_git| {
+                bail!(CliFailure::dot_git(format!(
+                    "{}run `wheat` with --allow-dot-git to write them",
+                    listing(dot_git)
+                )))
+            }),
+        }
     }
 }
 
@@ -155,6 +164,18 @@ mod tests {
     #[test]
     fn allow_passes_everything() {
         DotGitGate::Allow.check([".git/hooks/pre-commit"]).unwrap();
+    }
+
+    #[test]
+    fn refuse_passes_other_paths_and_refuses_dot_git_ones() {
+        DotGitGate::Refuse
+            .check(["src/main.rs", ".gitignore"])
+            .unwrap();
+        let result = DotGitGate::Refuse.check(["ok.txt", ".git/hooks/post-checkout"]);
+        assert!(refused(&result));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains(".git/hooks/post-checkout"), "{message}");
+        assert!(message.contains("--allow-dot-git"), "{message}");
     }
 
     #[test]
