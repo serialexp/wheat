@@ -12,6 +12,7 @@ mod diff_view;
 mod fixture;
 mod graph;
 mod history_screen;
+mod live;
 mod model;
 mod sidebar;
 mod snapshot;

@@ -6,14 +6,21 @@ the same commit.
 ## Desktop client (2026-10-22)
 
 `crates/wheat-desktop` builds the Workspace and Changes screens of the design comp
-(`Wheat Client.dc.html`, see CLAUDE.md) against `fixture.rs`, the comp's demo data.
+(`Wheat Client.dc.html`, see CLAUDE.md). `live.rs` reads and writes a workspace
+through `crates/wheat-client`; `--fixture` shows the comp's demo data.
 
-- [ ] `crates/wheat-client`: move the service code out of wheat-cli into a library
-  that the CLI and the desktop both call, then add a live `Backend` in
-  wheat-desktop. Until then `--workspace DIR` (the default) says it can't open.
-- [ ] Loading a store with thousands of changes needs a scale contract or bench case
-  before the live backend ships: the Changes list pages (`older_changes`), and
-  graph layout and filtering are linear per load / keystroke.
+- [ ] Loading a store with thousands of changes needs a scale contract or bench case:
+  every load reads three objects per change (`history::read`) and the Changes list
+  doesn't page yet (`older_changes` is 0 live), and graph layout and filtering are
+  linear per load / keystroke.
+- [ ] Live gaps: Refresh and frontier switching say to use `wheat refresh` /
+  `wheat switch` (`switch_workspace` and friends are still in wheat-cli's main.rs);
+  a capture that would move edits out of later changes is refused, for want of a
+  confirmation dialog; the file list's `+n −m` stat column is empty; a frontier
+  choice doesn't say how many changes it has; the conflicts line counts no paths.
+- [ ] Each live load takes the store's locks five times in a row (status, changes,
+  history, workspaces, frontiers); one read that takes them once would also see one
+  consistent head.
 - [ ] Workspace screen: the "Changes…" base for a new change needs a change picker;
   Create Change is disabled on that tab until it exists.
 - [ ] Changes screen: Interdiff, Push to Git… and Resolve… are drawn disabled.

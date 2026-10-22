@@ -118,11 +118,11 @@ fn ticking_files_and_adding_captures_them_into_the_selected_change() {
         .workspace
         .selected
         .expect("the fixture selects a change");
-    let revisions = window.model().changes[selected].revisions.len();
+    let revisions = window.model().changes[selected].revision_count;
     window.app.shortcut(KeyCode::Enter);
     window.frame();
     let model = window.model();
-    assert_eq!(model.changes[selected].revisions.len(), revisions + 1);
+    assert_eq!(model.changes[selected].revision_count, revisions + 1);
     assert!(
         !model
             .workspace
@@ -168,7 +168,7 @@ fn the_changes_screen_opens_on_the_selected_change_latest_revision() {
     let change = &model.changes[selected];
     assert_eq!(
         window.app.history.diff_for(),
-        Some(&(change.id.clone(), change.revisions.len() - 1))
+        Some(&(change.id.clone(), change.revision_count - 1))
     );
 }
 
@@ -191,14 +191,10 @@ fn clicking_a_revision_row_shows_that_revision() {
 }
 
 #[test]
-fn a_live_workspace_says_it_cannot_open_yet() {
+fn a_directory_that_is_not_a_workspace_fails_to_load() {
     let mut app = App::inline(Source::Workspace("/nowhere".into()));
     let mut layers = LayerStack::with_font_system(shared_font_system());
     app.build_ui(&mut layers, SIZE.0, SIZE.1);
     assert!(app.model.is_none());
-    assert!(
-        app.load_error
-            .as_deref()
-            .is_some_and(|error| error.contains("--fixture"))
-    );
+    assert!(app.load_error.is_some());
 }

@@ -46,6 +46,8 @@ pub struct HistoryScreen {
     pub revision: Option<usize>,
     /// Changes showing their revisions, by id.
     pub expanded: BTreeSet<String>,
+    /// Expanded changes whose revisions were asked for and haven't arrived, by id.
+    fetching: BTreeSet<String>,
     pub search: TextInput,
     rows: Vec<Row>,
     heights: RowHeights,
@@ -65,6 +67,7 @@ impl Default for HistoryScreen {
             picked: None,
             revision: None,
             expanded: BTreeSet::new(),
+            fetching: BTreeSet::new(),
             search: TextInput::new(0.0, 0.0, 0.0, 0.0)
                 .with_placeholder("Find change by title, author or id"),
             rows: Vec::new(),
@@ -103,10 +106,39 @@ impl HistoryScreen {
         }
         self.expanded
             .retain(|id| model.changes.iter().any(|change| &change.id == id));
+        // A reload carries each change's latest revision only.
+        self.fetching.clear();
+        self.fetch_revisions(model, pending);
         self.layout_rows(model);
         // The picked revision may have new content after a squash or capture.
         self.diff_for = None;
         self.request_diff(model, pending);
+    }
+
+    /// A change's revisions arrived in `model`: show them.
+    pub fn revisions_arrived(&mut self, model: &Model, pending: &mut Vec<Request>) {
+        self.fetching.retain(|id| {
+            model
+                .changes
+                .iter()
+                .any(|c| &c.id == id && !c.all_revisions_loaded())
+        });
+        self.layout_rows(model);
+        self.request_diff(model, pending);
+    }
+
+    /// Asks for the revisions of every expanded change that has only its latest.
+    fn fetch_revisions(&mut self, model: &Model, pending: &mut Vec<Request>) {
+        for change in &model.changes {
+            if self.expanded.contains(&change.id)
+                && !change.all_revisions_loaded()
+                && self.fetching.insert(change.id.clone())
+            {
+                pending.push(Request::Revisions {
+                    change: change.id.clone(),
+                });
+            }
+        }
     }
 
     #[cfg(test)]
@@ -128,7 +160,7 @@ impl HistoryScreen {
     /// The picked revision, clamped to the picked change's.
     fn picked_revision(&self, model: &Model) -> Option<(usize, usize)> {
         let index = self.picked_index(model)?;
-        let count = model.changes[index].revisions.len();
+        let count = model.changes[index].revision_count;
         if count == 0 {
             return None;
         }
@@ -145,11 +177,19 @@ impl HistoryScreen {
         if self.diff_for.as_ref() == Some(&key) {
             return;
         }
-        self.diff = Diff::Loading;
         self.diff_scroll = ListState::default();
+        // An older revision is picked from its row, so it has loaded; until the
+        // chain arrives after a reload, it waits as Loading.
+        let Some(id) = model.changes[index].revision(revision) else {
+            self.diff = Diff::Loading;
+            self.diff_for = None;
+            return;
+        };
+        self.diff = Diff::Loading;
         pending.push(Request::RevisionDiff {
             change: key.0.clone(),
             revision,
+            id: id.id.clone(),
         });
         self.diff_for = Some(key);
     }
@@ -166,7 +206,7 @@ impl HistoryScreen {
             }
             self.rows.push(Row::Change(index));
             if self.expanded.contains(&change.id) {
-                for revision in (0..change.revisions.len()).rev() {
+                for revision in (change.first_loaded_revision()..change.revision_count).rev() {
                     self.rows.push(Row::Revision(index, revision));
                 }
             }
@@ -371,7 +411,7 @@ impl HistoryScreen {
                             } else {
                                 PhosphorIcon::CaretRight
                             };
-                            if !change.revisions.is_empty() {
+                            if change.revision_count > 0 {
                                 list.phosphor_icon(Rect::new(columns.title - 14.0, row.y + 6.0, 11.0, 11.0), caret, dim);
                             }
                             let short_w = chrome::mono(list, &s, Rect::new(columns.title, row.y, 50.0, row.height), &change.short, TextSize::Meta, dim);
@@ -385,7 +425,7 @@ impl HistoryScreen {
                             let icon = if change.agent { PhosphorIcon::Robot } else { PhosphorIcon::User };
                             list.phosphor_icon(Rect::new(columns.author, row.y + 6.0, 12.0, 12.0), icon, dim);
                             chrome::sans(list, &s, Rect::new(columns.author + 16.0, row.y, AUTHOR_W - 20.0, row.height), &change.author, TextSize::Row, ink);
-                            chrome::mono(list, &s, Rect::new(columns.revs, row.y, REVS_W, row.height), &change.revisions.len().to_string(), TextSize::Meta, dim);
+                            chrome::mono(list, &s, Rect::new(columns.revs, row.y, REVS_W, row.height), &change.revision_count.to_string(), TextSize::Meta, dim);
                             let (tone, label) = state_badge(change);
                             let badge = Badge::new(tone);
                             badge.draw(list, &s, columns.state, row.y + (row.height - badge.height()) * 0.5, label);
@@ -400,7 +440,7 @@ impl HistoryScreen {
                                     list.line([x, row.y], [x, row.bottom()], 1.0, line);
                                 }
                             }
-                            let rev = &change.revisions[revision];
+                            let Some(rev) = change.revision(revision) else { return };
                             let w = chrome::mono(list, &s, Rect::new(columns.title + 12.0, row.y, 40.0, row.height), &format!("r{}", revision + 1), TextSize::Meta, dim);
                             chrome::sans(list, &s, Rect::new(columns.title + 20.0 + w, row.y, (columns.author - 28.0 - w - columns.title).max(0.0), row.height), &rev.message, TextSize::Row, ink);
                             chrome::sans(list, &s, Rect::new(columns.author + 16.0, row.y, AUTHOR_W - 20.0, row.height), &rev.actor, TextSize::Row, dim);
@@ -424,6 +464,7 @@ impl HistoryScreen {
                     if on_caret || was_picked {
                         if !self.expanded.remove(&id) {
                             self.expanded.insert(id);
+                            self.fetch_revisions(model, pending);
                         }
                         self.layout_rows(model);
                     }
@@ -519,7 +560,7 @@ impl HistoryScreen {
         };
         let revisions = format!(
             "{} · {}",
-            change.revisions.len(),
+            change.revision_count,
             if change.published {
                 "published"
             } else {
@@ -570,7 +611,7 @@ impl HistoryScreen {
             (
                 "Squash Change",
                 Tone::Default,
-                change.revisions.len() > 1 && !change.published,
+                change.revision_count > 1 && !change.published,
                 Some(Request::SquashChange {
                     change: change.id.clone(),
                 }),
@@ -603,7 +644,7 @@ impl HistoryScreen {
         let head = Rect::new(rect.x, y, rect.width, HEADER_H);
         chrome::hrule(frame.list, theme, rect.x, y - 1.0, rect.width);
         frame.list.paint_quad(head, theme.chrome.dock.header);
-        if let Some(rev) = change.revisions.get(revision) {
+        if let Some(rev) = change.revision(revision) {
             let w = chrome::mono(
                 frame.list,
                 &s,

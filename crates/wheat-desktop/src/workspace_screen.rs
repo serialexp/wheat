@@ -400,12 +400,14 @@ impl WorkspaceScreen {
         x -= w;
         integrate.draw(Rect::new(x, rect.y + 8.0, w, 22.0), &mut frame.cx());
         for choice in view.frontiers.iter().rev() {
-            let label = format!(
-                "{} · {} change{}",
-                choice.name,
-                choice.changes,
-                if choice.changes == 1 { "" } else { "s" }
-            );
+            let label = match choice.changes {
+                Some(changes) => format!(
+                    "{} · {changes} change{}",
+                    choice.name,
+                    if changes == 1 { "" } else { "s" }
+                ),
+                None => choice.name.clone(),
+            };
             let button = Button::new(label);
             let w = button.intrinsic_size(frame.list, &s).0;
             x -= w + 8.0;
@@ -694,7 +696,7 @@ impl WorkspaceScreen {
                         s.ink(Ink::Title),
                     );
                     let dependents = model.dependents(index);
-                    let mut note = format!("becomes revision {}", change.revisions.len() + 1);
+                    let mut note = format!("becomes revision {}", change.revision_count + 1);
                     if !dependents.is_empty() {
                         let shorts: Vec<&str> = dependents
                             .iter()

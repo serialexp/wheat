@@ -35,9 +35,15 @@ pub enum Request {
     WorkspaceDiff {
         path: String,
     },
+    /// A change's revision, by index from its first, and its id.
     RevisionDiff {
         change: String,
         revision: usize,
+        id: String,
+    },
+    /// Every revision of a change, for when it is expanded.
+    Revisions {
+        change: String,
     },
     Add {
         paths: Vec<String>,
@@ -73,6 +79,13 @@ pub enum Update {
         change: String,
         revision: usize,
         diff: Diff,
+    },
+    /// `change`'s newest revisions, oldest first; `complete` when they are all of
+    /// them.
+    Revisions {
+        change: String,
+        revisions: Result<Vec<Revision>, String>,
+        complete: bool,
     },
     /// An action finished. `Ok` carries a toast's title and message; a reload
     /// follows either way.
@@ -142,22 +155,6 @@ impl Client {
 
     pub fn try_recv(&self) -> Option<Update> {
         self.updates.try_recv().ok()
-    }
-}
-
-/// A source this build can't open yet: every load fails with why, so the
-/// window says so instead of showing data that isn't the repository's.
-pub struct Unavailable(pub String);
-
-impl Backend for Unavailable {
-    fn handle(&mut self, request: Request) -> Vec<Update> {
-        match request {
-            Request::Load | Request::Refresh => vec![Update::Loaded(Err(self.0.clone()))],
-            other => vec![Update::Done {
-                action: action_name(&other),
-                outcome: Err(self.0.clone()),
-            }],
-        }
     }
 }
 
@@ -254,8 +251,11 @@ impl FixtureBackend {
                     .files
                     .retain(|file| !paths.contains(&file.path));
                 let change = &mut self.model.changes[index];
+                change.revision_count += 1;
+                let id = format!("{}-r{}", change.short, change.revision_count);
                 if change.revisions.is_empty() {
                     change.revisions.push(Revision {
+                        id,
                         message: title,
                         actor: "you".into(),
                         age: "now".into(),
@@ -266,6 +266,7 @@ impl FixtureBackend {
                     ));
                 }
                 change.revisions.push(Revision {
+                    id,
                     message: if title.is_empty() {
                         "Capture local edits".into()
                     } else {
@@ -276,7 +277,7 @@ impl FixtureBackend {
                 });
                 change.age = "now".into();
                 Ok((
-                    format!("{} r{}", change.short, change.revisions.len()),
+                    format!("{} r{}", change.short, change.revision_count),
                     format!("{} paths added to “{}”.", paths.len(), change.title),
                 ))
             }
@@ -300,8 +301,9 @@ impl FixtureBackend {
             Request::SquashChange { change } => {
                 let index = self.index(&change).ok_or("no such change")?;
                 let change = &mut self.model.changes[index];
-                let count = change.revisions.len();
+                let count = change.revision_count;
                 change.revisions.truncate(1);
+                change.revision_count = 1;
                 Ok((
                     format!("Squashed {}", change.short),
                     format!("{count} unpublished revisions collapsed into one."),
@@ -312,8 +314,10 @@ impl FixtureBackend {
                 let mut stack = vec![index];
                 stack.extend(self.model.dependents(index));
                 for &at in &stack {
-                    if !self.model.changes[at].published {
-                        self.model.changes[at].revisions.truncate(1);
+                    let change = &mut self.model.changes[at];
+                    if !change.published {
+                        change.revisions.truncate(1);
+                        change.revision_count = change.revision_count.min(1);
                     }
                 }
                 Ok((
@@ -332,7 +336,10 @@ impl FixtureBackend {
                     String::new(),
                 ))
             }
-            Request::Load | Request::WorkspaceDiff { .. } | Request::RevisionDiff { .. } => {
+            Request::Load
+            | Request::WorkspaceDiff { .. }
+            | Request::RevisionDiff { .. }
+            | Request::Revisions { .. } => {
                 unreachable!("not an action")
             }
         }
@@ -347,7 +354,20 @@ impl Backend for FixtureBackend {
                 let diff = fixture::workspace_diff(&self.model, &path);
                 vec![Update::WorkspaceDiff { path, diff }]
             }
-            Request::RevisionDiff { change, revision } => {
+            Request::Revisions { change } => {
+                let revisions = self
+                    .index(&change)
+                    .map(|index| self.model.changes[index].revisions.clone())
+                    .ok_or_else(|| "no such change".to_owned());
+                vec![Update::Revisions {
+                    change,
+                    revisions,
+                    complete: true,
+                }]
+            }
+            Request::RevisionDiff {
+                change, revision, ..
+            } => {
                 let diff = self.index(&change).map_or(Diff::None, |index| {
                     fixture::revision_diff(&self.model, index, revision)
                 });
@@ -378,6 +398,7 @@ pub fn action_name(request: &Request) -> String {
         Request::Load => "load".into(),
         Request::WorkspaceDiff { path } => format!("diff {path}"),
         Request::RevisionDiff { revision, .. } => format!("diff r{revision}"),
+        Request::Revisions { .. } => "revisions".into(),
         Request::Add { paths, .. } => format!("add {} paths", paths.len()),
         Request::Restore { paths } => format!("restore {} paths", paths.len()),
         Request::SelectChange { .. } => "select change".into(),
@@ -420,6 +441,7 @@ mod tests {
         assert_eq!(model.changes.len(), before.changes.len() + 1);
         let created = &model.changes[0];
         assert_eq!(created.title, "Split the lexer module");
+        assert_eq!(created.revision_count, 1);
         assert_eq!(created.revisions.len(), 1);
         assert_eq!(model.changes[created.depends_on[0]].id, base);
         assert_eq!(model.workspace.selected, Some(selected + 1));
@@ -478,14 +500,5 @@ mod tests {
             },
         );
         assert!(outcome.is_err());
-    }
-
-    #[test]
-    fn an_unavailable_source_fails_every_load() {
-        let mut backend = Unavailable("no".into());
-        assert!(matches!(
-            backend.handle(Request::Load).as_slice(),
-            [Update::Loaded(Err(error))] if error == "no"
-        ));
     }
 }

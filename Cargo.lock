@@ -5995,10 +5995,15 @@ dependencies = [
 name = "wheat-desktop"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "mimalloc",
  "pollster",
+ "tempfile",
  "wgpu",
  "wgpu-gameui",
+ "wheat-client",
+ "wheat-core",
+ "wheat-store",
  "winit",
 ]
 

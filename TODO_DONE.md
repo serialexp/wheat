@@ -2,6 +2,13 @@
 
 Finished items, moved here from `TODO.md` under the same headings.
 
+## Desktop client (2026-10-22)
+
+- `[x]` **`crates/wheat-client`**: the service code moved out of wheat-cli into a
+  library that the CLI and the desktop both call (e30bef6), with typed reads
+  (f8a96ae) and authoring services (4b00e8e). The desktop's live backend
+  (`live.rs`) is its default source now; `--fixture` keeps the comp's demo data.
+
 ## Found while dogfooding (2026-10-19)
 
 - `[x]` **`structural_delta::one_step_forward_yields_little_more_than_the_difference`

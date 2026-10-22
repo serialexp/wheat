@@ -199,8 +199,10 @@ pub fn model() -> Model {
             author: demo.author.to_owned(),
             agent: AGENTS.contains(&demo.author),
             age: demo.age.to_owned(),
+            revision_count: demo.revisions,
             revisions: (1..=demo.revisions)
                 .map(|number| Revision {
+                    id: format!("{}-r{number}", demo.short),
                     message: demo.messages.get(number - 1).map_or_else(
                         || {
                             if number == 1 {
@@ -359,15 +361,15 @@ pub fn model() -> Model {
             frontiers: vec![
                 FrontierChoice {
                     name: "f1".into(),
-                    changes: 1,
+                    changes: Some(1),
                 },
                 FrontierChoice {
                     name: "f2".into(),
-                    changes: 4,
+                    changes: Some(4),
                 },
                 FrontierChoice {
                     name: "f3".into(),
-                    changes: 2,
+                    changes: Some(2),
                 },
             ],
             selected,

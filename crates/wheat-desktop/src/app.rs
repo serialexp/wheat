@@ -13,9 +13,10 @@ use wgpu_gameui::{
 };
 use winit::keyboard::KeyCode;
 
-use crate::backend::{Backend, Client, FixtureBackend, Request, Unavailable, Update, Wake};
+use crate::backend::{Backend, Client, FixtureBackend, Request, Update, Wake};
 use crate::chrome;
 use crate::history_screen::HistoryScreen;
+use crate::live::LiveBackend;
 use crate::model::{Model, WorkspaceState};
 use crate::sidebar::Sidebar;
 use crate::workspace_screen::WorkspaceScreen;
@@ -36,10 +37,7 @@ pub enum Source {
 fn backend(source: Source) -> Box<dyn Backend> {
     match source {
         Source::Fixture => Box::new(FixtureBackend::new()),
-        Source::Workspace(path) => Box::new(Unavailable(format!(
-            "Opening {} needs the live backend, which is not built yet; run with --fixture",
-            path.display()
-        ))),
+        Source::Workspace(path) => Box::new(LiveBackend::new(path)),
     }
 }
 
@@ -207,6 +205,32 @@ impl App {
                     revision,
                     diff,
                 } => self.history.diff_arrived(change, revision, diff),
+                Update::Revisions {
+                    change,
+                    revisions,
+                    complete,
+                } => match revisions {
+                    Ok(revisions) => {
+                        if let Some(model) = self.model.as_mut()
+                            && let Some(at) = model.changes.iter().position(|c| c.id == change)
+                        {
+                            let target = &mut model.changes[at];
+                            // A change's count is an estimate until its whole chain is read.
+                            target.revision_count = if complete {
+                                revisions.len()
+                            } else {
+                                target.revision_count.max(revisions.len())
+                            };
+                            target.revisions = revisions;
+                            self.history.revisions_arrived(model, &mut self.pending);
+                        }
+                    }
+                    Err(error) => {
+                        self.ui_state
+                            .toasts
+                            .push(Toast::error(error).with_title("revisions"));
+                    }
+                },
                 Update::Done { action, outcome } => {
                     self.last = action;
                     match outcome {
@@ -237,7 +261,10 @@ impl App {
         for request in std::mem::take(&mut self.pending) {
             if !matches!(
                 request,
-                Request::Load | Request::WorkspaceDiff { .. } | Request::RevisionDiff { .. }
+                Request::Load
+                    | Request::WorkspaceDiff { .. }
+                    | Request::RevisionDiff { .. }
+                    | Request::Revisions { .. }
             ) {
                 self.last = crate::backend::action_name(&request);
             }
@@ -491,7 +518,7 @@ fn draw_status(
         .and_then(|index| model.changes.get(index))
         .map_or_else(
             || "no change selected".to_owned(),
-            |change| format!("{} · r{}", change.short, change.revisions.len()),
+            |change| format!("{} · r{}", change.short, change.revision_count),
         );
     let conflicts = match model.store.conflicted_changes {
         0 => "no conflicts".to_owned(),

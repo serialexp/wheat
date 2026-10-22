@@ -75,7 +75,8 @@ pub struct WorkspaceView {
 #[derive(Clone, Debug)]
 pub struct FrontierChoice {
     pub name: String,
-    pub changes: usize,
+    /// How many changes it has above the label's view, when known.
+    pub changes: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,7 +125,10 @@ pub struct Change {
     pub agent: bool,
     /// `4m`, `2d`: how long ago its latest revision was made.
     pub age: String,
-    /// Oldest first; `revisions.len()` is the revision count.
+    /// How many revisions the change has.
+    pub revision_count: usize,
+    /// Its newest revisions, oldest first: all `revision_count` of them, or only
+    /// the latest until the change is expanded and the rest are read.
     pub revisions: Vec<Revision>,
     /// The changes it is built on, as indexes into `Model::changes`.
     pub depends_on: Vec<usize>,
@@ -138,6 +142,7 @@ pub struct Change {
 
 #[derive(Clone, Debug, Default)]
 pub struct Revision {
+    pub id: String,
     pub message: String,
     pub actor: String,
     pub age: String,
@@ -175,6 +180,26 @@ pub struct DiffLine {
     pub old: Option<u32>,
     pub new: Option<u32>,
     pub text: String,
+}
+
+impl Change {
+    /// Revision `index`, counting from the change's first (0); `None` when it
+    /// isn't loaded.
+    pub fn revision(&self, index: usize) -> Option<&Revision> {
+        let first = self.first_loaded_revision();
+        index
+            .checked_sub(first)
+            .and_then(|at| self.revisions.get(at))
+    }
+
+    /// The index of the oldest loaded revision.
+    pub fn first_loaded_revision(&self) -> usize {
+        self.revision_count.saturating_sub(self.revisions.len())
+    }
+
+    pub fn all_revisions_loaded(&self) -> bool {
+        self.revisions.len() >= self.revision_count
+    }
 }
 
 impl Model {
@@ -234,5 +259,26 @@ mod tests {
         model.index_dependents();
         assert_eq!(model.dependents(3), vec![1, 2, 0]);
         assert_eq!(model.dependents(0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn revisions_count_from_the_first_even_when_only_the_latest_is_loaded() {
+        let revision = |message: &str| Revision {
+            message: message.into(),
+            ..Revision::default()
+        };
+        let mut change = Change {
+            revision_count: 3,
+            revisions: vec![revision("r3")],
+            ..Change::default()
+        };
+        assert_eq!(change.first_loaded_revision(), 2);
+        assert!(change.revision(0).is_none());
+        assert_eq!(change.revision(2).unwrap().message, "r3");
+        assert!(change.revision(3).is_none());
+        assert!(!change.all_revisions_loaded());
+        change.revisions = vec![revision("r1"), revision("r2"), revision("r3")];
+        assert_eq!(change.revision(0).unwrap().message, "r1");
+        assert!(change.all_revisions_loaded());
     }
 }

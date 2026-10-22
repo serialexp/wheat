@@ -9,6 +9,7 @@ name = "wheat-desktop"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
 mimalloc = { workspace = true }
 pollster = "0.3"
 wgpu = "24"
@@ -18,7 +19,13 @@ wgpu = "24"
 #     [patch.'https://github.com/serialexp/wgpu-gameui']
 #     wgpu-gameui = { path = "../wgpu-gameui/crates/core" }
 wgpu-gameui = { git = "https://github.com/serialexp/wgpu-gameui", rev = "d292485b1bf4d1ac5e771b58aec517e52df5ecb0" }
+wheat-client = { path = "../wheat-client" }
+wheat-core = { path = "../wheat-core" }
+wheat-store = { path = "../wheat-store" }
 winit = "0.30"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
