@@ -1,5 +1,34 @@
 # Current task
 
+## 2026-10-22: desktop client (@calm-lynx) — Bart: "read the design for the wheat gui and try to build that"
+
+Design: Claude Design project `0dfb95ac-…` (see CLAUDE.md), comp `Wheat Client.dc.html`.
+Bart chose: new crate in this repo, a new `wheat-client` library both the CLI and the
+GUI call, and "Workspace + Changes first", fully against real data.
+
+Done:
+- 5d1a1a6 `crates/wheat-desktop`: Workspace and Changes screens with wgpu-gameui
+  (git dep on serialexp/wgpu-gameui at a pinned rev) against `fixture.rs` (the comp's
+  demo data). `--render-ui PATH [--screen changes] --fixture` renders headlessly;
+  `app_tests.rs` drives clicks through `App::build_ui`. `--workspace DIR` (default)
+  currently answers "needs the live backend".
+- e30bef6 phase 1: wheat-cli's service modules moved into `crates/wheat-client`
+  unchanged; `outcome.rs` holds `Success`/`CliFailure`/`OutputFormat`; the CLI keeps
+  `main.rs` and `command_output.rs` (emission). lucky-raven was told (they wait on it
+  for incremental-validation step 9 in frontier_service/label_service/materialization).
+
+Next (phase 2): typed services in wheat-client, called by the CLI arms in `execute()`
+and by a live `Backend` in wheat-desktop:
+- status (Status arm), active changes (Changes arm), workspace/revision diffs (Diff
+  arm), frontiers, workspaces list (`workspace_lifecycle::list` returns `Success`),
+  restore (`restore_workspace`), add (Add arm, ~260 lines; the edit-move prompt
+  becomes a caller-supplied confirmation), change new (Change New arm; CLI keeps
+  `capture_initial_edit` / `explain_initial_edit`), change select.
+- History for the Changes screen: a typed log (log_inspection only renders `Success`);
+  a revision's `generation` gives the revision count without walking chains; fetch a
+  chain only when a change is expanded. Needs a bench case at 2k/20k changes.
+- TODO.md "Desktop client (2026-10-22)" lists the rest.
+
 ## 2026-10-21: mutations proportional to what they touch (@lucky-raven)
 
 Incremental validation step 6 is done (7be8dc0). Benchmarking it (new case
