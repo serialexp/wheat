@@ -19,7 +19,20 @@ const OWNED_CONTROL_ENTRIES: &[&str] = &[
     "materialization-transactions",
 ];
 
-pub fn list(workspace: &Path, explicit_store: Option<&Path>) -> Result<Success> {
+/// A workspace registered with the store.
+#[derive(Clone, Debug)]
+pub struct WorkspaceEntry {
+    pub workspace_id: uuid::Uuid,
+    pub path: std::path::PathBuf,
+    /// The workspace `--workspace` resolved to.
+    pub current: bool,
+    /// `attached`, `missing`, `inaccessible` or `identity_mismatch`.
+    pub status: &'static str,
+    pub effective_view: wheat_core::ViewId,
+}
+
+/// The workspaces registered with the store.
+pub fn entries(workspace: &Path, explicit_store: Option<&Path>) -> Result<Vec<WorkspaceEntry>> {
     let current = discover_workspace(workspace).ok();
     let store_root = if let Some(store) = explicit_store {
         canonical_store_path(store)?
@@ -38,24 +51,37 @@ pub fn list(workspace: &Path, explicit_store: Option<&Path>) -> Result<Success> 
         (context.store_root == store_root).then_some(context.workspace.workspace_id)
     });
 
-    let mut rows = Vec::with_capacity(pins.len());
+    Ok(pins
+        .into_iter()
+        .map(|pin| WorkspaceEntry {
+            workspace_id: pin.workspace_id,
+            status: workspace_status(&pin.workspace_path, &pin),
+            current: current_id == Some(pin.workspace_id),
+            effective_view: pin.stable.selected_frontier.unwrap_or(pin.stable.basis),
+            path: pin.workspace_path,
+        })
+        .collect())
+}
+
+pub fn list(workspace: &Path, explicit_store: Option<&Path>) -> Result<Success> {
+    let entries = entries(workspace, explicit_store)?;
+    let mut rows = Vec::with_capacity(entries.len());
     let mut human = String::new();
-    for pin in pins {
-        let status = workspace_status(&pin.workspace_path, &pin);
-        let is_current = current_id == Some(pin.workspace_id);
+    for entry in entries {
         writeln!(
             human,
-            "{}{}\t{}\t{status}",
-            if is_current { "* " } else { "  " },
-            pin.workspace_id,
-            pin.workspace_path.display()
+            "{}{}\t{}\t{}",
+            if entry.current { "* " } else { "  " },
+            entry.workspace_id,
+            entry.path.display(),
+            entry.status
         )?;
         rows.push(json!({
-            "workspace_id": pin.workspace_id.to_string(),
-            "path": pin.workspace_path,
-            "current": is_current,
-            "status": status,
-            "effective_view": pin.stable.selected_frontier.unwrap_or(pin.stable.basis).to_string(),
+            "workspace_id": entry.workspace_id.to_string(),
+            "path": entry.path,
+            "current": entry.current,
+            "status": entry.status,
+            "effective_view": entry.effective_view.to_string(),
         }));
     }
     Success::new("workspace.list", json!({ "workspaces": rows }), human)

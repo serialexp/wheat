@@ -1,10 +1,44 @@
+use std::path::Path;
+
+use anyhow::Result;
 use serde::Serialize;
 use wheat_core::{ViewId, diff_model::DiffDescriptor};
 
 use crate::{
-    workspace_scan::WorkspaceScan,
-    workspace_walk::{UntrackedClassification, WorkspaceWalkResult},
+    discovery::resolve_context,
+    local::open,
+    rewrite_transaction::StoreOperationGuard,
+    workspace_metadata::WorkspaceMetadata,
+    workspace_scan::{self, WorkspaceScan},
+    workspace_walk::{self, UntrackedClassification, WorkspaceWalkResult},
 };
+
+/// The workspace's tracked edits and untracked files against what it materialized.
+pub fn read(workspace: &Path, explicit_store: Option<&Path>) -> Result<WorkspaceStatus> {
+    let mut context = resolve_context(workspace, explicit_store)?;
+    let local = open(&context.store_root)?;
+    let _operation = StoreOperationGuard::acquire(&context.store_root, &local)?;
+    context.workspace = WorkspaceMetadata::read(&context.root)?;
+    let scan = workspace_scan::scan(
+        &context.root,
+        &local,
+        &context.workspace,
+        0,
+        &wheat_store::TreePathFilter::default(),
+    )?;
+    let global = wheat_ignore::loader::read_global_ignore();
+    let global_ref = global
+        .as_ref()
+        .map(|(content, path)| (content.as_str(), path.clone()));
+    let mut ignore_stack = wheat_ignore::stack::IgnoreStack::new(global_ref, &[]);
+    let walk = workspace_walk::walk_workspace(
+        &context.root,
+        &scan.tracked_paths,
+        &mut ignore_stack,
+        workspace_walk::WalkLimits::default(),
+    )?;
+    Ok(WorkspaceStatus::from_scan(scan, Some(walk)))
+}
 
 #[derive(Debug, Serialize)]
 pub struct WorkspaceStatus {

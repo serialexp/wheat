@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Serialize;
 use wheat_core::{ChangeId, RevisionId, ViewId};
 use wheat_store::{
-    ApplicationMapStore, ChangeMapStore, ObjectStoreError, RepositoryHead,
+    ApplicationMapStore, ChangeMapStore, ObjectStoreError, PublicationStore, RepositoryHead,
     RepositoryPublicationError, RepositoryReader, RevisionMapStore,
 };
 
@@ -42,6 +42,34 @@ pub struct ActiveChanges {
     #[serde(serialize_with = "display_optional_id")]
     pub selected: Option<ChangeId>,
     pub changes: Vec<ActiveChange>,
+}
+
+/// The changes the workspace's working view adds above its basis.
+pub fn read(
+    workspace: &std::path::Path,
+    explicit_store: Option<&std::path::Path>,
+) -> Result<ActiveChanges> {
+    let mut context = crate::discovery::resolve_context(workspace, explicit_store)?;
+    let local = crate::local::open(&context.store_root)?;
+    let _operation =
+        crate::rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+    let _workspace_lock = crate::materialization::WorkspaceLock::acquire(&context.root)?;
+    context.workspace = crate::workspace_metadata::WorkspaceMetadata::read(&context.root)?;
+    let runtime = crate::local::runtime()?;
+    runtime.block_on(crate::materialization::recover_locked(
+        &context.root,
+        &local,
+        &mut context.workspace,
+    ))?;
+    crate::selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
+    let head = local.heads.read()?;
+    runtime.block_on(inspect(
+        &local,
+        head,
+        context.workspace.basis,
+        context.workspace.effective_view(),
+        context.workspace.selected_change,
+    ))
 }
 
 pub fn render_human(document: &ActiveChanges) -> Result<Vec<u8>> {

@@ -1,6 +1,6 @@
 //! Build the shared bounded diff model from canonical, bounded inputs.
 
-use std::time::Instant;
+use std::{path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
 use similar::{ChangeTag, TextDiff};
@@ -14,7 +14,90 @@ use wheat_core::{
     text_capture::{self, CaptureKind},
 };
 
-use crate::{repository_diff::TreeChangeInput, workspace_scan::WorkspaceScan};
+use wheat_core::RevisionId;
+use wheat_store::TreePathFilter;
+
+use crate::{
+    discovery::resolve_context,
+    local::{open, runtime},
+    repository_diff::{self, ComparisonInput, TreeChangeInput},
+    rewrite_transaction::StoreOperationGuard,
+    workspace_metadata::WorkspaceMetadata,
+    workspace_scan::{self, WorkspaceScan},
+};
+
+/// What a diff compares.
+#[derive(Clone, Debug)]
+pub enum Comparison {
+    /// The workspace against the tree it materialized.
+    Workspace,
+    /// A revision against its predecessor.
+    Revision(RevisionId),
+    /// Two views, by label or ID.
+    Views { from: String, to: String },
+}
+
+/// The bounded diff of `comparison`, limited to `filter`.
+pub fn compare(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    comparison: Comparison,
+    filter: &TreePathFilter,
+) -> Result<DiffDocument> {
+    let mut context = resolve_context(workspace, explicit_store)?;
+    let local = open(&context.store_root)?;
+    let _operation = StoreOperationGuard::acquire(&context.store_root, &local)?;
+    context.workspace = WorkspaceMetadata::read(&context.root)?;
+    let limits = DiffLimits::default();
+    let deadline = Instant::now() + limits.deadline;
+    match comparison {
+        Comparison::Revision(revision) => {
+            let input = runtime()?.block_on(repository_diff::revision(
+                &local, revision, filter, deadline,
+            ))?;
+            let comparison = match input.comparison {
+                ComparisonInput::Revision { revision, from, to } => DiffComparison::Revision {
+                    revision,
+                    from_tree: from,
+                    to_tree: to,
+                    head_generation: input.head_generation,
+                },
+                _ => unreachable!("revision resolver returns revision comparison"),
+            };
+            build_repository(comparison, input.changes, limits, deadline)
+        }
+        Comparison::Views { from, to } => {
+            let input = runtime()?
+                .block_on(repository_diff::views(&local, &from, &to, filter, deadline))?;
+            let comparison = match input.comparison {
+                ComparisonInput::Views {
+                    from_view,
+                    to_view,
+                    from,
+                    to,
+                } => DiffComparison::Views {
+                    from_view,
+                    to_view,
+                    from_tree: from,
+                    to_tree: to,
+                    head_generation: input.head_generation,
+                },
+                _ => unreachable!("view resolver returns view comparison"),
+            };
+            build_repository(comparison, input.changes, limits, deadline)
+        }
+        Comparison::Workspace => {
+            let scan = workspace_scan::scan(
+                &context.root,
+                &local,
+                &context.workspace,
+                limits.max_inline_bytes_per_side,
+                filter,
+            )?;
+            build(scan, limits, deadline)
+        }
+    }
+}
 
 struct Budget {
     text: usize,

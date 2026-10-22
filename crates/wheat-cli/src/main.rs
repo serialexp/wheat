@@ -39,10 +39,10 @@ use wheat_client::{
     active_changes, authoring_metadata, capture_settlement, conflict_inspection, credential,
     diff_render, discovery, dot_git, edit_move, frontier_service, git_pull, ignore_import,
     import_trace, inspection, label_service, local, log_inspection, materialization, prompt,
-    remote, remote_config, repack, repository_diff, rewrite_transaction, selection_recovery,
-    squash, squash_attribution, store_analyze, store_lookup, workspace, workspace_clone,
-    workspace_diff, workspace_lifecycle, workspace_metadata, workspace_registry_service,
-    workspace_scan, workspace_status, workspace_walk,
+    remote, remote_config, repack, rewrite_transaction, selection_recovery, squash,
+    squash_attribution, store_analyze, store_lookup, workspace, workspace_clone, workspace_diff,
+    workspace_lifecycle, workspace_metadata, workspace_registry_service, workspace_scan,
+    workspace_status,
 };
 use workspace_lifecycle::{ensure_fresh_workspace, initialize_workspace_directory};
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
@@ -803,34 +803,7 @@ fn execute(cli: Cli) -> Result<Success> {
             )
         }
         Command::Status => {
-            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let local = open(&context.store_root)?;
-            let _operation =
-                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
-            context.workspace = WorkspaceMetadata::read(&context.root)?;
-            let scan = workspace_scan::scan(
-                &context.root,
-                &local,
-                &context.workspace,
-                0,
-                &wheat_store::TreePathFilter::default(),
-            )?;
-
-            // Discover untracked files via workspace walk with ignore rules.
-            let global = wheat_ignore::loader::read_global_ignore();
-            let global_ref = global
-                .as_ref()
-                .map(|(content, path)| (content.as_str(), path.clone()));
-            let mut ignore_stack = wheat_ignore::stack::IgnoreStack::new(global_ref, &[]);
-            let walk_result = workspace_walk::walk_workspace(
-                &context.root,
-                &scan.tracked_paths,
-                &mut ignore_stack,
-                workspace_walk::WalkLimits::default(),
-            )?;
-
-            let status = workspace_status::WorkspaceStatus::from_scan(scan, Some(walk_result));
-
+            let status = workspace_status::read(&requested_workspace, cli.store.as_deref())?;
             let mut output = String::new();
             // Print diagnostics to stderr (they're informational, not command output).
             for diagnostic in &status.diagnostics {
@@ -930,27 +903,7 @@ fn execute(cli: Cli) -> Result<Success> {
             Success::new("ignore.import", &imported, human)
         }
         Command::Changes => {
-            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let local = open(&context.store_root)?;
-            let _operation =
-                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
-            let _workspace_lock = materialization::WorkspaceLock::acquire(&context.root)?;
-            context.workspace = WorkspaceMetadata::read(&context.root)?;
-            runtime()?.block_on(materialization::recover_locked(
-                &context.root,
-                &local,
-                &mut context.workspace,
-            ))?;
-            selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
-            let basis = context.workspace.basis;
-            let head = local.heads.read()?;
-            let document = runtime()?.block_on(active_changes::inspect(
-                &local,
-                head,
-                basis,
-                context.workspace.effective_view(),
-                context.workspace.selected_change,
-            ))?;
+            let document = active_changes::read(&requested_workspace, cli.store.as_deref())?;
             let human = active_changes::render_human(&document)?;
             Success::new("changes", &document, human)
         }
@@ -1038,62 +991,22 @@ fn execute(cli: Cli) -> Result<Success> {
             Success::new("conflicts", &document, human)
         }
         Command::Diff(arguments) => {
-            let mut context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let local = open(&context.store_root)?;
-            let _operation =
-                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
-            context.workspace = WorkspaceMetadata::read(&context.root)?;
             let filter = diff_path_filter(arguments.paths)?;
-            let limits = wheat_core::diff_model::DiffLimits::default();
-            let deadline = std::time::Instant::now() + limits.deadline;
-            let document = if let Some(revision) = arguments.revision {
+            let comparison = if let Some(revision) = arguments.revision {
                 let revision = RevisionId::from_str(&revision)
                     .map_err(|_| CliFailure::invalid("invalid revision ID"))?;
-                let input = runtime()?.block_on(repository_diff::revision(
-                    &local, revision, &filter, deadline,
-                ))?;
-                let comparison = match input.comparison {
-                    repository_diff::ComparisonInput::Revision { revision, from, to } => {
-                        wheat_core::diff_model::DiffComparison::Revision {
-                            revision,
-                            from_tree: from,
-                            to_tree: to,
-                            head_generation: input.head_generation,
-                        }
-                    }
-                    _ => unreachable!("revision resolver returns revision comparison"),
-                };
-                workspace_diff::build_repository(comparison, input.changes, limits, deadline)?
+                workspace_diff::Comparison::Revision(revision)
             } else if let (Some(from), Some(to)) = (arguments.from, arguments.to) {
-                let input = runtime()?.block_on(repository_diff::views(
-                    &local, &from, &to, &filter, deadline,
-                ))?;
-                let comparison = match input.comparison {
-                    repository_diff::ComparisonInput::Views {
-                        from_view,
-                        to_view,
-                        from,
-                        to,
-                    } => wheat_core::diff_model::DiffComparison::Views {
-                        from_view,
-                        to_view,
-                        from_tree: from,
-                        to_tree: to,
-                        head_generation: input.head_generation,
-                    },
-                    _ => unreachable!("view resolver returns view comparison"),
-                };
-                workspace_diff::build_repository(comparison, input.changes, limits, deadline)?
+                workspace_diff::Comparison::Views { from, to }
             } else {
-                let scan = workspace_scan::scan(
-                    &context.root,
-                    &local,
-                    &context.workspace,
-                    limits.max_inline_bytes_per_side,
-                    &filter,
-                )?;
-                workspace_diff::build(scan, limits, deadline)?
+                workspace_diff::Comparison::Workspace
             };
+            let document = workspace_diff::compare(
+                &requested_workspace,
+                cli.store.as_deref(),
+                comparison,
+                &filter,
+            )?;
             let human = diff_render::human_bytes(&document)?;
             Success::new("diff", &document, human)
         }
@@ -2178,7 +2091,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
     let runtime = runtime()?;
     let (base, selected, state) = runtime.block_on(async {
         let reader = RepositoryReader::new(&local.objects, &local.content);
-        let envelope = reader.validate_envelope(expected.envelope).await?;
+        let envelope = reader.envelope(expected.envelope).await?;
         let state = reader.state(envelope.state).await?;
         let selected = match arguments
             .source
@@ -2194,6 +2107,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
                 .with_context(|| format!("unknown Wheat label {name}"))?,
             PushSource::View(view) => *view,
         };
+        reader.retained_view(&state, selected).await?;
         Ok::<_, anyhow::Error>((state.base_view, selected, state))
     })?;
     let prepared = runtime.block_on(wheat_git::bridge::prepare_push(
@@ -2285,7 +2199,7 @@ fn push_tag(root: &std::path::Path, remote: &str, tag: &str) -> Result<Success> 
     let runtime = runtime()?;
     let (base, label, changes) = runtime.block_on(async {
         let reader = RepositoryReader::new(&local.objects, &local.content);
-        let envelope = reader.validate_envelope(expected.envelope).await?;
+        let envelope = reader.envelope(expected.envelope).await?;
         let state = reader.state(envelope.state).await?;
         let label = reader
             .view_label_manifest(envelope.labels)
@@ -2297,6 +2211,7 @@ fn push_tag(root: &std::path::Path, remote: &str, tag: &str) -> Result<Success> 
                     "unknown Wheat label {label_name}; create it with `wheat label create {label_name} -m <message>`"
                 ))
             })?;
+        reader.retained_view(&state, label.view).await?;
         Ok::<_, anyhow::Error>((state.base_view, label, state.changes))
     })?;
     let annotation = label.annotation.as_ref().ok_or_else(|| {
