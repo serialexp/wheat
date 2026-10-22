@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 gix = { workspace = true }
+wheat-client = { path = "../wheat-client" }
 wheat-core = { path = "../wheat-core" }
 wheat-git = { path = "../wheat-git" }
 wheat-server = { path = "../wheat-server" }

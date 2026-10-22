@@ -4,8 +4,11 @@
 use std::path::Path;
 
 use anyhow::Result;
-use wheat_core::{Actor, ChangeId, RevisionId, Timestamp};
-use wheat_store::{ChangeMapStore, PublicationStore, RepositoryReader, RevisionMapStore};
+use wheat_core::{Actor, ChangeId, RevisionId, Timestamp, ViewId};
+use wheat_store::{
+    ChangeMapStore, ContentStore, ImmutableObjectStore, PublicationStore, RepositoryHead,
+    RepositoryReader, RevisionMapStore,
+};
 
 use crate::{
     discovery::resolve_context,
@@ -52,54 +55,63 @@ pub fn read(workspace: &Path, explicit_store: Option<&Path>) -> Result<Vec<Histo
     let local = open(&context.store_root)?;
     let _operation = StoreOperationGuard::acquire(&context.store_root, &local)?;
     context.workspace = WorkspaceMetadata::read(&context.root)?;
-    let effective_view = context.workspace.effective_view();
-    let mut entries = runtime()?.block_on(async {
-        let head = local.heads.read()?;
-        let reader = RepositoryReader::new(&local.objects, &local.content);
-        let envelope = reader.envelope(head.envelope).await?;
-        let state = reader.state(envelope.state).await?;
-        let working = reader.view(effective_view).await?;
-        if working.id() != effective_view {
-            return Err(CliFailure::corrupt("effective view identity mismatch"));
+    let head = local.heads.read()?;
+    runtime()?.block_on(entries(
+        &local.objects,
+        &local.content,
+        head,
+        context.workspace.effective_view(),
+    ))
+}
+
+/// Every change `view` selects at `head`, newest commit first.
+pub async fn entries<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    head: RepositoryHead,
+    view: ViewId,
+) -> Result<Vec<HistoryEntry>> {
+    let reader = RepositoryReader::new(objects, content);
+    let envelope = reader.envelope(head.envelope).await?;
+    let state = reader.state(envelope.state).await?;
+    let working = reader.view(view).await?;
+    if working.id() != view {
+        return Err(CliFailure::corrupt("effective view identity mismatch"));
+    }
+    let revisions = RevisionMapStore::new(objects);
+    let changes = ChangeMapStore::new(objects);
+    let mut cursor = revisions.cursor(working.revisions).await?;
+    let mut entries = Vec::new();
+    while let Some((change_id, revision_id)) = cursor.next().await? {
+        if entries.len() == MAX_HISTORY_CHANGES {
+            return Err(CliFailure::limit(
+                "current revision count exceeds the history limit",
+            ));
         }
-        let revisions = RevisionMapStore::new(&local.objects);
-        let changes = ChangeMapStore::new(&local.objects);
-        let mut cursor = revisions.cursor(working.revisions).await?;
-        let mut entries = Vec::new();
-        while let Some((change_id, revision_id)) = cursor.next().await? {
-            if entries.len() == MAX_HISTORY_CHANGES {
-                return Err(CliFailure::limit(
-                    "current revision count exceeds the history limit",
-                ));
-            }
-            let revision = reader.revision(revision_id).await?;
-            if revision.id() != revision_id || revision.change_id != change_id {
-                return Err(CliFailure::corrupt("revision identity mismatch"));
-            }
-            let change_object = changes
-                .get(state.changes, change_id)
-                .await?
-                .ok_or_else(|| {
-                    CliFailure::corrupt("revision refers to an unindexed logical change")
-                })?;
-            let change = reader.change(change_object).await?;
-            if change.id != change_id {
-                return Err(CliFailure::corrupt("logical change identity mismatch"));
-            }
-            entries.push(HistoryEntry {
-                change: change_id,
-                title: change.metadata.title,
-                creator: change.metadata.creator,
-                revision: revision_id,
-                message: revision.metadata.message.clone(),
-                author: revision.metadata.author.clone(),
-                generation: revision.generation,
-                dependencies: revision.dependencies.iter().copied().collect(),
-                committed_at: revision.metadata.committed_at,
-            });
+        let revision = reader.revision(revision_id).await?;
+        if revision.id() != revision_id || revision.change_id != change_id {
+            return Err(CliFailure::corrupt("revision identity mismatch"));
         }
-        Ok(entries)
-    })?;
+        let change_object = changes
+            .get(state.changes, change_id)
+            .await?
+            .ok_or_else(|| CliFailure::corrupt("revision refers to an unindexed logical change"))?;
+        let change = reader.change(change_object).await?;
+        if change.id != change_id {
+            return Err(CliFailure::corrupt("logical change identity mismatch"));
+        }
+        entries.push(HistoryEntry {
+            change: change_id,
+            title: change.metadata.title,
+            creator: change.metadata.creator,
+            revision: revision_id,
+            message: revision.metadata.message.clone(),
+            author: revision.metadata.author.clone(),
+            generation: revision.generation,
+            dependencies: revision.dependencies.iter().copied().collect(),
+            committed_at: revision.metadata.committed_at,
+        });
+    }
     entries.sort_by(|left, right| {
         right
             .committed_at

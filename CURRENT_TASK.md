@@ -8,26 +8,30 @@ GUI call, and "Workspace + Changes first", fully against real data.
 
 Done:
 - 5d1a1a6 `crates/wheat-desktop`: Workspace and Changes screens with wgpu-gameui
-  (git dep on serialexp/wgpu-gameui at a pinned rev) against `fixture.rs` (the comp's
-  demo data). `--render-ui PATH [--screen changes] --fixture` renders headlessly;
-  `app_tests.rs` drives clicks through `App::build_ui`. `--workspace DIR` (default)
-  currently answers "needs the live backend".
-- e30bef6 phase 1: wheat-cli's service modules moved into `crates/wheat-client`
-  unchanged; `outcome.rs` holds `Success`/`CliFailure`/`OutputFormat`; the CLI keeps
-  `main.rs` and `command_output.rs` (emission). lucky-raven was told (they wait on it
-  for incremental-validation step 9 in frontier_service/label_service/materialization).
+  (git dep on serialexp/wgpu-gameui at a pinned rev). `--render-ui PATH [--screen
+  changes] [--fixture | --workspace DIR]` renders headlessly; `app_tests.rs` drives
+  clicks through `App::build_ui`.
+- e30bef6: wheat-cli's service modules moved into `crates/wheat-client`;
+  `outcome.rs` holds `Success`/`CliFailure`/`OutputFormat`; the CLI keeps `main.rs`
+  and `command_output.rs` (emission).
+- f8a96ae typed reads: `workspace_status::read`, `active_changes::read`,
+  `workspace_diff::compare`, `history::{read, entries, revisions}`,
+  `workspace_lifecycle::entries`. 4b00e8e `authoring::{add, create_change,
+  select_change, restore}` (add asks a caller callback before moving edits).
+  9cf2450 `workspace_lifecycle::init`, `frontier_service::read`,
+  `DotGitGate::Refuse`. The CLI arms call all of these.
+- 5252603 `live.rs`: the desktop's default backend. A change carries
+  `revision_count` (its generation + 1) and only its latest revision until expanded,
+  when `Request::Revisions` reads the chain. Change ids show their last 8 hex digits
+  (UUIDv7 prefixes are timestamps).
 
-Next (phase 2): typed services in wheat-client, called by the CLI arms in `execute()`
-and by a live `Backend` in wheat-desktop:
-- status (Status arm), active changes (Changes arm), workspace/revision diffs (Diff
-  arm), frontiers, workspaces list (`workspace_lifecycle::list` returns `Success`),
-  restore (`restore_workspace`), add (Add arm, ~260 lines; the edit-move prompt
-  becomes a caller-supplied confirmation), change new (Change New arm; CLI keeps
-  `capture_initial_edit` / `explain_initial_edit`), change select.
-- History for the Changes screen: a typed log (log_inspection only renders `Success`);
-  a revision's `generation` gives the revision count without walking chains; fetch a
-  chain only when a change is expanded. Needs a bench case at 2k/20k changes.
-- TODO.md "Desktop client (2026-10-22)" lists the rest.
+- Bench case `crates/wheat-bench/src/quick/client_history.rs` (Rule 20):
+  `history::entries` at 1k/5k/20k changes; at 20k it reads 4.01 objects and 11.9 KB
+  per change in 0.64 s (budgets 5, 16 KiB, 1 s).
+
+Open (TODO.md "Desktop client"): refresh/switch still in wheat-cli main.rs, no
+edit-move confirmation dialog, empty stat column, five lock acquisitions per load,
+the diff-deadline flake and the leaked test stores.
 
 ## 2026-10-21: mutations proportional to what they touch (@lucky-raven)
 

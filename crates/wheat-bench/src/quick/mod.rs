@@ -14,6 +14,7 @@
 mod add_scale;
 mod bootstrap_validate;
 mod checkpoint_stack;
+mod client_history;
 mod content_repack_plan;
 mod cpus;
 mod deep_stack;
@@ -77,6 +78,7 @@ pub const CASES: &[&str] = &[
     publish_contention::NAME,
     remote_latency::NAME,
     head_receipts::NAME,
+    client_history::NAME,
 ];
 
 /// How big the cases are.
@@ -232,6 +234,7 @@ pub fn run_case(
         publish_contention::NAME => publish_contention::run(&context),
         remote_latency::NAME => remote_latency::run(&context),
         head_receipts::NAME => head_receipts::run(&context),
+        client_history::NAME => client_history::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

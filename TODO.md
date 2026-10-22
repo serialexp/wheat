@@ -9,10 +9,11 @@ the same commit.
 (`Wheat Client.dc.html`, see CLAUDE.md). `live.rs` reads and writes a workspace
 through `crates/wheat-client`; `--fixture` shows the comp's demo data.
 
-- [ ] Loading a store with thousands of changes needs a scale contract or bench case:
-  every load reads three objects per change (`history::read`) and the Changes list
-  doesn't page yet (`older_changes` is 0 live), and graph layout and filtering are
-  linear per load / keystroke.
+- [ ] Loading history is linear in the working view's changes (bench case
+  `client_history`: 0.64 s, 4 reads and 11.9 KB per change at 20,000; the bytes per
+  change grow because every change-map lookup re-reads its nodes, which get larger
+  with the history). The Changes list doesn't page (`older_changes` is 0 live), and
+  graph layout and filtering are linear per load / keystroke.
 - [ ] Live gaps: Refresh and frontier switching say to use `wheat refresh` /
   `wheat switch` (`switch_workspace` and friends are still in wheat-cli's main.rs);
   a capture that would move edits out of later changes is refused, for want of a

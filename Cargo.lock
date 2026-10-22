@@ -5901,6 +5901,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "wheat-client",
  "wheat-core",
  "wheat-git",
  "wheat-server",

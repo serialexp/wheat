@@ -1,0 +1,36 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261022-020929
+# client_history	{"checkpoints":[1000,5000,20000],"samples":3}
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	5252603de3fc
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+client_history.total.wall	49.67652557	s
+client_history.total.peak_rss	219471872	bytes
+client_history.n1000.load_cold.wall	0.036735071	s
+client_history.n1000.load.wall	0.036063797	s
+client_history.n1000.load.reads	4061	count
+client_history.n1000.load.bytes	7170161	bytes
+client_history.n1000.load.reads_per_change	4.061	count
+client_history.n1000.load.bytes_per_change	7170.161	bytes
+client_history.n5000.load_cold.wall	0.139128156	s
+client_history.n5000.load.wall	0.136127084	s
+client_history.n5000.load.reads	20094	count
+client_history.n5000.load.bytes	39761022	bytes
+client_history.n5000.load.reads_per_change	4.0188	count
+client_history.n5000.load.bytes_per_change	7952.2044	bytes
+client_history.n20000.load_cold.wall	0.637589868	s
+client_history.n20000.load.wall	0.638905726	s
+client_history.n20000.load.reads	80236	count
+client_history.n20000.load.bytes	238533562	bytes
+client_history.n20000.load.reads_per_change	4.0118	count
+client_history.n20000.load.bytes_per_change	11926.6781	bytes
+run.total_time	49.676986828	s
+process.peak_rss	219471872	bytes
+suite.cases	1	count
+suite.case_failures	0	count
