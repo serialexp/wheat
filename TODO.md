@@ -3,6 +3,29 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Desktop client (2026-10-22)
+
+`crates/wheat-desktop` builds the Workspace and Changes screens of the design comp
+(`Wheat Client.dc.html`, see CLAUDE.md) against `fixture.rs`, the comp's demo data.
+
+- [ ] `crates/wheat-client`: move the service code out of wheat-cli into a library
+  that the CLI and the desktop both call, then add a live `Backend` in
+  wheat-desktop. Until then `--workspace DIR` (the default) says it can't open.
+- [ ] Loading a store with thousands of changes needs a scale contract or bench case
+  before the live backend ships: the Changes list pages (`older_changes`), and
+  graph layout and filtering are linear per load / keystroke.
+- [ ] Workspace screen: the "Changes…" base for a new change needs a change picker;
+  Create Change is disabled on that tab until it exists.
+- [ ] Changes screen: Interdiff, Push to Git… and Resolve… are drawn disabled.
+- [ ] Not built: the Labels, Conflicts, Remotes, Storage and Agents screens, and
+  Repository › Open / Import / Clone.
+- [ ] Data the comp shows that wheat doesn't expose yet: an agent workspace's
+  state and task text, and who moved the repository and when (the "Repository
+  advanced" line).
+- [ ] wgpu-gameui gaps: `Button` has no icon, `Checkbox` has no mixed state (the
+  "All tracked" box) and its painter isn't public (file rows draw a checkbox
+  through a throwaway `DrawContext`), and there is no commit-graph widget.
+
 ## Found while dogfooding (2026-10-19)
 
 A release build imported Wheat's own history (163 commits), pushed changes to a bare

@@ -1,0 +1,24 @@
+[package]
+name = "wheat-desktop"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "wheat-desktop"
+path = "src/main.rs"
+
+[dependencies]
+mimalloc = { workspace = true }
+pollster = "0.3"
+wgpu = "24"
+# The UI toolkit agent-ui is drawn with. Pinned to a pushed revision of its public
+# repository so CI can fetch it; crates.io only has 0.5.0 (1.0.0 there is yanked).
+# To build against a local checkout next to this one, add to `.cargo/config.toml`:
+#     [patch.'https://github.com/serialexp/wgpu-gameui']
+#     wgpu-gameui = { path = "../wgpu-gameui/crates/core" }
+wgpu-gameui = { git = "https://github.com/serialexp/wgpu-gameui", rev = "d292485b1bf4d1ac5e771b58aec517e52df5ecb0" }
+winit = "0.30"
+
+[lints]
+workspace = true

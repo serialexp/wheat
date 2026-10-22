@@ -16,6 +16,7 @@ through import and push.
 | `wheat-ignore` | `.gitignore`-compatible ignore rules for workspaces. |
 | `wheat-protocol` | Native wire protocol messages and framing. |
 | `wheat-server` | Standalone native protocol server. |
+| `wheat-desktop` | The desktop client, drawn with wgpu-gameui. Its Workspace and Changes screens run against the design's demo data (`--fixture`) so far. |
 | `wheat-bench` | Benchmark profiles, uploaded to Gothab. |
 | `wheat-trace` | Opt-in span timing (`WHEAT_TRACE`, `WHEAT_TRACE_SUMMARY`) for the binaries. |
 
