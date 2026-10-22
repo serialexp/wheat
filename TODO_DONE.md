@@ -8,6 +8,16 @@ Finished items, moved here from `TODO.md` under the same headings.
   library that the CLI and the desktop both call (e30bef6), with typed reads
   (f8a96ae) and authoring services (4b00e8e). The desktop's live backend
   (`live.rs`) is its default source now; `--fixture` keeps the comp's demo data.
+- `[x]` **Diff tests flaked under load**: `DiffLimits::deadline` is 250 ms of wall
+  clock, so a busy machine truncated diffs the tests expected whole. `compare` takes
+  its `DiffLimits` now and `wheat diff --time-limit-ms` sets the deadline; the tests
+  that read diff output pass 10 minutes.
+- `[x]` **Tests leaked stores and configuration**: `tests/active_changes.rs` set no
+  `WHEAT_STORE_HOME`, so its stores went to `~/.local/share/wheat/stores`, and the
+  harnesses of `workspace_add.rs`, `workspace_diff.rs` and `local_workflow.rs` kept
+  them beside a workspace that was itself a temporary directory, so in `/tmp`. Those
+  workspaces sit inside a temporary directory now (`tests/sandbox`), and the leaked
+  stores and directories were deleted.
 
 ## Found while dogfooding (2026-10-19)
 

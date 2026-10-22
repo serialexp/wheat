@@ -33,13 +33,6 @@ through `crates/wheat-client`; `--fixture` shows the comp's demo data.
 - [ ] wgpu-gameui gaps: `Button` has no icon, `Checkbox` has no mixed state (the
   "All tracked" box) and its painter isn't public (file rows draw a checkbox
   through a throwaway `DrawContext`), and there is no commit-graph widget.
-- [ ] Flaky under load: `phase1_acceptance::phase_one_routine_single_target_workflow_across_processes`
-  asserts a diff isn't `truncated`, but `DiffLimits::deadline` is 250 ms of wall
-  clock, so a busy machine truncates it (seen once in a full `just test`, passes
-  alone). Tests need a count-based way to rule out truncation (Rule 22).
-- [ ] CLI tests that run `wheat init` without `WHEAT_STORE_HOME` leave stores in
-  `~/.local/share/wheat/stores` (881 there on 2026-10-22), e.g. `tests/active_changes.rs`.
-  Point every test at a temp store home and clean out the leaked ones.
 
 ## Found while dogfooding (2026-10-19)
 

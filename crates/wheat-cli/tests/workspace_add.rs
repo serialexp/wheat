@@ -5,6 +5,13 @@ use std::{
     process::{Command, Output},
 };
 
+use sandbox::{Sandbox, sandbox};
+
+mod sandbox;
+
+/// Diffs here must come out whole however busy the machine is.
+const DIFF_TIME_LIMIT: &str = "--time-limit-ms=600000";
+
 fn wheat_command(root: &std::path::Path, arguments: &[&str]) -> Command {
     let mut adjusted = arguments.to_vec();
     if adjusted.first() == Some(&"init") && adjusted.len() == 1 {
@@ -110,8 +117,8 @@ fn edit_ids(output: &Output) -> Vec<String> {
         .collect()
 }
 
-fn setup() -> (tempfile::TempDir, String, String) {
-    let dir = tempfile::tempdir().unwrap();
+fn setup() -> (Sandbox, String, String) {
+    let dir = sandbox();
     ok(dir.path(), &["init"]);
     let base = ok(
         dir.path(),
@@ -205,7 +212,7 @@ fn appending_to_a_file_twice_in_one_change_keeps_both_lines() {
 
 #[test]
 fn independent_guarded_components_have_exact_lineage_and_undo_has_none() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     ok(dir.path(), &["init"]);
     let base_text = "zero\none\ntwo\nthree\nfour\n";
     let first_text = "zero\nONE\ntwo\nthree\nfour\n";
@@ -462,7 +469,7 @@ fn add_holds_the_workspace_operation_lock_across_capture_and_publication() {
 
 #[test]
 fn a_directory_and_a_file_trade_places_in_one_revision() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     let root = dir.path();
     ok(root, &["init"]);
     ok(root, &["change", "new", "-m", "shapes"]);
@@ -500,13 +507,15 @@ fn a_directory_and_a_file_trade_places_in_one_revision() {
     assert!(status.contains("tracked changes: 0"), "{status}");
     assert!(!status.contains("untracked"), "{status}");
     ok(root, &["validate"]);
-    let shown = |path: &str| String::from_utf8(ok(root, &["diff", "--", path]).stdout).unwrap();
+    let shown = |path: &str| {
+        String::from_utf8(ok(root, &["diff", DIFF_TIME_LIMIT, "--", path]).stdout).unwrap()
+    };
     assert!(shown("dir").is_empty() && shown("node/child").is_empty());
 }
 
 #[test]
 fn explicit_guard_ranges_use_canonical_lf_byte_offsets() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     ok(dir.path(), &["init"]);
     let base_text = "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n";
     let child_text = "zero\nONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n";

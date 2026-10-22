@@ -7,6 +7,9 @@ use std::{
     process::{Command, Output},
 };
 
+/// Diffs here must come out whole however busy the machine is.
+const DIFF_TIME_LIMIT: &str = "--time-limit-ms=600000";
+
 use serde_json::Value;
 
 struct Harness {
@@ -463,7 +466,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         ])
     );
 
-    let diff = harness.json_ok(&harness.workspace, &["diff"]);
+    let diff = harness.json_ok(&harness.workspace, &["diff", DIFF_TIME_LIMIT]);
     assert_eq!(diff["command"], "diff");
     assert_eq!(diff["result"]["schema_version"], 1);
     assert_eq!(diff["result"]["comparison"]["type"], "workspace_vs_pinned");

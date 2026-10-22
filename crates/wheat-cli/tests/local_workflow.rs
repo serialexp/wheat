@@ -2,8 +2,10 @@
 
 use std::process::{Command, Output};
 
+use sandbox::sandbox;
 use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
 
+mod sandbox;
 mod support;
 
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
@@ -98,7 +100,7 @@ fn git(root: &std::path::Path, arguments: &[&str]) {
 
 #[test]
 fn initializes_mutates_and_reopens_local_repository() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = sandbox();
 
     let initialized = wheat(directory.path(), &["init"]);
     assert!(initialized.status.success());
@@ -334,7 +336,7 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
 
 #[test]
 fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = sandbox();
     assert!(wheat(directory.path(), &["init"]).status.success());
 
     let a = wheat(
@@ -523,7 +525,7 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
 
 #[test]
 fn embedded_prototype_is_rejected_without_modification() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     std::fs::create_dir(dir.path().join(".wheat")).unwrap();
     let path = dir.path().join(".wheat/repository.yaml");
     std::fs::write(&path, b"legacy snapshot").unwrap();
@@ -535,7 +537,7 @@ fn embedded_prototype_is_rejected_without_modification() {
 
 #[test]
 fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     let revised = wheat(dir.path(), &["change", "revise"]);
     assert!(!revised.status.success());
     assert!(String::from_utf8_lossy(&revised.stderr).contains("unrecognized subcommand 'revise'"));
@@ -556,7 +558,7 @@ fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
 
 #[test]
 fn string_values_are_normalized_and_mode_only_edits_preserve_content() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     assert!(wheat(dir.path(), &["init"]).status.success());
     let created = wheat(
         dir.path(),
@@ -601,7 +603,7 @@ fn string_values_are_normalized_and_mode_only_edits_preserve_content() {
 
 #[test]
 fn symlink_string_values_preserve_carriage_returns() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     assert!(wheat(dir.path(), &["init"]).status.success());
     let target = "directory\r\ntarget\r";
     let created = wheat(
@@ -661,7 +663,7 @@ fn symlink_string_values_preserve_carriage_returns() {
 
 #[test]
 fn failed_mutation_keeps_head_and_emits_no_success() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     assert!(wheat(dir.path(), &["init"]).status.success());
     let created = wheat(
         dir.path(),
@@ -695,7 +697,7 @@ fn failed_mutation_keeps_head_and_emits_no_success() {
 /// why, and how to fix it, and classifies as an input error.
 #[test]
 fn initial_edit_that_does_not_apply_explains_expected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     assert!(wheat(dir.path(), &["init"]).status.success());
     let created = wheat(
         dir.path(),
@@ -767,7 +769,7 @@ fn initial_edit_that_does_not_apply_explains_expected() {
 #[test]
 fn corrupted_canonical_state_is_not_replaced() {
     use wheat_store::{LocalPublicationStore, PublicationStore};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = sandbox();
     assert!(wheat(dir.path(), &["init"]).status.success());
     let store = store_path(dir.path());
     let head_path = store.join("repository.head");

@@ -2,6 +2,7 @@
 
 use std::{fs, process::Command};
 
+/// Runs `wheat` in `root`, with its configuration and stores under `config`.
 fn command(
     root: &std::path::Path,
     config: &std::path::Path,
@@ -10,6 +11,7 @@ fn command(
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .current_dir(root)
         .env("XDG_CONFIG_HOME", config)
+        .env("WHEAT_STORE_HOME", config.join("stores"))
         .args(args)
         .output()
         .unwrap()

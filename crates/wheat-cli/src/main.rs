@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, Stdio},
     str::FromStr,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -14,7 +15,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
     ApplicationResultRecord, ChangeId, ContentId, EditFailure, EditTransition, FileKind, FileValue,
-    ObjectId, ProjectedCommit, RepositoryError, RevisionEdits, RevisionId, ViewId, guarded::Limits,
+    ObjectId, ProjectedCommit, RepositoryError, RevisionEdits, RevisionId, ViewId,
+    diff_model::DiffLimits, guarded::Limits,
 };
 use wheat_store::{
     ApplicationMapStore, Arrival, BatchObjectStore, ImmutableObjectStore, MerkleTreeStore,
@@ -247,6 +249,10 @@ struct DiffArgs {
     from: Option<String>,
     #[arg(long, requires = "from", conflicts_with = "revision")]
     to: Option<String>,
+    /// Stop working out line diffs after this many milliseconds; files not done
+    /// by then are shown truncated. The default is 250.
+    #[arg(long, value_name = "MILLISECONDS")]
+    time_limit_ms: Option<u64>,
     /// Show only changes at or below these repository-relative paths.
     paths: Vec<String>,
 }
@@ -998,11 +1004,16 @@ fn execute(cli: Cli) -> Result<Success> {
             } else {
                 workspace_diff::Comparison::Workspace
             };
+            let mut limits = DiffLimits::default();
+            if let Some(milliseconds) = arguments.time_limit_ms {
+                limits.deadline = Duration::from_millis(milliseconds);
+            }
             let document = workspace_diff::compare(
                 &requested_workspace,
                 cli.store.as_deref(),
                 comparison,
                 &filter,
+                limits,
             )?;
             let human = diff_render::human_bytes(&document)?;
             Success::new("diff", &document, human)

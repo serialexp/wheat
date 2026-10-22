@@ -4,6 +4,9 @@
 
 use std::process::{Command, Output};
 
+/// Diffs here must come out whole however busy the machine is.
+const DIFF_TIME_LIMIT: &str = "--time-limit-ms=600000";
+
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
     let mut arguments = arguments.to_vec();
     if arguments.starts_with(&["change", "new"]) || arguments.first() == Some(&"add") {
@@ -92,38 +95,51 @@ fn setup() -> (tempfile::TempDir, std::path::PathBuf, String) {
 #[test]
 fn workspace_diff_reports_only_selected_files_and_directories() {
     let (_parent, root, _) = setup();
-    assert_eq!(diffed_paths(&root, &["diff"]).len(), 4);
+    assert_eq!(diffed_paths(&root, &["diff", DIFF_TIME_LIMIT]).len(), 4);
     assert_eq!(
-        diffed_paths(&root, &["diff", "src"]),
+        diffed_paths(&root, &["diff", DIFF_TIME_LIMIT, "src"]),
         ["src/a", "src/sub/b"]
     );
     assert_eq!(
-        diffed_paths(&root, &["diff", "src/"]),
+        diffed_paths(&root, &["diff", DIFF_TIME_LIMIT, "src/"]),
         ["src/a", "src/sub/b"]
     );
     assert_eq!(
-        diffed_paths(&root, &["diff", "src/sub/b", "docs"]),
+        diffed_paths(&root, &["diff", DIFF_TIME_LIMIT, "src/sub/b", "docs"]),
         ["docs/c", "src/sub/b"]
     );
-    assert!(diffed_paths(&root, &["diff", "missing"]).is_empty());
+    assert!(diffed_paths(&root, &["diff", DIFF_TIME_LIMIT, "missing"]).is_empty());
 
-    let human = String::from_utf8(ok(&root, &["diff", "src-x"]).stdout).unwrap();
+    let human = String::from_utf8(ok(&root, &["diff", DIFF_TIME_LIMIT, "src-x"]).stdout).unwrap();
     assert!(human.contains("+src-x two"));
     assert!(!human.contains("src/a"));
-    assert!(ok(&root, &["diff", "missing"]).stdout.is_empty());
+    assert!(
+        ok(&root, &["diff", DIFF_TIME_LIMIT, "missing"])
+            .stdout
+            .is_empty()
+    );
 }
 
 #[test]
 fn revision_diff_reports_only_selected_paths() {
     let (_parent, root, revision) = setup();
-    let all = ["diff", "--revision", revision.as_str()];
+    let all = ["diff", DIFF_TIME_LIMIT, "--revision", revision.as_str()];
     assert_eq!(diffed_paths(&root, &all).len(), 4);
     assert_eq!(
-        diffed_paths(&root, &["diff", "--revision", &revision, "src"]),
+        diffed_paths(
+            &root,
+            &["diff", DIFF_TIME_LIMIT, "--revision", &revision, "src"]
+        ),
         ["src/a", "src/sub/b"]
     );
-    let human =
-        String::from_utf8(ok(&root, &["diff", "--revision", &revision, "docs/c"]).stdout).unwrap();
+    let human = String::from_utf8(
+        ok(
+            &root,
+            &["diff", DIFF_TIME_LIMIT, "--revision", &revision, "docs/c"],
+        )
+        .stdout,
+    )
+    .unwrap();
     assert!(human.contains("--- /dev/null\n+++ b/docs/c"));
     assert!(human.contains("+docs/c one"));
     assert!(!human.contains("src"));
@@ -137,7 +153,14 @@ fn view_diff_reports_only_selected_paths() {
     let effective: wheat_core::ViewId =
         serde_json::from_value(status["result"]["effective_view"].clone()).unwrap();
     let effective = effective.to_string();
-    let views = ["diff", "--from", "label:main", "--to", effective.as_str()];
+    let views = [
+        "diff",
+        DIFF_TIME_LIMIT,
+        "--from",
+        "label:main",
+        "--to",
+        effective.as_str(),
+    ];
     let all = diffed_paths(&root, &views);
     assert_eq!(all.len(), 5, "{all:?}");
     let mut selected = views.to_vec();
@@ -149,7 +172,7 @@ fn view_diff_reports_only_selected_paths() {
 fn diff_rejects_paths_outside_the_repository() {
     let (_parent, root, _) = setup();
     for path in ["../x", "/abs", "a//b", ""] {
-        let output = wheat(&root, &["diff", path]);
+        let output = wheat(&root, &["diff", DIFF_TIME_LIMIT, path]);
         assert_eq!(output.status.code(), Some(2), "{path:?}");
         assert!(output.stdout.is_empty());
         assert!(

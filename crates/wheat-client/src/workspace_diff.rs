@@ -37,18 +37,19 @@ pub enum Comparison {
     Views { from: String, to: String },
 }
 
-/// The bounded diff of `comparison`, limited to `filter`.
+/// The diff of `comparison`, limited to `filter` and bounded by `limits`; the
+/// deadline starts once the store is open.
 pub fn compare(
     workspace: &Path,
     explicit_store: Option<&Path>,
     comparison: Comparison,
     filter: &TreePathFilter,
+    limits: DiffLimits,
 ) -> Result<DiffDocument> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let local = open(&context.store_root)?;
     let _operation = StoreOperationGuard::acquire(&context.store_root, &local)?;
     context.workspace = WorkspaceMetadata::read(&context.root)?;
-    let limits = DiffLimits::default();
     let deadline = Instant::now() + limits.deadline;
     match comparison {
         Comparison::Revision(revision) => {

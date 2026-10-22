@@ -6,6 +6,13 @@ use std::{
     process::{Command, Output},
 };
 
+use sandbox::{Sandbox, sandbox};
+
+mod sandbox;
+
+/// Diffs here must come out whole however busy the machine is.
+const DIFF_TIME_LIMIT: &str = "--time-limit-ms=600000";
+
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
     let mut arguments = arguments.to_vec();
     if arguments.starts_with(&["change", "new"]) {
@@ -47,8 +54,8 @@ fn ok(root: &std::path::Path, arguments: &[&str]) -> Output {
     output
 }
 
-fn setup() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+fn setup() -> Sandbox {
+    let dir = sandbox();
     ok(dir.path(), &["init", dir.path().to_str().unwrap()]);
     ok(
         dir.path(),
@@ -96,7 +103,7 @@ fn workspace_diff_covers_text_binary_symlink_kind_delete_crlf_and_json_v1() {
     permissions.set_mode(0o755);
     fs::set_permissions(dir.path().join("kind"), permissions).unwrap();
 
-    let human = ok(dir.path(), &["diff"]);
+    let human = ok(dir.path(), &["diff", DIFF_TIME_LIMIT]);
     let human = String::from_utf8(human.stdout).unwrap();
     assert!(human.contains("-two\n\\ No newline at end of file"));
     assert!(human.contains("+changed\n"));
@@ -109,7 +116,7 @@ fn workspace_diff_covers_text_binary_symlink_kind_delete_crlf_and_json_v1() {
     assert!(human.contains("--- a/gone\n+++ /dev/null"));
     assert!(human.contains("@@ -1,1 +0,0 @@"));
 
-    let json = ok(dir.path(), &["diff", "--format", "json"]);
+    let json = ok(dir.path(), &["diff", DIFF_TIME_LIMIT, "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     let document = &document["result"];
     assert_eq!(document["schema_version"], 1);
@@ -134,7 +141,7 @@ fn workspace_diff_covers_text_binary_symlink_kind_delete_crlf_and_json_v1() {
 #[test]
 fn clean_workspace_diff_has_no_human_output() {
     let dir = setup();
-    assert!(ok(dir.path(), &["diff"]).stdout.is_empty());
+    assert!(ok(dir.path(), &["diff", DIFF_TIME_LIMIT]).stdout.is_empty());
 }
 
 #[test]
@@ -145,7 +152,7 @@ fn workspace_diff_is_lexical_ignores_untracked_files_and_does_not_change_metadat
     fs::write(dir.path().join("binary"), b"changed\n").unwrap();
     fs::write(dir.path().join("untracked"), b"not part of phase one\n").unwrap();
 
-    let output = ok(dir.path(), &["diff", "--format", "json"]);
+    let output = ok(dir.path(), &["diff", DIFF_TIME_LIMIT, "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let paths = document["result"]["files"]
         .as_array()
@@ -172,7 +179,7 @@ fn oversized_workspace_text_is_identified_without_inline_capture() {
     bytes[64 * 1024] = b'\n';
     fs::write(dir.path().join("text"), &bytes).unwrap();
 
-    let output = ok(dir.path(), &["diff", "--format", "json"]);
+    let output = ok(dir.path(), &["diff", DIFF_TIME_LIMIT, "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let file = document["result"]["files"]
         .as_array()
@@ -206,7 +213,7 @@ fn oversized_workspace_binary_reports_raw_identity_and_length() {
     bytes[last] = 0xff;
     fs::write(dir.path().join("binary"), &bytes).unwrap();
 
-    let output = ok(dir.path(), &["diff", "--format", "json"]);
+    let output = ok(dir.path(), &["diff", DIFF_TIME_LIMIT, "--format", "json"]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let file = document["result"]["files"]
         .as_array()
@@ -217,6 +224,26 @@ fn oversized_workspace_binary_reports_raw_identity_and_length() {
     assert_eq!(file["new"]["text"], false);
     assert_eq!(file["new"]["bytes"], bytes.len());
     assert_eq!(file["presentation"]["type"], "binary");
+}
+
+#[test]
+fn a_spent_time_limit_omits_line_diffs() {
+    let dir = setup();
+    fs::write(dir.path().join("text"), b"changed\n").unwrap();
+
+    let output = ok(
+        dir.path(),
+        &["diff", "--time-limit-ms=0", "--format", "json"],
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let file = document["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "text")
+        .unwrap();
+    assert_eq!(file["presentation"]["type"], "omitted");
+    assert_eq!(file["presentation"]["reason"], "deadline");
 }
 
 #[test]
@@ -238,7 +265,7 @@ fn diff_uses_the_pinned_tree_when_repository_authority_advances() {
 
     // The workspace still exactly matches the pinned materialization even though
     // the current working view now contains a different value.
-    assert!(ok(dir.path(), &["diff"]).stdout.is_empty());
+    assert!(ok(dir.path(), &["diff", DIFF_TIME_LIMIT]).stdout.is_empty());
     let status = ok(dir.path(), &["status", "--format", "json"]);
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["result"]["authority_advanced"], true);
@@ -269,7 +296,7 @@ fn diff_recovers_an_interrupted_workspace_operation_before_scanning() {
     assert!(!interrupted.status.success());
     assert!(dir.path().join(".wheat/materialization.json").exists());
 
-    assert!(ok(dir.path(), &["diff"]).stdout.is_empty());
+    assert!(ok(dir.path(), &["diff", DIFF_TIME_LIMIT]).stdout.is_empty());
     assert!(!dir.path().join(".wheat/materialization.json").exists());
 }
 
@@ -290,7 +317,7 @@ fn diff_obeys_the_workspace_operation_lock() {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    let blocked = wheat(dir.path(), &["diff"]);
+    let blocked = wheat(dir.path(), &["diff", DIFF_TIME_LIMIT]);
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("workspace is locked"));
 }
@@ -298,16 +325,23 @@ fn diff_obeys_the_workspace_operation_lock() {
 #[test]
 fn diff_validates_revision_and_view_forms() {
     let dir = setup();
-    let invalid = wheat(dir.path(), &["diff", "--revision", "anything"]);
+    let invalid = wheat(
+        dir.path(),
+        &["diff", DIFF_TIME_LIMIT, "--revision", "anything"],
+    );
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid revision ID"));
-    let incomplete = wheat(dir.path(), &["diff", "--from", "label:main"]);
+    let incomplete = wheat(
+        dir.path(),
+        &["diff", DIFF_TIME_LIMIT, "--from", "label:main"],
+    );
     assert!(!incomplete.status.success());
     assert!(incomplete.stdout.is_empty());
     let conflicting = wheat(
         dir.path(),
         &[
             "diff",
+            DIFF_TIME_LIMIT,
             "--revision",
             "anything",
             "--from",
@@ -321,7 +355,14 @@ fn diff_validates_revision_and_view_forms() {
     assert!(
         wheat(
             dir.path(),
-            &["diff", "--from", "label:main", "--to", "label:main"]
+            &[
+                "diff",
+                DIFF_TIME_LIMIT,
+                "--from",
+                "label:main",
+                "--to",
+                "label:main"
+            ]
         )
         .status
         .success()

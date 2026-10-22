@@ -2,6 +2,9 @@
 
 use std::process::{Command, Output};
 
+/// Diffs here must come out whole however busy the machine is.
+const DIFF_TIME_LIMIT: &str = "--time-limit-ms=600000";
+
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
     let mut arguments = arguments.to_vec();
     if arguments.starts_with(&["change", "new"]) || arguments.first() == Some(&"add") {
@@ -59,7 +62,10 @@ fn compares_initial_and_successor_revisions_without_workspace_reads() {
     let initial_revision = field(&initial, "revision");
 
     // The immutable command succeeds even though the workspace was never materialized.
-    let initial_diff = ok(&root, &["diff", "--revision", &initial_revision]);
+    let initial_diff = ok(
+        &root,
+        &["diff", DIFF_TIME_LIMIT, "--revision", &initial_revision],
+    );
     let rendered = String::from_utf8_lossy(&initial_diff.stdout);
     assert!(rendered.contains("diff --wheat a/file b/file"));
     assert!(rendered.contains("--- /dev/null\n+++ b/file"));
@@ -83,7 +89,12 @@ fn compares_initial_and_successor_revisions_without_workspace_reads() {
     );
     let successor_diff = ok(
         &root,
-        &["diff", "--revision", &field(&successor, "revision")],
+        &[
+            "diff",
+            DIFF_TIME_LIMIT,
+            "--revision",
+            &field(&successor, "revision"),
+        ],
     );
     let rendered = String::from_utf8_lossy(&successor_diff.stdout);
     assert!(rendered.contains("@@ -1,1 +1,1 @@"));
@@ -118,11 +129,18 @@ fn immutable_diff_classifies_utf8_with_nul_as_binary_and_emits_complete_json() {
     );
     let revision = field(&updated, "revision");
 
-    let human = ok(&root, &["diff", "--revision", &revision]);
+    let human = ok(&root, &["diff", DIFF_TIME_LIMIT, "--revision", &revision]);
     assert!(String::from_utf8_lossy(&human.stdout).contains("Binary files differ"));
     let json = ok(
         &root,
-        &["diff", "--revision", &revision, "--format", "json"],
+        &[
+            "diff",
+            DIFF_TIME_LIMIT,
+            "--revision",
+            &revision,
+            "--format",
+            "json",
+        ],
     );
     let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     let document = &document["result"];
@@ -149,14 +167,35 @@ fn compares_symbolic_and_exact_retained_views_and_rejects_unknown_ids() {
         serde_json::from_value(status["result"]["effective_view"].clone()).unwrap();
     let basis = basis.to_string();
     let effective = effective.to_string();
-    let symbolic = ok(&root, &["diff", "--from", "label:main", "--to", &effective]);
-    let exact = ok(&root, &["diff", "--from", &basis, "--to", &effective]);
+    let symbolic = ok(
+        &root,
+        &[
+            "diff",
+            DIFF_TIME_LIMIT,
+            "--from",
+            "label:main",
+            "--to",
+            &effective,
+        ],
+    );
+    let exact = ok(
+        &root,
+        &[
+            "diff",
+            DIFF_TIME_LIMIT,
+            "--from",
+            &basis,
+            "--to",
+            &effective,
+        ],
+    );
     assert_eq!(symbolic.stdout, exact.stdout);
 
     let unknown = wheat(
         &root,
         &[
             "diff",
+            DIFF_TIME_LIMIT,
             "--from",
             &wheat_core::ViewId::from_digest([0x55; 32]).to_string(),
             "--to",

@@ -18,7 +18,8 @@ use wheat_client::{
     workspace_status,
 };
 use wheat_core::diff_model::{
-    DiffDocument, DiffLineOperation, DiffPresentation, DiffText, FileChangeKind, FileDiff,
+    DiffDocument, DiffLimits, DiffLineOperation, DiffPresentation, DiffText, FileChangeKind,
+    FileDiff,
 };
 use wheat_core::{ChangeId, RevisionEdits, RevisionId, Timestamp, text_capture};
 use wheat_store::TreePathFilter;
@@ -214,6 +215,7 @@ impl LiveBackend {
                 None,
                 workspace_diff::Comparison::Workspace,
                 &TreePathFilter::new(vec![path.to_owned()]),
+                DiffLimits::default(),
             )
             .map(|document| document_diff(&document))
         };
@@ -229,6 +231,7 @@ impl LiveBackend {
                     None,
                     workspace_diff::Comparison::Revision(revision),
                     &TreePathFilter::default(),
+                    DiffLimits::default(),
                 )
             })
             .map(|document| document_diff(&document))

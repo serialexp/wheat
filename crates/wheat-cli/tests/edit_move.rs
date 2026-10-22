@@ -12,6 +12,9 @@ use std::{
     process::{Command, Output},
 };
 
+/// Diffs here must come out whole however busy the machine is.
+const DIFF_TIME_LIMIT: &str = "--time-limit-ms=600000";
+
 struct Workspace {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -139,7 +142,7 @@ fn edits(workspace: &Workspace, revision: &str) -> String {
 
 /// B's own delta in `revision`.
 fn revision_diff(workspace: &Workspace, revision: &str) -> String {
-    stdout(&workspace.ok(&["diff", "--revision", revision, "file"]))
+    stdout(&workspace.ok(&["diff", DIFF_TIME_LIMIT, "--revision", revision, "file"]))
 }
 
 #[test]
