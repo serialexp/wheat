@@ -1,5 +1,16 @@
 # Current task
 
+## 2026-10-22: label moves (@lucky-raven) — plan `docs/design/wheat-label-moves.md`
+
+Review 4 (Codex and Antigravity) is folded into the plan, with Bart's decisions 14–16
+(squash stops at branch points; a separate merge meter; `label move` rebinds only
+when the target is the workspace's effective view). Step 1 is done (see the plan's
+"Order of work"). Next: step 2, `forward(from, to)` in a new
+`crates/wheat-store/src/label_move.rs`, over `RevisionMapStore::delta`, using
+`RevisionMerge` (`maximal` for ancestry, `merged_edits` for the merge) under one
+`MergeBudget` per command, with read-count tests. `RevisionMerge` is `pub(crate)`;
+`forward` lives in the same crate.
+
 ## 2026-10-22: desktop client (@calm-lynx) — Bart: "read the design for the wheat gui and try to build that"
 
 Design: Claude Design project `0dfb95ac-…` (see CLAUDE.md), comp `Wheat Client.dc.html`.

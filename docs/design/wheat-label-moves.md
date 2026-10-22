@@ -203,10 +203,13 @@ Cost: one merge per new combined revision. Merge work (revision reads for the
 merge-base walks, edits compared, virtual-base recursion) is metered by `MergeBudget`
 (decision 15), not by `IncrementBudget`'s object-read meter, so an honest merge with a
 distant base does not exhaust the increment's allowance. Reads the merge makes do not
-pass through `Metered`. One `MergeBudget` covers a whole validation run, under every
-arrival mode (incremental, bootstrap, forced/full); its limits are constants
-(`MergeBudget::STANDARD`), set from the step 1 benchmark's slopes, and over budget is an
-error naming the change. Memory is bounded by the same limits (the walk's queue and
+pass through `Metered`. Each combined revision's check gets its own
+`MergeBudget::STANDARD`, under every arrival mode (incremental, bootstrap, forced/full),
+so validation's merge work grows with the combined revisions validated and no single
+merge can take more than the standard budget; integration uses the same budget per
+joined change, so a merge the author could make is one a validator accepts. The limits
+are constants, set from the step 1 benchmark's slopes, and over budget is an error
+naming the change. Memory is bounded by the same limits (the walk's queue and
 the memo hold at most `max_revision_reads` entries).
 
 ## Definitions
@@ -546,6 +549,18 @@ size for `just test`; release run; results under `bench/results/`.
 0. The prerequisite project (decision 13), with its own plan.
 1. Merge bases over the DAG; pairwise in-memory edit merge in `join_revisions`; the
    merge check in validation; squash's boundary. Regression tests first.
+   **Done 2026-10-22**: `crates/wheat-store/src/revision_merge.rs` (`RevisionMerge`,
+   `MergeBudget::STANDARD` = 4,096 revision reads, recursion depth 16, 2^20 edits
+   compared; `check_combination` in full, bootstrap and incremental validation);
+   `RepositoryReader::squash_boundary` and `SquashStops` in `repository_rewrite.rs`,
+   called by the client's squash with every authority root's revision as held;
+   `validate_boundary` refuses collapsing a combined revision. Bench case
+   `revision_merge`: joining after a line of 10, 100 and 1,000 revisions reads 51, 51
+   and 67 objects, validating it 93, 94 and 118 (log growth of the collections, 0.016
+   and 0.025 reads per line revision; contract 0.1). Criss-cross rounds 4 and 12: 88
+   and 180 reads joining, 193 and 436 validating. Each criss-cross round nests one
+   virtual base, so more than 16 rounds of distinct combinations of one change exceed
+   the recursion depth and integration refuses, naming the change.
 2. `forward` + tests + read counts.
 3. Integrate with lacking frontiers and the basis lineage edge.
 4. Materialize from the pinned basis; the journal's binding check. (Full validation
