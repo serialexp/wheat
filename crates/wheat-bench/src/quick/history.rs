@@ -158,6 +158,28 @@ pub(crate) fn rewrite(
     ))
 }
 
+/// Where change number `index` of a history built by [`create_at`] puts its file.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Layout {
+    /// Two directories deep, so a history's files spread over 65,536 directories.
+    Spread,
+    /// All in one directory.
+    Flat,
+}
+
+impl Layout {
+    fn path(self, index: usize) -> String {
+        match self {
+            Self::Spread => format!(
+                "d{:02x}/d{:02x}/f{index}.txt",
+                index & 0xff,
+                (index >> 8) & 0xff
+            ),
+            Self::Flat => format!("flat/f{index}.txt"),
+        }
+    }
+}
+
 /// Creates change number `index` on the frontier of `effective` and publishes it, the
 /// way `wheat change new` does: one new file two directories deep, so a history's files
 /// spread over 65,536 directories. Returns the new head and view.
@@ -173,11 +195,35 @@ where
     O: ImmutableObjectStore,
     P: PublicationStore,
 {
-    let path = format!(
-        "d{:02x}/d{:02x}/f{index}.txt",
-        index & 0xff,
-        (index >> 8) & 0xff
-    );
+    create_at(
+        mutator,
+        content,
+        head,
+        base,
+        effective,
+        index,
+        Layout::Spread,
+    )
+    .await
+}
+
+/// Creates change number `index` on the frontier of `effective` and publishes it, the
+/// way `wheat change new` does, adding one file where `layout` puts it. Returns the new
+/// head and view.
+pub(crate) async fn create_at<O, P>(
+    mutator: &PersistedRepositoryMutator<'_, O, P>,
+    content: &ContentStore,
+    head: RepositoryHead,
+    base: ViewId,
+    effective: ViewId,
+    index: usize,
+    layout: Layout,
+) -> Result<(RepositoryHead, ViewId)>
+where
+    O: ImmutableObjectStore,
+    P: PublicationStore,
+{
+    let path = layout.path(index);
     let (_, edits) = rewrite(content, &path, path.as_bytes(), None)?;
     let (prepared, outcome) = mutator
         .create_on_frontier(

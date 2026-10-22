@@ -16,10 +16,13 @@
 //! whole tree. The first push has no recorded commit to start from and reads every
 //! file, which is recorded without a budget.
 //!
-//! Like every local command until incremental-validation step 9, pull validates the
-//! whole history first (`frontier_service::list`): 2.7 of the long side's 3.2 s on
-//! 2026-10-21, and push does too (`validate_envelope`): 1.8 of its 2.4 s. So their wall
-//! times are recorded without a budget.
+//! Until incremental-validation step 9, every local command validated the whole
+//! history first: pull in `frontier_service::list` (2.7 of the long side's 3.2 s on
+//! 2026-10-21) and push in `validate_envelope` (1.8 of its 2.4 s). Heads are now
+//! validated when they arrive and local commands trust the store: on 2026-10-22 the
+//! long side's pull took 0.27 s and its push 0.24 s. `wheat labels` and
+//! `wheat frontier list` on each side are recorded too, the median of [`LIST_RUNS`].
+//! Their wall times are recorded without a budget.
 
 use std::{fmt::Write as _, fs};
 
@@ -40,6 +43,8 @@ pub(crate) const NAME: &str = "git_pull_incremental";
 /// deeper and the tree spreads over 32 directories instead of one. A pull that
 /// rewrote state growing with the history would be near 4,000%.
 const RECORD_GROWTH_BUDGET_PERCENT: f64 = 250.0;
+/// Runs of each listing command per side.
+const LIST_RUNS: usize = 5;
 /// Files per directory, like a source tree's.
 const FILES_PER_DIRECTORY: usize = 64;
 /// The commit time of every fixture commit.
@@ -99,6 +104,15 @@ fn pull_side(
     let (workspace, imported) = Workspace::import(context, &source)?;
     recorder.timing(&format!("{side}.import"), imported.timing);
     let url = path_text(&source)?;
+    for (step, args) in [
+        ("labels", &["labels"][..]),
+        ("frontier_list", &["frontier", "list"]),
+    ] {
+        let runs = (0..LIST_RUNS)
+            .map(|_| workspace.ok(args).map(|captured| captured.timing))
+            .collect::<Result<Vec<_>>>()?;
+        recorder.runs(&format!("{side}.{step}"), &runs);
+    }
 
     workspace.ok(&["change", "new", "--message", "local work"])?;
     workspace.write("local.txt", "local\n")?;
