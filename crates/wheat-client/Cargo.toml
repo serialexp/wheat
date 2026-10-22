@@ -1,0 +1,31 @@
+[package]
+name = "wheat-client"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+blake3 = { workspace = true }
+chrono = { workspace = true }
+crc32fast = "1"
+futures = "0.3"
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+tempfile = "3"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.28", features = ["connect"] }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+wheat-core = { path = "../wheat-core" }
+wheat-ignore = { path = "../wheat-ignore" }
+wheat-git = { path = "../wheat-git" }
+wheat-protocol = { path = "../wheat-protocol" }
+wheat-store = { path = "../wheat-store" }
+
+[lints]
+workspace = true

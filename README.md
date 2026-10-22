@@ -11,7 +11,8 @@ through import and push.
 |---|---|
 | `wheat-core` | Git-independent primitives: changes, revisions, guarded edits, views, applications, conflicts. The reference model. |
 | `wheat-store` | Local content-addressed, copy-on-write storage and the persisted mutator. |
-| `wheat-cli` | The `wheat` command: workspaces, `add`, `change`, `stack`, `diff`, `materialize`, `repack`, ... |
+| `wheat-client` | The local services behind the `wheat` command: workspaces, capture, materialization, inspection, remotes. Shared with the desktop client. |
+| `wheat-cli` | The `wheat` command: argument parsing and output for `add`, `change`, `stack`, `diff`, `materialize`, `repack`, ... |
 | `wheat-git` | Git import and push. |
 | `wheat-ignore` | `.gitignore`-compatible ignore rules for workspaces. |
 | `wheat-protocol` | Native wire protocol messages and framing. |

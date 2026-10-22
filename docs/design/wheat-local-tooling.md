@@ -16,7 +16,7 @@ land; move whole sections to "done" once everything inside them is checked.
 - [x] **Phase 0 — repository discovery.** Walk the directory hierarchy upward from
   the working directory to find the `.wheat` control directory, stop at filesystem
   boundaries, and expose the resolved workspace/store paths to every subsequent
-  command without requiring `--repository`. (`crates/wheat-cli/src/discovery.rs`
+  command without requiring `--repository`. (`crates/wheat-client/src/discovery.rs`
   `discover_workspace`: stops at a `st_dev` change, refuses a symlinked `.wheat`,
   and checks the workspace's store identity against the store. Test:
   `untracked_status::discovery_from_subdirectory`.)
@@ -213,7 +213,7 @@ core.default_label  string    (repo)         — default active label for new wo
 core.default_format string    (repo, user)   — "human" or "json"; default "human"
 credential.helper   string    (repo, user)   — shell command that prints `token=<token>`
                                                for a native remote (implemented; see
-                                               `crates/wheat-cli/src/credential.rs`)
+                                               `crates/wheat-client/src/credential.rs`)
 ```
 
 The config holds the helper command, never the token itself.

@@ -24,7 +24,7 @@ land and move completed bullets from Outstanding to Done.
 - [x] **Phase 1 — exact view materialization.** Materialize any retained Wheat
   view as a safe private filesystem tree, with authenticated content, file-kind
   fidelity, deterministic paths, and no dependency on a live Git checkout.
-  (`crates/wheat-cli/src/materialization.rs`: no-follow descriptor traversal,
+  (`crates/wheat-client/src/materialization.rs`: no-follow descriptor traversal,
   `renameat2` exchange, regular/executable/symlink kinds. Any retained view is
   reachable through `label create --view` plus `switch`. Tests in
   `crates/wheat-cli/tests/materialization_recovery.rs` and
@@ -641,9 +641,9 @@ binding, or the lifecycle operations specified here.
   capture
 - `crates/wheat-core/src/guarded/authoring.rs` — incremental guarded-edit
   normalization and lineage
-- `crates/wheat-cli/src/workspace.rs` — current explicit-path workspace authoring
+- `crates/wheat-client/src/workspace.rs` — current explicit-path workspace authoring
   proof
-- `crates/wheat-cli/src/workspace_files.rs` — bounded safe workspace reads
+- `crates/wheat-client/src/workspace_files.rs` — bounded safe workspace reads
 - `crates/wheat-store/src/publication.rs` — repository-head CAS
 - `crates/wheat-store/src/repository_publication.rs` — immutable closure
   preparation and publication

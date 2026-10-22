@@ -68,7 +68,7 @@ described here.
   provenance on imported labels, and store workspace basis plus selected frontier.
   Zero descendant frontiers selects the basis, one existing frontier auto-selects,
   and multiple require an explicit choice; never synthesize their union.
-  (`crates/wheat-cli/src/label_service.rs`, `frontier_service.rs`,
+  (`crates/wheat-client/src/label_service.rs`, `frontier_service.rs`,
   `BranchRecord::original_git_ref`, `WorkspaceMetadata::{basis,
   selected_frontier}`; tests in `crates/wheat-cli/tests/labels.rs` and
   `materialization_recovery.rs`.)

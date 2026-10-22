@@ -5927,14 +5927,37 @@ name = "wheat-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "blake3",
+ "clap",
+ "libc",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wheat-client",
+ "wheat-core",
+ "wheat-git",
+ "wheat-ignore",
+ "wheat-protocol",
+ "wheat-server",
+ "wheat-store",
+ "wheat-trace",
+]
+
+[[package]]
+name = "wheat-client"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
  "chrono",
- "clap",
  "crc32fast",
  "futures",
  "libc",
- "mimalloc",
  "serde",
  "serde_json",
  "similar",
@@ -5949,9 +5972,7 @@ dependencies = [
  "wheat-git",
  "wheat-ignore",
  "wheat-protocol",
- "wheat-server",
  "wheat-store",
- "wheat-trace",
 ]
 
 [[package]]

@@ -197,7 +197,7 @@ both lists.
   and remove the CLI's direct dependence on production store capabilities before
   adding remote mode. (2026-09-25: `wheat-protocol` exists and remote mode
   landed first. There is no `wheat-client` crate; the protocol engine lives in
-  `crates/wheat-cli/src/remote.rs` and the CLI still depends on `wheat-store`
+  `crates/wheat-client/src/remote.rs` and the CLI still depends on `wheat-store`
   directly.)
 - [~] **Phase 3 — local synchronization.** Add persisted remote-view observations
   and incremental synchronization once the versioned native protocol exists;

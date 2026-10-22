@@ -102,7 +102,7 @@ top of them.
 - [~] **Phase 2 — remote tracking.** Persist observed remote views locally
   (`wheat-remote` configuration, remote-view observations) without treating them
   as local authority. Enable incremental fetch (only transfer objects the client
-  is missing). (2026-09-26: `crates/wheat-cli/src/remote_config.rs` persists one
+  is missing). (2026-09-26: `crates/wheat-client/src/remote_config.rs` persists one
   remote and its last observed head, and both structural and content fetch are
   incremental. There is no named or multi-remote configuration. The push still
   sends whole objects; sending deltas against the objects the client has is
@@ -115,7 +115,7 @@ top of them.
   standalone server reads token hashes from the `[auth]` table of
   `--config wheat-server.toml`, runs open only on loopback, and refuses
   upgrades whose `Origin` is not in `allowed_origins`. The client gets its token
-  from `credential.helper` (`crates/wheat-cli/src/credential.rs`). TLS is still
+  from `credential.helper` (`crates/wheat-client/src/credential.rs`). TLS is still
   missing: `wheat+tls://` cannot connect, so tokens travel in clear text unless a
   TLS proxy sits in front.)
 - [~] **Phase 2 — authorization and publish gates.** Server-side namespace/

@@ -195,7 +195,7 @@ Performance, most serious first:
     already stored;
   - remote_packed seal validates objects (not content) twice: at `put_if_absent` and
     again through `CheckedRecord::check` in `seal`;
-  - `FileBytes::value` in `crates/wheat-cli/src/edit_move.rs` hashes on every call
+  - `FileBytes::value` in `crates/wheat-client/src/edit_move.rs` hashes on every call
     during `wheat move` replay.
 
   Not a defect: `wheat add` hashes raw file bytes in the scan and canonical
@@ -267,7 +267,7 @@ budget passes, but by only about 0.7 s.
   platform code. `discovery.rs` (the device that stops discovery at a mount) and
   `store_analyze.rs` (allocated bytes) also keep small `cfg(unix)` branches, whose
   non-Unix halves guess instead of failing.
-- `[ ]` **`wheat+tls://` URLs parse but cannot connect.** `crates/wheat-cli/src/remote.rs`
+- `[ ]` **`wheat+tls://` URLs parse but cannot connect.** `crates/wheat-client/src/remote.rs`
   accepts the scheme, but `tokio-tungstenite` is built with only the `connect`
   feature (no rustls/native-tls), in both wheat-cli and wheat-server. Since
   2026-09-26 the client sends a bearer token from `credential.helper`, so over plain
@@ -309,7 +309,7 @@ budget passes, but by only about 0.7 s.
   `subsumed` or `resolutions` entries, even where the combined revisions recorded
   them. Check whether `later_edits` / path history need them carried over.
 - `[ ]` **JSON output of `status` and `conflicts` gives IDs as byte arrays
-  (2026-10-09).** `WorkspaceStatus` (`crates/wheat-cli/src/workspace_status.rs`) and
+  (2026-10-09).** `WorkspaceStatus` (`crates/wheat-client/src/workspace_status.rs`) and
   `ConflictEntry` (`conflict_inspection.rs`) serialize `ViewId`, `ChangeId` and the
   other IDs with their derived `Serialize`, so `--format json` prints 32 numbers
   where the human output and every other document print the hex ID.

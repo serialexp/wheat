@@ -22,55 +22,48 @@ use wheat_store::{
     PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
     RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
-mod active_changes;
-mod authoring_metadata;
-mod capture_settlement;
 mod command_output;
-mod conflict_inspection;
-mod credential;
-mod diff_render;
-mod discovery;
-mod dot_git;
-mod edit_move;
-mod frontier_service;
-mod git_pull;
-mod ignore_import;
-mod import_trace;
-mod inspection;
-mod label_service;
-mod local;
-mod log_inspection;
-mod materialization;
-mod prompt;
-mod remote;
-mod remote_config;
-mod repack;
-mod repository_diff;
-mod rewrite_transaction;
-mod selection_recovery;
-mod squash;
-mod squash_attribution;
-mod store_analyze;
-mod store_lookup;
-mod sys;
-mod workspace;
-mod workspace_clone;
-mod workspace_diff;
-mod workspace_files;
-mod workspace_lifecycle;
-mod workspace_metadata;
-mod workspace_registry;
-mod workspace_registry_service;
-mod workspace_scan;
-mod workspace_status;
-mod workspace_walk;
+
 use command_output::{
-    CliFailure, OutputFormat, Success, clap_error, emit_error, emit_success, requested_format,
-    require_supported_platform, write_stderr,
+    clap_error, emit_error, emit_success, requested_format, require_supported_platform,
+    write_stderr,
 };
-use discovery::{allocate_store_root, canonical_store_path, discover_workspace, store_home};
+use discovery::{
+    allocate_store_root, canonical_store_path, discover_workspace, resolve_context,
+    resolve_store_root, store_home,
+};
 use local::{content_store, initialize, open, projection_path, revision_with_edits, runtime};
+use materialization::materialize_resolved;
+use wheat_client::outcome::{CliFailure, OutputFormat, Success};
+use wheat_client::{
+    active_changes, authoring_metadata, capture_settlement, conflict_inspection, credential,
+    diff_render, discovery, dot_git, edit_move, frontier_service, git_pull, ignore_import,
+    import_trace, inspection, label_service, local, log_inspection, materialization, prompt,
+    remote, remote_config, repack, repository_diff, rewrite_transaction, selection_recovery,
+    squash, squash_attribution, store_analyze, store_lookup, workspace, workspace_clone,
+    workspace_diff, workspace_lifecycle, workspace_metadata, workspace_registry_service,
+    workspace_scan, workspace_status, workspace_walk,
+};
+use workspace_lifecycle::{ensure_fresh_workspace, initialize_workspace_directory};
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
+use workspace_scan::ensure_workspace_clean_locked;
+
+/// `--format`, as clap parses it.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum FormatArg {
+    #[default]
+    Human,
+    Json,
+}
+
+impl From<FormatArg> for OutputFormat {
+    fn from(format: FormatArg) -> Self {
+        match format {
+            FormatArg::Human => OutputFormat::Human,
+            FormatArg::Json => OutputFormat::Json,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "wheat", version, about = "Wheat source control prototype")]
@@ -83,7 +76,7 @@ struct Cli {
     workspace: Option<PathBuf>,
     /// Output format for people or automation.
     #[arg(long, value_enum, default_value_t, global = true)]
-    format: OutputFormat,
+    format: FormatArg,
     #[command(subcommand)]
     command: Command,
 }
@@ -682,7 +675,7 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => return clap_error(requested, error),
     };
-    let format = cli.format;
+    let format = OutputFormat::from(cli.format);
     let command = command_name(&cli.command);
     match tracing::info_span!("command", command).in_scope(|| execute(cli)) {
         Ok(success) => emit_success(format, &success),
@@ -733,7 +726,7 @@ fn command_name(command: &Command) -> &'static str {
 }
 
 fn execute(cli: Cli) -> Result<Success> {
-    let format = cli.format;
+    let format = OutputFormat::from(cli.format);
     let requested_workspace = cli.workspace.unwrap_or_else(|| PathBuf::from("."));
     match cli.command {
         Command::Init(arguments) => init_workspace(
@@ -1399,9 +1392,9 @@ fn execute(cli: Cli) -> Result<Success> {
                 .map_err(|_| CliFailure::invalid("invalid content ID"))?;
             let store = content_store(&store_root)?;
             let limit = if format == OutputFormat::Json {
-                command_output::MAX_OUTPUT_BYTES / 4
+                wheat_client::outcome::MAX_OUTPUT_BYTES / 4
             } else {
-                command_output::MAX_OUTPUT_BYTES
+                wheat_client::outcome::MAX_OUTPUT_BYTES
             };
             let bytes = store.get_bounded(id, limit)?;
             let result = json!({ "content_id": id.to_string(), "bytes": &bytes });
@@ -1879,23 +1872,6 @@ fn init_workspace(
     )
 }
 
-fn ensure_fresh_workspace(root: &Path) -> Result<()> {
-    if root.exists() && root.read_dir()?.next().is_some() {
-        return Err(CliFailure::invalid(format!(
-            "Wheat workspace destination is not empty: {}",
-            root.display()
-        )));
-    }
-    Ok(())
-}
-
-fn initialize_workspace_directory(root: &Path) -> Result<()> {
-    if !root.exists() {
-        std::fs::create_dir_all(root)?;
-    }
-    Ok(())
-}
-
 fn reject_selected_label_mutation(
     context: Option<&discovery::ResolvedWorkspace>,
     name: &str,
@@ -1907,31 +1883,6 @@ fn reject_selected_label_mutation(
         )));
     }
     Ok(())
-}
-
-fn resolve_context(
-    workspace: &Path,
-    explicit_store: Option<&Path>,
-) -> Result<discovery::ResolvedWorkspace> {
-    let context = discover_workspace(workspace)?;
-    if let Some(store) = explicit_store {
-        let explicit = canonical_store_path(store)?;
-        if explicit != context.store_root {
-            return Err(CliFailure::invalid(
-                "explicit Wheat store does not match the discovered workspace link",
-            ));
-        }
-    }
-    Ok(context)
-}
-
-fn resolve_store_root(workspace: &Path, explicit_store: Option<&Path>) -> Result<PathBuf> {
-    if let Some(store) = explicit_store {
-        let store = canonical_store_path(store)?;
-        StoreMetadata::read(&store)?;
-        return Ok(store);
-    }
-    Ok(discover_workspace(workspace)?.store_root)
 }
 
 fn materialize_active_workspace(
@@ -2167,66 +2118,6 @@ fn integration_failure(error: wheat_store::RepositoryMutationError) -> anyhow::E
 }
 
 /// Fill a freshly created workspace (init, import, clone).
-fn materialize_resolved(
-    workspace: &Path,
-    explicit_store: Option<&Path>,
-    label: String,
-    resolved: frontier_service::ResolvedFrontier,
-    dot_git: dot_git::DotGitGate,
-) -> Result<(ViewId, PathBuf)> {
-    let mut context = resolve_context(workspace, explicit_store)?;
-    let repository = open(&context.store_root)?;
-    let view = resolved.effective_view();
-    let materialized = runtime()?.block_on(materialization::materialize(
-        &context.root,
-        &repository,
-        &mut context.workspace,
-        resolved.head,
-        label,
-        resolved.basis,
-        resolved.selected_frontier,
-        resolved.tree,
-        dot_git,
-    ));
-    if let Err(error) = materialized {
-        // The workspace already exists, so running the same command again would
-        // fail; say how to finish this one instead.
-        if matches!(
-            error.downcast_ref::<CliFailure>(),
-            Some(CliFailure::DotGitPaths(_))
-        ) {
-            return Err(CliFailure::dot_git(format!(
-                "{error}\nthe workspace {} is set up but its files were not written; \
-                 to write them, run `wheat --workspace {} materialize --allow-dot-git`",
-                context.root.display(),
-                context.root.display()
-            )));
-        }
-        return Err(error);
-    }
-    Ok((view, context.root))
-}
-
-fn ensure_workspace_clean_locked(
-    root: &Path,
-    repository: &local::LocalRepository,
-    workspace: &WorkspaceMetadata,
-) -> Result<()> {
-    let scan = workspace_scan::scan_locked(
-        root,
-        repository,
-        workspace,
-        0,
-        &wheat_store::TreePathFilter::default(),
-    )?;
-    if !scan.changes.is_empty() {
-        return Err(CliFailure::invalid(
-            "uncaptured tracked workspace edits block switch, refresh or integrate",
-        ));
-    }
-    Ok(())
-}
-
 fn parse_optional_view(value: Option<String>) -> Result<Option<ViewId>> {
     value
         .map(|value| ViewId::from_str(&value).context("invalid frontier view ID"))

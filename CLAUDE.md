@@ -17,8 +17,8 @@ structs, no version bumps.
 
 - `just check`, `just clippy`, `just fmt-check`, `just test` (nextest plus doctests).
 - `just check-windows`: everything must build for Windows, though workspace file
-  operations only run on Linux. New operating-system calls in wheat-cli go through
-  `crates/wheat-cli/src/sys.rs`, not `libc` or `cfg` at the call site.
+  operations only run on Linux. New operating-system calls in wheat-client go through
+  `crates/wheat-client/src/sys.rs`, not `libc` or `cfg` at the call site.
 - Use `cargo nextest`, not plain `cargo test`: several suites rely on each test having
   its own process.
 - Build with `-j 2` / `--build-jobs 2` on Bart's machine.
@@ -57,7 +57,7 @@ The brief it was made from is `docs/wheat-gui-design-brief.md`.
 
 Conventional Commits: `type(scope): description`, lowercase, imperative, no trailing
 period. Scopes are the crate areas: `core`, `store`, `cli`, `git`, `server`,
-`protocol`, `ignore`, or `wheat` for changes across several.
+`protocol`, `ignore`, `client`, `desktop`, or `wheat` for changes across several.
 
 ## TODO bookkeeping
 

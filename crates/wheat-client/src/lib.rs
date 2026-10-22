@@ -1,0 +1,45 @@
+//! Wheat's local services: workspaces, capture, materialization, inspection,
+//! remotes and Git, shared by the `wheat` command and the desktop client.
+
+pub mod active_changes;
+pub mod authoring_metadata;
+pub mod capture_settlement;
+pub mod conflict_inspection;
+pub mod credential;
+pub mod diff_render;
+pub mod discovery;
+pub mod dot_git;
+pub mod edit_move;
+pub mod frontier_service;
+pub mod git_pull;
+pub mod ignore_import;
+pub mod import_trace;
+pub mod inspection;
+pub mod label_service;
+pub mod local;
+pub mod log_inspection;
+pub mod materialization;
+pub mod outcome;
+pub mod prompt;
+pub mod remote;
+pub mod remote_config;
+pub mod repack;
+pub mod repository_diff;
+pub mod rewrite_transaction;
+pub mod selection_recovery;
+pub mod squash;
+pub mod squash_attribution;
+pub mod store_analyze;
+pub mod store_lookup;
+pub mod sys;
+pub mod workspace;
+pub mod workspace_clone;
+pub mod workspace_diff;
+pub mod workspace_files;
+pub mod workspace_lifecycle;
+pub mod workspace_metadata;
+pub mod workspace_registry;
+pub mod workspace_registry_service;
+pub mod workspace_scan;
+pub mod workspace_status;
+pub mod workspace_walk;

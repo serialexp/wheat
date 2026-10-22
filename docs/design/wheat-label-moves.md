@@ -123,7 +123,7 @@ Without decision 12 this is today's `join_revisions` rule with a correct base.
 
 ### Squash
 
-`crates/wheat-store/src/repository_rewrite.rs`, `crates/wheat-cli/src/squash.rs`:
+`crates/wheat-store/src/repository_rewrite.rs`, `crates/wheat-client/src/squash.rs`:
 
 - Squash never collapses a combined revision (review 3, items 3 and 10). It collapses
   only the plain revisions after the boundary, which is the latest of: the basis's
