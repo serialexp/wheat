@@ -235,11 +235,13 @@ Paths that need explicit changes beyond the store users (review 2, item 8):
 
 ## The validator
 
-`RepositoryReader::validate_increment(old, new, mode, budget) -> Result<IncrementReport>`
+`RepositoryReader::validate_increment(old, new, budget) -> Result<IncrementReport>`
 in `crates/wheat-store/src/increment_validation.rs`, replacing
-`validate_transition_with_options`. `old` (state and labels) is trusted; see "What is
-trusted". Modes: `Extend` (ordinary), `Bootstrap` (clone: no old state), `Forced`
-(`allow_non_monotonic`).
+`validate_transition_with_options` at the boundaries. `old` (state and labels) is
+trusted; see "What is trusted". The boundaries call `validate_arrival(new, arrival)`,
+where `Arrival` is `Extends(old)` (ordinary: `validate_increment` with
+`IncrementBudget::STANDARD`), `Bootstrap` (clone, or a fetch with no trusted envelope:
+`validate_bootstrap`) or `Forced` (`allow_non_monotonic`: `validate_envelope`).
 
 ### Finding what is new, without trusting what merely exists
 
@@ -329,6 +331,10 @@ updater give the same root as building the final entries from scratch.
 No old state. The base view is checked against I1's base rule; every other retained
 object is new and goes through steps 2-8, so the cost is the repository's size, as a
 clone already is. A base view other than the one in the remote state does not arise.
+`validate_bootstrap` runs the increment from a state holding only the base view.
+Bart chose it over full validation for clone (2026-10-22) after the
+`bootstrap_validate` bench (see the order of work, step 7); a fetch into a store with
+no trusted envelope of the remote uses it too.
 
 ### Forced (`allow_non_monotonic`)
 
@@ -339,7 +345,9 @@ incremental steps don't see. A forced publish or forced fetch runs full validati
 `validate_envelope`'s, not `validate_complete`'s, review 2, item 6). Full validation
 proves the same invariants as the incremental steps (see "Full validation
 changes"), so a forced state is as trustworthy as an incremental one. Forced
-operations are rare and explicitly destructive; their cost is documented.
+operations are rare and explicitly destructive; their cost is documented. Bart kept
+full validation here rather than Bootstrap (2026-10-22), so a second, independent
+validator stays in a live path.
 
 ### Budget
 
@@ -578,10 +586,23 @@ content it needs anyway; close or keep per Bart.
    per-run object cache): full validation 0.99 / 14.1 / 66.8 s at 1,000 / 10,000 /
    30,000 changes, `validate_bootstrap` (the incremental steps from a state holding
    only the base view) 0.49 / 6.6 / 24.4 s, with about the same reads and peak memory.
-   Which one clone uses is Bart's call. Both grow faster than the history (1.8 M reads,
+   Bart chose Bootstrap for clone and full validation for forced operations
+   (2026-10-22). Both grow faster than the history (1.8 M reads,
    3.2 GB at 30,000), partly the bench's shape: its top directories gain an entry per
    256 changes, so a view's tree diff reads larger directory records.
 8. Server publish (`commit`, including joined publishes); client fetch, clone and
-   the joined-state fetch after a publish.
+   the joined-state fetch after a publish. Done: all of them call
+   `validate_arrival`. The server's `validate` passes `Extends(current)`, or `Forced`
+   for a forced publish (which is never joined). Clone validates `Bootstrap` before
+   its staged objects are flushed. Fetch validates the remote head before the union
+   with local work, `Extends(last fetched)` when that envelope is here, `Bootstrap`
+   when it isn't, `Forced` with `--force`; a refused increment says that `--force`
+   takes a rewritten history. The joined head after a publish is checked as
+   `Extends(local head)`, the client's own. Tests: `remote_fetch.rs`
+   `a_clone_refuses_a_forged_head` and `a_fetch_refuses_a_rewritten_remote_unless_forced`.
+   Until step 9, local commands still run full validation after these, so a clone
+   validates twice. `validate_transition` no longer runs at a boundary; it still
+   serves `RepositoryPublisher::publish_envelope` (local, step 9) and the rewrite in
+   `repository_rewrite.rs`.
 9. Drop full validation from the local read paths.
 10. Benchmarks, docs, TODO bookkeeping.

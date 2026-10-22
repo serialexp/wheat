@@ -62,9 +62,21 @@ Step 7 (2026-10-22): budgets done (3a518b6, see the design doc's order of work).
 Forced is `validate_envelope`. Bootstrap: Bart asked to try the incremental
 validator from an empty state before deciding; `validate_bootstrap` exists and is
 2–2.7× faster than full validation at the same reads and memory (bench
-`bootstrap_validate`). Waiting on Bart's pick; the mode API (which call a clone, a
-forced publish and an ordinary one make) follows from it and lands with step 8,
-which wires the server publish and client fetch/clone.
+`bootstrap_validate`). Bart: Bootstrap for clone, full validation for forced
+publishes and fetches (2026-10-22).
+
+Step 8 (2026-10-22): done. `Arrival { Extends(old), Bootstrap, Forced }` and
+`validate_arrival` in wheat-store; the server publish, clone, fetch and the joined
+fetch after a publish call it (details in the design doc's order of work). Release
+`fetch_incremental` and `publish_contention`: results
+`20261022-005122-c4387e0fcfad.tsv`. Against 20261021-054251 (ten commits earlier,
+format changes in between, so not this change alone): server CPU per publish
+unchanged, catch-up fetch 74 → 102 ms, revise fetch 96 → 114 ms, one-change fetches
+unchanged. `just fmt-check` and `just check-windows` fail on @calm-lynx's
+in-progress `crates/wheat-desktop` (no `main.rs` yet); both pass on the other
+crates. Next: step 9, dropping full validation from the local read paths
+(`frontier_service`, `label_service`, `materialization`, Git push), which
+@calm-lynx's wheat-client move will touch: coordinate first.
 
 ## 2026-10-21: Git push/pull round trip (@calm-lynx)
 
