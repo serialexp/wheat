@@ -56,8 +56,8 @@ pub fn pull(
 
     let label = context.workspace.active_label.clone();
     let listed = runtime.block_on(frontier_service::list(&repository, &label))?;
-    // The head `list` validated, unless a command published since; the publication
-    // below refuses that.
+    // The head `list` read, unless a command published since; the publication below
+    // refuses that.
     let expected = repository.heads.read()?;
     let effective = match listed.frontiers.as_slice() {
         [] => listed.basis,

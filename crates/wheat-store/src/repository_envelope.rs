@@ -1,6 +1,6 @@
 //! Publication metadata is separate from the executable reference repository.
 use crate::{
-    ImmutableObjectStore, PublicationError, PublicationStore, RepositoryHead,
+    ImmutableObjectStore, IncrementBudget, PublicationError, PublicationStore, RepositoryHead,
     RepositoryPublicationError, RepositoryPublisher, RepositoryReader, RetainedSetStore,
 };
 use wheat_core::{
@@ -72,6 +72,19 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
         Ok(id)
     }
 
+    /// Stores `state` with `labels` as an envelope without validating it, for
+    /// [`Self::publish_envelope`], which validates what it adds to the head it replaces.
+    pub async fn stage_envelope(
+        &self,
+        state: RepositoryStateId,
+        labels: &ViewLabelManifestRecord,
+    ) -> Result<RepositoryEnvelopeId> {
+        self.objects
+            .put_if_absent(labels.id().into(), &labels.canonical_bytes())
+            .await?;
+        self.prepare_envelope_unchecked(state, labels.id()).await
+    }
+
     pub(crate) async fn prepare_envelope_unchecked(
         &self,
         state: RepositoryStateId,
@@ -104,6 +117,9 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
     }
     /// Explicit view-label publication. Ordinary model publication preserves
     /// the authenticated old manifest through `publish_root` instead.
+    ///
+    /// The head it replaces was validated, so only what `root` adds to it is: the
+    /// changed labels, and the history when the state changed too.
     pub async fn publish_envelope(
         &self,
         expected: RepositoryHead,
@@ -113,10 +129,9 @@ impl<O: ImmutableObjectStore, P: PublicationStore> RepositoryPublisher<'_, O, P>
         if actual != expected {
             return Err(PublicationError::Stale { expected, actual }.into());
         }
-        let reader = RepositoryReader::new(self.objects, self.content);
-        let new = reader.validate_envelope(root).await?;
-        let old = reader.envelope(expected.envelope).await?;
-        reader.validate_transition(old.state, new.state).await?;
+        RepositoryReader::new(self.objects, self.content)
+            .validate_increment(expected.envelope, root, IncrementBudget::STANDARD)
+            .await?;
         let proposed = expected.next(root)?;
         self.publications.compare_and_advance(expected, proposed)?;
         Ok(proposed)

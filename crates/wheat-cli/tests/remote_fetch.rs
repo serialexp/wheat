@@ -487,3 +487,72 @@ fn a_fetch_refuses_a_rewritten_remote_unless_forced() {
     assert_eq!(forced["up_to_date"], false, "{forced}");
     ok(&reader, &reader_stores, &config, &["validate"]);
 }
+
+/// Runs `wheat` with a trace and returns the names of the spans it recorded.
+fn span_names(cwd: &Path, stores: &Path, config: &Path, args: &[&str]) -> Vec<String> {
+    let trace = cwd.parent().unwrap().join("spans.json");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wheat"))
+        .current_dir(cwd)
+        .args(args)
+        .env("WHEAT_STORE_HOME", stores)
+        .env("XDG_CONFIG_HOME", config)
+        .env("WHEAT_TRACE", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wheat {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&trace).unwrap()).unwrap();
+    fs::remove_file(&trace).unwrap();
+    document["traceEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["ph"] != "E")
+        .filter_map(|event| event["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn count(names: &[String], name: &str) -> usize {
+    names.iter().filter(|recorded| *recorded == name).count()
+}
+
+/// A clone checks the history it receives once, and the local commands after it trust
+/// the store instead of checking all of its history again.
+#[test]
+fn a_clone_validates_once_and_local_commands_trust_the_store() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server = serve(root, &config);
+    let (writer, writer_stores) = (root.join("writer"), root.join("writer-stores"));
+    ok(
+        root,
+        &writer_stores,
+        &config,
+        &["clone", &server.url, writer.to_str().unwrap()],
+    );
+    add_change(&writer, &writer_stores, &config, "one");
+    ok(&writer, &writer_stores, &config, &["publish"]);
+
+    let (reader, stores) = (root.join("reader"), root.join("reader-stores"));
+    let clone = ["clone", &server.url, reader.to_str().unwrap()];
+    let cloned = span_names(root, &stores, &config, &clone);
+    assert_eq!(count(&cloned, "validate_bootstrap"), 1);
+    assert_eq!(count(&cloned, "validate_complete"), 0);
+    for args in [
+        &["frontier", "list"][..],
+        &["labels"],
+        &["label", "create", "kept"],
+        &["switch", "kept"],
+    ] {
+        let names = span_names(&reader, &stores, &config, args);
+        assert_eq!(count(&names, "validate_complete"), 0, "wheat {args:?}");
+    }
+    // The span is recorded where full validation does run.
+    let validated = span_names(&reader, &stores, &config, &["validate"]);
+    assert_eq!(count(&validated, "validate_complete"), 1);
+}

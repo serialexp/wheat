@@ -492,6 +492,14 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Explicit history collapse, repack, and GC
 
+- `[x]` **Read-only `wheat` commands cost a full validation (~30 s on Gothab).**
+  `wheat labels` took as long as `wheat validate` because `label_service::load`
+  called `validate_envelope`. Done 2026-10-22 (incremental validation step 9):
+  heads are validated when they arrive (publish, fetch, clone), so frontier and
+  label commands, materialization recovery and Git push read the envelope and
+  check that the views they name are retained (`RepositoryReader::retained_view`),
+  and a label publish validates only the labels it changes. The store-open half
+  of the item stays in TODO.md.
 - `[x]` **`wheat change squash`.** Collapse one change's unpublished checkpoint
   suffix, retain the last published predecessor boundary, and rebuild affected
   descendants while preserving stable `ChangeId`s, latest canonical `EditId` sets,

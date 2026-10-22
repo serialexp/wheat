@@ -87,3 +87,33 @@ async fn dangling_label_target_never_creates_head() {
     }
     assert!(matches!(heads.read(), Err(PublicationError::Missing)));
 }
+
+/// A label publish checks only what the new manifest changes against the head it
+/// replaces, which still refuses a label naming a view the state doesn't retain.
+#[tokio::test]
+async fn a_staged_label_naming_an_unretained_view_is_not_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let heads = LocalPublicationStore::new(dir.path().join("head"));
+    let publisher = RepositoryPublisher::new(&objects, &content, &heads);
+    let repo = Repository::new(Tree::new());
+    let basis = repo.base_view().id;
+    let initial = publisher.initialize(&repo).await.unwrap();
+    let state = RepositoryReader::new(&objects, &content)
+        .envelope(initial.envelope)
+        .await
+        .unwrap()
+        .state;
+
+    let dangling =
+        ViewLabelManifestRecord::new([("missing", ViewId::from_digest([42; 32]))]).unwrap();
+    let staged = publisher.stage_envelope(state, &dangling).await.unwrap();
+    assert!(publisher.publish_envelope(initial, staged).await.is_err());
+    assert_eq!(heads.read().unwrap(), initial);
+
+    let labels = ViewLabelManifestRecord::new([("main", basis)]).unwrap();
+    let staged = publisher.stage_envelope(state, &labels).await.unwrap();
+    let published = publisher.publish_envelope(initial, staged).await.unwrap();
+    assert_eq!(published.envelope, staged);
+}

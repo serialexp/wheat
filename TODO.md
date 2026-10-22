@@ -384,16 +384,13 @@ operation; repack is independently useful and may run without either squash or G
     with a revision-wide default of 250,000 (`DEFAULT_MAX_REVISION_EDITS`),
     which covers both. Retry the imports once it lands.
   - Bare clones are in `/tmp/wheat-bigrepos/`.
-- `[ ]` **Read-only `wheat` commands cost a full validation (~30 s on Gothab).**
-  Measured 2026-09-24 on the disposable repacked import: `wheat labels` takes
-  30 s / 350 MB RSS, the same as `wheat validate`, because
-  `label_service::load` calls `RepositoryReader::validate_envelope` (full
-  retained-history verification) just to list names. Profile is all tree and
-  content-set decoding. Also, every `PackedObjectStore::open` re-reads and
+- `[ ]` **Opening a packed store costs O(store).** Measured 2026-09-24 on the
+  disposable repacked import: every `PackedObjectStore::open` re-reads and
   re-hashes the whole selected content pack (`validate_content_generation`,
   124 MiB) and tries one `unlink` per manifest entry
-  (`retire_repacked_content`, 208,190 failing syscalls). Decide which commands
-  truly need full verification and make store open O(changes), not O(store).
+  (`retire_repacked_content`, 208,190 failing syscalls). Make store open
+  O(changes), not O(store). (The full validation the same measurement found in
+  read-only commands is gone: TODO_DONE.md.)
 - `[ ]` **Remote packed store keeps its head pointer as JSON.**
   `crates/wheat-store/src/remote_packed/catalog.rs` `HeadPointer` is
   serde_json at `{prefix}/catalog/head`, which breaks the BinSchema-only rule

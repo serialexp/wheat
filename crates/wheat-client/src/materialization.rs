@@ -1135,7 +1135,8 @@ async fn authenticate_journal(
 async fn authenticate_target(repository: &LocalRepository, journal: &Journal) -> Result<()> {
     let head: RepositoryHead = journal.target.repository_head.into();
     let reader = wheat_store::RepositoryReader::new(&repository.objects, &repository.content);
-    let envelope = reader.validate_envelope(head.envelope).await?;
+    let envelope = reader.envelope(head.envelope).await?;
+    let state = reader.state(envelope.state).await?;
     let labels = reader.view_label_manifest(envelope.labels).await?;
     let pinned_binding = labels
         .labels
@@ -1158,7 +1159,7 @@ async fn authenticate_target(repository: &LocalRepository, journal: &Journal) ->
         "journal pinned frontier does not match its target view"
     );
     ensure!(
-        reader.view(selected).await?.tree == journal.target.tree,
+        reader.retained_view(&state, selected).await?.tree == journal.target.tree,
         "journal target view does not resolve to target tree"
     );
     Ok(())

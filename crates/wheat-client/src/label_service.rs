@@ -176,7 +176,7 @@ pub fn delete(
 async fn load(repository: &LocalRepository) -> Result<LabelList> {
     let head = repository.heads.read()?;
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
-    let envelope = reader.validate_envelope(head.envelope).await?;
+    let envelope = reader.envelope(head.envelope).await?;
     let manifest = reader.view_label_manifest(envelope.labels).await?;
     let labels = manifest
         .labels
@@ -209,7 +209,7 @@ where
             )));
         }
         let reader = RepositoryReader::new(&repository.objects, &repository.content);
-        let envelope = reader.validate_envelope(expected.envelope).await?;
+        let envelope = reader.envelope(expected.envelope).await?;
         let manifest = reader.view_label_manifest(envelope.labels).await?;
         let mut labels = manifest.labels;
         let entry = change(&mut labels)?;
@@ -220,7 +220,9 @@ where
             &repository.content,
             &repository.heads,
         );
-        let root = publisher.prepare_envelope(envelope.state, &manifest).await?;
+        // Publishing validates what the new manifest changes: each created or moved
+        // label must name a retained view.
+        let root = publisher.stage_envelope(envelope.state, &manifest).await?;
         let head = publisher.publish_envelope(expected, root).await?;
         Success::new(
             command,

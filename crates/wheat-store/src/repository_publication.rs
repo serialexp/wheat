@@ -120,7 +120,7 @@ where
         let reader = crate::RepositoryReader::new(self.objects, self.content);
         let old = reader.envelope(expected.envelope).await?;
         let labels = reader.view_label_manifest(old.labels).await?;
-        let envelope = self.prepare_envelope(root, &labels).await?;
+        let envelope = self.stage_envelope(root, &labels).await?;
         self.publish_envelope(expected, envelope).await
     }
 

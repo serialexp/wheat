@@ -812,6 +812,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
     }
 
     /// Verify completely while reporting stable coarse phase boundaries.
+    #[tracing::instrument(name = "validate_complete", level = "debug", skip_all)]
     pub async fn validate_complete_with_observer<F>(
         &self,
         id: RepositoryStateId,

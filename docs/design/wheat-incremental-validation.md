@@ -412,13 +412,13 @@ Once the boundary validates, these drop `validate_envelope` / `validate_complete
 check only what they use (envelope, state and label manifest decode; the views they
 name are retained):
 
-- `frontier_service::list` and `::resolve` (`frontier_service.rs:46,130`): init,
+- `frontier_service::list` and `::resolve` (`crates/wheat-client`): init,
   materialize, switch, refresh, pull, integrate, clone, frontier list.
-- `label_service::load` and `::mutate` (`label_service.rs:182,220`), and the
+- `label_service::load` and `::mutate` (`crates/wheat-client`), and the
   publisher calls it makes (`prepare_envelope`, `publish_envelope`).
-- `materialization::authenticate_target` (`materialization.rs:1128`): it keeps its
+- `materialization::authenticate_target` (`crates/wheat-client`): it keeps its
   binding, selection and tree checks, only the history-wide validation goes.
-- Git `push` (`main.rs:2261,2338`).
+- Git `push` and `push --tag` (`crates/wheat-cli/src/main.rs`).
 
 Unchanged: `wheat validate`; `prepare_squash` and other rewrites; `plan_repack`
 (relies on it, `packed/store.rs:360`); snapshot import/export; general imports.
@@ -604,5 +604,15 @@ content it needs anyway; close or keep per Bart.
    validates twice. `validate_transition` no longer runs at a boundary; it still
    serves `RepositoryPublisher::publish_envelope` (local, step 9) and the rewrite in
    `repository_rewrite.rs`.
-9. Drop full validation from the local read paths.
+9. Drop full validation from the local read paths. Done: the commands listed
+   under "Local commands trust the store" (now in `crates/wheat-client`) read the
+   envelope and check each view they name with `RepositoryReader::retained_view`. A
+   label publish stores its envelope unchecked (`RepositoryPublisher::stage_envelope`),
+   and `publish_envelope` validates it with `validate_increment` against the head it
+   replaces, so only the changed labels are checked; `publish_root` does the same for
+   a new state. `prepare_envelope` (initial publication, imports) still validates
+   fully. `validate_complete` has a `validate_complete` span, and
+   `remote_fetch.rs` `a_clone_validates_once_and_local_commands_trust_the_store`
+   counts it: zero for frontier list, label list and create, and switch after a
+   clone, which itself runs one `validate_bootstrap`.
 10. Benchmarks, docs, TODO bookkeeping.

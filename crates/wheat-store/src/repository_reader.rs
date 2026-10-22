@@ -72,6 +72,25 @@ impl<'a, O: ImmutableObjectStore> RepositoryReader<'a, O> {
     read_record!(edit, EditId, EditRecord, Edit, decode_edit_record);
     read_record!(conflict, ConflictId, Conflict, Conflict, decode_conflict);
 
+    /// `view` as `state` retains it. Local commands trust their store, whose heads were
+    /// validated when they arrived, so this is the check they make on a view named by a
+    /// label, a journal or the user before reading it.
+    pub async fn retained_view(
+        &self,
+        state: &RepositoryStateRecord,
+        view: ViewId,
+    ) -> Result<ViewRecord> {
+        if !crate::RetainedSetStore::new(self.objects)
+            .contains(state.retained_views, view.into())
+            .await?
+        {
+            return Err(RepositoryPublicationError::InvalidReferences(
+                "view not retained by the repository head",
+            ));
+        }
+        self.view(view).await
+    }
+
     /// `view`'s producing application: the application of its last change. None for the
     /// base.
     pub(crate) async fn producing_application(

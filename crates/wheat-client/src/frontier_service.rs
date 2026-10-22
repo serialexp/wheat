@@ -43,7 +43,7 @@ pub async fn resolve(
 ) -> Result<ResolvedFrontier> {
     let head = repository.heads.read()?;
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
-    let envelope = reader.validate_envelope(head.envelope).await?;
+    let envelope = reader.envelope(head.envelope).await?;
     resolve_at_head(repository, &reader, head, envelope, label, requested).await
 }
 
@@ -109,7 +109,10 @@ async fn resolve_at_head<O: wheat_store::ImmutableObjectStore>(
             }
         },
     };
-    let tree = reader.view(selected_frontier.unwrap_or(basis)).await?.tree;
+    let tree = reader
+        .retained_view(&state, selected_frontier.unwrap_or(basis))
+        .await?
+        .tree;
     // Re-read the publication pointer after all authenticated traversal so callers never
     // materialize a selection assembled across two repository snapshots.
     anyhow::ensure!(
@@ -128,7 +131,7 @@ async fn resolve_at_head<O: wheat_store::ImmutableObjectStore>(
 pub async fn list(repository: &LocalRepository, label: &str) -> Result<FrontierList> {
     let head = repository.heads.read()?;
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
-    let envelope = reader.validate_envelope(head.envelope).await?;
+    let envelope = reader.envelope(head.envelope).await?;
     let state = reader.state(envelope.state).await?;
     let labels = reader.view_label_manifest(envelope.labels).await?;
     if label.is_empty() {
@@ -139,6 +142,7 @@ pub async fn list(repository: &LocalRepository, label: &str) -> Result<FrontierL
         .get(label)
         .map(|value| value.view)
         .ok_or_else(|| CliFailure::invalid(format!("unknown Wheat label {label}")))?;
+    reader.retained_view(&state, basis).await?;
     let frontiers = ViewLineageMapStore::new(&repository.objects)
         .descendant_frontiers(state.view_lineage, basis, ViewLineageLimits::default())
         .await?;
