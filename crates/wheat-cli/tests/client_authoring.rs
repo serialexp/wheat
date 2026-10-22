@@ -13,7 +13,7 @@ use std::{
 
 use wheat_client::{
     authoring::{self, AddPaths, AddRequest, NewChange},
-    authoring_metadata::MetadataArgs,
+    authoring_metadata::{MetadataArgs, UserConfig},
     dot_git::DotGitGate,
     history,
 };
@@ -31,16 +31,31 @@ impl Workspace {
         fs::create_dir(&root).unwrap();
         let workspace = Self { _dir: dir, root };
         workspace.wheat(&["init"]);
-        workspace.wheat(&["config", "set", "actor.name", "Test"]);
-        workspace.wheat(&["config", "set", "actor.email", "test@example.invalid"]);
+        workspace.wheat(&["config", "set", "--global", "actor.name", "Test"]);
+        workspace.wheat(&[
+            "config",
+            "set",
+            "--global",
+            "actor.email",
+            "test@example.invalid",
+        ]);
         workspace
+    }
+
+    /// The configuration home the `wheat` command and the library calls share.
+    fn config_home(&self) -> PathBuf {
+        self.root.parent().unwrap().join("config")
+    }
+
+    fn user(&self) -> UserConfig {
+        UserConfig::in_home(&self.config_home())
     }
 
     fn wheat(&self, args: &[&str]) {
         let home = self.root.parent().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_wheat"))
             .current_dir(&self.root)
-            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CONFIG_HOME", self.config_home())
             .env("WHEAT_STORE_HOME", home.join("stores"))
             .args(args)
             .output()
@@ -68,6 +83,7 @@ impl Workspace {
         authoring::create_change(
             self.path(),
             None,
+            &self.user(),
             NewChange {
                 dependencies: Default::default(),
                 independent: false,
@@ -95,6 +111,7 @@ impl Workspace {
         authoring::add(
             self.path(),
             None,
+            &self.user(),
             AddRequest {
                 paths,
                 change,
@@ -123,6 +140,15 @@ fn never(_: ChangeId, moves: &[String]) -> anyhow::Result<()> {
 
 fn listed(paths: &[&str]) -> AddPaths {
     AddPaths::Listed(paths.iter().map(|path| (*path).to_owned()).collect())
+}
+
+#[test]
+fn the_author_comes_from_the_user_configuration_passed_in() {
+    let workspace = Workspace::new();
+    let change = workspace.create("authored");
+    let author = workspace.current(change).author;
+    assert_eq!(author.name, "Test");
+    assert_eq!(author.email, "test@example.invalid");
 }
 
 #[test]

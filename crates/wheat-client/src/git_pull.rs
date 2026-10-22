@@ -35,6 +35,7 @@ use crate::{
 pub fn pull(
     workspace: &Path,
     explicit_store: Option<&Path>,
+    user: &authoring_metadata::UserConfig,
     url: &str,
     from: Option<&str>,
     dot_git: DotGitGate,
@@ -116,7 +117,7 @@ pub fn pull(
         );
     }
 
-    let actor = authoring_metadata::actor(&context.store_root)?;
+    let actor = authoring_metadata::actor(user, &context.store_root)?;
     let now = authoring_metadata::now()?;
     let objects = BatchObjectStore::new(&repository.objects, 1024, 8 * 1024 * 1024);
     let mutator = PersistedRepositoryMutator::new(&objects, &repository.content, &repository.heads)

@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use wheat_client::authoring::{self, AddPaths, AddRequest, NewChange};
-use wheat_client::authoring_metadata::MetadataArgs;
+use wheat_client::authoring_metadata::{MetadataArgs, UserConfig};
 use wheat_client::dot_git::DotGitGate;
 use wheat_client::squash_attribution::Coauthors;
 use wheat_client::{
@@ -37,6 +37,8 @@ const MAX_UNTRACKED_BYTES: u64 = 1024 * 1024;
 
 pub struct LiveBackend {
     workspace: PathBuf,
+    /// The user's own configuration, beneath the repository's.
+    user: UserConfig,
     /// Each change's current revision, by change id, as the last load found it.
     current: HashMap<String, RevisionId>,
     /// Paths the last load found untracked or ignored, which have no tracked diff.
@@ -44,9 +46,10 @@ pub struct LiveBackend {
 }
 
 impl LiveBackend {
-    pub fn new(workspace: PathBuf) -> Self {
+    pub fn new(workspace: PathBuf, user: UserConfig) -> Self {
         Self {
             workspace,
+            user,
             current: HashMap::new(),
             untracked: HashSet::new(),
         }
@@ -274,12 +277,13 @@ impl LiveBackend {
                 let change = match target {
                     Target::Selected => None,
                     Target::Change(id) => Some(parse_change(&id)?),
-                    Target::New(base) => Some(create(root, &message, base)?),
+                    Target::New(base) => Some(create(root, &self.user, &message, base)?),
                 };
                 let count = paths.len();
                 let added = authoring::add(
                     root,
                     None,
+                    &self.user,
                     AddRequest {
                         paths: AddPaths::Listed(paths),
                         change,
@@ -328,6 +332,7 @@ impl LiveBackend {
                 let success = squash::execute(
                     root,
                     None,
+                    &self.user,
                     squash::Scope::Change(Some(&change)),
                     Coauthors::Credit,
                 )?;
@@ -337,7 +342,13 @@ impl LiveBackend {
                 ))
             }
             Request::SquashStack { .. } => {
-                let success = squash::execute(root, None, squash::Scope::Stack, Coauthors::Credit)?;
+                let success = squash::execute(
+                    root,
+                    None,
+                    &self.user,
+                    squash::Scope::Stack,
+                    Coauthors::Credit,
+                )?;
                 Ok(("Squashed stack".into(), human(&success.human)))
             }
             Request::Refresh | Request::SwitchFrontier { .. } => anyhow::bail!(
@@ -395,7 +406,7 @@ impl Backend for LiveBackend {
 }
 
 /// Creates the change a capture goes to, titled by the message's first line.
-fn create(root: &Path, message: &str, base: NewBase) -> Result<ChangeId> {
+fn create(root: &Path, user: &UserConfig, message: &str, base: NewBase) -> Result<ChangeId> {
     let (dependencies, independent) = match base {
         NewBase::Frontier => (Default::default(), false),
         NewBase::Changes(ids) => (
@@ -409,6 +420,7 @@ fn create(root: &Path, message: &str, base: NewBase) -> Result<ChangeId> {
     let created = authoring::create_change(
         root,
         None,
+        user,
         NewChange {
             dependencies,
             independent,
@@ -643,16 +655,18 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("workspace");
             let store = dir.path().join("store");
+            let user = UserConfig::in_home(&dir.path().join("config"));
             workspace_lifecycle::init(&root, Some(&store)).unwrap();
-            authoring_metadata::set(Some(&store), false, ConfigKey::ActorName, "Test").unwrap();
+            authoring_metadata::set(&user, None, true, ConfigKey::ActorName, "Test").unwrap();
             authoring_metadata::set(
-                Some(&store),
-                false,
+                &user,
+                None,
+                true,
                 ConfigKey::ActorEmail,
                 "test@example.invalid",
             )
             .unwrap();
-            let backend = LiveBackend::new(root.clone());
+            let backend = LiveBackend::new(root.clone(), user);
             Self {
                 _dir: dir,
                 root,

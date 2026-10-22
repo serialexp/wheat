@@ -117,6 +117,36 @@ impl std::str::FromStr for ConfigKey {
     }
 }
 
+/// The user's own Wheat configuration file, which a repository's configuration
+/// overrides. Callers name it, so a test or an embedding process can keep it away
+/// from the user's.
+#[derive(Clone, Debug)]
+pub struct UserConfig {
+    path: PathBuf,
+}
+
+impl UserConfig {
+    /// `$XDG_CONFIG_HOME/wheat/config.json`, else `~/.config/wheat/config.json`.
+    pub fn from_environment() -> Result<Self> {
+        let home = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(path) => PathBuf::from(path),
+            None => PathBuf::from(
+                std::env::var_os("HOME")
+                    .context("cannot locate Wheat user config: set XDG_CONFIG_HOME")?,
+            )
+            .join(".config"),
+        };
+        Ok(Self::in_home(&home))
+    }
+
+    /// The configuration in `config_home`, the directory `XDG_CONFIG_HOME` names.
+    pub fn in_home(config_home: &Path) -> Self {
+        Self {
+            path: config_home.join("wheat/config.json"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MetadataArgs {
     pub message: String,
@@ -126,9 +156,15 @@ pub struct MetadataArgs {
     pub committed_at: Option<String>,
 }
 
-pub fn set(store_root: Option<&Path>, global: bool, key: ConfigKey, value: &str) -> Result<()> {
+pub fn set(
+    user: &UserConfig,
+    store_root: Option<&Path>,
+    global: bool,
+    key: ConfigKey,
+    value: &str,
+) -> Result<()> {
     let path = if global {
-        user_config_path()?
+        user.path.clone()
     } else {
         store_root
             .context("repository configuration requires a Wheat workspace or --store")?
@@ -177,7 +213,7 @@ pub fn set(store_root: Option<&Path>, global: bool, key: ConfigKey, value: &str)
 
 /// The configured `credential.helper`: the repository's if it sets one, else
 /// the user's. `store_root` is `None` before a store exists (clone).
-pub fn credential_helper(store_root: Option<&Path>) -> Result<Option<String>> {
+pub fn credential_helper(user: &UserConfig, store_root: Option<&Path>) -> Result<Option<String>> {
     let repository = match store_root {
         Some(root) => read_optional(&root.join("config.json"))?,
         None => None,
@@ -185,12 +221,12 @@ pub fn credential_helper(store_root: Option<&Path>) -> Result<Option<String>> {
     let from = |config: Option<Config>| config.and_then(|c| c.credential).and_then(|c| c.helper);
     match from(repository) {
         Some(helper) => Ok(Some(helper)),
-        None => Ok(from(read_optional(&user_config_path()?)?)),
+        None => Ok(from(read_optional(&user.path)?)),
     }
 }
 
-pub fn actor(store_root: &Path) -> Result<Actor> {
-    let user = read_optional(&user_config_path()?)?.unwrap_or_default();
+pub fn actor(user: &UserConfig, store_root: &Path) -> Result<Actor> {
+    let user = read_optional(&user.path)?.unwrap_or_default();
     let repository = read_optional(&store_root.join("config.json"))?.unwrap_or_default();
     let name =
         repository.actor.name.or(user.actor.name).context(
@@ -204,12 +240,13 @@ pub fn actor(store_root: &Path) -> Result<Actor> {
 }
 
 pub fn metadata(
+    user: &UserConfig,
     store_root: &Path,
     arguments: MetadataArgs,
     include_change: bool,
 ) -> Result<(Option<ChangeMetadata>, RevisionMetadata)> {
     validate_revision_message(&arguments.message, include_change)?;
-    let actor = actor(store_root)?;
+    let actor = actor(user, store_root)?;
     let now = Local::now().fixed_offset();
     let authored_at = parse_timestamp(arguments.authored_at.as_deref(), now, "authored-at")?;
     let committed_at = parse_timestamp(arguments.committed_at.as_deref(), now, "committed-at")?;
@@ -340,16 +377,6 @@ fn ensure_bounded(field: &str, value: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn user_config_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(path).join("wheat/config.json"));
-    }
-    Ok(PathBuf::from(
-        std::env::var_os("HOME").context("cannot locate Wheat user config: set XDG_CONFIG_HOME")?,
-    )
-    .join(".config/wheat/config.json"))
-}
-
 fn read_optional(path: &Path) -> Result<Option<Config>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -428,12 +455,13 @@ fn write_config(path: &Path, config: &Config) -> Result<()> {
 /// Builds a label annotation: the configured actor tags it, at `tagged_at`
 /// (RFC3339) or now.
 pub fn annotation(
+    user: &UserConfig,
     store_root: &Path,
     message: String,
     tagged_at: Option<&str>,
 ) -> Result<wheat_core::LabelAnnotation> {
     let annotation = wheat_core::LabelAnnotation {
-        tagger: actor(store_root)?,
+        tagger: actor(user, store_root)?,
         tagged_at: parse_timestamp(tagged_at, Local::now().fixed_offset(), "tagged-at")?,
         message,
     };

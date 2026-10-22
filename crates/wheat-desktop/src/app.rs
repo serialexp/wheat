@@ -11,6 +11,7 @@ use wgpu_gameui::{
     PhosphorIcon, Status, StatusPart, StatusZone, StyleResolver, Theme, Toast, Tone, UiState,
     ZonedStatusBar,
 };
+use wheat_client::authoring_metadata::UserConfig;
 use winit::keyboard::KeyCode;
 
 use crate::backend::{Backend, Client, FixtureBackend, Request, Update, Wake};
@@ -30,14 +31,14 @@ const MENU_ID: u64 = 0x5748_0001;
 pub enum Source {
     /// The comp's demo repository.
     Fixture,
-    /// A live workspace directory.
-    Workspace(PathBuf),
+    /// A live workspace directory, authored as the user `user` configures.
+    Workspace { path: PathBuf, user: UserConfig },
 }
 
 fn backend(source: Source) -> Box<dyn Backend> {
     match source {
         Source::Fixture => Box::new(FixtureBackend::new()),
-        Source::Workspace(path) => Box::new(LiveBackend::new(path)),
+        Source::Workspace { path, user } => Box::new(LiveBackend::new(path, user)),
     }
 }
 

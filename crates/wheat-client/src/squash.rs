@@ -67,6 +67,7 @@ struct RetainedAuthorities {
 pub fn execute(
     workspace: &Path,
     explicit_store: Option<&Path>,
+    user: &authoring_metadata::UserConfig,
     scope: Scope<'_>,
     coauthors: Coauthors,
 ) -> Result<Success> {
@@ -79,7 +80,7 @@ pub fn execute(
     let invoking = WorkspaceMetadata::read(&context.root)?;
     let expected = local.heads.read()?;
     let remote = RemoteConfig::read(&context.store_root)?;
-    let actor = authoring_metadata::actor(&context.store_root)?;
+    let actor = authoring_metadata::actor(user, &context.store_root)?;
     let now = authoring_metadata::now()?;
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
     let planned = runtime()?.block_on(plan(

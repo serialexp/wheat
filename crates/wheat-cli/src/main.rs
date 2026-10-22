@@ -35,6 +35,7 @@ use discovery::{
 };
 use local::{content_store, open, projection_path, revision_with_edits, runtime};
 use materialization::materialize_resolved;
+use wheat_client::authoring_metadata::UserConfig;
 use wheat_client::outcome::{CliFailure, OutputFormat, Success};
 use wheat_client::{
     active_changes, authoring, authoring_metadata, conflict_inspection, credential, diff_render,
@@ -943,6 +944,7 @@ fn execute(cli: Cli) -> Result<Success> {
                     let annotation = message
                         .map(|message| {
                             authoring_metadata::annotation(
+                                &UserConfig::from_environment()?,
                                 &store_root,
                                 message,
                                 tagged_at.as_deref(),
@@ -1028,7 +1030,13 @@ fn execute(cli: Cli) -> Result<Success> {
                 )?)
             };
             let key_name = key.name();
-            authoring_metadata::set(store_root.as_deref(), global, key, &value)?;
+            authoring_metadata::set(
+                &UserConfig::from_environment()?,
+                store_root.as_deref(),
+                global,
+                key,
+                &value,
+            )?;
             Success::new(
                 "config.set",
                 json!({ "global": global, "key": key_name }),
@@ -1087,6 +1095,7 @@ fn execute(cli: Cli) -> Result<Success> {
             let added = authoring::add(
                 &requested_workspace,
                 cli.store.as_deref(),
+                &UserConfig::from_environment()?,
                 authoring::AddRequest {
                     paths,
                     change,
@@ -1180,6 +1189,7 @@ fn execute(cli: Cli) -> Result<Success> {
             let created = authoring::create_change(
                 &requested_workspace,
                 cli.store.as_deref(),
+                &UserConfig::from_environment()?,
                 authoring::NewChange {
                     dependencies,
                     independent: arguments.independent,
@@ -1229,12 +1239,14 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Change(ChangeCommand::Squash { change, options }) => squash::execute(
             &requested_workspace,
             cli.store.as_deref(),
+            &UserConfig::from_environment()?,
             squash::Scope::Change(change.as_deref()),
             options.coauthors(),
         ),
         Command::Stack(StackCommand::Squash(options)) => squash::execute(
             &requested_workspace,
             cli.store.as_deref(),
+            &UserConfig::from_environment()?,
             squash::Scope::Stack,
             options.coauthors(),
         ),
@@ -1297,6 +1309,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 Some(url) if !remote::is_wheat_url(&url) => git_pull::pull(
                     &requested_workspace,
                     cli.store.as_deref(),
+                    &UserConfig::from_environment()?,
                     &url,
                     arguments.from.as_deref(),
                     dot_git,
@@ -2269,7 +2282,7 @@ fn native_clone(
     }
 
     // Ask the helper before creating anything, so a failure leaves no store.
-    let token = credential::token_for(None, &parsed)?;
+    let token = credential::token_for(&UserConfig::from_environment()?, None, &parsed)?;
     let store_root = allocate_store_root()?;
     if store_root.exists() {
         return Err(CliFailure::invalid(format!(
@@ -2419,7 +2432,11 @@ fn native_fetch(
 
     let last_fetched = remote_cfg.last_fetched_head()?;
 
-    let token = credential::token_for(Some(&context.store_root), &parsed)?;
+    let token = credential::token_for(
+        &UserConfig::from_environment()?,
+        Some(&context.store_root),
+        &parsed,
+    )?;
     let rt = runtime()?;
     let staged = remote::staged(&local.objects);
     let (remote_state, since, fetched, content) = rt.block_on(async {
@@ -2658,7 +2675,11 @@ fn native_publish(
 
     let last_fetched = remote_cfg.last_fetched_head()?;
 
-    let token = credential::token_for(Some(&context.store_root), &parsed)?;
+    let token = credential::token_for(
+        &UserConfig::from_environment()?,
+        Some(&context.store_root),
+        &parsed,
+    )?;
     let rt = runtime()?;
     let staged = remote::staged(&local.objects);
     let (outcome, joined) = rt.block_on(async {

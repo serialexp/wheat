@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use wgpu_gameui::{LayerStack, UiRenderer};
+use wheat_client::authoring_metadata::UserConfig;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -326,7 +327,8 @@ fn usage() -> ExitCode {
 fn main() -> ExitCode {
     let mut render_to = None;
     let mut screen = app::Screen::Workspace;
-    let mut source = app::Source::Workspace(std::env::current_dir().unwrap_or_default());
+    // `None` shows the comp's demo data.
+    let mut workspace = Some(std::env::current_dir().unwrap_or_default());
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -338,14 +340,24 @@ fn main() -> ExitCode {
                 Some(parsed) => screen = parsed,
                 None => return usage(),
             },
-            "--fixture" => source = app::Source::Fixture,
+            "--fixture" => workspace = None,
             "--workspace" => match args.next() {
-                Some(path) => source = app::Source::Workspace(PathBuf::from(path)),
+                Some(path) => workspace = Some(PathBuf::from(path)),
                 None => return usage(),
             },
             _ => return usage(),
         }
     }
+    let source = match workspace {
+        None => app::Source::Fixture,
+        Some(path) => match UserConfig::from_environment() {
+            Ok(user) => app::Source::Workspace { path, user },
+            Err(error) => {
+                eprintln!("wheat-desktop: {error:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     if let Some(path) = render_to {
         return match snapshot::capture(&path, source, screen) {
             Ok(()) => ExitCode::SUCCESS,

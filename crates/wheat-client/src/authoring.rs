@@ -15,7 +15,9 @@ use wheat_store::{
 };
 
 use crate::{
-    active_changes, authoring_metadata, capture_settlement,
+    active_changes,
+    authoring_metadata::{self, UserConfig},
+    capture_settlement,
     discovery::resolve_context,
     dot_git::DotGitGate,
     local::{open, runtime},
@@ -77,6 +79,7 @@ pub struct MovedEdit {
 pub fn add(
     workspace: &Path,
     explicit_store: Option<&Path>,
+    user: &UserConfig,
     request: AddRequest,
     confirm_moves: impl FnOnce(ChangeId, &[String]) -> Result<()>,
 ) -> Result<AddOutcome> {
@@ -137,6 +140,7 @@ pub fn add(
     let title = destination.title.clone();
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
     let (_, revision_metadata) = authoring_metadata::metadata(
+        user,
         &context.store_root,
         authoring_metadata::MetadataArgs {
             message: request.message,
@@ -296,6 +300,7 @@ pub struct NewChangeOutcome {
 pub fn create_change(
     workspace: &Path,
     explicit_store: Option<&Path>,
+    user: &UserConfig,
     request: NewChange,
     edits: impl FnOnce(&ContentStore) -> Result<RevisionEdits>,
 ) -> Result<NewChangeOutcome> {
@@ -314,7 +319,7 @@ pub fn create_change(
     let expected = local.heads.read()?;
     let use_frontier = request.dependencies.is_empty() && !request.independent;
     let (change_metadata, revision_metadata) =
-        authoring_metadata::metadata(&context.store_root, request.metadata, true)?;
+        authoring_metadata::metadata(user, &context.store_root, request.metadata, true)?;
     let edits = edits(&local.content)?;
     let change = ChangeId::new();
     let proposal = ChangeProposal {

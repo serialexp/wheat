@@ -23,7 +23,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::authoring_metadata;
+use crate::authoring_metadata::{self, UserConfig};
 use crate::remote::WheatUrl;
 
 /// Largest token Wheat will send; the server looks at no more than this.
@@ -33,8 +33,8 @@ const MAX_HELPER_OUTPUT_BYTES: u64 = 64 * 1024;
 
 /// The token for `url`: from the configured helper, or empty when no helper is
 /// configured or it has none. `store_root` is `None` before a store exists.
-pub fn token_for(store_root: Option<&Path>, url: &WheatUrl) -> Result<Vec<u8>> {
-    match authoring_metadata::credential_helper(store_root)? {
+pub fn token_for(user: &UserConfig, store_root: Option<&Path>, url: &WheatUrl) -> Result<Vec<u8>> {
+    match authoring_metadata::credential_helper(user, store_root)? {
         Some(helper) => run_helper(&helper, url),
         None => Ok(Vec::new()),
     }

@@ -1,8 +1,11 @@
 //! The window driven the way a person would: frames with the pointer moved,
 //! pressed and released, against the fixture answering inline.
 
+use std::path::Path;
+
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{LayerStack, StyleResolver, shared_font_system};
+use wheat_client::authoring_metadata::UserConfig;
 use winit::keyboard::KeyCode;
 
 use super::{App, Regions, Screen, Source};
@@ -192,7 +195,10 @@ fn clicking_a_revision_row_shows_that_revision() {
 
 #[test]
 fn a_directory_that_is_not_a_workspace_fails_to_load() {
-    let mut app = App::inline(Source::Workspace("/nowhere".into()));
+    let mut app = App::inline(Source::Workspace {
+        path: "/nowhere".into(),
+        user: UserConfig::in_home(Path::new("/nowhere")),
+    });
     let mut layers = LayerStack::with_font_system(shared_font_system());
     app.build_ui(&mut layers, SIZE.0, SIZE.1);
     assert!(app.model.is_none());
