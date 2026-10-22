@@ -77,6 +77,8 @@ pub use repository_verify::{RepositoryValidationPhase, TransitionValidationOptio
 mod verification_scratch;
 pub use repository_reader::RepositoryReader;
 mod revision_map;
+mod revision_merge;
+pub use revision_merge::MergeBudget;
 mod semantic_checks;
 mod sets;
 mod snapshot;
@@ -131,7 +133,7 @@ pub use repository_mutation::{
 pub use repository_publication::{RepositoryPublicationError, RepositoryPublisher};
 pub use repository_rewrite::{
     PreparedRepositoryRewrite, RepositoryRewriteError, RepositoryRewriter, RewriteMapping,
-    SquashRewriteRequest, finalize_repository_rewrite,
+    SquashRewriteRequest, SquashStops, finalize_repository_rewrite,
 };
 pub use revision_map::{
     RevisionMapCursor, RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapError, RevisionMapStore,

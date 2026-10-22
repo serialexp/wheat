@@ -21,10 +21,10 @@
 //!
 //! Frontiers may hold different revisions of one change. A revision another one
 //! descends from (through predecessors and the inputs of combined revisions) is
-//! superseded by it. Revisions that went their own ways from a common predecessor are
-//! combined by date: the earliest one, with each later one's edit changes since that
-//! predecessor laid on top in commit order, becomes one new revision whose predecessor
-//! is the earliest and which records the others as the revisions it combines. It is a
+//! superseded by it. Revisions that went their own ways are merged over their ancestry
+//! ([`crate::revision_merge`]), two at a time in date order, into one new revision whose
+//! predecessor is the earliest and which records the others as the revisions it
+//! combines. It is a
 //! new revision even when one input already holds the combined edits, so it descends
 //! from every input and each frontier's edge to the joined view increases its weight.
 //! At most [`MAX_COMBINES`] + 1 revisions combine at once; more is refused, naming the
@@ -32,7 +32,7 @@
 //! reapplied revision may, but none may fail; if one does, integration is refused and
 //! names the change.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use wheat_core::{
     ChangeId, EditId, EditRecord, EditTransition, MAX_COMBINES, RevisionId, RevisionRecord, ViewId,
@@ -40,11 +40,12 @@ use wheat_core::{
 };
 
 use crate::{
-    ApplicationMapStore, ImmutableObjectStore, PersistedRepositoryMutator,
+    ApplicationMapStore, ImmutableObjectStore, MergeBudget, PersistedRepositoryMutator,
     PreparedRepositoryMutation, PublicationStore, RepositoryHead, RepositoryMutationError,
     RepositoryPublicationError, RepositoryReader, RetainedSetStore, RevisionMapDelta,
     RevisionMapStore,
     repository_mutation::{Fresh, Replay, generation_after, topological_by},
+    revision_merge::{RevisionMerge, merge_order},
 };
 
 type Result<T> = std::result::Result<T, RepositoryMutationError>;
@@ -358,31 +359,17 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         revisions: &BTreeSet<RevisionId>,
     ) -> Result<Joined> {
         let reader = RepositoryReader::new(self.objects, self.content);
-        // Each candidate with its predecessors, nearest first.
-        let mut lines: BTreeMap<RevisionId, (RevisionRecord, Vec<RevisionId>)> = BTreeMap::new();
-        for revision in revisions {
-            let record = reader.revision(*revision).await?;
-            if record.change_id != change {
-                return Err(RepositoryPublicationError::InvalidReferences(
-                    "revision-map change mismatch",
-                )
-                .into());
-            }
-            if revisions.len() == 1 {
-                return Ok(Joined::Existing(*revision, record));
-            }
-            let ancestors = revision_ancestors(&reader, &record).await?;
-            lines.insert(*revision, (record, ancestors));
+        let mut merge = RevisionMerge::new(&reader, change, MergeBudget::STANDARD);
+        let candidates = revisions.iter().copied().collect::<Vec<_>>();
+        if let [revision] = candidates.as_slice() {
+            let record = merge.record(*revision).await?.clone();
+            return Ok(Joined::Existing(*revision, record));
         }
         // A revision another one descends from is superseded by it.
-        let superseded = lines
-            .values()
-            .flat_map(|(_, ancestors)| ancestors.iter().copied())
-            .collect::<BTreeSet<_>>();
-        lines.retain(|revision, _| !superseded.contains(revision));
-        if lines.len() == 1 {
-            let (revision, (record, _)) = lines.pop_first().expect("one revision");
-            return Ok(Joined::Existing(revision, record));
+        let mut lines = merge.maximal(&candidates).await?;
+        if let [revision] = lines.as_slice() {
+            let record = merge.record(*revision).await?.clone();
+            return Ok(Joined::Existing(*revision, record));
         }
         if lines.len() > MAX_COMBINES + 1 {
             return Err(RepositoryMutationError::TooManyRevisions {
@@ -391,39 +378,32 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
             });
         }
 
-        // The nearest predecessor every remaining line shares.
-        let mut lines = lines.into_iter().collect::<Vec<_>>();
-        let common = lines[0].1.1.iter().copied().find(|candidate| {
-            lines[1..]
-                .iter()
-                .all(|(_, (_, ancestors))| ancestors.contains(candidate))
-        });
-        let common_edits = match common {
-            Some(common) => reader.revision(common).await?.edits,
-            None => BTreeSet::new(),
-        };
-        lines.sort_by_key(|(revision, (record, _))| {
-            (record.metadata.committed_at.seconds, *revision)
-        });
-        let (earliest, (first, _)) = lines.remove(0);
-
-        let mut selected = first.edits.clone();
+        let mut ordered = Vec::with_capacity(lines.len());
+        for revision in lines.drain(..) {
+            ordered.push(merge_order(revision, merge.record(revision).await?));
+        }
+        ordered.sort();
+        let ordered = ordered
+            .into_iter()
+            .map(|(_, revision)| revision)
+            .collect::<Vec<_>>();
+        let selected = merge.merged_edits(&ordered).await?;
+        let earliest = ordered[0];
+        let first = merge.record(earliest).await?.clone();
         let mut dependencies = first.dependencies.clone();
         let mut metadata = first.metadata.clone();
-        for (_, (later, _)) in &lines {
-            selected.retain(|edit| later.edits.contains(edit) || !common_edits.contains(edit));
-            selected.extend(later.edits.difference(&common_edits).copied());
+        let mut generations = vec![first.generation];
+        for revision in &ordered[1..] {
+            let later = merge.record(*revision).await?;
             dependencies.extend(later.dependencies.iter().copied());
             metadata = later.metadata.clone();
+            generations.push(later.generation);
         }
         // Always a new revision, even when one input already holds the combined edits:
         // the joined view's edge from every frontier must increase its weight, so the
         // revision descends from every input.
-        let generation = generation_after(
-            std::iter::once(first.generation)
-                .chain(lines.iter().map(|(_, (record, _))| record.generation)),
-        )?;
-        let combines = lines.iter().map(|(revision, _)| *revision).collect();
+        let generation = generation_after(generations)?;
+        let combines = ordered[1..].iter().copied().collect();
         let mut edits = BTreeMap::new();
         for edit in &selected {
             edits.insert(*edit, reader.edit(*edit).await?);
@@ -481,29 +461,4 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         let revision = self.put_revision(&record, fresh).await?;
         Ok((revision, combination.edits))
     }
-}
-
-/// Every revision `record` descends from, through predecessors and the inputs of
-/// combined revisions, nearest first, each once.
-async fn revision_ancestors<O: ImmutableObjectStore>(
-    reader: &RepositoryReader<'_, O>,
-    record: &RevisionRecord,
-) -> Result<Vec<RevisionId>> {
-    let mut ancestors = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut pending = record
-        .predecessor
-        .iter()
-        .chain(&record.combines)
-        .copied()
-        .collect::<VecDeque<_>>();
-    while let Some(revision) = pending.pop_front() {
-        if !seen.insert(revision) {
-            continue;
-        }
-        ancestors.push(revision);
-        let parent = reader.revision(revision).await?;
-        pending.extend(parent.predecessor.iter().chain(&parent.combines).copied());
-    }
-    Ok(ancestors)
 }

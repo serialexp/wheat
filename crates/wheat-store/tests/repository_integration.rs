@@ -258,6 +258,8 @@ enum Revision<'a> {
     Replace(&'a [u8]),
     /// Keeps the predecessor's edits and adds one writing `path`.
     Add(&'a str),
+    /// Keeps the predecessor's edits except the one writing `path`.
+    Remove(&'a str),
 }
 
 /// Revises `change` at its revision in `effective`, committed at `committed_at`, and
@@ -293,6 +295,26 @@ async fn revise(
                     .insert(*id, fixture.reader().edit(*id).await.unwrap());
                 edits.transition.preserved.insert(*id);
             }
+            edits
+        }
+        Revision::Remove(path) => {
+            let mut edits = RevisionEdits {
+                edits: Default::default(),
+                transition: EditTransition::default(),
+            };
+            for id in &old.edits {
+                let edit = fixture.reader().edit(*id).await.unwrap();
+                if edit.path == path {
+                    edits.transition.removed.insert(*id);
+                } else {
+                    edits.edits.insert(*id, edit);
+                    edits.transition.preserved.insert(*id);
+                }
+            }
+            assert!(
+                !edits.transition.removed.is_empty(),
+                "no edit writes {path}"
+            );
             edits
         }
     };
@@ -387,11 +409,11 @@ async fn revisions_that_went_their_own_ways_combine_by_date() {
     fixture.validate().await;
 }
 
-/// Squashing a combined revision writes an ordinary one of a lower generation. The
-/// frontiers that held the inputs stay retained beside it, and every edge still
-/// increases the weight.
+/// A combined revision's edits are its inputs' merge, which validation checks, so a
+/// squash never collapses one: the rewrite is refused, and the boundary a squash looks
+/// for stops at it.
 #[tokio::test]
-async fn a_combined_revision_squashes_into_a_valid_history() {
+async fn a_combined_revision_is_never_squashed() {
     let fixture = Fixture::new().await;
     let base = fixture.base;
     let (a, first) = fixture.create(base, base, "a", b"a1").await;
@@ -419,20 +441,163 @@ async fn a_combined_revision_squashes_into_a_valid_history() {
         authority_view_sets: Default::default(),
         authority_revision_sets: Default::default(),
     };
-    let prepared = RepositoryRewriter::new(&fixture.objects, &fixture.content, &fixture.heads)
+    let error = RepositoryRewriter::new(&fixture.objects, &fixture.content, &fixture.heads)
         .prepare_squash(fixture.head(), base, joined, request)
         .await
-        .unwrap()
-        .unwrap();
-    let squashed = prepared.mapping().revisions[&combined];
-    let resulting = prepared.resulting_view();
-    finalize_repository_rewrite(&fixture.heads, prepared).unwrap();
+        .err()
+        .expect("the squash is refused");
+    assert!(
+        matches!(error, RepositoryRewriteError::CollapsesCombinedRevision),
+        "{error}"
+    );
 
-    let squashed = fixture.reader().revision(squashed).await.unwrap();
-    assert!(squashed.combines.is_empty());
-    assert_eq!(squashed.generation, 0);
-    assert_eq!(fixture.weight(resulting).await, 1);
-    fixture.validate().await;
+    let boundary = fixture
+        .reader()
+        .squash_boundary(combined, stops(&[]), 100)
+        .await
+        .unwrap();
+    assert_eq!(boundary, Some(combined));
+}
+
+fn stops(held: &[RevisionId]) -> SquashStops<'_> {
+    SquashStops {
+        basis: None,
+        published: None,
+        held,
+    }
+}
+
+/// A squash's boundary on a plain line: the whole line without stops, else the latest
+/// of the basis's revision, a published one and a combined one.
+#[tokio::test]
+async fn a_squash_stops_at_the_latest_kept_revision() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (c, s) = fixture.create(base, base, "s", b"s").await;
+    let a = revise(&fixture, base, s, c, Revision::Add("a"), 100).await;
+    let b = revise(&fixture, base, s, c, Revision::Add("b"), 200).await;
+    let joined = fixture
+        .integrate(base, &[a, b])
+        .await
+        .unwrap()
+        .resulting_view;
+    let after = revise(&fixture, base, joined, c, Revision::Add("x"), 300).await;
+    let tip = revise(&fixture, base, after, c, Revision::Add("y"), 400).await;
+    let (first, combined, middle, latest) = (
+        revision_in(&fixture, s, c).await.id(),
+        revision_in(&fixture, joined, c).await.id(),
+        revision_in(&fixture, after, c).await.id(),
+        revision_in(&fixture, tip, c).await.id(),
+    );
+    let reader = fixture.reader();
+
+    assert_eq!(
+        reader
+            .squash_boundary(latest, stops(&[]), 100)
+            .await
+            .unwrap(),
+        Some(combined)
+    );
+    let a_line = revise(&fixture, base, a, c, Revision::Add("z"), 500).await;
+    let a_latest = revision_in(&fixture, a_line, c).await.id();
+    assert_eq!(
+        reader
+            .squash_boundary(a_latest, stops(&[]), 100)
+            .await
+            .unwrap(),
+        None
+    );
+    let basis = SquashStops {
+        basis: Some(first),
+        ..stops(&[])
+    };
+    assert_eq!(
+        reader.squash_boundary(a_latest, basis, 100).await.unwrap(),
+        Some(first)
+    );
+    let state = fixture
+        .reader()
+        .state(
+            reader
+                .envelope(fixture.head().envelope)
+                .await
+                .unwrap()
+                .state,
+        )
+        .await
+        .unwrap();
+    let published = SquashStops {
+        published: Some(state.retained_revisions),
+        ..stops(&[])
+    };
+    assert_eq!(
+        reader
+            .squash_boundary(latest, published, 100)
+            .await
+            .unwrap(),
+        Some(latest)
+    );
+    assert_eq!(
+        reader
+            .squash_boundary(latest, stops(&[]), 1)
+            .await
+            .unwrap_err()
+            .to_string(),
+        RepositoryRewriteError::LineTooLong { limit: 1 }.to_string()
+    );
+    assert_ne!(middle, latest);
+}
+
+/// B = {s}; M adds `e`, N removes it again. O revises M adding `o`, in another view
+/// that stays. M is a branch point: collapsing M and N into one revision after B would
+/// leave no record that N's line removed `e`, and joining O afterwards would bring it
+/// back. So the squash collapses only N, and the join still drops `e`.
+#[tokio::test]
+async fn a_squash_stops_at_a_revision_another_line_branched_from() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (c, b) = fixture.create(base, base, "s", b"s").await;
+    let m = revise(&fixture, base, b, c, Revision::Add("e"), 100).await;
+    let n = revise(&fixture, base, m, c, Revision::Remove("e"), 200).await;
+    let o = revise(&fixture, base, m, c, Revision::Add("o"), 300).await;
+    let (m_revision, n_revision, o_revision) = (
+        revision_in(&fixture, m, c).await.id(),
+        revision_in(&fixture, n, c).await.id(),
+        revision_in(&fixture, o, c).await.id(),
+    );
+    let reader = fixture.reader();
+
+    assert_eq!(
+        reader
+            .squash_boundary(n_revision, stops(&[]), 100)
+            .await
+            .unwrap(),
+        None
+    );
+    let held = [n_revision, o_revision];
+    assert_eq!(
+        reader
+            .squash_boundary(n_revision, stops(&held), 100)
+            .await
+            .unwrap(),
+        Some(m_revision)
+    );
+    // A view holding a later revision of the squashed line keeps the whole line.
+    let later = revise(&fixture, base, n, c, Revision::Add("later"), 400).await;
+    let held = [revision_in(&fixture, later, c).await.id()];
+    assert_eq!(
+        reader
+            .squash_boundary(n_revision, stops(&held), 100)
+            .await
+            .unwrap(),
+        Some(n_revision)
+    );
+
+    let outcome = fixture.integrate(base, &[n, o]).await.unwrap();
+    assert_eq!(
+        present(&fixture, outcome.resulting_view, &["s", "e", "o"]).await,
+        ["s", "o"]
+    );
 }
 
 /// Two revisions with the same edits still get a combined revision, which descends
@@ -768,5 +933,208 @@ fn assert_reads_far_below_history(reads: &[usize]) {
     assert!(
         reads[1] < reads[0] + added / 4,
         "reads grew with the history: {reads:?}"
+    );
+}
+
+/// The files of `paths` that `view` holds.
+async fn present(fixture: &Fixture, view: ViewId, paths: &[&str]) -> Vec<String> {
+    let mut held = Vec::new();
+    for path in paths {
+        if fixture.file(view, path).await.is_some() {
+            held.push((*path).to_owned());
+        }
+    }
+    held
+}
+
+/// S = {s}; A adds `a`, B adds `b`; J combines them; B2 revises B, removing `b`.
+/// Joining J with B2 keeps the removal: J records B as an input, so B is their base.
+#[tokio::test]
+async fn a_removal_after_a_combination_is_kept() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (c, s) = fixture.create(base, base, "s", b"s").await;
+    let a = revise(&fixture, base, s, c, Revision::Add("a"), 100).await;
+    let b = revise(&fixture, base, s, c, Revision::Add("b"), 200).await;
+    let joined = fixture
+        .integrate(base, &[a, b])
+        .await
+        .unwrap()
+        .resulting_view;
+    let b2 = revise(&fixture, base, b, c, Revision::Remove("b"), 300).await;
+
+    let outcome = fixture.integrate(base, &[joined, b2]).await.unwrap();
+
+    assert_eq!(
+        present(&fixture, outcome.resulting_view, &["s", "a", "b"]).await,
+        ["s", "a"]
+    );
+    fixture.validate().await;
+}
+
+/// A = {s, a, b} and B = {s, b} added `b` on their own; their combination holds both.
+/// B2 revises B, removing `b`; joining it with the combination keeps the removal.
+#[tokio::test]
+async fn a_removal_after_combining_an_edit_both_sides_made_is_kept() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (c, s) = fixture.create(base, base, "s", b"s").await;
+    let a1 = revise(&fixture, base, s, c, Revision::Add("a"), 100).await;
+    let a = revise(&fixture, base, a1, c, Revision::Add("b"), 150).await;
+    let b = revise(&fixture, base, s, c, Revision::Add("b"), 200).await;
+    let joined = fixture
+        .integrate(base, &[a, b])
+        .await
+        .unwrap()
+        .resulting_view;
+    let b2 = revise(&fixture, base, b, c, Revision::Remove("b"), 300).await;
+
+    let outcome = fixture.integrate(base, &[joined, b2]).await.unwrap();
+
+    assert_eq!(
+        present(&fixture, outcome.resulting_view, &["s", "a", "b"]).await,
+        ["s", "a"]
+    );
+    fixture.validate().await;
+}
+
+/// S = {s}; M adds `e`; X revises M removing `e`; Y revises M adding `y`; Z revises S
+/// adding `z`. The only revision all three share is S, which lacks `e`, so a merge
+/// against it would keep `e` from Y. Merged two at a time, X and Y meet at M and drop
+/// `e`, whatever order their dates put them in.
+#[tokio::test]
+async fn three_revisions_keep_a_removal_two_of_them_share() {
+    let orders: [[i64; 3]; 6] = [
+        [1, 2, 3],
+        [1, 3, 2],
+        [2, 1, 3],
+        [2, 3, 1],
+        [3, 1, 2],
+        [3, 2, 1],
+    ];
+    for [x_at, y_at, z_at] in orders {
+        let fixture = Fixture::new().await;
+        let base = fixture.base;
+        let (c, s) = fixture.create(base, base, "s", b"s").await;
+        let m = revise(&fixture, base, s, c, Revision::Add("e"), 10).await;
+        let x = revise(&fixture, base, m, c, Revision::Remove("e"), 100 * x_at).await;
+        let y = revise(&fixture, base, m, c, Revision::Add("y"), 100 * y_at).await;
+        let z = revise(&fixture, base, s, c, Revision::Add("z"), 100 * z_at).await;
+
+        let outcome = fixture.integrate(base, &[x, y, z]).await.unwrap();
+
+        assert_eq!(
+            present(&fixture, outcome.resulting_view, &["s", "e", "y", "z"]).await,
+            ["s", "y", "z"],
+            "dates {x_at} {y_at} {z_at}"
+        );
+        fixture.validate().await;
+    }
+}
+
+/// A criss-cross: A and B revise S; X1 combines A and B, Y1 combines A, B and C. X
+/// revises X1 removing `a`, Y revises Y1 removing `b`. X and Y share two best bases, A
+/// and B, which merge into the base {s, a, b}: each side's removal holds and each side's
+/// additions stay. The first shared ancestor on one side's line alone is A or B, against
+/// which the other one's removal is lost.
+#[tokio::test]
+async fn criss_crossed_revisions_merge_over_both_bases() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (c, s) = fixture.create(base, base, "s", b"s").await;
+    let a = revise(&fixture, base, s, c, Revision::Add("a"), 100).await;
+    let b = revise(&fixture, base, s, c, Revision::Add("b"), 200).await;
+    let third = revise(&fixture, base, s, c, Revision::Add("c"), 300).await;
+    let x1 = fixture
+        .integrate(base, &[a, b])
+        .await
+        .unwrap()
+        .resulting_view;
+    let y1 = fixture
+        .integrate(base, &[a, b, third])
+        .await
+        .unwrap()
+        .resulting_view;
+    let x = revise(&fixture, base, x1, c, Revision::Add("x"), 400).await;
+    let x = revise(&fixture, base, x, c, Revision::Remove("a"), 410).await;
+    let y = revise(&fixture, base, y1, c, Revision::Add("y"), 500).await;
+    let y = revise(&fixture, base, y, c, Revision::Remove("b"), 510).await;
+
+    let outcome = fixture.integrate(base, &[x, y]).await.unwrap();
+
+    assert_eq!(
+        present(
+            &fixture,
+            outcome.resulting_view,
+            &["s", "a", "b", "c", "x", "y"]
+        )
+        .await,
+        ["s", "c", "x", "y"]
+    );
+    fixture.validate().await;
+}
+
+/// O and R added the same edit `e` on their own; N revises R, removing it. Joining O
+/// with N drops `e`: N's line removed that edit, and O's copy is the same edit
+/// (decision 12 of the label-moves plan).
+#[tokio::test]
+async fn an_edit_one_line_removed_stays_removed_though_another_line_made_it_too() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (c, s) = fixture.create(base, base, "s", b"s").await;
+    let o = revise(&fixture, base, s, c, Revision::Add("e"), 100).await;
+    let r = revise(&fixture, base, s, c, Revision::Add("e"), 200).await;
+    assert_ne!(
+        revision_in(&fixture, o, c).await.id(),
+        revision_in(&fixture, r, c).await.id()
+    );
+    let n = revise(&fixture, base, r, c, Revision::Remove("e"), 300).await;
+
+    let outcome = fixture.integrate(base, &[o, n]).await.unwrap();
+
+    assert_eq!(
+        present(&fixture, outcome.resulting_view, &["s", "e"]).await,
+        ["s"]
+    );
+    fixture.validate().await;
+}
+
+/// Joining two revisions that diverged after a long line of one change's revisions,
+/// beside the line's own tip, reads the revisions from the inputs down to where they
+/// meet, not the line below it.
+#[tokio::test]
+async fn joining_revisions_reads_down_to_where_they_meet() {
+    const LINES: [usize; 2] = [10, 100];
+    let mut reads = Vec::new();
+    for line in LINES {
+        let fixture = Fixture::new().await;
+        let base = fixture.base;
+        let (c, mut tip) = fixture.create(base, base, "s", b"s").await;
+        // Adding and removing one edit in turn keeps every revision small, so only the
+        // number of revisions grows.
+        for index in 0..line {
+            let at = i64::try_from(index).unwrap();
+            let step = if index % 2 == 0 {
+                Revision::Add("t")
+            } else {
+                Revision::Remove("t")
+            };
+            tip = revise(&fixture, base, tip, c, step, at).await;
+        }
+        let left = revise(&fixture, base, tip, c, Revision::Add("left"), 10_000).await;
+        let right = revise(&fixture, base, tip, c, Revision::Add("right"), 20_000).await;
+        fixture.objects.reads.store(0, Ordering::Relaxed);
+        let (_, outcome) = fixture
+            .mutator()
+            .integrate(fixture.head(), base, &[tip, left, right])
+            .await
+            .unwrap();
+        assert_eq!(outcome.combined.len(), 1);
+        reads.push(fixture.objects.reads.load(Ordering::Relaxed));
+    }
+    let added = LINES[1] - LINES[0];
+    assert!(
+        reads[1] < reads[0] + added / 4,
+        "reads grew with the change's history: {reads:?}"
     );
 }

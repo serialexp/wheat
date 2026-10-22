@@ -602,6 +602,10 @@ fn squash_updates_shared_workspace_metadata_without_changing_materialized_files(
         ],
     ));
     materialize(&workspace, &config);
+    fs::write(workspace.join("file"), "two").unwrap();
+    ok(wheat(&workspace, &config, &["add", "--all", "-m", "two"]));
+    // The second workspace holds the latest checkpoint, as the first does; one holding
+    // an earlier one would stop the squash there.
     let second = temp.path().join("second");
     ok(wheat(
         &second,
@@ -613,8 +617,6 @@ fn squash_updates_shared_workspace_metadata_without_changing_materialized_files(
         ],
     ));
     let bytes = fs::read(second.join("file")).unwrap();
-    fs::write(workspace.join("file"), "two").unwrap();
-    ok(wheat(&workspace, &config, &["add", "--all", "-m", "two"]));
     let output = ok(wheat(
         &workspace,
         &config,
@@ -625,5 +627,45 @@ fn squash_updates_shared_workspace_metadata_without_changing_materialized_files(
         2
     );
     assert_eq!(fs::read(second.join("file")).unwrap(), bytes);
+    ok(wheat(&second, &config, &["status"]));
+}
+
+/// Another workspace holds an earlier checkpoint of the line. Collapsing it would erase
+/// what the line did after it, which a later merge with that workspace's work needs, so
+/// the squash keeps it and collapses only the checkpoints after it.
+#[tokio::test]
+async fn squash_stops_at_a_checkpoint_another_workspace_holds() {
+    let (temp, workspace, config) = setup();
+    let (change, [_, _, a3], _) = three_checkpoints(&workspace, &config);
+    let second = temp.path().join("second");
+    ok(wheat(
+        &second,
+        &config,
+        &[
+            "clone",
+            workspace.to_str().unwrap(),
+            second.to_str().unwrap(),
+        ],
+    ));
+    let mut after = Vec::new();
+    for (value, message) in [("four", "A4"), ("five", "A5")] {
+        fs::write(workspace.join("file"), value).unwrap();
+        after.push(field(
+            &ok(wheat(&workspace, &config, &["add", "--all", "-m", message])),
+            "revision ",
+        ));
+    }
+
+    let squashed = json(
+        &workspace,
+        &config,
+        &["--format", "json", "change", "squash", &change],
+    );
+
+    // A4 and A5 became one revision following A3, which the second workspace holds.
+    let replacement = squashed["result"]["revisions"][&after[1]].as_str().unwrap();
+    let replacement = revision(&workspace_store(&workspace), replacement).await;
+    assert_eq!(replacement.predecessor.map(|id| id.to_string()), Some(a3));
+    ok(wheat(&workspace, &config, &["validate"]));
     ok(wheat(&second, &config, &["status"]));
 }

@@ -365,6 +365,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         };
         let Some(budget) = budget else {
             self.check_state_delta(&new, &delta).await?;
+            self.check_combinations(&delta).await?;
             return Ok(report);
         };
         let units = self.budget_units(&delta).await?;
@@ -380,7 +381,22 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             return Err(RepositoryPublicationError::OverBudget { allowance });
         }
         checked?;
+        self.check_combinations(&delta).await?;
         Ok(report)
+    }
+
+    /// Checks each new combined revision is the merge of its parents. A merge may read
+    /// back to a distant base, which what the increment adds says nothing about, so it
+    /// is bounded per revision by a [`crate::MergeBudget`] instead of by the increment's
+    /// allowance.
+    async fn check_combinations(&self, delta: &StateDelta) -> Result<()> {
+        for id in &delta.revisions {
+            let revision = self
+                .revision(RevisionId::from_digest(*id.as_bytes()))
+                .await?;
+            self.check_combination(&revision).await?;
+        }
+        Ok(())
     }
 
     /// The units an increment's budget is sized from: one per object it adds, and one

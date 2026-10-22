@@ -141,6 +141,61 @@ impl History {
         outcome.resulting_view
     }
 
+    /// Revises `change` from `predecessor`, keeping its edits and adding one writing
+    /// `path` (whose content is already stored), committed at `at`.
+    async fn add(
+        &mut self,
+        effective: ViewId,
+        change: ChangeId,
+        predecessor: RevisionId,
+        path: &str,
+        at: i64,
+    ) -> (ViewId, RevisionId) {
+        let mut edits = files(&[(path, None, path.as_bytes())]);
+        for id in self.reader().revision(predecessor).await.unwrap().edits {
+            edits
+                .edits
+                .insert(id, self.reader().edit(id).await.unwrap());
+            edits.transition.preserved.insert(id);
+        }
+        let metadata = RevisionMetadata {
+            committed_at: Timestamp {
+                seconds: at,
+                offset_minutes: 0,
+            },
+            ..RevisionMetadata::default()
+        };
+        let (prepared, outcome) = self
+            .mutator()
+            .revise(
+                self.head(),
+                self.base,
+                effective,
+                change,
+                predecessor,
+                metadata,
+                edits,
+            )
+            .await
+            .unwrap();
+        self.publish(prepared).await;
+        (outcome.resulting_view, outcome.revision_id)
+    }
+
+    /// The published state with `revision` stored and retained.
+    async fn retaining_revision(&self, revision: &RevisionRecord) -> RepositoryStateRecord {
+        self.put(revision.id().into(), &revision.canonical_bytes())
+            .await;
+        let state = self.state().await;
+        RepositoryStateRecord {
+            retained_revisions: RetainedSetStore::new(&self.objects)
+                .insert(state.retained_revisions, revision.id().into())
+                .await
+                .unwrap(),
+            ..state
+        }
+    }
+
     async fn application_in(&self, view: ViewId, change: ChangeId) -> ApplicationRecord {
         let view = self.reader().view(view).await.unwrap();
         let id = ApplicationMapStore::new(&self.objects)
@@ -759,4 +814,148 @@ fn validation_is_send() {
     let reader = RepositoryReader::new(&objects, &content);
     let id = RepositoryEnvelopeId::from_digest([0; 32]);
     send(&reader.validate_increment(id, id, IncrementBudget::STANDARD));
+}
+
+/// Change `0xa0` writes `a`; `left` and `right` revise it adding `x` and `y`, at 100
+/// and 200; `joined` combines them. `later` revises `left` adding `z`, at 300.
+struct Combined {
+    history: History,
+    left: RevisionRecord,
+    right: RevisionRecord,
+    joined: RevisionRecord,
+    later: RevisionRecord,
+}
+
+impl Combined {
+    async fn new() -> Self {
+        let mut history = History::new().await;
+        for bytes in [&b"a"[..], b"x", b"y", b"z"] {
+            history.content.put(bytes).unwrap();
+        }
+        let base = history.base;
+        let c = change(0xa0);
+        let (first, created) = history
+            .create(base, c, &[], files(&[("a", None, b"a")]))
+            .await;
+        let (left_view, left) = history.add(first, c, created, "x", 100).await;
+        let (right_view, right) = history.add(first, c, created, "y", 200).await;
+        let (prepared, outcome) = history
+            .mutator()
+            .integrate(history.head(), base, &[left_view, right_view])
+            .await
+            .unwrap();
+        history.publish(prepared).await;
+        let joined = outcome.combined[&c];
+        let (_, later) = history.add(left_view, c, left, "z", 300).await;
+        let reader = history.reader();
+        let (left, right, joined, later) = (
+            reader.revision(left).await.unwrap(),
+            reader.revision(right).await.unwrap(),
+            reader.revision(joined).await.unwrap(),
+            reader.revision(later).await.unwrap(),
+        );
+        Self {
+            history,
+            left,
+            right,
+            joined,
+            later,
+        }
+    }
+}
+
+/// The transition from `predecessor`'s edits to `edits`.
+fn transition(
+    predecessor: &RevisionRecord,
+    edits: &std::collections::BTreeSet<EditId>,
+) -> EditTransition {
+    EditTransition {
+        preserved: predecessor.edits.intersection(edits).copied().collect(),
+        added: edits.difference(&predecessor.edits).copied().collect(),
+        removed: predecessor.edits.difference(edits).copied().collect(),
+        ..EditTransition::default()
+    }
+}
+
+/// The history the fixture built validates, combined revision included.
+#[tokio::test]
+async fn a_combined_revision_integration_authored_is_valid() {
+    let combined = Combined::new().await;
+    let history = &combined.history;
+    let reader = history.reader();
+    for step in history.envelopes.windows(2) {
+        reader
+            .validate_increment(step[0], step[1], IncrementBudget::STANDARD)
+            .await
+            .unwrap();
+    }
+    reader
+        .validate_bootstrap(history.head().envelope)
+        .await
+        .unwrap();
+    reader
+        .validate_complete(history.state().await.id())
+        .await
+        .unwrap();
+}
+
+/// A combined revision claiming only its predecessor's edits, as if the revision it
+/// combines added nothing. It replays to the predecessor's tree, so only the merge
+/// check can tell.
+#[tokio::test]
+async fn a_combined_revision_dropping_an_inputs_edits_is_refused() {
+    let combined = Combined::new().await;
+    let (left, right) = (&combined.left, &combined.right);
+    let forged = RevisionRecord {
+        predecessor: Some(left.id()),
+        combines: [right.id()].into(),
+        generation: left.generation.max(right.generation) + 1,
+        edits: left.edits.clone(),
+        transition: transition(left, &left.edits),
+        authored_against: left.authored_against,
+        resulting_tree: left.resulting_tree,
+        ..combined.joined.clone()
+    };
+    let state = combined.history.retaining_revision(&forged).await;
+    let reason = combined.history.refusal(state).await;
+    assert!(reason.contains("not the merge"), "{reason}");
+}
+
+/// A combined revision of `left` and its own descendant `later`. Its edits are their
+/// merge, `later`'s, but a revision combining an ancestor would let a later merge read
+/// that ancestor's line as removed again.
+#[tokio::test]
+async fn a_combined_revision_combining_its_own_ancestor_is_refused() {
+    let combined = Combined::new().await;
+    let (left, later) = (&combined.left, &combined.later);
+    let forged = RevisionRecord {
+        predecessor: Some(left.id()),
+        combines: [later.id()].into(),
+        generation: later.generation + 1,
+        edits: later.edits.clone(),
+        transition: transition(left, &later.edits),
+        authored_against: later.authored_against,
+        resulting_tree: later.resulting_tree,
+        ..combined.joined.clone()
+    };
+    let state = combined.history.retaining_revision(&forged).await;
+    let reason = combined.history.refusal(state).await;
+    assert!(reason.contains("descend from one another"), "{reason}");
+}
+
+/// The combination of `left` and `right` recorded as following `right`, the later one.
+#[tokio::test]
+async fn a_combined_revision_following_a_later_input_is_refused() {
+    let combined = Combined::new().await;
+    let (left, right, joined) = (&combined.left, &combined.right, &combined.joined);
+    assert_eq!(joined.predecessor, Some(left.id()));
+    let forged = RevisionRecord {
+        predecessor: Some(right.id()),
+        combines: [left.id()].into(),
+        transition: transition(right, &joined.edits),
+        ..joined.clone()
+    };
+    let state = combined.history.retaining_revision(&forged).await;
+    let reason = combined.history.refusal(state).await;
+    assert!(reason.contains("earliest"), "{reason}");
 }

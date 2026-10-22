@@ -30,6 +30,11 @@ pub enum RepositoryPublicationError {
         "checking the increment needs more than the {allowance} object reads its budget allows"
     )]
     OverBudget { allowance: u64 },
+    #[error("merging the revisions of change {change} needs more {limit} than its budget allows")]
+    MergeOverBudget {
+        change: wheat_core::ChangeId,
+        limit: &'static str,
+    },
     #[error(transparent)]
     Collection(#[from] crate::CollectionError),
     #[error(transparent)]

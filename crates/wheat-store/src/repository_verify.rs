@@ -728,6 +728,7 @@ where
                 .await?;
             self.tree(revision.resulting_tree, aggregate).await?;
             self.checks().revision(&revision).await?;
+            self.reader.check_combination(&revision).await?;
         }
         (self.observer)(RepositoryValidationPhase::VerifyApplications);
         let mut cursor = retained.cursor(state.retained_applications).await?;

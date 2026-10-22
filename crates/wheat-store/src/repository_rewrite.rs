@@ -109,6 +109,12 @@ pub enum RepositoryRewriteError {
     InvalidBoundary,
     #[error("rewrite boundary is the selected current revision")]
     BoundaryIsCurrent,
+    /// A combined revision's edits are exactly the merge of the revisions it combines,
+    /// which validation checks, so a rewrite never collapses one.
+    #[error("rewrite would collapse a revision that combines others")]
+    CollapsesCombinedRevision,
+    #[error("the line a squash would collapse has more than {limit} revisions")]
+    LineTooLong { limit: usize },
     #[error("rewrite metadata is missing for a collapsed change")]
     MissingMetadata,
     #[error("collapsed revision evidence cannot be represented without losing provenance")]
@@ -697,20 +703,107 @@ async fn validate_boundary<O: ImmutableObjectStore>(
     current: RevisionId,
     boundary: Option<RevisionId>,
 ) -> Result<()> {
-    let Some(wanted) = boundary else {
-        return Ok(());
-    };
-    if wanted == current {
+    if boundary == Some(current) {
         return Err(RepositoryRewriteError::BoundaryIsCurrent);
     }
-    let mut at = reader.revision(current).await?.predecessor;
+    let mut at = Some(current);
     while let Some(id) = at {
-        if id == wanted {
+        if Some(id) == boundary {
             return Ok(());
         }
-        at = reader.revision(id).await?.predecessor;
+        let record = reader.revision(id).await?;
+        if !record.combines.is_empty() {
+            return Err(RepositoryRewriteError::CollapsesCombinedRevision);
+        }
+        at = record.predecessor;
     }
-    Err(RepositoryRewriteError::InvalidBoundary)
+    if boundary.is_some() {
+        return Err(RepositoryRewriteError::InvalidBoundary);
+    }
+    Ok(())
+}
+
+/// What a squash of one change's line keeps besides its latest revision.
+#[derive(Clone, Copy, Debug)]
+pub struct SquashStops<'s> {
+    /// The change's revision in the workspace's basis.
+    pub basis: Option<RevisionId>,
+    /// A retained-revision set whose members stay, such as the observed remote state's.
+    pub published: Option<RetainedSetId>,
+    /// The change's revisions in the other views that stay retained: other workspaces'
+    /// views, labels.
+    pub held: &'s [RevisionId],
+}
+
+impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
+    /// The predecessor a squash of the line ending at `latest` collapses onto: the
+    /// latest revision on its predecessor chain that is the basis's, is published,
+    /// combines revisions, or is a branch point, one a held revision descends from.
+    /// Collapsing a branch point would erase the removals a later merge with the line
+    /// branching off it needs. `None` collapses the whole line; `Some(latest)`, nothing.
+    ///
+    /// Reads the line down to the boundary, and from each held revision the revisions
+    /// no lower than the line's lowest generation.
+    pub async fn squash_boundary(
+        &self,
+        latest: RevisionId,
+        stops: SquashStops<'_>,
+        max_revisions: usize,
+    ) -> Result<Option<RevisionId>> {
+        let retained = RetainedSetStore::new(self.objects);
+        // The revisions a squash may collapse, by their generation.
+        let mut line = BTreeMap::new();
+        let mut at = latest;
+        let stop = loop {
+            if Some(at) == stops.basis {
+                break Some(at);
+            }
+            if let Some(published) = stops.published
+                && retained.contains(published, at.into()).await?
+            {
+                break Some(at);
+            }
+            let record = self.revision(at).await?;
+            if !record.combines.is_empty() {
+                break Some(at);
+            }
+            if line.len() >= max_revisions {
+                return Err(RepositoryRewriteError::LineTooLong {
+                    limit: max_revisions,
+                });
+            }
+            line.insert(at, record.generation);
+            match record.predecessor {
+                Some(predecessor) => at = predecessor,
+                None => break None,
+            }
+        };
+        let Some(lowest) = line.values().min().copied() else {
+            return Ok(stop);
+        };
+        let mut branch: Option<(u64, RevisionId)> = None;
+        for held in stops.held {
+            if *held == latest {
+                continue;
+            }
+            let mut pending = vec![*held];
+            let mut seen = BTreeSet::new();
+            while let Some(id) = pending.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                if let Some(generation) = line.get(&id) {
+                    branch = branch.max(Some((*generation, id)));
+                    continue;
+                }
+                let record = self.revision(id).await?;
+                if record.generation > lowest {
+                    pending.extend(record.predecessor.iter().chain(&record.combines));
+                }
+            }
+        }
+        Ok(branch.map(|(_, id)| Some(id)).unwrap_or(stop))
+    }
 }
 
 /// Composes the transition evidence of a collapsed checkpoint suffix into the evidence that is

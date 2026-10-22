@@ -32,6 +32,7 @@ mod packed_append;
 mod publish_content;
 mod publish_contention;
 mod remote_latency;
+mod revision_merge;
 mod server;
 mod sharded_manifest;
 mod snapshot_export;
@@ -63,6 +64,7 @@ pub const CASES: &[&str] = &[
     add_scale::NAME,
     transition_validate::NAME,
     increment_validate::NAME,
+    revision_merge::NAME,
     bootstrap_validate::NAME,
     packed_append::NAME,
     content_repack_plan::NAME,
@@ -219,6 +221,7 @@ pub fn run_case(
         add_scale::NAME => add_scale::run(&context),
         transition_validate::NAME => transition_validate::run(&context),
         increment_validate::NAME => increment_validate::run(&context),
+        revision_merge::NAME => revision_merge::run(&context),
         bootstrap_validate::NAME => bootstrap_validate::run(&context),
         packed_append::NAME => packed_append::run(&context),
         content_repack_plan::NAME => content_repack_plan::run(&context),

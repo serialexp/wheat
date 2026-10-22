@@ -8,11 +8,11 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use wheat_core::{ChangeId, ObjectId, RevisionId, Timestamp, ViewId};
+use wheat_core::{ChangeId, RevisionId, Timestamp, ViewId};
 use wheat_store::{
     BatchObjectStore, ChangeMapStore, ConflictSetStore, ImmutableObjectStore, PublicationStore,
-    RepositoryHead, RepositoryReader, RepositoryRewriter, RetainedSetStore, RevisionMapStore,
-    SquashRewriteRequest, finalize_repository_rewrite,
+    RepositoryHead, RepositoryReader, RepositoryRewriter, RevisionMapStore, SquashRewriteRequest,
+    SquashStops, finalize_repository_rewrite,
 };
 
 use crate::{
@@ -269,39 +269,6 @@ async fn plan<O: ImmutableObjectStore>(
     let published_root = published_state
         .as_ref()
         .map(|state| state.retained_revisions);
-    let retained = RetainedSetStore::new(objects);
-    let mut predecessors = BTreeMap::new();
-    let mut metadata = BTreeMap::new();
-    let mut rewritten = Vec::new();
-    for change in selected {
-        let latest = revisions[&change];
-        let boundary = if let Some(root) = published_root {
-            first_retained_predecessor(&reader, &retained, root, latest).await?
-        } else {
-            basis_revisions.get(&change).copied()
-        };
-        if boundary == Some(latest) {
-            continue;
-        }
-        let records = suffix(&reader, latest, boundary).await?;
-        if records.len() <= 1 {
-            continue;
-        }
-        // `suffix` walks back from the latest checkpoint; attribution folds oldest first.
-        let oldest_first = records
-            .iter()
-            .rev()
-            .map(|(_, record)| &record.metadata)
-            .collect::<Vec<_>>();
-        let replacement = attributed_squash_metadata(&oldest_first, actor, now, coauthors)?;
-        predecessors.insert(change, boundary);
-        metadata.insert(change, replacement);
-        rewritten.push(change);
-    }
-    if predecessors.is_empty() {
-        return Ok(None);
-    }
-
     let mut workspaces = Vec::new();
     let mut roots = BTreeSet::new();
     for (root, metadata) in rewrite_transaction::preflight_workspaces(store_root)? {
@@ -331,6 +298,48 @@ async fn plan<O: ImmutableObjectStore>(
     roots.extend(labels.labels.values().map(|label| label.view));
     roots.insert(state.base_view);
     roots.insert(invoking.effective_view());
+    // The views that stay retained hold the lines a squash must not cut.
+    let mut held_views = Vec::with_capacity(roots.len());
+    for root in &roots {
+        held_views.push(reader.view(*root).await?.revisions);
+    }
+    let maps = RevisionMapStore::new(objects);
+    let mut predecessors = BTreeMap::new();
+    let mut metadata = BTreeMap::new();
+    let mut rewritten = Vec::new();
+    for change in selected {
+        let latest = revisions[&change];
+        let mut held = Vec::with_capacity(held_views.len());
+        for map in &held_views {
+            held.extend(maps.get(*map, change).await?);
+        }
+        let stops = SquashStops {
+            basis: basis_revisions.get(&change).copied(),
+            published: published_root,
+            held: &held,
+        };
+        let boundary = reader.squash_boundary(latest, stops, MAX_REVISIONS).await?;
+        if boundary == Some(latest) {
+            continue;
+        }
+        let records = suffix(&reader, latest, boundary).await?;
+        if records.len() <= 1 {
+            continue;
+        }
+        // `suffix` walks back from the latest checkpoint; attribution folds oldest first.
+        let oldest_first = records
+            .iter()
+            .rev()
+            .map(|(_, record)| &record.metadata)
+            .collect::<Vec<_>>();
+        let replacement = attributed_squash_metadata(&oldest_first, actor, now, coauthors)?;
+        predecessors.insert(change, boundary);
+        metadata.insert(change, replacement);
+        rewritten.push(change);
+    }
+    if predecessors.is_empty() {
+        return Ok(None);
+    }
 
     Ok(Some((
         SquashRewriteRequest {
@@ -394,23 +403,6 @@ async fn collect_revisions<O: ImmutableObjectStore>(
         out.insert(change, revision);
     }
     Ok(out)
-}
-
-async fn first_retained_predecessor<O: ImmutableObjectStore>(
-    reader: &RepositoryReader<'_, O>,
-    retained: &RetainedSetStore<'_, O>,
-    root: wheat_core::RetainedSetId,
-    mut revision: RevisionId,
-) -> Result<Option<RevisionId>> {
-    loop {
-        if retained.contains(root, ObjectId::from(revision)).await? {
-            return Ok(Some(revision));
-        }
-        match reader.revision(revision).await?.predecessor {
-            Some(previous) => revision = previous,
-            None => return Ok(None),
-        }
-    }
 }
 
 async fn suffix<O: ImmutableObjectStore>(
