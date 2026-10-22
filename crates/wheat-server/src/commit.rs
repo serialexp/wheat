@@ -20,9 +20,9 @@ use tokio::sync::{Mutex, oneshot};
 use tracing::{Instrument as _, debug_span, warn};
 use wheat_core::{PublishReceiptRecord, RepositoryEnvelopeId};
 use wheat_store::{
-    ImmutableObjectStore, PendingPublications, PublicationError, PublicationStore, RepositoryHead,
-    RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
-    RepositoryStoreError, RepositoryUnionError, StagedPublication, TransitionValidationOptions,
+    Arrival, ImmutableObjectStore, PendingPublications, PublicationError, PublicationStore,
+    RepositoryHead, RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
+    RepositoryStoreError, RepositoryUnionError, StagedPublication,
 };
 
 use crate::receipt::{PublishKey, Recorded};
@@ -553,8 +553,9 @@ fn unix_seconds() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// Checks that `to` may follow `from`. The outer error is a failure to read either
-/// envelope; the inner one says why the transition is invalid.
+/// Checks that `to` may follow `from`: what it adds, or the whole of it when forced.
+/// The outer error is a failure to read the current envelope; the inner one says why
+/// `to` is invalid.
 #[tracing::instrument(name = "publish_validate", level = "debug", skip_all)]
 async fn validate<O: ImmutableObjectStore>(
     reader: &RepositoryReader<'_, O>,
@@ -562,18 +563,14 @@ async fn validate<O: ImmutableObjectStore>(
     to: RepositoryEnvelopeId,
     force: bool,
 ) -> Result<Result<(), RepositoryPublicationError>, String> {
-    let from = reader
+    reader
         .envelope(from)
         .await
         .map_err(|e| format!("publish: read the current envelope: {e}"))?;
-    let to = reader
-        .envelope(to)
-        .await
-        .map_err(|e| format!("publish: read the joined envelope: {e}"))?;
-    let options = TransitionValidationOptions {
-        allow_non_monotonic: force,
+    let arrival = if force {
+        Arrival::Forced
+    } else {
+        Arrival::Extends(from)
     };
-    Ok(reader
-        .validate_transition_with_options(from.state, to.state, options)
-        .await)
+    Ok(reader.validate_arrival(to, arrival).await)
 }

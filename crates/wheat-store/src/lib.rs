@@ -30,7 +30,7 @@ mod content_io;
 mod delta;
 mod durability;
 mod increment_validation;
-pub use increment_validation::{IncrementBudget, IncrementReport};
+pub use increment_validation::{Arrival, IncrementBudget, IncrementReport};
 mod loose;
 mod merkle_tree;
 mod metadata_repack;

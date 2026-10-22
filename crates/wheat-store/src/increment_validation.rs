@@ -55,6 +55,21 @@ pub struct IncrementReport {
     pub budget_spent: u64,
 }
 
+/// What an envelope arriving at a trust boundary (publish, fetch, clone) is validated
+/// against, which decides how [`RepositoryReader::validate_arrival`] checks it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Arrival {
+    /// An ordinary publish or fetch: the new envelope extends this trusted one, and
+    /// only what it adds is checked, within [`IncrementBudget::STANDARD`].
+    Extends(RepositoryEnvelopeId),
+    /// A clone, or a fetch into a store with no trusted envelope of the remote:
+    /// everything is new and checked as an increment from the base view.
+    Bootstrap,
+    /// A forced publish or fetch, which may remove history, so nothing unchanged can be
+    /// trusted to still hold: full validation and every label.
+    Forced,
+}
+
 /// How many object reads checking an increment may take, relative to what it adds.
 ///
 /// A unit is one object the increment adds (change, view, revision, application,
@@ -266,6 +281,27 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         RepositoryReader::new(&cached, self.content)
             .bootstrap(new)
             .await
+    }
+
+    /// Validates envelope `new` as `arrival` says: see [`Arrival`].
+    pub async fn validate_arrival(
+        &self,
+        new: RepositoryEnvelopeId,
+        arrival: Arrival,
+    ) -> Result<()> {
+        match arrival {
+            Arrival::Extends(old) => {
+                self.validate_increment(old, new, IncrementBudget::STANDARD)
+                    .await?;
+            }
+            Arrival::Bootstrap => {
+                self.validate_bootstrap(new).await?;
+            }
+            Arrival::Forced => {
+                self.validate_envelope(new).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn bootstrap(&self, new: RepositoryEnvelopeId) -> Result<IncrementReport> {

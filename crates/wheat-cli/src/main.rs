@@ -18,7 +18,7 @@ use wheat_core::{
     ViewId, guarded::Limits,
 };
 use wheat_store::{
-    ApplicationMapStore, BatchObjectStore, ImmutableObjectStore, MerkleTreeStore,
+    ApplicationMapStore, Arrival, BatchObjectStore, ImmutableObjectStore, MerkleTreeStore,
     PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
     RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
 };
@@ -2789,6 +2789,12 @@ fn native_clone(
         let content_count = remote::fetch_content(&mut session, 2, &staged, state.envelope, None)
             .await?
             .fetched;
+        // Nothing here is trusted yet, so the whole head is checked before the store
+        // keeps it.
+        RepositoryReader::new(&staged, staged.content())
+            .validate_arrival(state.envelope, Arrival::Bootstrap)
+            .await
+            .context("the remote's head failed validation")?;
         staged.flush().await?;
 
         write_stderr(format_args!(
@@ -2947,6 +2953,27 @@ fn native_fetch(
     // remote lacks. It is kept: the new head joins it with the remote's history,
     // and labels merge against the last fetch. --force takes the remote as it is.
     let kept_local = !arguments.force && local_head.envelope != last_fetched.envelope;
+    if remote_moved {
+        // The last fetched envelope was validated when it arrived, so only what the
+        // remote added since needs checking; without one here, all of it does. A
+        // forced fetch may take a history that lost something, so it is checked whole.
+        let arrival = if arguments.force {
+            Arrival::Forced
+        } else {
+            since.map_or(Arrival::Bootstrap, Arrival::Extends)
+        };
+        rt.block_on(
+            RepositoryReader::new(&staged, staged.content())
+                .validate_arrival(remote_state.envelope, arrival),
+        )
+        .with_context(|| match arrival {
+            Arrival::Extends(_) => {
+                "the remote's head failed validation; if its history was rewritten by a \
+                 forced publish, `wheat fetch --force` takes it as it is"
+            }
+            Arrival::Bootstrap | Arrival::Forced => "the remote's head failed validation",
+        })?;
+    }
     let envelope = if arguments.force {
         remote_state.envelope
     } else if !remote_moved {
@@ -3188,6 +3215,12 @@ fn native_publish(
                 let since = Some(local_head.envelope);
                 remote::fetch_objects(&mut session, 2, &staged, new_envelope, since).await?;
                 remote::fetch_content(&mut session, 3, &staged, new_envelope, since).await?;
+                // The local head is this store's own, so only what the join added to
+                // it needs checking.
+                RepositoryReader::new(&staged, staged.content())
+                    .validate_arrival(new_envelope, Arrival::Extends(local_head.envelope))
+                    .await
+                    .context("the joined head failed validation")?;
                 staged.flush().await?;
                 true
             }

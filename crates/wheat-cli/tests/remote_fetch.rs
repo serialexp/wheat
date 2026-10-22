@@ -8,7 +8,7 @@ mod remote_support;
 use std::fs;
 use std::path::Path;
 
-use remote_support::{fails, git, ok, ok_json, serve, write_config};
+use remote_support::{fails, git, ok, ok_json, serve, serve_store, workspace_store, write_config};
 
 const COMMITS: usize = 80;
 
@@ -360,4 +360,130 @@ fn a_label_moved_on_both_sides_stops_the_fetch() {
         "{refused}"
     );
     assert!(refused.contains("shared"), "{refused}");
+}
+
+/// Points the head of `store` at a forged state: its own, except that the retained
+/// changes leave out the changes its change map names.
+fn forge_unretained_changes(store: &Path) {
+    use wheat_core::RepositoryEnvelopeRecord;
+    use wheat_store::{
+        ImmutableObjectStore, LocalPublicationStore, PackedObjectStore, PublicationStore,
+        RepositoryReader, RetainedSetStore,
+    };
+
+    let heads = LocalPublicationStore::new(store.join("repository.head"));
+    let objects = PackedObjectStore::open(store.join("storage")).unwrap();
+    let content = objects.content_store();
+    let reader = RepositoryReader::new(&objects, &content);
+    let head = heads.read().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let forged = runtime.block_on(async {
+        let envelope = reader.envelope(head.envelope).await.unwrap();
+        let mut state = reader.state(envelope.state).await.unwrap();
+        state.retained_changes = RetainedSetStore::new(&objects).empty_root().await.unwrap();
+        objects
+            .put_if_absent(state.id().into(), &state.canonical_bytes())
+            .await
+            .unwrap();
+        let forged = RepositoryEnvelopeRecord {
+            state: state.id(),
+            labels: envelope.labels,
+        };
+        objects
+            .put_if_absent(forged.id().into(), &forged.canonical_bytes())
+            .await
+            .unwrap();
+        forged.id()
+    });
+    heads
+        .compare_and_advance(head, head.next(forged).unwrap())
+        .unwrap();
+}
+
+/// Nothing a clone receives is trusted, so it checks the whole head before keeping it.
+#[test]
+fn a_clone_refuses_a_forged_head() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server_stores = root.join("server-stores");
+    let source = root.join("source");
+    ok(
+        root,
+        &server_stores,
+        &config,
+        &["init", source.to_str().unwrap()],
+    );
+    add_change(&source, &server_stores, &config, "forged");
+    let store = workspace_store(&source);
+    forge_unretained_changes(&store);
+    let server = serve_store(&store);
+
+    let reader = root.join("reader");
+    let refused = fails(
+        root,
+        &root.join("reader-stores"),
+        &config,
+        &["clone", &server.url, reader.to_str().unwrap()],
+    );
+    assert!(
+        refused.contains("the remote's head failed validation"),
+        "{refused}"
+    );
+}
+
+/// A forced publish can drop history a reader already fetched. A fetch checks only
+/// what the remote added to its last fetch, so it refuses the rewritten head and says
+/// how to take it; `--force` checks the whole head and takes it.
+#[test]
+fn a_fetch_refuses_a_rewritten_remote_unless_forced() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server = serve(root, &config);
+    let clone = |name: &str| {
+        let stores = root.join(format!("{name}-stores"));
+        let workspace = root.join(name);
+        ok(
+            root,
+            &stores,
+            &config,
+            &["clone", &server.url, workspace.to_str().unwrap()],
+        );
+        (workspace, stores)
+    };
+    let (writer, writer_stores) = clone("writer");
+    let (reader, reader_stores) = clone("reader");
+    add_change(&writer, &writer_stores, &config, "dropped");
+    ok(&writer, &writer_stores, &config, &["publish"]);
+    ok(&reader, &reader_stores, &config, &["fetch"]);
+
+    // An unrelated history, which lacks the reader's fetched change, replaces it.
+    let other_stores = root.join("other-stores");
+    let other = root.join("other");
+    ok(
+        root,
+        &other_stores,
+        &config,
+        &["init", other.to_str().unwrap()],
+    );
+    add_change(&other, &other_stores, &config, "kept");
+    ok(
+        &other,
+        &other_stores,
+        &config,
+        &["publish", "--remote", &server.url, "--force"],
+    );
+
+    let refused = fails(&reader, &reader_stores, &config, &["fetch"]);
+    assert!(
+        refused.contains("the remote's head failed validation"),
+        "{refused}"
+    );
+    assert!(refused.contains("wheat fetch --force"), "{refused}");
+    let forced = ok_json(&reader, &reader_stores, &config, &["fetch", "--force"]);
+    assert_eq!(forced["up_to_date"], false, "{forced}");
+    ok(&reader, &reader_stores, &config, &["validate"]);
 }
