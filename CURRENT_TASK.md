@@ -103,10 +103,8 @@ format changes in between, so not this change alone): server CPU per publish
 unchanged, catch-up fetch 74 → 102 ms, revise fetch 96 → 114 ms, one-change fetches
 unchanged.
 
-Step 9 (2026-10-22): done in 314e786, except the Git push hunks in
-`crates/wheat-cli/src/main.rs` (`push`, `push_tag`: `envelope` + `retained_view`
-instead of `validate_envelope`). They sit in the working tree beside @calm-lynx's
-uncommitted main.rs edits; @calm-lynx commits main.rs whole. Release
+Step 9 (2026-10-22): done in 314e786; the Git push part (`push`, `push_tag` in
+`crates/wheat-cli/src/main.rs`) went in with @calm-lynx's f8a96ae. Release
 `git_pull_incremental` (with the push hunks): late pull 2.1 → 0.27 s, late push
 2.1 → 0.24 s (results `20261022-012352-d9b1799c7754.tsv`). Next: step 10
 (benchmarks, docs, TODO bookkeeping; restate the read contract as logarithmic),
