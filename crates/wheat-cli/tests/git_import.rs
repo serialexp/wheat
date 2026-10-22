@@ -25,10 +25,13 @@ fn git(directory: Option<&Path>, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
+/// Runs `wheat` with its stores in `store_home`, a directory inside the test's
+/// temporary directory, and its configuration beside it.
 fn wheat(store_home: &Path, arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_wheat"))
         .args(arguments)
         .env("WHEAT_STORE_HOME", store_home)
+        .env("XDG_CONFIG_HOME", store_home.with_file_name("config"))
         .output()
         .unwrap()
 }
@@ -275,7 +278,7 @@ fn import_trace_must_be_a_fresh_file_before_import_changes_state() {
 #[test]
 fn import_help_documents_trace_path() {
     let root = tempfile::tempdir().unwrap();
-    let help = wheat(root.path(), &["import", "--help"]);
+    let help = wheat(&root.path().join("stores"), &["import", "--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("--trace <PATH>"));
 }

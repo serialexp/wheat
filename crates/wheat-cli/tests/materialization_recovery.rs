@@ -752,6 +752,7 @@ fn interrupted_directory_to_file_transition_recovers_structurally() {
         let interrupted = Command::new(env!("CARGO_BIN_EXE_wheat"))
             .args(["--workspace", workspace.to_str().unwrap(), "materialize"])
             .env("WHEAT_STORE_HOME", &stores)
+            .env("XDG_CONFIG_HOME", test_config(&stores))
             .env("WHEAT_TEST_MATERIALIZATION_FAIL_AFTER", checkpoint)
             .env("WHEAT_TEST_MATERIALIZATION_FAIL_MODE", "sigkill")
             .output()
@@ -852,6 +853,7 @@ fn recovery_truncates_corrupt_final_full_width_progress_record() {
             "feature",
         ])
         .env("WHEAT_STORE_HOME", &stores)
+        .env("XDG_CONFIG_HOME", test_config(&stores))
         .env("WHEAT_TEST_MATERIALIZATION_FAIL_AFTER", "intent-persisted")
         .env("WHEAT_TEST_MATERIALIZATION_FAIL_MODE", "sigkill")
         .output()
@@ -934,6 +936,7 @@ fn interrupted_rematerialization_recovers_exchange_and_deletion() {
                 "feature",
             ])
             .env("WHEAT_STORE_HOME", &stores)
+            .env("XDG_CONFIG_HOME", test_config(&stores))
             .env("WHEAT_TEST_MATERIALIZATION_FAIL_AFTER", checkpoint)
             .env(
                 "WHEAT_TEST_MATERIALIZATION_FAIL_OCCURRENCE",

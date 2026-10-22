@@ -287,6 +287,13 @@ fn diff_recovers_an_interrupted_workspace_operation_before_scanning() {
             )),
         )
         .env(
+            "XDG_CONFIG_HOME",
+            dir.path().parent().unwrap().join(format!(
+                ".{}-test-config",
+                dir.path().file_name().unwrap().to_string_lossy()
+            )),
+        )
+        .env(
             "WHEAT_TEST_MATERIALIZATION_FAIL_AFTER",
             "completion-persisted",
         )

@@ -13,6 +13,8 @@ fn every_invocation_fails_before_side_effects_on_unsupported_platforms() {
             "init",
             workspace.to_str().expect("temporary path is UTF-8"),
         ])
+        .env("WHEAT_STORE_HOME", root.path().join("stores"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
         .output()
         .unwrap();
 
