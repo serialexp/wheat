@@ -190,12 +190,16 @@ fn revision_map_nodes_enforce_prefix_terminal_and_unique_edges() {
 
 #[test]
 fn directory_nodes_reject_non_components() {
-    for invalid in ["", ".", "..", "nested/file", "nul\0name"] {
+    let too_long = "n".repeat(wheat_core::MAX_DIRECTORY_COMPONENT_BYTES + 1);
+    for invalid in ["", ".", "..", "nested/file", "nul\0name", &too_long] {
         assert!(matches!(
             DirectoryNode::new([(invalid.to_owned(), DirectoryEntry::File(content("value")))]),
             Err(CanonicalObjectError::InvalidDirectoryComponent(name)) if name == invalid
         ));
     }
+    // The limit counts bytes, not characters: 85 three-byte characters fit.
+    let longest = "語".repeat(wheat_core::MAX_DIRECTORY_COMPONENT_BYTES / 3);
+    assert!(DirectoryNode::new([(longest, DirectoryEntry::File(content("value")))]).is_ok());
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use std::{path::Path, process::Command};
 
-use wheat_core::{EditOperation, FileKind};
+use wheat_core::{CanonicalObjectError, EditOperation, FileKind, edit_capture::EditCaptureError};
 use wheat_git::{
     ImportError, ImportLimit, ImportLimits, import_repository, import_repository_with_limits,
 };
@@ -339,4 +339,36 @@ impl ImportedCommitExt for wheat_git::ImportedCommit {
             .unwrap()
             .dependencies()
     }
+}
+
+#[test]
+fn import_rejects_a_name_longer_than_a_wheat_component() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "-b", "main"]);
+    std::fs::write(directory.path().join("blob"), b"one").unwrap();
+    let blob = git(directory.path(), &["hash-object", "-w", "blob"]);
+    let name = "n".repeat(wheat_core::MAX_DIRECTORY_COMPONENT_BYTES + 1);
+    let listing = directory.path().join("listing");
+    std::fs::write(&listing, format!("100644 blob {blob}\t{name}\n")).unwrap();
+    let tree = Command::new("git")
+        .arg("-C")
+        .arg(directory.path())
+        .arg("mktree")
+        .stdin(std::fs::File::open(&listing).unwrap())
+        .output()
+        .unwrap();
+    assert!(tree.status.success());
+    let tree = String::from_utf8(tree.stdout).unwrap().trim().to_owned();
+    let commit = git(directory.path(), &["commit-tree", &tree, "-m", "long"]);
+    git(
+        directory.path(),
+        &["update-ref", "refs/heads/main", &commit],
+    );
+    let content_dir = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        import_repository(directory.path(), &ContentStore::new(content_dir.path())),
+        Err(ImportError::EditCapture(EditCaptureError::InvalidPath(
+            CanonicalObjectError::InvalidDirectoryComponent(component)
+        ))) if component == name
+    ));
 }
