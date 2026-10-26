@@ -400,6 +400,8 @@
         { name: "expected_generation", type: "varlength", encoding: "leb128_canonical" },
         { name: "expected_envelope", type: "Digest256" },
         { name: "force", type: "bool" },
+        // Moves labels to views that are not forward from where they were.
+        { name: "force_labels", type: "bool" },
       ],
     },
 

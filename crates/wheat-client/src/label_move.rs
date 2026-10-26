@@ -29,19 +29,8 @@ impl MoveRefusal {
     /// One sentence for each reason, naming label `name` and the target view `to`.
     pub fn describe(&self, name: &str, to: ViewId) -> String {
         let mut reasons = Vec::new();
-        match self.not_forward {
-            Some(NotForward::Missing { change }) => reasons.push(format!(
-                "view {to} lacks change {change}, which label {name} holds"
-            )),
-            Some(NotForward::Diverged {
-                change,
-                edits_added,
-                edits_dropped,
-            }) => reasons.push(format!(
-                "label {name}'s revision of change {change} is not in view {to}: merging it \
-                 would add {edits_added} and drop {edits_dropped} edits"
-            )),
-            None => {}
+        if let Some(not_forward) = self.not_forward {
+            reasons.push(not_forward.describe(name, to));
         }
         if !self.left_behind.is_empty() {
             let views = self

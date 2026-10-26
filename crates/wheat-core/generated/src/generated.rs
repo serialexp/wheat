@@ -7987,6 +7987,7 @@ pub struct PublishRequestInputV1 {
     pub expected_generation: u64,
     pub expected_envelope: Digest256,
     pub force: bool,
+    pub force_labels: bool,
 }
 
 impl PublishRequestInputV1 {
@@ -8001,6 +8002,7 @@ impl PublishRequestInputV1 {
         encoder.write_u64_be(self.expected_generation);
         self.expected_envelope.encode_into(encoder)?;
         encoder.write_byte(if self.force { 1 } else { 0 });
+        encoder.write_byte(if self.force_labels { 1 } else { 0 });
         Ok(())
     }
 
@@ -8014,11 +8016,13 @@ impl PublishRequestInputV1 {
         let expected_generation = decoder.read_u64_be()?;
         let expected_envelope = Digest256::decode_with_decoder(decoder)?;
         let force = decoder.read_byte()? != 0;
+        let force_labels = decoder.read_byte()? != 0;
         Ok(Self {
             envelope,
             expected_generation,
             expected_envelope,
             force,
+            force_labels,
         })
     }
 }

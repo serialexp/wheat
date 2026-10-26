@@ -214,10 +214,10 @@ both lists.
   identity, shared-store creation/list/detach, operation locks, and content pins are
   implemented. Still define user-facing integration when two workspaces advance
   independent frontiers and the remote synchronization policy around that state.
-- [~] **Label advancement and frontier consolidation.** Planned in
+- [x] **Label advancement and frontier consolidation.** Planned in
   `docs/design/wheat-label-moves.md` (2026-10-15). `wheat label move`, `integrate`,
-  `pull` and `refresh` move labels and `fetch` takes remote moves (2026-10-26);
-  `publish` moving the label and the server's label checks remain.
+  `pull`, `refresh` and `publish` move labels, `fetch` takes remote moves, and the
+  server takes a label only forward unless the publish forces labels (2026-10-26).
 - [ ] **Open question — staging semantics.** Decide whether Wheat needs a
   persistent index-like state or whether explicit change/revision capture makes
   one unnecessary.
@@ -877,6 +877,16 @@ is refused (`label_move_refused`) unless `--keep-label` or `--force`. `pull` is
 when the label's view does not cover the workspace's, and otherwise switches to the
 label as before. The JSON of all three gains `label_moved` (`{from, to}` or null).
 
+`publish` moves the active label to the workspace's effective view before it sends
+anything, under the checks `label move` makes, and rebinds the workspace the same
+way; the published envelope carries the move. A move that would not be forward or
+would leave frontiers behind refuses the publish with nothing sent. `--keep-label`
+publishes without moving the label; `--force-label` moves it anyway and lets the
+server take a backward move (the request's `force_labels`, which needs `force`
+access); `--force` still only replaces the remote head. A publish the server refuses
+keeps the local move, says so, and the next `pull` reconciles it through the fetch
+rule. The JSON gains `label_moved` (`{from, label}` or null).
+
 A fetch takes the remote's label moves and deletions (and settles a label both sides
 moved with the forward check) unless that would hide local work no workspace shows:
 for a move, the frontiers of the label's local view that the new view does not cover
@@ -885,8 +895,7 @@ local view's descendant frontiers. Such a fetch is refused (`unresolved_conflict
 naming the label and the views; switching a workspace to them, or integrating them,
 lets it through.
 
-Label advancement and consolidation of multiple frontiers are explicit deferred
-work. When designed, stack editing and integration should expose dependency
+Stack editing and integration should expose dependency
 changes and application outcomes directly. Revising the bottom of `A -> B -> C`
 should show new applications of descendants without pretending that old revisions
 ceased to exist. Combining independent tips requires an explicit integration/join

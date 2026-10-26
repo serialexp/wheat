@@ -643,6 +643,19 @@ size for `just test`; release run; results under `bench/results/`.
    **Store part done 2026-10-26**: `RepositoryReader::backward_label(old, new,
    budget)` names the first label `new` moved to a view not forward from `old`'s
    (`BackwardLabel`), for `commit.rs` to refuse unless `force_labels`.
+   **Done 2026-10-26**: `PublishRequest.force_labels`, in the request digest too;
+   `commit::accept` refuses a backward move (`refuse_backward_labels`, one
+   `MergeBudget::STANDARD`) against the head the publish joined onto, forced or not.
+   Two judgement calls (Bart did not answer in time): `force_labels` needs `force`
+   access, like `force`; and the cross-process re-join is not checked again, since a
+   publish's joined labels differ from the head's only where the head kept its base's
+   value, so the re-join compares the same views, and a label both moved is stale.
+   `wheat publish` moves the active label first (`--keep-label`, `--force-label`),
+   keeping the move when the server refuses. Tests: `group_commit_test.rs` (the four
+   flag combinations, per-request permission, stale on acceptance and on re-join, key
+   reuse), `access_test.rs`, `crates/wheat-cli/tests/label_publish.rs`. Tests that
+   need two frontiers of one label now publish with `--keep-label`, and so does the
+   `publish_contention` benchmark.
 10. Git bridge tag replacement.
    **Done 2026-10-26**: `prepare_tag_push(…, force_with_lease)` replaces a differing
    remote tag under a lease on the observed tag object (`PreparedTagPush::replaces`);

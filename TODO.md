@@ -119,7 +119,7 @@ A release build imported Wheat's own history (163 commits), pushed changes to a 
 Git remote, and ran two clones against a `wheat-server` with a conflict between them.
 Import, Git push (incremental, fast-forward), clone, publish, fetch, pull and
 resolve worked; a fetched join with a conflict failed validation (fixed in 3485b1e).
-Besides labels never moving (`docs/design/wheat-label-moves.md`), plain-text
+Besides labels never moving (they move since 2026-10-26, `docs/design/wheat-label-moves.md`), plain-text
 `wheat://` (TLS item below) and read-only commands paying a full validation (1.4 s
 for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
 
@@ -315,7 +315,19 @@ budget passes, but by only about 0.7 s.
   of the view lineage from the basis, so they are linear in the history since the
   basis. The lineage only stores parent → children links. Mutations no longer do this
   (see TODO_DONE.md); a fix here likely needs parent links or a frontier index stored
-  with the label (option B from the mutation fix, a format change).
+  with the label (option B from the mutation fix, a format change). Since the label
+  moves (2026-10-26) `publish`, `fetch`, `integrate` and `label move` run it as well;
+  moving labels keeps the distance short in normal use, but a label left in place
+  while work piles up on it does not.
+- `[ ]` **`active_changes::inspect` collects the basis's whole revision map
+  (2026-10-26).** `collect_revisions` reads every change's entry of the basis view to
+  skip the unchanged ones, so `status` and `changes` are linear in the changes the
+  label holds. A diff of the two revision maps (`RevisionMapStore::delta`, as
+  `forward` uses) would read only what differs.
+- `[ ]` **`wheat-server::fetch_test a_wanted_object_too_large_for_a_batch_comes_in_chunks`
+  failed once in a full workspace run (2026-10-26).** It passed alone 5 times and in 6
+  loaded runs of the store and server suites; the failing run's output was not kept.
+  Rerun the workspace suite a few times and keep the output if it recurs.
 - `[ ]` **The core reference model and `initialize` grow faster than linearly
   (2026-10-21).** In the debug test profile, building a 32-change chain with
   `Repository::create_change_with_id` takes 0.3 s, a 256-change chain 35 s; publishing

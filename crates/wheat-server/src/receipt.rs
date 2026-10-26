@@ -61,6 +61,7 @@ impl PublishKey {
                 "invalid expected envelope ID",
             )?,
             request.force,
+            request.force_labels,
         );
         Ok(Self { key, request })
     }
@@ -126,6 +127,7 @@ mod tests {
             expected_generation: 3,
             expected_envelope: Digest256 { bytes: vec![9; 32] },
             force: false,
+            force_labels: false,
         }
     }
 
@@ -156,6 +158,16 @@ mod tests {
         );
         assert_eq!(sent("alice", 1, 3).find(&receipts), Some(Recorded::Reused));
         assert_eq!(sent("alice", 2, 2).find(&receipts), None);
+        let forcing_labels = PublishRequestOutput {
+            force_labels: true,
+            ..request(1, 2)
+        };
+        assert_eq!(
+            PublishKey::new(&principal("alice"), &forcing_labels)
+                .unwrap()
+                .find(&receipts),
+            Some(Recorded::Reused)
+        );
     }
 
     #[test]

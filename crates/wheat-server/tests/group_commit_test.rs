@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Notify, Semaphore};
 use wheat_core::{
-    ApplicationContext, ObjectId, Repository, RepositoryEnvelopeId, Tree, VerifiedContent,
+    ApplicationContext, ObjectId, Repository, RepositoryEnvelopeId, Tree, VerifiedContent, ViewId,
+    ViewLabelManifestRecord,
 };
 use wheat_protocol::{Digest256, PublishRequestOutput, Uuid128};
 use wheat_server::access::Principal;
@@ -117,6 +118,9 @@ struct Server {
     gate: Arc<Gate>,
     entry: Arc<RepositoryEntry>,
     initial: RepositoryHead,
+    /// The repository's base view, and the view with its one change.
+    base: ViewId,
+    greeting: ViewId,
 }
 
 /// A repository with one change, served through a [`GatedStore`].
@@ -128,14 +132,15 @@ async fn server() -> Server {
     content.put(b"hello wheat").unwrap();
     let mut repo = Repository::new(Tree::new());
     let basis = repo.base_view().id;
-    repo.create_change(
-        basis,
-        basis,
-        [],
-        edit("greeting.txt", b"hello wheat"),
-        ApplicationContext::new(&content),
-    )
-    .unwrap();
+    let (_, greeting) = repo
+        .create_change(
+            basis,
+            basis,
+            [],
+            edit("greeting.txt", b"hello wheat"),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
     RepositoryPublisher::new(&objects, &content, &heads)
         .initialize(&repo)
         .await
@@ -158,6 +163,8 @@ async fn server() -> Server {
         gate,
         entry: Arc::new(RepositoryEntry::new(Box::new(store), heads)),
         initial,
+        base: basis,
+        greeting: greeting.resulting_view,
     }
 }
 
@@ -193,6 +200,17 @@ async fn propose<'a>(
 
 /// The key of a publish of `proposed` sent with the client key `seed`.
 fn key(seed: u8, proposed: RepositoryEnvelopeId) -> PublishKey {
+    forcing_key(seed, proposed, false, false)
+}
+
+/// The key of a publish of `proposed` sent with the client key `seed` and the given
+/// `force` and `force_labels`.
+fn forcing_key(
+    seed: u8,
+    proposed: RepositoryEnvelopeId,
+    force: bool,
+    force_labels: bool,
+) -> PublishKey {
     let request = PublishRequestOutput {
         message_type: 0x40,
         op_id: 1,
@@ -204,7 +222,8 @@ fn key(seed: u8, proposed: RepositoryEnvelopeId) -> PublishKey {
         },
         expected_generation: 0,
         expected_envelope: Digest256 { bytes: vec![0; 32] },
-        force: false,
+        force,
+        force_labels,
     };
     PublishKey::new(
         &Principal {
@@ -276,6 +295,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         initial.envelope,
         first,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -298,6 +318,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         initial.envelope,
         a,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -307,6 +328,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         key(3, b),
         initial.envelope,
         b,
+        false,
         false,
     )
     .await
@@ -353,6 +375,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         initial.envelope,
         first,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -363,6 +386,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         key(2, a),
         initial.envelope,
         a,
+        false,
         false,
     )
     .await
@@ -394,6 +418,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         initial.envelope,
         c,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -422,6 +447,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         initial.envelope,
         first,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -432,6 +458,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         key(2, a),
         initial.envelope,
         a,
+        false,
         false,
     )
     .await
@@ -456,6 +483,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         key(4, c),
         initial.envelope,
         c,
+        false,
         false,
     )
     .await
@@ -482,6 +510,7 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
         key(2, a),
         initial.envelope,
         a,
+        false,
         false,
     )
     .await
@@ -549,6 +578,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         initial.envelope,
         first,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -560,6 +590,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         key(2, a),
         initial.envelope,
         a,
+        false,
         false,
     )
     .await
@@ -577,6 +608,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         key(2, a),
         initial.envelope,
         a,
+        false,
         false,
     )
     .await
@@ -606,6 +638,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         initial.envelope,
         first,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -620,6 +653,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         key(2, a),
         first_head.envelope,
         a,
+        false,
         false,
     )
     .await
@@ -643,6 +677,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         initial.envelope,
         first,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -662,6 +697,7 @@ async fn a_publish_key_used_for_a_different_publish_is_refused() {
         key(1, first),
         initial.envelope,
         first,
+        false,
         false,
     )
     .await
@@ -690,9 +726,331 @@ async fn a_publish_key_used_for_a_different_publish_is_refused() {
             initial.envelope,
             a,
             false,
+            false,
         )
         .await
         .map(Some),
     );
     assert_eq!(server.entry.heads.read().unwrap(), first_head);
+}
+fn manifest(labels: &[(&str, ViewId)]) -> ViewLabelManifestRecord {
+    ViewLabelManifestRecord::new(labels.iter().copied()).unwrap()
+}
+
+/// A publish's stage holding an envelope of `head`'s state with `labels` instead of
+/// its own, and that envelope.
+async fn relabel<'a>(
+    server: &'a Server,
+    head: RepositoryHead,
+    labels: &[(&str, ViewId)],
+) -> (Stage<'a>, RepositoryEnvelopeId) {
+    let stage = empty(server);
+    let state = RepositoryReader::new(&stage, stage.content())
+        .envelope(head.envelope)
+        .await
+        .unwrap()
+        .state;
+    let envelope = RepositoryPublisher::new(&stage, stage.content(), &server.entry.heads)
+        .stage_envelope(state, &manifest(labels))
+        .await
+        .unwrap();
+    (stage, envelope)
+}
+
+/// Publishes `head`'s state with `labels` straight to the server's store, as another
+/// process sharing it would.
+async fn relabel_directly(
+    server: &Server,
+    head: RepositoryHead,
+    labels: &[(&str, ViewId)],
+) -> RepositoryHead {
+    let content = server.objects.content_store();
+    let publisher = RepositoryPublisher::new(&server.objects, &content, &server.entry.heads);
+    let state = RepositoryReader::new(&server.objects, &content)
+        .envelope(head.envelope)
+        .await
+        .unwrap()
+        .state;
+    let envelope = publisher
+        .stage_envelope(state, &manifest(labels))
+        .await
+        .unwrap();
+    publisher.publish_envelope(head, envelope).await.unwrap()
+}
+
+/// The view label `name` names in the server's head.
+async fn label_view(server: &Server, name: &str) -> Option<ViewId> {
+    let content = server.objects.content_store();
+    let reader = RepositoryReader::new(&server.objects, &content);
+    let head = server.entry.heads.read().unwrap();
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    labels.labels.get(name).map(|label| label.view)
+}
+
+fn assert_rejected(outcome: Result<commit::Accepted, CommitFailure>, needle: &str) {
+    match outcome {
+        Err(CommitFailure::Rejected { message, .. }) => {
+            assert!(message.contains(needle), "{message}");
+        }
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got an accepted publish"),
+    }
+}
+
+fn assert_stale(outcome: Result<commit::Accepted, CommitFailure>, needle: &str) {
+    match outcome {
+        Err(CommitFailure::Stale { message, .. }) => {
+            assert!(message.contains(needle), "{message}");
+        }
+        Err(other) => panic!("expected a stale refusal, got {other:?}"),
+        Ok(_) => panic!("expected a stale refusal, got an accepted publish"),
+    }
+}
+
+/// A publish moving `main` from the view with the change to the base view, which
+/// lacks it, is refused unless it forces labels, forced or not; forcing the head alone
+/// does not move a label backward.
+#[tokio::test]
+async fn a_backward_label_move_is_refused_unless_the_publish_forces_labels() {
+    for (force, force_labels) in [(false, false), (true, false), (false, true), (true, true)] {
+        let server = server().await;
+        let labeled = relabel_directly(&server, server.initial, &[("main", server.greeting)]).await;
+        let (stage, backward) = relabel(&server, labeled, &[("main", server.base)]).await;
+        server.gate.permits.add_permits(1);
+        let outcome = commit::accept(
+            &server.entry,
+            &stage,
+            forcing_key(1, backward, force, force_labels),
+            labeled.envelope,
+            backward,
+            force,
+            force_labels,
+        )
+        .await;
+        if force_labels {
+            let head = outcome.unwrap().durable().await.unwrap();
+            assert_eq!(head.envelope, backward, "force={force}");
+            assert_eq!(label_view(&server, "main").await, Some(server.base));
+        } else {
+            assert_rejected(outcome, "label main would move");
+            assert_eq!(server.entry.heads.read().unwrap(), labeled, "force={force}");
+        }
+    }
+}
+
+/// A forward move needs no flag, and neither do created or deleted labels.
+#[tokio::test]
+async fn forward_moves_and_new_or_deleted_labels_are_accepted() {
+    let server = server().await;
+    let labeled = relabel_directly(
+        &server,
+        server.initial,
+        &[("main", server.base), ("old", server.base)],
+    )
+    .await;
+    let (stage, forward) = relabel(
+        &server,
+        labeled,
+        &[("main", server.greeting), ("new", server.base)],
+    )
+    .await;
+    server.gate.permits.add_permits(1);
+    let head = commit::accept(
+        &server.entry,
+        &stage,
+        key(1, forward),
+        labeled.envelope,
+        forward,
+        false,
+        false,
+    )
+    .await
+    .unwrap()
+    .durable()
+    .await
+    .unwrap();
+    assert_eq!(head.envelope, forward);
+    assert_eq!(label_view(&server, "main").await, Some(server.greeting));
+}
+
+/// The permission `force_labels` gives belongs to its publish: one joined after it in
+/// the same batch that moves no label is accepted, and one that moves another label
+/// backward without the flag is refused.
+#[tokio::test]
+async fn forcing_labels_permits_only_its_own_publish() {
+    let server = server().await;
+    let labeled = relabel_directly(
+        &server,
+        server.initial,
+        &[("main", server.greeting), ("other", server.greeting)],
+    )
+    .await;
+    let (forced_stage, forced) = relabel(
+        &server,
+        labeled,
+        &[("main", server.base), ("other", server.greeting)],
+    )
+    .await;
+    let first = commit::accept(
+        &server.entry,
+        &forced_stage,
+        forcing_key(1, forced, false, true),
+        labeled.envelope,
+        forced,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    server.gate.arrived.notified().await;
+
+    // Built on the forced move, it moves `other` backward too, without the flag.
+    let (back_stage, back) = relabel(
+        &server,
+        labeled,
+        &[("main", server.base), ("other", server.base)],
+    )
+    .await;
+    assert_rejected(
+        commit::accept(
+            &server.entry,
+            &back_stage,
+            key(2, back),
+            forced,
+            back,
+            false,
+            false,
+        )
+        .await,
+        "label other would move",
+    );
+
+    // Built on the head before the forced move, it leaves the labels alone, so it
+    // joins onto the forced move without moving `main` again.
+    let (a_stage, a) = propose(&server, labeled, "a.txt").await;
+    let a_accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(3, a),
+        labeled.envelope,
+        a,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    server.gate.permits.add_permits(2);
+    first.durable().await.unwrap();
+    let head = a_accepted.durable().await.unwrap();
+    assert_eq!(
+        head.envelope,
+        joined(&server, labeled.envelope, forced, a).await
+    );
+    assert_eq!(label_view(&server, "main").await, Some(server.base));
+    assert_eq!(label_view(&server, "other").await, Some(server.greeting));
+}
+
+/// A label the publish moves and the head moved differently since the publish's base
+/// refuses the publish as stale: here the first publish moves `main` forward, and the
+/// second, built on the same head, deletes it.
+#[tokio::test]
+async fn a_label_moved_differently_by_an_accepted_publish_refuses_the_publish_as_stale() {
+    let server = server().await;
+    let labeled = relabel_directly(&server, server.initial, &[("main", server.base)]).await;
+    let (moving_stage, moving) = relabel(&server, labeled, &[("main", server.greeting)]).await;
+    let (deleting_stage, deleting) = relabel(&server, labeled, &[]).await;
+    let moved = commit::accept(
+        &server.entry,
+        &moving_stage,
+        key(1, moving),
+        labeled.envelope,
+        moving,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_stale(
+        commit::accept(
+            &server.entry,
+            &deleting_stage,
+            key(2, deleting),
+            labeled.envelope,
+            deleting,
+            false,
+            false,
+        )
+        .await,
+        "labels were moved differently",
+    );
+    server.gate.permits.add_permits(1);
+    moved.durable().await.unwrap();
+}
+
+/// As above when the batch is re-joined: another process sharing the store deletes
+/// `main` while the batch moving it is written.
+#[tokio::test]
+async fn a_label_moved_differently_by_another_process_refuses_the_batch_as_stale() {
+    let server = server().await;
+    let labeled = relabel_directly(&server, server.initial, &[("main", server.base)]).await;
+    let (moving_stage, moving) = relabel(&server, labeled, &[("main", server.greeting)]).await;
+    let moved = commit::accept(
+        &server.entry,
+        &moving_stage,
+        key(1, moving),
+        labeled.envelope,
+        moving,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    server.gate.arrived.notified().await;
+    let deleted = relabel_directly(&server, labeled, &[]).await;
+    server.gate.permits.add_permits(1);
+    match moved.durable().await {
+        Err(CommitFailure::Stale { head, message }) => {
+            assert_eq!(head, deleted);
+            assert!(
+                message.contains("labels were moved differently"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a stale refusal, got {other:?}"),
+    }
+    assert_eq!(server.entry.heads.read().unwrap(), deleted);
+}
+
+/// `force_labels` is part of what a publish key names: the same key sent again with a
+/// different flag is a different publish.
+#[tokio::test]
+async fn a_publish_key_reused_with_a_different_force_labels_is_refused() {
+    let server = server().await;
+    let (stage, a) = propose(&server, server.initial, "a.txt").await;
+    let accepted = commit::accept(
+        &server.entry,
+        &stage,
+        key(1, a),
+        server.initial.envelope,
+        a,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    server.gate.arrived.notified().await;
+    match previous(&server, &forcing_key(1, a, false, true)).await {
+        Err(CommitFailure::Rejected { message, .. }) => {
+            assert!(message.contains("publish key was used"), "{message}");
+        }
+        Err(other) => panic!("expected a refusal, got {other:?}"),
+        Ok(other) => panic!(
+            "expected a refusal, got repeated={:?}",
+            other.map(|a| a.repeated())
+        ),
+    }
+    server.gate.permits.add_permits(1);
+    accepted.durable().await.unwrap();
 }

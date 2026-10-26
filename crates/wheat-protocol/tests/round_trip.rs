@@ -131,6 +131,7 @@ fn publish_request_round_trip() {
         expected_generation: 5,
         expected_envelope: zero_digest(),
         force: false,
+        force_labels: true,
     });
     let decoded = round_trip(msg.clone());
     assert_eq!(msg, decoded);

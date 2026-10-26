@@ -500,6 +500,19 @@ reading the head to its CAS, so a join is never made against a head that is
 about to be replaced. A forced publish is never joined: it must name the
 current head.
 
+**Labels move forward.** Each label the publish moves, compared with the head it
+joined onto (a forced publish included), must move to a view that is forward from
+the one it named: integrating the old view into the new one would change nothing
+(see `wheat-label-moves.md`). Otherwise the publish is rejected, unless it sets
+`force_labels`. Created and deleted labels are not checked. The check is made when
+the publish is accepted, and its permission is that publish's alone, not that of
+the others committed in its batch. A re-join with a head another process published
+needs no second check: a label that head moved and the publish moved too refuses the
+publish as stale. `force` and `force_labels` are separate permissions: replacing the
+head does not move a label backward, and `force_labels` alone does not replace the
+head. Both need `force` access. `force_labels` is part of what a `publish_key`
+names, so a retry with a different flag is a different publish.
+
 `ok` does not say whether the publish was joined. The client compares
 `new_head.envelope` with the envelope it proposed; when they differ, it fetches
 the joined state's objects and content over the same session, walking from its
@@ -821,6 +834,7 @@ PublishRequest
   expected_generation: u64
   expected_envelope: bytes[32]
   force: bool                                 // skip monotonicity check
+  force_labels: bool                          // labels may move backward
 
 PublishPushEnd                                // the client's push is over;
   op_id: u32                                  // ObjectBatch and ContentBatch

@@ -131,7 +131,8 @@ pub async fn handle_publish(
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
     let op_id = req.op_id;
     let force = req.force;
-    debug!(op_id, force, "publish: starting");
+    let force_labels = req.force_labels;
+    debug!(op_id, force, force_labels, "publish: starting");
 
     // A publish sent again, after the connection it was first sent on was lost, gets
     // the first sending's answer, and nothing is transferred again.
@@ -373,6 +374,7 @@ pub async fn handle_publish(
         expected,
         proposed_envelope_id,
         force,
+        force_labels,
     )
     .await
 }
@@ -394,8 +396,18 @@ async fn commit(
     expected: RepositoryHead,
     proposed: RepositoryEnvelopeId,
     force: bool,
+    force_labels: bool,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
-    let accepted = commit::accept(entry, staged, key, expected.envelope, proposed, force).await;
+    let accepted = commit::accept(
+        entry,
+        staged,
+        key,
+        expected.envelope,
+        proposed,
+        force,
+        force_labels,
+    )
+    .await;
     answer(ws, op_id, key, accepted).await
 }
 

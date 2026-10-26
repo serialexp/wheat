@@ -63,12 +63,13 @@ fn every_field_of_a_publish_digest_input_changes_the_digest() {
     assert_ne!(key(b"alice", [1; 16]), key(b"alice", [2; 16]));
 
     let envelope = |seed| RepositoryEnvelopeId::from_digest([seed; 32]);
-    let request = publish_request_digest(envelope(1), 2, envelope(3), false);
+    let request = publish_request_digest(envelope(1), 2, envelope(3), false, false);
     for other in [
-        publish_request_digest(envelope(9), 2, envelope(3), false),
-        publish_request_digest(envelope(1), 9, envelope(3), false),
-        publish_request_digest(envelope(1), 2, envelope(9), false),
-        publish_request_digest(envelope(1), 2, envelope(3), true),
+        publish_request_digest(envelope(9), 2, envelope(3), false, false),
+        publish_request_digest(envelope(1), 9, envelope(3), false, false),
+        publish_request_digest(envelope(1), 2, envelope(9), false, false),
+        publish_request_digest(envelope(1), 2, envelope(3), true, false),
+        publish_request_digest(envelope(1), 2, envelope(3), false, true),
     ] {
         assert_ne!(request, other);
     }

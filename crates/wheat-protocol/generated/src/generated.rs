@@ -231,6 +231,7 @@ impl WheatProtocolMessage {
                 encoder.write_varlength(v.expected_generation, "leb128_canonical")?;
                 v.expected_envelope.encode_into(encoder)?;
                 encoder.write_uint8(if v.force { 1 } else { 0 });
+                encoder.write_uint8(if v.force_labels { 1 } else { 0 });
             }
             WheatProtocolMessage::ObjectsNeeded(v) => {
                 encoder.write_uint8(v.message_type);
@@ -2561,6 +2562,7 @@ pub struct PublishRequestInput {
     pub expected_generation: u64,
     pub expected_envelope: Digest256,
     pub force: bool,
+    pub force_labels: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2572,6 +2574,7 @@ pub struct PublishRequestOutput {
     pub expected_generation: u64,
     pub expected_envelope: Digest256,
     pub force: bool,
+    pub force_labels: bool,
 }
 
 pub type PublishRequest = PublishRequestOutput;
@@ -2591,6 +2594,7 @@ impl PublishRequestInput {
         encoder.write_varlength(self.expected_generation, "leb128_canonical")?;
         self.expected_envelope.encode_into(encoder)?;
         encoder.write_byte(if self.force { 1 } else { 0 });
+        encoder.write_byte(if self.force_labels { 1 } else { 0 });
         Ok(())
     }
 }
@@ -2615,6 +2619,7 @@ impl PublishRequestOutput {
         let expected_generation = decoder.read_varlength("leb128_canonical")?;
         let expected_envelope = Digest256::decode_with_decoder(decoder)?;
         let force = decoder.read_byte()? != 0;
+        let force_labels = decoder.read_byte()? != 0;
         Ok(Self {
             message_type,
             op_id,
@@ -2623,6 +2628,7 @@ impl PublishRequestOutput {
             expected_generation,
             expected_envelope,
             force,
+            force_labels,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -2642,6 +2648,7 @@ impl From<PublishRequestOutput> for PublishRequestInput {
             expected_generation: o.expected_generation,
             expected_envelope: o.expected_envelope,
             force: o.force,
+            force_labels: o.force_labels,
         }
     }
 }
@@ -2656,6 +2663,7 @@ impl From<PublishRequestInput> for PublishRequestOutput {
             expected_generation: i.expected_generation,
             expected_envelope: i.expected_envelope,
             force: i.force,
+            force_labels: i.force_labels,
         }
     }
 }

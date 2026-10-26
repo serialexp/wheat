@@ -20,9 +20,10 @@ use tokio::sync::{Mutex, oneshot};
 use tracing::{Instrument as _, debug_span, warn};
 use wheat_core::{PublishReceiptRecord, RepositoryEnvelopeId};
 use wheat_store::{
-    Arrival, ImmutableObjectStore, PendingPublications, PublicationError, PublicationStore,
-    RepositoryHead, RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
-    RepositoryStoreError, RepositoryUnionError, StagedPublication,
+    Arrival, ImmutableObjectStore, MergeBudget, PendingPublications, PublicationError,
+    PublicationStore, RepositoryHead, RepositoryPublicationError, RepositoryReader,
+    RepositoryStage, RepositoryStore, RepositoryStoreError, RepositoryUnionError,
+    StagedPublication,
 };
 
 use crate::receipt::{PublishKey, Recorded};
@@ -165,8 +166,9 @@ pub async fn previous(
 /// The join is the one a fetch does: the union of both states, with labels merged
 /// three ways against `expected`. Only a label both sides moved, or a change
 /// recorded differently on each side, refuses the publish as stale. A forced publish
-/// is never joined: it replaces exactly the head it names. Refusals report the
-/// durable head, the one the client can fetch.
+/// is never joined: it replaces exactly the head it names. Each label the publish
+/// moves must move forward unless `force_labels`. Refusals report the durable head,
+/// the one the client can fetch.
 ///
 /// A publish whose key was accepted meanwhile, by another session sending it again,
 /// is answered as that one is instead.
@@ -178,6 +180,7 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
     expected: RepositoryEnvelopeId,
     proposed: RepositoryEnvelopeId,
     force: bool,
+    force_labels: bool,
 ) -> Result<Accepted, CommitFailure> {
     let mut turn = entry
         .commit
@@ -216,6 +219,9 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
             });
         }
         Err(e) => return Err(CommitFailure::Internal(e)),
+    }
+    if !force_labels {
+        refuse_backward_labels(&reader, current, joined, durable).await?;
     }
     let publication = staged.take().await.map_err(|e| {
         CommitFailure::Internal(format!("publish: take the staged publication: {e}"))
@@ -551,6 +557,41 @@ fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
+}
+
+/// Refuses a publish that moves a label from where `from` has it to a view that is not
+/// forward from there; see `docs/design/wheat-label-moves.md`.
+///
+/// Checked when the publish is accepted only, against the head it joined onto. A
+/// publish joins labels only where that head and the publish's own base agree, so the
+/// labels it moves are the ones its sender moved, and the permission `force_labels`
+/// gives belongs to that request alone, not to the others in its batch. A re-join in
+/// [`commit_batch`] moves no label from a view other than the one checked here: a label
+/// another process moved meanwhile, and this batch moved too, refuses the batch as
+/// stale.
+async fn refuse_backward_labels<O: ImmutableObjectStore>(
+    reader: &RepositoryReader<'_, O>,
+    from: RepositoryEnvelopeId,
+    to: RepositoryEnvelopeId,
+    head: RepositoryHead,
+) -> Result<(), CommitFailure> {
+    let mut budget = MergeBudget::STANDARD;
+    let backward = reader
+        .backward_label(from, to, &mut budget)
+        .instrument(debug_span!("publish_label_check"))
+        .await;
+    let message = match backward {
+        Ok(None) => return Ok(()),
+        Ok(Some(label)) => format!(
+            "label {} would move from view {} backward: {}; publish with --force-label to \
+             move it anyway",
+            label.name,
+            label.from,
+            label.not_forward.describe(&label.name, label.to)
+        ),
+        Err(e) => format!("checking the labels this publish moves failed: {e}"),
+    };
+    Err(CommitFailure::Rejected { head, message })
 }
 
 /// Checks that `to` may follow `from`: what it adds, or the whole of it when forced.

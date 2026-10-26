@@ -1012,6 +1012,7 @@
         { name: "expected_generation", type: "uint64" },
         { name: "expected_envelope", type: "Digest256" },
         { name: "force", type: "bool" },
+        { name: "force_labels", type: "bool" },
       ],
     },
     PublishReceiptIdInputV1: {

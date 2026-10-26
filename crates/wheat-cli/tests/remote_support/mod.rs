@@ -16,6 +16,8 @@ use serde_json::Value;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 
+pub mod sides;
+
 /// Runs `wheat` in `cwd` and insists that it succeeds.
 pub fn ok(cwd: &Path, stores: &Path, config: &Path, args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_wheat"))

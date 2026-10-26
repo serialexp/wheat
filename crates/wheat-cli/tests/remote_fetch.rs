@@ -212,8 +212,14 @@ fn a_fetch_keeps_local_work_beside_the_remotes() {
     let (writer, writer_stores) = clone("writer");
     let (reader, reader_stores) = clone("reader");
 
+    // Published without moving the label, the two changes stay frontiers of it.
     add_change(&writer, &writer_stores, &config, "remote");
-    ok(&writer, &writer_stores, &config, &["publish"]);
+    ok(
+        &writer,
+        &writer_stores,
+        &config,
+        &["publish", "--keep-label"],
+    );
     add_change(&reader, &reader_stores, &config, "local");
     let local_only = frontiers(&reader, &reader_stores, &config);
     assert_eq!(local_only.len(), 1, "{local_only:?}");
@@ -229,7 +235,12 @@ fn a_fetch_keeps_local_work_beside_the_remotes() {
     // Fetching again changes nothing, and the joined history publishes.
     let again = ok_json(&reader, &reader_stores, &config, &["fetch"]);
     assert_eq!(again["up_to_date"], true, "{again}");
-    ok(&reader, &reader_stores, &config, &["publish"]);
+    ok(
+        &reader,
+        &reader_stores,
+        &config,
+        &["publish", "--keep-label"],
+    );
 
     let back = ok_json(&writer, &writer_stores, &config, &["fetch"]);
     assert_eq!(back["kept_local"], false, "{back}");
@@ -470,11 +481,26 @@ fn a_fetch_refuses_a_rewritten_remote_unless_forced() {
         &["init", other.to_str().unwrap()],
     );
     add_change(&other, &other_stores, &config, "kept");
-    ok(
+    // Its `main` lacks the change the remote's holds: replacing that needs
+    // `--force-label` as well.
+    let refused = fails(
         &other,
         &other_stores,
         &config,
         &["publish", "--remote", &server.url, "--force"],
+    );
+    assert!(refused.contains("label main would move"), "{refused}");
+    ok(
+        &other,
+        &other_stores,
+        &config,
+        &[
+            "publish",
+            "--remote",
+            &server.url,
+            "--force",
+            "--force-label",
+        ],
     );
 
     let refused = fails(&reader, &reader_stores, &config, &["fetch"]);

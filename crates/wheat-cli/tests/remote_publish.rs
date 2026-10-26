@@ -83,9 +83,10 @@ impl Clients {
     }
 }
 
-/// Two writers start from the same head and publish unrelated changes. The second
-/// needs no fetch first: the server joins its change with the first, and the
-/// writer ends up holding the joined head, as if it had fetched afterwards.
+/// Two writers start from the same head and publish unrelated changes, leaving the
+/// label where it is. The second needs no fetch first: the server joins its change
+/// with the first, and the writer ends up holding the joined head, as if it had
+/// fetched afterwards.
 #[test]
 fn a_publish_behind_the_remote_is_joined_with_it() {
     let root = tempfile::tempdir().unwrap();
@@ -94,11 +95,11 @@ fn a_publish_behind_the_remote_is_joined_with_it() {
     let second = clients.clone("second");
 
     clients.add_change(&first, "one");
-    let published = clients.json(&first, &["publish"]);
+    let published = clients.json(&first, &["publish", "--keep-label"]);
     assert_eq!(published["joined"], false, "{published}");
 
     clients.add_change(&second, "two");
-    let published = clients.json(&second, &["publish"]);
+    let published = clients.json(&second, &["publish", "--keep-label"]);
     assert_eq!(published["joined"], true, "{published}");
     assert_eq!(published["generation"], 2, "{published}");
 

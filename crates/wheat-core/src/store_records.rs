@@ -245,12 +245,14 @@ pub fn publish_key_digest(principal: &[u8], key: [u8; 16]) -> Result<[u8; 16], S
     ))
 }
 
-/// What a publish asks for: its envelope, on the head it expects, forced or not.
+/// What a publish asks for: its envelope, on the head it expects, forced or not, and
+/// whether it may move labels backward.
 pub fn publish_request_digest(
     envelope: RepositoryEnvelopeId,
     expected_generation: u64,
     expected_envelope: RepositoryEnvelopeId,
     force: bool,
+    force_labels: bool,
 ) -> [u8; 16] {
     digest16(
         b"wheat-publish-request-v1\0",
@@ -259,6 +261,7 @@ pub fn publish_request_digest(
             expected_generation,
             expected_envelope: digest(*expected_envelope.as_bytes()),
             force,
+            force_labels,
         }
         .encode(),
     )

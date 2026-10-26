@@ -195,6 +195,7 @@ fn publish_request(state: &RepositoryStateOutput, force: bool) -> WheatProtocolM
         expected_generation: state.head_generation + 99,
         expected_envelope: state.head_envelope.clone(),
         force,
+        force_labels: false,
     })
 }
 
@@ -440,6 +441,45 @@ async fn publish_access_cannot_force() {
         forced.message.contains("force access"),
         "{}",
         forced.message
+    );
+}
+
+/// Moving a label backward is forcing too: a writer's publish that asks to is refused
+/// before the head is looked at.
+#[tokio::test]
+async fn publish_access_cannot_force_labels() {
+    let server = start(token_file()).await;
+    let (mut ws, state) = open_ok(server.addr, b"writer-token").await;
+    let WheatProtocolMessage::PublishRequest(request) = publish_request(&state, false) else {
+        unreachable!()
+    };
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::PublishRequest(PublishRequestOutput {
+            force_labels: true,
+            ..request
+        }),
+    )
+    .await;
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
+            message_type: 0x4b,
+            op_id: 7,
+            pushed_objects: 0,
+            pushed_contents: 0,
+        }),
+    )
+    .await;
+    let refused = match recv_msg(&mut ws).await {
+        WheatProtocolMessage::PublishResult(result) => result,
+        other => panic!("expected PublishResult, got {other:?}"),
+    };
+    assert!(is_permission_denial(&refused), "{refused:?}");
+    assert!(
+        refused.message.contains("force access"),
+        "{}",
+        refused.message
     );
 }
 

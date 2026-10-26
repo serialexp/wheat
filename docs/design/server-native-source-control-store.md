@@ -185,10 +185,15 @@ described here.
   them after the format is fixed. (2026-09-25: everything except deletion has
   landed, including `wheat-store/src/snapshot.rs` and
   `tests/snapshot_restore.rs`. Nothing deletes unreachable data yet.)
-- [ ] **Defer — label advancement and frontier consolidation.** Define explicit
+- [x] **Label advancement and frontier consolidation.** Define explicit
   operations and policy for moving a label or consolidating several retained
   descendant frontiers. Repository state has no global workspace working/published
-  view and routine mutation must not introduce one implicitly.
+  view and routine mutation must not introduce one implicitly. (2026-10-26: done as
+  `docs/design/wheat-label-moves.md` plans. Labels move only forward: `wheat label
+  move`, and `integrate`, `pull`, `refresh` and `publish` moving the active label to
+  the workspace's view, refuse a move that loses a change or leaves a frontier behind
+  unless forced; `fetch` takes the remote's moves unless they would hide local work;
+  the server refuses a backward move unless the publish sets `force_labels`.)
 - [ ] **Phase 2 — immutable-object and publication-store interfaces.** Keep
   content-addressed reads/writes independent from the tiny mutable repository
   head. Portable async traits, local loose-object/locked-head implementations,

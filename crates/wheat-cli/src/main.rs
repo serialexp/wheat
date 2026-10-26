@@ -693,6 +693,13 @@ struct NativePublishArgs {
     /// Force publish (skip monotonicity checks on the server).
     #[arg(long)]
     force: bool,
+    /// Publish without moving the active label to this workspace's view.
+    #[arg(long)]
+    keep_label: bool,
+    /// Move the active label even when the move is not forward or leaves frontiers
+    /// of it behind, here and on the server.
+    #[arg(long, conflicts_with = "keep_label")]
+    force_label: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3034,6 +3041,19 @@ fn native_publish(
     let local = open(&context.store_root)?;
     let _operation =
         rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+    // The published envelope carries the active label at this workspace's view. The
+    // move is local and stays when the server refuses the publish; the next pull
+    // reconciles it with the remote's label.
+    let moved = if arguments.keep_label {
+        None
+    } else {
+        Some(move_label_for_publish(
+            &context,
+            &local,
+            arguments.force_label,
+        )?)
+        .filter(label_service::MovedLabel::moved)
+    };
     let local_head = local.heads.read()?;
 
     // Resolve remote URL.
@@ -3103,6 +3123,7 @@ fn native_publish(
                 local_head.envelope,
                 &expected,
                 arguments.force,
+                arguments.force_label,
             )
             .await
             {
@@ -3171,7 +3192,7 @@ fn native_publish(
             }
             remote_cfg.write(&context.store_root)?;
 
-            let human = format!(
+            let mut human = format!(
                 "published to generation {new_generation}, envelope {new_envelope}\n{}",
                 if joined {
                     "joined with work published since the last fetch\n"
@@ -3179,6 +3200,12 @@ fn native_publish(
                     ""
                 }
             );
+            if let Some(moved) = &moved {
+                human.push_str(&format!(
+                    "moved label {} from view {} to view {}\n",
+                    moved.label.name, moved.from, moved.label.view
+                ));
+            }
             Success::new(
                 "publish",
                 json!({
@@ -3186,6 +3213,10 @@ fn native_publish(
                     "generation": new_generation,
                     "envelope": new_envelope.to_string(),
                     "joined": joined,
+                    "label_moved": moved.as_ref().map(|moved| json!({
+                        "from": moved.from.to_string(),
+                        "label": &moved.label,
+                    })),
                 }),
                 human,
             )
@@ -3195,15 +3226,62 @@ fn native_publish(
             remote_envelope,
             message,
         } => Err(CliFailure::stale(format!(
-            "publish rejected: remote is at generation {remote_generation} (envelope {remote_envelope}); {message}"
+            "publish rejected: remote is at generation {remote_generation} (envelope {remote_envelope}); {message}{}",
+            kept_move(moved.as_ref())
         ))),
-        remote::PublishOutcome::Rejected { message } => {
-            Err(CliFailure::invalid(format!("publish rejected: {message}")))
-        }
-        remote::PublishOutcome::Error { message } => {
-            Err(CliFailure::transport(format!("publish error: {message}")))
-        }
+        remote::PublishOutcome::Rejected { message } => Err(CliFailure::invalid(format!(
+            "publish rejected: {message}{}",
+            kept_move(moved.as_ref())
+        ))),
+        remote::PublishOutcome::Error { message } => Err(CliFailure::transport(format!(
+            "publish error: {message}{}",
+            kept_move(moved.as_ref())
+        ))),
     }
+}
+
+const PUBLISH_LABEL_HINT: &str = "pass --keep-label to publish without moving the label, or \
+                                  --force-label to move it anyway";
+
+/// Moves the workspace's active label to its effective view before a publish, under
+/// the checks `label move` makes, rebinding the workspace to it.
+fn move_label_for_publish(
+    context: &discovery::ResolvedWorkspace,
+    repository: &wheat_client::local::LocalRepository,
+    force: bool,
+) -> Result<label_service::MovedLabel> {
+    let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
+    let mut workspace = WorkspaceMetadata::read(&context.root)?;
+    runtime()?.block_on(materialization::recover_locked(
+        &context.root,
+        repository,
+        &mut workspace,
+    ))?;
+    selection_recovery::recover(&context.root, repository, &mut workspace)?;
+    label_service::move_label(
+        repository,
+        workspace.active_label.clone(),
+        workspace.effective_view(),
+        force,
+        PUBLISH_LABEL_HINT,
+        None,
+        Some(label_service::MovingWorkspace {
+            root: &context.root,
+            store_root: &context.store_root,
+            metadata: &mut workspace,
+        }),
+    )
+}
+
+/// What a failed publish adds when it moved the label locally first: the move stays.
+fn kept_move(moved: Option<&label_service::MovedLabel>) -> String {
+    moved.map_or_else(String::new, |moved| {
+        format!(
+            "; label {} stays moved to view {} here, and the next pull reconciles it with \
+             the remote's",
+            moved.label.name, moved.label.view
+        )
+    })
 }
 
 /// Resolve the remote URL from --remote flag or remote.meta.

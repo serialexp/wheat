@@ -375,7 +375,7 @@ async fn run_session(
                 crate::fetch::handle_content_fetch(ws, &entry, req).await?;
             }
             WheatProtocolMessage::PublishRequest(req) => {
-                let needed = if req.force {
+                let needed = if req.force || req.force_labels {
                     Access::Force
                 } else {
                     Access::Publish

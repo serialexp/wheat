@@ -73,7 +73,8 @@ fn frontier_count(side: &(PathBuf, PathBuf), config: &Path) -> usize {
         .len()
 }
 
-/// Local and remote work each on its own frontier after a fetch.
+/// Local and remote work each on its own frontier after a fetch: the remote work was
+/// published without moving the label.
 fn diverged(writes: [(&str, &str); 2]) -> (Sides, remote_support::Server) {
     let (sides, server) = sides();
     change(&sides.writer, &sides.config, writes[0].0, writes[0].1);
@@ -81,7 +82,7 @@ fn diverged(writes: [(&str, &str); 2]) -> (Sides, remote_support::Server) {
         &sides.writer.0,
         &sides.writer.1,
         &sides.config,
-        &["publish"],
+        &["publish", "--keep-label"],
     );
     change(&sides.reader, &sides.config, writes[1].0, writes[1].1);
     ok(&sides.reader.0, &sides.reader.1, &sides.config, &["fetch"]);
@@ -160,7 +161,7 @@ fn both_sides_revising_one_change_combine() {
 
     fs::write(writer.join("writer.txt"), "writer").unwrap();
     ok(writer, writer_stores, config, &["add", "writer.txt"]);
-    ok(writer, writer_stores, config, &["publish"]);
+    ok(writer, writer_stores, config, &["publish", "--keep-label"]);
     fs::write(reader.join("reader.txt"), "reader").unwrap();
     ok(reader, reader_stores, config, &["add", "reader.txt"]);
     ok(reader, reader_stores, config, &["fetch"]);
@@ -352,10 +353,20 @@ fn a_fetched_join_with_a_conflict_stays_valid() {
     let (writer, writer_stores) = &sides.writer;
     let (reader, reader_stores) = &sides.reader;
     change(&sides.writer, &sides.config, "same.txt", "writer");
-    ok(writer, writer_stores, &sides.config, &["publish"]);
+    ok(
+        writer,
+        writer_stores,
+        &sides.config,
+        &["publish", "--keep-label"],
+    );
     change(&sides.reader, &sides.config, "other.txt", "other");
     change(&sides.reader, &sides.config, "same.txt", "reader");
-    ok(reader, reader_stores, &sides.config, &["publish"]);
+    ok(
+        reader,
+        reader_stores,
+        &sides.config,
+        &["publish", "--keep-label"],
+    );
     ok(writer, writer_stores, &sides.config, &["fetch"]);
     ok(writer, writer_stores, &sides.config, &["validate"]);
 
@@ -430,7 +441,12 @@ fn a_refused_integrate_keeps_the_pulled_fetch() {
     let (writer, writer_stores) = &sides.writer;
     let (reader, reader_stores) = &sides.reader;
     change(&sides.writer, &sides.config, "remote.txt", "remote");
-    ok(writer, writer_stores, &sides.config, &["publish"]);
+    ok(
+        writer,
+        writer_stores,
+        &sides.config,
+        &["publish", "--keep-label"],
+    );
     change(&sides.reader, &sides.config, "local.txt", "local");
     ok(reader, reader_stores, &sides.config, &["materialize"]);
     fs::write(reader.join("local.txt"), "edited").unwrap();

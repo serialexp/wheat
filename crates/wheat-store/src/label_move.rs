@@ -35,6 +35,25 @@ pub enum NotForward {
     },
 }
 
+impl NotForward {
+    /// Why label `name` may not move to view `to`, as one sentence.
+    pub fn describe(&self, name: &str, to: ViewId) -> String {
+        match *self {
+            Self::Missing { change } => {
+                format!("view {to} lacks change {change}, which label {name} holds")
+            }
+            Self::Diverged {
+                change,
+                edits_added,
+                edits_dropped,
+            } => format!(
+                "label {name}'s revision of change {change} is not in view {to}: merging it \
+                 would add {edits_added} and drop {edits_dropped} edits"
+            ),
+        }
+    }
+}
+
 /// A label one head moved to a view that is not forward from where it was.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackwardLabel {

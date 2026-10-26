@@ -878,6 +878,7 @@ pub async fn publish<O: ImmutableObjectStore>(
     local_envelope: RepositoryEnvelopeId,
     expected_remote: &RepositoryHead,
     force: bool,
+    force_labels: bool,
 ) -> Result<PublishOutcome> {
     // Send PublishRequest.
     send_msg(
@@ -892,6 +893,7 @@ pub async fn publish<O: ImmutableObjectStore>(
             expected_generation: expected_remote.generation,
             expected_envelope: envelope_id_to_digest(expected_remote.envelope),
             force,
+            force_labels,
         }),
     )
     .await?;

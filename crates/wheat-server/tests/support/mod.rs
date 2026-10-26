@@ -464,6 +464,7 @@ pub async fn request_publish_pushing(
             expected_generation: expected.0,
             expected_envelope: digest(expected.1.as_bytes()),
             force,
+            force_labels: false,
         }),
     )
     .await;

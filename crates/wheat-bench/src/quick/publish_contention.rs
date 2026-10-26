@@ -10,7 +10,9 @@
 //! For each writer count a fresh server runs in this process, pinned to whole cores of
 //! its own, and each writer is a loop of `wheat` processes on the remaining cores:
 //! `change new`, then `publish` until it is accepted, with `fetch` after each refusal.
-//! Every writer has its own clone and store home, as separate agents would.
+//! Every writer has its own clone and store home, as separate agents would. Writers
+//! publish with `--keep-label`: each moving `main` to its own work would refuse every
+//! publish but the first, which is what `pull` and `integrate` are for, not this case.
 
 use std::{path::PathBuf, sync::Barrier, time::Instant};
 
@@ -330,8 +332,11 @@ impl Client {
     }
 
     fn publish(&self, source: &Workspace) -> Result<(Publish, f64)> {
-        let captured =
-            source.run_in_stores(&self.root, &self.stores, &["--format", "json", "publish"])?;
+        let captured = source.run_in_stores(
+            &self.root,
+            &self.stores,
+            &["--format", "json", "publish", "--keep-label"],
+        )?;
         let wall = captured.timing.wall_seconds;
         Ok((classify(&captured)?, wall))
     }
@@ -339,16 +344,16 @@ impl Client {
 
 /// Reads how a publish ended; a failure other than a stale refusal is an error.
 fn classify(captured: &Captured) -> Result<Publish> {
+    let document: Option<Value> = serde_json::from_slice(&captured.stdout).ok();
     if captured.status.success() {
-        let document: Value = serde_json::from_slice(&captured.stdout)
-            .context("wheat publish printed no JSON document")?;
+        let document = document.context("wheat publish printed no JSON document")?;
         let Some(joined) = document["result"]["joined"].as_bool() else {
             bail!("wheat publish did not say whether it joined: {document}");
         };
         return Ok(Publish::Accepted { joined });
     }
-    let stderr = String::from_utf8_lossy(&captured.stderr);
-    if stderr.contains("publish rejected: remote is at generation") {
+    // With `--format json` a refusal is the document's error, on stdout.
+    if document.is_some_and(|document| document["error"]["code"] == "stale_state") {
         Ok(Publish::Refused)
     } else {
         captured.ensure_success("wheat publish")?;
