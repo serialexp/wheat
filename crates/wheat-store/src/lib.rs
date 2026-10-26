@@ -31,6 +31,8 @@ mod delta;
 mod durability;
 mod increment_validation;
 pub use increment_validation::{Arrival, IncrementBudget, IncrementReport};
+mod label_move;
+pub use label_move::NotForward;
 mod loose;
 mod merkle_tree;
 mod metadata_repack;

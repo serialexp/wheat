@@ -2,7 +2,7 @@
 
 Status: proposed (2026-10-15), revised after Codex reviews 1–3; references refreshed
 2026-10-22 after the prerequisite validation project (decision 13) landed, then revised
-after review 4 (Codex and Antigravity, 2026-10-22); step 1 in progress
+after review 4 (Codex and Antigravity, 2026-10-22); steps 1 and 2 done
 Owner: bart
 
 ## Why
@@ -253,20 +253,22 @@ pub enum NotForward {
     Diverged { change: ChangeId, edits_added: usize, edits_dropped: usize },
 }
 impl RepositoryReader {
-    pub async fn forward(&self, from: ViewId, to: ViewId, limits: &mut MergeBudget)
+    pub async fn forward(&self, from: &ViewRecord, to: &ViewRecord, budget: &mut MergeBudget)
         -> Result<Option<NotForward>>;
 }
 ```
 
-- A new `RevisionMapStore::diff` over `radix::paired_diff` (as `ChangeMapStore` has
-  in `change_map.rs`). `Removed` → `Missing`; `Added` → fine; `Changed(o, n)` →
-  ancestry first (generation lets `o ∈ anc*(n)` stop once the walk passes `o`'s
-  generation), then the merge.
-- Reads: revision records only; edit sets come from the records.
-- `MergeBudget` is shared by every check of one command or publish (review 2,
-  item 11): revision reads, walk steps, edits compared, map-diff entries.
+- The views are records: callers have already read them checking they are retained.
 - The revision-map diff is the existing `RevisionMapStore::delta`
-  (`revision_map.rs:223`), which already runs over `radix::paired_diff`.
+  (`revision_map.rs:223`), over `radix::paired_diff`, under its default limits.
+  `Removed` → `Missing`; `Added` → fine; `Changed(o, n)` → the merge of `o` and `n`.
+  No separate ancestry walk: when `o ∈ anc*(n)`, the merge's walk stops at `o`, its
+  base, and gives `n`'s edits.
+- Reads: radix nodes where the maps differ, then revision records only; edit sets
+  come from the records.
+- `MergeBudget` is shared by every check of one command or publish (review 2,
+  item 11): each merge runs within what is left and `MergeBudget::spend` takes its
+  `MergeWork` off. The map diff is bounded by its own limits.
 
 ### Integrate: frontiers that lack label changes
 
@@ -569,6 +571,12 @@ size for `just test`; release run; results under `bench/results/`.
    so about two hundred such rounds fit in the standard budget. Twenty rounds, past the
    old depth limit, join and validate (`repository_integration.rs`).
 2. `forward` + tests + read counts.
+   **Done 2026-10-26**: `crates/wheat-store/src/label_move.rs`
+   (`RepositoryReader::forward`, `NotForward`); `MergeBudget::spend`; tests in
+   `crates/wheat-store/tests/label_move.rs`, over the fixture now shared with
+   `repository_integration.rs` in `tests/support/mod.rs`. A move that revised one change
+   once reads 5 objects after 10 or 100 revisions of the change and after 16 or 160
+   other changes.
 3. Integrate with lacking frontiers and the basis lineage edge.
 4. Materialize from the pinned basis; the journal's binding check. (Full validation
    already left the read paths in the prerequisite.)

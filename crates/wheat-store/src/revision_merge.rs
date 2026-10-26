@@ -53,6 +53,13 @@ impl MergeBudget {
         max_walk_steps: 1 << 18,
         max_edits: 1 << 20,
     };
+
+    /// Takes `work` off what is left, for a budget several merges share.
+    pub fn spend(&mut self, work: MergeWork) {
+        self.max_revision_reads = self.max_revision_reads.saturating_sub(work.revision_reads);
+        self.max_walk_steps = self.max_walk_steps.saturating_sub(work.walk_steps);
+        self.max_edits = self.max_edits.saturating_sub(work.edits);
+    }
 }
 
 /// The work one merge took, metered as [`MergeBudget`] bounds it.

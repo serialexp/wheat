@@ -4,12 +4,12 @@
 
 Review 4 (Codex and Antigravity) is folded into the plan, with Bart's decisions 14–16
 (squash stops at branch points; a separate merge meter; `label move` rebinds only
-when the target is the workspace's effective view). Step 1 is done (see the plan's
-"Order of work"). Next: step 2, `forward(from, to)` in a new
-`crates/wheat-store/src/label_move.rs`, over `RevisionMapStore::delta`, using
-`RevisionMerge` (`maximal` for ancestry, `merged_edits` for the merge) under one
-`MergeBudget` per command, with read-count tests. `RevisionMerge` is `pub(crate)`;
-`forward` lives in the same crate.
+when the target is the workspace's effective view). Steps 1 and 2 are done (see the
+plan's "Order of work"); the merge budget meters walk steps instead of recursion depth
+(Bart, 2026-10-26). Next: step 3, integrate with frontiers that lack label changes
+(`frontier_revisions` returns lacked changes, `start_below` treats them like revised
+ones, the basis's revisions join `join_revisions`) and the basis → result lineage
+edge, in `crates/wheat-store/src/repository_integration.rs`.
 
 ## 2026-10-22: desktop client (@calm-lynx) — Bart: "read the design for the wheat gui and try to build that"
 
