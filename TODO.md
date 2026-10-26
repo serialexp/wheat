@@ -3,6 +3,92 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Hosting on Gothab (2026-10-26)
+
+Found while scoping Wheat repositories served natively from Gothab's gitd hosts
+(option C of the scoping: Wheat as the stored format, not a Git projection). gitd
+places each repository on one primary host with fencing, local disk for structure and
+a shared object store for blobs; Gothab's server does authentication and repository
+authorization in front of it and proxies to the right host. Items marked
+**(format)** touch a stored record or the protocol, so they want deciding before the
+formats freeze. Items already listed elsewhere that this also needs: the registry is
+not pluggable, blocking disk work on async threads, chunked uploads reassembled in
+memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
+listing the bucket, opening a packed store costing O(store), the remote catalog head
+being JSON, and `wheat gc` / server-authoritative remote maintenance.
+
+- `[ ]` **(format) The repository is named only inside the protocol.** The client
+  connects to `{scheme}://{authority}` with no path (`ws_url`,
+  `crates/wheat-client/src/remote.rs`) and names the repository in `RepositoryOpen`
+  after the handshake. A front door that routes each repository to its host must then
+  terminate the WebSocket and parse `ClientHello` and `RepositoryOpen` before it knows
+  where to forward. Options: put the repository in the URL path as well (the
+  `/wheat/ws` mount in `wheat-native-protocol.md` assumes a path); or keep it in the
+  protocol and have embedders proxy at message level. Decide whether `RepositoryOpen`
+  stays the authority once the path names the repository too.
+- `[ ]` **(format) The head record holds the publish receipts.** `RepositoryHeadRecord`
+  carries the head and its receipts together (`crates/wheat-store/src/publication.rs`),
+  and the server uses `LocalPublicationStore`'s inherent `*_with_receipts` methods,
+  not the `PublicationStore` trait. A host keeping the head in a database row
+  (compare-and-swap on `generation`, as the protocol doc's Gothab column proposes)
+  needs the head, the receipts and the compare-and-advance behind one trait the
+  server is given. Decide whether `RepositoryHeadRecord` stays a stored format every
+  backend writes, or becomes the local backend's own encoding.
+- `[ ]` **(format) Content IDs and Gothab's blobstore.** `ContentId` is BLAKE3 of the
+  file bytes and `ObjectId` BLAKE3 of canonical bytes, with no domain separation
+  (`crates/wheat-core/src/id.rs`). Gothab's blobstore keys Git blobs by Git OID, so
+  Wheat content cannot share entries with Git repositories holding the same files;
+  it would be a separate object kind. Check that is acceptable (or whether a
+  content record should also name its Git OID), and whether object and content IDs
+  should be domain-separated before the formats freeze.
+- `[ ]` **(format) `RepositoryState` stops at 10,000 labels.** Repository open sends at
+  most 10,000 labels with a `truncated` flag (`connection.rs`), and `ListLabels`,
+  which would page the rest, is in the schema but not served. Gothab repositories can
+  have more branches than that. Implement `ListLabels` paging, and check its message
+  shape before the freeze.
+- `[ ]` **Handlers take `WebSocketStream<TcpStream>`.** `wire::send`/`recv` and every
+  handler in `connection.rs`, `fetch.rs` and `publish.rs` name the concrete stream, so
+  the server cannot run on an axum or hyper upgraded connection. Make them generic over
+  the stream (or a `Sink + Stream` of messages), and expose a "serve this connection"
+  entry point beside `run`'s accept loop.
+- `[ ]` **No hooks around a publish.** Besides `AccessProvider::access`, nothing lets
+  an embedder refuse a publish (protected labels, required checks, quota, size) or
+  learn it happened: after the head moves the server only logs (`publish.rs`). Gothab
+  needs a pre-publish check that sees the principal, the old and new head, the label
+  moves and the bytes uploaded; and a post-publish notification with the same, called
+  once the head is durable (for its push journal, webhooks, CI and search). Labels
+  live inside the envelope, so the label moves need computing from the two label
+  manifests; expose that as a store call.
+- `[ ]` **The registry must open and close repositories.** Beyond being pluggable (item
+  under the design-doc audit), a host serving thousands of repositories opens them on
+  demand and evicts idle ones. Opening holds `catalog.lock` exclusively, so eviction
+  has to release it, and an open must not cost O(store). Gothab also needs to fence a
+  repository's writes when its primary moves: a store write should be refusable by a
+  host-supplied check, so a stale primary after failover cannot write.
+- `[ ]` **Content backend is crate-private.** `ContentBackend` and
+  `ContentStore::with_backend` are `pub(crate)` (`content_store.rs`), and
+  `RemotePackedStore::open` takes only `S3ObjectStoreConfig` (`open_backend` with an
+  `Arc<dyn ObjectStore>` is private). An embedder can't put content in its own object
+  store client. Make one of them public; Gothab would keep structure on the host's disk
+  and content in its blobstore.
+- `[ ]` **No library call creates or deletes a served repository.** A served directory
+  is made out of band as a local store. Add store-level create (empty, and from a Git
+  import) and delete for embedders.
+- `[ ]` **No consistent snapshot of a live served repository.** Gothab backs repositories
+  up to object storage and moves them between hosts (drain, snapshot, stage,
+  activate). Wheat needs a way to quiesce one repository (finish the group commit,
+  refuse new publishes) and take a consistent copy of its store and head, then resume.
+- `[ ]` **No repository size or per-publish byte count.** Quotas and billing need a
+  repository's stored bytes and each publish's uploaded bytes; neither is reported.
+- `[ ]` **Server-side reads for browsing.** Gothab's repository pages read a label's
+  tree, a file, history and diffs without a workspace, bounded and paged. wheat-client
+  has typed history, diff and changes reads; check which work against a served store
+  with no workspace, and add the missing ones (list a tree at a view, read a file at a
+  path, page history newest first).
+- `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
+  protocol doc's two-tier storage keeps structure per fork network; there is no
+  library operation to create a fork that shares its parent's storage.
+
 ## Desktop client (2026-10-22)
 
 `crates/wheat-desktop` builds the Workspace and Changes screens of the design comp
