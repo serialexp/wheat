@@ -58,11 +58,13 @@ impl Scratch {
     }
 }
 
-/// An object store counting the objects and bytes read through it.
+/// An object store counting the objects and bytes read through it, and the bytes
+/// written to it.
 pub(crate) struct Counting {
     pub(crate) inner: PackedObjectStore,
     reads: AtomicU64,
     bytes: AtomicU64,
+    written: AtomicU64,
 }
 
 impl Counting {
@@ -71,6 +73,7 @@ impl Counting {
             inner,
             reads: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            written: AtomicU64::new(0),
         }
     }
 
@@ -81,6 +84,12 @@ impl Counting {
             self.bytes.swap(0, Ordering::Relaxed),
         )
     }
+
+    /// The bytes handed to the store since the last call, whether or not it held them
+    /// already.
+    pub(crate) fn take_written(&self) -> u64 {
+        self.written.swap(0, Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
@@ -90,6 +99,8 @@ impl ImmutableObjectStore for Counting {
         id: ObjectId,
         canonical_bytes: &[u8],
     ) -> Result<(), ObjectStoreError> {
+        self.written
+            .fetch_add(canonical_bytes.len() as u64, Ordering::Relaxed);
         self.inner.put_if_absent(id, canonical_bytes).await
     }
 
@@ -98,6 +109,8 @@ impl ImmutableObjectStore for Counting {
         objects: &[(ObjectId, Vec<u8>)],
         concurrency: usize,
     ) -> Result<(), ObjectStoreError> {
+        let written: usize = objects.iter().map(|(_, bytes)| bytes.len()).sum();
+        self.written.fetch_add(written as u64, Ordering::Relaxed);
         self.inner.put_batch(objects, concurrency).await
     }
 
@@ -205,33 +218,6 @@ impl Layout {
             Self::Flat => format!("flat/f{index}.txt"),
         }
     }
-}
-
-/// Creates change number `index` on the frontier of `effective` and publishes it, the
-/// way `wheat change new` does: one new file two directories deep, so a history's files
-/// spread over 65,536 directories. Returns the new head and view.
-pub(crate) async fn create_spread<O, P>(
-    mutator: &PersistedRepositoryMutator<'_, O, P>,
-    content: &ContentStore,
-    head: RepositoryHead,
-    base: ViewId,
-    effective: ViewId,
-    index: usize,
-) -> Result<(RepositoryHead, ViewId)>
-where
-    O: ImmutableObjectStore,
-    P: PublicationStore,
-{
-    create_at(
-        mutator,
-        content,
-        head,
-        base,
-        effective,
-        index,
-        Layout::Spread,
-    )
-    .await
 }
 
 /// Creates change number `index` on the frontier of `effective` and publishes it, the

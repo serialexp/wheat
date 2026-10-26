@@ -822,6 +822,7 @@ where
     /// The view's content map counts exactly the tree entries naming each blob, all in
     /// the aggregate (I7). Reads the whole tree and map: the fallback when an edge can't
     /// be checked by diff.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn content_map_matches_tree(
         &self,
         scratch: &VerificationScratch,
@@ -856,6 +857,7 @@ where
     /// it equals the child's tree too, and every blob the child's tree gains is in the
     /// aggregate. Returns false when a diff exceeds its limits and the edge needs
     /// [`Self::content_map_matches_tree`] instead.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn content_map_follows_tree_diff(
         &self,
         parent: &ViewRecord,

@@ -164,6 +164,7 @@ where
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn index_retained(&self, kind: Retained, root: RetainedSetId) -> Result<()> {
         let mut cursor = RetainedSetStore::new(self.reader.objects)
             .cursor(root)
@@ -177,6 +178,7 @@ where
     /// Authenticate each distinct tree node once per validation run. The receipt
     /// carries height so reuse beneath a deeper directory cannot bypass the
     /// verification depth limit.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn authenticate_tree(&self, root: TreeId) -> Result<()> {
         const MAX_DIRECTORY_DEPTH: usize = 1023;
         if let Some(height) = self.scratch.tree_height(root)? {
@@ -232,6 +234,7 @@ where
     }
 
     /// Every file of the tree names content in the aggregate.
+    #[tracing::instrument(name = "verify_tree_content", level = "debug", skip_all)]
     async fn tree(&self, root: TreeId, aggregate: ContentSetId) -> Result<()> {
         self.authenticate_tree(root).await?;
         if self.scratch.tree_semantics_verified(root, aggregate)? {
@@ -258,6 +261,7 @@ where
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn verify_view_trees_by_lineage_delta(
         &self,
         state: &RepositoryStateRecord,
@@ -332,6 +336,7 @@ where
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn revision_map(&self, root: RevisionMapId, retained: RetainedSetId) -> Result<()> {
         let store = RadixStore::<_, RevisionCollection>::new(self.reader.objects);
         let mut walk = store
@@ -372,6 +377,7 @@ where
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn application_map(
         &self,
         application_root: ApplicationMapId,
@@ -463,6 +469,7 @@ where
     /// order (I2, per application).
     ///
     /// `children` lists each view's lineage children, each list in ID order.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn verify_composition(
         &self,
         state: &RepositoryStateRecord,
@@ -483,6 +490,7 @@ where
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn verify_lineage_semantics(
         &self,
         state: &RepositoryStateRecord,

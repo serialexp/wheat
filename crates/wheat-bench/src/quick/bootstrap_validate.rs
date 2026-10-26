@@ -7,15 +7,19 @@
 //! the frontier, each adding one file two directories deep, and at each checkpoint
 //! records each validator's wall time, objects and bytes read, and peak resident memory,
 //! to choose which a clone uses.
+//!
+//! The same is recorded for a history whose files all sit in one directory (`flat.`
+//! steps): every change makes a new version of one wide directory, stored in chunks,
+//! and most of its chunks are unchanged from the version before.
 
-use std::{path::Path, time::Instant};
+use std::{fs, path::Path, time::Instant};
 
 use anyhow::Result;
 use wheat_store::{LocalPublicationStore, PersistedRepositoryMutator, RepositoryReader};
 
 use super::{
     CaseContext, CaseOutput, Recorder,
-    history::{Counting, Scratch, create_spread},
+    history::{Counting, Layout, Scratch, create_at},
 };
 use crate::measure::PhasePeak;
 
@@ -25,15 +29,26 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let checkpoints = context
         .scale
         .pick(vec![1_000, 10_000, 30_000], vec![20, 60]);
+    let flat = context.scale.pick(vec![1_000, 10_000], vec![20, 60]);
     let mut recorder = Recorder::new(NAME);
     recorder.parameter("checkpoints", &checkpoints);
+    recorder.parameter("flat_checkpoints", &flat);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(measure_history(
-        &context.scratch,
+        &context.scratch.join("spread"),
+        Layout::Spread,
+        "",
         &checkpoints,
+        &mut recorder,
+    ))?;
+    runtime.block_on(measure_history(
+        &context.scratch.join("flat"),
+        Layout::Flat,
+        "flat.",
+        &flat,
         &mut recorder,
     ))?;
     Ok(recorder.finish())
@@ -41,9 +56,12 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
 
 async fn measure_history(
     root: &Path,
+    layout: Layout,
+    prefix: &str,
     checkpoints: &[usize],
     recorder: &mut Recorder,
 ) -> Result<()> {
+    fs::create_dir_all(root)?;
     let scratch = Scratch::open(root)?;
     let (base, mut head) = scratch.initialize().await?;
     let objects = Counting::new(scratch.objects);
@@ -57,13 +75,21 @@ async fn measure_history(
     let mut effective = base;
     let started = Instant::now();
     for index in 0..largest {
-        (head, effective) =
-            create_spread(&mutator, &scratch.content, head, base, effective, index).await?;
+        (head, effective) = create_at(
+            &mutator,
+            &scratch.content,
+            head,
+            base,
+            effective,
+            index,
+            layout,
+        )
+        .await?;
         let size = index + 1;
         if !checkpoints.contains(&size) {
             continue;
         }
-        let step = format!("n{size}");
+        let step = format!("{prefix}n{size}");
 
         objects.take();
         let mut peak = PhasePeak::start()?;
@@ -86,7 +112,7 @@ async fn measure_history(
         recorder.value(&format!("{step}.bootstrap.reads"), reads as f64, "count");
         recorder.value(&format!("{step}.bootstrap.bytes"), bytes as f64, "bytes");
         eprintln!(
-            "{NAME}: {size} changes after {:.0} s",
+            "{NAME}: {prefix}{size} changes after {:.0} s",
             started.elapsed().as_secs_f64()
         );
     }

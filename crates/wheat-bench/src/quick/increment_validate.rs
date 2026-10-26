@@ -7,9 +7,9 @@
 //! [`SAMPLES`] more, with the objects and bytes the validator read. The mean
 //! create-and-publish time of the [`CREATE_WINDOW`] changes up to each checkpoint is
 //! recorded too, and the slowest single one since the checkpoint before, which shows
-//! store work that only some publications pay, and the objects the last create read
+//! store work that only some publications pay, the objects the last create read
 //! (the frontier, the order index's skip chain to place the new application, and the
-//! paths the new records are written along).
+//! paths the new records are written along), and the bytes it wrote.
 //!
 //! The validator reads a root-to-leaf path in each collection a change touches and
 //! walks the order index's skip chain, so its reads grow with the logarithm of the
@@ -17,14 +17,15 @@
 //! most [`READ_GROWTH_PER_BIT_PERCENT`] from the first checkpoint to [`LARGEST`], and
 //! the same holds for what a create reads. Bytes grow faster than that in this shape:
 //! the second-level directories gain an entry every 256 changes, so the directory
-//! records on a change's path get larger with the history; they have the looser
-//! [`BYTE_GROWTH_PER_BIT_PERCENT`]. What matters for people is the wall time: a
-//! one-change publication after [`LARGEST`] changes validates within
+//! records on a change's path get larger with the history; bytes read and written
+//! have the looser [`BYTE_GROWTH_PER_BIT_PERCENT`]. What matters for people is the
+//! wall time: a one-change publication after [`LARGEST`] changes validates within
 //! [`VALIDATE_BUDGET_SECONDS`].
 //!
-//! The same is recorded, without a contract, for a history whose files all sit in one
-//! directory (`flat.` steps, to [`FLAT_LARGEST`] changes): a directory is one record,
-//! so a change to it reads and writes all of its entries.
+//! The same is measured, under the same contract, for a history whose files all sit
+//! in one directory (`flat.` steps). A directory wider than 256 entries is stored in
+//! chunks along its names' hashes, so a change to it reads and writes the chunks on
+//! one name's path, not the whole directory.
 
 use std::{collections::VecDeque, fs, path::Path, time::Instant};
 
@@ -46,16 +47,15 @@ const SAMPLES: usize = 5;
 const CREATE_WINDOW: usize = 100;
 /// The history size the budgets are checked at.
 const LARGEST: usize = 100_000;
-/// The largest flat history: every create rewrites the one directory, so building it
-/// costs the square of its size.
-const FLAT_LARGEST: usize = 10_000;
 const VALIDATE_BUDGET_SECONDS: f64 = 0.1;
 /// Growth of object reads per bit of history size, first checkpoint to [`LARGEST`].
 /// Measured 2026-10-21 (release): validation 119 reads at 1,000 changes and 157 at
 /// 100,000, 79%.
 const READ_GROWTH_PER_BIT_PERCENT: f64 = 125.0;
-/// Growth of bytes read per bit of history size: 305 KB at 1,000 changes and 601 KB at
-/// 100,000 on 2026-10-21, 118%.
+/// Growth of bytes read or written per bit of history size: validation read 305 KB at
+/// 1,000 changes and 601 KB at 100,000 on 2026-10-21, 118%. On 2026-10-26 a create
+/// wrote 92 KB at 1,000 and 159 KB at 100,000 (104%), and in one directory 101 KB and
+/// 172 KB (102%), where validation read 345 KB and 584 KB (102%).
 const BYTE_GROWTH_PER_BIT_PERCENT: f64 = 150.0;
 
 /// What one checkpoint measured.
@@ -64,18 +64,15 @@ struct Checkpoint {
     validate_reads: u64,
     validate_bytes: u64,
     create_reads: u64,
+    create_written: u64,
 }
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let checkpoints = context
         .scale
         .pick(vec![1_000, 10_000, LARGEST], vec![CREATE_WINDOW, 300]);
-    let flat = context
-        .scale
-        .pick(vec![1_000, FLAT_LARGEST], vec![CREATE_WINDOW]);
     let mut recorder = Recorder::new(NAME);
     recorder.parameter("checkpoints", &checkpoints);
-    recorder.parameter("flat_checkpoints", &flat);
     recorder.parameter("samples", SAMPLES);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -88,49 +85,63 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         &checkpoints,
         &mut recorder,
     ))?;
-    runtime.block_on(measure_history(
+    let flat = runtime.block_on(measure_history(
         &context.scratch.join("flat"),
         Layout::Flat,
         "flat.",
-        &flat,
+        &checkpoints,
         &mut recorder,
     ))?;
+    check_growth(&mut recorder, "", &spread);
+    check_growth(&mut recorder, "flat.", &flat);
+    Ok(recorder.finish())
+}
 
+/// Holds a history's checkpoints to the wall budget at [`LARGEST`] and to the growth
+/// budgets from the first checkpoint to it.
+fn check_growth(recorder: &mut Recorder, prefix: &str, measured: &[Checkpoint]) {
     recorder.at_most(
-        &format!("n{LARGEST}.validate.wall"),
+        &format!("{prefix}n{LARGEST}.validate.wall"),
         VALIDATE_BUDGET_SECONDS,
         "s",
     );
-    if let (Some(first), Some(last)) = (spread.first(), spread.last())
-        && last.size == LARGEST
-    {
-        let growth = |of: fn(&Checkpoint) -> u64| {
-            let per_bit =
-                |checkpoint: &Checkpoint| of(checkpoint) as f64 / (checkpoint.size as f64).log2();
-            per_bit(last) / per_bit(first) * 100.0
-        };
-        for (name, value, budget) in [
-            (
-                "validate.read_growth_per_bit",
-                growth(|c| c.validate_reads),
-                READ_GROWTH_PER_BIT_PERCENT,
-            ),
-            (
-                "validate.byte_growth_per_bit",
-                growth(|c| c.validate_bytes),
-                BYTE_GROWTH_PER_BIT_PERCENT,
-            ),
-            (
-                "create.read_growth_per_bit",
-                growth(|c| c.create_reads),
-                READ_GROWTH_PER_BIT_PERCENT,
-            ),
-        ] {
-            recorder.value(name, value, "percent");
-            recorder.at_most(name, budget, "percent");
-        }
+    let (Some(first), Some(last)) = (measured.first(), measured.last()) else {
+        return;
+    };
+    if last.size != LARGEST {
+        return;
     }
-    Ok(recorder.finish())
+    let growth = |of: fn(&Checkpoint) -> u64| {
+        let per_bit =
+            |checkpoint: &Checkpoint| of(checkpoint) as f64 / (checkpoint.size as f64).log2();
+        per_bit(last) / per_bit(first) * 100.0
+    };
+    for (name, value, budget) in [
+        (
+            "validate.read_growth_per_bit",
+            growth(|c| c.validate_reads),
+            READ_GROWTH_PER_BIT_PERCENT,
+        ),
+        (
+            "validate.byte_growth_per_bit",
+            growth(|c| c.validate_bytes),
+            BYTE_GROWTH_PER_BIT_PERCENT,
+        ),
+        (
+            "create.read_growth_per_bit",
+            growth(|c| c.create_reads),
+            READ_GROWTH_PER_BIT_PERCENT,
+        ),
+        (
+            "create.write_growth_per_bit",
+            growth(|c| c.create_written),
+            BYTE_GROWTH_PER_BIT_PERCENT,
+        ),
+    ] {
+        let name = format!("{prefix}{name}");
+        recorder.value(&name, value, "percent");
+        recorder.at_most(&name, budget, "percent");
+    }
 }
 
 async fn measure_history(
@@ -161,6 +172,7 @@ async fn measure_history(
         let checkpoint = checkpoints.contains(&size);
         if checkpoint {
             objects.take();
+            objects.take_written();
         }
         let created = Instant::now();
         let previous = head.envelope;
@@ -184,6 +196,7 @@ async fn measure_history(
             continue;
         }
         let (create_reads, _) = objects.take();
+        let create_written = objects.take_written();
         let step = format!("{prefix}n{size}");
         recorder.wall(&format!("{step}.build"), started.elapsed().as_secs_f64());
         recorder.wall(
@@ -196,6 +209,11 @@ async fn measure_history(
             &format!("{step}.create.reads"),
             create_reads as f64,
             "count",
+        );
+        recorder.value(
+            &format!("{step}.create.written"),
+            create_written as f64,
+            "bytes",
         );
 
         let first = Instant::now();
@@ -239,6 +257,7 @@ async fn measure_history(
             validate_reads: reads,
             validate_bytes: bytes,
             create_reads,
+            create_written,
         });
         eprintln!(
             "{NAME}: {prefix}{size} changes after {:.0} s",

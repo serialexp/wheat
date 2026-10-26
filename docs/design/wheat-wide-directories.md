@@ -1,12 +1,12 @@
 # Wheat wide directories — Design
 
-Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 to 5
+Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 to 6
 and the switch-on landed, so every writer stores a directory wider than 256
-entries chunked. Step 6 (benchmarks and contracts, and the memoization question)
-and the docs remain. A tree-format change, so it lands before the V1 format
-freeze.
+entries chunked, under a benchmark contract. Per-chunk memoization in full
+verification and import (measured: needed) and the docs remain. A tree-format
+change, so it lands before the V1 format freeze.
 Owner: bart
-Last updated: 2026-10-26 (steps 3, 5 and the switch-on)
+Last updated: 2026-10-26 (step 6)
 
 ## Implementation status
 
@@ -120,6 +120,22 @@ land and move them from Outstanding to Done.
   `wheat-cli/tests/git_wide_directory.rs` pulls a 300-file Git directory, changes
   one file and pushes (Git sees only that file change, `fsck --strict` passes),
   then pulls a Git change to another file.
+- [x] **Step 6 — benchmarks and contracts.** `increment_validate` runs its flat
+  history (every file in one directory) to 100,000 changes under the same
+  contract as the spread one, and both now also record and bound the bytes a
+  create writes. Release, 2026-10-26, flat history:
+
+  | Directory size | Create (mean) | Create writes | Validate one change: reads | bytes | wall |
+  |---|---|---|---|---|---|
+  | 1,000 | 2.1 ms | 101 KB | 136 | 345 KB | 1.0 ms |
+  | 10,000 | 2.3 ms | 110 KB | 140 | 372 KB | 0.8 ms |
+  | 100,000 | 7.3 ms | 172 KB | 164 | 584 KB | 1.6 ms |
+
+  Per bit of directory size, from 1,000 to 100,000: validation reads 72%, bytes
+  102%; create reads 73%, writes 102% (budgets 125% and 150%). Building the
+  10,000-file history took 20 s, against 116 s with one record per directory.
+  `bootstrap_validate` gained the same flat history (to 10,000), which measured
+  the memoization question below.
 
 ### Outstanding
 
@@ -131,9 +147,15 @@ land and move them from Outstanding to Done.
   count (for the header's count check), its subdirectories' greatest height and
   its per-aggregate content check carried in the memo, in three walks. Decide
   from the step 6 numbers.
-- [ ] **Step 6 — benchmarks and contracts.** A contract on the flat layout in
-  `increment_validate` (reads and bytes per create and per validation grow with
-  the logarithm of the directory).
+
+  Measured (`bootstrap_validate`, release, 2026-10-26): full validation of the
+  flat history takes 68 s at 10,000 changes, against 17 s for the spread one,
+  with about the same objects and bytes read (its chunk reads hit
+  `CachedObjects`). A span trace puts 52 s of the 66 s in the two per-tree walks
+  over each view's new directory version: `authenticate_tree` 16.8 s and the
+  content walk (`tree`) 35.6 s. Both are quadratic in this shape, as they were
+  with one `TreeV1` per directory. Incremental validation (`validate_bootstrap`)
+  is not affected: 5.6 s flat against 6.4 s spread.
 - [ ] **Docs and TODO.md.** Close "A change in a large directory reads and
   writes the whole directory" and update `server-native-source-control-store.md`
   ("deterministic shards for exceptionally wide directories").
