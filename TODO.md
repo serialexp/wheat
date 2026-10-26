@@ -65,12 +65,6 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   has to release it, and an open must not cost O(store). Gothab also needs to fence a
   repository's writes when its primary moves: a store write should be refusable by a
   host-supplied check, so a stale primary after failover cannot write.
-- `[ ]` **Content backend is crate-private.** `ContentBackend` and
-  `ContentStore::with_backend` are `pub(crate)` (`content_store.rs`), and
-  `RemotePackedStore::open` takes only `S3ObjectStoreConfig` (`open_backend` with an
-  `Arc<dyn ObjectStore>` is private). An embedder can't put content in its own object
-  store client. Make one of them public; Gothab would keep structure on the host's disk
-  and content in its blobstore.
 - `[ ]` **No library call creates or deletes a served repository.** A served directory
   is made out of band as a local store. Add store-level create (empty, and from a Git
   import) and delete for embedders.

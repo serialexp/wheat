@@ -151,6 +151,27 @@ impl fmt::Debug for PackedObjectStore {
 }
 
 impl PackedEngine {
+    /// `id`'s record from the published content generation, a segment or a loose
+    /// envelope, in that order.
+    fn read_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
+        if let Some(record) = self.with_generation(id, |reader| reader.read(id))? {
+            return Ok(record.into());
+        }
+        // Content not yet repacked lives in segments as raw bytes, which the segment's
+        // reader verified as it read them.
+        let value = self
+            .catalog
+            .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), usize::MAX)
+            .map_err(|error| content_catalog_error(id, error))?;
+        if let Some(content) = value.and_then(VerifiedPayload::into_content) {
+            return Ok(StoredContent::Verified(content));
+        }
+        // Fall back to loose content store (which uses envelope files).
+        self.content
+            .read_local_raw_envelope(id)
+            .map(StoredContent::from)
+    }
+
     /// Stores the blobs of `contents` too large for a segment as loose files.
     /// Returns the catalog records of the rest, for the caller to append.
     fn content_records<'c>(
@@ -1341,74 +1362,12 @@ impl ContentBackend for PackedEngine {
         Ok(())
     }
 
-    fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
-        let generation = self
-            .catalog
-            .published()
-            .map_err(|error| content_catalog_error(id, error))?
-            .content_generation();
-        if generation.generation != 0 || generation.manifest != [0; 32] {
-            return crate::content_store::resolve_delta_chain(id, max, |current_id| {
-                self.get_stored(current_id)
-            })
-            .map(VerifiedContent::into_inner);
-        }
-        let value = self
-            .catalog
-            .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), max)
-            .map_err(|error| match error {
-                CatalogError::Segment(super::segment::SegmentError::ReadLimit { minimum }) => {
-                    ContentStoreError::TooLarge { id, max, minimum }
-                }
-                error => content_catalog_error(id, error),
-            })?;
-        if let Some(payload) = value.as_ref().filter(|payload| payload.bytes().len() > max) {
-            return Err(ContentStoreError::TooLarge {
-                id,
-                max,
-                minimum: payload.bytes().len(),
-            });
-        }
-        let Some(payload) = value else {
-            // Not in a packed segment — could be oversized raw content or a
-            // delta envelope in the loose content directory. Use
-            // resolve_delta_chain with our own get_stored so that a
-            // delta stored loose can reference a base in a packed segment.
-            let bytes = crate::content_store::resolve_delta_chain(id, max, |current_id| {
-                self.get_stored(current_id)
-            })?
-            .into_inner();
-            if let Some(trace) = &self.trace {
-                trace.content_get(bytes.len());
-            }
-            return Ok(bytes);
-        };
-        // SegmentReader authenticated the immutable segment and verified this
-        // payload against the requested content digest before returning it.
-        let bytes = payload.into_bytes();
-        if let Some(trace) = &self.trace {
-            trace.content_get(bytes.len());
-        }
-        Ok(bytes)
-    }
-
     fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
-        if let Some(record) = self.with_generation(id, |reader| reader.read(id))? {
-            return Ok(record.into());
+        let stored = self.read_stored(id)?;
+        if let Some(trace) = &self.trace {
+            trace.content_get(stored.stored_length());
         }
-        // Content not yet repacked lives in segments as raw bytes, which the segment's
-        // reader verified as it read them.
-        let value = self
-            .catalog
-            .get_bounded(CONTENT_NAMESPACE, *id.as_bytes(), usize::MAX)
-            .map_err(|error| content_catalog_error(id, error))?;
-        if let Some(content) = value.and_then(VerifiedPayload::into_content) {
-            return Ok(StoredContent::Verified(content));
-        }
-        // Fall back to loose content store (which uses envelope files).
-        self.content
-            .read_local_raw_envelope(id)
-            .map(StoredContent::from)
+        Ok(stored)
     }
 
     /// Answers from indexed metadata in the same order reads resolve content: the
@@ -1432,10 +1391,10 @@ impl ContentBackend for PackedEngine {
         &self,
         envelopes: &[(ContentId, Vec<u8>)],
     ) -> Result<(), ContentStoreError> {
-        // Delta envelopes are stored in the loose content directory. The read
-        // path (get_bounded) resolves delta chains via get_raw_envelope which
-        // checks both the packed catalog and loose files, so a delta whose base
-        // lives in a packed segment resolves correctly.
+        // Delta envelopes are stored in the loose content directory. Reads resolve
+        // delta chains through get_stored, which checks both the packed catalog
+        // and loose files, so a delta whose base lives in a packed segment
+        // resolves correctly.
         for (id, envelope) in envelopes {
             self.content.put_raw_envelope(*id, envelope.clone())?;
         }

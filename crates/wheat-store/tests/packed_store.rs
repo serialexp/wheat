@@ -149,6 +149,11 @@ fn logical_length_covers_every_packed_location_without_reading_payloads() {
     // Before close the record sits in the unpublished bulk segment.
     assert_eq!(content.logical_length(id).unwrap(), 4096);
     assert_eq!(trace.snapshot().unwrap().content_gets, 0);
+    // A read does count, so the zero above is not a counter that never moves.
+    assert_eq!(content.get(id).unwrap(), small);
+    let read = trace.snapshot().unwrap();
+    assert_eq!(read.content_gets, 1);
+    assert_eq!(read.content_get_bytes, 4096);
     drop(content);
     objects.close().unwrap();
 

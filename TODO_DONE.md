@@ -2,6 +2,18 @@
 
 Finished items, moved here from `TODO.md` under the same headings.
 
+## Hosting on Gothab (2026-10-26)
+
+- `[x]` **Content backend is crate-private.** An embedder now implements the public
+  `ContentBlobStore` (`crates/wheat-store/src/content_blobs.rs`): an async key/value
+  store of Wheat's content records (put, get, a ranged get for the header, optional
+  paged listing). `ContentStore::over_blobs` wraps it, keeping envelope encoding,
+  delta chains and the hash check inside Wheat, and `SeparateRepositoryStore` pairs it
+  with any object store, so Gothab can keep structure on the host's disk and content
+  in its blobstore. S3 content goes through the same path (`ObjectStoreBlobs`). Found
+  on the way: the packed store's `content_gets` trace counter had counted nothing
+  since reads moved to `get_stored` (eba97a7); it counts there now.
+
 ## Desktop client (2026-10-22)
 
 - `[x]` **`crates/wheat-client`**: the service code moved out of wheat-cli into a

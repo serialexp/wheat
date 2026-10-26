@@ -37,7 +37,11 @@ impl<'a> ContentItem<'a> {
     }
 }
 
-fn codec_error(id: ContentId, max: usize, error: codec::CodecError) -> ContentStoreError {
+pub(crate) fn codec_error(
+    id: ContentId,
+    max: usize,
+    error: codec::CodecError,
+) -> ContentStoreError {
     match error {
         codec::CodecError::ReadLimit { logical, .. } => ContentStoreError::TooLarge {
             id,
@@ -124,6 +128,14 @@ impl StoredContent {
             Self::Envelope(header, _) => header.logical_length,
         }
     }
+
+    /// The bytes read for this record: the content, or the envelope's payload.
+    pub(crate) fn stored_length(&self) -> usize {
+        match self {
+            Self::Verified(content) => content.len(),
+            Self::Envelope(_, payload) => payload.len(),
+        }
+    }
 }
 
 impl From<(codec::EnvelopeHeader, Vec<u8>)> for StoredContent {
@@ -135,7 +147,6 @@ impl From<(codec::EnvelopeHeader, Vec<u8>)> for StoredContent {
 pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
     /// Stores `contents`, which arrive verified and are not hashed again.
     fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError>;
-    fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError>;
 
     /// The content's record as stored: bytes the backend verified as it read them, or
     /// an envelope for `resolve_delta_chain` to resolve.
@@ -177,20 +188,6 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
     /// Remote backends override this to use a single LIST/scan call
     /// instead of one GET per item.
     fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
-        None
-    }
-
-    /// Fetch multiple content blobs concurrently.
-    ///
-    /// Returns `None` if the backend does not support concurrent reads
-    /// (the caller should fall back to sequential `get_bounded` calls).
-    /// Remote backends override this to issue concurrent S3 GETs.
-    #[allow(clippy::type_complexity)]
-    fn get_many_bounded(
-        &self,
-        _ids: &[ContentId],
-        _max: usize,
-    ) -> Option<Result<Vec<(ContentId, Vec<u8>)>, ContentStoreError>> {
         None
     }
 }
@@ -674,20 +671,12 @@ impl ContentStore {
         self.path(id).is_file()
     }
 
-    /// Fetch multiple content blobs, using concurrent reads when the
-    /// backend supports it (S3). Falls back to sequential `get_bounded`
-    /// for local filesystem backends.
+    /// Reads each of `ids` as [`Self::get_bounded`] does, one after another.
     pub fn get_many_bounded(
         &self,
         ids: &[ContentId],
         max: usize,
     ) -> Result<Vec<(ContentId, Vec<u8>)>, ContentStoreError> {
-        if let Some(backend) = &self.backend
-            && let Some(result) = backend.get_many_bounded(ids, max)
-        {
-            return result;
-        }
-        // Fallback: sequential reads (fast for local filesystem).
         let mut results = Vec::with_capacity(ids.len());
         for &id in ids {
             let bytes = self.get_bounded(id, max)?;

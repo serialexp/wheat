@@ -458,17 +458,6 @@ impl StagedBlob {
         self.content.len()
     }
 
-    fn bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
-        if self.len() > max {
-            return Err(ContentStoreError::TooLarge {
-                id,
-                max,
-                minimum: self.len(),
-            });
-        }
-        Ok(self.content.bytes().to_vec())
-    }
-
     fn stored(&self) -> StoredContent {
         StoredContent::Verified(self.content.clone())
     }
@@ -536,13 +525,6 @@ impl ContentBackend for StagedContent {
         self.stored.put_many(contents, WRITE_CONCURRENCY)
     }
 
-    fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
-        match self.staged(id)? {
-            Some(blob) => blob.bounded(id, max),
-            None => self.stored.get_bounded(id, max),
-        }
-    }
-
     fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
         match self.staged(id)? {
             Some(blob) => Ok(blob.stored()),
@@ -600,13 +582,6 @@ impl PendingContent {
 impl ContentBackend for PendingContent {
     fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError> {
         self.below.put_many(contents, WRITE_CONCURRENCY)
-    }
-
-    fn get_bounded(&self, id: ContentId, max: usize) -> Result<Vec<u8>, ContentStoreError> {
-        match self.pending(id) {
-            Some(blob) => blob.bounded(id, max),
-            None => self.below.get_bounded(id, max),
-        }
     }
 
     fn get_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {

@@ -274,15 +274,15 @@ itself often contains literal runs that compress well.
 
 ### Storage layout
 
-Content is stored as individual S3 keys via `RemoteContentBackend`
+Content is stored as individual S3 keys through `ObjectStoreBlobs`, the
+`ContentBlobStore` over the object store
 (`{prefix}/content/{first2hex}/{resthex}`), not inside packed segments.
 A delta record's base is just another ContentId in the same store —
 resolving it is a normal content lookup. There is no segment-boundary
 concern for content deltas.
 
-A delta read costs one extra content-store GET per chain link. With
-the concurrent `get_many_bounded` path, the base fetch can overlap
-with other content reads. Deep chains (up to the depth-16 cap) cost
+A delta read costs one extra content-store GET per chain link, issued
+one after another. Deep chains (up to the depth-16 cap) cost
 proportionally more GETs, but repack keeps chains short in practice.
 
 ### Expected impact
@@ -706,8 +706,8 @@ split in `SegmentIndexEntry`). This is the foundation for all
 compression work:
 
 - Phase 0 (content deltas) adds codec values 2/3 to the **content
-  envelope**. Content is currently stored as individual S3 keys via
-  `RemoteContentBackend`, so delta bases are resolved through the
+  envelope**. Content is currently stored as individual S3 keys
+  (`ObjectStoreBlobs`), so delta bases are resolved through the
   same content store — no segment interaction.
 - Phase 2 (block compression) adds codec value 4 to the segment
   index, building directly on their work.

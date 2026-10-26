@@ -82,7 +82,7 @@ top of them.
   in `wheat-store/src/remote_packed/` stores packed segments on S3-compatible
   backends (SeaweedFS, R2, Hetzner). In-memory index rebuilt from S3 catalog
   chain on startup. `SegmentBuilder` (ungated from `#[cfg(test)]`) builds
-  segments from buffered objects on `seal()`. `RemoteContentBackend` stores
+  segments from buffered objects on `seal()`. `ObjectStoreBlobs` stores
   content as individual S3 keys. `RepositoryEntry.objects` is now
   `Box<dyn ImmutableObjectStore>` with a blanket delegation impl; wheat-server
   `--store s3-packed` mode reads S3 config from `WHEAT_S3_*` env vars. LRU
@@ -246,7 +246,7 @@ is a trait the server takes as a parameter:
 ```text
 WheatServer::new(
     object_store,      // ImmutableObjectStore — local / S3 / R2
-    content_store,     // ContentBackend — global content tier
+    content_store,     // ContentBlobStore — global content tier
     head_coordinator,  // HeadCoordinator — CAS on repository heads
     catalog_backend,   // CatalogBackend — segment index / lookup
     auth_provider,     // AuthProvider — token validation
@@ -259,7 +259,7 @@ WheatServer::new(
 | `CatalogBackend` | Local SQLite (existing `PackedCatalog`) | Postgres + S3 | S3 index object |
 | `AuthProvider` | Config file / none (localhost) | Gothab auth middleware | OIDC / custom |
 | `ImmutableObjectStore` | `LooseObjectStore` | `S3ObjectStoreAdapter` | `S3ObjectStoreAdapter` |
-| `ContentBackend` | Local files | R2 / Hetzner | S3 |
+| `ContentBlobStore` (`ContentStore::over_blobs`) | Local files | Gothab blobstore | S3 |
 
 The protocol crate defines only messages and framing — it knows nothing
 about storage or coordination. The server crate composes the pieces. This

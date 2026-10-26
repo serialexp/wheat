@@ -11,7 +11,7 @@ use object_store::{
 use wheat_core::{ObjectId, SegmentId, validate_canonical_object};
 
 use super::catalog::RemoteCatalog;
-use super::content::RemoteContentBackend;
+use super::content::ObjectStoreBlobs;
 use super::segment_cache::SegmentCache;
 use crate::object_store_adapter::S3ObjectStoreConfig;
 use crate::packed::segment::{
@@ -19,8 +19,8 @@ use crate::packed::segment::{
     PreparedSegmentRecord, SegmentBuilder, SegmentError, SegmentRecord, prepare_record,
 };
 use crate::{
-    ContentItem, ContentStore, Durability, ImmutableObjectStore, ObjectKind, ObjectStoreError,
-    RepositoryStore, RepositoryStoreError, StoredObject, put_separately,
+    ContentItem, ContentStore, ImmutableObjectStore, ObjectKind, ObjectStoreError, RepositoryStore,
+    RepositoryStoreError, StoredObject, put_separately,
 };
 
 const DEFAULT_SEGMENT_CACHE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
@@ -185,16 +185,10 @@ impl RemotePackedStore {
 
     /// Returns a `ContentStore` backed by S3 individual keys.
     pub fn content_store(&self) -> ContentStore {
-        let backend =
-            RemoteContentBackend::new(Arc::clone(&self.backend), self.content_prefix.clone());
-        // Use a dummy root — the RemoteContentBackend handles all I/O.
-        // The ContentStore's loose fallback never fires because the backend
-        // is always present.
-        ContentStore::with_backend(
-            std::path::PathBuf::from("/dev/null"),
-            Arc::new(backend),
-            Durability::Durable,
-        )
+        ContentStore::over_blobs(Arc::new(ObjectStoreBlobs::new(
+            Arc::clone(&self.backend),
+            self.content_prefix.clone(),
+        )))
     }
 
     /// Download a segment into the cache if not already present, then look up

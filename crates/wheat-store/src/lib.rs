@@ -153,7 +153,9 @@ pub use view_lineage::{
     ViewLineageError, ViewLineageLimits, ViewLineageMapStore, ViewLineageValidation,
 };
 
+mod content_blobs;
 mod content_store;
+pub use content_blobs::{BlobPage, BlobRead, ContentBlobStore};
 pub use content_store::{ContentItem, ContentStore, ContentStoreError};
 
 /// Read-only segment and loose-object access for analysis tools (e.g.
