@@ -1,11 +1,12 @@
 # Wheat wide directories — Design
 
-Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0, 1,
-1b and 2 landed (format, validation, core builder, bucketed radix, the store's
-directory reader). Nothing writes chunked directories yet (steps 3 and 5, then
-the switch-on). A tree-format change, so it lands before the V1 format freeze.
+Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 to 5
+and the switch-on landed, so every writer stores a directory wider than 256
+entries chunked. Step 6 (benchmarks and contracts, and the memoization question)
+and the docs remain. A tree-format change, so it lands before the V1 format
+freeze.
 Owner: bart
-Last updated: 2026-10-26 (step 2)
+Last updated: 2026-10-26 (steps 3, 5 and the switch-on)
 
 ## Implementation status
 
@@ -64,25 +65,75 @@ land and move them from Outstanding to Done.
   instead of five copies. Tests in `wheat-store/tests/wide_directories.rs`
   count the reads of a lookup, a sorted batch and a diff. The object-graph walks
   that decode `TreeV1` themselves are step 4.
+- [x] **Step 4 — walks over the object graph.** A wide directory's chunks are
+  `RadixKind::Directory` in `object_graph`, so:
+  - `StructuralDelta` (fetch, push, publish) walks a chunked tree's radix like
+    any other and pairs each subdirectory with its old counterpart by name key,
+    whichever layout either side has (both chunked through the radix; a flat side
+    as the key list it holds; a directory that shrank to flat by looking each
+    subdirectory up in the old radix);
+  - metadata repack's `pair_trees` pairs two chunked directories' chunks at the
+    same edge path and their changed entries by name, walking a chunk with no
+    counterpart so an entry that moved between a bucket and a child chunk still
+    pairs; `reachable_from_view` keeps every chunk a tip reaches whole;
+  - the client's `store analyze` content classifier reads chunks;
+  - the snapshot closure walk already followed `for_each_reference`, which lists
+    a header's root and a chunk's children and entries;
+  - `staged_metrics` sizes its per-kind counters from `ObjectKind::HIGHEST_CODE`
+    (it panicked on kinds above 18, already true of 21 and 22).
+
+  Tests: `structural_delta` (only what changed comes back, across the threshold
+  both ways, nothing paired is read), `metadata_repack` (entry pairs and
+  same-kind proposals as buckets turn into chunks, tips keep every chunk), and the
+  CLI's `store_analyze` wide-directory case. Full verification and staged
+  import read a chunked tree whole through `read_node`, which is correct; see
+  per-chunk memoization below.
+- [x] **Step 3 — store writes.** `merkle_tree/directory.rs` writes both layouts:
+  - `write_directory` applies a batch of a directory's changes to the directory
+    it opened. Staying chunked, it updates the radix along the touched chunks
+    only, serving the chunks the open directory already read from memory; a batch
+    that crosses `T` either way rebuilds the directory in the other layout from
+    its entries. The new count comes from each name's slot (empty, held, or a
+    different name with the same key, which is refused).
+  - `write_entries` builds a directory from scratch through `build_directory`
+    (`write_node`, empty directories).
+
+  `apply_edits` and `final_update` both go through it. `final_update` stages its
+  writes in a `BatchObjectStore` and checks its byte budget against the staged
+  size, so `FinalTreeUpdateLimits` lost `max_node_bytes`: the format now bounds
+  a node (256 entries of names up to 255 bytes) and a chunk. `select_paths` looks
+  selector names up in a directory instead of listing it, so a selected path in
+  a wide directory reads its key path, not every chunk. Tests in
+  `wide_directories.rs`: batches crossing the threshold both ways, alternating
+  both writers, land on `build_directory`'s IDs, and one change reads and writes
+  only the chunks on its path. The I/O tests that assumed one node per directory
+  (`merkle_tree.rs` lookups and selections, `final_tree_update.rs`
+  `representative_wide_update_has_linear_io_budget`) count chunks now.
+- [x] **Switch-on.** `wire::tree_objects` builds with `build_directory`, so core
+  (`Repository`, the client's capture) writes the same IDs as the store, and
+  canonical validation refuses a `TreeV1` with more than 256 entries. The server
+  fetch test that needed a structural object larger than a batch used a
+  250,000-entry directory; it uses a change with a long description now.
+- [x] **Step 5 — Git bridge.** No code of its own: import writes trees through
+  the store's `apply_final_edits`, so a wide Git tree is stored chunked, and
+  export lists each directory with `read_node`, in name order, into one Git tree.
+  `wheat-cli/tests/git_wide_directory.rs` pulls a 300-file Git directory, changes
+  one file and pushes (Git sees only that file change, `fsck --strict` passes),
+  then pulls a Git change to another file.
 
 ### Outstanding
 
-- [ ] **Switch-on.** `wire::tree_objects` builds with `build_directory`, and
-  `TreeV1` refuses more than 256 entries. Lands with steps 3 and 5, once the store
-  reads and writes chunks, so no two writers disagree on a tree's ID.
-- [ ] **Step 3 — store writes.** `edit_node` and `final_update::apply` update a
-  chunked directory along the touched chunks only, converting between flat and
-  chunked when a directory crosses `T`.
-- [ ] **Step 4 — walks over the object graph.** `StructuralDelta`, the snapshot
-  closure walk, `object_graph::tree`, metadata repack's `pair_trees`, and full
-  verification's memoized tree walks follow chunk nodes.
-- [ ] **Step 5 — Git bridge.** Export iterates a chunked directory in name order
-  into one Git tree; import writes wide Git trees chunked.
+- [ ] **Per-chunk memoization in verification and import (measure first, in
+  step 6).** `repository_verify`'s `authenticate_tree` and `tree`, and staged
+  import's `authenticate_tree_once`, memoize per tree, so each new version of a
+  wide directory reads all its chunks: the bytes a flat `TreeV1` costs today, in
+  more objects. Skipping chunks proven before needs each skipped chunk's entry
+  count (for the header's count check), its subdirectories' greatest height and
+  its per-aggregate content check carried in the memo, in three walks. Decide
+  from the step 6 numbers.
 - [ ] **Step 6 — benchmarks and contracts.** A contract on the flat layout in
   `increment_validate` (reads and bytes per create and per validation grow with
-  the logarithm of the directory), plus updated I/O tests that assume one node
-  per directory (`final_tree_update.rs` `representative_wide_update_has_linear_io_budget`,
-  the `merkle_tree.rs` node-read count test).
+  the logarithm of the directory).
 - [ ] **Docs and TODO.md.** Close "A change in a large directory reads and
   writes the whole directory" and update `server-native-source-control-store.md`
   ("deterministic shards for exceptionally wide directories").

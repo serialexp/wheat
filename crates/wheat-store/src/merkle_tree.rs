@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, btree_map},
+    collections::{BTreeMap, BTreeSet, btree_map},
     iter::Peekable,
     num::NonZeroUsize,
     ops::Bound,
@@ -311,7 +311,6 @@ pub struct FinalTreeUpdateLimits {
     pub max_path_bytes: usize,
     pub max_depth: usize,
     pub max_nodes: usize,
-    pub max_node_bytes: usize,
     pub max_total_node_bytes: usize,
 }
 
@@ -323,7 +322,6 @@ impl Default for FinalTreeUpdateLimits {
             max_path_bytes: 64 * 1024 * 1024,
             max_depth: 128,
             max_nodes: 250_000,
-            max_node_bytes: 16 * 1024 * 1024,
             max_total_node_bytes: 256 * 1024 * 1024,
         }
     }
@@ -480,10 +478,17 @@ where
         self.write_node(&DirectoryNode::default()).await
     }
 
+    /// Writes a directory of `node`'s entries, in the layout their count calls for:
+    /// a flat `TreeV1`, or a chunked tree for more than 256.
     pub async fn write_node(&self, node: &DirectoryNode) -> Result<TreeId, MerkleTreeError> {
-        let bytes = node.canonical_bytes();
-        let id = node.id();
-        self.objects.put_if_absent(id.into(), &bytes).await?;
+        if let Some(id) = self.write_entries(node.entries.clone()).await? {
+            return Ok(id);
+        }
+        let empty = DirectoryNode::default();
+        let id = empty.id();
+        self.objects
+            .put_if_absent(id.into(), &empty.canonical_bytes())
+            .await?;
         Ok(id)
     }
 
@@ -925,8 +930,19 @@ where
 
         let read_limits = ReadLimits::from(limits);
         let mut count = ReadCount::default();
-        let root_node = self.read_directory(root, read_limits, &mut count).await?;
-        let mut buffered_entries = root_node.entries.len();
+        let root_node = self
+            .selection_entries(
+                root,
+                Some(
+                    (0..selectors.len())
+                        .map(|index| component(index, 0))
+                        .collect(),
+                ),
+                read_limits,
+                &mut count,
+            )
+            .await?;
+        let mut buffered_entries = root_node.len();
         if buffered_entries > limits.max_buffered_entries {
             return Err(MerkleTreeError::BufferedEntriesExceeded {
                 limit: limits.max_buffered_entries,
@@ -940,7 +956,7 @@ where
             selector_end: selectors.len(),
             component_depth: 0,
             selected: false,
-            entries: root_node.entries.into_iter(),
+            entries: root_node.into_iter(),
         });
         let mut matched = vec![false; selectors.len()];
         let mut files = Vec::new();
@@ -1026,8 +1042,17 @@ where
                             selected = true;
                         }
                     }
-                    let child_node = self.read_directory(child, read_limits, &mut count).await?;
-                    let buffered = buffered_entries.saturating_add(child_node.entries.len());
+                    let child_components = frame_component_depth + 1;
+                    let wanted = (!selected).then(|| {
+                        (first..end)
+                            .filter(|index| parsed[*index].component_len > child_components)
+                            .map(|index| component(index, child_components))
+                            .collect()
+                    });
+                    let child_node = self
+                        .selection_entries(child, wanted, read_limits, &mut count)
+                        .await?;
+                    let buffered = buffered_entries.saturating_add(child_node.len());
                     if buffered > limits.max_buffered_entries {
                         return Err(MerkleTreeError::BufferedEntriesExceeded {
                             limit: limits.max_buffered_entries,
@@ -1039,9 +1064,9 @@ where
                         depth: child_depth,
                         selector_cursor: first,
                         selector_end: end,
-                        component_depth: frame_component_depth + 1,
+                        component_depth: child_components,
                         selected,
-                        entries: child_node.entries.into_iter(),
+                        entries: child_node.into_iter(),
                     });
                 }
             }
@@ -1165,6 +1190,32 @@ where
         Ok(files)
     }
 
+    /// The entries of directory `id` a selection visits: all of them when `wanted`
+    /// is `None` (the whole directory is selected), otherwise those named in
+    /// `wanted`, looked up so a wide directory reads only the chunks on their paths.
+    async fn selection_entries(
+        &self,
+        id: TreeId,
+        wanted: Option<BTreeSet<&str>>,
+        limits: ReadLimits,
+        count: &mut ReadCount,
+    ) -> Result<BTreeMap<String, DirectoryEntry>, MerkleTreeError> {
+        let Some(wanted) = wanted else {
+            return Ok(self.read_directory(id, limits, count).await?.entries);
+        };
+        let mut directory = self.open_directory(id, limits, count).await?;
+        let mut entries = BTreeMap::new();
+        for name in wanted {
+            if let Some(entry) = self
+                .directory_get(&mut directory, name, limits, count)
+                .await?
+            {
+                entries.insert(name.to_owned(), entry);
+            }
+        }
+        Ok(entries)
+    }
+
     #[tracing::instrument(name = "tree_apply_edits", level = "debug", skip_all, fields(edits = edits.len()))]
     pub async fn apply_edits(
         &self,
@@ -1174,18 +1225,24 @@ where
         if edits.is_empty() {
             return Ok(root);
         }
-        let root_node = self.read_node(root).await?;
-        let root_node = self.edit_node(root_node, edits).await?;
-        self.write_node(&root_node).await
+        let root = self
+            .open_directory(root, ReadLimits::UNBOUNDED, &mut ReadCount::default())
+            .await?;
+        match self.edit_directory(root, edits).await? {
+            Some(root) => Ok(root),
+            None => self.empty_root().await,
+        }
     }
 
-    /// Applies `edits` to `node` and returns the result unwritten. Every changed
-    /// directory below it is written, except those left empty, which are dropped.
-    async fn edit_node(
+    /// Applies `edits` to `directory`, writes it and every changed directory below
+    /// it, and returns its ID; `None` when it is left empty (those below that are
+    /// left empty are dropped).
+    async fn edit_directory(
         &self,
-        mut node: DirectoryNode,
+        mut directory: Directory,
         edits: &[TreeEdit],
-    ) -> Result<DirectoryNode, MerkleTreeError> {
+    ) -> Result<Option<TreeId>, MerkleTreeError> {
+        let (limits, mut count) = (ReadLimits::UNBOUNDED, ReadCount::default());
         let mut grouped = BTreeMap::<String, Vec<TreeEdit>>::new();
         for edit in edits {
             let Some((first, rest)) = edit.path.split_first() else {
@@ -1197,37 +1254,31 @@ where
                 value: edit.value,
             });
         }
+        let mut changes = BTreeMap::new();
         for (name, child_edits) in grouped {
             let direct = child_edits.iter().find(|edit| edit.path.is_empty());
             if let Some(edit) = direct {
                 if child_edits.len() != 1 {
                     return Err(MerkleTreeError::FileInPath(name));
                 }
-                match edit.value {
-                    Some(value) => {
-                        node.entries.insert(name, DirectoryEntry::File(value));
-                    }
-                    None => {
-                        node.entries.remove(&name);
-                    }
-                }
+                changes.insert(name, edit.value.map(DirectoryEntry::File));
                 continue;
             }
 
-            let child = match node.entries.get(&name) {
-                Some(DirectoryEntry::Directory(id)) => self.read_node(*id).await?,
+            let child = match self
+                .directory_get(&mut directory, &name, limits, &mut count)
+                .await?
+            {
+                Some(DirectoryEntry::Directory(id)) => {
+                    self.open_directory(id, limits, &mut count).await?
+                }
                 Some(DirectoryEntry::File(_)) => return Err(MerkleTreeError::FileInPath(name)),
-                None => DirectoryNode::default(),
+                None => Directory::Flat(DirectoryNode::default()),
             };
-            let child = Box::pin(self.edit_node(child, &child_edits)).await?;
-            if child.entries.is_empty() {
-                node.entries.remove(&name);
-            } else {
-                let child = self.write_node(&child).await?;
-                node.entries.insert(name, DirectoryEntry::Directory(child));
-            }
+            let child = Box::pin(self.edit_directory(child, &child_edits)).await?;
+            changes.insert(name, child.map(DirectoryEntry::Directory));
         }
-        Ok(node)
+        self.write_directory(directory, changes).await
     }
 
     /// Apply mixed deletions and insertions as one final-tree update.

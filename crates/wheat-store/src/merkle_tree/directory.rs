@@ -5,17 +5,23 @@
 //! A name lookup reads the chunks on its key's path. Listing a directory in name
 //! order reads a chunked one whole and sorts it. Two chunked directories are
 //! compared through their radix, reading only the chunks where they differ.
+//!
+//! Writing a change to a chunked directory rewrites the chunks on the changed
+//! names' paths and its header; a directory that crosses the flat threshold is
+//! rebuilt in the other layout.
 
 use std::collections::{BTreeMap, HashMap, hash_map};
 
+use async_trait::async_trait;
 use wheat_core::{
-    ChunkedTree, DirectoryChunkEntry, DirectoryChunkId, DirectoryEntry, DirectoryNode, TreeId,
-    decode_chunked_tree, decode_directory_node, directory_name_key,
+    ChunkedTree, DirectoryChunkEntry, DirectoryChunkId, DirectoryEntry, DirectoryNode,
+    FLAT_DIRECTORY_MAX_ENTRIES, ObjectId, TreeId, build_directory, decode_chunked_tree,
+    decode_directory_node, directory_name_key,
 };
 
 use super::{MerkleTreeError, MerkleTreeStore};
 use crate::{
-    ImmutableObjectStore, ObjectKind, ObjectStoreError,
+    ImmutableObjectStore, ObjectKind, ObjectStoreError, StoredObject,
     directory_chunks::DirectoryChunkCollection,
     radix::{self, DiffEntry, DiffError, DiffLimits, Node},
 };
@@ -80,6 +86,13 @@ impl ReadCount {
 
 type ChunkNode = Node<DirectoryChunkId, DirectoryChunkEntry>;
 
+/// A chunk read from the store: decoded, and its canonical bytes for a write to
+/// read again.
+pub(crate) struct Chunk {
+    node: ChunkNode,
+    bytes: bytes::Bytes,
+}
+
 /// A directory opened from its [`TreeId`].
 pub(crate) enum Directory {
     /// A `TreeV1` record, decoded whole.
@@ -87,8 +100,53 @@ pub(crate) enum Directory {
     /// A chunked tree's header, with the chunks lookups have read so far.
     Chunked {
         tree: ChunkedTree,
-        chunks: HashMap<DirectoryChunkId, ChunkNode>,
+        chunks: HashMap<DirectoryChunkId, Chunk>,
     },
+}
+
+/// What a chunked directory holds at a name's key.
+enum Slot {
+    Empty,
+    Holds(DirectoryEntry),
+    /// Another name, whose key is the same.
+    Collides,
+}
+
+/// The store a chunked directory's update goes through: the radix update reads the
+/// chunks on the changed names' paths, which looking the names up has just read,
+/// so those come from memory.
+struct Remembered<'d, S> {
+    objects: &'d S,
+    chunks: &'d HashMap<DirectoryChunkId, Chunk>,
+}
+
+#[async_trait]
+impl<S: ImmutableObjectStore> ImmutableObjectStore for Remembered<'_, S> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.objects.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        match self
+            .chunks
+            .get(&DirectoryChunkId::from_digest(*id.as_bytes()))
+        {
+            Some(chunk) => Ok(StoredObject {
+                id,
+                kind: ObjectKind::DirectoryChunkNode,
+                canonical_bytes: chunk.bytes.clone(),
+            }),
+            None => self.objects.get(id).await,
+        }
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.objects.exists_many(ids).await
+    }
 }
 
 impl Directory {
@@ -106,6 +164,18 @@ impl Directory {
 pub(crate) struct DirectoryDiff {
     pub old: BTreeMap<String, DirectoryEntry>,
     pub new: BTreeMap<String, DirectoryEntry>,
+}
+
+fn apply(
+    entries: &mut BTreeMap<String, DirectoryEntry>,
+    changes: BTreeMap<String, Option<DirectoryEntry>>,
+) {
+    for (name, change) in changes {
+        match change {
+            Some(entry) => entries.insert(name, entry),
+            None => entries.remove(&name),
+        };
+    }
 }
 
 fn malformed(error: radix::Error) -> MerkleTreeError {
@@ -170,15 +240,18 @@ impl<S: ImmutableObjectStore> MerkleTreeStore<'_, S> {
         position: usize,
         limits: ReadLimits,
         count: &mut ReadCount,
-    ) -> Result<ChunkNode, MerkleTreeError> {
+    ) -> Result<Chunk, MerkleTreeError> {
         count.node(limits)?;
-        let (node, size) = radix::Store::<S, DirectoryChunkCollection>::new(self.objects)
-            .read_at_with_size(id, position)
-            .await
+        let object = self.objects.get(id.into()).await?;
+        ReadCount::bytes(limits, object.canonical_bytes.len())?;
+        let node = radix::Store::<S, DirectoryChunkCollection>::new(self.objects)
+            .decode_at(&object, position)
             .map_err(malformed)?;
-        ReadCount::bytes(limits, size)?;
         count.entries(limits, node.entries.len())?;
-        Ok(node)
+        Ok(Chunk {
+            node,
+            bytes: object.canonical_bytes,
+        })
     }
 
     /// What `directory` holds under `name`. A chunked directory reads the chunks on
@@ -195,39 +268,149 @@ impl<S: ImmutableObjectStore> MerkleTreeStore<'_, S> {
             Directory::Flat(node) => return Ok(node.entries.get(name).copied()),
             Directory::Chunked { tree, chunks } => (tree, chunks),
         };
+        Ok(
+            match self.slot(tree.root, chunks, name, limits, count).await? {
+                Slot::Holds(entry) => Some(entry),
+                // Two names cannot share a key, so another name there means `name` is
+                // absent.
+                Slot::Empty | Slot::Collides => None,
+            },
+        )
+    }
+
+    async fn slot(
+        &self,
+        root: DirectoryChunkId,
+        chunks: &mut HashMap<DirectoryChunkId, Chunk>,
+        name: &str,
+        limits: ReadLimits,
+        count: &mut ReadCount,
+    ) -> Result<Slot, MerkleTreeError> {
         let key = directory_name_key(name);
-        let mut id = tree.root;
+        let mut id = root;
         let mut position = 0;
         loop {
             let node = match chunks.entry(id) {
-                hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                hash_map::Entry::Occupied(entry) => &entry.into_mut().node,
                 hash_map::Entry::Vacant(entry) => {
-                    entry.insert(self.read_chunk(id, position, limits, count).await?)
+                    &entry
+                        .insert(self.read_chunk(id, position, limits, count).await?)
+                        .node
                 }
             };
             let end = position + node.prefix.len();
             if key[position..end] != node.prefix[..] {
-                return Ok(None);
+                return Ok(Slot::Empty);
             }
             let rest = &key[end..];
             if let Ok(index) = node
                 .entries
                 .binary_search_by(|(suffix, _)| suffix.as_slice().cmp(rest))
             {
-                // Two names cannot share a key, so another name here means `name`
-                // is absent.
                 let found = &node.entries[index].1;
-                return Ok((found.name == name).then_some(found.entry));
+                return Ok(if found.name == name {
+                    Slot::Holds(found.entry)
+                } else {
+                    Slot::Collides
+                });
             }
             let Some(edge) = rest.first() else {
-                return Ok(None);
+                return Ok(Slot::Empty);
             };
             let Ok(index) = node.children.binary_search_by_key(edge, |child| child.0) else {
-                return Ok(None);
+                return Ok(Slot::Empty);
             };
             id = node.children[index].1;
             position = end + 1;
         }
+    }
+
+    /// Writes `directory` with `changes` applied (`None` removes a name) and returns
+    /// its ID, or `None` when nothing is left in it.
+    ///
+    /// A chunked directory rewrites only the chunks on the changed names' paths,
+    /// reading those it has not read already. A directory that crosses
+    /// [`FLAT_DIRECTORY_MAX_ENTRIES`] either way is rebuilt in the other layout,
+    /// reading a chunked one whole.
+    pub(crate) async fn write_directory(
+        &self,
+        directory: Directory,
+        changes: BTreeMap<String, Option<DirectoryEntry>>,
+    ) -> Result<Option<TreeId>, MerkleTreeError> {
+        let (limits, mut count) = (ReadLimits::UNBOUNDED, ReadCount::default());
+        let (tree, mut chunks) = match directory {
+            Directory::Flat(mut node) => {
+                apply(&mut node.entries, changes);
+                return self.write_entries(node.entries).await;
+            }
+            Directory::Chunked { tree, chunks } => (tree, chunks),
+        };
+        let mut size = tree.count;
+        let mut edits = Vec::with_capacity(changes.len());
+        for (name, change) in &changes {
+            match (
+                self.slot(tree.root, &mut chunks, name, limits, &mut count)
+                    .await?,
+                change,
+            ) {
+                (Slot::Collides, Some(_)) => {
+                    return Err(MerkleTreeError::MalformedDirectory(
+                        "two names in the directory have the same key",
+                    ));
+                }
+                // Removing an absent name changes nothing; the key is the other
+                // name's.
+                (Slot::Collides, None) => continue,
+                (Slot::Empty, Some(_)) => size += 1,
+                (Slot::Holds(_), None) => size -= 1,
+                _ => {}
+            }
+            edits.push((
+                directory_name_key(name),
+                change.map(|entry| DirectoryChunkEntry {
+                    name: name.clone(),
+                    entry,
+                }),
+            ));
+        }
+        if size <= FLAT_DIRECTORY_MAX_ENTRIES as u64 {
+            let mut entries = self
+                .directory_entries(Directory::Chunked { tree, chunks }, limits, &mut count)
+                .await?;
+            apply(&mut entries, changes);
+            return self.write_entries(entries).await;
+        }
+        let objects = Remembered {
+            objects: self.objects,
+            chunks: &chunks,
+        };
+        let root = radix::Store::<_, DirectoryChunkCollection>::new(&objects)
+            .update_batch(tree.root, edits)
+            .await
+            .map_err(malformed)?;
+        let header = ChunkedTree::new(size, root)?;
+        let id = header.id();
+        self.objects
+            .put_if_absent(id.into(), &header.canonical_bytes())
+            .await?;
+        Ok(Some(id))
+    }
+
+    /// Writes a directory of `entries` from scratch, in the layout its size calls
+    /// for, and returns its ID; `None` when it is empty.
+    pub(crate) async fn write_entries(
+        &self,
+        entries: BTreeMap<String, DirectoryEntry>,
+    ) -> Result<Option<TreeId>, MerkleTreeError> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut objects = Vec::new();
+        let id = build_directory(entries, |object| objects.push(object))?;
+        for object in objects {
+            self.objects.put_if_absent(object.id, &object.bytes).await?;
+        }
+        Ok(Some(id))
     }
 
     /// Every entry of `directory`, in name order. A chunked directory is read whole,
@@ -239,9 +422,9 @@ impl<S: ImmutableObjectStore> MerkleTreeStore<'_, S> {
         limits: ReadLimits,
         count: &mut ReadCount,
     ) -> Result<BTreeMap<String, DirectoryEntry>, MerkleTreeError> {
-        let tree = match directory {
+        let (tree, mut chunks) = match directory {
             Directory::Flat(node) => return Ok(node.entries),
-            Directory::Chunked { tree, .. } => tree,
+            Directory::Chunked { tree, chunks } => (tree, chunks),
         };
         let mut entries = BTreeMap::new();
         // The key bytes above the node being read. Nodes pop depth first, so a
@@ -251,7 +434,11 @@ impl<S: ImmutableObjectStore> MerkleTreeStore<'_, S> {
         while let Some((id, above, edge)) = stack.pop() {
             key.truncate(above);
             key.extend(edge);
-            let node = self.read_chunk(id, key.len(), limits, count).await?;
+            // Lookups read chunks at the same positions.
+            let node = match chunks.remove(&id) {
+                Some(chunk) => chunk.node,
+                None => self.read_chunk(id, key.len(), limits, count).await?.node,
+            };
             key.extend_from_slice(&node.prefix);
             let end = key.len();
             for (_, entry) in node.entries {

@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use wheat_core::{ContentId, FileKind, FileValue, ObjectId};
+use wheat_core::{ContentId, DirectoryEntry, FileKind, FileValue, ObjectId};
 use wheat_store::{
     ImmutableObjectStore, LooseObjectStore, MerkleTreeError, MerkleTreeStore, ObjectStoreError,
     StoredObject, TreeEdit,
@@ -260,8 +260,21 @@ async fn representative_wide_update_has_linear_io_budget() {
         .map(|index| edit(&format!("wide/{index:04}"), Some("new")))
         .collect::<Vec<_>>();
 
+    // `wide` is chunked: each of its objects is read and written at most once.
+    let Some(&DirectoryEntry::Directory(wide)) =
+        trees.read_node(root).await.unwrap().entries.get("wide")
+    else {
+        panic!("wide is a directory");
+    };
+    let mut wide_objects = 0;
+    wheat_core::build_directory(trees.read_node(wide).await.unwrap().entries, |_| {
+        wide_objects += 1;
+    })
+    .unwrap();
+    assert!(wide_objects > 2, "wide is chunked");
+
     objects.reset();
     trees.apply_final_edits(root, &edits).await.unwrap();
-    assert!(objects.reads.load(Ordering::Relaxed) <= 2);
-    assert!(objects.writes.lock().unwrap().len() <= 2);
+    assert!(objects.reads.load(Ordering::Relaxed) <= 1 + wide_objects);
+    assert!(objects.writes.lock().unwrap().len() <= 1 + wide_objects);
 }

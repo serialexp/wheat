@@ -15,6 +15,7 @@ use crate::{
 };
 use crate::{
     ChunkedTree, DirectoryChunkChild, DirectoryChunkEntry, DirectoryChunkId, DirectoryChunkNode,
+    ObjectId,
 };
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -1196,20 +1197,19 @@ pub(crate) fn directory_node_bytes(node: &DirectoryNode) -> Vec<u8> {
 }
 
 pub(crate) fn tree_id(tree: &Tree) -> TreeId {
-    tree_objects(tree)
-        .pop()
-        .expect("every tree has a root directory")
-        .0
+    tree_objects(tree).0
 }
 
-pub(crate) fn tree_objects(tree: &Tree) -> Vec<(TreeId, Vec<u8>)> {
+/// The root of `tree`'s directories, and every object they take: a flat `TreeV1`
+/// per directory, or a chunked tree's header and chunks for a wide one.
+pub(crate) fn tree_objects(tree: &Tree) -> (TreeId, Vec<(ObjectId, Vec<u8>)>) {
     #[derive(Default)]
     struct PendingDirectory {
         files: BTreeMap<String, FileValue>,
         directories: BTreeMap<String, PendingDirectory>,
     }
 
-    fn emit(directory: PendingDirectory, objects: &mut Vec<(TreeId, Vec<u8>)>) -> TreeId {
+    fn emit(directory: PendingDirectory, objects: &mut Vec<(ObjectId, Vec<u8>)>) -> TreeId {
         let mut entries = directory
             .files
             .into_iter()
@@ -1218,11 +1218,8 @@ pub(crate) fn tree_objects(tree: &Tree) -> Vec<(TreeId, Vec<u8>)> {
         for (name, child) in directory.directories {
             entries.insert(name, DirectoryEntry::Directory(emit(child, objects)));
         }
-        let node = DirectoryNode { entries };
-        let bytes = directory_node_bytes(&node);
-        let id = TreeId::of_canonical_bytes(&bytes);
-        objects.push((id, bytes));
-        id
+        crate::build_directory(entries, |object| objects.push((object.id, object.bytes)))
+            .expect("a tree's directories are canonical")
     }
 
     let mut root = PendingDirectory::default();
@@ -1251,8 +1248,8 @@ pub(crate) fn tree_objects(tree: &Tree) -> Vec<(TreeId, Vec<u8>)> {
         }
     }
     let mut objects = Vec::new();
-    emit(root, &mut objects);
-    objects
+    let root = emit(root, &mut objects);
+    (root, objects)
 }
 
 pub(crate) fn change_bytes(change: &Change) -> Vec<u8> {
@@ -1639,6 +1636,11 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             }
         }
         wire::WheatObject::TreeV1(tree) => {
+            if tree.entries.len() > FLAT_DIRECTORY_MAX_ENTRIES {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "a flat directory holds at most 256 entries",
+                ));
+            }
             validate_sorted_unique_by(
                 &tree.entries,
                 |entry| entry.name.as_str(),

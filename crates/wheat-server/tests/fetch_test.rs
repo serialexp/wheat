@@ -397,17 +397,25 @@ async fn a_want_the_server_does_not_have_is_refused() {
 #[tokio::test]
 async fn a_wanted_object_too_large_for_a_batch_comes_in_chunks() {
     let served = serve_history(3).await;
-    // A directory holding a quarter million files is a structural object that
-    // grows past a batch.
-    let directory = wheat_core::DirectoryNode::new((0u32..250_000).map(|i| {
-        let file = wheat_core::FileValue {
-            content: ContentId::of(&i.to_le_bytes()),
-            kind: wheat_core::FileKind::Regular,
-        };
-        (format!("file-{i}"), wheat_core::DirectoryEntry::File(file))
-    }))
-    .unwrap();
-    let bytes = directory.canonical_bytes();
+    // A change whose description is longer than a batch is a structural object
+    // that grows past one.
+    let change = wheat_core::Change {
+        id: wheat_core::ChangeId::new(),
+        metadata: wheat_core::ChangeMetadata {
+            title: "large".into(),
+            description: "x".repeat(MAX_OBJECT_BATCH_SIZE + 1),
+            creator: wheat_core::Actor {
+                name: "test".into(),
+                email: "test@test".into(),
+            },
+            created_at: wheat_core::Timestamp {
+                seconds: 1_000_000,
+                offset_minutes: 0,
+            },
+            provenance: None,
+        },
+    };
+    let bytes = change.canonical_bytes();
     assert!(bytes.len() > MAX_OBJECT_BATCH_SIZE);
     let large = ObjectId::of_canonical_bytes(&bytes);
     served.objects.put_if_absent(large, &bytes).await.unwrap();

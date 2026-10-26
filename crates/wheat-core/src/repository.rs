@@ -1416,8 +1416,8 @@ fn single_outcome(outcome: RevisionsOutcome, change: ChangeId) -> RevisionOutcom
 }
 
 fn insert_tree_object(objects: &mut BTreeMap<ObjectId, Vec<u8>>, tree: &Tree) {
-    for (id, bytes) in crate::wire::tree_objects(tree) {
-        insert_canonical_object(objects, id.into(), bytes);
+    for (id, bytes) in crate::wire::tree_objects(tree).1 {
+        insert_canonical_object(objects, id, bytes);
     }
 }
 

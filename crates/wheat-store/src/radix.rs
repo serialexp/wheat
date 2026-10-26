@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin};
 
 use wheat_core::{CanonicalObjectError, ObjectId};
 
-use crate::{ImmutableObjectStore, ObjectKind, ObjectStoreError};
+use crate::{ImmutableObjectStore, ObjectKind, ObjectStoreError, StoredObject};
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -399,17 +399,15 @@ where
         Ok((public, decoded_bytes))
     }
 
-    /// Reads the node `id` at key byte `position`, checks its shape there, and
-    /// returns it with its canonical size.
-    pub(crate) async fn read_at_with_size(
+    /// Decodes `object` as a node at key byte `position` and checks its shape there.
+    pub(crate) fn decode_at(
         &self,
-        id: C::Id,
+        object: &StoredObject,
         position: usize,
-    ) -> Result<(Node<C::Id, C::Value>, usize), Error> {
-        let object = self.objects.get(id.into()).await?;
+    ) -> Result<Node<C::Id, C::Value>, Error> {
         if object.kind != C::KIND {
             return Err(ObjectStoreError::WrongKind {
-                id: id.into(),
+                id: object.id,
                 expected: C::KIND,
                 actual: object.kind,
             }
@@ -417,13 +415,11 @@ where
         }
         let node = C::unpack(C::decode(&object.canonical_bytes)?);
         self.validate_at(&node, position)?;
-        Ok((node, object.canonical_bytes.len()))
+        Ok(node)
     }
 
     async fn read_at(&self, id: C::Id, position: usize) -> Result<Node<C::Id, C::Value>, Error> {
-        self.read_at_with_size(id, position)
-            .await
-            .map(|(node, _)| node)
+        self.decode_at(&self.objects.get(id.into()).await?, position)
     }
 
     fn validate_at(&self, node: &Node<C::Id, C::Value>, position: usize) -> Result<(), Error> {

@@ -822,9 +822,17 @@ async fn select_paths_shares_ancestors_deduplicates_and_skips_unrelated_subtrees
             .collect::<Vec<_>>(),
         ["selected/a", "selected/nested/b", "selected/nested/c"]
     );
-    // Only root, selected, and selected/nested are read. None of the thousand
-    // unrelated directory roots (or their descendants) are fetched.
-    assert_eq!(objects.reads(), 3);
+    // The root is wide: of it, only the chunks on `selected`'s key path are read, as
+    // a lookup of `selected` reads them; then selected and selected/nested. None of
+    // the thousand unrelated directory roots (or their descendants) are fetched.
+    let selection_reads = objects.reads();
+    trees.lookup(root, &["selected".into()]).await.unwrap();
+    let path_reads = objects.reads() - selection_reads;
+    assert!(
+        path_reads <= 4,
+        "{path_reads} reads to one name of the root"
+    );
+    assert_eq!(selection_reads, path_reads + 2);
 }
 
 #[tokio::test]
@@ -1048,10 +1056,24 @@ async fn lookup_many_matches_lookup_and_reads_each_directory_once() {
     paths.sort();
     let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
 
+    // `a` is wide: a chunked tree of a header and chunks.
+    let Some(&DirectoryEntry::Directory(a)) = trees.read_node(root).await.unwrap().entries.get("a")
+    else {
+        panic!("a is a directory");
+    };
+    let mut a_objects = 0;
+    let rebuilt = wheat_core::build_directory(trees.read_node(a).await.unwrap().entries, |_| {
+        a_objects += 1;
+    })
+    .unwrap();
+    assert_eq!(rebuilt, a);
+    assert!(a_objects > 2, "a is chunked");
+
     let before = objects.reads();
     let many = trees.lookup_many(root, &paths).await.unwrap();
-    // root, a, a/deep: every directory node is decoded once, however many paths lie below it.
-    assert_eq!(objects.reads() - before, 3);
+    // root, every object of a, a/deep: each is decoded once, however many paths lie
+    // below it.
+    assert_eq!(objects.reads() - before, 1 + a_objects + 1);
 
     for (path, value) in paths.iter().zip(&many) {
         let components = path.split('/').map(str::to_owned).collect::<Vec<_>>();

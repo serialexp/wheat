@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use wheat_core::{DirectoryEntry, DirectoryNode, FileValue, TreeId, validate_directory_component};
 
-use super::{FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, TreeEdit};
-use crate::ImmutableObjectStore;
+use super::{
+    Directory, FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, ReadCount, ReadLimits,
+    TreeEdit,
+};
+use crate::{BatchObjectStore, ImmutableObjectStore};
 
 #[derive(Default)]
 struct FinalEditNode {
@@ -12,40 +15,34 @@ struct FinalEditNode {
     children: BTreeMap<String, FinalEditNode>,
 }
 
-enum UpdatedDirectory {
-    Empty,
-    Tree(TreeId),
-}
+/// The update's objects, held in memory until all of them are derived.
+type Staged<'s, 'o, S> = MerkleTreeStore<'s, BatchObjectStore<'o, S>>;
 
 struct Budget {
     limits: FinalTreeUpdateLimits,
-    nodes: usize,
-    bytes: usize,
 }
 
 impl Budget {
-    fn stage(&mut self, node: DirectoryNode) -> Result<DirectoryNode, MerkleTreeError> {
-        let bytes = node.canonical_bytes().len();
-        if bytes > self.limits.max_node_bytes {
-            return Err(MerkleTreeError::NodeBytesExceeded {
-                size: bytes,
-                limit: self.limits.max_node_bytes,
-            });
-        }
-        self.nodes += 1;
-        if self.nodes > self.limits.max_nodes {
+    /// Checks what the update holds staged against the limits, so the memory held
+    /// between derivation and persistence stays bounded. Each directory is checked
+    /// once written, so one directory's objects may pass a limit before it fails.
+    async fn check<S: ImmutableObjectStore>(
+        &self,
+        staged: &BatchObjectStore<'_, S>,
+    ) -> Result<(), MerkleTreeError> {
+        let (nodes, bytes) = staged.pending_size().await;
+        if nodes > self.limits.max_nodes {
             return Err(MerkleTreeError::NodeLimitExceeded {
                 limit: self.limits.max_nodes,
             });
         }
-        self.bytes = self.bytes.saturating_add(bytes);
-        if self.bytes > self.limits.max_total_node_bytes {
+        if bytes > self.limits.max_total_node_bytes {
             return Err(MerkleTreeError::StagedNodeBytesExceeded {
-                size: self.bytes,
+                size: bytes,
                 limit: self.limits.max_total_node_bytes,
             });
         }
-        Ok(node)
+        Ok(())
     }
 }
 
@@ -103,41 +100,39 @@ pub(super) async fn apply<S: ImmutableObjectStore>(
         node.direct = edit.value;
     }
 
-    let root_node = store.read_node(root).await?;
-    let mut pending = Vec::new();
-    let mut budget = Budget {
-        limits,
-        nodes: 0,
-        bytes: 0,
+    // Derive and check every final object before persisting any of them, so a
+    // rejected shape transition cannot leave orphan tree objects: writes stay in
+    // memory, read through, until the whole update is derived.
+    let staged = BatchObjectStore::new(store.objects, usize::MAX, usize::MAX);
+    let trees = MerkleTreeStore::new(&staged);
+    let budget = Budget { limits };
+    let root = trees
+        .open_directory(root, ReadLimits::UNBOUNDED, &mut ReadCount::default())
+        .await?;
+    let result = match update_directory(&trees, root, &final_edits, &budget).await? {
+        Some(id) => id,
+        None => trees.empty_root().await?,
     };
-    let updated =
-        update_directory(store, root_node, &final_edits, &mut pending, &mut budget).await?;
-    let result = match updated {
-        UpdatedDirectory::Tree(id) => id,
-        UpdatedDirectory::Empty => {
-            let empty = DirectoryNode::default();
-            let id = empty.id();
-            pending.push(empty);
-            id
-        }
-    };
-    // Derive and validate every final node before persisting any of them. A
-    // rejected shape transition therefore cannot leave orphan tree nodes.
-    for node in pending {
-        store.write_node(&node).await?;
-    }
+    budget.check(&staged).await?;
+    staged.flush().await?;
     Ok(result)
 }
 
+/// Applies `edits` to `directory` and stages it and every changed directory below
+/// it; `None` when it is left empty.
 async fn update_directory<S: ImmutableObjectStore>(
-    store: &MerkleTreeStore<'_, S>,
-    mut directory: DirectoryNode,
+    trees: &Staged<'_, '_, S>,
+    mut directory: Directory,
     edits: &FinalEditNode,
-    pending: &mut Vec<DirectoryNode>,
-    budget: &mut Budget,
-) -> Result<UpdatedDirectory, MerkleTreeError> {
+    budget: &Budget,
+) -> Result<Option<TreeId>, MerkleTreeError> {
+    let (limits, mut count) = (ReadLimits::UNBOUNDED, ReadCount::default());
+    let empty = || Directory::Flat(DirectoryNode::default());
+    let mut changes = BTreeMap::new();
     for (name, child_edits) in &edits.children {
-        let old = directory.entries.remove(name);
+        let old = trees
+            .directory_get(&mut directory, name, limits, &mut count)
+            .await?;
         let direct = child_edits.has_direct.then_some(child_edits.direct);
         let replacement = match (old, direct, child_edits.children.is_empty()) {
             (old, Some(Some(value)), true) => {
@@ -151,79 +146,41 @@ async fn update_directory<S: ImmutableObjectStore>(
             }
             (_, Some(None), true) => None,
             (Some(DirectoryEntry::File(_)), Some(None), false) => {
-                let empty = DirectoryNode::default();
-                match Box::pin(update_directory(store, empty, child_edits, pending, budget)).await?
-                {
-                    UpdatedDirectory::Tree(id) => Some(DirectoryEntry::Directory(id)),
-                    UpdatedDirectory::Empty => None,
-                }
+                Box::pin(update_directory(trees, empty(), child_edits, budget))
+                    .await?
+                    .map(DirectoryEntry::Directory)
             }
             (Some(DirectoryEntry::File(_)), _, false) => {
                 return Err(MerkleTreeError::FileInPath(name.clone()));
             }
             (Some(DirectoryEntry::Directory(id)), Some(Some(value)), false) => {
-                let old_child = store.read_node(id).await?;
-                match Box::pin(update_directory(
-                    store,
-                    old_child,
-                    child_edits,
-                    pending,
-                    budget,
-                ))
-                .await?
-                {
-                    UpdatedDirectory::Empty => Some(DirectoryEntry::File(value)),
-                    UpdatedDirectory::Tree(_) => {
-                        return Err(MerkleTreeError::FileInPath(name.clone()));
-                    }
+                let old_child = trees.open_directory(id, limits, &mut count).await?;
+                match Box::pin(update_directory(trees, old_child, child_edits, budget)).await? {
+                    None => Some(DirectoryEntry::File(value)),
+                    Some(_) => return Err(MerkleTreeError::FileInPath(name.clone())),
                 }
             }
             (Some(DirectoryEntry::Directory(_)), Some(None), false) => {
                 return Err(MerkleTreeError::FileInPath(name.clone()));
             }
             (Some(DirectoryEntry::Directory(id)), None, false) => {
-                let old_child = store.read_node(id).await?;
-                match Box::pin(update_directory(
-                    store,
-                    old_child,
-                    child_edits,
-                    pending,
-                    budget,
-                ))
-                .await?
-                {
-                    UpdatedDirectory::Tree(id) => Some(DirectoryEntry::Directory(id)),
-                    UpdatedDirectory::Empty => None,
-                }
+                let old_child = trees.open_directory(id, limits, &mut count).await?;
+                Box::pin(update_directory(trees, old_child, child_edits, budget))
+                    .await?
+                    .map(DirectoryEntry::Directory)
             }
             (None, Some(Some(_)), false) => {
                 return Err(MerkleTreeError::FileInPath(name.clone()));
             }
-            (None, _, false) => {
-                let empty = DirectoryNode::default();
-                match Box::pin(update_directory(store, empty, child_edits, pending, budget)).await?
-                {
-                    UpdatedDirectory::Tree(id) => Some(DirectoryEntry::Directory(id)),
-                    UpdatedDirectory::Empty => None,
-                }
-            }
-            (None, None, true) => None,
-            (Some(entry), None, true) => Some(entry),
+            (None, _, false) => Box::pin(update_directory(trees, empty(), child_edits, budget))
+                .await?
+                .map(DirectoryEntry::Directory),
+            // Nothing to change: every edit node has a direct edit or children.
+            (_, None, true) => continue,
         };
-        if let Some(replacement) = replacement {
-            directory.entries.insert(name.clone(), replacement);
-        }
+        changes.insert(name.clone(), replacement);
     }
-
-    if directory.entries.is_empty() {
-        Ok(UpdatedDirectory::Empty)
-    } else {
-        // Charge every retained directory body against the aggregate budget
-        // before it enters the pending write set, so the memory the caller
-        // holds between derivation and persistence stays bounded.
-        let directory = budget.stage(directory)?;
-        let id = directory.id();
-        pending.push(directory);
-        Ok(UpdatedDirectory::Tree(id))
-    }
+    let id = trees.write_directory(directory, changes).await?;
+    budget.check(trees.objects).await?;
+    Ok(id)
 }

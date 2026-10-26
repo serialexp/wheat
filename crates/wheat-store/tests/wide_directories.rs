@@ -1,5 +1,7 @@
 //! Every tree reader sees a wide (chunked) directory as the entries it holds, and a
-//! name lookup or a diff reads only the chunks it needs.
+//! name lookup or a diff reads only the chunks it needs. Every writer lands on the
+//! tree `build_directory` makes, rewriting only the chunks on the changed names'
+//! paths.
 
 use std::{
     collections::BTreeMap,
@@ -19,18 +21,23 @@ use wheat_core::{
 };
 use wheat_store::{
     ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, ObjectStoreAdapter, ObjectStoreError,
-    StoredObject, TreeContentWalkLimits, TreeDiff, TreeDiffLimits, TreeFile, TreeListing,
+    StoredObject, TreeContentWalkLimits, TreeDiff, TreeDiffLimits, TreeEdit, TreeFile, TreeListing,
     TreePathLimits, TreePathSelection, TreeSelectionLimits, TreeWalkLimits,
 };
 
 struct CountingStore<S> {
     inner: S,
     reads: AtomicUsize,
+    writes: AtomicUsize,
 }
 
 impl<S> CountingStore<S> {
     fn reads(&self) -> usize {
         self.reads.swap(0, Ordering::Relaxed)
+    }
+
+    fn writes(&self) -> usize {
+        self.writes.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -41,6 +48,7 @@ impl<S: ImmutableObjectStore> ImmutableObjectStore for CountingStore<S> {
         id: ObjectId,
         canonical_bytes: &[u8],
     ) -> Result<(), ObjectStoreError> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
         self.inner.put_if_absent(id, canonical_bytes).await
     }
 
@@ -60,6 +68,7 @@ fn store() -> Store {
     CountingStore {
         inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), "wide-directories"),
         reads: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
     }
 }
 
@@ -451,4 +460,111 @@ async fn a_subtree_under_another_edge_is_refused() {
             "an entry is filed under another name's key"
         ))
     ));
+}
+
+fn file_edit(name: &str, value: Option<FileValue>) -> TreeEdit {
+    TreeEdit {
+        path: path(&["wide", name]),
+        value,
+    }
+}
+
+/// `wide`'s entry in `root`, after checking that it is the tree `build_directory`
+/// makes of `expected` and lists as `expected`.
+async fn assert_wide(store: &Store, root: TreeId, expected: &BTreeMap<String, DirectoryEntry>) {
+    let trees = MerkleTreeStore::new(store);
+    let entries = trees.read_node(root).await.unwrap().entries;
+    let Some(&DirectoryEntry::Directory(wide)) = entries.get("wide") else {
+        panic!("wide is a directory");
+    };
+    let fresh = build_directory(expected.clone(), |_| {}).unwrap();
+    assert_eq!(wide, fresh, "{} entries", expected.len());
+    assert_eq!(&trees.read_node(wide).await.unwrap().entries, expected);
+}
+
+/// Batches of changes, additions and removals, through both writers, some crossing
+/// the flat threshold either way, each landing on the fresh build of its entries.
+#[tokio::test]
+async fn incremental_writes_land_on_the_fresh_build() {
+    let store = store();
+    let trees = MerkleTreeStore::new(&store);
+    let mut expected = files(300, 0);
+    let seed: Vec<_> = expected
+        .iter()
+        .map(|(name, entry)| {
+            let DirectoryEntry::File(value) = entry else {
+                unreachable!()
+            };
+            file_edit(name, Some(*value))
+        })
+        .collect();
+    let mut root = trees
+        .apply_edits(trees.empty_root().await.unwrap(), &seed)
+        .await
+        .unwrap();
+    assert_wide(&store, root, &expected).await;
+
+    // (first name, last name, version; 0 removes): 300 → change 20 → remove 60
+    // (240, flat) → add 120 (360, chunked) → remove 100 (260) → remove 10 (250,
+    // flat) → change 5 → add 10 (260, chunked).
+    let batches: [(usize, usize, u8); 7] = [
+        (0, 20, 1),
+        (240, 300, 0),
+        (240, 360, 2),
+        (0, 100, 0),
+        (100, 110, 0),
+        (200, 205, 3),
+        (500, 510, 4),
+    ];
+    for (round, (first, last, version)) in batches.into_iter().enumerate() {
+        let edits: Vec<_> = (first..last)
+            .map(|index| {
+                let name = name(index);
+                let value = (version != 0).then(|| value(&name, version));
+                match value {
+                    Some(value) => expected.insert(name.clone(), DirectoryEntry::File(value)),
+                    None => expected.remove(&name),
+                };
+                file_edit(&name, value)
+            })
+            .collect();
+        root = if round % 2 == 0 {
+            trees.apply_edits(root, &edits).await.unwrap()
+        } else {
+            trees.apply_final_edits(root, &edits).await.unwrap()
+        };
+        assert_wide(&store, root, &expected).await;
+    }
+}
+
+/// A one-file change in a wide directory reads and writes the root, the header and
+/// the chunks on the name's key path: what a lookup of it reads.
+#[tokio::test]
+async fn a_change_rewrites_only_the_chunks_on_its_path() {
+    let store = store();
+    let (root, _, objects) = fixture(&store, 10_000, 0).await;
+    let trees = MerkleTreeStore::new(&store);
+    let changed = name(4_242);
+    trees
+        .lookup(root, &path(&["wide", &changed]))
+        .await
+        .unwrap()
+        .unwrap();
+    let path_objects = store.reads();
+    assert!(path_objects <= 2 + 3, "{path_objects} objects to one name");
+    assert!(path_objects < objects);
+
+    let edit = [file_edit(&changed, Some(value(&changed, 1)))];
+    for final_update in [false, true] {
+        store.reads();
+        store.writes();
+        let updated = if final_update {
+            trees.apply_final_edits(root, &edit).await.unwrap()
+        } else {
+            trees.apply_edits(root, &edit).await.unwrap()
+        };
+        assert_ne!(updated, root);
+        assert_eq!(store.reads(), path_objects, "final update: {final_update}");
+        assert_eq!(store.writes(), path_objects, "final update: {final_update}");
+    }
 }
