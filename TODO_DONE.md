@@ -25,6 +25,16 @@ Finished items, moved here from `TODO.md` under the same headings.
   publication. The server does not pass them on yet (publish hooks item). On the way,
   retiring repacked content at open looks only at the recorded loose files instead of
   one `unlink` per manifest entry, and open removes what crashed writes left behind.
+- `[x]` **No library call creates or deletes a served repository.**
+  `wheat_store::RepositoryDirectory` is the served layout (`storage/` and
+  `repository.head`). `create_empty(label)` builds a first envelope over an empty tree
+  in a hidden stage and renames it into place; `begin_create` gives the same stage to
+  other builders, and the atomic Git import now uses it instead of its own copy.
+  `delete` refuses while the store is open anywhere (it holds the catalog lock through
+  the rename) and renames the directory to a hidden tombstone before removing it. A
+  per-name lock serialises creates and deletes, and either sweeps the marked stages and
+  tombstones a crash left. `Registry::from_repos_dir` skips hidden entries; it had
+  tried to open a stage or tombstone left in a repos directory as a repository.
 
 ## Desktop client (2026-10-22)
 

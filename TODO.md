@@ -68,9 +68,6 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   has to release it, and an open must not cost O(store). Gothab also needs to fence a
   repository's writes when its primary moves: a store write should be refusable by a
   host-supplied check, so a stale primary after failover cannot write.
-- `[ ]` **No library call creates or deletes a served repository.** A served directory
-  is made out of band as a local store. Add store-level create (empty, and from a Git
-  import) and delete for embedders.
 - `[ ]` **No consistent snapshot of a live served repository.** Gothab backs repositories
   up to object storage and moves them between hosts (drain, snapshot, stage,
   activate). Wheat needs a way to quiesce one repository (finish the group commit,

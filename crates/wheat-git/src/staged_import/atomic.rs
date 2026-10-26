@@ -1,28 +1,20 @@
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    ffi::{OsStr, OsString},
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use thiserror::Error;
-use uuid::Uuid;
 use wheat_store::{
     Durability, LocalPublicationStore, ObjectStoreError, PackedObjectStore,
-    PackedStoreTraceSnapshot, RepositoryHead, sync_directory, sync_filesystem,
+    PackedStoreTraceSnapshot, RepositoryDirectory, RepositoryDirectoryError, RepositoryHead,
+    sync_filesystem,
 };
 
 use super::{
     FinalizeImportError, FinalizePhase, StagedImportError,
     finalize::finalize_import_deferred_with_observer, stage_import_deferred,
 };
-
-const MARKER_NAME: &str = "import.marker";
-const MARKER: &[u8] = b"wheat-atomic-import-v1\n";
-const STAGE_SUFFIX: &str = ".tmp";
 
 /// Stable coarse boundaries and bounded progress emitted by a traced atomic import.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +104,20 @@ pub enum AtomicImportError {
     Validation(String),
 }
 
+impl From<RepositoryDirectoryError> for AtomicImportError {
+    fn from(error: RepositoryDirectoryError) -> Self {
+        match error {
+            RepositoryDirectoryError::MissingParent => Self::MissingParent,
+            RepositoryDirectoryError::Exists(path) => Self::DestinationExists(path),
+            RepositoryDirectoryError::Locked(path) => Self::AlreadyLocked(path),
+            RepositoryDirectoryError::Io(error) => Self::Io(error),
+            RepositoryDirectoryError::Store(error) => Self::Store(error),
+            // Creating and installing a stage reports none of the rest.
+            error => Self::Io(io::Error::other(error)),
+        }
+    }
+}
+
 /// Imports a Git repository into a fresh directory with one terminal durability checkpoint.
 ///
 /// In-progress work is isolated in a hidden sibling directory and is intentionally not
@@ -149,41 +155,14 @@ where
     F: FnMut(AtomicImportEvent),
 {
     let git_path = git_path.as_ref();
-    let destination = destination.as_ref();
-    let parent = destination
-        .parent()
-        .ok_or(AtomicImportError::MissingParent)?;
-    let name = destination
-        .file_name()
-        .ok_or(AtomicImportError::MissingParent)?;
-    if !parent.is_dir() {
-        return Err(
-            io::Error::new(io::ErrorKind::NotFound, "destination parent is missing").into(),
-        );
-    }
 
     observer(AtomicImportEvent::PhaseStarted {
         phase: AtomicImportPhase::LockAndCleanup,
     });
     let phase_started = Instant::now();
-    let stage_prefix = private_stage_prefix(name);
-    let lock_path = parent.join(private_lock_name(name));
-    let lock = DestinationLock::acquire(lock_path)?;
-    if destination.exists() {
-        return Err(AtomicImportError::DestinationExists(
-            destination.to_path_buf(),
-        ));
-    }
-
-    remove_stale_stages(parent, &stage_prefix)?;
-
-    let mut staging_name = stage_prefix.clone();
-    staging_name.push(Uuid::new_v4().to_string());
-    staging_name.push(STAGE_SUFFIX);
-    let staging = parent.join(staging_name);
-    fs::create_dir(&staging)?;
-    let mut cleanup = StageCleanup::new(staging.clone());
-    write_stage_marker(&staging)?;
+    let mut pending = RepositoryDirectory::new(destination.as_ref()).begin_create()?;
+    let stage = pending.directory().clone();
+    let staging = stage.root();
     observer(AtomicImportEvent::PhaseFinished {
         phase: AtomicImportPhase::LockAndCleanup,
         elapsed: phase_started.elapsed(),
@@ -195,14 +174,10 @@ where
         });
         let phase_started = Instant::now();
         let (objects, trace) = if traced {
-            let (objects, trace) =
-                PackedObjectStore::open_deferred_traced(staging.join("storage"))?;
+            let (objects, trace) = PackedObjectStore::open_deferred_traced(stage.storage())?;
             (objects, Some(trace))
         } else {
-            (
-                PackedObjectStore::open_deferred(staging.join("storage"))?,
-                None,
-            )
+            (PackedObjectStore::open_deferred(stage.storage())?, None)
         };
         observer(AtomicImportEvent::PhaseFinished {
             phase: AtomicImportPhase::OpenStore,
@@ -210,10 +185,8 @@ where
         });
         let content = objects.content_store();
         let journal = staging.join("import.sqlite");
-        let publications = LocalPublicationStore::with_durability(
-            staging.join("repository.head"),
-            Durability::Deferred,
-        );
+        let publications =
+            LocalPublicationStore::with_durability(stage.head(), Durability::Deferred);
 
         observer(AtomicImportEvent::PhaseStarted {
             phase: AtomicImportPhase::Stage,
@@ -335,7 +308,7 @@ where
             phase: AtomicImportPhase::FilesystemSync,
         });
         let phase_started = Instant::now();
-        sync_filesystem(&staging)?;
+        sync_filesystem(staging)?;
         observer(AtomicImportEvent::PhaseFinished {
             phase: AtomicImportPhase::FilesystemSync,
             elapsed: phase_started.elapsed(),
@@ -347,8 +320,7 @@ where
         phase: AtomicImportPhase::Install,
     });
     let phase_started = Instant::now();
-    rename_noreplace(&staging, destination)?;
-    cleanup.disarm();
+    pending.install()?;
     observer(AtomicImportEvent::PhaseFinished {
         phase: AtomicImportPhase::Install,
         elapsed: phase_started.elapsed(),
@@ -357,164 +329,11 @@ where
         phase: AtomicImportPhase::ParentSync,
     });
     let phase_started = Instant::now();
-    sync_directory(parent)?;
+    pending.sync_parent()?;
     observer(AtomicImportEvent::PhaseFinished {
         phase: AtomicImportPhase::ParentSync,
         elapsed: phase_started.elapsed(),
     });
-    drop(lock);
+    drop(pending);
     Ok(head)
-}
-
-fn private_stage_prefix(destination_name: &OsStr) -> OsString {
-    let mut prefix = OsString::from(".");
-    prefix.push(destination_name);
-    prefix.push(".wheat-import-");
-    prefix
-}
-
-fn private_lock_name(destination_name: &OsStr) -> OsString {
-    let mut name = OsString::from(".");
-    name.push(destination_name);
-    name.push(".wheat-import.lock");
-    name
-}
-
-fn write_stage_marker(staging: &Path) -> io::Result<()> {
-    let marker_path = staging.join(MARKER_NAME);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut marker = options.open(marker_path)?;
-    marker.write_all(MARKER)?;
-    marker.sync_all()?;
-    sync_directory(staging)
-}
-
-fn remove_stale_stages(parent: &Path, prefix: &OsStr) -> io::Result<()> {
-    let prefix = prefix.as_encoded_bytes();
-    let mut removed_any = false;
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.as_encoded_bytes();
-        if !name.starts_with(prefix) || !name.ends_with(STAGE_SUFFIX.as_bytes()) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() || file_type.is_symlink() || !has_exact_stage_marker(&entry.path()) {
-            continue;
-        }
-        fs::remove_dir_all(entry.path())?;
-        removed_any = true;
-    }
-    if removed_any {
-        sync_directory(parent)?;
-    }
-    Ok(())
-}
-
-/// Off Unix a marker cannot be opened without following a symlink, so no
-/// directory counts as a stage and none is removed.
-#[cfg(not(unix))]
-fn has_exact_stage_marker(_candidate: &Path) -> bool {
-    false
-}
-
-#[cfg(unix)]
-fn has_exact_stage_marker(candidate: &Path) -> bool {
-    use std::io::Read as _;
-
-    let marker = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(candidate.join(MARKER_NAME))
-    {
-        Ok(marker) => marker,
-        Err(_) => return false,
-    };
-    let metadata = match marker.metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return false,
-    };
-    if !metadata.file_type().is_file() || metadata.len() != MARKER.len() as u64 {
-        return false;
-    }
-    let mut contents = [0_u8; MARKER.len()];
-    let mut marker = marker;
-    marker.read_exact(&mut contents).is_ok() && contents == MARKER
-}
-
-struct DestinationLock {
-    _file: File,
-}
-
-impl DestinationLock {
-    fn acquire(path: PathBuf) -> Result<Self, AtomicImportError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(fs::TryLockError::WouldBlock) => Err(AtomicImportError::AlreadyLocked(path)),
-            Err(fs::TryLockError::Error(error)) => Err(error.into()),
-        }
-    }
-}
-
-struct StageCleanup {
-    path: Option<PathBuf>,
-}
-
-impl StageCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for StageCleanup {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_dir_all(path);
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "renaming without replacing needs Linux's renameat2",
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let destination = CString::new(destination.as_os_str().as_bytes())?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
 }

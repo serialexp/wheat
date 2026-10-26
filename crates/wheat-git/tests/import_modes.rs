@@ -214,11 +214,11 @@ async fn resuming_after_a_tampered_mapping_is_refused() {
 }
 
 fn private_stage(root: &Path, destination: &str, id: &str) -> PathBuf {
-    root.join(format!(".{destination}.wheat-import-{id}.tmp"))
+    root.join(format!(".{destination}.wheat-stage-{id}.tmp"))
 }
 
 fn stage_names(root: &Path, destination: &str) -> Vec<String> {
-    let prefix = format!(".{destination}.wheat-import-");
+    let prefix = format!(".{destination}.wheat-stage-");
     let mut names = std::fs::read_dir(root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -515,15 +515,15 @@ async fn atomic_import_removes_only_marker_authenticated_stale_stages_for_its_de
         std::fs::create_dir(path).unwrap();
         std::fs::write(path.join("sentinel"), b"keep").unwrap();
     }
-    std::fs::write(stale.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+    std::fs::write(stale.join("stage.marker"), b"wheat-repository-stage-v1\n").unwrap();
     for path in [&other_destination, &similarly_named_destination] {
-        std::fs::write(path.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+        std::fs::write(path.join("stage.marker"), b"wheat-repository-stage-v1\n").unwrap();
     }
-    std::fs::write(malformed.join("import.marker"), b"wrong\n").unwrap();
-    std::fs::create_dir(marker_directory.join("import.marker")).unwrap();
+    std::fs::write(malformed.join("stage.marker"), b"wrong\n").unwrap();
+    std::fs::create_dir(marker_directory.join("stage.marker")).unwrap();
     let external_marker = root.path().join("external-marker");
-    std::fs::write(&external_marker, b"wheat-atomic-import-v1\n").unwrap();
-    symlink(&external_marker, marker_symlink.join("import.marker")).unwrap();
+    std::fs::write(&external_marker, b"wheat-repository-stage-v1\n").unwrap();
+    symlink(&external_marker, marker_symlink.join("stage.marker")).unwrap();
     symlink(&symlink_target, &stage_symlink).unwrap();
 
     atomic_import(git.path(), &destination, "refs/heads/main")
@@ -560,7 +560,7 @@ async fn destination_exists_does_not_clean_authenticated_stale_stages() {
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("sentinel"), b"keep").unwrap();
     std::fs::create_dir(&stale).unwrap();
-    std::fs::write(stale.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+    std::fs::write(stale.join("stage.marker"), b"wheat-repository-stage-v1\n").unwrap();
     std::fs::write(stale.join("sentinel"), b"stale").unwrap();
 
     assert!(matches!(
@@ -581,7 +581,7 @@ async fn repeated_atomic_failures_do_not_accumulate_private_stages() {
     let destination = root.path().join("repository");
     let stale = private_stage(root.path(), "repository", "stale");
     std::fs::create_dir(&stale).unwrap();
-    std::fs::write(stale.join("import.marker"), b"wheat-atomic-import-v1\n").unwrap();
+    std::fs::write(stale.join("stage.marker"), b"wheat-repository-stage-v1\n").unwrap();
 
     for _ in 0..3 {
         assert!(
@@ -612,7 +612,7 @@ async fn atomic_finalization_failure_removes_its_private_stage_and_leaves_no_des
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains("wheat-import-") && name.ends_with(".tmp"))
+        .filter(|name| name.contains("wheat-stage-") && name.ends_with(".tmp"))
         .collect::<Vec<_>>();
     assert!(leftovers.is_empty(), "private stages remain: {leftovers:?}");
 }

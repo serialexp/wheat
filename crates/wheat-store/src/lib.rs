@@ -55,6 +55,7 @@ mod remote_packed;
 pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
 mod publication;
 mod radix;
+mod repository_directory;
 mod repository_envelope;
 mod repository_hydration;
 mod repository_integration;
@@ -131,6 +132,7 @@ pub use publication::{
     LocalPublicationStore, PUBLISH_RECEIPT_RETENTION_SECONDS, PublicationError, PublicationStore,
     RepositoryHead,
 };
+pub use repository_directory::{PendingRepository, RepositoryDirectory, RepositoryDirectoryError};
 pub use repository_mutation::{
     AuthoringSession, PersistedConflictResolution, PersistedRepositoryMutator,
     PreparedRepositoryMutation, RepositoryMutationError,

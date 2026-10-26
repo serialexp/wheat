@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use wheat_store::{
-    ContentStore, LocalPublicationStore, ObjectStoreError, PackedObjectStore, RepositoryStore,
+    ContentStore, LocalPublicationStore, ObjectStoreError, RepositoryDirectory, RepositoryStore,
 };
 
 use crate::commit::GroupCommit;
@@ -24,9 +24,10 @@ pub struct RepositoryEntry {
 impl RepositoryEntry {
     /// Opens the packed store in `data_dir/storage` and its publication head.
     pub fn open(data_dir: &Path) -> Result<Self, ObjectStoreError> {
+        let directory = RepositoryDirectory::new(data_dir);
         Ok(Self::new(
-            Box::new(PackedObjectStore::open(data_dir.join("storage"))?),
-            LocalPublicationStore::new(data_dir.join("repository.head")),
+            Box::new(directory.open_store()?),
+            directory.publications(),
         ))
     }
 
@@ -80,7 +81,9 @@ impl Registry {
     }
 
     /// Create a registry from a directory where each subdirectory is a
-    /// repository (named `owner/repo` from the two-level nesting).
+    /// repository (named `owner/repo` from the two-level nesting). Hidden
+    /// entries are skipped: they hold repositories still being created or deleted
+    /// (see [`RepositoryDirectory`]).
     pub fn from_repos_dir(repos_dir: &Path) -> std::io::Result<Self> {
         let mut repos = HashMap::new();
         for owner_entry in std::fs::read_dir(repos_dir)? {
@@ -93,6 +96,9 @@ impl Registry {
             let Some(owner_str) = owner_name.to_str() else {
                 continue;
             };
+            if owner_str.starts_with('.') {
+                continue;
+            }
             for repo_entry in std::fs::read_dir(&owner_path)? {
                 let repo_entry = repo_entry?;
                 let repo_path = repo_entry.path();
@@ -103,6 +109,9 @@ impl Registry {
                 let Some(repo_str) = repo_name.to_str() else {
                     continue;
                 };
+                if repo_str.starts_with('.') {
+                    continue;
+                }
                 let name = format!("{owner_str}/{repo_str}");
                 let entry = RepositoryEntry::open(&repo_path).map_err(std::io::Error::other)?;
                 repos.insert(name, Arc::new(entry));
