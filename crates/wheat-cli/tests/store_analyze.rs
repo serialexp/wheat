@@ -51,6 +51,13 @@ fn store_path(workspace: &Path) -> std::path::PathBuf {
 }
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fixture_with(|_| {})
+}
+
+/// [`fixture`] with more files, written by `extra` into the Git source.
+fn fixture_with(
+    extra: impl FnOnce(&Path),
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let stores = root.path().join("stores");
     let source = root.path().join("git");
@@ -58,7 +65,8 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     fs::create_dir(&source).unwrap();
     git(&source, &["init", "-b", "main"]);
     fs::write(source.join("file.txt"), b"one\ntwo\nthree\n").unwrap();
-    git(&source, &["add", "file.txt"]);
+    extra(&source);
+    git(&source, &["add", "."]);
     git(&source, &["commit", "-m", "root"]);
     ok(
         root.path(),
@@ -101,6 +109,40 @@ fn analyze_is_repeatable_read_only_and_census_is_exhaustive() {
             .as_u64()
             .unwrap()
             >= 1
+    );
+}
+
+/// A directory too wide for one tree node is stored in chunks; its files are
+/// whole-file content all the same.
+#[test]
+fn analyze_finds_the_files_of_a_wide_directory() {
+    let (root, stores, workspace) = fixture_with(|source| {
+        fs::create_dir(source.join("wide")).unwrap();
+        for index in 0..300 {
+            fs::write(
+                source.join(format!("wide/f{index}.txt")),
+                format!("file {index}\n"),
+            )
+            .unwrap();
+        }
+    });
+    let store = store_path(&workspace);
+    let output = ok(
+        root.path(),
+        &stores,
+        &[
+            "--store",
+            store.to_str().unwrap(),
+            "--format",
+            "json",
+            "store",
+            "analyze",
+        ],
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["result"]["content_roles"]["whole_file_only_ids"], 301,
+        "{value}"
     );
 }
 

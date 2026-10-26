@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use wheat_core::{
-    ApplicationResultRecord, DirectoryEntry, EditOperation, ObjectId, decode_application_record,
-    decode_content_set_node, decode_directory_node, decode_edit_record,
-    decode_repository_envelope_record, decode_repository_head, decode_repository_state_record,
-    decode_retained_set_node, decode_revision_record, decode_view_label_manifest_record,
-    decode_view_record,
+    ApplicationResultRecord, CanonicalObjectError, CanonicalObjectKind, DirectoryEntry,
+    EditOperation, ObjectId, decode_application_record, decode_chunked_tree,
+    decode_content_set_node, decode_directory_chunk_node, decode_directory_node,
+    decode_edit_record, decode_repository_envelope_record, decode_repository_head,
+    decode_repository_state_record, decode_retained_set_node, decode_revision_record,
+    decode_view_label_manifest_record, decode_view_record,
 };
 use wheat_store::packed_segment_reader::{self, AuthenticatedSegment, read_loose_envelope};
 
@@ -171,24 +172,42 @@ pub(super) fn classify(store_root: &Path) -> Result<ContentRoles> {
         edits.extend(application.applied.keys().map(|id| *id.as_bytes()));
     }
 
-    let mut seen_trees = HashSet::new();
+    // Trees and a wide directory's chunks, each read once.
+    let mut seen = HashSet::new();
+    let mut chunks = Vec::new();
     while let Some(tree) = trees.iter().next().copied() {
         trees.remove(&tree);
-        if !seen_trees.insert(tree) {
+        if !seen.insert(tree) {
             continue;
         }
-        for entry in decode_directory_node(&source.read(tree)?)?
-            .entries
-            .into_values()
-        {
-            match entry {
-                DirectoryEntry::File(file) => {
-                    roles.whole.insert(*file.content.as_bytes());
-                }
-                DirectoryEntry::Directory(child) => {
-                    trees.insert(*child.as_bytes());
+        let mut visit = |entry| match entry {
+            DirectoryEntry::File(file) => {
+                roles.whole.insert(*file.content.as_bytes());
+            }
+            DirectoryEntry::Directory(child) => {
+                trees.insert(*child.as_bytes());
+            }
+        };
+        let bytes = source.read(tree)?;
+        match decode_directory_node(&bytes) {
+            Ok(node) => node.entries.into_values().for_each(&mut visit),
+            Err(CanonicalObjectError::WrongKind {
+                actual: CanonicalObjectKind::ChunkedTree,
+                ..
+            }) => {
+                chunks.push(*decode_chunked_tree(&bytes)?.root.as_bytes());
+                while let Some(chunk) = chunks.pop() {
+                    if !seen.insert(chunk) {
+                        continue;
+                    }
+                    let node = decode_directory_chunk_node(&source.read(chunk)?)?;
+                    chunks.extend(node.children.iter().map(|child| *child.child.as_bytes()));
+                    for (_, entry) in node.entries {
+                        visit(entry.entry);
+                    }
                 }
             }
+            Err(error) => return Err(error.into()),
         }
     }
     for edit in edits {
