@@ -33,7 +33,8 @@
 //!
 //! The state and envelope pair field by field. Radix nodes pair by key path (with path
 //! compression, an old node may cover only part of a new node's prefix). Directory
-//! nodes pair by entry name. A new view pairs with its nearest ancestor in the old
+//! nodes pair by entry name; a wide directory's chunks are a radix keyed by the hash of
+//! the name, and pair with the old directory's whichever layout it has. A new view pairs with its nearest ancestor in the old
 //! retained views, found through the lineage map's new parent → child links; a
 //! revision's tree pairs with the tree of the view it was authored against, an
 //! application's with its target view's. Views are only walked after the state-level
@@ -184,6 +185,8 @@ enum Role {
     ProjectedCommits,
     /// A view's tips.
     Tips,
+    /// A wide directory's chunks.
+    Directory,
 }
 
 impl Role {
@@ -203,6 +206,7 @@ impl Role {
             Self::AggregateContent => RadixKind::ContentSet,
             Self::ProjectedCommits => RadixKind::ProjectedCommitSet,
             Self::Tips => RadixKind::ChangeSet,
+            Self::Directory => RadixKind::Directory,
         }
     }
 
@@ -219,6 +223,7 @@ impl Role {
                 | Self::ConflictSet
                 | Self::ViewContent
                 | Self::Tips
+                | Self::Directory
         )
     }
 
@@ -315,6 +320,13 @@ fn old_value_at(old: &OldRadix) -> OldValue {
 enum OldValue {
     Absent,
     Present(Option<ObjectId>),
+    Unknown,
+}
+
+/// The old counterpart of a directory, in whichever layout it has.
+enum OldDirectory {
+    Flat(wheat_core::DirectoryNode),
+    Chunked(wheat_core::DirectoryChunkId),
     Unknown,
 }
 
@@ -652,18 +664,19 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         }
     }
 
-    /// Reads an old-side object; missing (or the wrong kind) means "no counterpart".
+    /// Reads an old-side object; missing (or not one of `kinds`) means "no
+    /// counterpart".
     async fn read_old(
         &mut self,
         id: Option<ObjectId>,
-        kind: ObjectKind,
+        kinds: &[ObjectKind],
     ) -> Result<Option<StoredObject>> {
         let Some(id) = id else {
             return Ok(None);
         };
         self.stats.old_reads += 1;
         match self.objects.get(id).await {
-            Ok(stored) if stored.kind == kind => Ok(Some(stored)),
+            Ok(stored) if kinds.contains(&stored.kind) => Ok(Some(stored)),
             Ok(_) => Ok(None),
             Err(ObjectStoreError::Missing(_)) => {
                 self.stats.old_missing += 1;
@@ -704,7 +717,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(None);
         };
         let record = decode(&stored, wheat_core::decode_repository_envelope_record)?;
-        let old = match self.read_old(old, ObjectKind::RepositoryEnvelope).await? {
+        let old = match self
+            .read_old(old, &[ObjectKind::RepositoryEnvelope])
+            .await?
+        {
             Some(old) => Some(decode(&old, wheat_core::decode_repository_envelope_record)?),
             None => None,
         };
@@ -737,7 +753,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(None);
         };
         let new = decode(&stored, wheat_core::decode_repository_state_record)?;
-        let old = match self.read_old(old, ObjectKind::RepositoryState).await? {
+        let old = match self.read_old(old, &[ObjectKind::RepositoryState]).await? {
             Some(old) => Some(decode(&old, wheat_core::decode_repository_state_record)?),
             None => None,
         };
@@ -851,24 +867,84 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         if self.prune_proven_old(task.id()) {
             return Ok(None);
         }
-        let Some(stored) = self.read_new(&task, "tree", &[ObjectKind::Tree]).await? else {
+        const LAYOUTS: [ObjectKind; 2] = [ObjectKind::Tree, ObjectKind::ChunkedTree];
+        let Some(stored) = self.read_new(&task, "tree", &LAYOUTS).await? else {
             return Ok(None);
         };
-        let node = decode(&stored, wheat_core::decode_directory_node)?;
-        let old = match self.read_old(old, ObjectKind::Tree).await? {
-            Some(old) => Some(decode(&old, wheat_core::decode_directory_node)?),
-            None => None,
+        let old = match self.read_old(old, &LAYOUTS).await? {
+            Some(old) if old.kind == ObjectKind::Tree => {
+                OldDirectory::Flat(decode(&old, wheat_core::decode_directory_node)?)
+            }
+            Some(old) => OldDirectory::Chunked(decode(&old, wheat_core::decode_chunked_tree)?.root),
+            None => OldDirectory::Unknown,
         };
-        object_graph::tree(&node, |reference| match reference {
-            Ref::Object(TreeSite::Directory(name), id) => {
-                let old_child = old.as_ref().and_then(|old| match old.entries.get(name) {
+        if stored.kind == ObjectKind::ChunkedTree {
+            let root = ObjectId::from(decode(&stored, wheat_core::decode_chunked_tree)?.root);
+            match old {
+                OldDirectory::Chunked(old_root) => {
+                    self.push_radix_root(root, Role::Directory, Some(old_root.into()), None)?;
+                }
+                OldDirectory::Flat(old) => self.push(Task::Radix {
+                    id: root,
+                    role: Role::Directory,
+                    path: KeyPath::ROOT,
+                    old: OldRadix::Keys(
+                        old.entries
+                            .iter()
+                            .map(|(name, entry)| {
+                                let value = match entry {
+                                    DirectoryEntry::Directory(id) => Some(ObjectId::from(*id)),
+                                    DirectoryEntry::File(_) => None,
+                                };
+                                (wheat_core::directory_name_key(name).to_vec(), value)
+                            })
+                            .collect(),
+                    ),
+                    parent: None,
+                })?,
+                OldDirectory::Unknown => {
+                    self.push_radix_root(root, Role::Directory, None, None)?;
+                }
+            }
+            return Ok(self.emit(stored));
+        }
+        let node = decode(&stored, wheat_core::decode_directory_node)?;
+        let mut children = Vec::new();
+        object_graph::tree(&node, |reference| {
+            if let Ref::Object(TreeSite::Directory(name), id) = reference {
+                children.push((name, id));
+            }
+            Ok::<_, StructuralDeltaError>(())
+        })?;
+        // The directory shrank below the chunking threshold: each subdirectory's old
+        // counterpart is under its name's key, below the old root read once here.
+        let old_root = match &old {
+            OldDirectory::Chunked(root) if !children.is_empty() => {
+                self.advance(OldRadix::Id((*root).into()), &[], Role::Directory)
+                    .await?
+            }
+            _ => OldRadix::Unknown,
+        };
+        for (name, id) in children {
+            let old_child = match &old {
+                OldDirectory::Flat(old) => match old.entries.get(name) {
                     Some(DirectoryEntry::Directory(id)) => Some(ObjectId::from(*id)),
                     _ => None,
-                });
-                self.push_paired(Task::Tree { id, old: old_child }, old_child)
-            }
-            Ref::Content(_) => Ok(()),
-        })?;
+                },
+                OldDirectory::Chunked(_) => {
+                    let key = wheat_core::directory_name_key(name);
+                    let there = self
+                        .advance(old_root.clone(), &key, Role::Directory)
+                        .await?;
+                    match old_value_at(&there) {
+                        OldValue::Present(value) => value,
+                        OldValue::Absent | OldValue::Unknown => None,
+                    }
+                }
+                OldDirectory::Unknown => None,
+            };
+            self.push_paired(Task::Tree { id, old: old_child }, old_child)?;
+        }
         Ok(self.emit(stored))
     }
 
@@ -1015,7 +1091,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
     }
 
     async fn read_old_radix(&mut self, id: ObjectId, role: Role) -> Result<Option<Arc<RadixNode>>> {
-        let Some(stored) = self.read_old(Some(id), role.kind()).await? else {
+        let Some(stored) = self.read_old(Some(id), &[role.kind()]).await? else {
             return Ok(None);
         };
         Ok(Some(Arc::new(decode(&stored, |bytes| role.decode(bytes))?)))
@@ -1065,6 +1141,13 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             Role::ChangeMap => self.push_entity(target, Entity::Change, false),
             Role::RevisionMap => self.push_entity(target, Entity::Revision, false),
             Role::ApplicationMap => self.push_entity(target, Entity::Application, false),
+            Role::Directory => {
+                let old = match old {
+                    OldValue::Present(old) => old,
+                    OldValue::Absent | OldValue::Unknown => None,
+                };
+                self.push_paired(Task::Tree { id: target, old }, old)
+            }
             // Content keys are blobs, projected commits name retained applications and
             // tips are change IDs, and object_graph lists none of them as references.
             Role::ViewContent | Role::AggregateContent | Role::ProjectedCommits | Role::Tips => {
@@ -1244,7 +1327,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         if let Some(&record) = self.old_views.get(&view) {
             return Ok(record);
         }
-        let record = match self.read_old(Some(view.into()), ObjectKind::View).await? {
+        let record = match self
+            .read_old(Some(view.into()), &[ObjectKind::View])
+            .await?
+        {
             Some(stored) => Some(decode(&stored, wheat_core::decode_view_record)?),
             None => None,
         };
@@ -1261,7 +1347,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(());
         }
         if let Some(stored) = self
-            .read_old(Some(revision.into()), ObjectKind::Revision)
+            .read_old(Some(revision.into()), &[ObjectKind::Revision])
             .await?
         {
             let record = decode(&stored, wheat_core::decode_revision_record)?;
@@ -1463,6 +1549,10 @@ fn decode<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use wheat_core::TreeId;
+
     use super::*;
     use crate::{Durability, LooseObjectStore};
 
@@ -1616,5 +1706,118 @@ mod tests {
         // Backwards, removed keys collapse children into inline entries.
         let (_, unproven) = walk_set(&objects, Some(new), old).await;
         assert_eq!(unproven, keys[..100].iter().copied().collect());
+    }
+
+    fn file(tag: &str) -> DirectoryEntry {
+        DirectoryEntry::File(wheat_core::FileValue {
+            content: wheat_core::ContentId::of(tag.as_bytes()),
+            kind: wheat_core::FileKind::Regular,
+        })
+    }
+
+    async fn directory(
+        objects: &LooseObjectStore,
+        entries: BTreeMap<String, DirectoryEntry>,
+    ) -> TreeId {
+        let mut written = Vec::new();
+        let id = wheat_core::build_directory(entries, |object| written.push(object)).unwrap();
+        for object in written {
+            objects
+                .put_if_absent(object.id, &object.bytes)
+                .await
+                .unwrap();
+        }
+        id
+    }
+
+    /// A directory of `files` files and `subdirectories` subdirectories of one file
+    /// each; the entries named in `changed` hold other contents.
+    async fn wide(
+        objects: &LooseObjectStore,
+        files: usize,
+        subdirectories: usize,
+        changed: &[&str],
+    ) -> TreeId {
+        let tag = |name: &str| {
+            if changed.contains(&name) {
+                format!("{name} changed")
+            } else {
+                name.to_owned()
+            }
+        };
+        let mut entries = BTreeMap::new();
+        for index in 0..files {
+            let name = format!("f{index}");
+            entries.insert(name.clone(), file(&tag(&name)));
+        }
+        for index in 0..subdirectories {
+            let name = format!("d{index}");
+            let inner = directory(objects, [("inner".to_owned(), file(&tag(&name)))].into()).await;
+            entries.insert(name, DirectoryEntry::Directory(inner));
+        }
+        directory(objects, entries).await
+    }
+
+    /// Walks one tree against another, which must need nothing it doesn't have.
+    async fn walk_tree(
+        objects: &LooseObjectStore,
+        old: Option<TreeId>,
+        new: TreeId,
+    ) -> (HashSet<ObjectId>, StructuralDeltaStats) {
+        let nothing = RepositoryEnvelopeId::from_digest([0; 32]);
+        let mut walk = StructuralDelta::new(objects, Some(nothing), nothing, Default::default());
+        walk.push(Task::Tree {
+            id: new.into(),
+            old: old.map(Into::into),
+        })
+        .unwrap();
+        let mut yielded = HashSet::new();
+        while let Some(step) = walk.next().await.unwrap() {
+            match step {
+                DeltaStep::Object(object) => assert!(yielded.insert(object.id)),
+                DeltaStep::Missing(ids) => panic!("the walk needs {ids:?}"),
+            }
+        }
+        (yielded, walk.stats().clone())
+    }
+
+    /// A wide directory pairs with its old version whichever layout either has, so
+    /// only what changed comes back: when both are chunked, when it grows past the
+    /// flat threshold and when it shrinks below it.
+    #[tokio::test]
+    async fn a_wide_directory_yields_only_what_changed() {
+        let (_dir, objects) = store();
+        for (old_files, new_files) in [(3_000, 3_000), (200, 300), (300, 200)] {
+            let context = format!("{old_files} -> {new_files} files");
+            let old = wide(&objects, old_files, 40, &[]).await;
+            let new = wide(&objects, new_files, 40, &["f3", "d5"]).await;
+            let (old_closure, _) = walk_tree(&objects, None, old).await;
+            let (new_closure, _) = walk_tree(&objects, None, new).await;
+            let (yielded, stats) = walk_tree(&objects, Some(old), new).await;
+            let expected: HashSet<_> = new_closure.difference(&old_closure).copied().collect();
+            assert_eq!(yielded, expected, "{context}");
+            // Nothing that pairs is even read.
+            assert_eq!(stats.new_reads, yielded.len() as u64, "{context}");
+        }
+    }
+
+    /// The walk of a wide directory from nothing finds every chunk and subdirectory.
+    #[tokio::test]
+    async fn a_wide_directory_from_nothing_yields_its_closure() {
+        let (_dir, objects) = store();
+        let mut written = Vec::new();
+        let entries: BTreeMap<_, _> = (0..1_000)
+            .map(|index| (format!("f{index}"), file(&index.to_string())))
+            .collect();
+        let tree = wheat_core::build_directory(entries, |object| written.push(object)).unwrap();
+        for object in &written {
+            objects
+                .put_if_absent(object.id, &object.bytes)
+                .await
+                .unwrap();
+        }
+        let (yielded, _) = walk_tree(&objects, None, tree).await;
+        assert!(written.len() > 2, "the directory is chunked");
+        assert_eq!(yielded, written.iter().map(|object| object.id).collect());
     }
 }

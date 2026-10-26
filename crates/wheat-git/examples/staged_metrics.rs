@@ -9,7 +9,7 @@ use wheat_core::ObjectId;
 use wheat_git::{FinalizePhase, finalize_import_with_observer, stage_import};
 use wheat_store::*;
 
-const OBJECT_KIND_COUNT: usize = 18;
+const OBJECT_KIND_COUNT: usize = ObjectKind::HIGHEST_CODE as usize;
 
 struct Meter {
     inner: PackedObjectStore,

@@ -14,7 +14,8 @@
 //! (parent) view's objects are paired with the newer (child) view's objects at
 //! the same position:
 //!
-//! - directory nodes at the same path, descending only where IDs differ;
+//! - directory nodes at the same path, descending only where IDs differ (a wide
+//!   directory's chunks pair at the same edge path, like the maps' nodes);
 //! - file content at the same path, where it differs;
 //! - revision- and application-map radix nodes at the same edge path;
 //! - the views' required-content sets.
@@ -28,14 +29,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wheat_core::{
-    CanonicalObjectError, ContentId, DirectoryEntry, ObjectId, RepositoryStateId, ViewId,
-    decode_application_map_node, decode_content_map_node, decode_directory_node,
+    CanonicalObjectError, ContentId, DirectoryChunkNode, DirectoryEntry, ObjectId,
+    RepositoryStateId, ViewId, decode_application_map_node, decode_chunked_tree,
+    decode_content_map_node, decode_directory_chunk_node, decode_directory_node,
     decode_repository_state_record, decode_revision_map_node, decode_view_record,
 };
 
 use crate::{
-    CollectionError, ContentHistoryPair, ImmutableObjectStore, ObjectStoreError, RetainedSetStore,
-    ViewLineageError, ViewLineageMapStore,
+    CollectionError, ContentHistoryPair, ImmutableObjectStore, ObjectKind, ObjectStoreError,
+    RetainedSetStore, ViewLineageError, ViewLineageMapStore,
 };
 
 type Digest = [u8; 32];
@@ -324,11 +326,58 @@ async fn view_roots<S: ImmutableObjectStore>(
     })
 }
 
-async fn directory_entries<S: ImmutableObjectStore>(
+type Entries = BTreeMap<String, DirectoryEntry>;
+
+/// A directory as stored: its entries, or the root chunk of a wide one.
+enum Directory {
+    Flat(Entries),
+    Chunked(Digest),
+}
+
+async fn directory<S: ImmutableObjectStore>(
     store: &S,
     id: Digest,
-) -> Result<BTreeMap<String, DirectoryEntry>, HistoryPlanError> {
-    Ok(decode_directory_node(&read(store, id).await?)?.entries)
+) -> Result<Directory, HistoryPlanError> {
+    let stored = store.get(ObjectId::from_digest(id)).await?;
+    Ok(if stored.kind == ObjectKind::ChunkedTree {
+        Directory::Chunked(
+            *decode_chunked_tree(&stored.canonical_bytes)?
+                .root
+                .as_bytes(),
+        )
+    } else {
+        Directory::Flat(decode_directory_node(&stored.canonical_bytes)?.entries)
+    })
+}
+
+async fn chunk<S: ImmutableObjectStore>(
+    store: &S,
+    id: Digest,
+) -> Result<DirectoryChunkNode, HistoryPlanError> {
+    Ok(decode_directory_chunk_node(&read(store, id).await?)?)
+}
+
+/// Every entry of a directory, reading all of a wide one's chunks.
+async fn all_entries<S: ImmutableObjectStore>(
+    store: &S,
+    directory: Directory,
+) -> Result<Entries, HistoryPlanError> {
+    let root = match directory {
+        Directory::Flat(entries) => return Ok(entries),
+        Directory::Chunked(root) => root,
+    };
+    let mut entries = Entries::new();
+    let mut chunks = vec![root];
+    while let Some(id) = chunks.pop() {
+        let node = chunk(store, id).await?;
+        chunks.extend(node.children.iter().map(|child| *child.child.as_bytes()));
+        entries.extend(
+            node.entries
+                .into_iter()
+                .map(|(_, entry)| (entry.name, entry.entry)),
+        );
+    }
+    Ok(entries)
 }
 
 async fn map_children<S: ImmutableObjectStore>(
@@ -371,9 +420,26 @@ async fn pair_trees<S: ImmutableObjectStore>(
         if older == newer {
             continue;
         }
-        proposals.propose(older, newer)?;
-        let newer_entries = directory_entries(store, newer).await?;
-        for (name, older_entry) in directory_entries(store, older).await? {
+        let (older_entries, newer_entries) = match (
+            directory(store, older).await?,
+            directory(store, newer).await?,
+        ) {
+            (Directory::Flat(older_entries), Directory::Flat(newer_entries)) => {
+                proposals.propose(older, newer)?;
+                (older_entries, newer_entries)
+            }
+            (Directory::Chunked(older_root), Directory::Chunked(newer_root)) => {
+                proposals.propose(older, newer)?;
+                pair_chunks(store, proposals, older_root, newer_root).await?
+            }
+            // The directory crossed the chunking threshold: a flat node and a
+            // chunk header make no delta, but their entries still pair.
+            (older_directory, newer_directory) => (
+                all_entries(store, older_directory).await?,
+                all_entries(store, newer_directory).await?,
+            ),
+        };
+        for (name, older_entry) in older_entries {
             match (older_entry, newer_entries.get(&name)) {
                 (DirectoryEntry::Directory(older), Some(DirectoryEntry::Directory(newer))) => {
                     pending.push((*older.as_bytes(), *newer.as_bytes()));
@@ -388,6 +454,54 @@ async fn pair_trees<S: ImmutableObjectStore>(
         }
     }
     Ok(())
+}
+
+/// Pairs two wide directories' chunks at every shared edge path whose IDs differ,
+/// and returns the entries held by every chunk that differs, on each side.
+///
+/// An entry that changed is held by a differing chunk on both sides, though not
+/// necessarily at the same edge path: two entries sharing a key byte sit inline on
+/// one side and in a child chunk on the other. So a chunk with no counterpart is
+/// walked too; it holds only entries that were added or removed below it.
+async fn pair_chunks<S: ImmutableObjectStore>(
+    store: &S,
+    proposals: &mut Proposals,
+    older: Digest,
+    newer: Digest,
+) -> Result<(Entries, Entries), HistoryPlanError> {
+    let mut entries = (Entries::new(), Entries::new());
+    let mut pending = vec![(Some(older), Some(newer))];
+    while let Some((older, newer)) = pending.pop() {
+        if older.is_some() && older == newer {
+            continue;
+        }
+        if let (Some(older), Some(newer)) = (older, newer) {
+            proposals.propose(older, newer)?;
+        }
+        let mut children = BTreeMap::<u8, (Option<Digest>, Option<Digest>)>::new();
+        if let Some(older) = older {
+            let node = chunk(store, older).await?;
+            for child in &node.children {
+                children.entry(child.edge).or_default().0 = Some(*child.child.as_bytes());
+            }
+            let older_entries = node.entries.into_iter().map(|(_, entry)| entry);
+            entries
+                .0
+                .extend(older_entries.map(|entry| (entry.name, entry.entry)));
+        }
+        if let Some(newer) = newer {
+            let node = chunk(store, newer).await?;
+            for child in &node.children {
+                children.entry(child.edge).or_default().1 = Some(*child.child.as_bytes());
+            }
+            let newer_entries = node.entries.into_iter().map(|(_, entry)| entry);
+            entries
+                .1
+                .extend(newer_entries.map(|entry| (entry.name, entry.entry)));
+        }
+        pending.extend(children.into_values());
+    }
+    Ok(entries)
 }
 
 /// Pairs the older and newer radix node at every shared edge path whose IDs
@@ -426,14 +540,33 @@ async fn reachable_from_view<S: ImmutableObjectStore>(
     content: &mut ContentCollector,
 ) -> Result<(), HistoryPlanError> {
     let mut trees = vec![view.tree];
+    let mut chunks = Vec::new();
     while let Some(tree) = trees.pop() {
         if !into.insert(tree) {
             continue;
         }
-        for entry in directory_entries(store, tree).await?.into_values() {
-            match entry {
-                DirectoryEntry::Directory(child) => trees.push(*child.as_bytes()),
-                DirectoryEntry::File(file) => content.tip(file.content)?,
+        let mut visit = |entry| match entry {
+            DirectoryEntry::Directory(child) => {
+                trees.push(*child.as_bytes());
+                Ok(())
+            }
+            DirectoryEntry::File(file) => content.tip(file.content),
+        };
+        match directory(store, tree).await? {
+            Directory::Flat(entries) => entries.into_values().try_for_each(&mut visit)?,
+            Directory::Chunked(root) => {
+                // A chunk shared with a directory walked before was walked then.
+                chunks.push(root);
+                while let Some(id) = chunks.pop() {
+                    if !into.insert(id) {
+                        continue;
+                    }
+                    let node = chunk(store, id).await?;
+                    chunks.extend(node.children.iter().map(|child| *child.child.as_bytes()));
+                    for (_, entry) in node.entries {
+                        visit(entry.entry)?;
+                    }
+                }
             }
         }
     }
@@ -460,7 +593,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ContentStore, LooseObjectStore};
+    use crate::{
+        ApplicationMapStore, ContentMapStore, ContentStore, LooseObjectStore, RevisionMapStore,
+    };
 
     const WIDTH: usize = 16;
 
@@ -709,6 +844,165 @@ mod tests {
         );
         // The merged view is the only tip.
         assert_eq!(plan.content.tips, fixture.tips(&[merged]).await.1.tips);
+    }
+
+    /// Stores a directory of `entries`, adding every object it writes to `written`.
+    async fn store_directory(
+        objects: &LooseObjectStore,
+        entries: Entries,
+        written: &mut BTreeSet<Digest>,
+    ) -> Digest {
+        let mut objects_written = Vec::new();
+        let id =
+            wheat_core::build_directory(entries, |object| objects_written.push(object)).unwrap();
+        for object in objects_written {
+            objects
+                .put_if_absent(object.id, &object.bytes)
+                .await
+                .unwrap();
+            written.insert(*object.id.as_bytes());
+        }
+        *id.as_bytes()
+    }
+
+    /// A directory of `files` files and 40 subdirectories of one file each, whose
+    /// entries named in `changed` hold other contents; with every object it writes.
+    async fn wide(
+        objects: &LooseObjectStore,
+        files: usize,
+        changed: &[&str],
+    ) -> (Digest, BTreeSet<Digest>) {
+        let contents = |name: &str| {
+            let tag = if changed.contains(&name) {
+                format!("{name} changed")
+            } else {
+                name.to_owned()
+            };
+            DirectoryEntry::File(file(tag.as_bytes()))
+        };
+        let mut written = BTreeSet::new();
+        let mut entries = Entries::new();
+        for index in 0..files {
+            let name = format!("f{index}");
+            entries.insert(name.clone(), contents(&name));
+        }
+        for index in 0..40 {
+            let name = format!("d{index}");
+            let inner = [("inner".to_owned(), contents(&name))].into();
+            let inner = store_directory(objects, inner, &mut written).await;
+            entries.insert(
+                name,
+                DirectoryEntry::Directory(wheat_core::TreeId::from_digest(inner)),
+            );
+        }
+        (
+            store_directory(objects, entries, &mut written).await,
+            written,
+        )
+    }
+
+    /// A wide directory pairs its chunks, and the entries that changed, with its
+    /// older version's: when both are chunked, when names added or removed turn
+    /// buckets into chunks and back, and when it crosses the flat threshold.
+    #[tokio::test]
+    async fn wide_directories_pair_their_chunks_and_changed_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::new(directory.path());
+        // With 40 subdirectories, 216 files or fewer make a flat directory.
+        for (older_files, newer_files) in [
+            (3_000, 3_000),
+            (3_000, 3_600),
+            (3_600, 3_000),
+            (200, 300),
+            (300, 200),
+        ] {
+            let context = format!("{older_files} -> {newer_files} files");
+            let (older, _) = wide(&objects, older_files, &[]).await;
+            // Every fifth file changes, so some of them sit in a bucket on one side
+            // and in a chunk below it on the other.
+            let changed: Vec<String> = (0..newer_files)
+                .step_by(5)
+                .map(|index| format!("f{index}"))
+                .chain(["d5".to_owned()])
+                .collect();
+            let changed: Vec<&str> = changed.iter().map(String::as_str).collect();
+            let (newer, _) = wide(&objects, newer_files, &changed).await;
+            let mut proposals = Proposals {
+                bases: BTreeMap::new(),
+                limit: 10_000,
+            };
+            let mut content = ContentCollector {
+                history: ContentHistory::default(),
+                limits: LIMITS,
+            };
+            pair_trees(&objects, &mut proposals, &mut content, older, newer)
+                .await
+                .unwrap();
+            let expected: BTreeSet<_> = changed
+                .iter()
+                .filter(|name| {
+                    name.starts_with('d') || name[1..].parse::<usize>().unwrap() < older_files
+                })
+                .map(|name| pair(name.as_bytes(), format!("{name} changed").as_bytes()))
+                .collect();
+            assert_eq!(content.history.pairs, expected, "{context}");
+            let same_layout = (older_files > 216) == (newer_files > 216);
+            assert_eq!(
+                proposals.bases.get(&older) == Some(&Proposal::Unique(newer)),
+                same_layout,
+                "{context}"
+            );
+            // The changed subdirectory pairs, and every proposal pairs objects of one
+            // kind: chunks with chunks, never a flat node with a chunk header.
+            assert!(!proposals.bases.is_empty(), "{context}");
+            for (target, base) in &proposals.bases {
+                let Proposal::Unique(base) = base else {
+                    panic!("{context}: a conflict in one directory");
+                };
+                let kind = |id: &Digest| objects.get(ObjectId::from_digest(*id));
+                assert_eq!(
+                    kind(target).await.unwrap().kind,
+                    kind(base).await.unwrap().kind,
+                    "{context}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tip_keeps_every_chunk_of_a_wide_directory_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let objects = LooseObjectStore::new(directory.path());
+        let (tree, written) = wide(&objects, 3_000, &[]).await;
+        let roots = ViewRoots {
+            tree,
+            revisions: *RevisionMapStore::new(&objects)
+                .empty_root()
+                .await
+                .unwrap()
+                .as_bytes(),
+            applications: *ApplicationMapStore::new(&objects)
+                .empty_root()
+                .await
+                .unwrap()
+                .as_bytes(),
+            content: *ContentMapStore::new(&objects)
+                .empty_root()
+                .await
+                .unwrap()
+                .as_bytes(),
+        };
+        let mut tips = BTreeSet::new();
+        let mut content = ContentCollector {
+            history: ContentHistory::default(),
+            limits: LIMITS,
+        };
+        reachable_from_view(&objects, roots, &mut tips, &mut content)
+            .await
+            .unwrap();
+        assert!(written.len() > 42, "the directory is chunked");
+        assert!(written.is_subset(&tips));
+        assert_eq!(content.history.tips.len(), 3_040);
     }
 
     #[tokio::test]

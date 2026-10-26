@@ -22,6 +22,7 @@ use crate::{
     application_map::ApplicationCollection,
     change_map::ChangeCollection,
     content_map::ContentMapCollection,
+    directory_chunks::DirectoryChunkCollection,
     radix::{self, Collection, Key as _, Node},
     revision_map::RevisionCollection,
     sets::{
@@ -397,6 +398,10 @@ pub(crate) enum RadixKind {
     ProjectedCommitSet,
     /// A view's tips: change IDs, which name no object.
     ChangeSet,
+    /// A wide directory: the hash of a name → its entry, which refers to a tree when
+    /// it is a subdirectory. A file's blob is not listed: walks gather blobs from the
+    /// directory nodes themselves ([`directory_chunk`]).
+    Directory,
 }
 
 impl RadixKind {
@@ -412,6 +417,7 @@ impl RadixKind {
             Self::ContentSet => ObjectKind::ContentSetNode,
             Self::ProjectedCommitSet => ObjectKind::ProjectedCommitSetNode,
             Self::ChangeSet => ObjectKind::ChangeSetNode,
+            Self::Directory => ObjectKind::DirectoryChunkNode,
         }
     }
 
@@ -427,6 +433,15 @@ impl RadixKind {
             Self::ContentSet => <ContentCollection as Collection>::Key::LEN,
             Self::ProjectedCommitSet => <ProjectedCommitCollection as Collection>::Key::LEN,
             Self::ChangeSet => <ChangeSetCollection as Collection>::Key::LEN,
+            Self::Directory => <DirectoryChunkCollection as Collection>::Key::LEN,
+        }
+    }
+
+    /// How many entries sharing their next key byte a node holds inline.
+    fn bucket(self) -> usize {
+        match self {
+            Self::Directory => DirectoryChunkCollection::BUCKET,
+            _ => 1,
         }
     }
 
@@ -442,6 +457,7 @@ impl RadixKind {
             Self::ContentSet => uniform::<ContentCollection>(bytes),
             Self::ProjectedCommitSet => uniform::<ProjectedCommitCollection>(bytes),
             Self::ChangeSet => uniform::<ChangeSetCollection>(bytes),
+            Self::Directory => uniform::<DirectoryChunkCollection>(bytes),
         }
     }
 
@@ -496,6 +512,15 @@ radix_value!(
     wheat_core::ChangeObjectId,
     wheat_core::RetainedSetId
 );
+/// A subdirectory's tree; a file refers to no object.
+impl RadixValue for wheat_core::DirectoryChunkEntry {
+    fn object(self) -> Option<ObjectId> {
+        match self.entry {
+            DirectoryEntry::Directory(id) => Some(id.into()),
+            DirectoryEntry::File(_) => None,
+        }
+    }
+}
 
 fn uniform<C: Collection>(bytes: &[u8]) -> Result<RadixNode, CanonicalObjectError>
 where
@@ -547,7 +572,8 @@ pub(crate) fn radix<E: From<MalformedRadix>>(
         id,
         position: above.len(),
     };
-    radix::validate_node_at(node, above.len(), kind.key_len(), 1).map_err(|_| malformed())?;
+    radix::validate_node_at(node, above.len(), kind.key_len(), kind.bucket())
+        .map_err(|_| malformed())?;
     let keys = node
         .value
         .iter()
@@ -561,6 +587,10 @@ pub(crate) fn radix<E: From<MalformedRadix>>(
     for (entry, suffix, value) in keys.filter(|_| kind.keys_are_references()) {
         let target = if kind.members_are_keys() {
             ObjectId::from_digest(full_key([above, &node.prefix, suffix]).ok_or_else(malformed)?)
+        } else if kind == RadixKind::Directory {
+            // A file names a blob, not an object.
+            let Some(value) = value else { continue };
+            value
         } else {
             value.ok_or_else(malformed)?
         };
