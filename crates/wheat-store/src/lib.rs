@@ -73,7 +73,9 @@ pub use repository_store::{
 mod repository_rewrite;
 mod repository_transition;
 mod repository_union;
-pub use repository_union::{RepositoryUnionError, merge_labels};
+pub use repository_union::{
+    EnvelopeUnion, LabelChange, LabelMerge, LabelPolicy, RepositoryUnionError, merge_labels,
+};
 mod repository_verify;
 pub use repository_verify::{RepositoryValidationPhase, TransitionValidationOptions};
 mod verification_scratch;

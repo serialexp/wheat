@@ -597,6 +597,13 @@ size for `just test`; release run; results under `bench/results/`.
 6. Authoring on label-held changes.
 7. integrate/pull/refresh move the label; `--keep-label`; one-frontier rule.
 8. Fetch label rules (store + CLI).
+   **Store part done 2026-10-26**: `merge_labels(base, local, remote, LabelPolicy)`
+   returns a `LabelMerge` naming the labels both sides only moved (`both_moved`);
+   `RepositoryReader::union_envelopes_under(…, LabelPolicy::Fetch)` settles each with
+   `forward` under one `MergeBudget` per join and returns an `EnvelopeUnion` with the
+   `LabelChange`s against the local side, for the CLI's left-behind check.
+   `union_envelopes` keeps the publish policy and reads nothing for label changes.
+   The CLI (`native_fetch` in `main.rs`) still calls `union_envelopes`.
 9. Protocol field, server label checks and limits, publish moving the label.
 10. Git bridge tag replacement.
 11. Race test, docs, benchmark, TODO bookkeeping.

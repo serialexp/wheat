@@ -7,19 +7,64 @@
 //! sides moved apart, not how much history they hold.
 //!
 //! Labels live outside the state. They are joined three ways against the manifest
-//! both sides started from.
+//! both sides started from, under a [`LabelPolicy`]: a fetch settles a label both sides
+//! moved by which move is forward, a publish refuses it.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wheat_core::{
     ChangeId, RepositoryEnvelopeId, RepositoryEnvelopeRecord, RepositoryStateId,
-    RepositoryStateRecord, ViewId, ViewLabelManifestRecord,
+    RepositoryStateRecord, ViewId, ViewLabel, ViewLabelManifestRecord,
 };
 
 use crate::{
     ChangeMapError, ChangeMapStore, CollectionError, ContentSetStore, ImmutableObjectStore,
-    ObjectStoreError, ProjectedCommitSetStore, RepositoryPublicationError, RepositoryReader,
-    RetainedSetStore, ViewLineageError, ViewLineageMapStore,
+    MergeBudget, ObjectStoreError, ProjectedCommitSetStore, RepositoryPublicationError,
+    RepositoryReader, RetainedSetStore, ViewLineageError, ViewLineageMapStore,
 };
+
+/// How a label both sides changed differently joins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LabelPolicy {
+    /// A fetch. A label both sides moved to different views, each keeping its
+    /// annotation and provenance as they were, takes the remote's view when the move
+    /// from the local one to it is forward, else the local one's when the move the
+    /// other way is, else the remote's. Any other label both sides changed
+    /// differently refuses.
+    Fetch,
+    /// A publish. Any label both sides changed differently refuses: the publisher
+    /// fetches and integrates first.
+    Publish,
+}
+
+/// Labels merged three ways.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LabelMerge {
+    pub labels: ViewLabelManifestRecord,
+    /// Under [`LabelPolicy::Fetch`], the labels both sides moved to different views,
+    /// sorted by name. `labels` holds the remote's value for each; which side's view
+    /// it takes is the caller's to settle.
+    pub both_moved: Vec<String>,
+}
+
+/// A label whose value in a joined envelope differs from the local side's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LabelChange {
+    pub name: String,
+    /// None when the local side lacks it.
+    pub local: Option<ViewLabel>,
+    /// None when the joined envelope lacks it.
+    pub joined: Option<ViewLabel>,
+}
+
+/// An envelope joining two sides, and its labels that differ from the local side's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvelopeUnion {
+    pub envelope: RepositoryEnvelopeId,
+    /// Sorted by name.
+    pub label_changes: Vec<LabelChange>,
+}
 
 #[derive(Debug, Error)]
 pub enum RepositoryUnionError {
@@ -63,16 +108,17 @@ type Result<T> = std::result::Result<T, RepositoryUnionError>;
 
 /// Joins label manifests three ways. A label one side left as it was in `base` takes
 /// the other side's value, including its removal; a label both sides changed the same
-/// way keeps that change. A label both sides changed differently is a conflict, and
-/// all of them are returned, sorted by name.
+/// way keeps that change. A label both sides changed differently joins as `policy`
+/// says; those that conflict are all returned, sorted by name.
 pub fn merge_labels(
     base: &ViewLabelManifestRecord,
     local: &ViewLabelManifestRecord,
     remote: &ViewLabelManifestRecord,
-) -> std::result::Result<ViewLabelManifestRecord, Vec<String>> {
-    let names: std::collections::BTreeSet<&String> =
-        local.labels.keys().chain(remote.labels.keys()).collect();
-    let mut merged = std::collections::BTreeMap::new();
+    policy: LabelPolicy,
+) -> std::result::Result<LabelMerge, Vec<String>> {
+    let names: BTreeSet<&String> = local.labels.keys().chain(remote.labels.keys()).collect();
+    let mut merged = BTreeMap::new();
+    let mut both_moved = Vec::new();
     let mut divergent = Vec::new();
     for name in names {
         let was = base.labels.get(name);
@@ -82,6 +128,13 @@ pub fn merge_labels(
             here
         } else if here == was {
             there
+        } else if policy == LabelPolicy::Fetch
+            && let (Some(was), Some(here), Some(there)) = (was, here, there)
+            && only_moved(was, here)
+            && only_moved(was, there)
+        {
+            both_moved.push(name.clone());
+            Some(there)
         } else {
             divergent.push(name.clone());
             continue;
@@ -91,10 +144,21 @@ pub fn merge_labels(
         }
     }
     if divergent.is_empty() {
-        Ok(ViewLabelManifestRecord { labels: merged })
+        Ok(LabelMerge {
+            labels: ViewLabelManifestRecord { labels: merged },
+            both_moved,
+        })
     } else {
         Err(divergent)
     }
+}
+
+/// Whether `now` is `was` naming another view, its annotation and provenance as they
+/// were.
+fn only_moved(was: &ViewLabel, now: &ViewLabel) -> bool {
+    now.view != was.view
+        && now.original_git_ref == was.original_git_ref
+        && now.annotation == was.annotation
 }
 
 impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
@@ -166,10 +230,8 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         Ok(state.id())
     }
 
-    /// The envelope joining `local` and `remote`: the union of their states, and their
-    /// labels merged against `base`, the envelope both sides last agreed on. Without a
-    /// `base` every label starts out absent, so a label both sides hold must agree.
-    #[tracing::instrument(name = "union_envelopes", level = "debug", skip_all)]
+    /// The envelope joining `local` and `remote` under [`LabelPolicy::Publish`]; see
+    /// [`Self::union_envelopes_under`].
     pub async fn union_envelopes(
         &self,
         base: Option<RepositoryEnvelopeId>,
@@ -182,6 +244,43 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         if Some(remote) == base {
             return Ok(local);
         }
+        Ok(self
+            .merge_envelopes(base, local, remote, LabelPolicy::Publish)
+            .await?
+            .envelope)
+    }
+
+    /// The envelope joining `local` and `remote`: the union of their states, and their
+    /// labels merged against `base`, the envelope both sides last agreed on, under
+    /// `policy`. Without a `base` every label starts out absent, so a label both sides
+    /// hold must agree. A label both sides moved is settled with
+    /// [`RepositoryReader::forward`], every such check of one join sharing one
+    /// [`MergeBudget`]. Returns it with the labels that differ from `local`'s.
+    #[tracing::instrument(name = "union_envelopes", level = "debug", skip_all)]
+    pub async fn union_envelopes_under(
+        &self,
+        base: Option<RepositoryEnvelopeId>,
+        local: RepositoryEnvelopeId,
+        remote: RepositoryEnvelopeId,
+        policy: LabelPolicy,
+    ) -> Result<EnvelopeUnion> {
+        if local == remote || Some(local) == base {
+            return self.joined(local, remote).await;
+        }
+        if Some(remote) == base {
+            return self.joined(local, local).await;
+        }
+        self.merge_envelopes(base, local, remote, policy).await
+    }
+
+    /// The union of two envelopes neither of which is `base`.
+    async fn merge_envelopes(
+        &self,
+        base: Option<RepositoryEnvelopeId>,
+        local: RepositoryEnvelopeId,
+        remote: RepositoryEnvelopeId,
+        policy: LabelPolicy,
+    ) -> Result<EnvelopeUnion> {
         let here = self.envelope(local).await?;
         let there = self.envelope(remote).await?;
         let base_labels = match base {
@@ -193,12 +292,33 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                 labels: std::collections::BTreeMap::new(),
             },
         };
-        let labels = merge_labels(
+        let local_labels = self.view_label_manifest(here.labels).await?;
+        let merge = merge_labels(
             &base_labels,
-            &self.view_label_manifest(here.labels).await?,
+            &local_labels,
             &self.view_label_manifest(there.labels).await?,
+            policy,
         )
         .map_err(RepositoryUnionError::DivergentLabels)?;
+        let mut labels = merge.labels;
+        let mut budget = MergeBudget::STANDARD;
+        for name in &merge.both_moved {
+            let local_view = self.view(local_labels.labels[name].view).await?;
+            let remote_view = self.view(labels.labels[name].view).await?;
+            if self
+                .forward(&local_view, &remote_view, &mut budget)
+                .await?
+                .is_some()
+                && self
+                    .forward(&remote_view, &local_view, &mut budget)
+                    .await?
+                    .is_none()
+            {
+                labels
+                    .labels
+                    .insert(name.clone(), local_labels.labels[name].clone());
+            }
+        }
         if labels.labels.len() > wheat_core::MAX_LABELS {
             return Err(RepositoryUnionError::TooManyLabels(labels.labels.len()));
         }
@@ -212,6 +332,51 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         self.objects
             .put_if_absent(envelope.id().into(), &envelope.canonical_bytes())
             .await?;
-        Ok(envelope.id())
+        Ok(EnvelopeUnion {
+            envelope: envelope.id(),
+            label_changes: changed_labels(&local_labels, &labels),
+        })
     }
+
+    /// `joined`, which is `local` or the remote, with its labels that differ from
+    /// `local`'s.
+    async fn joined(
+        &self,
+        local: RepositoryEnvelopeId,
+        joined: RepositoryEnvelopeId,
+    ) -> Result<EnvelopeUnion> {
+        let mut label_changes = Vec::new();
+        if joined != local {
+            let (here, there) = (self.envelope(local).await?, self.envelope(joined).await?);
+            if here.labels != there.labels {
+                label_changes = changed_labels(
+                    &self.view_label_manifest(here.labels).await?,
+                    &self.view_label_manifest(there.labels).await?,
+                );
+            }
+        }
+        Ok(EnvelopeUnion {
+            envelope: joined,
+            label_changes,
+        })
+    }
+}
+
+/// The labels of `joined` whose value differs from `local`'s, sorted by name.
+fn changed_labels(
+    local: &ViewLabelManifestRecord,
+    joined: &ViewLabelManifestRecord,
+) -> Vec<LabelChange> {
+    let names: BTreeSet<&String> = local.labels.keys().chain(joined.labels.keys()).collect();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let (here, there) = (local.labels.get(name), joined.labels.get(name));
+            (here != there).then(|| LabelChange {
+                name: name.clone(),
+                local: here.cloned(),
+                joined: there.cloned(),
+            })
+        })
+        .collect()
 }

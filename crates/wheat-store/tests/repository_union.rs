@@ -412,10 +412,11 @@ fn labels_merge_three_ways() {
     ]);
     let remote = manifest(&[("kept", 1), ("here", 1), ("there", 2), ("same", 3)]);
 
-    let merged = merge_labels(&base, &local, &remote).unwrap();
+    let merged = merge_labels(&base, &local, &remote, LabelPolicy::Publish).unwrap();
 
+    assert!(merged.both_moved.is_empty());
     assert_eq!(
-        merged,
+        merged.labels,
         manifest(&[
             ("kept", 1),
             ("here", 2),
@@ -429,9 +430,36 @@ fn labels_merge_three_ways() {
     // different targets: both conflict.
     let local = manifest(&[("gone", 2), ("fresh", 1)]);
     let remote = manifest(&[("fresh", 2)]);
+    for policy in [LabelPolicy::Publish, LabelPolicy::Fetch] {
+        assert_eq!(
+            merge_labels(&base, &local, &remote, policy).unwrap_err(),
+            ["fresh", "gone"]
+        );
+    }
+}
+
+/// A label both sides moved to different views is refused on publish; on fetch it
+/// holds the remote's view, named for the caller to settle, unless a side also changed
+/// its annotation or provenance.
+#[test]
+fn a_label_both_sides_moved_settles_only_on_fetch() {
+    let view = |n: u8| ViewId::from_digest([n; 32]);
+    let base = ViewLabelManifestRecord::new([("main", view(1)), ("tag", view(1))]).unwrap();
+    let local = ViewLabelManifestRecord::new([("main", view(2)), ("tag", view(2))]).unwrap();
+    let mut remote = ViewLabelManifestRecord::new([("main", view(3)), ("tag", view(3))]).unwrap();
+
     assert_eq!(
-        merge_labels(&base, &local, &remote).unwrap_err(),
-        ["fresh", "gone"]
+        merge_labels(&base, &local, &remote, LabelPolicy::Publish).unwrap_err(),
+        ["main", "tag"]
+    );
+    let merged = merge_labels(&base, &local, &remote, LabelPolicy::Fetch).unwrap();
+    assert_eq!(merged.both_moved, ["main", "tag"]);
+    assert_eq!(merged.labels, remote);
+
+    remote.labels.get_mut("tag").unwrap().original_git_ref = Some("refs/tags/tag".into());
+    assert_eq!(
+        merge_labels(&base, &local, &remote, LabelPolicy::Fetch).unwrap_err(),
+        ["tag"]
     );
 }
 

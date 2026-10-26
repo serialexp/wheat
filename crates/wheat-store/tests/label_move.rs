@@ -390,3 +390,115 @@ async fn a_label_move_that_no_longer_holds_refuses_the_publication() {
     }
     assert_eq!(label(&fixture, "v1").await, Some(annotated(d)));
 }
+/// An envelope of the current state whose only label is `main`, naming `view`.
+async fn envelope_naming(fixture: &Fixture, view: ViewId) -> RepositoryEnvelopeId {
+    let reader = fixture.reader();
+    let state = reader
+        .envelope(fixture.head().envelope)
+        .await
+        .unwrap()
+        .state;
+    let labels = ViewLabelManifestRecord::new([("main", view)]).unwrap();
+    RepositoryPublisher::new(&fixture.objects, &fixture.content, &fixture.heads)
+        .prepare_envelope(state, &labels)
+        .await
+        .unwrap()
+}
+
+/// L; C adds `x` on L; D adds `y` on L; J joins D into C. Returns the fixture and L, C,
+/// D and J.
+async fn grown_apart_and_joined() -> (Fixture, [ViewId; 4]) {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (_, l) = fixture.create(base, base, "l", b"l").await;
+    let (_, d) = fixture.create(base, l, "y", b"y").await;
+    let (_, c) = fixture.create(base, l, "x", b"x").await;
+    let j = fixture.integrate(c, &[d]).await.unwrap().resulting_view;
+    (fixture, [l, c, d, j])
+}
+
+/// What `main` names after fetching, when both sides moved it from `was`, and the
+/// label changes the fetch reports.
+async fn fetched(
+    fixture: &Fixture,
+    was: ViewId,
+    local: ViewId,
+    remote: ViewId,
+) -> (ViewId, Vec<LabelChange>) {
+    let reader = fixture.reader();
+    let union = reader
+        .union_envelopes_under(
+            Some(envelope_naming(fixture, was).await),
+            envelope_naming(fixture, local).await,
+            envelope_naming(fixture, remote).await,
+            LabelPolicy::Fetch,
+        )
+        .await
+        .unwrap();
+    let envelope = reader.envelope(union.envelope).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    (labels.labels["main"].view, union.label_changes)
+}
+
+fn moved(local: ViewId, joined: ViewId) -> Vec<LabelChange> {
+    vec![LabelChange {
+        name: "main".to_owned(),
+        local: Some(local.into()),
+        joined: Some(joined.into()),
+    }]
+}
+
+/// Both sides moved `main` from L: the fetch takes the remote's view when it is forward
+/// from the local one, the local one when that is forward from the remote's, and the
+/// remote's when neither is.
+#[tokio::test]
+async fn a_fetch_settles_a_label_both_sides_moved_by_which_is_forward() {
+    let (fixture, [l, c, d, j]) = grown_apart_and_joined().await;
+
+    assert_eq!(fetched(&fixture, l, c, j).await, (j, moved(c, j)));
+    assert_eq!(fetched(&fixture, l, j, c).await, (j, Vec::new()));
+    assert_eq!(fetched(&fixture, l, c, d).await, (d, moved(c, d)));
+}
+
+/// A label only the remote moved takes the remote's view, reported as a change, through
+/// the join and when the local side has nothing new.
+#[tokio::test]
+async fn a_fetch_reports_a_label_only_the_remote_moved() {
+    let (fixture, [l, c, _, j]) = grown_apart_and_joined().await;
+
+    assert_eq!(fetched(&fixture, l, l, j).await, (j, moved(l, j)));
+
+    let reader = fixture.reader();
+    let base = envelope_naming(&fixture, c).await;
+    let union = reader
+        .union_envelopes_under(
+            Some(base),
+            base,
+            envelope_naming(&fixture, j).await,
+            LabelPolicy::Fetch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(union.label_changes, moved(c, j));
+}
+
+/// A publish joining a label the server moved differently refuses, forward or not.
+#[tokio::test]
+async fn a_publish_refuses_a_label_both_sides_moved() {
+    let (fixture, [l, c, _, j]) = grown_apart_and_joined().await;
+    let reader = fixture.reader();
+
+    let error = reader
+        .union_envelopes(
+            Some(envelope_naming(&fixture, l).await),
+            envelope_naming(&fixture, c).await,
+            envelope_naming(&fixture, j).await,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, RepositoryUnionError::DivergentLabels(names) if names == &["main"]),
+        "{error}"
+    );
+}
