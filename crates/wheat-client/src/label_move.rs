@@ -4,10 +4,12 @@
 //! that move the active label as part of their work.
 
 use anyhow::Result;
-use wheat_core::{RepositoryStateRecord, ViewId};
+use std::collections::BTreeSet;
+
+use wheat_core::{RepositoryStateRecord, ViewId, ViewRecord};
 use wheat_store::{
-    ImmutableObjectStore, MergeBudget, NotForward, RepositoryReader, ViewLineageLimits,
-    ViewLineageMapStore,
+    ImmutableObjectStore, LabelChange, MergeBudget, NotForward, RepositoryReader,
+    ViewLineageLimits, ViewLineageMapStore,
 };
 
 /// Why a move from one view to another may not happen without being forced.
@@ -69,29 +71,105 @@ pub async fn check<O: ImmutableObjectStore>(
     to: ViewId,
     budget: &mut MergeBudget,
 ) -> Result<MoveRefusal> {
-    let mut refusal = MoveRefusal::default();
     if from == to {
-        return Ok(refusal);
+        return Ok(MoveRefusal::default());
     }
     let target = reader.retained_view(state, to).await?;
     let source = reader.retained_view(state, from).await?;
-    refusal.not_forward = reader.forward(&source, &target, budget).await?;
-    let mut frontiers = ViewLineageMapStore::new(objects)
+    let frontiers = ViewLineageMapStore::new(objects)
         .descendant_frontiers(state.view_lineage, from, ViewLineageLimits::default())
         .await?;
-    if frontiers.is_empty() {
-        // `from` is its own only frontier, and the forward check above covers it.
-        return Ok(refusal);
-    }
+    check_target(reader, &source, &target, to, frontiers, budget).await
+}
+
+/// [`check`] against a target the head may not retain yet, such as the view an
+/// integration is about to publish, read through `reader` from where it is staged.
+/// `frontiers` are the descendant frontiers of the label's view in the state before
+/// the move.
+pub async fn check_target<O: ImmutableObjectStore>(
+    reader: &RepositoryReader<'_, O>,
+    source: &ViewRecord,
+    target: &ViewRecord,
+    to: ViewId,
+    mut frontiers: Vec<ViewId>,
+    budget: &mut MergeBudget,
+) -> Result<MoveRefusal> {
+    let mut refusal = MoveRefusal {
+        not_forward: reader.forward(source, target, budget).await?,
+        left_behind: Vec::new(),
+    };
+    // Without frontiers the label's view is its own only one, and the forward check
+    // above covers it.
     frontiers.sort();
     for frontier in frontiers {
         if frontier == to {
             continue;
         }
         let view = reader.view(frontier).await?;
-        if reader.forward(&view, &target, budget).await?.is_some() {
+        if reader.forward(&view, target, budget).await?.is_some() {
             refusal.left_behind.push(frontier);
         }
     }
     Ok(refusal)
+}
+/// A label a fetch would change, and the views the change would hide.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HiddenByFetch {
+    pub label: String,
+    pub views: Vec<ViewId>,
+}
+
+/// The views a fetch's label changes would hide that no workspace in `shown` shows.
+/// A moved label hides what the move leaves behind ([`check_target`]: the local view's
+/// frontiers the new view does not cover, or the local view itself when it has none
+/// and is not covered). A deleted label hides its local view's descendant frontiers,
+/// the local work built on it; its own view is the remote's to drop. `state` is the
+/// local state before the fetch; `reader` also reads what the fetch staged.
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn hidden_by_fetch<O: ImmutableObjectStore>(
+    reader: &RepositoryReader<'_, O>,
+    objects: &O,
+    state: &RepositoryStateRecord,
+    changes: &[LabelChange],
+    shown: &BTreeSet<ViewId>,
+    budget: &mut MergeBudget,
+) -> Result<Vec<HiddenByFetch>> {
+    let mut hidden = Vec::new();
+    for change in changes {
+        let Some(before) = &change.before else {
+            continue;
+        };
+        let frontiers = ViewLineageMapStore::new(objects)
+            .descendant_frontiers(
+                state.view_lineage,
+                before.view,
+                ViewLineageLimits::default(),
+            )
+            .await?;
+        let mut views = match &change.after {
+            Some(after) if after.view == before.view => continue,
+            Some(after) => {
+                let source = reader.view(before.view).await?;
+                let target = reader.view(after.view).await?;
+                let has_frontiers = !frontiers.is_empty();
+                let refusal =
+                    check_target(reader, &source, &target, after.view, frontiers, budget).await?;
+                let mut views = refusal.left_behind;
+                if !has_frontiers && refusal.not_forward.is_some() {
+                    views.push(before.view);
+                }
+                views
+            }
+            None => frontiers,
+        };
+        views.retain(|view| !shown.contains(view));
+        if !views.is_empty() {
+            views.sort();
+            hidden.push(HiddenByFetch {
+                label: change.name.clone(),
+                views,
+            });
+        }
+    }
+    Ok(hidden)
 }

@@ -103,7 +103,8 @@ fn integrate_joins_the_fetched_work_with_the_local_work() {
         0,
         "{joined}"
     );
-    assert_eq!(frontier_count(&sides.reader, &sides.config), 1);
+    // The label moved to the joined view, which leaves it no frontiers.
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 0);
     assert_eq!(
         fs::read_to_string(reader.join("remote.txt")).unwrap(),
         "remote"
@@ -114,6 +115,7 @@ fn integrate_joins_the_fetched_work_with_the_local_work() {
     );
     let status = ok_json(reader, stores, &sides.config, &["status"]);
     assert_eq!(status["changes"].as_array().unwrap().len(), 0, "{status}");
+    assert_eq!(joined["label_moved"]["to"], joined["view"], "{joined}");
     ok(reader, stores, &sides.config, &["validate"]);
 
     // Nothing is left to join, and the joined view publishes.
@@ -122,7 +124,13 @@ fn integrate_joins_the_fetched_work_with_the_local_work() {
     ok(reader, stores, &sides.config, &["publish"]);
     let (writer, writer_stores) = &sides.writer;
     ok(writer, writer_stores, &sides.config, &["fetch"]);
-    assert_eq!(frontier_count(&sides.writer, &sides.config), 1);
+    // The fetch took the label's move to the joined view; refresh follows it.
+    assert_eq!(frontier_count(&sides.writer, &sides.config), 0);
+    ok(writer, writer_stores, &sides.config, &["refresh"]);
+    assert_eq!(
+        fs::read_to_string(writer.join("local.txt")).unwrap(),
+        "local"
+    );
 }
 
 /// Both sides add a file to the same published change. Integration combines the two
@@ -199,7 +207,7 @@ fn work_on_one_path_joins_with_a_conflict_to_resolve() {
         "{conflicts}"
     );
     ok(reader, stores, &sides.config, &["validate"]);
-    assert_eq!(frontier_count(&sides.reader, &sides.config), 1);
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 0);
 }
 
 #[test]
@@ -249,26 +257,15 @@ fn an_untracked_file_in_the_way_leaves_the_workspace_as_it_was() {
 
     let refused = fails(reader, stores, &sides.config, &["integrate"]);
 
-    assert!(
-        refused.contains("wheat switch main --frontier"),
-        "{refused}"
-    );
+    assert!(refused.contains("run `wheat switch main`"), "{refused}");
     assert_eq!(
         fs::read_to_string(reader.join("remote.txt")).unwrap(),
         "mine"
     );
-    assert_eq!(frontier_count(&sides.reader, &sides.config), 1);
+    // The label moved to the joined view with the join.
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 0);
     fs::remove_file(reader.join("remote.txt")).unwrap();
-    let view = ok_json(reader, stores, &sides.config, &["frontier", "list"])["frontiers"][0]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    ok(
-        reader,
-        stores,
-        &sides.config,
-        &["switch", "main", "--frontier", &view],
-    );
+    ok(reader, stores, &sides.config, &["switch", "main"]);
     assert_eq!(
         fs::read_to_string(reader.join("remote.txt")).unwrap(),
         "remote"
@@ -331,7 +328,7 @@ fn pull_joins_the_remote_work_with_the_local_work() {
 
     assert_eq!(pulled["fetch"]["kept_local"], true, "{pulled}");
     assert_eq!(pulled["integrate"]["integrated"], true, "{pulled}");
-    assert_eq!(frontier_count(&sides.reader, &sides.config), 1);
+    assert_eq!(frontier_count(&sides.reader, &sides.config), 0);
     assert_eq!(
         fs::read_to_string(reader.join("remote.txt")).unwrap(),
         "remote"
@@ -366,7 +363,7 @@ fn a_fetched_join_with_a_conflict_stays_valid() {
 
     assert_eq!(joined["integrated"], true, "{joined}");
     ok(writer, writer_stores, &sides.config, &["validate"]);
-    assert_eq!(frontier_count(&sides.writer, &sides.config), 1);
+    assert_eq!(frontier_count(&sides.writer, &sides.config), 0);
 }
 
 /// A label made at a view with a conflict holds the conflicted change. Resolving it
@@ -421,7 +418,7 @@ fn pull_takes_a_resolution_of_a_conflict_the_label_holds() {
         0,
         "{conflicts}"
     );
-    assert_eq!(frontier_count(&sides.reader, config), 1);
+    assert_eq!(frontier_count(&sides.reader, config), 0);
     ok(reader, reader_stores, config, &["validate"]);
     ok(reader, reader_stores, config, &["publish"]);
 }

@@ -299,3 +299,146 @@ fn a_change_the_label_holds_can_be_revised_selected_and_squashed() {
         "third"
     );
 }
+/// Two sibling frontiers of the label's view: `a.txt` then `b.txt`, the workspace on
+/// the second.
+fn two_frontiers(local: &Local) -> (String, String, String) {
+    let base = local.label_view("main");
+    let first = local.change("a.txt");
+    local.ok_json(&["switch", "main", "--frontier", &base]);
+    let second = local.change("b.txt");
+    (base, first, second)
+}
+
+#[test]
+fn integrate_moves_the_label_to_its_one_covering_frontier() {
+    let local = Local::new();
+    let base = local.label_view("main");
+    let frontier = local.change("a.txt");
+
+    let kept = local.ok_json(&["integrate", "--keep-label"]);
+    assert_eq!(kept["integrated"], false, "{kept}");
+    assert_eq!(kept["label_moved"], serde_json::Value::Null, "{kept}");
+    assert_eq!(local.label_view("main"), base);
+
+    let moved = local.ok_json(&["integrate"]);
+    assert_eq!(moved["integrated"], false, "{moved}");
+    assert_eq!(moved["label_moved"]["from"], base.as_str(), "{moved}");
+    assert_eq!(moved["label_moved"]["to"], frontier.as_str(), "{moved}");
+    assert_eq!(local.label_view("main"), frontier);
+    let metadata = local.metadata();
+    assert_eq!(metadata.basis, view(&frontier));
+    assert_eq!(metadata.selected_frontier, None);
+}
+
+#[test]
+fn integrate_joins_the_frontiers_and_moves_the_label_unless_kept() {
+    let local = Local::new();
+    let (base, _, _) = two_frontiers(&local);
+
+    let kept = local.ok_json(&["integrate", "--keep-label"]);
+    assert_eq!(kept["integrated"], true, "{kept}");
+    assert_eq!(kept["label_moved"], serde_json::Value::Null, "{kept}");
+    let joined = kept["view"].as_str().unwrap().to_owned();
+    assert_eq!(local.label_view("main"), base);
+    let metadata = local.metadata();
+    assert_eq!(metadata.basis, view(&base));
+    assert_eq!(metadata.selected_frontier, Some(view(&joined)));
+
+    // The joined view is now the label's one frontier, and covers it.
+    let moved = local.ok_json(&["integrate"]);
+    assert_eq!(moved["label_moved"]["to"], joined.as_str(), "{moved}");
+    assert_eq!(local.label_view("main"), joined);
+
+    let local = Local::new();
+    two_frontiers(&local);
+    let joined = local.ok_json(&["integrate"]);
+    assert_eq!(joined["integrated"], true, "{joined}");
+    let view_id = joined["view"].as_str().unwrap().to_owned();
+    assert_eq!(joined["label_moved"]["to"], view_id.as_str(), "{joined}");
+    assert_eq!(local.label_view("main"), view_id);
+    let metadata = local.metadata();
+    assert_eq!(metadata.basis, view(&view_id));
+    assert_eq!(metadata.selected_frontier, None);
+    for path in ["a.txt", "b.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(local.workspace.join(path)).unwrap(),
+            path
+        );
+    }
+}
+
+#[test]
+fn integrating_some_frontiers_does_not_move_the_label_past_the_rest() {
+    let local = Local::new();
+    let (base, first, second) = two_frontiers(&local);
+    local.ok_json(&["switch", "main", "--frontier", &base]);
+    let third = local.change("c.txt");
+    let before = local.ok_json(&["labels"])["head"].clone();
+
+    let refused = local.fails(&["integrate", "--frontier", &first, "--frontier", &second]);
+    assert!(refused.contains("label_move_refused"), "{refused}");
+    assert!(refused.contains(&third), "{refused}");
+    assert!(refused.contains("--keep-label"), "{refused}");
+    assert_eq!(local.ok_json(&["labels"])["head"], before);
+
+    let kept = local.ok_json(&[
+        "integrate",
+        "--frontier",
+        &first,
+        "--frontier",
+        &second,
+        "--keep-label",
+    ]);
+    assert_eq!(kept["integrated"], true, "{kept}");
+    assert_eq!(local.label_view("main"), base);
+    let joined = kept["view"].as_str().unwrap().to_owned();
+
+    // The joined view alone covers the label's view, but not the third frontier.
+    let refused = local.fails(&["integrate", "--frontier", &joined]);
+    assert!(refused.contains(&third), "{refused}");
+    let forced = local.ok_json(&["integrate", "--frontier", &joined, "--force"]);
+    assert_eq!(forced["label_moved"]["to"], joined.as_str(), "{forced}");
+    assert_eq!(local.label_view("main"), joined);
+}
+
+/// The label moved to a view without the workspace's work: the workspace keeps working
+/// against its old basis, and refresh integrates its work with the label's view.
+#[test]
+fn a_workspace_the_label_moved_away_from_keeps_working_and_refresh_integrates() {
+    let local = Local::new();
+    let (_, first, second) = two_frontiers(&local);
+    let change = local.metadata().selected_change.unwrap().to_string();
+    local.ok_json(&["label", "move", "main", "--view", &first, "--force"]);
+
+    let status = local.ok_json(&["status"]);
+    assert_eq!(status["label_binding_drifted"], true, "{status}");
+    local.ok_json(&["materialize"]);
+    std::fs::write(local.workspace.join("b.txt"), "revised").unwrap();
+    local.ok_json(&["add", "b.txt", "--change", &change, "--message", "revised"]);
+    std::fs::remove_file(local.workspace.join("b.txt")).unwrap();
+    local.ok_json(&["restore", "b.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(local.workspace.join("b.txt")).unwrap(),
+        "revised"
+    );
+    assert_ne!(local.metadata().effective_view(), view(&second));
+
+    let refreshed = local.ok_json(&["refresh"]);
+    assert_eq!(refreshed["integrated"], true, "{refreshed}");
+    let joined = refreshed["view"].as_str().unwrap().to_owned();
+    assert_eq!(
+        refreshed["label_moved"]["from"],
+        first.as_str(),
+        "{refreshed}"
+    );
+    assert_eq!(local.label_view("main"), joined);
+    assert_eq!(local.metadata().basis, view(&joined));
+    for (path, value) in [("a.txt", "a.txt"), ("b.txt", "revised")] {
+        assert_eq!(
+            std::fs::read_to_string(local.workspace.join(path)).unwrap(),
+            value
+        );
+    }
+    let status = local.ok_json(&["status"]);
+    assert_eq!(status["label_binding_drifted"], false, "{status}");
+}

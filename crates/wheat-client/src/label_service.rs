@@ -187,12 +187,26 @@ pub struct MovingWorkspace<'a> {
     pub metadata: &'a mut WorkspaceMetadata,
 }
 
-/// Moves label `name` to view `to`, which the head must retain. Unless `force`, the
-/// move must be forward and leave no frontier of the label's view behind. Moving the
-/// workspace's active label to its effective view rebinds the workspace there; the
-/// rebind is staged in its metadata before the head moves, so an interruption on either
-/// side of the CAS leaves an operation the next command completes or discards.
-pub fn move_label(
+/// What [`move_label`] did.
+#[derive(Clone, Debug)]
+pub struct MovedLabel {
+    /// The head after the move, or the one it found when the label already named the
+    /// view.
+    pub head: RepositoryHead,
+    pub from: ViewId,
+    pub label: LabelEntry,
+    /// Whether the workspace now follows the label at its new view.
+    pub rebound: bool,
+}
+
+impl MovedLabel {
+    pub fn moved(&self) -> bool {
+        self.label.view != self.from.to_string()
+    }
+}
+
+/// `wheat label move`: [`move_label`], reported.
+pub fn move_label_command(
     repository: &LocalRepository,
     name: String,
     to: ViewId,
@@ -200,6 +214,55 @@ pub fn move_label(
     expected: Option<RepositoryHead>,
     workspace: Option<MovingWorkspace<'_>>,
 ) -> Result<Success> {
+    let moved = move_label(
+        repository,
+        name.clone(),
+        to,
+        force,
+        "pass --force to move it anyway",
+        expected,
+        workspace,
+    )?;
+    let mut human = if moved.moved() {
+        format!("moved label {name} from view {} to view {to}\n", moved.from)
+    } else {
+        format!("label {name} already names view {to}\n")
+    };
+    if moved.rebound {
+        writeln!(
+            human,
+            "this workspace now follows label {name} at view {to}"
+        )?;
+    }
+    Success::new(
+        "label.move",
+        serde_json::json!({
+            "schema_version": 1,
+            "head": HeadDocument::from(moved.head),
+            "label": moved.label,
+            "moved": moved.moved(),
+            "from": moved.from.to_string(),
+            "rebound": moved.rebound,
+        }),
+        human,
+    )
+}
+
+/// Moves label `name` to view `to`, which the head must retain. Unless `force`, the
+/// move must be forward and leave no frontier of the label's view behind; a refusal
+/// ends with `hint`. Moving the workspace's active label to its effective view rebinds
+/// the workspace there; the rebind is staged in its metadata before the head moves, so
+/// an interruption on either side of the CAS leaves an operation the next command
+/// completes or discards.
+pub fn move_label(
+    repository: &LocalRepository,
+    name: String,
+    to: ViewId,
+    force: bool,
+    hint: &str,
+    expected: Option<RepositoryHead>,
+    workspace: Option<MovingWorkspace<'_>>,
+) -> Result<MovedLabel> {
     let runtime = runtime()?;
     let observed = repository.heads.read()?;
     let expected = expected.unwrap_or(observed);
@@ -228,7 +291,7 @@ pub fn move_label(
                     .await?;
             if !refusal.is_empty() {
                 return Err(CliFailure::label_move_refused(format!(
-                    "cannot move label {name} to view {to}: {}; pass --force to move it anyway",
+                    "cannot move label {name} to view {to}: {}; {hint}",
                     refusal.describe(&name, to)
                 )));
             }
@@ -236,19 +299,12 @@ pub fn move_label(
         Ok::<_, anyhow::Error>((envelope.state, labels, from))
     })?;
     if from == to {
-        let entry = LabelEntry::new(name.clone(), &labels[&name])?;
-        return Success::new(
-            "label.move",
-            serde_json::json!({
-                "schema_version": 1,
-                "head": HeadDocument::from(expected),
-                "label": entry,
-                "moved": false,
-                "from": from.to_string(),
-                "rebound": false,
-            }),
-            format!("label {name} already names view {to}\n"),
-        );
+        return Ok(MovedLabel {
+            head: expected,
+            from,
+            label: LabelEntry::new(name.clone(), &labels[&name])?,
+            rebound: false,
+        });
     }
     let label = labels.get_mut(&name).expect("the label was read above");
     label.view = to;
@@ -293,25 +349,12 @@ pub fn move_label(
         Some(head) => head,
         None => runtime.block_on(publisher.publish_envelope(expected, root))?,
     };
-    let mut human = format!("moved label {name} from view {from} to view {to}\n");
-    if rebound {
-        writeln!(
-            human,
-            "this workspace now follows label {name} at view {to}"
-        )?;
-    }
-    Success::new(
-        "label.move",
-        serde_json::json!({
-            "schema_version": 1,
-            "head": HeadDocument::from(head),
-            "label": entry,
-            "moved": true,
-            "from": from.to_string(),
-            "rebound": rebound,
-        }),
-        human,
-    )
+    Ok(MovedLabel {
+        head,
+        from,
+        label: entry,
+        rebound,
+    })
 }
 
 fn ensure_expected(expected: RepositoryHead, observed: RepositoryHead) -> Result<()> {

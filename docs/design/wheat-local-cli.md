@@ -214,9 +214,10 @@ both lists.
   identity, shared-store creation/list/detach, operation locks, and content pins are
   implemented. Still define user-facing integration when two workspaces advance
   independent frontiers and the remote synchronization policy around that state.
-- [ ] **Defer — label advancement and frontier consolidation.** Do not define
-  automatic label movement or combine retained descendant frontiers until an
-  explicit later workflow and policy decision.
+- [~] **Label advancement and frontier consolidation.** Planned in
+  `docs/design/wheat-label-moves.md` (2026-10-15). `wheat label move`, `integrate`,
+  `pull` and `refresh` move labels and `fetch` takes remote moves (2026-10-26);
+  `publish` moving the label and the server's label checks remain.
 - [ ] **Open question — staging semantics.** Decide whether Wheat needs a
   persistent index-like state or whether explicit change/revision capture makes
   one unnecessary.
@@ -863,6 +864,26 @@ do not change. The rebind is staged in the workspace metadata before the head's 
 and finished after it, so the next command completes or discards an interrupted one.
 A move elsewhere leaves the workspace's basis and selection as they were: the label
 moved away from it, and `refresh`, `integrate`, `pull` or `switch` re-read it.
+
+**Commands that move the label (2026-10-26).** `integrate` joins the active label's
+descendant frontiers, plus the workspace's own view when the label moved to a view
+that does not cover it, and moves the label to the result in the same CAS; the
+workspace then follows the label there. One frontier that covers the label's view
+needs no join: the label moves to it. `--keep-label` leaves the label where it is
+(the result becomes the workspace's selected frontier, as before), and a move that
+would leave frontiers behind (only possible with an explicit `--frontier` subset)
+is refused (`label_move_refused`) unless `--keep-label` or `--force`. `pull` is
+`fetch` then `integrate` and takes `--keep-label`. `refresh` integrates the same way
+when the label's view does not cover the workspace's, and otherwise switches to the
+label as before. The JSON of all three gains `label_moved` (`{from, to}` or null).
+
+A fetch takes the remote's label moves and deletions (and settles a label both sides
+moved with the forward check) unless that would hide local work no workspace shows:
+for a move, the frontiers of the label's local view that the new view does not cover
+(or the local view itself when it has none and is not covered); for a deletion, the
+local view's descendant frontiers. Such a fetch is refused (`unresolved_conflict`)
+naming the label and the views; switching a workspace to them, or integrating them,
+lets it through.
 
 Label advancement and consolidation of multiple frontiers are explicit deferred
 work. When designed, stack editing and integration should expose dependency

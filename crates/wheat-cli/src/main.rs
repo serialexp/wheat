@@ -19,9 +19,10 @@ use wheat_core::{
     diff_model::DiffLimits, guarded::Limits,
 };
 use wheat_store::{
-    ApplicationMapStore, Arrival, BatchObjectStore, ImmutableObjectStore, MerkleTreeStore,
-    PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore, RepositoryReader,
-    RevisionMapStore, finalize_mutation_publication, prepare_mutation_publication,
+    ApplicationMapStore, Arrival, BatchObjectStore, ImmutableObjectStore, MergeBudget,
+    MerkleTreeStore, PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore,
+    RepositoryReader, RevisionMapStore, finalize_mutation_publication,
+    prepare_mutation_publication, prepare_mutation_publication_moving_label,
 };
 mod command_output;
 
@@ -40,7 +41,7 @@ use wheat_client::outcome::{CliFailure, OutputFormat, Success};
 use wheat_client::{
     active_changes, authoring, authoring_metadata, conflict_inspection, credential, diff_render,
     discovery, dot_git, edit_move, frontier_service, git_pull, ignore_import, import_trace,
-    inspection, label_service, local, log_inspection, materialization, prompt, remote,
+    inspection, label_move, label_service, local, log_inspection, materialization, prompt, remote,
     remote_config, repack, rewrite_transaction, selection_recovery, squash, squash_attribution,
     store_analyze, store_lookup, workspace, workspace_clone, workspace_diff, workspace_lifecycle,
     workspace_metadata, workspace_registry_service, workspace_scan, workspace_status,
@@ -203,6 +204,8 @@ struct IntegrateArgs {
     #[arg(long = "frontier")]
     frontiers: Vec<String>,
     #[command(flatten)]
+    label: KeepLabelArgs,
+    #[command(flatten)]
     dot_git: DotGitArgs,
 }
 
@@ -212,7 +215,28 @@ struct RefreshArgs {
     #[arg(long)]
     frontier: Option<String>,
     #[command(flatten)]
+    label: KeepLabelArgs,
+    #[command(flatten)]
     dot_git: DotGitArgs,
+}
+
+#[derive(Debug, Args)]
+struct KeepLabelArgs {
+    /// Leave the active label where it is instead of moving it to the joined view.
+    #[arg(long)]
+    keep_label: bool,
+    /// Move the label even when that leaves frontiers of it behind.
+    #[arg(long, conflicts_with = "keep_label")]
+    force: bool,
+}
+
+impl KeepLabelArgs {
+    fn policy(&self) -> LabelMovePolicy {
+        LabelMovePolicy {
+            keep: self.keep_label,
+            force: self.force,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -654,6 +678,9 @@ struct NativePullArgs {
     /// Override the remote URL (wheat://host:port/owner/repo).
     #[arg(long)]
     remote: Option<String>,
+    /// Leave the active label where it is instead of moving it to the joined view.
+    #[arg(long)]
+    keep_label: bool,
     #[command(flatten)]
     dot_git: DotGitArgs,
 }
@@ -785,20 +812,18 @@ fn execute(cli: Cli) -> Result<Success> {
                 &requested_workspace,
                 cli.store.as_deref(),
                 &frontiers,
+                arguments.label.policy(),
+                "integrate",
                 dot_git,
             )
         }
-        Command::Refresh(arguments) => {
-            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            switch_workspace(
-                &requested_workspace,
-                cli.store.as_deref(),
-                context.workspace.active_label,
-                parse_optional_view(arguments.frontier)?,
-                "refresh",
-                arguments.dot_git.gate(format),
-            )
-        }
+        Command::Refresh(arguments) => refresh_workspace(
+            &requested_workspace,
+            cli.store.as_deref(),
+            parse_optional_view(arguments.frontier)?,
+            arguments.label.policy(),
+            arguments.dot_git.gate(format),
+        ),
         Command::Frontier(FrontierCommand::List { label }) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let label = label.unwrap_or(context.workspace.active_label);
@@ -1356,6 +1381,10 @@ fn execute(cli: Cli) -> Result<Success> {
                         &requested_workspace,
                         cli.store.as_deref(),
                         url.or(arguments.remote),
+                        LabelMovePolicy {
+                            keep: arguments.keep_label,
+                            force: false,
+                        },
                         dot_git,
                     )
                 }
@@ -1579,7 +1608,14 @@ fn move_label(
         let view = view.ok_or_else(|| {
             CliFailure::invalid("label move without a workspace requires an explicit --view")
         })?;
-        return label_service::move_label(repository, name, view, force, expected_head, None);
+        return label_service::move_label_command(
+            repository,
+            name,
+            view,
+            force,
+            expected_head,
+            None,
+        );
     };
     let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
     context.workspace = WorkspaceMetadata::read(&context.root)?;
@@ -1590,7 +1626,7 @@ fn move_label(
     ))?;
     selection_recovery::recover(&context.root, repository, &mut context.workspace)?;
     let view = view.unwrap_or_else(|| context.workspace.effective_view());
-    label_service::move_label(
+    label_service::move_label_command(
         repository,
         name,
         view,
@@ -1696,12 +1732,86 @@ fn switch_workspace(
     )
 }
 
+const KEEP_LABEL_HINT: &str =
+    "pass --keep-label to leave the label where it is, or --force to move it anyway";
+
+/// How a command that joins frontiers treats the active label.
+#[derive(Clone, Copy, Debug, Default)]
+struct LabelMovePolicy {
+    /// Leave the label where it is.
+    keep: bool,
+    /// Move it even when that leaves frontiers behind.
+    force: bool,
+}
+
+/// `wheat refresh`: re-read the active label. When the label's view does not cover the
+/// workspace's (a fetch moved the label underneath it), the workspace's work would be
+/// lost by switching, so refresh integrates it with the label's view as `integrate`
+/// does; otherwise it switches to the label's view or its one frontier.
+fn refresh_workspace(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    frontier: Option<ViewId>,
+    policy: LabelMovePolicy,
+    dot_git: dot_git::DotGitGate,
+) -> Result<Success> {
+    let (label, covered) = {
+        let mut context = resolve_context(workspace, explicit_store)?;
+        let repository = open(&context.store_root)?;
+        let _operation =
+            rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
+        let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
+        context.workspace = WorkspaceMetadata::read(&context.root)?;
+        let runtime = runtime()?;
+        runtime.block_on(materialization::recover_locked(
+            &context.root,
+            &repository,
+            &mut context.workspace,
+        ))?;
+        selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
+        let label = context.workspace.active_label.clone();
+        let listed = runtime.block_on(frontier_service::list(&repository, &label))?;
+        let effective = context.workspace.effective_view();
+        let covered = effective == listed.basis
+            || listed.frontiers.contains(&effective)
+            || runtime.block_on(async {
+                let reader = RepositoryReader::new(&repository.objects, &repository.content);
+                let from = reader.view(effective).await?;
+                let to = reader.view(listed.basis).await?;
+                let mut budget = MergeBudget::STANDARD;
+                Ok::<_, anyhow::Error>(reader.forward(&from, &to, &mut budget).await?.is_none())
+            })?;
+        (label, covered)
+    };
+    if covered {
+        return switch_workspace(
+            workspace,
+            explicit_store,
+            label,
+            frontier,
+            "refresh",
+            dot_git,
+        );
+    }
+    if frontier.is_some() {
+        return Err(CliFailure::invalid(format!(
+            "label {label} moved to a view that does not have this workspace's work, so \
+             refresh integrates the two and takes no --frontier"
+        )));
+    }
+    integrate_workspace(workspace, explicit_store, &[], policy, "refresh", dot_git)
+}
+
 /// Join the active label's descendant frontiers, or the chosen ones, into one view and
-/// materialize it as the workspace's frontier.
+/// materialize it, moving the label there unless `--keep-label`. The workspace's own
+/// view joins them when the label moved to a view that does not cover it. One frontier
+/// that covers the label's view needs no join: the label moves to it.
 fn integrate_workspace(
     workspace: &Path,
     explicit_store: Option<&Path>,
     chosen: &[ViewId],
+    policy: LabelMovePolicy,
+    command: &'static str,
     dot_git: dot_git::DotGitGate,
 ) -> Result<Success> {
     let mut context = resolve_context(workspace, explicit_store)?;
@@ -1721,11 +1831,26 @@ fn integrate_workspace(
 
     let label = context.workspace.active_label.clone();
     let listed = runtime.block_on(frontier_service::list(&repository, &label))?;
+    let reader = RepositoryReader::new(&repository.objects, &repository.content);
+    let mut budget = MergeBudget::STANDARD;
+    let effective = context.workspace.effective_view();
+    let uncovered = effective != listed.basis
+        && !listed.frontiers.contains(&effective)
+        && runtime.block_on(async {
+            let from = reader.view(effective).await?;
+            let to = reader.view(listed.basis).await?;
+            Ok::<_, anyhow::Error>(reader.forward(&from, &to, &mut budget).await?.is_some())
+        })?;
+    let mut candidates = listed.frontiers.clone();
+    if uncovered {
+        candidates.push(effective);
+        candidates.sort();
+    }
     let frontiers = if chosen.is_empty() {
-        listed.frontiers.clone()
+        candidates
     } else {
         for view in chosen {
-            if !listed.frontiers.contains(view) {
+            if !candidates.contains(view) {
                 return Err(CliFailure::invalid(format!(
                     "view {view} is not a descendant frontier of label {label}"
                 )));
@@ -1736,11 +1861,68 @@ fn integrate_workspace(
         chosen.dedup();
         chosen
     };
-    if frontiers.len() < 2 {
+
+    let only_covering = match frontiers.as_slice() {
+        [] => None,
+        [only] => runtime.block_on(async {
+            let from = reader.view(listed.basis).await?;
+            let to = reader.view(*only).await?;
+            Ok::<_, anyhow::Error>(
+                reader
+                    .forward(&from, &to, &mut budget)
+                    .await?
+                    .is_none()
+                    .then_some(*only),
+            )
+        })?,
+        _ => None,
+    };
+    if frontiers.is_empty() || (only_covering.is_some() && policy.keep) {
         return Success::new(
-            "integrate",
-            json!({ "integrated": false, "label": label }),
+            command,
+            json!({ "integrated": false, "label": label, "label_moved": null }),
             format!("label {label} has nothing to integrate\n"),
+        );
+    }
+    if let Some(view) = only_covering {
+        // Nothing to join: the label moves to the frontier, under the same checks.
+        let moved = label_service::move_label(
+            &repository,
+            label.clone(),
+            view,
+            policy.force,
+            KEEP_LABEL_HINT,
+            None,
+            Some(label_service::MovingWorkspace {
+                root: &context.root,
+                store_root: &context.store_root,
+                metadata: &mut context.workspace,
+            }),
+        )?;
+        let tree = runtime.block_on(reader.view(view))?.tree;
+        runtime.block_on(materialization::materialize_locked(
+            &context.root,
+            &repository,
+            &mut context.workspace,
+            moved.head,
+            label.clone(),
+            view,
+            None,
+            tree,
+            dot_git,
+        ))?;
+        return Success::new(
+            command,
+            json!({
+                "integrated": false,
+                "label": label,
+                "view": view.to_string(),
+                "label_moved": { "from": listed.basis.to_string(), "to": view.to_string() },
+            }),
+            format!(
+                "moved label {label} from view {} to view {view}\n",
+                listed.basis
+            ),
         );
     }
 
@@ -1750,36 +1932,75 @@ fn integrate_workspace(
     let (prepared, outcome) = runtime
         .block_on(mutator.integrate(expected, listed.basis, &frontiers))
         .map_err(integration_failure)?;
-    let publication = runtime.block_on(prepare_mutation_publication(
+    let view = outcome.resulting_view;
+    let label_move = if policy.keep {
+        None
+    } else {
+        if !policy.force {
+            // The joined view is staged in the batch, not yet in the head.
+            let staged = RepositoryReader::new(&objects, &repository.content);
+            let refusal = runtime.block_on(async {
+                let source = staged.view(listed.basis).await?;
+                let target = staged.view(view).await?;
+                label_move::check_target(
+                    &staged,
+                    &source,
+                    &target,
+                    view,
+                    listed.frontiers.clone(),
+                    &mut budget,
+                )
+                .await
+            })?;
+            if !refusal.is_empty() {
+                return Err(CliFailure::label_move_refused(format!(
+                    "cannot move label {label} to view {view}: {}; {KEEP_LABEL_HINT}",
+                    refusal.describe(&label, view)
+                )));
+            }
+        }
+        Some(wheat_store::LabelMove {
+            name: label.clone(),
+            from: listed.basis,
+            to: view,
+        })
+    };
+    let publication = runtime.block_on(prepare_mutation_publication_moving_label(
         &objects,
         &repository.content,
         &repository.heads,
         expected,
         prepared,
+        label_move.as_ref(),
     ))?;
     runtime.block_on(objects.flush())?;
     let head = finalize_mutation_publication(&repository.heads, publication)?;
 
-    let view = outcome.resulting_view;
-    let tree = runtime
-        .block_on(RepositoryReader::new(&repository.objects, &repository.content).view(view))?
-        .tree;
+    let tree = runtime.block_on(reader.view(view))?.tree;
+    let (basis, selected) = match label_move {
+        Some(_) => (view, None),
+        None => (listed.basis, (view != listed.basis).then_some(view)),
+    };
     let materialized = runtime.block_on(materialization::materialize_locked(
         &context.root,
         &repository,
         &mut context.workspace,
         head,
         label.clone(),
-        listed.basis,
-        (view != listed.basis).then_some(view),
+        basis,
+        selected,
         tree,
         dot_git,
     ));
     if let Err(error) = materialized {
         // The joined view is recorded; only the workspace still shows the old one.
+        let switch = match label_move {
+            Some(_) => format!("wheat switch {label}"),
+            None => format!("wheat switch {label} --frontier {view}"),
+        };
         return Err(error.context(format!(
             "the frontiers were joined into view {view}, but the workspace was not \
-             switched to it; run `wheat switch {label} --frontier {view}`"
+             switched to it; run `{switch}`"
         )));
     }
 
@@ -1807,9 +2028,12 @@ fn integrate_workspace(
     if !outcome.conflicted.is_empty() {
         writeln!(human, "see `wheat conflicts` to resolve them")?;
     }
+    if label_move.is_some() {
+        writeln!(human, "moved label {label} to view {view}")?;
+    }
     let ids = |ids: &[ChangeId]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
     Success::new(
-        "integrate",
+        command,
         json!({
             "integrated": true,
             "label": label,
@@ -1819,6 +2043,10 @@ fn integrate_workspace(
             "reapplied": ids(&outcome.reapplied),
             "combined": outcome.combined.keys().map(ToString::to_string).collect::<Vec<_>>(),
             "conflicted": ids(&outcome.conflicted),
+            "label_moved": label_move.map(|moved| json!({
+                "from": moved.from.to_string(),
+                "to": moved.to.to_string(),
+            })),
         }),
         human,
     )
@@ -2590,14 +2818,24 @@ fn native_fetch(
     } else if !remote_moved {
         local_head.envelope
     } else {
-        rt.block_on(
-            RepositoryReader::new(&staged, staged.content()).union_envelopes(
+        let reader = RepositoryReader::new(&staged, staged.content());
+        let union = rt
+            .block_on(reader.union_envelopes_under(
                 since,
                 local_head.envelope,
                 remote_state.envelope,
-            ),
-        )
-        .map_err(union_failure)?
+                wheat_store::LabelPolicy::Fetch,
+            ))
+            .map_err(union_failure)?;
+        refuse_hiding_frontiers(
+            &context.store_root,
+            &local,
+            &staged,
+            &reader,
+            local_head,
+            &union,
+        )?;
+        union.envelope
     };
     // The store must hold the fetched closure before the remote configuration
     // records it, and the new head before the head names it.
@@ -2679,6 +2917,7 @@ fn native_pull(
     workspace: &Path,
     explicit_store: Option<&Path>,
     remote: Option<String>,
+    policy: LabelMovePolicy,
     dot_git: dot_git::DotGitGate,
 ) -> Result<Success> {
     let fetched = native_fetch(
@@ -2696,8 +2935,9 @@ fn native_pull(
         )
     };
     let mut integrated =
-        integrate_workspace(workspace, explicit_store, &[], dot_git).map_err(after_fetch)?;
-    if integrated.result["integrated"] == false {
+        integrate_workspace(workspace, explicit_store, &[], policy, "integrate", dot_git)
+            .map_err(after_fetch)?;
+    if integrated.result["integrated"] == false && integrated.result["label_moved"].is_null() {
         let label = resolve_context(workspace, explicit_store)?
             .workspace
             .active_label;
@@ -2711,6 +2951,63 @@ fn native_pull(
         json!({ "fetch": fetched.result, "integrate": integrated.result }),
         human,
     )
+}
+
+/// Refuses a fetch whose label changes would hide frontiers of the local labels' views
+/// that no workspace registered with this store shows: the work on them would only be
+/// reachable by view ID.
+fn refuse_hiding_frontiers<O: ImmutableObjectStore>(
+    store_root: &Path,
+    local: &wheat_client::local::LocalRepository,
+    objects: &O,
+    reader: &RepositoryReader<'_, O>,
+    local_head: wheat_store::RepositoryHead,
+    union: &wheat_store::EnvelopeUnion,
+) -> Result<()> {
+    if union.label_changes.is_empty() {
+        return Ok(());
+    }
+    let shown =
+        wheat_client::workspace_registry::WorkspaceRegistry::new(store_root, local.store_id)?
+            .enumerate()?
+            .into_iter()
+            .map(|pin| pin.stable.selected_frontier.unwrap_or(pin.stable.basis))
+            .collect();
+    let hidden = runtime()?.block_on(async {
+        let state = reader
+            .state(reader.envelope(local_head.envelope).await?.state)
+            .await?;
+        let mut budget = MergeBudget::STANDARD;
+        label_move::hidden_by_fetch(
+            reader,
+            objects,
+            &state,
+            &union.label_changes,
+            &shown,
+            &mut budget,
+        )
+        .await
+    })?;
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    let named = hidden
+        .iter()
+        .map(|hidden| {
+            let views = hidden
+                .views
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("label {} ({views})", hidden.label)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CliFailure::conflict(format!(
+        "the remote moved or deleted labels in a way that would hide work no workspace \
+         shows: {named}; integrate it or switch a workspace to it, then fetch again"
+    )))
 }
 
 /// A fetch that cannot keep the local work beside the remote's is a conflict the user

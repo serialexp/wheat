@@ -616,6 +616,15 @@ size for `just test`; release run; results under `bench/results/`.
    basis's whole map); `change squash` accepts any change of the view and is a no-op
    for one the basis holds unrevised. Test in `crates/wheat-cli/tests/label_move.rs`.
 7. integrate/pull/refresh move the label; `--keep-label`; one-frontier rule.
+   **Done 2026-10-26** (`integrate_workspace` and `refresh_workspace` in `main.rs`):
+   the label moves to the joined view through
+   `prepare_mutation_publication_moving_label`, checked against the staged result with
+   `label_move::check_target`; one covering frontier moves the label through
+   `label_service::move_label`. With `--keep-label` and one covering frontier,
+   `integrate` does nothing (and `pull` switches to it, as before). `pull` takes
+   `--keep-label` but not `--force`: joining every frontier leaves none behind. Tests in
+   `crates/wheat-cli/tests/label_move.rs`; the existing `integrate.rs` tests now expect
+   no frontiers after a join, since the label is on it.
 8. Fetch label rules (store + CLI).
    **Store part done 2026-10-26**: `merge_labels(base, local, remote, LabelPolicy)`
    returns a `LabelMerge` naming the labels both sides only moved (`both_moved`);
@@ -623,7 +632,13 @@ size for `just test`; release run; results under `bench/results/`.
    `forward` under one `MergeBudget` per join and returns an `EnvelopeUnion` with the
    `LabelChange`s against the local side, for the CLI's left-behind check.
    `union_envelopes` keeps the publish policy and reads nothing for label changes.
-   The CLI (`native_fetch` in `main.rs`) still calls `union_envelopes`.
+   **CLI part done 2026-10-26**: `native_fetch` uses `union_envelopes_under(…, Fetch)`
+   and `refuse_hiding_frontiers` (`label_move::hidden_by_fetch`) against the effective
+   views of the store's registered workspaces. A judgement call to revisit (Bart did
+   not answer the question in time): for a deletion only the local view's descendant
+   frontiers count, not the deleted label's own view, which is the remote's published
+   view; read literally, any remote deletion of a label no workspace is on would refuse
+   every clone's fetch until `--force`. Tests in `crates/wheat-cli/tests/label_fetch.rs`.
 9. Protocol field, server label checks and limits, publish moving the label.
    **Store part done 2026-10-26**: `RepositoryReader::backward_label(old, new,
    budget)` names the first label `new` moved to a view not forward from `old`'s
