@@ -1,10 +1,11 @@
 # Wheat Lessons from Scion — Design
 
 Status: draft — review guidance and scope decisions landed; server-side publish
-reconciliation, resumable content and publish, lazy content, sparse materialization,
-derived-data indexes and deterministic simulation are not yet implemented
+reconciliation and capability negotiation landed; resumable content and publish,
+lazy content, sparse materialization, derived-data indexes and deterministic
+simulation are not yet implemented
 Owner: bart
-Last updated: 2026-10-15
+Last updated: 2026-10-26
 
 ## Implementation status
 
@@ -88,14 +89,16 @@ land and move completed bullets from Outstanding to Done.
   with the first sending's head, or waits for it while it is still being written.
   `wheat publish` sends the publish once more over a new connection when the
   connection is lost.
+- [x] **Capability negotiation (2026-10-26).** `ServerHello.capabilities` offers
+  the server's optional modes and `ClientHello.capabilities` names the ones the
+  session uses, all from the offer (`wheat-protocol/src/capabilities.rs`). None
+  exist yet; resumable content and lazy content are switched on by one when they
+  land.
 
 ### Outstanding
 - [ ] **Defer unless the contention benchmark shows the server merge as the
   bottleneck — per-label heads.** Labels get their own CAS and changes are accepted
   without a head CAS.
-- [ ] **Capability negotiation.** `ClientHello` gains a capability list and the
-  server fills `ServerHello.capabilities`, so optional modes are switched on per
-  connection.
 - [ ] **Resumable — content offsets.** Per-blob start offsets in
   `ContentFetchRequest` and `ContentNeeded`; the server keeps partial uploads.
 - [ ] **Resumable — publish objects.** Remote publishes that keep received objects
@@ -532,6 +535,7 @@ server, or refuse in sparse mode.
   objects. (The server ignored `publish_key` too, until 2026-10-20.)
 - **`ServerHello.capabilities`** exists but is sent empty, and `ClientHello` has no
   capability list. `Credit` and `ContentRedirect` exist in the schema unused.
+  (2026-10-26: `ClientHello` now names the capabilities a session uses; see Done.)
 
 ### What depends on the full closure
 

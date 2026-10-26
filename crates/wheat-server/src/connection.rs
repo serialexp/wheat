@@ -158,7 +158,10 @@ async fn run_session(
             protocol_version_min: 1,
             protocol_version_max: 1,
             server_id: config.server_id.to_vec(),
-            capabilities: vec![],
+            capabilities: SUPPORTED_CAPABILITIES
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect(),
         }),
     )
     .await?;
@@ -199,6 +202,19 @@ async fn run_session(
         .await?;
         return Ok(());
     }
+
+    // The capabilities the session uses: only ones the server offered.
+    let capabilities = match accept_capabilities(&client_hello.capabilities, SUPPORTED_CAPABILITIES)
+    {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            let message = format!("ClientHello capabilities refused: {error}");
+            send_error(ws, 0, 1, connection_error_scope(), false, &message).await?;
+            return Err(ConnectionError::Protocol(
+                "ClientHello capabilities refused",
+            ));
+        }
+    };
 
     // 3. Authenticate the bearer token.
     let principal = if client_hello.auth_token.len() > MAX_AUTH_TOKEN_BYTES {
@@ -253,7 +269,12 @@ async fn run_session(
     )
     .await?;
 
-    info!(peer = %peer, principal = %principal.name, "session established (v1)");
+    info!(
+        peer = %peer,
+        principal = %principal.name,
+        capabilities = ?capabilities.to_vec(),
+        "session established (v1)"
+    );
 
     // --- Repository open ---
 

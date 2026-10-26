@@ -266,6 +266,15 @@ mod url_tests {
 /// A connected and handshaken session to a wheat-server.
 pub struct WheatSession {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    capabilities: Capabilities,
+}
+
+impl WheatSession {
+    /// The optional modes the session uses: those the server offered that this
+    /// client supports.
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
 }
 
 /// Repository state received after opening.
@@ -423,7 +432,7 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
 
     // Receive ServerHello.
     let server_hello = recv_msg(&mut ws).await?;
-    match &server_hello {
+    let capabilities = match &server_hello {
         WheatProtocolMessage::ServerHello(sh) => {
             if sh.protocol_version_min > 1 || sh.protocol_version_max < 1 {
                 bail!(
@@ -432,9 +441,11 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
                     sh.protocol_version_max
                 );
             }
+            select_capabilities(&sh.capabilities, SUPPORTED_CAPABILITIES)
+                .context("server offered malformed capabilities")?
         }
         other => bail!("expected ServerHello, got {other:?}"),
-    }
+    };
 
     send_msg(
         &mut ws,
@@ -444,6 +455,7 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
             auth_token: token.to_vec(),
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
+            capabilities: capabilities.to_vec(),
         }),
     )
     .await?;
@@ -483,7 +495,7 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
     }
 
     let state = repository_state(&mut ws, &url.repo_name).await?;
-    Ok((WheatSession { ws }, state))
+    Ok((WheatSession { ws, capabilities }, state))
 }
 
 /// Reads the reply to `RepositoryOpen` for the repository `name`.

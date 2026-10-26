@@ -123,6 +123,8 @@
     // Session messages
     // ─────────────────────────────────────────────────────────────────────
 
+    // `capabilities` offers the optional modes the server supports; the client
+    // names in ClientHello the ones the session uses.
     ServerHello: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x01 },
@@ -146,6 +148,15 @@
         { name: "auth_token", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "receive_window_bytes", type: "uint32" },
         { name: "receive_window_messages", type: "uint16" },
+        // The capabilities from ServerHello this session uses; the server refuses
+        // one it did not offer.
+        {
+          name: "capabilities",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "varlength", length_encoding: "leb128_canonical",
+          items: { type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        },
       ],
     },
 

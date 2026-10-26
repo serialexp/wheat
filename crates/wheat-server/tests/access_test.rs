@@ -146,6 +146,7 @@ async fn hello(addr: SocketAddr, token: &[u8]) -> (Ws, SessionEstablishedOutput)
             auth_token: token.to_vec(),
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
+            capabilities: vec![],
         }),
     )
     .await;
@@ -282,6 +283,7 @@ async fn a_refused_session_ends_cleanly_with_a_request_behind_it() {
                 auth_token: b"not-a-token".to_vec(),
                 receive_window_bytes: 16 * 1024 * 1024,
                 receive_window_messages: 256,
+                capabilities: vec![],
             }),
         )
         .await;

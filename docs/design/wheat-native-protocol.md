@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-09-25
+Last updated: 2026-10-26
 
 ## Implementation status
 
@@ -95,6 +95,13 @@ top of them.
   Benchmark test (`s3_packed_test::publish_clone_s3_benchmark`) measures
   publish and clone timing separately against the latency-injected S3
   backend.
+- [x] **Capability negotiation (2026-10-26).** `ServerHello.capabilities` offers
+  the server's optional modes (`SUPPORTED_CAPABILITIES`, empty so far) and
+  `ClientHello.capabilities` names the ones the session uses; the server refuses
+  a capability it did not offer. Names are 1–64 bytes of `[a-z0-9.-]`, at most 64
+  per list (`wheat-protocol/src/capabilities.rs`). Added before the V1 format
+  freeze, because a decoder needs the field from the start; see
+  [Schema evolution policy](#schema-evolution-policy).
 
 ### Outstanding
 
@@ -650,7 +657,7 @@ Client                          Server
   │<──── ServerHello ────────────┤  version_min, version_max,
   │                               │  server_id, capabilities
   ├─ ClientHello ────────────────>│  selected_version, auth_token,
-  │                               │  receive_window
+  │                               │  receive_window, capabilities
   ├─ RepositoryOpen ─────────────>│  repo_name (sent with ClientHello,
   │                               │  without waiting for the session)
   │                               │
@@ -678,6 +685,13 @@ that says why it ended.
 confirms the selected version or rejects with `version_mismatch` and the
 server's supported range. The selected version governs which message types
 and field layouts are valid for the session.
+
+**Capability negotiation:** `ServerHello.capabilities` offers the optional
+modes the server supports. `ClientHello.capabilities` names the ones the
+session uses, each from the offer; the server refuses the session with an
+`Error` when one was not offered. Both sides then hold the same set without a
+further message. A new optional message type or behaviour is switched on by a
+capability, so peers that predate it keep working within one protocol version.
 
 **Authentication:** Connections require TLS. The `auth_token` field in
 `ClientHello` carries a bearer token. The server validates the token and
@@ -724,6 +738,7 @@ ClientHello
   auth_token: bytes (length-prefixed, max 8 KiB)
   receive_window_bytes: u32                   // flow control
   receive_window_messages: u16
+  capabilities: array<string, max=64>         // from ServerHello's offer
 
 SessionEstablished
   selected_version: u16
@@ -948,6 +963,14 @@ The object schema (`wheat-core`) and the protocol schema evolve
 independently. The protocol carries supported object schema versions in
 `ServerHello.capabilities` so the client can detect incompatible object
 formats before fetching.
+
+As built (2026-10-26): the generated protocol decoders ignore bytes after the
+last field they know, so an older peer skips a field appended to a message.
+A newer decoder still fails on a message that lacks the field, though, and a
+message type the decoder does not know is an error in either range. A change
+that has to work across versions therefore goes in a new message type that a
+capability switches on, and is sent only to a peer that negotiated it. That is
+why `ClientHello` carries its capability list from V1 on.
 
 ## Server deployment model
 

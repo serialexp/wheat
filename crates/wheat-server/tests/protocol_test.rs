@@ -200,6 +200,43 @@ async fn repo_not_found() {
     let _ = shutdown.send(());
 }
 
+/// The server offers the capabilities it supports, and refuses a session that asks
+/// for one it did not offer.
+#[tokio::test]
+async fn a_capability_the_server_did_not_offer_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _repo = setup_repo(dir.path()).await;
+    let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+        .await
+        .unwrap();
+    match recv_msg(&mut ws).await {
+        WheatProtocolMessage::ServerHello(hello) => {
+            assert_eq!(hello.capabilities, SUPPORTED_CAPABILITIES)
+        }
+        other => panic!("expected ServerHello, got {other:?}"),
+    }
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::ClientHello(ClientHelloOutput {
+            message_type: 0x02,
+            selected_version: 1,
+            auth_token: vec![],
+            receive_window_bytes: 16 * 1024 * 1024,
+            receive_window_messages: 256,
+            capabilities: vec!["not-offered".to_owned()],
+        }),
+    )
+    .await;
+    match recv_msg(&mut ws).await {
+        WheatProtocolMessage::Error(error) => {
+            assert!(error.message.contains("not-offered"), "{}", error.message)
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    let _ = shutdown.send(());
+}
+
 #[tokio::test]
 async fn a_message_over_the_limit_is_refused_before_it_ends() {
     use futures::StreamExt;

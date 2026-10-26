@@ -93,6 +93,7 @@ pub async fn connect_and_handshake(addr: SocketAddr) -> Ws {
             auth_token: vec![],
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
+            capabilities: vec![],
         }),
     )
     .await;

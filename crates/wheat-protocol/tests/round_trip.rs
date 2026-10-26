@@ -1,12 +1,13 @@
 //! Smoke tests: encode a protocol message, decode, compare.
 
 use wheat_protocol::{
-    CreditOutput, Digest256, ErrorOutput, ErrorScope, ErrorScopeConnectionOutput,
-    FetchCompleteOutput, FetchPushEndOutput, FetchRequestOutput, ObjectBatchOutput,
-    ObjectChunkOutput, ObjectEntry, ObjectWantOutput, ObjectWantReplyOutput, PublishPushEndOutput,
-    PublishRequestOutput, PublishResultOutput, PublishResultStatus, PublishStatusOkOutput,
-    RepositoryOpenOutput, ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus,
-    SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message, encode_message,
+    ClientHelloOutput, CreditOutput, Digest256, ErrorOutput, ErrorScope,
+    ErrorScopeConnectionOutput, FetchCompleteOutput, FetchPushEndOutput, FetchRequestOutput,
+    ObjectBatchOutput, ObjectChunkOutput, ObjectEntry, ObjectWantOutput, ObjectWantReplyOutput,
+    PublishPushEndOutput, PublishRequestOutput, PublishResultOutput, PublishResultStatus,
+    PublishStatusOkOutput, RepositoryOpenOutput, ServerHelloOutput, SessionEstablishedOutput,
+    SessionEstablishedStatus, SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message,
+    encode_message,
 };
 
 fn zero_digest() -> Digest256 {
@@ -30,6 +31,20 @@ fn server_hello_round_trip() {
         protocol_version_max: 1,
         server_id: vec![0xab; 32],
         capabilities: vec!["wheat-objects-v0.1".to_string()],
+    });
+    let decoded = round_trip(msg.clone());
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn client_hello_round_trip() {
+    let msg = WheatProtocolMessage::ClientHello(ClientHelloOutput {
+        message_type: 0x02,
+        selected_version: 1,
+        auth_token: b"token".to_vec(),
+        receive_window_bytes: 16 * 1024 * 1024,
+        receive_window_messages: 256,
+        capabilities: vec!["resume".to_string(), "lazy-content".to_string()],
     });
     let decoded = round_trip(msg.clone());
     assert_eq!(msg, decoded);

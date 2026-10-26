@@ -77,6 +77,13 @@ impl WheatProtocolMessage {
                 }
                 encoder.write_uint32(v.receive_window_bytes, Endianness::BigEndian);
                 encoder.write_uint16(v.receive_window_messages, Endianness::BigEndian);
+                encoder.write_varlength(v.capabilities.len() as u64, "leb128_canonical")?;
+                for item in &v.capabilities {
+                    encoder.write_varlength(item.len() as u64, "leb128_canonical")?;
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
             }
             WheatProtocolMessage::SessionEstablished(v) => {
                 encoder.write_uint8(v.message_type);
@@ -738,6 +745,7 @@ pub struct ClientHelloInput {
     pub auth_token: Vec<u8>,
     pub receive_window_bytes: u32,
     pub receive_window_messages: u16,
+    pub capabilities: Vec<std::string::String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -747,6 +755,7 @@ pub struct ClientHelloOutput {
     pub auth_token: Vec<u8>,
     pub receive_window_bytes: u32,
     pub receive_window_messages: u16,
+    pub capabilities: Vec<std::string::String>,
 }
 
 pub type ClientHello = ClientHelloOutput;
@@ -767,6 +776,13 @@ impl ClientHelloInput {
         }
         encoder.write_u32_be(self.receive_window_bytes);
         encoder.write_u16_be(self.receive_window_messages);
+        encoder.write_varlength(self.capabilities.len() as u64, "leb128_canonical")?;
+        for item in &self.capabilities {
+            encoder.write_varlength(item.len() as u64, "leb128_canonical")?;
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
         Ok(())
     }
 }
@@ -790,12 +806,22 @@ impl ClientHelloOutput {
         let auth_token = decoder.read_bytes_vec(length)?;
         let receive_window_bytes = decoder.read_u32_be()?;
         let receive_window_messages = decoder.read_u16_be()?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut capabilities = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let str_len = decoder.read_varlength("leb128_canonical")? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes)
+                .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            capabilities.push(item);
+        }
         Ok(Self {
             message_type,
             selected_version,
             auth_token,
             receive_window_bytes,
             receive_window_messages,
+            capabilities,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -813,6 +839,7 @@ impl From<ClientHelloOutput> for ClientHelloInput {
             auth_token: o.auth_token,
             receive_window_bytes: o.receive_window_bytes,
             receive_window_messages: o.receive_window_messages,
+            capabilities: o.capabilities,
         }
     }
 }
@@ -825,6 +852,7 @@ impl From<ClientHelloInput> for ClientHelloOutput {
             auth_token: i.auth_token,
             receive_window_bytes: i.receive_window_bytes,
             receive_window_messages: i.receive_window_messages,
+            capabilities: i.capabilities,
         }
     }
 }

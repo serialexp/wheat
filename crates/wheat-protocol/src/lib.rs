@@ -21,9 +21,14 @@
 //! rejected. The framing layer (not binschema) enforces aggregate
 //! message-size bounds and per-field maximums before allocating.
 
+mod capabilities;
 mod content_batch;
 mod transfer_receiver;
 
+pub use capabilities::{
+    Capabilities, CapabilityError, MAX_CAPABILITIES, MAX_CAPABILITY_BYTES, SUPPORTED_CAPABILITIES,
+    accept_capabilities, select_capabilities,
+};
 pub use content_batch::{ContentBatcher, content_chunks};
 pub use transfer_receiver::{TransferError, TransferReceiver};
 pub use wheat_protocol_generated::generated::*;
