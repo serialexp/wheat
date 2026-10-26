@@ -7,6 +7,8 @@ use wheat_store::{
     RepositoryPublisher, RepositoryReader,
 };
 
+use crate::workspace_metadata::STORE_METADATA_FILE;
+
 /// Every local store keeps its objects and content in one packed store under `storage/`.
 pub struct LocalRepository {
     pub store_id: uuid::Uuid,
@@ -28,7 +30,7 @@ fn storage_path(root: &Path) -> Result<PathBuf> {
             root.display()
         );
     }
-    if !root.join("store.json").is_file() {
+    if !root.join(STORE_METADATA_FILE).is_file() {
         bail!("cannot open Wheat store: {}", root.display());
     }
     let storage = root.join("storage");
@@ -123,7 +125,7 @@ mod tests {
     #[test]
     fn layout_requires_packed_storage() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("store.json"), "{}").unwrap();
+        std::fs::write(root.path().join(STORE_METADATA_FILE), "").unwrap();
         std::fs::write(root.path().join("repository.head"), "head").unwrap();
         std::fs::create_dir(root.path().join("objects")).unwrap();
         let error = storage_path(root.path()).unwrap_err();

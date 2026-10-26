@@ -54,9 +54,10 @@ fn json(root: &Path, config: &Path, args: &[&str]) -> serde_json::Value {
     serde_json::from_str(&ok(wheat(root, config, args))).unwrap()
 }
 fn workspace_store(root: &Path) -> PathBuf {
-    let workspace: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join(".wheat/workspace.json")).unwrap()).unwrap();
-    PathBuf::from(workspace["store"]["path"].as_str().unwrap())
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(root)
+        .unwrap()
+        .store
+        .path
 }
 
 fn head(store: &Path) -> RepositoryHead {
@@ -66,20 +67,9 @@ fn head(store: &Path) -> RepositoryHead {
 }
 
 fn write_remote(store: &Path, observed: RepositoryHead) {
-    fs::write(
-        store.join("remote.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 1,
-            "display_url": "wheat://example.invalid/owner/repo",
-            "canonical_identity": "wheat://example.invalid/owner/repo",
-            "head": {
-                "generation": observed.generation,
-                "envelope": observed.envelope.to_string(),
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    wheat_client::remote_config::RemoteConfig::new("wheat://example.invalid/owner/repo", &observed)
+        .write(store)
+        .unwrap();
 }
 
 async fn revision(store: &Path, id: &str) -> wheat_core::RevisionRecord {
@@ -218,7 +208,7 @@ fn squash_is_noop_for_one_unpublished_checkpoint_and_stack_squashes_all_changes(
     ));
     let store = workspace_store(&workspace);
     let head_path = store.join("repository.head");
-    let metadata_path = workspace.join(".wheat/workspace.json");
+    let metadata_path = workspace.join(".wheat/workspace.meta");
     let transaction_path = store.join("rewrite-transaction.json");
     assert!(!transaction_path.exists());
     let head_before = fs::read(&head_path).unwrap();
@@ -449,7 +439,7 @@ fn remote_latest_retained_is_noop_and_corrupt_observation_preserves_state() {
     let store = workspace_store(&workspace);
     write_remote(&store, heads[2]);
     let head_before = fs::read(store.join("repository.head")).unwrap();
-    let workspace_before = fs::read(workspace.join(".wheat/workspace.json")).unwrap();
+    let workspace_before = fs::read(workspace.join(".wheat/workspace.meta")).unwrap();
     let no_op = json(
         &workspace,
         &config,
@@ -461,7 +451,7 @@ fn remote_latest_retained_is_noop_and_corrupt_observation_preserves_state() {
         head_before
     );
     assert_eq!(
-        fs::read(workspace.join(".wheat/workspace.json")).unwrap(),
+        fs::read(workspace.join(".wheat/workspace.meta")).unwrap(),
         workspace_before
     );
     assert!(!store.join("rewrite-transaction.json").exists());
@@ -481,7 +471,7 @@ fn remote_latest_retained_is_noop_and_corrupt_observation_preserves_state() {
         head_before
     );
     assert_eq!(
-        fs::read(workspace.join(".wheat/workspace.json")).unwrap(),
+        fs::read(workspace.join(".wheat/workspace.meta")).unwrap(),
         workspace_before
     );
     assert!(!store.join("rewrite-transaction.json").exists());
@@ -566,15 +556,14 @@ fn change_squash_without_a_selection_lists_active_changes() {
     ));
     let second_change = field(&second, "change ");
 
-    let metadata_path = workspace.join(".wheat/workspace.json");
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
-    metadata["selected_change"] = serde_json::Value::Null;
-    fs::write(
-        &metadata_path,
-        serde_json::to_vec_pretty(&metadata).unwrap(),
-    )
-    .unwrap();
+    let mut metadata =
+        wheat_client::workspace_metadata::WorkspaceMetadata::read(&workspace).unwrap();
+    metadata.selected_change = None;
+    metadata
+        .replace_prepared(&workspace)
+        .unwrap()
+        .publish()
+        .unwrap();
 
     let output = wheat(&workspace, &config, &["change", "squash"]);
     assert!(!output.status.success());

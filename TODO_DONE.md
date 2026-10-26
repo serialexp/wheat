@@ -556,6 +556,19 @@ Finished items, moved here from `TODO.md` under the same headings.
   Done 2026-09-26: squash composes subsumption chains through the suffix and keeps
   only resolutions of conflicts still present at the boundary (with the view their
   application produced). See "Rewrite semantics" in `docs/design/wheat-local-cli.md`.
+- `[x]` **Durable workspace and store files are JSON (2026-10-05).** Done 2026-10-26:
+  the storage rule now names three kinds (durable system state is BinSchema or
+  SQLite, files people edit are JSON, temporary files may be JSON), and the durable
+  files are BinSchema records: `store.meta` (`StoreMetadataV1`),
+  `.wheat/workspace.meta` (`WorkspaceMetadataV1`), the registry pins
+  `workspaces/<id>.pin` (`WorkspacePinV1`) and `remote.meta` (`RemoteConfigV1`),
+  with codecs in `wheat-core` `store_records.rs`. `config.json` stays JSON; the
+  temporary `materialization.json`, `progress.log` and `rewrite-transaction.json`
+  stay as they are.
+- `[x]` **Remote packed store keeps its head pointer as JSON.** Done 2026-10-26:
+  `{prefix}/catalog/head` is a `RemoteCatalogHeadV1` record
+  (`encode_remote_catalog_head` in `segment_records.rs`). Whether the remote store
+  moves to catalog snapshots stays open in TODO.md.
 
 ## Authoring workflow follow-ups (2026-09-24)
 

@@ -236,7 +236,7 @@ fn restores_leaf_and_recursive_directory_with_overlap_without_touching_siblings(
     fs::write(workspace.join("dir/b"), b"dirty b\n").unwrap();
     fs::write(workspace.join("other"), b"keep dirty\n").unwrap();
     fs::write(workspace.join("dir/untracked"), b"mine\n").unwrap();
-    let metadata = fs::read(workspace.join(".wheat/workspace.json")).unwrap();
+    let metadata = fs::read(workspace.join(".wheat/workspace.meta")).unwrap();
 
     let output = wheat(
         &stores,
@@ -261,7 +261,7 @@ fn restores_leaf_and_recursive_directory_with_overlap_without_touching_siblings(
         b"mine\n"
     );
     assert_eq!(
-        fs::read(workspace.join(".wheat/workspace.json")).unwrap(),
+        fs::read(workspace.join(".wheat/workspace.meta")).unwrap(),
         metadata
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("restored 2 tracked path(s)"));
@@ -270,7 +270,7 @@ fn restores_leaf_and_recursive_directory_with_overlap_without_touching_siblings(
 #[test]
 fn every_selector_is_validated_even_when_an_earlier_selection_is_clean() {
     let (_root, workspace, stores) = fixture();
-    for invalid in ["../other", ".wheat/workspace.json", "dir/missing"] {
+    for invalid in ["../other", ".wheat/workspace.meta", "dir/missing"] {
         let output = wheat(
             &stores,
             &[
@@ -354,7 +354,7 @@ fn repository_authority_advancement_does_not_retarget_restore() {
 fn interrupted_restore_recovers_exact_observed_preimage_without_retargeting() {
     let (_root, workspace, stores) = fixture();
     fs::write(workspace.join("dir/a"), b"dirty a\n").unwrap();
-    let metadata = fs::read(workspace.join(".wheat/workspace.json")).unwrap();
+    let metadata = fs::read(workspace.join(".wheat/workspace.meta")).unwrap();
     let failed = wheat_failing_at(
         &stores,
         &[
@@ -378,7 +378,7 @@ fn interrupted_restore_recovers_exact_observed_preimage_without_retargeting() {
     );
     assert_eq!(fs::read(workspace.join("dir/a")).unwrap(), b"a\n");
     assert_eq!(
-        fs::read(workspace.join(".wheat/workspace.json")).unwrap(),
+        fs::read(workspace.join(".wheat/workspace.meta")).unwrap(),
         metadata
     );
     assert!(!workspace.join(".wheat/materialization.json").exists());
@@ -390,7 +390,7 @@ fn clean_restore_is_a_true_noop_without_journal_or_metadata_change() {
     let (_root, workspace, stores) = fixture();
     let path = workspace.join("dir/a");
     let before_file = fs::metadata(&path).unwrap();
-    let before_metadata = fs::read(workspace.join(".wheat/workspace.json")).unwrap();
+    let before_metadata = fs::read(workspace.join(".wheat/workspace.meta")).unwrap();
 
     let output = wheat(
         &stores,
@@ -412,7 +412,7 @@ fn clean_restore_is_a_true_noop_without_journal_or_metadata_change() {
     assert_eq!(before_file.mtime_nsec(), after_file.mtime_nsec());
     assert_eq!(
         before_metadata,
-        fs::read(workspace.join(".wheat/workspace.json")).unwrap()
+        fs::read(workspace.join(".wheat/workspace.meta")).unwrap()
     );
     assert!(!workspace.join(".wheat/materialization.json").exists());
     let transactions = workspace.join(".wheat/materialization-transactions");

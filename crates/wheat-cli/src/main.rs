@@ -2653,7 +2653,7 @@ fn native_publish(
     // Resolve remote URL.
     let (parsed, mut remote_cfg) = if let Some(url) = arguments.remote.as_deref() {
         let parsed = remote::parse_wheat_url(url)?;
-        // If no remote.json exists, create one (first publish of a locally-initialized repo).
+        // If no remote.meta exists, create one (first publish of a locally-initialized repo).
         let cfg = remote_config::RemoteConfig::read(&context.store_root)?.unwrap_or_else(|| {
             remote_config::RemoteConfig::new(
                 url,
@@ -2820,7 +2820,7 @@ fn native_publish(
     }
 }
 
-/// Resolve the remote URL from --remote flag or remote.json.
+/// Resolve the remote URL from --remote flag or remote.meta.
 fn resolve_remote(
     store_root: &Path,
     explicit_url: Option<&str>,
@@ -2828,7 +2828,7 @@ fn resolve_remote(
     if let Some(url) = explicit_url {
         let parsed = remote::parse_wheat_url(url)?;
         let cfg = remote_config::RemoteConfig::read(store_root)?
-            .with_context(|| "no remote.json found; use wheat clone or pass --remote")?;
+            .with_context(|| "no remote.meta found; use wheat clone or pass --remote")?;
         if !cfg.has_same_identity(&parsed) {
             return Err(CliFailure::invalid(
                 "explicit native remote does not match this store's tracked remote",

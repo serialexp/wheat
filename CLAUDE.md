@@ -6,9 +6,17 @@ history. It must never depend on a gothab crate.
 
 ## Storage format
 
-Storage records are **BinSchema-generated binary only** (see
-`crates/wheat-core/CLAUDE.md`). No JSON, serde or hand-rolled encodings for anything
-persisted. Schemas: `crates/wheat-core/schemas/*.bs.json5`. Regenerate with
+What Wheat persists falls in three kinds (see `crates/wheat-core/CLAUDE.md`):
+
+- **Durable system state** is a **BinSchema-generated binary** record or a SQLite
+  database (the store locator, the catalog, the git journal). No JSON, serde or
+  hand-rolled encodings for anything the system writes and reads back later.
+- **Files people edit** are JSON. Today that is only `config.json` (user and
+  repository).
+- **Temporary files** that never outlive the operation that wrote them (for example
+  `materialization.json`, `rewrite-transaction.json`) may be JSON.
+
+Schemas: `crates/wheat-core/schemas/*.bs.json5`. Regenerate with
 `just gen-schema` / `just protocol-gen-schema` (needs `~/Projects/binschema` at the
 revision pinned in the scripts). Unreleased formats are edited in place: no V2
 structs, no version bumps.

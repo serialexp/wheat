@@ -8,12 +8,12 @@ use crate::{
     materialization::WorkspaceLock,
     outcome::{CliFailure, Success},
     sys::{self, EntryKind},
-    workspace_metadata::{StoreMetadata, WorkspaceMetadata},
+    workspace_metadata::{StoreMetadata, WORKSPACE_METADATA_FILE, WorkspaceMetadata},
     workspace_registry::WorkspaceRegistry,
 };
 
 const OWNED_CONTROL_ENTRIES: &[&str] = &[
-    "workspace.json",
+    WORKSPACE_METADATA_FILE,
     "workspace.lock",
     "materialization.json",
     "materialization-transactions",
@@ -258,7 +258,7 @@ fn remove_control_directory(root: &Path, control: &fs::File) -> Result<()> {
     for name in [
         "materialization-transactions",
         "materialization.json",
-        "workspace.json",
+        WORKSPACE_METADATA_FILE,
         "workspace.lock",
     ] {
         unlink_control_entry(control, name, name == "materialization-transactions")?;

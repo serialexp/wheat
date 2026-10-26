@@ -99,10 +99,10 @@ fn effective_view(workspace: &Path) -> String {
 }
 
 fn store_path(workspace: &Path) -> PathBuf {
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(workspace.join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    metadata["store"]["path"].as_str().unwrap().into()
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)
+        .unwrap()
+        .store
+        .path
 }
 
 fn bare(path: &Path) -> String {

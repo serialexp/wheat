@@ -260,7 +260,7 @@ async fn plan<O: ImmutableObjectStore>(
     let published_state = if let Some(config) = remote {
         let remote_head = config.last_fetched_head()?;
         let remote_envelope = reader.envelope(remote_head.envelope).await.map_err(|_| {
-            CliFailure::corrupt("remote.json observed envelope is not retained locally")
+            CliFailure::corrupt("remote.meta observed envelope is not retained locally")
         })?;
         Some(reader.state(remote_envelope.state).await?)
     } else {

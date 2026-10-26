@@ -74,10 +74,10 @@ pub fn write_config(config: &Path) {
 }
 
 pub fn workspace_store(workspace: &Path) -> PathBuf {
-    let value: Value =
-        serde_json::from_slice(&fs::read(workspace.join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    PathBuf::from(value["store"]["path"].as_str().unwrap())
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)
+        .unwrap()
+        .store
+        .path
 }
 
 pub fn git(cwd: &Path, args: &[&str]) {

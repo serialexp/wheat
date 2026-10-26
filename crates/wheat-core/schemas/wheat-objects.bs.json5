@@ -845,6 +845,16 @@
         { name: "head", type: "optional", value_type: "PhysicalCatalogRefV1" },
       ],
     },
+    // `{prefix}/catalog/head` of a remote (object-store) packed store: the newest
+    // SegmentCatalogRecordV1, by generation and the BLAKE3 digest of its encoding.
+    // A store with no segment has no head object.
+    RemoteCatalogHeadV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x5748434b },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "head", type: "PhysicalCatalogRefV1" },
+      ],
+    },
     // `repack.intent`: a repack about to move the head from `old` to `new`.
     RepackIntentFieldsV1: {
       sequence: [
@@ -1053,6 +1063,95 @@
       sequence: [
         { name: "name", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
         { name: "oid", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+      ],
+    },
+
+    // Workspace and store control files that wheat-client keeps. Paths are UTF-8.
+
+    // `store.meta`: the store's identity.
+    StoreMetadataV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x5748534d },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "store_id", type: "Uuid128" },
+      ],
+    },
+    // A repository head a workspace holds: its generation and envelope.
+    RepositoryRootV1: {
+      sequence: [
+        { name: "generation", type: "varlength", encoding: "leb128_canonical" },
+        { name: "envelope", type: "Digest256" },
+      ],
+    },
+    // The head, view and tree a workspace's files were (or are being) written from.
+    MaterializedRootsV1: {
+      sequence: [
+        { name: "repository_head", type: "RepositoryRootV1" },
+        { name: "view", type: "ViewId" },
+        { name: "tree", type: "TreeId" },
+      ],
+    },
+    // Both sides of a repository compare-and-swap a workspace has in flight, and
+    // the frontier it leaves the workspace on.
+    PendingRepositoryCasV1: {
+      sequence: [
+        { name: "expected_head", type: "RepositoryRootV1" },
+        { name: "proposed_head", type: "RepositoryRootV1" },
+        { name: "resulting_frontier", type: "ViewId" },
+      ],
+    },
+    PendingRepositoryOperationV1: {
+      sequence: [
+        { name: "cas", type: "PendingRepositoryCasV1" },
+        { name: "selected_change", type: "optional", value_type: "ChangeId" },
+      ],
+    },
+    // `.wheat/workspace.meta`: a workspace's binding to its store and label.
+    WorkspaceMetadataV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57485753 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "workspace_id", type: "Uuid128" },
+        { name: "registration_token", type: "Uuid128" },
+        { name: "store_path", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "store_id", type: "Uuid128" },
+        { name: "active_label", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "basis", type: "ViewId" },
+        { name: "observed_label_binding", type: "ViewId" },
+        { name: "selected_frontier", type: "optional", value_type: "ViewId" },
+        { name: "materialized", type: "optional", value_type: "MaterializedRootsV1" },
+        { name: "selected_change", type: "optional", value_type: "ChangeId" },
+        { name: "pending_repository_operation", type: "optional", value_type: "PendingRepositoryOperationV1" },
+      ],
+    },
+    // `workspaces/<workspace id>.pin` in a store: the roots a workspace keeps alive,
+    // independent of the workspace's own metadata.
+    WorkspacePinV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57485750 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "store_id", type: "Uuid128" },
+        { name: "workspace_id", type: "Uuid128" },
+        { name: "registration_token", type: "Uuid128" },
+        { name: "workspace_path", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "basis", type: "ViewId" },
+        { name: "observed_label_binding", type: "ViewId" },
+        { name: "selected_frontier", type: "optional", value_type: "ViewId" },
+        { name: "selected_change", type: "optional", value_type: "ChangeId" },
+        { name: "materialized", type: "optional", value_type: "MaterializedRootsV1" },
+        { name: "pending_materialization", type: "optional", value_type: "MaterializedRootsV1" },
+        { name: "pending_repository_cas", type: "optional", value_type: "PendingRepositoryCasV1" },
+      ],
+    },
+    // `remote.meta` in a store: the remote it fetches from and publishes to, and
+    // the exact remote head it last observed.
+    RemoteConfigV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57485243 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "display_url", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "canonical_identity", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "head", type: "RepositoryRootV1" },
       ],
     },
   },

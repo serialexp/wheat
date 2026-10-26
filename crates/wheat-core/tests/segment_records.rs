@@ -382,6 +382,29 @@ fn catalog_head_round_trips_with_and_without_a_snapshot() {
 }
 
 #[test]
+fn remote_catalog_head_round_trips_and_refuses_trailing_bytes_and_other_records() {
+    let head = PhysicalCatalogRef {
+        generation: 1 << 40,
+        digest: [9; 32],
+    };
+    let mut bytes = encode_remote_catalog_head(head).unwrap();
+    assert_eq!(decode_remote_catalog_head(&bytes).unwrap(), head);
+    // A remote head is not a local `catalog.head`, nor the other way round.
+    assert!(decode_physical_catalog_head(&bytes).is_err());
+    assert!(
+        decode_remote_catalog_head(&encode_physical_catalog_head(Some(head)).unwrap()).is_err()
+    );
+    bytes.push(0);
+    assert_eq!(
+        decode_remote_catalog_head(&bytes),
+        Err(SegmentRecordError::NonCanonicalEncoding)
+    );
+    let mut version = encode_remote_catalog_head(head).unwrap();
+    version[5] = 2;
+    assert!(decode_remote_catalog_head(&version).is_err());
+}
+
+#[test]
 fn repack_intent_round_trips_and_its_digest_covers_every_field() {
     let new = PhysicalCatalogRef {
         generation: 4,

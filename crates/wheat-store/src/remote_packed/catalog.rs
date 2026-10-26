@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use object_store::{ObjectStore as BackendObjectStore, ObjectStoreExt, path::Path};
 use wheat_core::{
-    SegmentCatalogRecord, SegmentId, SegmentIndexEntry, decode_segment_catalog_record,
+    PhysicalCatalogRef, SegmentCatalogRecord, SegmentId, SegmentIndexEntry,
+    decode_remote_catalog_head, decode_segment_catalog_record, encode_remote_catalog_head,
     encode_segment_catalog_record,
 };
 
@@ -41,13 +42,6 @@ pub(super) struct RemoteCatalog {
     pub preloaded_segments: Vec<(SegmentId, Vec<u8>)>,
 }
 
-/// The JSON format for the catalog head pointer stored at `{prefix}/catalog/head`.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct HeadPointer {
-    generation: u64,
-    digest: String,
-}
-
 impl RemoteCatalog {
     /// Create an empty catalog (for fresh repositories).
     pub(super) fn empty() -> Self {
@@ -75,9 +69,9 @@ impl RemoteCatalog {
             Err(object_store::Error::NotFound { .. }) => return Ok(Self::empty()),
             Err(e) => return Err(CatalogError::Backend(e)),
         };
-        let head: HeadPointer =
-            serde_json::from_slice(&head_bytes).map_err(CatalogError::HeadFormat)?;
-        let head_digest = hex_to_digest(&head.digest)?;
+        let head = decode_remote_catalog_head(&head_bytes)
+            .map_err(|error| CatalogError::Corrupt(format!("decode catalog head: {error}")))?;
+        let head_digest = head.digest;
 
         // Walk the catalog chain from head to genesis, collecting records.
         let mut chain = Vec::new();
@@ -215,11 +209,11 @@ impl RemoteCatalog {
             .map_err(CatalogError::Backend)?;
 
         // Update the head pointer.
-        let head_pointer = HeadPointer {
+        let head_bytes = encode_remote_catalog_head(PhysicalCatalogRef {
             generation: new_generation,
-            digest: hex::encode(record_digest),
-        };
-        let head_bytes = serde_json::to_vec(&head_pointer).map_err(CatalogError::HeadFormat)?;
+            digest: record_digest,
+        })
+        .map_err(|error| CatalogError::Corrupt(format!("encode catalog head: {error}")))?;
         let head_path = Path::from(format!("{prefix}/catalog/head"));
         backend
             .put(&head_path, object_store::PutPayload::from(head_bytes))
@@ -277,14 +271,6 @@ async fn find_catalog_record(
     ))
 }
 
-fn hex_to_digest(hex_str: &str) -> Result<[u8; 32], CatalogError> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|_| CatalogError::Corrupt("invalid hex in head pointer".into()))?;
-    bytes
-        .try_into()
-        .map_err(|_| CatalogError::Corrupt("head pointer digest is not 32 bytes".into()))
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(super) enum CatalogError {
     #[error("S3 backend error: {0}")]
@@ -295,6 +281,4 @@ pub(super) enum CatalogError {
     Segment(#[from] SegmentError),
     #[error("catalog corrupt: {0}")]
     Corrupt(String),
-    #[error("head pointer format error: {0}")]
-    HeadFormat(#[from] serde_json::Error),
 }

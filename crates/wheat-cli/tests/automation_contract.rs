@@ -140,10 +140,11 @@ fn stale_predecessor_is_retryable_and_does_not_advance_the_head() {
     assert!(created.status.success());
     let created = document(&created);
     let change = created["result"]["change"].as_str().unwrap();
-    let workspace: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.path().join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    let store = Path::new(workspace["store"]["path"].as_str().unwrap());
+    let store = wheat_client::workspace_metadata::WorkspaceMetadata::read(root.path())
+        .unwrap()
+        .store
+        .path;
+    let store = store.as_path();
     let before = fs::read(store.join("repository.head")).unwrap();
     fs::write(root.path().join("file"), "value\n").unwrap();
 

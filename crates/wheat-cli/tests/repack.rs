@@ -46,10 +46,10 @@ fn git(repository: &Path, arguments: &[&str]) {
 }
 
 fn store_path(workspace: &Path) -> std::path::PathBuf {
-    let metadata: Value =
-        serde_json::from_slice(&fs::read(workspace.join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    metadata["store"]["path"].as_str().unwrap().into()
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)
+        .unwrap()
+        .store
+        .path
 }
 
 #[test]
@@ -78,8 +78,8 @@ fn packed_repack_preserves_shared_workspace_authority_and_materialization() {
     let store = store_path(&first);
     assert_eq!(store, store_path(&second));
     let head_before = fs::read(store.join("repository.head")).unwrap();
-    let first_metadata = fs::read(first.join(".wheat/workspace.json")).unwrap();
-    let second_metadata = fs::read(second.join(".wheat/workspace.json")).unwrap();
+    let first_metadata = fs::read(first.join(".wheat/workspace.meta")).unwrap();
+    let second_metadata = fs::read(second.join(".wheat/workspace.meta")).unwrap();
     let first_file = fs::read(first.join("file.txt")).unwrap();
     let second_file = fs::read(second.join("file.txt")).unwrap();
 
@@ -109,11 +109,11 @@ fn packed_repack_preserves_shared_workspace_authority_and_materialization() {
         head_before
     );
     assert_eq!(
-        fs::read(first.join(".wheat/workspace.json")).unwrap(),
+        fs::read(first.join(".wheat/workspace.meta")).unwrap(),
         first_metadata
     );
     assert_eq!(
-        fs::read(second.join(".wheat/workspace.json")).unwrap(),
+        fs::read(second.join(".wheat/workspace.meta")).unwrap(),
         second_metadata
     );
     assert_eq!(fs::read(first.join("file.txt")).unwrap(), first_file);

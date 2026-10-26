@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -8,27 +8,32 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-use wheat_core::{ChangeId, RepositoryEnvelopeId, TreeId, ViewId};
+use wheat_core::{
+    ChangeId, MaterializedRootsRecord, PendingRepositoryCasRecord, RepositoryEnvelopeId,
+    RepositoryRootRecord, StoreMetadataRecord, TreeId, ViewId, WorkspaceMetadataRecord,
+    decode_store_metadata, decode_workspace_metadata, encode_store_metadata,
+    encode_workspace_metadata,
+};
 use wheat_store::RepositoryHead;
 
-const STORE_FORMAT: &str = "wheat-store";
-const WORKSPACE_FORMAT: &str = "wheat-workspace";
-const STORE_FORMAT_VERSION: u32 = 1;
-const WORKSPACE_FORMAT_VERSION: u32 = 4;
+/// A store's identity, in its root.
+pub const STORE_METADATA_FILE: &str = "store.meta";
+/// A workspace's metadata, in its `.wheat` directory.
+pub const WORKSPACE_METADATA_FILE: &str = "workspace.meta";
+/// The most bytes a store or workspace metadata file may hold.
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreMetadata {
-    format: String,
-    version: u32,
     pub store_id: Uuid,
 }
 
+/// A workspace's binding to its store and label, kept in `.wheat/workspace.meta`.
+/// Serde serves only the rewrite transaction journal, which holds a workspace's old
+/// and new metadata while a rewrite is in flight.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMetadata {
-    format: String,
-    version: u32,
     pub workspace_id: Uuid,
     pub registration_token: Uuid,
     pub store: WorkspaceStore,
@@ -103,32 +108,69 @@ impl From<SerializedHead> for RepositoryHead {
     }
 }
 
+impl From<SerializedHead> for RepositoryRootRecord {
+    fn from(head: SerializedHead) -> Self {
+        Self {
+            generation: head.generation,
+            envelope: head.envelope,
+        }
+    }
+}
+
+impl From<RepositoryRootRecord> for SerializedHead {
+    fn from(head: RepositoryRootRecord) -> Self {
+        Self {
+            generation: head.generation,
+            envelope: head.envelope,
+        }
+    }
+}
+
+impl From<&MaterializedState> for MaterializedRootsRecord {
+    fn from(state: &MaterializedState) -> Self {
+        Self {
+            repository_head: state.repository_head.into(),
+            view: state.view,
+            tree: state.tree,
+        }
+    }
+}
+
+impl From<MaterializedRootsRecord> for MaterializedState {
+    fn from(record: MaterializedRootsRecord) -> Self {
+        Self {
+            repository_head: record.repository_head.into(),
+            view: record.view,
+            tree: record.tree,
+        }
+    }
+}
+
 impl StoreMetadata {
     pub fn create(root: &Path) -> Result<Self> {
         let metadata = Self {
-            format: STORE_FORMAT.into(),
-            version: STORE_FORMAT_VERSION,
             store_id: Uuid::now_v7(),
         };
-        write_json_new(&root.join("store.json"), &metadata)?;
+        let bytes = encode_store_metadata(StoreMetadataRecord {
+            store_id: metadata.store_id,
+        })?;
+        write_new(&root.join(STORE_METADATA_FILE), &bytes)?;
         Ok(metadata)
     }
 
     pub fn read(root: &Path) -> Result<Self> {
-        let path = root.join("store.json");
-        let metadata: Self = read_json(&path)?;
-        if metadata.format != STORE_FORMAT || metadata.version != STORE_FORMAT_VERSION {
-            bail!("unsupported Wheat store metadata at {}", path.display());
-        }
-        Ok(metadata)
+        let path = root.join(STORE_METADATA_FILE);
+        let record = decode_store_metadata(&read_bounded(&path)?)
+            .with_context(|| format!("unsupported Wheat store metadata at {}", path.display()))?;
+        Ok(Self {
+            store_id: record.store_id,
+        })
     }
 }
 
 impl WorkspaceMetadata {
     pub fn new(store_path: PathBuf, store_id: Uuid, active_label: String, basis: ViewId) -> Self {
         Self {
-            format: WORKSPACE_FORMAT.into(),
-            version: WORKSPACE_FORMAT_VERSION,
             workspace_id: Uuid::now_v7(),
             registration_token: Uuid::now_v7(),
             store: WorkspaceStore {
@@ -149,36 +191,96 @@ impl WorkspaceMetadata {
         self.selected_frontier.unwrap_or(self.basis)
     }
 
+    /// The metadata file of the workspace at `root`.
+    pub fn path(root: &Path) -> PathBuf {
+        root.join(".wheat").join(WORKSPACE_METADATA_FILE)
+    }
+
     pub fn read(root: &Path) -> Result<Self> {
-        let path = root.join(".wheat/workspace.json");
-        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let metadata: Self =
-            serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
-        if metadata.format != WORKSPACE_FORMAT
-            || metadata.version != WORKSPACE_FORMAT_VERSION
-            || metadata.workspace_id.is_nil()
-            || metadata.registration_token.is_nil()
-        {
-            bail!("unsupported Wheat workspace metadata at {}", path.display());
-        }
-        Ok(metadata)
+        let path = Self::path(root);
+        Self::decode(&read_bounded(&path)?)
+            .with_context(|| format!("unsupported Wheat workspace metadata at {}", path.display()))
+    }
+
+    /// Decodes a workspace metadata file's bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let record = decode_workspace_metadata(bytes)?;
+        Ok(Self {
+            workspace_id: record.workspace_id,
+            registration_token: record.registration_token,
+            store: WorkspaceStore {
+                path: PathBuf::from(record.store_path),
+                store_id: record.store_id,
+            },
+            active_label: record.active_label,
+            basis: record.basis,
+            observed_label_binding: record.observed_label_binding,
+            selected_frontier: record.selected_frontier,
+            materialized: record.materialized.map(MaterializedState::from),
+            selected_change: record.selected_change,
+            pending_repository_operation: record.pending_repository_operation.map(
+                |(cas, selected_change)| PendingRepositoryOperation {
+                    expected_head: cas.expected_head.into(),
+                    proposed_head: cas.proposed_head.into(),
+                    resulting_frontier: cas.resulting_frontier,
+                    selected_change,
+                },
+            ),
+        })
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let Some(store_path) = self.store.path.to_str() else {
+            bail!(
+                "workspace store path {} is not UTF-8",
+                self.store.path.display()
+            );
+        };
+        Ok(encode_workspace_metadata(&WorkspaceMetadataRecord {
+            workspace_id: self.workspace_id,
+            registration_token: self.registration_token,
+            store_path: store_path.to_owned(),
+            store_id: self.store.store_id,
+            active_label: self.active_label.clone(),
+            basis: self.basis,
+            observed_label_binding: self.observed_label_binding,
+            selected_frontier: self.selected_frontier,
+            materialized: self
+                .materialized
+                .as_ref()
+                .map(MaterializedRootsRecord::from),
+            selected_change: self.selected_change,
+            pending_repository_operation: self.pending_repository_operation.as_ref().map(
+                |operation| {
+                    (
+                        PendingRepositoryCasRecord {
+                            expected_head: operation.expected_head.into(),
+                            proposed_head: operation.proposed_head.into(),
+                            resulting_frontier: operation.resulting_frontier,
+                        },
+                        operation.selected_change,
+                    )
+                },
+            ),
+        })?)
     }
 
     pub fn initialize(&self, root: &Path) -> Result<()> {
         let control = root.join(".wheat");
+        let bytes = self.encode()?;
         fs::create_dir(&control)
             .with_context(|| format!("create workspace control directory {}", control.display()))?;
-        write_json_new(&control.join("workspace.json"), self)
+        write_new(&Self::path(root), &bytes)
     }
 
     pub fn replace_prepared(&self, root: &Path) -> Result<PreparedWorkspaceMetadata> {
-        let destination = root.join(".wheat/workspace.json");
+        let bytes = self.encode()?;
+        let destination = Self::path(root);
         let parent = destination
             .parent()
             .context("workspace metadata has no parent")?;
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer_pretty(&mut temporary, self)?;
-        temporary.write_all(b"\n")?;
+        temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
         Ok(PreparedWorkspaceMetadata {
             temporary,
@@ -196,20 +298,25 @@ impl PreparedWorkspaceMetadata {
     }
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))
+fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_METADATA_BYTES {
+        bail!("{} exceeds {MAX_METADATA_BYTES} bytes", path.display());
+    }
+    Ok(bytes)
 }
 
-fn write_json_new(path: &Path, value: &impl Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
+fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .with_context(|| format!("create {}", path.display()))?;
-    file.write_all(&bytes)?;
-    file.write_all(b"\n")?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     sync_parent(path)?;
     Ok(())
@@ -227,30 +334,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_metadata_round_trips_and_rejects_unknown_fields() {
+    fn store_metadata_round_trips_and_refuses_other_bytes() {
         let root = tempfile::tempdir().unwrap();
         let created = StoreMetadata::create(root.path()).unwrap();
         assert_eq!(StoreMetadata::read(root.path()).unwrap(), created);
-        std::fs::write(
-            root.path().join("store.json"),
-            format!(
-                "{{\"format\":\"wheat-store\",\"version\":1,\"store_id\":\"{}\",\"extra\":true}}",
-                created.store_id
-            ),
-        )
-        .unwrap();
+        let path = root.path().join(STORE_METADATA_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
         assert!(StoreMetadata::read(root.path()).is_err());
+        std::fs::write(&path, vec![0; MAX_METADATA_BYTES as usize + 1]).unwrap();
+        let error = StoreMetadata::read(root.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds"), "{error:#}");
     }
 
     #[test]
     fn prepared_workspace_metadata_publishes_atomically() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".wheat")).unwrap();
         let store_id = Uuid::now_v7();
         let basis = ViewId::from_digest([3; 32]);
         let original =
             WorkspaceMetadata::new(PathBuf::from("/store"), store_id, "main".into(), basis);
-        write_json_new(&root.path().join(".wheat/workspace.json"), &original).unwrap();
+        original.initialize(root.path()).unwrap();
         let mut replacement = original.clone();
         replacement.selected_frontier = Some(ViewId::from_digest([4; 32]));
         replacement
@@ -262,11 +367,14 @@ mod tests {
     }
 
     #[test]
-    fn workspace_v4_round_trips_pinned_label_and_effective_view() {
+    fn workspace_metadata_round_trips_every_root_and_effective_view() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".wheat")).unwrap();
         let basis = ViewId::from_digest([7; 32]);
         let frontier = ViewId::from_digest([8; 32]);
+        let head = SerializedHead {
+            generation: 9,
+            envelope: RepositoryEnvelopeId::from_digest([9; 32]),
+        };
         let mut metadata = WorkspaceMetadata::new(
             PathBuf::from("/store"),
             Uuid::now_v7(),
@@ -275,19 +383,41 @@ mod tests {
         );
         metadata.selected_frontier = Some(frontier);
         metadata.selected_change = Some(wheat_core::ChangeId::new());
-        write_json_new(&root.path().join(".wheat/workspace.json"), &metadata).unwrap();
+        metadata.materialized = Some(MaterializedState {
+            repository_head: head,
+            view: frontier,
+            tree: TreeId::from_digest([10; 32]),
+        });
+        metadata.pending_repository_operation = Some(PendingRepositoryOperation {
+            expected_head: head,
+            proposed_head: SerializedHead {
+                generation: 10,
+                envelope: RepositoryEnvelopeId::from_digest([11; 32]),
+            },
+            resulting_frontier: basis,
+            selected_change: None,
+        });
+        metadata.initialize(root.path()).unwrap();
         assert_eq!(WorkspaceMetadata::read(root.path()).unwrap(), metadata);
         assert_eq!(metadata.effective_view(), frontier);
-        let document: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(root.path().join(".wheat/workspace.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(document["version"], 4);
-        assert_eq!(
-            document["registration_token"],
-            metadata.registration_token.to_string()
+        let bytes = std::fs::read(WorkspaceMetadata::path(root.path())).unwrap();
+        assert_eq!(WorkspaceMetadata::decode(&bytes).unwrap(), metadata);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_refuses_a_store_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let metadata = WorkspaceMetadata::new(
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/store-\xff")),
+            Uuid::now_v7(),
+            "main".into(),
+            ViewId::from_digest([1; 32]),
         );
-        assert_eq!(document["active_label"], "main");
-        assert!(document.get("selection").is_none());
+        let error = metadata.initialize(root.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("not UTF-8"), "{error:#}");
+        assert!(!root.path().join(".wheat").exists());
     }
 }

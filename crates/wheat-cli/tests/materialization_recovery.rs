@@ -1070,10 +1070,8 @@ fn rematerialization_recovery_refuses_replacement_toctou() {
         std::fs::read(workspace.join("replace")).unwrap(),
         b"raced\n"
     );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(workspace.join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    assert_eq!(metadata["active_label"], "main");
+    let metadata = wheat_client::workspace_metadata::WorkspaceMetadata::read(&workspace).unwrap();
+    assert_eq!(metadata.active_label, "main");
     assert!(workspace.join(".wheat/materialization.json").is_file());
 }
 
@@ -1352,7 +1350,7 @@ fn no_op_materialization_does_not_rewrite_workspace_or_metadata() {
         .success()
     );
     let file = std::fs::metadata(workspace.join("same")).unwrap();
-    let metadata = std::fs::read(workspace.join(".wheat/workspace.json")).unwrap();
+    let metadata = std::fs::read(workspace.join(".wheat/workspace.meta")).unwrap();
     let noop = wheat(
         &stores,
         &["--workspace", workspace.to_str().unwrap(), "switch", "main"],
@@ -1369,7 +1367,7 @@ fn no_op_materialization_does_not_rewrite_workspace_or_metadata() {
     );
     assert_eq!(
         metadata,
-        std::fs::read(workspace.join(".wheat/workspace.json")).unwrap()
+        std::fs::read(workspace.join(".wheat/workspace.meta")).unwrap()
     );
     assert!(!workspace.join(".wheat/materialization.json").exists());
 }

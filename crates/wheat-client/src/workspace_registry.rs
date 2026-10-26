@@ -13,13 +13,17 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use wheat_core::{ChangeId, RepositoryEnvelopeId, TreeId, ViewId};
+use wheat_core::{
+    ChangeId, MaterializedRootsRecord, PendingRepositoryCasRecord, RepositoryEnvelopeId,
+    RepositoryRootRecord, TreeId, ViewId, WorkspacePinRecord, decode_workspace_pin,
+    encode_workspace_pin,
+};
 
-use crate::sys;
+use crate::{sys, workspace_metadata::WorkspaceMetadata};
 
-const REGISTRY_FORMAT: &str = "wheat-workspace-pin";
-const REGISTRY_VERSION: u32 = 1;
 const REGISTRY_DIRECTORY: &str = "workspaces";
+/// A pin's file name is its workspace ID with this extension.
+const PIN_EXTENSION: &str = ".pin";
 const REGISTRY_LOCK: &str = "workspace-registry.lock";
 const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
 const MAX_REGISTRY_ENTRIES: usize = 4096;
@@ -62,12 +66,12 @@ pub struct PendingRepositoryCasRoots {
     pub resulting_frontier: ViewId,
 }
 
-/// Strict, versioned pin document stored at `workspaces/<workspace-id>.json`.
+/// The pin stored at `workspaces/<workspace-id>.pin`. Serde serves only the rewrite
+/// transaction journal, which holds a workspace's old and new pins while a rewrite
+/// is in flight.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePin {
-    format: String,
-    version: u32,
     pub store_id: Uuid,
     pub workspace_id: Uuid,
     pub registration_token: Uuid,
@@ -102,8 +106,6 @@ impl WorkspacePin {
         stable: StableWorkspaceRoots,
     ) -> Self {
         Self {
-            format: REGISTRY_FORMAT.to_owned(),
-            version: REGISTRY_VERSION,
             store_id,
             workspace_id,
             registration_token,
@@ -134,13 +136,64 @@ impl WorkspacePin {
         roots
     }
 
+    fn encode(&self) -> Result<Vec<u8>> {
+        let workspace_path = self.workspace_path.to_str().with_context(|| {
+            format!(
+                "workspace path {} is not UTF-8",
+                self.workspace_path.display()
+            )
+        })?;
+        Ok(encode_workspace_pin(&WorkspacePinRecord {
+            store_id: self.store_id,
+            workspace_id: self.workspace_id,
+            registration_token: self.registration_token,
+            workspace_path: workspace_path.to_owned(),
+            basis: self.stable.basis,
+            observed_label_binding: self.stable.observed_label_binding,
+            selected_frontier: self.stable.selected_frontier,
+            selected_change: self.stable.selected_change,
+            materialized: self.stable.materialized.map(MaterializationRoots::record),
+            pending_materialization: self
+                .pending_materialization
+                .map(MaterializationRoots::record),
+            pending_repository_cas: self.pending_repository_cas.map(|cas| {
+                PendingRepositoryCasRecord {
+                    expected_head: cas.expected_head.record(),
+                    proposed_head: cas.proposed_head.record(),
+                    resulting_frontier: cas.resulting_frontier,
+                }
+            }),
+        })?)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let record = decode_workspace_pin(bytes)?;
+        Ok(Self {
+            store_id: record.store_id,
+            workspace_id: record.workspace_id,
+            registration_token: record.registration_token,
+            workspace_path: PathBuf::from(record.workspace_path),
+            stable: StableWorkspaceRoots {
+                basis: record.basis,
+                observed_label_binding: record.observed_label_binding,
+                selected_frontier: record.selected_frontier,
+                selected_change: record.selected_change,
+                materialized: record.materialized.map(MaterializationRoots::from_record),
+            },
+            pending_materialization: record
+                .pending_materialization
+                .map(MaterializationRoots::from_record),
+            pending_repository_cas: record.pending_repository_cas.map(|cas| {
+                PendingRepositoryCasRoots {
+                    expected_head: RepositoryRoot::from_record(cas.expected_head),
+                    proposed_head: RepositoryRoot::from_record(cas.proposed_head),
+                    resulting_frontier: cas.resulting_frontier,
+                }
+            }),
+        })
+    }
+
     fn validate(&self, expected_store_id: Uuid, expected_workspace_id: Uuid) -> Result<()> {
-        ensure!(
-            self.format == REGISTRY_FORMAT && self.version == REGISTRY_VERSION,
-            "unsupported Wheat workspace pin format {:?} version {}",
-            self.format,
-            self.version
-        );
         ensure!(
             !self.store_id.is_nil(),
             "workspace pin has a nil store identity"
@@ -187,6 +240,40 @@ impl WorkspacePin {
             "workspace pin has too many change roots"
         );
         Ok(())
+    }
+}
+
+impl RepositoryRoot {
+    fn record(self) -> RepositoryRootRecord {
+        RepositoryRootRecord {
+            generation: self.generation,
+            envelope: self.envelope,
+        }
+    }
+
+    fn from_record(record: RepositoryRootRecord) -> Self {
+        Self {
+            generation: record.generation,
+            envelope: record.envelope,
+        }
+    }
+}
+
+impl MaterializationRoots {
+    fn record(self) -> MaterializedRootsRecord {
+        MaterializedRootsRecord {
+            repository_head: self.repository_head.record(),
+            view: self.view,
+            tree: self.tree,
+        }
+    }
+
+    fn from_record(record: MaterializedRootsRecord) -> Self {
+        Self {
+            repository_head: RepositoryRoot::from_record(record.repository_head),
+            view: record.view,
+            tree: record.tree,
+        }
     }
 }
 
@@ -251,8 +338,7 @@ impl WorkspaceRegistry {
                 return Ok(());
             }
         }
-        let mut bytes = serde_json::to_vec_pretty(pin)?;
-        bytes.push(b'\n');
+        let bytes = pin.encode()?;
         ensure!(
             bytes.len() as u64 <= MAX_DOCUMENT_BYTES,
             "workspace pin is too large"
@@ -371,7 +457,7 @@ impl WorkspaceRegistry {
             "workspace pin exceeds the {MAX_DOCUMENT_BYTES}-byte limit: {}",
             path.display()
         );
-        let pin: WorkspacePin = serde_json::from_slice(&bytes)
+        let pin = WorkspacePin::decode(&bytes)
             .with_context(|| format!("decode workspace pin {}", path.display()))?;
         pin.validate(self.store_id, workspace_id)?;
         Ok(pin)
@@ -418,7 +504,7 @@ impl Drop for RegistryLock {
 }
 
 fn workspace_identity_matches(path: &Path, expected: &WorkspacePin) -> Result<bool> {
-    let metadata_path = path.join(".wheat/workspace.json");
+    let metadata_path = WorkspaceMetadata::path(path);
     let file = match open_read_no_follow(&metadata_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -441,27 +527,20 @@ fn workspace_identity_matches(path: &Path, expected: &WorkspacePin) -> Result<bo
         bytes.len() as u64 <= MAX_DOCUMENT_BYTES,
         "workspace metadata is too large"
     );
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let workspace_id = value
-        .get("workspace_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok());
-    let registration_token = value
-        .get("registration_token")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok());
-    Ok(workspace_id == Some(expected.workspace_id)
-        && registration_token == Some(expected.registration_token))
+    let workspace = WorkspaceMetadata::decode(&bytes)
+        .with_context(|| format!("decode {}", metadata_path.display()))?;
+    Ok(workspace.workspace_id == expected.workspace_id
+        && workspace.registration_token == expected.registration_token)
 }
 
 fn document_name(workspace_id: Uuid) -> String {
-    format!("{workspace_id}.json")
+    format!("{workspace_id}{PIN_EXTENSION}")
 }
 
 fn workspace_id_from_name(name: &str) -> Result<Uuid> {
     let stem = name
-        .strip_suffix(".json")
-        .context("workspace registry entry does not end in .json")?;
+        .strip_suffix(PIN_EXTENSION)
+        .with_context(|| format!("workspace registry entry does not end in {PIN_EXTENSION}"))?;
     let workspace_id =
         Uuid::parse_str(stem).context("workspace registry entry is not named by a UUID")?;
     ensure!(
@@ -595,11 +674,15 @@ mod tests {
                 .to_string()
                 .contains("byte limit")
         );
-        fs::write(&path, b"{ definitely not json }").unwrap();
+        fs::write(&path, b"not a workspace pin").unwrap();
+        assert!(registry.read(workspace_id).is_err());
+        let mut trailing = pin(store_id, workspace_id, 1).encode().unwrap();
+        trailing.push(0);
+        fs::write(&path, trailing).unwrap();
         assert!(registry.read(workspace_id).is_err());
 
         let other_id = Uuid::now_v7();
-        let bytes = serde_json::to_vec(&pin(store_id, other_id, 2)).unwrap();
+        let bytes = pin(store_id, other_id, 2).encode().unwrap();
         fs::write(&path, bytes).unwrap();
         assert!(
             registry
@@ -665,6 +748,54 @@ mod tests {
         )
         .unwrap();
         assert!(registry.enumerate().is_err());
+    }
+
+    #[test]
+    fn pending_roots_round_trip_and_only_pin_names_are_entries() {
+        let (root, registry, store_id) = registry();
+        let workspace_id = Uuid::now_v7();
+        let mut first = pin(store_id, workspace_id, 1);
+        first.stable.selected_change = Some(ChangeId::new());
+        first.pending_materialization = Some(MaterializationRoots {
+            repository_head: RepositoryRoot {
+                generation: 2,
+                envelope: envelope(3),
+            },
+            view: view(4),
+            tree: tree(5),
+        });
+        first.pending_repository_cas = Some(PendingRepositoryCasRoots {
+            expected_head: RepositoryRoot {
+                generation: 2,
+                envelope: envelope(3),
+            },
+            proposed_head: RepositoryRoot {
+                generation: 3,
+                envelope: envelope(6),
+            },
+            resulting_frontier: view(7),
+        });
+        registry.publish(&first).unwrap();
+        assert_eq!(registry.read(workspace_id).unwrap(), first);
+        assert_eq!(
+            document_name(workspace_id),
+            format!("{workspace_id}{PIN_EXTENSION}")
+        );
+
+        fs::write(
+            root.path()
+                .join(REGISTRY_DIRECTORY)
+                .join(format!("{}.json", Uuid::now_v7())),
+            b"{}",
+        )
+        .unwrap();
+        assert!(
+            registry
+                .enumerate()
+                .unwrap_err()
+                .to_string()
+                .contains("does not end in .pin")
+        );
     }
 
     #[test]

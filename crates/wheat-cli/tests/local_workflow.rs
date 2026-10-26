@@ -104,7 +104,7 @@ fn initializes_mutates_and_reopens_local_repository() {
 
     let initialized = wheat(directory.path(), &["init"]);
     assert!(initialized.status.success());
-    assert!(directory.path().join(".wheat/workspace.json").is_file());
+    assert!(directory.path().join(".wheat/workspace.meta").is_file());
     assert!(
         store_path(directory.path())
             .join("repository.head")

@@ -664,6 +664,23 @@ pub fn decode_physical_catalog_head(
     checked(bytes, head, encoded)
 }
 
+/// Encodes a remote packed store's `catalog/head`. A store with no segment has no
+/// head object, so there is always a head here.
+pub fn encode_remote_catalog_head(head: PhysicalCatalogRef) -> Result<Vec<u8>, SegmentRecordError> {
+    wire::RemoteCatalogHeadV1Input {
+        head: catalog_ref_wire(head),
+    }
+    .encode()
+    .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+pub fn decode_remote_catalog_head(bytes: &[u8]) -> Result<PhysicalCatalogRef, SegmentRecordError> {
+    let w = wire::RemoteCatalogHeadV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    let encoded = w.encode();
+    let head = catalog_ref_domain(w.head)?;
+    checked(bytes, head, encoded)
+}
+
 /// Encodes `repack.intent` with the digest of its fields.
 pub fn encode_repack_intent(intent: &RepackIntent) -> Result<Vec<u8>, SegmentRecordError> {
     let fields: wire::RepackIntentFieldsV1 = wire::RepackIntentFieldsV1Input {

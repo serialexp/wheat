@@ -89,7 +89,7 @@ fn imports_and_materializes_a_selected_git_branch_in_a_separate_store() {
         std::fs::read(workspace.join("feature.txt")).unwrap(),
         b"feature\n"
     );
-    assert!(workspace.join(".wheat/workspace.json").is_file());
+    assert!(workspace.join(".wheat/workspace.meta").is_file());
     assert!(!workspace.join("repository.head").exists());
     let stores = std::fs::read_dir(&stores)
         .unwrap()

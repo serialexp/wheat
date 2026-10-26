@@ -28,10 +28,10 @@ fn ok(workspace: &Path, stores: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn workspace_store(workspace: &Path) -> PathBuf {
-    let value: Value =
-        serde_json::from_slice(&fs::read(workspace.join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    PathBuf::from(value["store"]["path"].as_str().unwrap())
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)
+        .unwrap()
+        .store
+        .path
 }
 
 #[test]
@@ -50,11 +50,9 @@ fn local_clone_reuses_store_lists_workspaces_and_unregister_preserves_files() {
     );
 
     assert_eq!(workspace_store(&first), workspace_store(&second));
-    let first_meta: Value =
-        serde_json::from_slice(&fs::read(first.join(".wheat/workspace.json")).unwrap()).unwrap();
-    let second_meta: Value =
-        serde_json::from_slice(&fs::read(second.join(".wheat/workspace.json")).unwrap()).unwrap();
-    assert_ne!(first_meta["workspace_id"], second_meta["workspace_id"]);
+    let first_meta = wheat_client::workspace_metadata::WorkspaceMetadata::read(&first).unwrap();
+    let second_meta = wheat_client::workspace_metadata::WorkspaceMetadata::read(&second).unwrap();
+    assert_ne!(first_meta.workspace_id, second_meta.workspace_id);
 
     let listed = ok(&first, &stores, &["--format", "json", "workspace", "list"]);
     let document: Value = serde_json::from_slice(&listed.stdout).unwrap();
@@ -89,8 +87,8 @@ fn copied_workspace_identity_is_rejected_without_replacing_the_original_pin() {
     fs::create_dir(&copied).unwrap();
     fs::create_dir(copied.join(".wheat")).unwrap();
     fs::copy(
-        original.join(".wheat/workspace.json"),
-        copied.join(".wheat/workspace.json"),
+        original.join(".wheat/workspace.meta"),
+        copied.join(".wheat/workspace.meta"),
     )
     .unwrap();
 
@@ -122,7 +120,7 @@ fn unregister_refuses_unknown_control_entries_without_removing_pin() {
 
     let failed = wheat(&workspace, &stores, &["workspace", "unregister"]);
     assert!(!failed.status.success());
-    assert!(workspace.join(".wheat/workspace.json").is_file());
+    assert!(workspace.join(".wheat/workspace.meta").is_file());
     assert!(workspace.join(".wheat/unknown").is_file());
 
     let listed = ok(

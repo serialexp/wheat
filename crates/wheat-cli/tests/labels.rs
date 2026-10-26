@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::{fs, path::Path, process::Command};
+use std::{path::Path, process::Command};
 
 fn wheat(root: &Path, config: &Path, arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_wheat"))
@@ -49,9 +49,13 @@ fn expected_head(document: &serde_json::Value) -> String {
 }
 
 fn workspace_store(root: &Path) -> String {
-    let workspace: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join(".wheat/workspace.json")).unwrap()).unwrap();
-    workspace["store"]["path"].as_str().unwrap().to_owned()
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(root)
+        .unwrap()
+        .store
+        .path
+        .to_str()
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -345,10 +349,11 @@ fn labels_enforce_the_repository_size_bound_on_create() {
     };
 
     let (root, config) = setup();
-    let workspace: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.path().join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    let store = Path::new(workspace["store"]["path"].as_str().unwrap());
+    let store = wheat_client::workspace_metadata::WorkspaceMetadata::read(root.path())
+        .unwrap()
+        .store
+        .path;
+    let store = store.as_path();
     let heads = LocalPublicationStore::new(store.join("repository.head"));
     let objects = PackedObjectStore::open(store.join("storage")).unwrap();
     let head = heads.read().unwrap();

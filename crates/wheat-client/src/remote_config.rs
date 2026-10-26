@@ -1,6 +1,6 @@
 //! Durable remote configuration for divergence tracking across fetch/publish.
 //!
-//! `remote.json` lives in the wheat store root beside `store.json` and
+//! `remote.meta` lives in the wheat store root beside `store.meta` and
 //! `repository.head`. Writes use a same-directory atomic replacement and sync
 //! both the replacement and containing directory before returning.
 
@@ -11,13 +11,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
-use wheat_core::RepositoryEnvelopeId;
+use wheat_core::{
+    RemoteConfigRecord, RepositoryEnvelopeId, RepositoryRootRecord, decode_remote_config,
+    encode_remote_config,
+};
 use wheat_store::RepositoryHead;
 
 use crate::remote::{WheatUrl, parse_wheat_url};
 
-const REMOTE_CONFIG_VERSION: u32 = 1;
+/// The remote binding, in a store's root.
+pub const REMOTE_CONFIG_FILE: &str = "remote.meta";
 const MAX_REMOTE_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// In-memory remote configuration.
@@ -31,22 +34,6 @@ pub struct RemoteConfig {
     pub last_fetched_generation: u64,
     /// Hex-encoded envelope ID of the exact last-observed remote head.
     pub last_fetched_envelope: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VersionedRemoteConfig {
-    version: u32,
-    display_url: String,
-    canonical_identity: String,
-    head: StoredHead,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredHead {
-    generation: u64,
-    envelope: String,
 }
 
 impl RemoteConfig {
@@ -96,10 +83,7 @@ impl RemoteConfig {
         self.last_fetched_envelope = head.envelope.to_string();
     }
 
-    /// Read and validate `remote.json`. Returns `None` when it does not exist.
-    ///
-    /// The previous unversioned shape is accepted only when its URL and head
-    /// validate. The next write migrates it to the current versioned shape.
+    /// Read and validate `remote.meta`. Returns `None` when it does not exist.
     pub fn read(store_root: &Path) -> Result<Option<Self>> {
         let path = remote_config_path(store_root);
         let metadata = match fs::symlink_metadata(&path) {
@@ -130,15 +114,8 @@ impl RemoteConfig {
                 path.display()
             );
         }
-        let stored: VersionedRemoteConfig =
-            serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?;
-        if stored.version != REMOTE_CONFIG_VERSION {
-            bail!(
-                "unsupported remote config version {} in {}",
-                stored.version,
-                path.display()
-            );
-        }
+        let stored =
+            decode_remote_config(&data).with_context(|| format!("decode {}", path.display()))?;
         let parsed = parse_wheat_url(&stored.display_url)
             .with_context(|| format!("invalid display URL in {}", path.display()))?;
         if parsed.canonical_identity() != stored.canonical_identity {
@@ -147,36 +124,32 @@ impl RemoteConfig {
                 path.display()
             );
         }
-        parse_head(stored.head.generation, &stored.head.envelope)?;
         Ok(Some(Self {
             url: stored.display_url,
             canonical_identity: stored.canonical_identity,
             last_fetched_generation: stored.head.generation,
-            last_fetched_envelope: stored.head.envelope,
+            last_fetched_envelope: stored.head.envelope.to_string(),
         }))
     }
 
-    /// Atomically and durably replace `remote.json`.
+    /// Atomically and durably replace `remote.meta`.
     pub fn write(&self, store_root: &Path) -> Result<()> {
         let parsed = parse_wheat_url(&self.url).context("invalid remote display URL")?;
         if !self.has_same_identity(&parsed) {
             bail!("canonical remote identity does not match display URL");
         }
-        self.last_fetched_head()?;
+        let head = self.last_fetched_head()?;
 
-        let stored = VersionedRemoteConfig {
-            version: REMOTE_CONFIG_VERSION,
+        let data = encode_remote_config(&RemoteConfigRecord {
             display_url: self.url.clone(),
             canonical_identity: self.canonical_identity.clone(),
-            head: StoredHead {
-                generation: self.last_fetched_generation,
-                envelope: self.last_fetched_envelope.clone(),
+            head: RepositoryRootRecord {
+                generation: head.generation,
+                envelope: head.envelope,
             },
-        };
-        let mut data = serde_json::to_vec_pretty(&stored)?;
-        data.push(b'\n');
+        })?;
         if data.len() as u64 > MAX_REMOTE_CONFIG_BYTES {
-            bail!("serialized remote config exceeds {MAX_REMOTE_CONFIG_BYTES} bytes");
+            bail!("encoded remote config exceeds {MAX_REMOTE_CONFIG_BYTES} bytes");
         }
 
         let path = remote_config_path(store_root);
@@ -204,15 +177,16 @@ impl RemoteConfig {
 fn parse_head(generation: u64, envelope: &str) -> Result<RepositoryHead> {
     let envelope = envelope
         .parse::<RepositoryEnvelopeId>()
-        .with_context(|| format!("invalid envelope ID in remote.json: {envelope}"))?;
+        .with_context(|| format!("invalid envelope ID in {REMOTE_CONFIG_FILE}: {envelope}"))?;
     Ok(RepositoryHead {
         generation,
         envelope,
     })
 }
 
-fn remote_config_path(store_root: &Path) -> PathBuf {
-    store_root.join("remote.json")
+/// The remote binding of the store at `store_root`.
+pub fn remote_config_path(store_root: &Path) -> PathBuf {
+    store_root.join(REMOTE_CONFIG_FILE)
 }
 
 #[cfg(test)]
@@ -227,24 +201,25 @@ mod tests {
     }
 
     #[test]
-    fn writes_versioned_config_and_round_trips_exact_head() {
+    fn writes_config_and_round_trips_exact_head() {
         let directory = tempfile::tempdir().unwrap();
         let remote = parse_wheat_url("wheat+tls://EXAMPLE.com/Owner/Repo").unwrap();
         let config = RemoteConfig::new("wheat+tls://EXAMPLE.com/Owner/Repo", &head(7));
         assert!(config.has_same_identity(&remote));
         config.write(directory.path()).unwrap();
 
-        let bytes = fs::read(directory.path().join("remote.json")).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["display_url"], "wheat+tls://EXAMPLE.com/Owner/Repo");
+        let bytes = fs::read(remote_config_path(directory.path())).unwrap();
+        let stored = decode_remote_config(&bytes).unwrap();
+        assert_eq!(stored.display_url, "wheat+tls://EXAMPLE.com/Owner/Repo");
         assert_eq!(
-            value["canonical_identity"],
+            stored.canonical_identity,
             "wheat+tls://example.com/Owner/Repo"
         );
-        assert_eq!(value["head"]["generation"], 7);
+        assert_eq!(stored.head.generation, 7);
+        assert_eq!(stored.head.envelope, head(7).envelope);
 
         let loaded = RemoteConfig::read(directory.path()).unwrap().unwrap();
+        assert_eq!(loaded, config);
         assert_eq!(loaded.last_fetched_head().unwrap(), head(7));
         assert!(
             loaded
@@ -254,36 +229,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unversioned_shape() {
+    fn rejects_other_bytes_identity_mismatch_and_oversized_files() {
         let directory = tempfile::tempdir().unwrap();
-        let unversioned = serde_json::json!({
-            "url": "wheat://example.com/Owner/Repo",
-            "last_fetched_generation": 3,
-            "last_fetched_envelope": head(3).envelope.to_string(),
-        });
-        fs::write(
-            directory.path().join("remote.json"),
-            serde_json::to_vec(&unversioned).unwrap(),
-        )
-        .unwrap();
+        let path = remote_config_path(directory.path());
+        fs::write(&path, b"{\"version\":1}").unwrap();
         assert!(RemoteConfig::read(directory.path()).is_err());
-    }
 
-    #[test]
-    fn rejects_unknown_fields_identity_mismatch_and_oversized_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("remote.json");
-        let invalid = serde_json::json!({
-            "version": 1,
-            "display_url": "wheat://example.com/Owner/Repo",
-            "canonical_identity": "wheat://other.example/Owner/Repo",
-            "head": {
-                "generation": 1,
-                "envelope": head(1).envelope.to_string(),
-            }
-        });
-        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let record = |canonical_identity: &str| {
+            encode_remote_config(&RemoteConfigRecord {
+                display_url: "wheat://example.com/Owner/Repo".into(),
+                canonical_identity: canonical_identity.into(),
+                head: RepositoryRootRecord {
+                    generation: 1,
+                    envelope: head(1).envelope,
+                },
+            })
+            .unwrap()
+        };
+        let mut trailing = record("wheat://example.com/Owner/Repo");
+        fs::write(&path, &trailing).unwrap();
+        assert!(RemoteConfig::read(directory.path()).unwrap().is_some());
+        trailing.push(0);
+        fs::write(&path, &trailing).unwrap();
         assert!(RemoteConfig::read(directory.path()).is_err());
+
+        fs::write(&path, record("wheat://other.example/Owner/Repo")).unwrap();
+        let error = RemoteConfig::read(directory.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match display URL"),
+            "{error:#}"
+        );
 
         fs::write(&path, vec![b' '; MAX_REMOTE_CONFIG_BYTES as usize + 1]).unwrap();
         assert!(RemoteConfig::read(directory.path()).is_err());

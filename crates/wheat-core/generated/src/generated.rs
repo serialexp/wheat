@@ -6888,6 +6888,87 @@ impl From<PhysicalCatalogHeadV1Input> for PhysicalCatalogHeadV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RemoteCatalogHeadV1Input {
+    pub head: PhysicalCatalogRefV1,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteCatalogHeadV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub head: PhysicalCatalogRefV1,
+}
+
+pub type RemoteCatalogHeadV1 = RemoteCatalogHeadV1Output;
+
+impl RemoteCatalogHeadV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353611);
+        encoder.write_u16_be(1);
+        self.head.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl RemoteCatalogHeadV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353611u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353611, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let head = PhysicalCatalogRefV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            head,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        RemoteCatalogHeadV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        RemoteCatalogHeadV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<RemoteCatalogHeadV1Output> for RemoteCatalogHeadV1Input {
+    fn from(o: RemoteCatalogHeadV1Output) -> Self {
+        Self { head: o.head }
+    }
+}
+
+impl From<RemoteCatalogHeadV1Input> for RemoteCatalogHeadV1Output {
+    fn from(i: RemoteCatalogHeadV1Input) -> Self {
+        Self {
+            magic: 1464353611u32,
+            version: 1u16,
+            head: i.head,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepackIntentFieldsV1Input {
     pub old: Option<PhysicalCatalogRefV1>,
     pub new: PhysicalCatalogRefV1,
@@ -8327,5 +8408,770 @@ impl GitImportRefV1 {
         let length = decoder.read_u32_be()? as usize;
         let oid = decoder.read_bytes_vec(length)?;
         Ok(Self { name, oid })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreMetadataV1Input {
+    pub store_id: Uuid128,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreMetadataV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub store_id: Uuid128,
+}
+
+pub type StoreMetadataV1 = StoreMetadataV1Output;
+
+impl StoreMetadataV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464357709);
+        encoder.write_u16_be(1);
+        self.store_id.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl StoreMetadataV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464357709u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464357709, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let store_id = Uuid128::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            store_id,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        StoreMetadataV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        StoreMetadataV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<StoreMetadataV1Output> for StoreMetadataV1Input {
+    fn from(o: StoreMetadataV1Output) -> Self {
+        Self {
+            store_id: o.store_id,
+        }
+    }
+}
+
+impl From<StoreMetadataV1Input> for StoreMetadataV1Output {
+    fn from(i: StoreMetadataV1Input) -> Self {
+        Self {
+            magic: 1464357709u32,
+            version: 1u16,
+            store_id: i.store_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryRootV1 {
+    pub generation: u64,
+    pub envelope: Digest256,
+}
+
+impl RepositoryRootV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_varlength(self.generation, "leb128_canonical")?;
+        self.envelope.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let generation = decoder.read_varlength("leb128_canonical")?;
+        let envelope = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            generation,
+            envelope,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializedRootsV1 {
+    pub repository_head: RepositoryRootV1,
+    pub view: ViewId,
+    pub tree: TreeId,
+}
+
+impl MaterializedRootsV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.repository_head.encode_into(encoder)?;
+        self.view.encode_into(encoder)?;
+        self.tree.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let repository_head = RepositoryRootV1::decode_with_decoder(decoder)?;
+        let view = ViewId::decode_with_decoder(decoder)?;
+        let tree = TreeId::decode_with_decoder(decoder)?;
+        Ok(Self {
+            repository_head,
+            view,
+            tree,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingRepositoryCasV1 {
+    pub expected_head: RepositoryRootV1,
+    pub proposed_head: RepositoryRootV1,
+    pub resulting_frontier: ViewId,
+}
+
+impl PendingRepositoryCasV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.expected_head.encode_into(encoder)?;
+        self.proposed_head.encode_into(encoder)?;
+        self.resulting_frontier.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let expected_head = RepositoryRootV1::decode_with_decoder(decoder)?;
+        let proposed_head = RepositoryRootV1::decode_with_decoder(decoder)?;
+        let resulting_frontier = ViewId::decode_with_decoder(decoder)?;
+        Ok(Self {
+            expected_head,
+            proposed_head,
+            resulting_frontier,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingRepositoryOperationV1 {
+    pub cas: PendingRepositoryCasV1,
+    pub selected_change: Option<ChangeId>,
+}
+
+impl PendingRepositoryOperationV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.cas.encode_into(encoder)?;
+        if let Some(ref v) = self.selected_change {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let cas = PendingRepositoryCasV1::decode_with_decoder(decoder)?;
+        let has_value = decoder.read_uint8()? != 0;
+        let selected_change = if has_value {
+            Some(ChangeId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            cas,
+            selected_change,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceMetadataV1Input {
+    pub workspace_id: Uuid128,
+    pub registration_token: Uuid128,
+    pub store_path: std::string::String,
+    pub store_id: Uuid128,
+    pub active_label: std::string::String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub selected_frontier: Option<ViewId>,
+    pub materialized: Option<MaterializedRootsV1>,
+    pub selected_change: Option<ChangeId>,
+    pub pending_repository_operation: Option<PendingRepositoryOperationV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceMetadataV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub workspace_id: Uuid128,
+    pub registration_token: Uuid128,
+    pub store_path: std::string::String,
+    pub store_id: Uuid128,
+    pub active_label: std::string::String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub selected_frontier: Option<ViewId>,
+    pub materialized: Option<MaterializedRootsV1>,
+    pub selected_change: Option<ChangeId>,
+    pub pending_repository_operation: Option<PendingRepositoryOperationV1>,
+}
+
+pub type WorkspaceMetadataV1 = WorkspaceMetadataV1Output;
+
+impl WorkspaceMetadataV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464358739);
+        encoder.write_u16_be(1);
+        self.workspace_id.encode_into(encoder)?;
+        self.registration_token.encode_into(encoder)?;
+        encoder.write_varlength(self.store_path.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.store_path.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        self.store_id.encode_into(encoder)?;
+        encoder.write_varlength(self.active_label.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.active_label.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        self.basis.encode_into(encoder)?;
+        self.observed_label_binding.encode_into(encoder)?;
+        if let Some(ref v) = self.selected_frontier {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.materialized {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.selected_change {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.pending_repository_operation {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceMetadataV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464358739u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464358739, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let workspace_id = Uuid128::decode_with_decoder(decoder)?;
+        let registration_token = Uuid128::decode_with_decoder(decoder)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let store_path = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let store_id = Uuid128::decode_with_decoder(decoder)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let active_label = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let basis = ViewId::decode_with_decoder(decoder)?;
+        let observed_label_binding = ViewId::decode_with_decoder(decoder)?;
+        let has_value = decoder.read_uint8()? != 0;
+        let selected_frontier = if has_value {
+            Some(ViewId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let materialized = if has_value {
+            Some(MaterializedRootsV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let selected_change = if has_value {
+            Some(ChangeId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let pending_repository_operation = if has_value {
+            Some(PendingRepositoryOperationV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            magic,
+            version,
+            workspace_id,
+            registration_token,
+            store_path,
+            store_id,
+            active_label,
+            basis,
+            observed_label_binding,
+            selected_frontier,
+            materialized,
+            selected_change,
+            pending_repository_operation,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        WorkspaceMetadataV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        WorkspaceMetadataV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<WorkspaceMetadataV1Output> for WorkspaceMetadataV1Input {
+    fn from(o: WorkspaceMetadataV1Output) -> Self {
+        Self {
+            workspace_id: o.workspace_id,
+            registration_token: o.registration_token,
+            store_path: o.store_path,
+            store_id: o.store_id,
+            active_label: o.active_label,
+            basis: o.basis,
+            observed_label_binding: o.observed_label_binding,
+            selected_frontier: o.selected_frontier,
+            materialized: o.materialized,
+            selected_change: o.selected_change,
+            pending_repository_operation: o.pending_repository_operation,
+        }
+    }
+}
+
+impl From<WorkspaceMetadataV1Input> for WorkspaceMetadataV1Output {
+    fn from(i: WorkspaceMetadataV1Input) -> Self {
+        Self {
+            magic: 1464358739u32,
+            version: 1u16,
+            workspace_id: i.workspace_id,
+            registration_token: i.registration_token,
+            store_path: i.store_path,
+            store_id: i.store_id,
+            active_label: i.active_label,
+            basis: i.basis,
+            observed_label_binding: i.observed_label_binding,
+            selected_frontier: i.selected_frontier,
+            materialized: i.materialized,
+            selected_change: i.selected_change,
+            pending_repository_operation: i.pending_repository_operation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspacePinV1Input {
+    pub store_id: Uuid128,
+    pub workspace_id: Uuid128,
+    pub registration_token: Uuid128,
+    pub workspace_path: std::string::String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub selected_frontier: Option<ViewId>,
+    pub selected_change: Option<ChangeId>,
+    pub materialized: Option<MaterializedRootsV1>,
+    pub pending_materialization: Option<MaterializedRootsV1>,
+    pub pending_repository_cas: Option<PendingRepositoryCasV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspacePinV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub store_id: Uuid128,
+    pub workspace_id: Uuid128,
+    pub registration_token: Uuid128,
+    pub workspace_path: std::string::String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub selected_frontier: Option<ViewId>,
+    pub selected_change: Option<ChangeId>,
+    pub materialized: Option<MaterializedRootsV1>,
+    pub pending_materialization: Option<MaterializedRootsV1>,
+    pub pending_repository_cas: Option<PendingRepositoryCasV1>,
+}
+
+pub type WorkspacePinV1 = WorkspacePinV1Output;
+
+impl WorkspacePinV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464358736);
+        encoder.write_u16_be(1);
+        self.store_id.encode_into(encoder)?;
+        self.workspace_id.encode_into(encoder)?;
+        self.registration_token.encode_into(encoder)?;
+        encoder.write_varlength(self.workspace_path.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.workspace_path.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        self.basis.encode_into(encoder)?;
+        self.observed_label_binding.encode_into(encoder)?;
+        if let Some(ref v) = self.selected_frontier {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.selected_change {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.materialized {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.pending_materialization {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.pending_repository_cas {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspacePinV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464358736u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464358736, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let store_id = Uuid128::decode_with_decoder(decoder)?;
+        let workspace_id = Uuid128::decode_with_decoder(decoder)?;
+        let registration_token = Uuid128::decode_with_decoder(decoder)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let workspace_path = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let basis = ViewId::decode_with_decoder(decoder)?;
+        let observed_label_binding = ViewId::decode_with_decoder(decoder)?;
+        let has_value = decoder.read_uint8()? != 0;
+        let selected_frontier = if has_value {
+            Some(ViewId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let selected_change = if has_value {
+            Some(ChangeId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let materialized = if has_value {
+            Some(MaterializedRootsV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let pending_materialization = if has_value {
+            Some(MaterializedRootsV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let pending_repository_cas = if has_value {
+            Some(PendingRepositoryCasV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            magic,
+            version,
+            store_id,
+            workspace_id,
+            registration_token,
+            workspace_path,
+            basis,
+            observed_label_binding,
+            selected_frontier,
+            selected_change,
+            materialized,
+            pending_materialization,
+            pending_repository_cas,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        WorkspacePinV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        WorkspacePinV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<WorkspacePinV1Output> for WorkspacePinV1Input {
+    fn from(o: WorkspacePinV1Output) -> Self {
+        Self {
+            store_id: o.store_id,
+            workspace_id: o.workspace_id,
+            registration_token: o.registration_token,
+            workspace_path: o.workspace_path,
+            basis: o.basis,
+            observed_label_binding: o.observed_label_binding,
+            selected_frontier: o.selected_frontier,
+            selected_change: o.selected_change,
+            materialized: o.materialized,
+            pending_materialization: o.pending_materialization,
+            pending_repository_cas: o.pending_repository_cas,
+        }
+    }
+}
+
+impl From<WorkspacePinV1Input> for WorkspacePinV1Output {
+    fn from(i: WorkspacePinV1Input) -> Self {
+        Self {
+            magic: 1464358736u32,
+            version: 1u16,
+            store_id: i.store_id,
+            workspace_id: i.workspace_id,
+            registration_token: i.registration_token,
+            workspace_path: i.workspace_path,
+            basis: i.basis,
+            observed_label_binding: i.observed_label_binding,
+            selected_frontier: i.selected_frontier,
+            selected_change: i.selected_change,
+            materialized: i.materialized,
+            pending_materialization: i.pending_materialization,
+            pending_repository_cas: i.pending_repository_cas,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteConfigV1Input {
+    pub display_url: std::string::String,
+    pub canonical_identity: std::string::String,
+    pub head: RepositoryRootV1,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteConfigV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub display_url: std::string::String,
+    pub canonical_identity: std::string::String,
+    pub head: RepositoryRootV1,
+}
+
+pub type RemoteConfigV1 = RemoteConfigV1Output;
+
+impl RemoteConfigV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464357443);
+        encoder.write_u16_be(1);
+        encoder.write_varlength(self.display_url.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.display_url.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_varlength(self.canonical_identity.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.canonical_identity.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        self.head.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl RemoteConfigV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464357443u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464357443, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let display_url = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let canonical_identity = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let head = RepositoryRootV1::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            display_url,
+            canonical_identity,
+            head,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        RemoteConfigV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        RemoteConfigV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<RemoteConfigV1Output> for RemoteConfigV1Input {
+    fn from(o: RemoteConfigV1Output) -> Self {
+        Self {
+            display_url: o.display_url,
+            canonical_identity: o.canonical_identity,
+            head: o.head,
+        }
+    }
+}
+
+impl From<RemoteConfigV1Input> for RemoteConfigV1Output {
+    fn from(i: RemoteConfigV1Input) -> Self {
+        Self {
+            magic: 1464357443u32,
+            version: 1u16,
+            display_url: i.display_url,
+            canonical_identity: i.canonical_identity,
+            head: i.head,
+        }
     }
 }

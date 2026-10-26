@@ -40,9 +40,6 @@ fn catalog_error(error: super::catalog::CatalogError) -> ObjectStoreError {
         super::catalog::CatalogError::Io(error) => ObjectStoreError::Io(error),
         super::catalog::CatalogError::Segment(error) => segment_integrity(error),
         super::catalog::CatalogError::Corrupt(reason) => ObjectStoreError::Integrity(reason),
-        super::catalog::CatalogError::HeadFormat(error) => {
-            ObjectStoreError::Integrity(error.to_string())
-        }
     }
 }
 

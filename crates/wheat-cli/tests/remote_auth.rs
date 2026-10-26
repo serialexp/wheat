@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use serde_json::Value;
 use wheat_server::access::{Access, AuthConfig, PrincipalConfig, token_hash_hex};
 use wheat_server::config::FileConfig;
 use wheat_server::registry::Registry;
@@ -36,10 +35,10 @@ fn ok(cwd: &Path, stores: &Path, args: &[&str]) -> Output {
 }
 
 fn workspace_store(workspace: &Path) -> PathBuf {
-    let value: Value =
-        serde_json::from_slice(&fs::read(workspace.join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    PathBuf::from(value["store"]["path"].as_str().unwrap())
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)
+        .unwrap()
+        .store
+        .path
 }
 
 struct Fixture {

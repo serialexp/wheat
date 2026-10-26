@@ -147,7 +147,7 @@ fn clean_workspace_diff_has_no_human_output() {
 #[test]
 fn workspace_diff_is_lexical_ignores_untracked_files_and_does_not_change_metadata() {
     let dir = setup();
-    let metadata_before = fs::read(dir.path().join(".wheat/workspace.json")).unwrap();
+    let metadata_before = fs::read(dir.path().join(".wheat/workspace.meta")).unwrap();
     fs::write(dir.path().join("text"), b"changed\n").unwrap();
     fs::write(dir.path().join("binary"), b"changed\n").unwrap();
     fs::write(dir.path().join("untracked"), b"not part of phase one\n").unwrap();
@@ -162,7 +162,7 @@ fn workspace_diff_is_lexical_ignores_untracked_files_and_does_not_change_metadat
         .collect::<Vec<_>>();
     assert_eq!(paths, ["binary", "text"]);
     assert_eq!(
-        fs::read(dir.path().join(".wheat/workspace.json")).unwrap(),
+        fs::read(dir.path().join(".wheat/workspace.meta")).unwrap(),
         metadata_before
     );
     assert_eq!(

@@ -139,7 +139,7 @@ fn change_selection_can_switch_without_changing_repository_authority() {
         &["change", "new", "-m", "second"],
     );
     let b_id = field(&b, "change");
-    let before = fs::read(root.path().join(".wheat/workspace.json")).unwrap();
+    let before = fs::read(root.path().join(".wheat/workspace.meta")).unwrap();
     let selected = ok(root.path(), config.path(), &["change", "select", &a_id]);
     assert!(String::from_utf8_lossy(&selected.stdout).contains(&a_id));
     let listed = ok(root.path(), config.path(), &["changes", "--format", "json"]);
@@ -154,7 +154,7 @@ fn change_selection_can_switch_without_changing_repository_authority() {
             .any(|item| item["change"] == b_id)
     );
     assert_ne!(
-        fs::read(root.path().join(".wheat/workspace.json")).unwrap(),
+        fs::read(root.path().join(".wheat/workspace.meta")).unwrap(),
         before
     );
 }
@@ -162,10 +162,10 @@ fn change_selection_can_switch_without_changing_repository_authority() {
 #[test]
 fn missing_selection_and_non_tty_message_refuse_without_publishing() {
     let (root, config) = setup();
-    let store: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.path().join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    let store_path = std::path::PathBuf::from(store["store"]["path"].as_str().unwrap());
+    let store_path = wheat_client::workspace_metadata::WorkspaceMetadata::read(root.path())
+        .unwrap()
+        .store
+        .path;
     let head_before = fs::read(store_path.join("repository.head")).unwrap();
     fs::write(root.path().join("file"), "value\n").unwrap();
     let add = command(root.path(), config.path(), &["add", "file"]);

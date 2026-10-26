@@ -63,15 +63,10 @@ impl Harness {
     }
 
     fn store(&self) -> PathBuf {
-        let workspace: Value = serde_json::from_slice(
-            &fs::read(self.workspace.join(".wheat/workspace.json")).unwrap(),
-        )
-        .unwrap();
-        PathBuf::from(
-            workspace["store"]["path"]
-                .as_str()
-                .expect("workspace has a canonical store path"),
-        )
+        wheat_client::workspace_metadata::WorkspaceMetadata::read(&self.workspace)
+            .unwrap()
+            .store
+            .path
     }
 }
 
@@ -357,7 +352,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     for forbidden in [
         ".git",
         "repository.head",
-        "store.json",
+        "store.meta",
         "storage",
         "projection",
     ] {
@@ -423,7 +418,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
             .iter()
             .all(|(_, entry)| matches!(entry, SnapshotEntry::Regular { .. }))
     );
-    let metadata_before_reads = fs::read(harness.workspace.join(".wheat/workspace.json")).unwrap();
+    let metadata_before_reads = fs::read(harness.workspace.join(".wheat/workspace.meta")).unwrap();
     let status = harness.json_ok(&harness.workspace, &["status"]);
     assert_eq!(status["command"], "status");
     assert_eq!(status["result"]["schema_version"], 2);
@@ -549,7 +544,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         workspace_before_reads
     );
     assert_eq!(
-        fs::read(harness.workspace.join(".wheat/workspace.json")).unwrap(),
+        fs::read(harness.workspace.join(".wheat/workspace.meta")).unwrap(),
         metadata_before_reads
     );
 
@@ -844,31 +839,31 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         expected_reopened["result"]["changes"],
         serde_json::json!([])
     );
-    let pinned_metadata = fs::read(harness.workspace.join(".wheat/workspace.json")).unwrap();
-    let metadata_document: Value = serde_json::from_slice(&pinned_metadata).unwrap();
-    assert_eq!(metadata_document["format"], "wheat-workspace");
-    assert_eq!(metadata_document["version"], 4);
-    assert!(metadata_document["registration_token"].is_string());
-    assert_eq!(metadata_document["active_label"], "main");
+    let pinned_metadata = fs::read(harness.workspace.join(".wheat/workspace.meta")).unwrap();
+    let metadata =
+        wheat_client::workspace_metadata::WorkspaceMetadata::decode(&pinned_metadata).unwrap();
+    assert!(!metadata.registration_token.is_nil());
+    assert_eq!(metadata.active_label, "main");
     assert_eq!(
-        metadata_document["basis"],
+        serde_json::to_value(metadata.basis).unwrap(),
         expected_reopened["result"]["basis"]
     );
     assert_eq!(
-        metadata_document["selected_frontier"],
+        serde_json::to_value(metadata.selected_frontier).unwrap(),
         expected_reopened["result"]["selected_frontier"]
     );
-    assert_eq!(metadata_document["selected_change"], descendant_change);
     assert_eq!(
-        metadata_document["pending_repository_operation"],
-        Value::Null
+        metadata.selected_change.map(|change| change.to_string()),
+        Some(descendant_change.clone())
     );
+    assert!(metadata.pending_repository_operation.is_none());
+    let materialized = metadata.materialized.unwrap();
     assert_eq!(
-        metadata_document["materialized"]["repository_head"]["generation"],
+        Value::from(materialized.repository_head.generation),
         expected_reopened["result"]["materialized_head_generation"]
     );
     assert_eq!(
-        metadata_document["materialized"]["view"],
+        serde_json::to_value(materialized.view).unwrap(),
         expected_reopened["result"]["materialized_view"]
     );
     let head_path = harness.store().join("repository.head");
@@ -914,7 +909,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     );
     assert_eq!(fs::read(&head_path).unwrap(), expected_head);
     assert_eq!(
-        fs::read(harness.workspace.join(".wheat/workspace.json")).unwrap(),
+        fs::read(harness.workspace.join(".wheat/workspace.meta")).unwrap(),
         pinned_metadata
     );
     let workspace_after_reopen = filesystem_snapshot(&harness.workspace, false);

@@ -1,13 +1,11 @@
 //! A wheat-server running in the case's process, for the protocol cases.
 
 use std::{
-    fs,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
-use serde_json::Value;
 use tokio::{runtime::Runtime, sync::oneshot, task::JoinHandle};
 use wheat_server::{
     registry::Registry,
@@ -96,10 +94,9 @@ pub(crate) fn url(addr: SocketAddr) -> String {
 }
 
 fn workspace_store(workspace: &Path) -> Result<PathBuf> {
-    let document: Value =
-        serde_json::from_slice(&fs::read(workspace.join(".wheat/workspace.json"))?)?;
-    let path = document["store"]["path"]
-        .as_str()
-        .context("workspace.json has no store path")?;
-    Ok(PathBuf::from(path))
+    Ok(
+        wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)?
+            .store
+            .path,
+    )
 }

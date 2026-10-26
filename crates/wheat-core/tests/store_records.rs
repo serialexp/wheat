@@ -305,3 +305,222 @@ fn store_records_are_not_interchangeable() {
     assert!(decode_repository_head(&envelope).is_err());
     assert!(decode_snapshot_manifest(&ownership, 0, 0).is_err());
 }
+
+fn id(seed: u8) -> uuid::Uuid {
+    uuid::Uuid::from_bytes([seed; 16])
+}
+
+fn root(seed: u8) -> RepositoryRootRecord {
+    RepositoryRootRecord {
+        generation: u64::from(seed) << 20,
+        envelope: RepositoryEnvelopeId::from_digest([seed; 32]),
+    }
+}
+
+fn materialized(seed: u8) -> MaterializedRootsRecord {
+    MaterializedRootsRecord {
+        repository_head: root(seed),
+        view: ViewId::from_digest([seed.wrapping_add(1); 32]),
+        tree: TreeId::from_digest([seed.wrapping_add(2); 32]),
+    }
+}
+
+fn cas(seed: u8) -> PendingRepositoryCasRecord {
+    PendingRepositoryCasRecord {
+        expected_head: root(seed),
+        proposed_head: root(seed.wrapping_add(1)),
+        resulting_frontier: ViewId::from_digest([seed.wrapping_add(2); 32]),
+    }
+}
+
+fn workspace(full: bool) -> WorkspaceMetadataRecord {
+    WorkspaceMetadataRecord {
+        workspace_id: id(1),
+        registration_token: id(2),
+        store_path: "/stores/ünïcode store".into(),
+        store_id: id(3),
+        active_label: "main".into(),
+        basis: ViewId::from_digest([4; 32]),
+        observed_label_binding: ViewId::from_digest([5; 32]),
+        selected_frontier: full.then(|| ViewId::from_digest([6; 32])),
+        materialized: full.then(|| materialized(7)),
+        selected_change: full.then(|| ChangeId::from_bytes([8; 16])),
+        pending_repository_operation: full.then(|| (cas(9), Some(ChangeId::from_bytes([10; 16])))),
+    }
+}
+
+fn pin(full: bool) -> WorkspacePinRecord {
+    WorkspacePinRecord {
+        store_id: id(1),
+        workspace_id: id(2),
+        registration_token: id(3),
+        workspace_path: "/work/space".into(),
+        basis: ViewId::from_digest([4; 32]),
+        observed_label_binding: ViewId::from_digest([5; 32]),
+        selected_frontier: full.then(|| ViewId::from_digest([6; 32])),
+        selected_change: full.then(|| ChangeId::from_bytes([7; 16])),
+        materialized: full.then(|| materialized(8)),
+        pending_materialization: full.then(|| materialized(9)),
+        pending_repository_cas: full.then(|| cas(10)),
+    }
+}
+
+/// `bytes` with one more byte, and with the version after the four-byte magic
+/// raised to 2.
+fn tampered(bytes: &[u8]) -> [Vec<u8>; 2] {
+    let mut trailing = bytes.to_vec();
+    trailing.push(0);
+    let mut version = bytes.to_vec();
+    version[5] = 2;
+    [trailing, version]
+}
+
+#[test]
+fn store_metadata_round_trips_and_refuses_a_nil_store() {
+    let record = StoreMetadataRecord { store_id: id(1) };
+    let bytes = encode_store_metadata(record).unwrap();
+    assert_eq!(decode_store_metadata(&bytes).unwrap(), record);
+    let [trailing, version] = tampered(&bytes);
+    assert_eq!(
+        decode_store_metadata(&trailing),
+        Err(StoreRecordError::NonCanonicalEncoding)
+    );
+    assert!(matches!(
+        decode_store_metadata(&version),
+        Err(StoreRecordError::Decode(_))
+    ));
+    let nil = encode_store_metadata(StoreMetadataRecord {
+        store_id: uuid::Uuid::nil(),
+    })
+    .unwrap();
+    assert_eq!(
+        decode_store_metadata(&nil),
+        Err(StoreRecordError::NilIdentity("store ID"))
+    );
+}
+
+#[test]
+fn workspace_metadata_round_trips_with_and_without_optional_roots() {
+    for full in [false, true] {
+        let record = workspace(full);
+        let bytes = encode_workspace_metadata(&record).unwrap();
+        assert_eq!(decode_workspace_metadata(&bytes).unwrap(), record);
+        let [trailing, version] = tampered(&bytes);
+        assert_eq!(
+            decode_workspace_metadata(&trailing),
+            Err(StoreRecordError::NonCanonicalEncoding)
+        );
+        assert!(decode_workspace_metadata(&version).is_err());
+    }
+    // A pending operation that leaves no change selected is its own state.
+    let mut record = workspace(true);
+    record.pending_repository_operation = Some((cas(1), None));
+    let bytes = encode_workspace_metadata(&record).unwrap();
+    assert_eq!(decode_workspace_metadata(&bytes).unwrap(), record);
+}
+
+#[test]
+fn workspace_metadata_refuses_nil_identities() {
+    for (field, name) in [
+        (0, "workspace ID"),
+        (1, "registration token"),
+        (2, "store ID"),
+    ] {
+        let mut record = workspace(false);
+        match field {
+            0 => record.workspace_id = uuid::Uuid::nil(),
+            1 => record.registration_token = uuid::Uuid::nil(),
+            _ => record.store_id = uuid::Uuid::nil(),
+        }
+        let bytes = encode_workspace_metadata(&record).unwrap();
+        assert_eq!(
+            decode_workspace_metadata(&bytes),
+            Err(StoreRecordError::NilIdentity(name))
+        );
+    }
+}
+
+#[test]
+fn workspace_pin_round_trips_and_refuses_nil_identities() {
+    for full in [false, true] {
+        let record = pin(full);
+        let bytes = encode_workspace_pin(&record).unwrap();
+        assert_eq!(decode_workspace_pin(&bytes).unwrap(), record);
+        let [trailing, version] = tampered(&bytes);
+        assert_eq!(
+            decode_workspace_pin(&trailing),
+            Err(StoreRecordError::NonCanonicalEncoding)
+        );
+        assert!(decode_workspace_pin(&version).is_err());
+    }
+    for (field, name) in [
+        (0, "store ID"),
+        (1, "workspace ID"),
+        (2, "registration token"),
+    ] {
+        let mut record = pin(false);
+        match field {
+            0 => record.store_id = uuid::Uuid::nil(),
+            1 => record.workspace_id = uuid::Uuid::nil(),
+            _ => record.registration_token = uuid::Uuid::nil(),
+        }
+        let bytes = encode_workspace_pin(&record).unwrap();
+        assert_eq!(
+            decode_workspace_pin(&bytes),
+            Err(StoreRecordError::NilIdentity(name))
+        );
+    }
+}
+
+#[test]
+fn remote_config_round_trips_and_refuses_tampering() {
+    let record = RemoteConfigRecord {
+        display_url: "wheat://example.com/team/repo".into(),
+        canonical_identity: "wheat://example.com:443/team/repo".into(),
+        head: root(3),
+    };
+    let bytes = encode_remote_config(&record).unwrap();
+    assert_eq!(decode_remote_config(&bytes).unwrap(), record);
+    let [trailing, version] = tampered(&bytes);
+    assert_eq!(
+        decode_remote_config(&trailing),
+        Err(StoreRecordError::NonCanonicalEncoding)
+    );
+    assert!(decode_remote_config(&version).is_err());
+    // A string is UTF-8.
+    let mut invalid = bytes.clone();
+    let start = invalid
+        .windows(5)
+        .position(|window| window == b"wheat")
+        .unwrap();
+    invalid[start] = 0xff;
+    assert!(decode_remote_config(&invalid).is_err());
+}
+
+#[test]
+fn client_control_records_have_distinct_magics() {
+    let records = [
+        encode_store_metadata(StoreMetadataRecord { store_id: id(1) }).unwrap(),
+        encode_workspace_metadata(&workspace(false)).unwrap(),
+        encode_workspace_pin(&pin(false)).unwrap(),
+        encode_remote_config(&RemoteConfigRecord {
+            display_url: String::new(),
+            canonical_identity: String::new(),
+            head: root(1),
+        })
+        .unwrap(),
+        encode_repository_head(&RepositoryHeadRecord {
+            generation: 1,
+            envelope: RepositoryEnvelopeId::from_digest([1; 32]),
+            receipts: Vec::new(),
+        })
+        .unwrap(),
+    ];
+    for (index, record) in records.iter().enumerate() {
+        for other in &records[index + 1..] {
+            assert_ne!(record[..4], other[..4], "record {index}");
+        }
+    }
+    assert!(decode_workspace_pin(&records[1]).is_err());
+    assert!(decode_workspace_metadata(&records[2]).is_err());
+}

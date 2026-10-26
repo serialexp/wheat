@@ -418,7 +418,7 @@ fn a_wheat_url_pulls_natively() {
         error["message"]
             .as_str()
             .unwrap()
-            .contains("no remote.json found"),
+            .contains("no remote.meta found"),
         "{error:#}"
     );
 

@@ -1,13 +1,16 @@
 //! Safe domain wrappers for the stores' small persisted records: the repository
 //! head, the content envelope header, snapshot and ownership manifests, a
-//! workspace materialization's progress log, and a Git import's source binding.
+//! workspace materialization's progress log, a Git import's source binding, and
+//! the control files a client keeps: store and workspace metadata, workspace pins
+//! and the remote binding.
 //!
 //! Like the physical segment records, none of these are `WheatObject` variants.
 
 use thiserror::Error;
+use uuid::Uuid;
 use wheat_binschema::generated as wire;
 
-use crate::RepositoryEnvelopeId;
+use crate::{ChangeId, RepositoryEnvelopeId, TreeId, ViewId};
 
 /// Encoded size of a repository head with no publish receipts.
 pub const REPOSITORY_HEAD_ENCODED_SIZE: usize = 48;
@@ -30,6 +33,8 @@ pub enum StoreRecordError {
     NonCanonicalEncoding,
     #[error("store record count exceeds its limit or the supplied bytes")]
     InvalidCount,
+    #[error("store record's {0} is the nil UUID")]
+    NilIdentity(&'static str),
 }
 
 /// The published generation and its repository envelope, and the receipts of recent
@@ -88,6 +93,80 @@ pub struct MaterializationProgressFields {
     pub opcode: u16,
     pub transaction: [u8; 16],
     pub index: u64,
+}
+
+/// `store.meta`: a store's identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreMetadataRecord {
+    pub store_id: Uuid,
+}
+
+/// A repository head a workspace holds on to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepositoryRootRecord {
+    pub generation: u64,
+    pub envelope: RepositoryEnvelopeId,
+}
+
+/// The head, view and tree a workspace's files were (or are being) written from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterializedRootsRecord {
+    pub repository_head: RepositoryRootRecord,
+    pub view: ViewId,
+    pub tree: TreeId,
+}
+
+/// A repository compare-and-swap a workspace has in flight, and the frontier it
+/// leaves the workspace on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingRepositoryCasRecord {
+    pub expected_head: RepositoryRootRecord,
+    pub proposed_head: RepositoryRootRecord,
+    pub resulting_frontier: ViewId,
+}
+
+/// `.wheat/workspace.meta`: a workspace's binding to its store and label. Neither
+/// identity is nil.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceMetadataRecord {
+    pub workspace_id: Uuid,
+    pub registration_token: Uuid,
+    pub store_path: String,
+    pub store_id: Uuid,
+    pub active_label: String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub selected_frontier: Option<ViewId>,
+    pub materialized: Option<MaterializedRootsRecord>,
+    pub selected_change: Option<ChangeId>,
+    /// The compare-and-swap in flight and the change it leaves selected.
+    pub pending_repository_operation: Option<(PendingRepositoryCasRecord, Option<ChangeId>)>,
+}
+
+/// `workspaces/<workspace id>.pin` in a store: the roots a workspace keeps alive.
+/// No identity is nil.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspacePinRecord {
+    pub store_id: Uuid,
+    pub workspace_id: Uuid,
+    pub registration_token: Uuid,
+    pub workspace_path: String,
+    pub basis: ViewId,
+    pub observed_label_binding: ViewId,
+    pub selected_frontier: Option<ViewId>,
+    pub selected_change: Option<ChangeId>,
+    pub materialized: Option<MaterializedRootsRecord>,
+    pub pending_materialization: Option<MaterializedRootsRecord>,
+    pub pending_repository_cas: Option<PendingRepositoryCasRecord>,
+}
+
+/// `remote.meta` in a store: the remote it talks to and the remote head it last
+/// observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteConfigRecord {
+    pub display_url: String,
+    pub canonical_identity: String,
+    pub head: RepositoryRootRecord,
 }
 
 fn digest(bytes: [u8; 32]) -> wire::Digest256 {
@@ -458,4 +537,209 @@ pub fn encode_git_import_source<'a>(
         }
         .encode(),
     )
+}
+
+fn identity(value: Uuid) -> wire::Uuid128 {
+    uuid(*value.as_bytes())
+}
+fn identity_domain(value: wire::Uuid128, field: &'static str) -> Result<Uuid, StoreRecordError> {
+    let value = Uuid::from_bytes(uuid_array(value)?);
+    if value.is_nil() {
+        return Err(StoreRecordError::NilIdentity(field));
+    }
+    Ok(value)
+}
+fn view_wire(value: ViewId) -> wire::ViewId {
+    wire::ViewId {
+        digest: digest(*value.as_bytes()),
+    }
+}
+fn view_domain(value: wire::ViewId) -> Result<ViewId, StoreRecordError> {
+    Ok(ViewId::from_digest(digest_array(value.digest)?))
+}
+fn change_wire(value: ChangeId) -> wire::ChangeId {
+    wire::ChangeId {
+        uuid: uuid(*value.as_bytes()),
+    }
+}
+fn change_domain(value: wire::ChangeId) -> Result<ChangeId, StoreRecordError> {
+    Ok(ChangeId::from_bytes(uuid_array(value.uuid)?))
+}
+fn root_wire(value: RepositoryRootRecord) -> wire::RepositoryRootV1 {
+    wire::RepositoryRootV1 {
+        generation: value.generation,
+        envelope: digest(*value.envelope.as_bytes()),
+    }
+}
+fn root_domain(value: wire::RepositoryRootV1) -> Result<RepositoryRootRecord, StoreRecordError> {
+    Ok(RepositoryRootRecord {
+        generation: value.generation,
+        envelope: RepositoryEnvelopeId::from_digest(digest_array(value.envelope)?),
+    })
+}
+fn materialized_wire(value: MaterializedRootsRecord) -> wire::MaterializedRootsV1 {
+    wire::MaterializedRootsV1 {
+        repository_head: root_wire(value.repository_head),
+        view: view_wire(value.view),
+        tree: wire::TreeId {
+            digest: digest(*value.tree.as_bytes()),
+        },
+    }
+}
+fn materialized_domain(
+    value: wire::MaterializedRootsV1,
+) -> Result<MaterializedRootsRecord, StoreRecordError> {
+    Ok(MaterializedRootsRecord {
+        repository_head: root_domain(value.repository_head)?,
+        view: view_domain(value.view)?,
+        tree: TreeId::from_digest(digest_array(value.tree.digest)?),
+    })
+}
+fn cas_wire(value: PendingRepositoryCasRecord) -> wire::PendingRepositoryCasV1 {
+    wire::PendingRepositoryCasV1 {
+        expected_head: root_wire(value.expected_head),
+        proposed_head: root_wire(value.proposed_head),
+        resulting_frontier: view_wire(value.resulting_frontier),
+    }
+}
+fn cas_domain(
+    value: wire::PendingRepositoryCasV1,
+) -> Result<PendingRepositoryCasRecord, StoreRecordError> {
+    Ok(PendingRepositoryCasRecord {
+        expected_head: root_domain(value.expected_head)?,
+        proposed_head: root_domain(value.proposed_head)?,
+        resulting_frontier: view_domain(value.resulting_frontier)?,
+    })
+}
+
+pub fn encode_store_metadata(record: StoreMetadataRecord) -> Result<Vec<u8>, StoreRecordError> {
+    encoded(
+        wire::StoreMetadataV1Input {
+            store_id: identity(record.store_id),
+        }
+        .encode(),
+    )
+}
+pub fn decode_store_metadata(bytes: &[u8]) -> Result<StoreMetadataRecord, StoreRecordError> {
+    let w = wire::StoreMetadataV1::decode(bytes).map_err(decode_error)?;
+    let reencoded = w.encode();
+    let record = StoreMetadataRecord {
+        store_id: identity_domain(w.store_id, "store ID")?,
+    };
+    checked(bytes, record, reencoded)
+}
+
+pub fn encode_workspace_metadata(
+    record: &WorkspaceMetadataRecord,
+) -> Result<Vec<u8>, StoreRecordError> {
+    encoded(
+        wire::WorkspaceMetadataV1Input {
+            workspace_id: identity(record.workspace_id),
+            registration_token: identity(record.registration_token),
+            store_path: record.store_path.clone(),
+            store_id: identity(record.store_id),
+            active_label: record.active_label.clone(),
+            basis: view_wire(record.basis),
+            observed_label_binding: view_wire(record.observed_label_binding),
+            selected_frontier: record.selected_frontier.map(view_wire),
+            materialized: record.materialized.map(materialized_wire),
+            selected_change: record.selected_change.map(change_wire),
+            pending_repository_operation: record.pending_repository_operation.map(
+                |(cas, selected_change)| wire::PendingRepositoryOperationV1 {
+                    cas: cas_wire(cas),
+                    selected_change: selected_change.map(change_wire),
+                },
+            ),
+        }
+        .encode(),
+    )
+}
+pub fn decode_workspace_metadata(
+    bytes: &[u8],
+) -> Result<WorkspaceMetadataRecord, StoreRecordError> {
+    let w = wire::WorkspaceMetadataV1::decode(bytes).map_err(decode_error)?;
+    let reencoded = w.encode();
+    let record = WorkspaceMetadataRecord {
+        workspace_id: identity_domain(w.workspace_id, "workspace ID")?,
+        registration_token: identity_domain(w.registration_token, "registration token")?,
+        store_path: w.store_path,
+        store_id: identity_domain(w.store_id, "store ID")?,
+        active_label: w.active_label,
+        basis: view_domain(w.basis)?,
+        observed_label_binding: view_domain(w.observed_label_binding)?,
+        selected_frontier: w.selected_frontier.map(view_domain).transpose()?,
+        materialized: w.materialized.map(materialized_domain).transpose()?,
+        selected_change: w.selected_change.map(change_domain).transpose()?,
+        pending_repository_operation: w
+            .pending_repository_operation
+            .map(|operation| {
+                Ok::<_, StoreRecordError>((
+                    cas_domain(operation.cas)?,
+                    operation.selected_change.map(change_domain).transpose()?,
+                ))
+            })
+            .transpose()?,
+    };
+    checked(bytes, record, reencoded)
+}
+
+pub fn encode_workspace_pin(record: &WorkspacePinRecord) -> Result<Vec<u8>, StoreRecordError> {
+    encoded(
+        wire::WorkspacePinV1Input {
+            store_id: identity(record.store_id),
+            workspace_id: identity(record.workspace_id),
+            registration_token: identity(record.registration_token),
+            workspace_path: record.workspace_path.clone(),
+            basis: view_wire(record.basis),
+            observed_label_binding: view_wire(record.observed_label_binding),
+            selected_frontier: record.selected_frontier.map(view_wire),
+            selected_change: record.selected_change.map(change_wire),
+            materialized: record.materialized.map(materialized_wire),
+            pending_materialization: record.pending_materialization.map(materialized_wire),
+            pending_repository_cas: record.pending_repository_cas.map(cas_wire),
+        }
+        .encode(),
+    )
+}
+pub fn decode_workspace_pin(bytes: &[u8]) -> Result<WorkspacePinRecord, StoreRecordError> {
+    let w = wire::WorkspacePinV1::decode(bytes).map_err(decode_error)?;
+    let reencoded = w.encode();
+    let record = WorkspacePinRecord {
+        store_id: identity_domain(w.store_id, "store ID")?,
+        workspace_id: identity_domain(w.workspace_id, "workspace ID")?,
+        registration_token: identity_domain(w.registration_token, "registration token")?,
+        workspace_path: w.workspace_path,
+        basis: view_domain(w.basis)?,
+        observed_label_binding: view_domain(w.observed_label_binding)?,
+        selected_frontier: w.selected_frontier.map(view_domain).transpose()?,
+        selected_change: w.selected_change.map(change_domain).transpose()?,
+        materialized: w.materialized.map(materialized_domain).transpose()?,
+        pending_materialization: w
+            .pending_materialization
+            .map(materialized_domain)
+            .transpose()?,
+        pending_repository_cas: w.pending_repository_cas.map(cas_domain).transpose()?,
+    };
+    checked(bytes, record, reencoded)
+}
+
+pub fn encode_remote_config(record: &RemoteConfigRecord) -> Result<Vec<u8>, StoreRecordError> {
+    encoded(
+        wire::RemoteConfigV1Input {
+            display_url: record.display_url.clone(),
+            canonical_identity: record.canonical_identity.clone(),
+            head: root_wire(record.head),
+        }
+        .encode(),
+    )
+}
+pub fn decode_remote_config(bytes: &[u8]) -> Result<RemoteConfigRecord, StoreRecordError> {
+    let w = wire::RemoteConfigV1::decode(bytes).map_err(decode_error)?;
+    let reencoded = w.encode();
+    let record = RemoteConfigRecord {
+        display_url: w.display_url,
+        canonical_identity: w.canonical_identity,
+        head: root_domain(w.head)?,
+    };
+    checked(bytes, record, reencoded)
 }

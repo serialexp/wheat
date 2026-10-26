@@ -217,8 +217,17 @@ pub fn decode_repository_envelope_record(
     })
 }
 
+/// The longest directory or file name, in bytes: what most file systems allow. It also
+/// bounds a directory node's size, so a node of `n` entries stays `O(n)` bytes.
+pub const MAX_DIRECTORY_COMPONENT_BYTES: usize = 255;
+
 pub fn validate_directory_component(name: &str) -> Result<(), CanonicalObjectError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+    if name.is_empty()
+        || name.len() > MAX_DIRECTORY_COMPONENT_BYTES
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\0'])
+    {
         return Err(CanonicalObjectError::InvalidDirectoryComponent(
             name.to_owned(),
         ));

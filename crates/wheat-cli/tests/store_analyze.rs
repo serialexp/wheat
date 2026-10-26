@@ -44,10 +44,10 @@ fn git(repository: &Path, arguments: &[&str]) {
 }
 
 fn store_path(workspace: &Path) -> std::path::PathBuf {
-    let metadata: Value =
-        serde_json::from_slice(&fs::read(workspace.join(".wheat/workspace.json")).unwrap())
-            .unwrap();
-    metadata["store"]["path"].as_str().unwrap().into()
+    wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)
+        .unwrap()
+        .store
+        .path
 }
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
