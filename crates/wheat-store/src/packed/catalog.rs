@@ -39,9 +39,13 @@ use super::{
 };
 use crate::Durability;
 
+#[path = "loose_index.rs"]
+mod loose_index;
+pub(crate) use loose_index::LooseKind;
+
 const SCHEMA: &str = include_str!("catalog_sql/schema.sql");
 const LOOKUP: &str = include_str!("catalog_sql/lookup.sql");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SEGMENT_SUFFIX: &str = ".segment";
 const CATALOG_SUFFIX: &str = ".catalog";
 const CATALOG_HEAD_FILE: &str = "catalog.head";
@@ -254,6 +258,8 @@ pub(crate) struct PackedCatalog {
     head: Option<[u8; 32]>,
     content_generation: PhysicalContentGeneration,
     sealed_sources: Vec<SealedSource>,
+    /// The sum of `sealed_sources`' stored lengths, kept with them.
+    sealed_bytes: u64,
     sealed_readers: HashMap<[u8; 32], SegmentReader>,
     active: ActiveSegment,
     bulk: Option<DeferredBulk>,
@@ -634,6 +640,7 @@ impl PackedCatalog {
         }
         let append_index = connect_index(&index_path, durability)?;
         let sealed_sources = authority.as_ref().map_or_else(Vec::new, authority_sources);
+        let sealed_bytes = stored_length_sum(&sealed_sources)?;
         let mut catalog = Self {
             root,
             segments,
@@ -648,6 +655,7 @@ impl PackedCatalog {
                 .as_ref()
                 .map_or_else(no_content_generation, |snapshot| snapshot.content),
             sealed_sources,
+            sealed_bytes,
             sealed_readers: HashMap::new(),
             active,
             bulk: None,
@@ -1184,13 +1192,13 @@ impl PackedCatalog {
         transaction.commit()?;
         self.generation = Some(generation);
         self.head = Some(digest);
-        self.sealed_sources.push(SealedSource {
+        self.push_sealed(SealedSource {
             path: new_source,
             generation,
             sequence: 0,
             segment: finalized.id.0,
             stored_length: finalized.metadata.total_length,
-        });
+        })?;
         remove_superseded_catalog(&self.catalogs, superseded, self.durability)?;
         self.poisoned = false;
         Ok(())
@@ -1559,13 +1567,13 @@ impl PackedCatalog {
         self.generation = Some(generation);
         self.head = Some(digest);
         let sealed_source = format!("segments/{segment_name}");
-        self.sealed_sources.push(SealedSource {
+        self.push_sealed(SealedSource {
             path: sealed_source.clone(),
             generation,
             sequence: 0,
             segment: sealed.id.0,
             stored_length: sealed.metadata.total_length,
-        });
+        })?;
         self.sealed_readers.insert(sealed.id.0, reader);
         #[cfg(test)]
         {
@@ -1678,13 +1686,24 @@ impl PackedCatalog {
         })
     }
 
+    /// Bytes in sealed segments and in the active one, without reading either.
+    pub(crate) fn segment_bytes(&self) -> (u64, u64) {
+        (self.sealed_bytes, self.active.state().total_length)
+    }
+
+    fn push_sealed(&mut self, source: SealedSource) -> Result<(), CatalogError> {
+        self.sealed_bytes = self
+            .sealed_bytes
+            .checked_add(source.stored_length)
+            .ok_or(CatalogError::Corrupt("physical byte count overflow"))?;
+        self.sealed_sources.push(source);
+        Ok(())
+    }
+
     pub(crate) fn physical_stats(&mut self) -> Result<(usize, u64, u64), CatalogError> {
         self.load_sealed_readers()?;
-        let sealed_bytes = self.sealed_sources.iter().try_fold(0_u64, |sum, source| {
-            sum.checked_add(source.stored_length)
-                .ok_or(CatalogError::Corrupt("physical byte count overflow"))
-        })?;
-        let bytes = sealed_bytes
+        let bytes = self
+            .sealed_bytes
             .checked_add(self.active.state().total_length)
             .ok_or(CatalogError::Corrupt("physical byte count overflow"))?;
         let sealed_records = self
@@ -2082,6 +2101,7 @@ impl PackedCatalog {
         self.head = Some(digest);
         self.content_generation = replacement_content;
         self.sealed_readers = new_readers;
+        self.sealed_bytes = stored_length_sum(&new_sources)?;
         let old_sources = std::mem::replace(&mut self.sealed_sources, new_sources);
         self.rebuild_index()?;
         for source in old_sources {
@@ -2178,6 +2198,14 @@ impl PackedCatalog {
             insert_source_entries(&transaction, &source.path, reader.authenticated_entries())?;
         }
         insert_source_entries(&transaction, ACTIVE_FILE, self.active.entries())?;
+        if self.durability != Durability::Durable {
+            // A crash this index did not survive intact may also have lost loose-file
+            // rows, which only a durable store syncs; open lists the directories again.
+            transaction.execute(
+                "UPDATE checkpoint SET loose_recorded=0 WHERE singleton=1",
+                [],
+            )?;
+        }
         let locator_rows = locator_count(&transaction)?;
         write_checkpoint(
             &transaction,
@@ -2228,6 +2256,7 @@ impl PackedCatalog {
             head: _,
             content_generation: _,
             sealed_sources: _,
+            sealed_bytes: _,
             sealed_readers: _,
             active,
             bulk: _,
@@ -2541,6 +2570,13 @@ fn remove_unpublished_bulk_files(
         durability.sync_directory(segments)?;
     }
     Ok(())
+}
+
+fn stored_length_sum(sources: &[SealedSource]) -> Result<u64, CatalogError> {
+    sources.iter().try_fold(0_u64, |sum, source| {
+        sum.checked_add(source.stored_length)
+            .ok_or(CatalogError::Corrupt("physical byte count overflow"))
+    })
 }
 
 /// Whether `name` is one `tempfile` gives a temporary file: `.tmp` and six letters

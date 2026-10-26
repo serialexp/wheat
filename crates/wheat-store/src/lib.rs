@@ -49,7 +49,7 @@ mod packed;
 mod provenance;
 pub use packed::{
     PackedObjectStore, PackedStoreTrace, PackedStoreTraceSnapshot, RepackError, RepackOptions,
-    RepackPlan, RepackReport,
+    RepackPlan, RepackReport, StoredBytes,
 };
 mod remote_packed;
 pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};

@@ -5,7 +5,10 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -16,10 +19,11 @@ use wheat_core::{
 
 use super::{
     catalog::{
-        CatalogError, ExclusiveCatalog, LooseMetadataRecord, MetadataRepackInput, PackedCatalog,
-        SharedCatalog,
+        CatalogError, ExclusiveCatalog, LooseKind, LooseMetadataRecord, MetadataRepackInput,
+        PackedCatalog, SharedCatalog,
     },
     generation_reader::GenerationReader,
+    loose_files::LooseDirectories,
     segment::{CONTENT_NAMESPACE, CheckedRecord, METADATA_NAMESPACE, VerifiedPayload},
     trace::{PackedStoreTrace, PackedStoreTraceCounters},
 };
@@ -125,6 +129,33 @@ pub struct RepackReport {
     pub validated: bool,
 }
 
+/// What a packed store's files take on disk, by kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoredBytes {
+    /// Sealed segments.
+    pub segments: u64,
+    /// The segment appends go to.
+    pub active_segment: u64,
+    /// The selected content generation's index and shards.
+    pub content_generation: u64,
+    /// Objects too large for a segment.
+    pub loose_objects: u64,
+    /// Content too large for a segment, and delta envelopes.
+    pub loose_content: u64,
+}
+
+impl StoredBytes {
+    /// All of it.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.segments
+            .saturating_add(self.active_segment)
+            .saturating_add(self.content_generation)
+            .saturating_add(self.loose_objects)
+            .saturating_add(self.loose_content)
+    }
+}
+
 #[derive(Clone)]
 pub struct PackedObjectStore {
     engine: Arc<PackedEngine>,
@@ -135,6 +166,10 @@ struct PackedEngine {
     generation_reader: Mutex<Option<GenerationReader>>,
     objects: LooseObjectStore,
     content: ContentStore,
+    /// Where `objects` and `content` keep their files, which the catalog records.
+    loose: LooseDirectories,
+    /// The on-disk size of the selected content generation's files.
+    generation_bytes: AtomicU64,
     root: PathBuf,
     content_root: PathBuf,
     loose_threshold: usize,
@@ -151,6 +186,69 @@ impl fmt::Debug for PackedObjectStore {
 }
 
 impl PackedEngine {
+    /// Runs `write`, which writes loose files of `kind` for `ids`, recorded in the
+    /// catalog around it: pending before, settled by what is on disk after, whether
+    /// or not `write` succeeded.
+    fn writing_loose<T, E>(
+        &self,
+        kind: LooseKind,
+        ids: &[[u8; 32]],
+        error: impl Fn(CatalogError) -> E,
+        write: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let recorded = self.intend_loose_writes(kind, ids).map_err(&error)?;
+        let written = write();
+        let settled = self.settle_loose(kind, &recorded).map_err(&error);
+        let value = written?;
+        settled?;
+        Ok(value)
+    }
+
+    fn intend_loose_writes(
+        &self,
+        kind: LooseKind,
+        ids: &[[u8; 32]],
+    ) -> Result<Vec<[u8; 32]>, CatalogError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.catalog.exclusive()?.intend_loose_writes(kind, ids)
+    }
+
+    /// Settles `recorded` by what is on disk now.
+    fn settle_loose(&self, kind: LooseKind, recorded: &[[u8; 32]]) -> Result<(), CatalogError> {
+        if recorded.is_empty() {
+            return Ok(());
+        }
+        let files = self.loose.lengths(kind, recorded)?;
+        self.catalog.exclusive()?.settle_loose(kind, &files)
+    }
+
+    /// Stores delta envelopes as loose content files.
+    fn put_loose_envelopes(
+        &self,
+        envelopes: &[(ContentId, Vec<u8>)],
+    ) -> Result<(), ContentStoreError> {
+        let Some((first, _)) = envelopes.first() else {
+            return Ok(());
+        };
+        let first = *first;
+        let ids = envelopes
+            .iter()
+            .map(|(id, _)| *id.as_bytes())
+            .collect::<Vec<_>>();
+        self.writing_loose(
+            LooseKind::Content,
+            &ids,
+            |error| content_catalog_error(first, error),
+            || {
+                envelopes.iter().try_for_each(|(id, envelope)| {
+                    self.content.put_raw_envelope(*id, envelope.clone())
+                })
+            },
+        )
+    }
+
     /// `id`'s record from the published content generation, a segment or a loose
     /// envelope, in that order.
     fn read_stored(&self, id: ContentId) -> Result<StoredContent, ContentStoreError> {
@@ -185,12 +283,30 @@ impl PackedEngine {
             );
         }
         let mut records = Vec::new();
+        let mut loose = Vec::new();
         for content in contents {
             if content.len() > self.loose_threshold {
-                self.content.put_many(&[content], 1)?;
+                loose.push(content);
             } else {
                 records.push(CheckedRecord::content(content));
             }
+        }
+        if let Some(first) = loose.first() {
+            let first = first.id();
+            let ids = loose
+                .iter()
+                .map(|content| *content.id().as_bytes())
+                .collect::<Vec<_>>();
+            self.writing_loose(
+                LooseKind::Content,
+                &ids,
+                |error| content_catalog_error(first, error),
+                || {
+                    loose
+                        .iter()
+                        .try_for_each(|content| self.content.put_many(&[*content], 1))
+                },
+            )?;
         }
         Ok(records)
     }
@@ -289,33 +405,63 @@ impl PackedObjectStore {
     ) -> Result<Self, ObjectStoreError> {
         let root = root.as_ref();
         let trace = collect_trace.then(|| Arc::new(PackedStoreTraceCounters::default()));
-        let catalog = if let Some(trace) = trace.clone() {
+        let mut catalog = if let Some(trace) = trace.clone() {
             PackedCatalog::open_with_trace(root.join("packed"), durability, trace)
         } else {
             PackedCatalog::open(root.join("packed"), durability)
         }
         .map_err(object_catalog_error)?;
+        let loose = LooseDirectories::of(root);
+        loose
+            .reconcile(&mut catalog)
+            .map_err(object_catalog_error)?;
         let content_generation = catalog.content_generation();
         let content_manifest = validate_content_generation(root, content_generation)
             .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
         // The catalog's process lock remains held by `catalog`. Cleanup follows
         // recovery and validation, but never mutates catalog authority.
-        retire_repacked_content(root, content_generation, content_manifest.as_ref())
-            .and_then(|()| remove_partial_generations(root, content_generation.generation))
-            .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
+        retire_repacked_content(
+            &mut catalog,
+            &loose,
+            root,
+            content_generation,
+            content_manifest.as_ref(),
+        )
+        .and_then(|()| remove_partial_generations(root, content_generation.generation))
+        .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
         drop(content_manifest);
+        let generation_bytes = generation_bytes(root, content_generation)?;
         Ok(Self {
             engine: Arc::new(PackedEngine {
                 catalog: SharedCatalog::new(catalog),
                 generation_reader: Mutex::new(None),
                 objects: LooseObjectStore::with_durability(root.join("loose-objects"), durability),
                 content: ContentStore::with_durability(root.join("loose-content"), durability),
+                loose,
+                generation_bytes: AtomicU64::new(generation_bytes),
                 root: root.to_path_buf(),
                 content_root: root.join("loose-content"),
                 loose_threshold,
                 durability,
                 trace,
             }),
+        })
+    }
+
+    /// What the store's files take on disk, kept as they change rather than
+    /// measured: segments, the content generation and the loose files. The
+    /// catalog's own bookkeeping files are not counted.
+    pub fn stored_bytes(&self) -> Result<StoredBytes, ObjectStoreError> {
+        let catalog = self.catalog()?;
+        let (segments, active_segment) = catalog.segment_bytes();
+        let loose = catalog.loose_bytes().map_err(object_catalog_error)?;
+        Ok(StoredBytes {
+            segments,
+            active_segment,
+            // Repack stores it while holding the catalog, as here.
+            content_generation: self.engine.generation_bytes.load(Ordering::Relaxed),
+            loose_objects: loose.objects,
+            loose_content: loose.content,
         })
     }
 
@@ -583,10 +729,16 @@ impl PackedObjectStore {
         // lock. It intentionally does not alter catalog authority; failures are
         // returned after the new head is durable and retried by `open`.
         retire_repacked_content(
+            &mut catalog,
+            &self.engine.loose,
             &self.engine.root,
             replacement_content,
             validated_content.as_ref(),
         )?;
+        self.engine.generation_bytes.store(
+            generation_bytes(&self.engine.root, replacement_content)?,
+            Ordering::Relaxed,
+        );
         let content_after = ContentGenerationStats::of(validated_content.as_ref())?;
         drop(validated_content);
         // Same lock and timing: every absorbed object is in the durable head's
@@ -596,10 +748,27 @@ impl PackedObjectStore {
             .iter()
             .map(|digest| ObjectId::from_digest(*digest))
             .collect::<Vec<_>>();
-        self.engine
+        let absorbed_ids = absorbed.iter().map(|id| *id.as_bytes()).collect::<Vec<_>>();
+        let recorded = catalog
+            .intend_loose_removals(LooseKind::Object, &absorbed_ids)
+            .map_err(repack_catalog_error)?;
+        let retired = self
+            .engine
             .objects
             .retire(&absorbed)
-            .map_err(|error| RepackError::Corrupt(error.to_string()))?;
+            .map_err(|error| RepackError::Corrupt(error.to_string()));
+        let settled = self
+            .engine
+            .loose
+            .lengths(LooseKind::Object, &recorded)
+            .map_err(RepackError::from)
+            .and_then(|files| {
+                catalog
+                    .settle_loose(LooseKind::Object, &files)
+                    .map_err(repack_catalog_error)
+            });
+        retired?;
+        settled?;
         // The old generation's packs are retired only when a new one replaced it.
         let content_bytes_retired = if replacement_content == physical_authority.content {
             0
@@ -705,7 +874,21 @@ impl PackedObjectStore {
             }
         }
         if !loose.is_empty() {
-            self.engine.objects.put_batch(&loose, concurrency).await?;
+            let ids = loose
+                .iter()
+                .map(|(id, _)| *id.as_bytes())
+                .collect::<Vec<_>>();
+            let recorded = self
+                .engine
+                .intend_loose_writes(LooseKind::Object, &ids)
+                .map_err(object_catalog_error)?;
+            let written = self.engine.objects.put_batch(&loose, concurrency).await;
+            let settled = self
+                .engine
+                .settle_loose(LooseKind::Object, &recorded)
+                .map_err(object_catalog_error);
+            written?;
+            settled?;
         }
         Ok(records)
     }
@@ -1074,6 +1257,24 @@ fn authenticated_generation_dir(directory: &Path, generation: u64) -> Result<boo
 /// for, with any index file of theirs that doesn't authenticate (the index is
 /// written last, so a crash can cut it short). Only a canonically named directory
 /// holding nothing but shard files counts as one; other debris is left alone.
+/// The on-disk size of `generation`'s index and shard files; 0 when none is selected.
+fn generation_bytes(root: &Path, generation: PhysicalContentGeneration) -> io::Result<u64> {
+    if generation == super::catalog::no_content_generation() {
+        return Ok(0);
+    }
+    let directory = root.join("content-generations");
+    let mut bytes = fs::metadata(content_generation_index_path(
+        &directory,
+        generation.generation,
+        &generation.manifest,
+    ))?
+    .len();
+    for entry in fs::read_dir(directory.join(generation.generation.to_string()))? {
+        bytes = bytes.saturating_add(entry?.metadata()?.len());
+    }
+    Ok(bytes)
+}
+
 fn remove_partial_generations(root: &Path, retained: u64) -> Result<(), RepackError> {
     let directory = root.join("content-generations");
     let entries = match fs::read_dir(&directory) {
@@ -1184,6 +1385,8 @@ fn remove_staged_content_generation(
 /// `manifest` is the authenticated manifest of `retained`, as
 /// [`validate_content_generation`] returned it.
 fn retire_repacked_content(
+    catalog: &mut PackedCatalog,
+    loose: &LooseDirectories,
     root: &Path,
     retained: PhysicalContentGeneration,
     manifest: Option<&ContentGenerationManifest>,
@@ -1198,26 +1401,51 @@ fn retire_repacked_content(
     }
 
     // A post-repack writer may add content after this manifest was staged. Only
-    // IDs covered by this immutable manifest can lose their loose fallback.
-    // The manifest is decoded once; directory syncs are batched by the fixed
-    // two-hex-digit loose-content shard rather than performed per file.
-    let loose_root = root.join("loose-content");
-    let mut changed_prefixes = HashSet::new();
-    for entry in &manifest.entries {
-        let encoded = entry.id.to_string();
-        let prefix = &encoded[..2];
-        let path = loose_root.join(prefix).join(&encoded[2..]);
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                changed_prefixes.insert(prefix.to_owned());
+    // IDs covered by this immutable manifest can lose their loose fallback. The
+    // catalog records which loose content files exist, so this looks only at those
+    // (the manifest's entries are sorted by ID); directory syncs are batched by
+    // the fixed two-hex-digit loose-content shard rather than performed per file.
+    let covered = catalog
+        .loose_ids(LooseKind::Content)
+        .map_err(repack_catalog_error)?
+        .into_iter()
+        .filter(|id| {
+            manifest
+                .entries
+                .binary_search_by_key(&ContentId::from_digest(*id), |entry| entry.id)
+                .is_ok()
+        })
+        .collect::<Vec<_>>();
+    let recorded = catalog
+        .intend_loose_removals(LooseKind::Content, &covered)
+        .map_err(repack_catalog_error)?;
+    let removed = (|| -> Result<(), RepackError> {
+        let mut changed_shards = HashSet::new();
+        for id in &recorded {
+            let path = loose.path(LooseKind::Content, id);
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    changed_shards.extend(path.parent().map(Path::to_path_buf));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
-    }
-    for prefix in changed_prefixes {
-        File::open(loose_root.join(prefix))?.sync_all()?;
-    }
+        for shard in changed_shards {
+            File::open(shard)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    let settled = loose
+        .lengths(LooseKind::Content, &recorded)
+        .map_err(RepackError::from)
+        .and_then(|files| {
+            catalog
+                .settle_loose(LooseKind::Content, &files)
+                .map_err(repack_catalog_error)
+        });
+    removed?;
+    settled?;
 
     let directory = root.join("content-generations");
     let entries = match fs::read_dir(&directory) {
@@ -1331,6 +1559,7 @@ impl RepositoryStore for PackedObjectStore {
             .await?;
         let content_store = PackedObjectStore::content_store(self);
         let mut whole = Vec::with_capacity(content.len());
+        let mut deltas = Vec::new();
         for item in content {
             if let Some(base) = item.base {
                 if content_store.contains(item.id()) {
@@ -1341,12 +1570,13 @@ impl RepositoryStore for PackedObjectStore {
                 if let Ok(Some(envelope)) =
                     content_store.delta_envelope(item.id(), item.bytes(), base)
                 {
-                    self.engine.content.put_raw_envelope(item.id(), envelope)?;
+                    deltas.push((item.id(), envelope));
                     continue;
                 }
             }
             whole.push(item.content);
         }
+        self.engine.put_loose_envelopes(&deltas)?;
         records.extend(self.engine.content_records(whole.iter().copied())?);
         if !records.is_empty() {
             self.engine
@@ -1469,10 +1699,7 @@ impl ContentBackend for PackedEngine {
         // delta chains through get_stored, which checks both the packed catalog
         // and loose files, so a delta whose base lives in a packed segment
         // resolves correctly.
-        for (id, envelope) in envelopes {
-            self.content.put_raw_envelope(*id, envelope.clone())?;
-        }
-        Ok(())
+        self.put_loose_envelopes(envelopes)
     }
 
     fn supports_raw_envelopes(&self) -> bool {
@@ -1542,6 +1769,71 @@ mod tests {
             let read_back = content.get(*id).unwrap();
             assert_eq!(&read_back, expected, "re-read of depth-{} failed", i + 1);
         }
+    }
+
+    #[test]
+    fn open_settles_loose_files_a_crash_left_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PackedObjectStore::open(root.path()).unwrap();
+        let written = [1_u8; 32];
+        let never_written = [2_u8; 32];
+        let recorded = store
+            .engine
+            .intend_loose_writes(LooseKind::Object, &[written, never_written])
+            .unwrap();
+        assert_eq!(recorded, [written, never_written]);
+        let path = store.engine.loose.path(LooseKind::Object, &written);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"twelve bytes").unwrap();
+        let temporary = path.with_file_name(format!(".{}.4242.0.tmp", hex::encode(written)));
+        fs::write(&temporary, b"partial").unwrap();
+        // The process stops here, before settling either file.
+        drop(store);
+
+        let reopened = PackedObjectStore::open(root.path()).unwrap();
+        assert_eq!(reopened.stored_bytes().unwrap().loose_objects, 12);
+        assert!(!temporary.exists());
+        let catalog = reopened.catalog().unwrap();
+        assert_eq!(catalog.loose_ids(LooseKind::Object).unwrap(), [written]);
+        assert!(catalog.pending_loose().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_retries_interrupted_post_head_content_retirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("storage");
+        let objects = PackedObjectStore::open(&storage).unwrap();
+        let content = objects.content_store();
+        let heads = LocalPublicationStore::new(directory.path().join("repository.head"));
+        let bytes = vec![b'c'; 256 * 1024];
+        let id = content.put(&bytes).unwrap();
+        let loose_path = content.path(id);
+        crate::RepositoryPublisher::new(&objects, &content, &heads)
+            .initialize(&wheat_core::Repository::new(wheat_core::Tree::new()))
+            .await
+            .unwrap();
+        let plan = objects
+            .plan_repack(&heads, RepackOptions::default())
+            .await
+            .unwrap();
+        objects.execute_repack(&heads, plan).unwrap();
+        assert!(!loose_path.exists());
+        // An interrupted retirement leaves the file in place and its row pending,
+        // which is what this recreates, without touching catalog authority.
+        objects
+            .engine
+            .intend_loose_writes(LooseKind::Content, &[*id.as_bytes()])
+            .unwrap();
+        fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+        fs::write(&loose_path, b"redundant interrupted cleanup debris").unwrap();
+        drop(content);
+        drop(objects);
+
+        let reopened = PackedObjectStore::open(&storage).unwrap();
+        let reopened_content = reopened.content_store();
+        assert_eq!(reopened_content.get(id).unwrap(), bytes);
+        assert!(!loose_path.exists());
+        assert_eq!(reopened.stored_bytes().unwrap().loose_content, 0);
     }
 
     #[test]

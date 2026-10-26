@@ -75,6 +75,8 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   refuse new publishes) and take a consistent copy of its store and head, then resume.
 - `[ ]` **No repository size or per-publish byte count.** Quotas and billing need a
   repository's stored bytes and each publish's uploaded bytes; neither is reported.
+  `PackedObjectStore::stored_bytes` now reports the first, kept as files change
+  (2026-10-26).
 - `[ ]` **Server-side reads for browsing.** Gothab's repository pages read a label's
   tree, a file, history and diffs without a workspace, bounded and paged. wheat-client
   has typed history, diff and changes reads; check which work against a served store
@@ -487,7 +489,8 @@ operation; repack is independently useful and may run without either squash or G
   124 MiB) and tries one `unlink` per manifest entry
   (`retire_repacked_content`, 208,190 failing syscalls). Make store open
   O(changes), not O(store). (The full validation the same measurement found in
-  read-only commands is gone: TODO_DONE.md.)
+  read-only commands is gone: TODO_DONE.md.) Retirement now looks only at the loose
+  content files the catalog records (2026-10-26); the pack validation remains.
 - `[ ]` **Remote packed store runs on a different catalog format than local
   stores.** The remote store (`crates/wheat-store/src/remote_packed/catalog.rs`)
   still runs on the `SegmentCatalogRecordV1` chain, while local stores now use only

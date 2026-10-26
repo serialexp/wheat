@@ -170,39 +170,6 @@ async fn same_length_corrupt_generation_never_deletes_loose_fallback() {
 }
 
 #[tokio::test]
-async fn open_retries_interrupted_post_head_content_retirement() {
-    let directory = tempfile::tempdir().unwrap();
-    let storage = directory.path().join("storage");
-    let objects = PackedObjectStore::open(&storage).unwrap();
-    let content = objects.content_store();
-    let heads = LocalPublicationStore::new(directory.path().join("repository.head"));
-    let bytes = vec![b'c'; 256 * 1024];
-    let id = content.put(&bytes).unwrap();
-    let loose_path = content.path(id);
-    RepositoryPublisher::new(&objects, &content, &heads)
-        .initialize(&Repository::new(Tree::new()))
-        .await
-        .unwrap();
-    let plan = objects
-        .plan_repack(&heads, RepackOptions::default())
-        .await
-        .unwrap();
-    objects.execute_repack(&heads, plan).unwrap();
-    assert!(!loose_path.exists());
-    // Recreate the redundant pre-retirement fallback after a committed head,
-    // modelling an interrupted cleanup without modifying authority.
-    fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
-    fs::write(&loose_path, b"redundant interrupted cleanup debris").unwrap();
-    drop(content);
-    drop(objects);
-
-    let reopened = PackedObjectStore::open(&storage).unwrap();
-    let reopened_content = reopened.content_store();
-    assert_eq!(reopened_content.get(id).unwrap(), bytes);
-    assert!(!loose_path.exists());
-}
-
-#[tokio::test]
 async fn generation_only_content_survives_a_second_repack() {
     let directory = tempfile::tempdir().unwrap();
     let storage = directory.path().join("storage");

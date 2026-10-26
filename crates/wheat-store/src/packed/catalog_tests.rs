@@ -588,6 +588,38 @@ fn same_checkpoint_missing_locator_row_is_rebuilt_on_reopen() {
     assert_eq!(reopened.test_counts().unwrap().0, 1);
 }
 
+/// Only a durable store syncs its loose-file rows, so a rebuilt index keeps them
+/// for a durable store and lists the directories again for a deferred one.
+#[test]
+fn a_rebuilt_index_keeps_loose_rows_only_when_they_were_synced() {
+    for (durability, kept) in [
+        (crate::Durability::Durable, true),
+        (crate::Durability::Deferred, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        {
+            let mut store = PackedCatalog::open(root.path(), durability).unwrap();
+            store.put_records(&[record(b"indexed")]).unwrap();
+            store
+                .record_loose(&[(LooseKind::Object, [7; 32], 12)])
+                .unwrap();
+            assert!(store.loose_recorded().unwrap());
+            store.close().unwrap();
+        }
+        let connection = Connection::open(root.path().join(LOCATOR_FILE)).unwrap();
+        connection
+            .execute(
+                "UPDATE checkpoint SET locator_count=locator_count+1 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = PackedCatalog::open(root.path(), durability).unwrap();
+        assert_eq!(reopened.loose_recorded().unwrap(), kept, "{durability:?}");
+    }
+}
+
 #[test]
 fn an_append_a_crash_cut_short_is_dropped_and_unindexed_on_reopen() {
     let root = tempfile::tempdir().unwrap();
