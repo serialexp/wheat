@@ -72,11 +72,12 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   up to object storage and moves them between hosts (drain, snapshot, stage,
   activate). Wheat needs a way to quiesce one repository (finish the group commit,
   refuse new publishes) and take a consistent copy of its store and head, then resume.
-- `[ ]` **Server-side reads for browsing.** Gothab's repository pages read a label's
-  tree, a file, history and diffs without a workspace, bounded and paged. wheat-client
-  has typed history, diff and changes reads; check which work against a served store
-  with no workspace, and add the missing ones (list a tree at a view, read a file at a
-  path, page history newest first).
+- `[ ]` **Browsing history is in canonical order, not by time.**
+  `RepositoryBrowser::history` pages a view newest first along its canonical order
+  (dependencies first, ties by lowest change ID), which is cheap at any depth. Paging
+  by commit time, as `wheat log` and the desktop sort, would need an index on
+  `committed_at` in the view; today that order needs every change read and sorted.
+  Add one if Gothab's history page wants time order.
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network; there is no
   library operation to create a fork that shares its parent's storage.

@@ -9,8 +9,9 @@ use std::str::FromStr;
 use anyhow::Result;
 use wheat_core::{FileValue, ObjectId, RevisionId, TreeId, ViewId};
 use wheat_store::{
-    ContentStoreError, MerkleTreeError, MerkleTreeStore, PublicationStore, RepositoryReader,
-    RetainedSetStore, TreeDiffLimits, TreePathFilter,
+    ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
+    PackedObjectStore, PublicationStore, RepositoryHead, RepositoryReader, RetainedSetStore,
+    TreeDiffLimits, TreePathFilter,
 };
 
 use crate::{local::LocalRepository, outcome::CliFailure};
@@ -51,19 +52,46 @@ pub enum ComparisonInput {
     },
 }
 
+/// The store and head a repository diff reads. Any object store will do, so a served
+/// repository is diffed without a workspace.
+pub struct DiffSource<'a, O> {
+    pub objects: &'a O,
+    pub content: &'a ContentStore,
+    pub head: RepositoryHead,
+}
+
+impl<O> Clone for DiffSource<'_, O> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<O> Copy for DiffSource<'_, O> {}
+
+impl<'a> DiffSource<'a, PackedObjectStore> {
+    /// `repository` at its current head.
+    pub fn local(repository: &'a LocalRepository) -> Result<Self> {
+        Ok(Self {
+            objects: &repository.objects,
+            content: &repository.content,
+            head: repository.heads.read()?,
+        })
+    }
+}
+
 pub struct RepositoryDiffInput {
     pub head_generation: u64,
     pub comparison: ComparisonInput,
     pub changes: Vec<TreeChangeInput>,
 }
 
-pub async fn revision(
-    repository: &LocalRepository,
+pub async fn revision<O: ImmutableObjectStore>(
+    source: DiffSource<'_, O>,
     revision_id: RevisionId,
     filter: &TreePathFilter,
     deadline: std::time::Instant,
 ) -> Result<RepositoryDiffInput> {
-    let snapshot = Snapshot::read(repository).await?;
+    let snapshot = Snapshot::read(source).await?;
     if !snapshot
         .retained
         .contains(
@@ -107,7 +135,7 @@ pub async fn revision(
             .tree
     };
     finish(
-        repository,
+        source,
         snapshot.head_generation,
         ComparisonInput::Revision {
             revision: revision_id,
@@ -122,18 +150,18 @@ pub async fn revision(
     .await
 }
 
-pub async fn views(
-    repository: &LocalRepository,
+pub async fn views<O: ImmutableObjectStore>(
+    source: DiffSource<'_, O>,
     from: &str,
     to: &str,
     filter: &TreePathFilter,
     deadline: std::time::Instant,
 ) -> Result<RepositoryDiffInput> {
-    let snapshot = Snapshot::read(repository).await?;
+    let snapshot = Snapshot::read(source).await?;
     let (from_view, from_record) = snapshot.resolve_view(from).await?;
     let (to_view, to_record) = snapshot.resolve_view(to).await?;
     finish(
-        repository,
+        source,
         snapshot.head_generation,
         ComparisonInput::Views {
             from_view,
@@ -151,8 +179,8 @@ pub async fn views(
 
 /// Diffs `from` against `to`, reporting and reading content only for the paths
 /// `filter` selects.
-async fn finish(
-    repository: &LocalRepository,
+async fn finish<O: ImmutableObjectStore>(
+    source: DiffSource<'_, O>,
     head_generation: u64,
     comparison: ComparisonInput,
     from: TreeId,
@@ -160,7 +188,7 @@ async fn finish(
     filter: &TreePathFilter,
     _deadline: std::time::Instant,
 ) -> Result<RepositoryDiffInput> {
-    let trees = MerkleTreeStore::new(&repository.objects);
+    let trees = MerkleTreeStore::new(source.objects);
     let mut cursor = trees
         .diff_cursor(
             from,
@@ -177,13 +205,13 @@ async fn finish(
     while let Some(change) = cursor.next().await.map_err(classify_diff_error)? {
         let old_value = change.old;
         let new_value = change.new;
-        let old = read_side(repository, old_value, &mut remaining_inline_bytes)?;
+        let old = read_side(source.content, old_value, &mut remaining_inline_bytes)?;
         let new = if old_value.as_ref().map(|value| value.content)
             == new_value.as_ref().map(|value| value.content)
         {
             new_value.map(|value| reuse_side(value, old.as_ref()))
         } else {
-            read_side(repository, new_value, &mut remaining_inline_bytes)?
+            read_side(source.content, new_value, &mut remaining_inline_bytes)?
         };
         changes.push(TreeChangeInput {
             path: change.path,
@@ -221,7 +249,7 @@ fn reuse_side(value: FileValue, source: Option<&TreeSideInput>) -> TreeSideInput
 }
 
 fn read_side(
-    repository: &LocalRepository,
+    content: &ContentStore,
     value: Option<FileValue>,
     remaining: &mut usize,
 ) -> Result<Option<TreeSideInput>> {
@@ -229,7 +257,7 @@ fn read_side(
         return Ok(None);
     };
     let allowance = (*remaining).min(MAX_INLINE_CONTENT_BYTES);
-    let (bytes, min_bytes) = match repository.content.get_bounded(value.content, allowance) {
+    let (bytes, min_bytes) = match content.get_bounded(value.content, allowance) {
         Ok(bytes) => {
             *remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
                 CliFailure::corrupt("repository diff inline byte budget underflow")
@@ -247,18 +275,18 @@ fn read_side(
     }))
 }
 
-struct Snapshot<'a> {
-    reader: RepositoryReader<'a, wheat_store::PackedObjectStore>,
-    retained: RetainedSetStore<'a, wheat_store::PackedObjectStore>,
+struct Snapshot<'a, O> {
+    reader: RepositoryReader<'a, O>,
+    retained: RetainedSetStore<'a, O>,
     head_generation: u64,
     envelope: wheat_core::RepositoryEnvelopeRecord,
     state: wheat_core::RepositoryStateRecord,
 }
 
-impl<'a> Snapshot<'a> {
-    async fn read(repository: &'a LocalRepository) -> Result<Self> {
-        let head = repository.heads.read()?;
-        let reader = RepositoryReader::new(&repository.objects, &repository.content);
+impl<'a, O: ImmutableObjectStore> Snapshot<'a, O> {
+    async fn read(source: DiffSource<'a, O>) -> Result<Self> {
+        let head = source.head;
+        let reader = RepositoryReader::new(source.objects, source.content);
         let envelope = reader.envelope(head.envelope).await?;
         if envelope.id() != head.envelope {
             return Err(CliFailure::corrupt("repository envelope identity mismatch"));
@@ -271,7 +299,7 @@ impl<'a> Snapshot<'a> {
         // `wheat validate`; doing it here would make a sparse comparison scale with all history.
         Ok(Self {
             reader,
-            retained: RetainedSetStore::new(&repository.objects),
+            retained: RetainedSetStore::new(source.objects),
             head_generation: head.generation,
             envelope,
             state,

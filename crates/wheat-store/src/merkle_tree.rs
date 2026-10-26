@@ -2,6 +2,8 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, btree_map},
     iter::Peekable,
+    num::NonZeroUsize,
+    ops::Bound,
 };
 
 use thiserror::Error;
@@ -172,6 +174,23 @@ pub enum TreePathShape {
     BelowFile {
         depth: usize,
     },
+}
+
+/// What [`MerkleTreeStore::list_directory`] found at a path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TreeListing {
+    /// Nothing is at the path, or a file is above it.
+    Absent,
+    File(FileValue),
+    Directory(DirectoryPage),
+}
+
+/// One page of a directory's entries, in name order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DirectoryPage {
+    pub entries: Vec<(String, DirectoryEntry)>,
+    /// The name to pass as `after` for the next page; none after the last.
+    pub next: Option<String>,
 }
 
 /// The kind and selected contents of one path in a pinned Merkle tree.
@@ -560,6 +579,45 @@ where
             }
         }
         Ok(None)
+    }
+
+    /// Lists the directory at `path` (the root when empty): its first `limit` entries
+    /// whose names sort after `after`. Reads one node per path component. A page
+    /// decodes the whole listed directory, so it costs that directory's size, not
+    /// `limit`.
+    pub async fn list_directory(
+        &self,
+        root: TreeId,
+        path: &[String],
+        after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> Result<TreeListing, MerkleTreeError> {
+        let mut node = self.read_node(root).await?;
+        for (index, component) in path.iter().enumerate() {
+            validate_directory_component(component)?;
+            let last = index + 1 == path.len();
+            match node.entries.remove(component) {
+                None => return Ok(TreeListing::Absent),
+                Some(DirectoryEntry::File(value)) if last => return Ok(TreeListing::File(value)),
+                Some(DirectoryEntry::File(_)) => return Ok(TreeListing::Absent),
+                Some(DirectoryEntry::Directory(child)) => node = self.read_node(child).await?,
+            }
+        }
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut entries = node
+            .entries
+            .range::<str, _>((start, Bound::Unbounded))
+            .map(|(name, entry)| (name.clone(), *entry));
+        let page = entries.by_ref().take(limit.get()).collect::<Vec<_>>();
+        let next = if entries.next().is_some() {
+            page.last().map(|(name, _)| name.clone())
+        } else {
+            None
+        };
+        Ok(TreeListing::Directory(DirectoryPage {
+            entries: page,
+            next,
+        }))
     }
 
     /// Looks up many file paths with one shared traversal (see [`Self::path_shapes`]).

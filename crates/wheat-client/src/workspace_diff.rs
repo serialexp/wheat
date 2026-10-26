@@ -20,7 +20,7 @@ use wheat_store::TreePathFilter;
 use crate::{
     discovery::resolve_context,
     local::{open, runtime},
-    repository_diff::{self, ComparisonInput, TreeChangeInput},
+    repository_diff::{self, ComparisonInput, DiffSource, TreeChangeInput},
     rewrite_transaction::StoreOperationGuard,
     workspace_metadata::WorkspaceMetadata,
     workspace_scan::{self, WorkspaceScan},
@@ -54,7 +54,10 @@ pub fn compare(
     match comparison {
         Comparison::Revision(revision) => {
             let input = runtime()?.block_on(repository_diff::revision(
-                &local, revision, filter, deadline,
+                DiffSource::local(&local)?,
+                revision,
+                filter,
+                deadline,
             ))?;
             let comparison = match input.comparison {
                 ComparisonInput::Revision { revision, from, to } => DiffComparison::Revision {
@@ -68,8 +71,13 @@ pub fn compare(
             build_repository(comparison, input.changes, limits, deadline)
         }
         Comparison::Views { from, to } => {
-            let input = runtime()?
-                .block_on(repository_diff::views(&local, &from, &to, filter, deadline))?;
+            let input = runtime()?.block_on(repository_diff::views(
+                DiffSource::local(&local)?,
+                &from,
+                &to,
+                filter,
+                deadline,
+            ))?;
             let comparison = match input.comparison {
                 ComparisonInput::Views {
                     from_view,

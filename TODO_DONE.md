@@ -35,6 +35,18 @@ Finished items, moved here from `TODO.md` under the same headings.
   per-name lock serialises creates and deletes, and either sweeps the marked stages and
   tombstones a crash left. `Registry::from_repos_dir` skips hidden entries; it had
   tried to open a stage or tombstone left in a repos directory as a repository.
+- `[x]` **Server-side reads for browsing.** Audit: `history::entries`, `log_inspection`
+  and `repository_diff` already read without a workspace, but history read and sorted
+  every change and the diff took a `LocalRepository`. Added
+  `wheat_store::RepositoryBrowser`, opened at a head: label lookup, views refused
+  unless the head retains them, `list` (one directory a page at a time, by name, on
+  the new `MerkleTreeStore::list_directory`), `read_file` (a file at a path, its bytes
+  only within a bound) and `history` (newest first from a position cursor, O(log n)
+  reads to find the page and about five per change; `browse_history` bench case).
+  `repository_diff::{revision, views}` take a `DiffSource` (any store, content and
+  head), so a served repository diffs without a workspace. A wide directory's page
+  still decodes the whole directory; chunked directories keep that cost (see
+  `docs/design/wheat-wide-directories.md`).
 
 ## Desktop client (2026-10-22)
 

@@ -53,9 +53,11 @@ pub use packed::{
 };
 mod remote_packed;
 pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
+mod browse;
 mod publication;
 mod radix;
 mod repository_directory;
+pub use browse::{BrowseError, BrowsedFile, HistoryItem, HistoryPage, RepositoryBrowser};
 mod repository_envelope;
 mod repository_hydration;
 mod repository_integration;
@@ -115,10 +117,10 @@ pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };
 pub use merkle_tree::{
-    FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, TreeContentCursor,
+    DirectoryPage, FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, TreeContentCursor,
     TreeContentWalkLimits, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
-    TreePathFilter, TreePathLimits, TreePathSelection, TreePathShape, TreeSelectionLimits,
-    TreeWalkLimits,
+    TreeListing, TreePathFilter, TreePathLimits, TreePathSelection, TreePathShape,
+    TreeSelectionLimits, TreeWalkLimits,
 };
 pub use mutation_publication::{
     LabelMove, PreparedMutationPublication, finalize_mutation_publication,
