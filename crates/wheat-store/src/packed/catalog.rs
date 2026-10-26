@@ -46,6 +46,8 @@ const SEGMENT_SUFFIX: &str = ".segment";
 const CATALOG_SUFFIX: &str = ".catalog";
 const CATALOG_HEAD_FILE: &str = "catalog.head";
 const ACTIVE_FILE: &str = "active.segment";
+/// The fresh active segment `retire_active` builds before renaming it into place.
+const NEXT_ACTIVE_FILE: &str = "active.segment.next";
 const BULK_FILE_PREFIX: &str = "bulk-";
 const REPACK_INTENT_FILE: &str = "repack.intent";
 const DEFAULT_ACTIVE_TARGET_BYTES: u64 = super::active::ACTIVE_SEGMENT_TARGET_BYTES;
@@ -610,6 +612,7 @@ impl PackedCatalog {
         let authority = read_catalog_authority(&catalogs, durable_head)?;
         let active = recover_active(&root, durability)?;
         remove_unpublished_bulk_files(&segments, durability)?;
+        remove_temporary_files(&root, &segments, durability)?;
         remove_unreachable_publications(
             &segments,
             &catalogs,
@@ -2463,7 +2466,7 @@ fn retire_active(
         .generation
         .checked_add(1)
         .ok_or(CatalogError::Corrupt("active generation overflow"))?;
-    let temporary_path = root.join("active.segment.next");
+    let temporary_path = root.join(NEXT_ACTIVE_FILE);
     match fs::remove_file(&temporary_path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -2536,6 +2539,42 @@ fn remove_unpublished_bulk_files(
     }
     if removed {
         durability.sync_directory(segments)?;
+    }
+    Ok(())
+}
+
+/// Whether `name` is one `tempfile` gives a temporary file: `.tmp` and six letters
+/// or digits. Seals, repacks and catalog and head publishes write through such files
+/// and rename them into place, so one left behind is a crashed write's.
+fn is_temporary_file_name(name: &str) -> bool {
+    name.strip_prefix(".tmp").is_some_and(|rest| {
+        rest.len() == 6 && rest.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+/// Removes what crashed writes left behind in the catalog root and `segments`: their
+/// temporary files and an unrenamed next active segment. Runs under the writer lock,
+/// so no live write owns them.
+fn remove_temporary_files(
+    root: &Path,
+    segments: &Path,
+    durability: Durability,
+) -> Result<(), CatalogError> {
+    for directory in [root, segments] {
+        let mut removed = false;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let leftover = entry.file_name().to_str().is_some_and(|name| {
+                is_temporary_file_name(name) || (directory == root && name == NEXT_ACTIVE_FILE)
+            });
+            if leftover && entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            durability.sync_directory(directory)?;
+        }
     }
     Ok(())
 }

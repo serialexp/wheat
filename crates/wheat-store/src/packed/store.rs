@@ -1,6 +1,6 @@
 //! Public object/content adapters backed by immutable packed segments.
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
@@ -301,6 +301,7 @@ impl PackedObjectStore {
         // The catalog's process lock remains held by `catalog`. Cleanup follows
         // recovery and validation, but never mutates catalog authority.
         retire_repacked_content(root, content_generation, content_manifest.as_ref())
+            .and_then(|()| remove_partial_generations(root, content_generation.generation))
             .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
         drop(content_manifest);
         Ok(Self {
@@ -1067,6 +1068,79 @@ fn authenticated_generation_dir(directory: &Path, generation: u64) -> Result<boo
         }
     }
     Ok(false)
+}
+
+/// Removes generation directories a crashed repack staged but never wrote an index
+/// for, with any index file of theirs that doesn't authenticate (the index is
+/// written last, so a crash can cut it short). Only a canonically named directory
+/// holding nothing but shard files counts as one; other debris is left alone.
+fn remove_partial_generations(root: &Path, retained: u64) -> Result<(), RepackError> {
+    let directory = root.join("content-generations");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut directories = Vec::new();
+    let mut indexes: HashMap<u64, Vec<(PathBuf, bool)>> = HashMap::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if entry.file_type()?.is_dir() {
+            if let Ok(generation) = name.parse::<u64>()
+                && generation.to_string() == name
+                && generation != retained
+            {
+                directories.push((generation, entry.path()));
+            }
+        } else if let Some((generation, digest)) = parse_index_file_name(&name) {
+            let authenticated = authenticated_index(&entry.path(), generation, digest)?.is_some();
+            indexes
+                .entry(generation)
+                .or_default()
+                .push((entry.path(), authenticated));
+        }
+    }
+    let mut removed = false;
+    for (generation, path) in directories {
+        let named_by = indexes.get(&generation).map_or(&[][..], Vec::as_slice);
+        if named_by.iter().any(|(_, authenticated)| *authenticated) || !holds_only_shards(&path)? {
+            continue;
+        }
+        fs::remove_dir_all(&path)?;
+        for (index, _) in named_by {
+            fs::remove_file(index)?;
+        }
+        removed = true;
+    }
+    if removed {
+        File::open(&directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Whether `path` holds only files named like a generation's shards.
+fn holds_only_shards(path: &Path) -> Result<bool, RepackError> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let shard = entry.file_type()?.is_file()
+            && entry.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix("shard-")
+                    .and_then(|rest| {
+                        rest.strip_suffix(".manifest")
+                            .or_else(|| rest.strip_suffix(".pack"))
+                    })
+                    .is_some_and(|number| {
+                        number.len() == 6 && number.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            });
+        if !shard {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn remove_partial_generation(directory: &Path, generation: u64) -> Result<(), RepackError> {

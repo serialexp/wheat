@@ -229,3 +229,50 @@ async fn large_metadata_uses_standalone_fallback() {
 
     assert_eq!(objects.get(id).await.unwrap().canonical_bytes, bytes);
 }
+
+/// Opening removes what crashed writes left behind: temporary files in the catalog root
+/// and `segments`, an unrenamed next active segment, and content generations staged
+/// without an index. Anything not provably Wheat's own stays.
+#[tokio::test]
+async fn open_removes_crashed_writes_leftovers_and_nothing_else() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = DirectoryNode::default().canonical_bytes();
+    let id = ObjectId::of_canonical_bytes(&bytes);
+    {
+        let objects = PackedObjectStore::open(root.path()).unwrap();
+        objects.put_batch(&[(id, bytes.clone())], 1).await.unwrap();
+    }
+    let packed = root.path().join("packed");
+    let generations = root.path().join("content-generations");
+    let write = |path: std::path::PathBuf| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"leftover").unwrap();
+        path
+    };
+    let leftovers = [
+        write(packed.join(".tmpA1b2C3")),
+        write(packed.join("segments/.tmpZz9Yy8")),
+        write(packed.join("active.segment.next")),
+        write(generations.join("7/shard-000000.pack")),
+        write(generations.join("7/shard-000000.manifest")),
+        write(generations.join(format!("7-{}.manifest", "ab".repeat(32)))),
+    ];
+    let kept = [
+        write(packed.join(".tmp-not-ours")),
+        write(packed.join("segments/notes.txt")),
+        write(generations.join("8/shard-000000.pack")),
+        write(generations.join("8/notes.txt")),
+        write(generations.join("07/shard-000000.pack")),
+    ];
+
+    let objects = PackedObjectStore::open(root.path()).unwrap();
+
+    for path in &leftovers {
+        assert!(!path.exists(), "{} was left", path.display());
+    }
+    assert!(!generations.join("7").exists());
+    for path in &kept {
+        assert!(path.exists(), "{} was removed", path.display());
+    }
+    assert_eq!(objects.get(id).await.unwrap().canonical_bytes, bytes);
+}
