@@ -3,7 +3,7 @@
 use std::fs;
 
 use wheat_server::registry::Registry;
-use wheat_store::{PublicationStore, RepositoryDirectory};
+use wheat_store::RepositoryDirectory;
 
 #[tokio::test]
 async fn serves_created_repositories_and_skips_hidden_ones() {
@@ -22,7 +22,13 @@ async fn serves_created_repositories_and_skips_hidden_ones() {
 
     assert_eq!(registry.names().collect::<Vec<_>>(), ["owner/repo"]);
     assert_eq!(
-        registry.get("owner/repo").unwrap().heads.read().unwrap(),
+        registry
+            .get("owner/repo")
+            .unwrap()
+            .heads
+            .head()
+            .await
+            .unwrap(),
         head
     );
     drop(pending);

@@ -6,25 +6,28 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::{Notify, Semaphore};
 use wheat_core::{
-    ApplicationContext, ObjectId, Repository, RepositoryEnvelopeId, Tree, VerifiedContent, ViewId,
-    ViewLabelManifestRecord,
+    ApplicationContext, ObjectId, PublishReceiptRecord, Repository, RepositoryEnvelopeId, Tree,
+    VerifiedContent, ViewId, ViewLabelManifestRecord,
 };
 use wheat_protocol::{Digest256, PublishRequestOutput, Uuid128};
 use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
+use wheat_server::heads::HeadStore;
 use wheat_server::receipt::PublishKey;
 use wheat_server::registry::RepositoryEntry;
 use wheat_store::{
     ContentItem, ContentStore, ImmutableObjectStore, LocalPublicationStore, ObjectStoreError,
-    PackedObjectStore, PersistedRepositoryMutator, PublicationStore, RepositoryHead,
-    RepositoryPublisher, RepositoryReader, RepositoryStage, RepositoryStore, RepositoryStoreError,
-    StoredObject, finalize_mutation_publication, prepare_mutation_publication,
+    PackedObjectStore, PersistedRepositoryMutator, PublicationError, PublicationStore,
+    RepositoryHead, RepositoryPublisher, RepositoryReader, RepositoryStage, RepositoryStore,
+    RepositoryStoreError, StoredObject, finalize_mutation_publication,
+    prepare_mutation_publication,
 };
 
 use support::edit;
@@ -117,6 +120,8 @@ struct Server {
     objects: PackedObjectStore,
     gate: Arc<Gate>,
     entry: Arc<RepositoryEntry>,
+    /// The head `entry` serves, as another process sharing it would move it.
+    heads: LocalPublicationStore,
     initial: RepositoryHead,
     /// The repository's base view, and the view with its one change.
     base: ViewId,
@@ -161,7 +166,8 @@ async fn server() -> Server {
         _dir: dir,
         objects,
         gate,
-        entry: Arc::new(RepositoryEntry::new(Box::new(store), heads)),
+        entry: Arc::new(RepositoryEntry::new(Box::new(store), heads.clone())),
+        heads,
         initial,
         base: basis,
         greeting: greeting.resulting_view,
@@ -186,13 +192,13 @@ async fn propose<'a>(
     let reader = RepositoryReader::new(&stage, stage.content());
     let envelope = reader.envelope(base.envelope).await.unwrap();
     let basis = reader.state(envelope.state).await.unwrap().base_view;
-    let mutator = PersistedRepositoryMutator::new(&stage, stage.content(), &server.entry.heads);
+    let mutator = PersistedRepositoryMutator::new(&stage, stage.content(), &server.heads);
     let (prepared, _) = mutator
         .create_on_frontier(base, basis, basis, proposal(path, &value))
         .await
         .unwrap();
     let publication =
-        prepare_mutation_publication(&stage, stage.content(), &server.entry.heads, base, prepared)
+        prepare_mutation_publication(&stage, stage.content(), &server.heads, base, prepared)
             .await
             .unwrap();
     (stage, publication.proposed().envelope)
@@ -349,7 +355,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
     // One head advance for both.
     assert_eq!(a_head, b_head);
     assert_eq!(a_head.generation, initial.generation + 2);
-    assert_eq!(server.entry.heads.read().unwrap(), a_head);
+    assert_eq!(server.heads.read().unwrap(), a_head);
     let with_a = joined(&server, initial.envelope, first, a).await;
     assert_eq!(
         a_head.envelope,
@@ -407,7 +413,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         Err(CommitFailure::Stale { head, .. }) => assert_eq!(head, initial),
         other => panic!("expected the joined publish to be stale, got {other:?}"),
     }
-    assert_eq!(server.entry.heads.read().unwrap(), initial);
+    assert_eq!(server.heads.read().unwrap(), initial);
 
     // The next publish starts again from the durable head.
     let (c_stage, c) = propose(&server, initial, "c.txt").await;
@@ -473,7 +479,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
             other => panic!("expected the publish to fail, got {other:?}"),
         }
     }
-    assert_eq!(server.entry.heads.read().unwrap(), initial);
+    assert_eq!(server.heads.read().unwrap(), initial);
 
     // A new committer takes the next publish, built on the durable head.
     let (c_stage, c) = propose(&server, initial, "c.txt").await;
@@ -527,16 +533,16 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
         .await
         .unwrap()
         .base_view;
-    let mutator = PersistedRepositoryMutator::new(objects, &content, &server.entry.heads);
+    let mutator = PersistedRepositoryMutator::new(objects, &content, &server.heads);
     let (prepared, _) = mutator
         .create_on_frontier(initial, basis, basis, proposal("other.txt", b"other.txt"))
         .await
         .unwrap();
     let publication =
-        prepare_mutation_publication(objects, &content, &server.entry.heads, initial, prepared)
+        prepare_mutation_publication(objects, &content, &server.heads, initial, prepared)
             .await
             .unwrap();
-    let other = finalize_mutation_publication(&server.entry.heads, publication).unwrap();
+    let other = finalize_mutation_publication(&server.heads, publication).unwrap();
 
     // One write for the batch, one for the objects joining it with the other head.
     server.gate.permits.add_permits(2);
@@ -546,7 +552,7 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
         head.envelope,
         joined(&server, initial.envelope, other.envelope, a).await
     );
-    assert_eq!(server.entry.heads.read().unwrap(), head);
+    assert_eq!(server.heads.read().unwrap(), head);
 }
 
 /// A stage with nothing in it, as a publish sent again has before its transfer.
@@ -560,8 +566,13 @@ async fn previous(
     server: &Server,
     key: &PublishKey,
 ) -> Result<Option<commit::Accepted>, CommitFailure> {
-    let (head, receipts) = server.entry.heads.read_with_receipts().unwrap();
-    commit::previous(&server.entry, head, &receipts, key).await
+    let (head, receipt) = server
+        .entry
+        .heads
+        .head_with_receipt(key.key())
+        .await
+        .unwrap();
+    commit::previous(&server.entry, head, receipt.as_ref(), key).await
 }
 
 #[tokio::test]
@@ -623,7 +634,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
     assert_eq!(a_again.durable().await.unwrap(), a_head);
     // One advance each, not two.
     assert_eq!(a_head.generation, initial.generation + 2);
-    assert_eq!(server.entry.heads.read().unwrap(), a_head);
+    assert_eq!(server.heads.read().unwrap(), a_head);
 }
 
 #[tokio::test]
@@ -682,7 +693,121 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
     .await
     .unwrap();
     assert_eq!(again.durable().await.unwrap(), first_head);
-    assert_eq!(server.entry.heads.read().unwrap(), a_head);
+    assert_eq!(server.heads.read().unwrap(), a_head);
+}
+
+/// A head kept as a database would keep it: the head in one cell, compared and swapped,
+/// and each receipt in a table under its key.
+#[derive(Clone)]
+struct TableHeads(Arc<Mutex<Table>>);
+
+struct Table {
+    head: RepositoryHead,
+    receipts: HashMap<[u8; 16], PublishReceiptRecord>,
+    advances: usize,
+}
+
+impl TableHeads {
+    fn new(head: RepositoryHead) -> Self {
+        Self(Arc::new(Mutex::new(Table {
+            head,
+            receipts: HashMap::new(),
+            advances: 0,
+        })))
+    }
+
+    fn advances(&self) -> usize {
+        self.0.lock().unwrap().advances
+    }
+}
+
+#[async_trait]
+impl HeadStore for TableHeads {
+    async fn head(&self) -> Result<RepositoryHead, PublicationError> {
+        Ok(self.0.lock().unwrap().head)
+    }
+
+    async fn head_with_receipt(
+        &self,
+        key: &[u8; 16],
+    ) -> Result<(RepositoryHead, Option<PublishReceiptRecord>), PublicationError> {
+        let table = self.0.lock().unwrap();
+        Ok((table.head, table.receipts.get(key).copied()))
+    }
+
+    async fn advance(
+        &self,
+        expected: RepositoryHead,
+        proposed: RepositoryHead,
+        receipts: &[PublishReceiptRecord],
+        _now: u64,
+    ) -> Result<(), PublicationError> {
+        let mut table = self.0.lock().unwrap();
+        if table.head != expected {
+            return Err(PublicationError::Stale {
+                expected,
+                actual: table.head,
+            });
+        }
+        table.head = proposed;
+        for receipt in receipts {
+            table.receipts.insert(receipt.key, *receipt);
+        }
+        table.advances += 1;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() {
+    let server = server().await;
+    let initial = server.initial;
+    let table = TableHeads::new(initial);
+    let entry = Arc::new(RepositoryEntry::new(
+        Box::new(server.objects.clone()),
+        table.clone(),
+    ));
+    let (stage, proposed) = propose(&server, initial, "first.txt").await;
+    let accepted = commit::accept(
+        &entry,
+        &stage,
+        key(1, proposed),
+        initial.envelope,
+        proposed,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let head = accepted.durable().await.unwrap();
+    assert_eq!(head.generation, initial.generation + 1);
+    assert_eq!(table.head().await.unwrap(), head);
+    let (_, receipt) = table
+        .head_with_receipt(key(1, proposed).key())
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.map(|receipt| receipt.generation),
+        Some(head.generation)
+    );
+
+    // Sent again, the publish is answered from the table's receipt, and the head is
+    // not moved a second time.
+    let empty_stage = Stage::new(&*entry.store, 65_536, 64 * 1024 * 1024);
+    let again = commit::accept(
+        &entry,
+        &empty_stage,
+        key(1, proposed),
+        initial.envelope,
+        proposed,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(again.repeated());
+    assert_eq!(again.durable().await.unwrap(), head);
+    assert_eq!(table.advances(), 1);
 }
 
 #[tokio::test]
@@ -731,7 +856,7 @@ async fn a_publish_key_used_for_a_different_publish_is_refused() {
         .await
         .map(Some),
     );
-    assert_eq!(server.entry.heads.read().unwrap(), first_head);
+    assert_eq!(server.heads.read().unwrap(), first_head);
 }
 fn manifest(labels: &[(&str, ViewId)]) -> ViewLabelManifestRecord {
     ViewLabelManifestRecord::new(labels.iter().copied()).unwrap()
@@ -750,7 +875,7 @@ async fn relabel<'a>(
         .await
         .unwrap()
         .state;
-    let envelope = RepositoryPublisher::new(&stage, stage.content(), &server.entry.heads)
+    let envelope = RepositoryPublisher::new(&stage, stage.content(), &server.heads)
         .stage_envelope(state, &manifest(labels))
         .await
         .unwrap();
@@ -765,7 +890,7 @@ async fn relabel_directly(
     labels: &[(&str, ViewId)],
 ) -> RepositoryHead {
     let content = server.objects.content_store();
-    let publisher = RepositoryPublisher::new(&server.objects, &content, &server.entry.heads);
+    let publisher = RepositoryPublisher::new(&server.objects, &content, &server.heads);
     let state = RepositoryReader::new(&server.objects, &content)
         .envelope(head.envelope)
         .await
@@ -782,7 +907,7 @@ async fn relabel_directly(
 async fn label_view(server: &Server, name: &str) -> Option<ViewId> {
     let content = server.objects.content_store();
     let reader = RepositoryReader::new(&server.objects, &content);
-    let head = server.entry.heads.read().unwrap();
+    let head = server.heads.read().unwrap();
     let envelope = reader.envelope(head.envelope).await.unwrap();
     let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
     labels.labels.get(name).map(|label| label.view)
@@ -834,7 +959,7 @@ async fn a_backward_label_move_is_refused_unless_the_publish_forces_labels() {
             assert_eq!(label_view(&server, "main").await, Some(server.base));
         } else {
             assert_rejected(outcome, "label main would move");
-            assert_eq!(server.entry.heads.read().unwrap(), labeled, "force={force}");
+            assert_eq!(server.heads.read().unwrap(), labeled, "force={force}");
         }
     }
 }
@@ -1020,7 +1145,7 @@ async fn a_label_moved_differently_by_another_process_refuses_the_batch_as_stale
         }
         other => panic!("expected a stale refusal, got {other:?}"),
     }
-    assert_eq!(server.entry.heads.read().unwrap(), deleted);
+    assert_eq!(server.heads.read().unwrap(), deleted);
 }
 
 /// `force_labels` is part of what a publish key names: the same key sent again with a

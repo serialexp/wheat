@@ -21,9 +21,8 @@ use tracing::{Instrument as _, debug_span, warn};
 use wheat_core::{PublishReceiptRecord, RepositoryEnvelopeId};
 use wheat_store::{
     Arrival, ImmutableObjectStore, MergeBudget, PendingPublications, PublicationError,
-    PublicationStore, RepositoryHead, RepositoryPublicationError, RepositoryReader,
-    RepositoryStage, RepositoryStore, RepositoryStoreError, RepositoryUnionError,
-    StagedPublication,
+    RepositoryHead, RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
+    RepositoryStoreError, RepositoryUnionError, StagedPublication,
 };
 
 use crate::receipt::{PublishKey, Recorded};
@@ -143,7 +142,7 @@ impl Accepted {
 }
 
 /// The answer to a publish sent before with `key`, if it was: the head it was
-/// published in, by the `durable` head's `receipts`, or the batch it waits in.
+/// published in, by the `durable` head's `receipt` for it, or the batch it waits in.
 /// Checked before the publish's transfer, so a retry after the head moved is not
 /// refused as stale and sends nothing again.
 ///
@@ -153,11 +152,11 @@ impl Accepted {
 pub async fn previous(
     entry: &Arc<RepositoryEntry>,
     durable: RepositoryHead,
-    receipts: &[PublishReceiptRecord],
+    receipt: Option<&PublishReceiptRecord>,
     key: &PublishKey,
 ) -> Result<Option<Accepted>, CommitFailure> {
     let mut turn = entry.commit.state.lock().await;
-    turn.previous(receipts, durable, key).transpose()
+    turn.previous(receipt, durable, key).transpose()
 }
 
 /// Joins `proposed`, built on `expected`, with whatever was accepted since, and
@@ -188,8 +187,8 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
         .lock()
         .instrument(debug_span!("publish_commit_wait"))
         .await;
-    let (durable, receipts) = read_receipts(entry)?;
-    if let Some(previous) = turn.previous(&receipts, durable, &key) {
+    let (durable, receipt) = read_receipt(entry, &key).await?;
+    if let Some(previous) = turn.previous(receipt.as_ref(), durable, &key) {
         return previous;
     }
     let current = turn.tentative.unwrap_or(durable.envelope);
@@ -271,14 +270,14 @@ fn join_failure(error: RepositoryUnionError, head: RepositoryHead) -> CommitFail
 
 impl CommitState {
     /// The answer to a publish sent before with `key`: from the durable head's
-    /// `receipts`, or by waiting for the batch the first sending is in.
+    /// `receipt` for it, or by waiting for the batch the first sending is in.
     fn previous(
         &mut self,
-        receipts: &[PublishReceiptRecord],
+        receipt: Option<&PublishReceiptRecord>,
         durable: RepositoryHead,
         key: &PublishKey,
     ) -> Option<Result<Accepted, CommitFailure>> {
-        match key.find(receipts) {
+        match key.find(receipt) {
             Some(Recorded::Published(head)) => {
                 return Some(Ok(Accepted {
                     answer: Answer::Published(head),
@@ -444,7 +443,7 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> CommitOutcome {
     if let Err(e) = stored {
         warn!(error = %e, "publish: storing a batch failed");
         return Err(CommitFailure::Failed {
-            head: read_head(entry)?,
+            head: read_head(entry).await?,
             message: format!("storing the published objects failed: {e}"),
         });
     }
@@ -452,7 +451,7 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> CommitOutcome {
     let mut built_on = batch.built_on;
     let mut target = batch.target;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
-        let head = read_head(entry)?;
+        let head = read_head(entry).await?;
         if head.envelope != built_on {
             // Another process sharing the store moved the head, or an earlier batch
             // was joined with such a move: join again.
@@ -477,11 +476,11 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> CommitOutcome {
             .iter()
             .map(|key| key.receipt(new_head, now))
             .collect();
-        let advanced = debug_span!("publish_cas").in_scope(|| {
-            entry
-                .heads
-                .compare_and_advance_with_receipts(head, new_head, &receipts, now)
-        });
+        let advanced = entry
+            .heads
+            .advance(head, new_head, &receipts, now)
+            .instrument(debug_span!("publish_cas"))
+            .await;
         match advanced {
             Ok(()) => return Ok(new_head),
             Err(PublicationError::Stale { .. }) => continue,
@@ -494,7 +493,7 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> CommitOutcome {
         }
     }
     Err(CommitFailure::Stale {
-        head: read_head(entry)?,
+        head: read_head(entry).await?,
         message: "the head kept moving under this publish; try again".to_string(),
     })
 }
@@ -535,19 +534,22 @@ async fn rejoin(
     Ok(joined)
 }
 
-fn read_head(entry: &RepositoryEntry) -> Result<RepositoryHead, CommitFailure> {
+async fn read_head(entry: &RepositoryEntry) -> Result<RepositoryHead, CommitFailure> {
     entry
         .heads
-        .read()
+        .head()
+        .await
         .map_err(|e| CommitFailure::Internal(format!("publish: read the head: {e}")))
 }
 
-fn read_receipts(
+async fn read_receipt(
     entry: &RepositoryEntry,
-) -> Result<(RepositoryHead, Vec<PublishReceiptRecord>), CommitFailure> {
+    key: &PublishKey,
+) -> Result<(RepositoryHead, Option<PublishReceiptRecord>), CommitFailure> {
     entry
         .heads
-        .read_with_receipts()
+        .head_with_receipt(key.key())
+        .await
         .map_err(|e| CommitFailure::Internal(format!("publish: read the head: {e}")))
 }
 

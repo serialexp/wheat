@@ -56,6 +56,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   Sharing content with Gothab's Git blobs, keyed by Git OID, is not Wheat's concern
   (Bart): if Gothab wants to deduplicate, its blob table gets a BLAKE3 representation
   of Git content, and Wheat keeps its IDs.
+- `[x]` **(format) The head record holds the publish receipts (2026-10-27).** The
+  server reads and moves a repository's head through `wheat_server::heads::HeadStore`
+  (`head`, `head_with_receipt(key)`, `advance(expected, proposed, receipts, now)`),
+  which `RepositoryEntry` holds boxed, so a host can keep the head in a database row
+  compared and swapped on `generation` and the receipts in a table keyed by publish
+  key. A publish looks up its own receipt instead of reading all of them.
+  `RepositoryHeadRecord` is the local backend's own encoding (Bart: backends get their
+  own representation); `LocalPublicationStore` implements the trait. Tested with an
+  in-memory table backend in `group_commit_test.rs`.
 
 ## Desktop client (2026-10-22)
 

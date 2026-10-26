@@ -118,13 +118,13 @@ async fn read_push(
 const OVER_PUSH_LIMIT: &str = "a publish pushed more than MAX_PUSHED_BYTES";
 
 /// Handle a publish request whose push has been read, against `current_head` and the
-/// `receipts` it holds. Returns the new head if publication succeeded.
+/// `receipt` it holds for this publish's key. Returns the new head if publication succeeded.
 #[tracing::instrument(name = "publish", level = "debug", skip_all)]
 pub async fn handle_publish(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &Arc<RepositoryEntry>,
     current_head: &RepositoryHead,
-    receipts: &[PublishReceiptRecord],
+    receipt: Option<&PublishReceiptRecord>,
     req: PublishRequestOutput,
     key: PublishKey,
     mut pushed: Pushed,
@@ -136,7 +136,7 @@ pub async fn handle_publish(
 
     // A publish sent again, after the connection it was first sent on was lost, gets
     // the first sending's answer, and nothing is transferred again.
-    match commit::previous(entry, *current_head, receipts, &key).await {
+    match commit::previous(entry, *current_head, receipt, &key).await {
         Ok(None) => {}
         Ok(Some(previous)) => return answer(ws, op_id, key, Ok(previous)).await,
         Err(failure) => return answer(ws, op_id, key, Err(failure)).await,

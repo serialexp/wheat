@@ -84,9 +84,14 @@ impl PublishKey {
         publish_receipt_id(self.key, self.request, head.generation, head.envelope)
     }
 
-    /// What `receipts` say about this key, if any holds it.
-    pub fn find(&self, receipts: &[PublishReceiptRecord]) -> Option<Recorded> {
-        let receipt = receipts.iter().find(|receipt| receipt.key == self.key)?;
+    /// The key a [`crate::heads::HeadStore`] keeps this publish's receipt under.
+    pub fn key(&self) -> &[u8; 16] {
+        &self.key
+    }
+
+    /// What `receipt` says about this key, if it is this key's.
+    pub fn find(&self, receipt: Option<&PublishReceiptRecord>) -> Option<Recorded> {
+        let receipt = receipt.filter(|receipt| receipt.key == self.key)?;
         Some(if receipt.request == self.request {
             Recorded::Published(RepositoryHead {
                 generation: receipt.generation,
@@ -151,13 +156,14 @@ mod tests {
 
     #[test]
     fn a_receipt_answers_its_own_request_and_refuses_another_under_the_same_key() {
-        let receipts = [sent("alice", 1, 2).receipt(head(), 100)];
+        let receipt = sent("alice", 1, 2).receipt(head(), 100);
+        let receipts = Some(&receipt);
         assert_eq!(
-            sent("alice", 1, 2).find(&receipts),
+            sent("alice", 1, 2).find(receipts),
             Some(Recorded::Published(head()))
         );
-        assert_eq!(sent("alice", 1, 3).find(&receipts), Some(Recorded::Reused));
-        assert_eq!(sent("alice", 2, 2).find(&receipts), None);
+        assert_eq!(sent("alice", 1, 3).find(receipts), Some(Recorded::Reused));
+        assert_eq!(sent("alice", 2, 2).find(receipts), None);
         let forcing_labels = PublishRequestOutput {
             force_labels: true,
             ..request(1, 2)
@@ -165,15 +171,15 @@ mod tests {
         assert_eq!(
             PublishKey::new(&principal("alice"), &forcing_labels)
                 .unwrap()
-                .find(&receipts),
+                .find(receipts),
             Some(Recorded::Reused)
         );
     }
 
     #[test]
     fn the_same_key_from_another_principal_is_another_publish() {
-        let receipts = [sent("alice", 1, 2).receipt(head(), 100)];
-        assert_eq!(sent("bob", 1, 2).find(&receipts), None);
+        let receipt = sent("alice", 1, 2).receipt(head(), 100);
+        assert_eq!(sent("bob", 1, 2).find(Some(&receipt)), None);
     }
 
     #[test]

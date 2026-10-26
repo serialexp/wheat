@@ -4,18 +4,17 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use wheat_store::{
-    ContentStore, LocalPublicationStore, ObjectStoreError, RepositoryDirectory, RepositoryStore,
-};
+use wheat_store::{ContentStore, ObjectStoreError, RepositoryDirectory, RepositoryStore};
 
 use crate::commit::GroupCommit;
+use crate::heads::HeadStore;
 
 /// A single repository's stores.
 pub struct RepositoryEntry {
     pub store: Box<dyn RepositoryStore>,
     /// `store`'s content.
     pub content: ContentStore,
-    pub heads: LocalPublicationStore,
+    pub heads: Box<dyn HeadStore>,
     /// Publishes take turns joining onto the head, so none merges against a head
     /// another is about to replace, and are made durable in batches.
     pub commit: GroupCommit,
@@ -31,11 +30,11 @@ impl RepositoryEntry {
         ))
     }
 
-    pub fn new(store: Box<dyn RepositoryStore>, heads: LocalPublicationStore) -> Self {
+    pub fn new(store: Box<dyn RepositoryStore>, heads: impl HeadStore + 'static) -> Self {
         Self {
             content: store.content_store(),
             store,
-            heads,
+            heads: Box::new(heads),
             commit: GroupCommit::default(),
         }
     }
@@ -72,7 +71,7 @@ impl Registry {
     pub fn single_with_stores(
         name: String,
         store: Box<dyn RepositoryStore>,
-        heads: LocalPublicationStore,
+        heads: impl HeadStore + 'static,
     ) -> Self {
         let entry = Arc::new(RepositoryEntry::new(store, heads));
         let mut repos = HashMap::new();

@@ -26,14 +26,6 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   `/wheat/ws` mount in `wheat-native-protocol.md` assumes a path); or keep it in the
   protocol and have embedders proxy at message level. Decide whether `RepositoryOpen`
   stays the authority once the path names the repository too.
-- `[ ]` **(format) The head record holds the publish receipts.** `RepositoryHeadRecord`
-  carries the head and its receipts together (`crates/wheat-store/src/publication.rs`),
-  and the server uses `LocalPublicationStore`'s inherent `*_with_receipts` methods,
-  not the `PublicationStore` trait. A host keeping the head in a database row
-  (compare-and-swap on `generation`, as the protocol doc's Gothab column proposes)
-  needs the head, the receipts and the compare-and-advance behind one trait the
-  server is given. Decide whether `RepositoryHeadRecord` stays a stored format every
-  backend writes, or becomes the local backend's own encoding.
 - `[ ]` **(format) `RepositoryState` stops at 10,000 labels.** Repository open sends at
   most 10,000 labels with a `truncated` flag (`connection.rs`), and `ListLabels`,
   which would page the rest, is in the schema but not served. Gothab repositories can
