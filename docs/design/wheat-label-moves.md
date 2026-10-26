@@ -2,7 +2,7 @@
 
 Status: proposed (2026-10-15), revised after Codex reviews 1–3; references refreshed
 2026-10-22 after the prerequisite validation project (decision 13) landed, then revised
-after review 4 (Codex and Antigravity, 2026-10-22); steps 1 and 2 done
+after review 4 (Codex and Antigravity, 2026-10-22); steps 1–3 done
 Owner: bart
 
 ## Why
@@ -578,6 +578,13 @@ size for `just test`; release run; results under `bench/results/`.
    once reads 5 objects after 10 or 100 revisions of the change and after 16 or 160
    other changes.
 3. Integrate with lacking frontiers and the basis lineage edge.
+   **Done 2026-10-26**: `frontier_revisions` returns added, revised and lacked
+   changes (`FrontierRevisions`); `start_below` starts below every revised or lacked
+   change; above the start the basis is one more holder, so its revisions join with
+   the frontiers'; the basis gets a lineage edge to the result whenever they differ,
+   lacking frontiers or not. Tests: a frontier lacking the basis's own change, one
+   lacking a low change, and both sides revising one change while the frontier lacks
+   another.
 4. Materialize from the pinned basis; the journal's binding check. (Full validation
    already left the read paths in the prerequisite.)
 5. Label move in mutation publication; `label move`; workspace rebind.

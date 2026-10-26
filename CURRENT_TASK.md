@@ -4,12 +4,14 @@
 
 Review 4 (Codex and Antigravity) is folded into the plan, with Bart's decisions 14–16
 (squash stops at branch points; a separate merge meter; `label move` rebinds only
-when the target is the workspace's effective view). Steps 1 and 2 are done (see the
+when the target is the workspace's effective view). Steps 1–3 are done (see the
 plan's "Order of work"); the merge budget meters walk steps instead of recursion depth
-(Bart, 2026-10-26). Next: step 3, integrate with frontiers that lack label changes
-(`frontier_revisions` returns lacked changes, `start_below` treats them like revised
-ones, the basis's revisions join `join_revisions`) and the basis → result lineage
-edge, in `crates/wheat-store/src/repository_integration.rs`.
+(Bart, 2026-10-26). Next: step 4, `materialize` from the workspace's pinned basis
+instead of re-resolving the label (`materialize_active_workspace` in
+`crates/wheat-cli/src/main.rs`), and the materialization journal's
+`authenticate_target` (`crates/wheat-client/src/materialization.rs`) checking
+`basis == observed_label_binding` and retention instead of the label. Both are
+@calm-lynx's areas: PM them first.
 
 ## 2026-10-22: desktop client (@calm-lynx) — Bart: "read the design for the wheat gui and try to build that"
 

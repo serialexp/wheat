@@ -978,3 +978,73 @@ async fn a_combination_over_any_merge_budget_is_refused_naming_it() {
         }
     }
 }
+/// The label's view C and the remote's D grew from L apart: C adds `x`, D adds `y`, so
+/// D lacks a change C holds, as after a fetch moved the label to D. Joining D into C
+/// holds both sides' changes in canonical order, and both C and D lead to the result.
+#[tokio::test]
+async fn a_frontier_lacking_a_change_of_the_basis_joins_with_it() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (_, l) = fixture.create(base, base, "l", b"l").await;
+    let (_, d) = fixture.create(base, l, "y", b"y").await;
+    let (_, c) = fixture.create(base, l, "x", b"x").await;
+
+    let outcome = fixture.integrate(c, &[d]).await.unwrap();
+
+    let joined = outcome.resulting_view;
+    assert_eq!(
+        present(&fixture, joined, &["l", "x", "y"]).await,
+        ["l", "x", "y"]
+    );
+    assert_eq!(fixture.frontiers(c).await, [joined]);
+    assert_eq!(fixture.frontiers(d).await, [joined]);
+    assert!(outcome.combined.is_empty());
+    fixture.validate().await;
+}
+
+/// Both sides revised L's change differently, and D lacks C's own change: the joined
+/// view combines the two revisions and holds C's change too.
+#[tokio::test]
+async fn a_frontier_lacking_basis_changes_combines_a_revision_both_sides_made() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (a, l) = fixture.create(base, base, "s", b"s").await;
+    let d = revise(&fixture, base, l, a, Revision::Add("q"), 200).await;
+    let c = revise(&fixture, base, l, a, Revision::Add("p"), 100).await;
+    let (x, c) = fixture.create(base, c, "x", b"x").await;
+
+    let outcome = fixture.integrate(c, &[d]).await.unwrap();
+
+    let joined = outcome.resulting_view;
+    assert_eq!(
+        present(&fixture, joined, &["s", "p", "q", "x"]).await,
+        ["s", "p", "q", "x"]
+    );
+    assert_eq!(outcome.combined.keys().copied().collect::<Vec<_>>(), [a]);
+    assert_eq!(outcome.composed, [a]);
+    assert_eq!(outcome.reapplied, [x]);
+    assert_eq!(fixture.frontiers(c).await, [joined]);
+    fixture.validate().await;
+}
+
+/// A frontier that lacks changes of the basis composed below others it holds: the
+/// joined view starts below the lowest lacked change and composes the rest again.
+#[tokio::test]
+async fn a_frontier_lacking_a_low_change_of_the_basis_composes_from_below_it() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (_, l) = fixture.create(base, base, "l", b"l").await;
+    let (_, c) = fixture.create(base, l, "x", b"x").await;
+    let (_, c) = fixture.create(base, c, "z", b"z").await;
+    let (_, d) = fixture.create(base, l, "y", b"y").await;
+
+    let outcome = fixture.integrate(c, &[d]).await.unwrap();
+
+    let joined = outcome.resulting_view;
+    assert_eq!(
+        present(&fixture, joined, &["l", "x", "y", "z"]).await,
+        ["l", "x", "y", "z"]
+    );
+    assert_eq!(fixture.frontiers(c).await, [joined]);
+    fixture.validate().await;
+}
