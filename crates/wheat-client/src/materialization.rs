@@ -1137,22 +1137,14 @@ async fn authenticate_target(repository: &LocalRepository, journal: &Journal) ->
     let reader = wheat_store::RepositoryReader::new(&repository.objects, &repository.content);
     let envelope = reader.envelope(head.envelope).await?;
     let state = reader.state(envelope.state).await?;
-    let labels = reader.view_label_manifest(envelope.labels).await?;
-    let pinned_binding = labels
-        .labels
-        .get(&journal.active_label)
-        .map(|label| label.view)
-        .with_context(|| {
-            format!(
-                "journal references unknown Wheat label {}",
-                journal.active_label
-            )
-        })?;
+    // The label itself is not read: capture settlement advances the pinned head, whose
+    // label may already name another view (or none), while the workspace keeps the
+    // binding it observed until it re-reads the label.
     ensure!(
-        pinned_binding == journal.observed_label_binding
-            && journal.basis == journal.observed_label_binding,
+        journal.basis == journal.observed_label_binding,
         "journal label binding does not match its pinned basis"
     );
+    reader.retained_view(&state, journal.basis).await?;
     let selected = journal.selected_frontier.unwrap_or(journal.basis);
     ensure!(
         selected == journal.target.view,

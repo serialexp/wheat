@@ -47,6 +47,37 @@ pub async fn resolve(
     resolve_at_head(repository, &reader, head, envelope, label, requested).await
 }
 
+/// The workspace's own pinned basis and selected frontier at the current head, checking
+/// only that the head retains them. Unlike [`resolve`], this does not read the label:
+/// the label may since have moved or been deleted, and the workspace keeps what it
+/// pinned until `refresh`, `integrate`, `pull` or `switch` re-read it.
+pub async fn pinned(
+    repository: &LocalRepository,
+    basis: ViewId,
+    selected_frontier: Option<ViewId>,
+) -> Result<ResolvedFrontier> {
+    let head = repository.heads.read()?;
+    let reader = RepositoryReader::new(&repository.objects, &repository.content);
+    let envelope = reader.envelope(head.envelope).await?;
+    let state = reader.state(envelope.state).await?;
+    let basis_tree = reader.retained_view(&state, basis).await?.tree;
+    let tree = match selected_frontier {
+        Some(selected) => reader.retained_view(&state, selected).await?.tree,
+        None => basis_tree,
+    };
+    // As in `resolve_at_head`: never materialize a selection read across two heads.
+    anyhow::ensure!(
+        repository.heads.read()? == head,
+        "repository head changed while reading the workspace's pinned views"
+    );
+    Ok(ResolvedFrontier {
+        head,
+        basis,
+        selected_frontier,
+        tree,
+    })
+}
+
 /// Resolve directly from the exact head returned by a just-completed atomic import.
 ///
 /// Atomic import completely validates the envelope immediately before publishing it,

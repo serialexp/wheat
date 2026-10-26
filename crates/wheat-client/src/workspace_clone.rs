@@ -68,6 +68,7 @@ pub fn clone_local(source: &Path, workspace_root: &Path, dot_git: DotGitGate) ->
         store.store_id,
         label.clone(),
         resolved.basis,
+        resolved.selected_frontier,
     );
     workspace_registry_service::reconcile(workspace_root, &store_root, &metadata)?;
     metadata.initialize(workspace_root)?;

@@ -1500,3 +1500,133 @@ fn recovery_preserves_a_concurrent_workspace_collision() {
     assert_eq!(std::fs::read(workspace.join("a")).unwrap(), b"external\n");
     assert!(workspace.join(".wheat/materialization.json").is_file());
 }
+/// Runs a label command against `workspace`'s store from outside any workspace, so
+/// nothing recovers or refuses on the workspace's behalf: another workspace or a
+/// fetch moving the label underneath it.
+fn relabel(root: &Path, stores: &Path, workspace: &Path, args: &[&str]) {
+    let store = wheat_client::workspace_metadata::WorkspaceMetadata::read(workspace)
+        .unwrap()
+        .store
+        .path;
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut full = vec![
+        "--workspace",
+        elsewhere.to_str().unwrap(),
+        "--store",
+        store.to_str().unwrap(),
+        "label",
+    ];
+    full.extend_from_slice(args);
+    let output = wheat(stores, &full, None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn import_main(root: &Path, stores: &Path) -> std::path::PathBuf {
+    let source = source_with_delta(root);
+    let workspace = root.join("workspace");
+    let imported = wheat(
+        stores,
+        &[
+            "import",
+            source.to_str().unwrap(),
+            workspace.to_str().unwrap(),
+            "--branch",
+            "refs/heads/main",
+        ],
+        None,
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    workspace
+}
+
+// The workspace keeps the basis it pinned until it re-reads the label, so
+// materializing does not follow a label that moved or vanished underneath it.
+#[test]
+fn materialize_keeps_the_pinned_basis_when_the_label_moves_or_goes() {
+    let root = tempfile::tempdir().unwrap();
+    let stores = root.path().join("stores");
+    let workspace = import_main(root.path(), &stores);
+    let main_view = label_view(&stores, &workspace, "main");
+    let feature_view = label_view(&stores, &workspace, "feature");
+    let materialize = || {
+        let output = wheat(
+            &stores,
+            &[
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--format=json",
+                "materialize",
+            ],
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        document["result"]["view"].as_str().unwrap().to_owned()
+    };
+
+    relabel(root.path(), &stores, &workspace, &["delete", "main"]);
+    relabel(
+        root.path(),
+        &stores,
+        &workspace,
+        &["create", "main", "--view", &feature_view],
+    );
+    assert_eq!(materialize(), main_view);
+    assert_eq!(std::fs::read(workspace.join("replace")).unwrap(), b"old\n");
+
+    relabel(root.path(), &stores, &workspace, &["delete", "main"]);
+    assert_eq!(materialize(), main_view);
+    assert_eq!(
+        std::fs::read(workspace.join("delete")).unwrap(),
+        b"delete\n"
+    );
+}
+
+// Recovery checks the journal against itself and the views the head retains, not
+// against where its label points now.
+#[test]
+fn interrupted_switch_recovers_after_its_label_is_deleted() {
+    let root = tempfile::tempdir().unwrap();
+    let stores = root.path().join("stores");
+    let workspace = import_main(root.path(), &stores);
+    let interrupted = wheat(
+        &stores,
+        &[
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "switch",
+            "feature",
+        ],
+        Some("staged"),
+    );
+    assert!(!interrupted.status.success());
+    assert!(workspace.join(".wheat/materialization.json").is_file());
+
+    relabel(root.path(), &stores, &workspace, &["delete", "feature"]);
+    let recovered = wheat(
+        &stores,
+        &["--workspace", workspace.to_str().unwrap(), "status"],
+        None,
+    );
+
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(std::fs::read(workspace.join("replace")).unwrap(), b"new\n");
+    assert!(!workspace.join(".wheat/materialization.json").exists());
+}

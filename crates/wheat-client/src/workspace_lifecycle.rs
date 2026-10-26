@@ -52,6 +52,7 @@ pub fn init(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Init
         store.store_id,
         "main".into(),
         resolved.basis,
+        resolved.selected_frontier,
     );
     crate::workspace_registry_service::reconcile(workspace_root, &store_root, &workspace)?;
     workspace.initialize(workspace_root)?;

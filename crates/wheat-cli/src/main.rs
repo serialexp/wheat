@@ -1454,6 +1454,7 @@ fn import(
         store.store_id,
         selected_label.clone(),
         resolved.basis,
+        resolved.selected_frontier,
     );
     drop(repository);
     let phase_started = std::time::Instant::now();
@@ -1548,9 +1549,9 @@ fn materialize_active_workspace(
         &mut context.workspace,
     ))?;
     selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
-    let resolved = runtime()?.block_on(frontier_service::resolve(
+    let resolved = runtime()?.block_on(frontier_service::pinned(
         &repository,
-        &context.workspace.active_label,
+        context.workspace.basis,
         context.workspace.selected_frontier,
     ))?;
     let view = resolved.effective_view();
@@ -2382,6 +2383,7 @@ fn native_clone(
         store.store_id,
         label_name.clone(),
         resolved.basis,
+        resolved.selected_frontier,
     );
     workspace_registry_service::reconcile(&workspace_root, &store_root, &workspace)?;
     workspace.initialize(&workspace_root)?;

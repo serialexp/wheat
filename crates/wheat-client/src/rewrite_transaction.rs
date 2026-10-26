@@ -554,8 +554,13 @@ mod tests {
         let store_root = store_root.canonicalize().unwrap();
         let workspace_root = temporary.path().join("workspace");
         fs::create_dir(&workspace_root).unwrap();
-        let metadata =
-            WorkspaceMetadata::new(store_root.clone(), store.store_id, "main".into(), view(1));
+        let metadata = WorkspaceMetadata::new(
+            store_root.clone(),
+            store.store_id,
+            "main".into(),
+            view(1),
+            None,
+        );
         metadata.initialize(&workspace_root).unwrap();
         workspace_registry_service::reconcile(&workspace_root, &store_root, &metadata).unwrap();
         let workspace_root = workspace_root.canonicalize().unwrap();
@@ -622,6 +627,7 @@ mod tests {
             repository.store_id,
             "main".into(),
             view(1),
+            None,
         );
         second.initialize(&second_root).unwrap();
         workspace_registry_service::reconcile(&second_root, &store_root, &second).unwrap();

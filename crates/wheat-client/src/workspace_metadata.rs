@@ -169,7 +169,15 @@ impl StoreMetadata {
 }
 
 impl WorkspaceMetadata {
-    pub fn new(store_path: PathBuf, store_id: Uuid, active_label: String, basis: ViewId) -> Self {
+    /// A workspace on `active_label` at `basis`, pinning `selected_frontier` when the
+    /// label had one frontier to select. Materializing reads only what is pinned here.
+    pub fn new(
+        store_path: PathBuf,
+        store_id: Uuid,
+        active_label: String,
+        basis: ViewId,
+        selected_frontier: Option<ViewId>,
+    ) -> Self {
         Self {
             workspace_id: Uuid::now_v7(),
             registration_token: Uuid::now_v7(),
@@ -180,7 +188,7 @@ impl WorkspaceMetadata {
             active_label,
             basis,
             observed_label_binding: basis,
-            selected_frontier: None,
+            selected_frontier,
             materialized: None,
             selected_change: None,
             pending_repository_operation: None,
@@ -353,8 +361,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store_id = Uuid::now_v7();
         let basis = ViewId::from_digest([3; 32]);
-        let original =
-            WorkspaceMetadata::new(PathBuf::from("/store"), store_id, "main".into(), basis);
+        let original = WorkspaceMetadata::new(
+            PathBuf::from("/store"),
+            store_id,
+            "main".into(),
+            basis,
+            None,
+        );
         original.initialize(root.path()).unwrap();
         let mut replacement = original.clone();
         replacement.selected_frontier = Some(ViewId::from_digest([4; 32]));
@@ -380,8 +393,8 @@ mod tests {
             Uuid::now_v7(),
             "main".into(),
             basis,
+            Some(frontier),
         );
-        metadata.selected_frontier = Some(frontier);
         metadata.selected_change = Some(wheat_core::ChangeId::new());
         metadata.materialized = Some(MaterializedState {
             repository_head: head,
@@ -415,6 +428,7 @@ mod tests {
             Uuid::now_v7(),
             "main".into(),
             ViewId::from_digest([1; 32]),
+            None,
         );
         let error = metadata.initialize(root.path()).unwrap_err();
         assert!(format!("{error:#}").contains("not UTF-8"), "{error:#}");

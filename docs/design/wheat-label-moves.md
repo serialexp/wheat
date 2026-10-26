@@ -587,6 +587,15 @@ size for `just test`; release run; results under `bench/results/`.
    another.
 4. Materialize from the pinned basis; the journal's binding check. (Full validation
    already left the read paths in the prerequisite.)
+   **Done 2026-10-26**: `frontier_service::pinned` reads the workspace's basis and
+   selected frontier, checking only that the head retains them; `materialize` uses it.
+   `authenticate_target` checks `basis == observed_label_binding` within the journal
+   and that the head retains its views, without reading the label. `init`, `import`
+   and `clone` now pin the frontier they resolved in the new workspace's metadata
+   (`WorkspaceMetadata::new` takes it), since a refused first materialization used to
+   rely on `materialize` re-resolving the label to find it. Tests in
+   `materialization_recovery.rs`: materialize after the label moved or was deleted,
+   and recovery of an interrupted switch after its label was deleted.
 5. Label move in mutation publication; `label move`; workspace rebind.
    **Store part done 2026-10-26**: `LabelMove { name, from, to }`,
    `prepare_mutation_publication_moving_label` and
