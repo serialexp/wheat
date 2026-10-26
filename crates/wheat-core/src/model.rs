@@ -26,7 +26,7 @@ pub struct FileValue {
 
 pub type Tree = BTreeMap<String, FileValue>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectoryEntry {
     File(FileValue),
     Directory(crate::TreeId),

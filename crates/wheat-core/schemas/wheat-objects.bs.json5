@@ -40,6 +40,8 @@
         { type: "ViewLineageMapNodeV1", when: "value == 0x1201" },
         { type: "ProjectedCommitSetNodeV1", when: "value == 0x1301" },
         { type: "ChangeSetNodeV1", when: "value == 0x1401" },
+        { type: "ChunkedTreeV1", when: "value == 0x1501" },
+        { type: "DirectoryChunkNodeV1", when: "value == 0x1601" },
       ],
     },
 
@@ -82,6 +84,7 @@
     ViewLineageMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
     RepositoryStateId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewLabelManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    DirectoryChunkId: { sequence: [{ name: "digest", type: "Digest256" }] },
 
     TreeV1: {
       sequence: [
@@ -137,6 +140,39 @@
       sequence: [
         { name: "entry_kind", type: "uint8", const: 1 },
         { name: "directory", type: "TreeId" },
+      ],
+    },
+
+    // A directory of more than 256 entries. A TreeId names either a TreeV1 (at most
+    // 256 entries) or this, never the other layout for the same entries.
+    ChunkedTreeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x1501 },
+        // The number of entries in the directory, more than 256.
+        { name: "count", type: "varlength", encoding: "leb128_canonical" },
+        { name: "root", type: "DirectoryChunkId" },
+      ],
+    },
+    // Radix node keyed by BLAKE3-256 of an entry's name. An entry keeps its name; its
+    // suffix is the rest of that hash.
+    DirectoryChunkNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x1601 },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "DirectoryChunkChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "DirectoryChunkEntryV1" } },
+      ],
+    },
+    DirectoryChunkChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "DirectoryChunkId" },
+      ],
+    },
+    DirectoryChunkEntryV1: {
+      sequence: [
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
+        { name: "entry", type: "DirectoryEntryV1" },
       ],
     },
 

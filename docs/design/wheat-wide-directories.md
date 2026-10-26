@@ -1,9 +1,10 @@
 # Wheat wide directories — Design
 
-Status: partial (2026-10-26): option A, threshold 256; step 0 landed. A
-tree-format change, so it lands before the V1 format freeze.
+Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 and
+1 landed (format, validation, core builder; not yet used by `tree_objects` or the
+store). A tree-format change, so it lands before the V1 format freeze.
 Owner: bart
-Last updated: 2026-10-26
+Last updated: 2026-10-26 (step 1)
 
 ## Implementation status
 
@@ -21,12 +22,29 @@ land and move them from Outstanding to Done.
   in the shared `validate_directory_component`, so capture, Git import (a
   wider Git name is refused with `InvalidDirectoryComponent`) and canonical
   validation all refuse longer names, and a chunk node's bytes are bounded.
+- [x] **Decision — where the count lives (2026-10-26).** A `TreeId` names a
+  small `ChunkedTreeV1` header `{count, root}`; the chunk nodes are a plain radix
+  collection. Bart did not answer in time, so this was the default; see
+  [Format](#format).
+- [x] **Decision — leaf buckets (2026-10-26).** `B` = 2: up to two entries sharing
+  their next key byte stay inline. Bart chose it from the measurements in
+  [Format](#format).
+- [x] **Step 1 — format.** `ChunkedTreeV1` (0x1501) and `DirectoryChunkNodeV1`
+  (0x1601), object kinds 23 and 24, `DirectoryChunkId`, core types, canonical
+  validation of both (count above 256, bucket rule, every entry's suffix the tail
+  of its name's key), the reference builder `build_directory`, and the
+  references `object_graph` follows.
 
 ### Outstanding
 
-- [ ] **Step 1 — format.** The chunk node schema, wire tags, core types,
-  canonical validation (flat iff at most `T` entries), and the core reference
-  builder (`wire::tree_objects`, `collection_builders.rs`).
+- [ ] **Switch-on.** `wire::tree_objects` builds with `build_directory`, and
+  `TreeV1` refuses more than 256 entries. Lands with steps 3 and 5, once the store
+  reads and writes chunks, so no two writers disagree on a tree's ID.
+- [ ] **Step 1b — radix buckets in the store.** `radix.rs` gains the
+  per-collection bucket (1 for every existing collection) in `validate_node_at`,
+  updates, diffs and walks, and `Collection::Value` relaxes from `Copy` to `Clone`.
+  A reader below the root also checks the rule's non-local half: a node without
+  children holds more than `B` entries.
 - [ ] **Step 2 — store reads.** One directory reader in `merkle_tree.rs` that
   hides the layout: name lookup, sorted multi-lookup, ordered iteration, and a
   two-directory diff. Move every reader in [Callers](#callers) onto it.
@@ -212,6 +230,67 @@ follows:
   node counts, whole walks and the 256↔257 transition, not only reads per
   lookup.
 
+## Format
+
+A `TreeId` names one of two objects:
+
+- `TreeV1`, a flat directory of at most 256 entries;
+- `ChunkedTreeV1 {count, root}`, a directory of more, whose entries are in a radix
+  of `DirectoryChunkNodeV1` nodes. `count` is how many entries the directory holds.
+  A writer uses it to know when a removal crosses back to 256, which turns the
+  directory flat again, without reading every node.
+
+The header costs one extra read of 36 bytes per wide directory a reader visits.
+Putting the count in the root node instead would save that read, but `radix.rs`
+would then have to carry a field that only the root has through every rewrite.
+
+A chunk node is a radix node over the 32-byte key `BLAKE3(name)`, with prefix,
+children and inline entries; an entry is `{suffix, name, value}`, where the suffix
+is the rest of the name's key. Unlike other collections it keeps a *bucket* of up
+to `B` = 2 entries that share their next key byte inline, and only a larger group
+becomes a child.
+
+**Why buckets.** With single-entry buckets, as in every other collection, each
+collision on a key byte becomes its own two-entry node. 257 entries spread over
+256 first bytes leave about 70 collisions, so the directory takes 72 objects.
+Measured with the core builder (names like `file-00042.txt`, 14 bytes):
+
+| Entries | Flat | `B`=1 | `B`=2 | `B`=4 | `B`=8 | `B`=16 |
+|---|---|---|---|---|---|---|
+| **Mean bytes a one-entry change rewrites** | | | | | | |
+| 257 | 12.6 KB | 10.5 KB | 17.5 KB | 21 KB | 21 KB | 21 KB |
+| 1,000 | 49 KB | 9.4 KB | 13.9 KB | 39.5 KB | 80 KB | 82 KB |
+| 4,000 | 195 KB | 9.7 KB | 9.8 KB | 10.1 KB | 13.6 KB | 170 KB |
+| 10,000 | 489 KB | 11.3 KB | 11.7 KB | 11.7 KB | 11.7 KB | 11.7 KB |
+| 100,000 | 4.9 MB | 19.4 KB | 27.7 KB | 38 KB | 40 KB | 40 KB |
+| **Objects** | | | | | | |
+| 257 | 1 | 72 | 18 | 1 | 1 | 1 |
+| 1,000 | 1 | 240 | 199 | 96 | 3 | 1 |
+| 10,000 | 1 | 948 | 289 | 257 | 257 | 257 |
+| 100,000 | 1 | 30,081 | 13,219 | 1,534 | 258 | 257 |
+
+A larger `B` leaves fewer objects. The cost is that the root can hold up to
+`256 × B` entries inline, so a directory below that size is one node, and a
+change rewrites all of it.
+
+**Size.** Total bytes are 1.7–1.9× flat for every `B`. Most of the overhead is the
+stored suffix, about 32 bytes per entry against names of 14 bytes here. Dropping
+the suffix would bring the total to about 1.1× flat, because readers would
+recompute `BLAKE3(name)`. Bart kept the suffix.
+
+**Validation.** Checked within one node:
+
+- The suffixes are sorted and all the same length.
+- Each suffix is the tail of its own name's key.
+- No bucket exceeds `B` or shares its byte with a child.
+- The node branches on at least two bytes.
+
+Checked by a reader walking from the root:
+
+- The key bytes above a node.
+- A node below the root with no children holds more than `B` entries.
+- `count` matches the entries, checked by a full walk.
+
 ## Callers
 
 From the survey of the tree today, grouped by what they need:
@@ -244,6 +323,10 @@ From the survey of the tree today, grouped by what they need:
 The steps in the checklist, in order. Steps 2 and 3 can land with only a flat
 layout behind the new reader and writer (no behaviour change), then step 1's
 chunked layout switches on.
+
+Step 1 has landed with the format, validation and core builder, but nothing
+writes chunks yet. Readers can be built and tested against `build_directory`'s
+output before any writer switches over.
 
 ## Open questions for review
 

@@ -202,6 +202,8 @@ impl SegmentIndexEntry {
             // 19 and 20 were the removed content-set snapshot and delta kinds.
             crate::CanonicalObjectKind::ProjectedCommitSetNode => 21,
             crate::CanonicalObjectKind::ChangeSetNode => 22,
+            crate::CanonicalObjectKind::ChunkedTree => 23,
+            crate::CanonicalObjectKind::DirectoryChunkNode => 24,
         }
     }
 
@@ -228,6 +230,8 @@ impl SegmentIndexEntry {
             18 => crate::CanonicalObjectKind::ViewLineageMapNode,
             21 => crate::CanonicalObjectKind::ProjectedCommitSetNode,
             22 => crate::CanonicalObjectKind::ChangeSetNode,
+            23 => crate::CanonicalObjectKind::ChunkedTree,
+            24 => crate::CanonicalObjectKind::DirectoryChunkNode,
             _ => return None,
         })
     }

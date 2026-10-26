@@ -149,8 +149,17 @@ fn edit_kind_index_entry_round_trips_and_unassigned_kinds_are_rejected() {
         Some(CanonicalObjectKind::ContentSetNode)
     );
 
+    assert_eq!(
+        SegmentIndexEntry::canonical_kind(23),
+        Some(CanonicalObjectKind::ChunkedTree)
+    );
+    assert_eq!(
+        SegmentIndexEntry::canonical_kind(24),
+        Some(CanonicalObjectKind::DirectoryChunkNode)
+    );
+
     // 19 and 20 were the removed content-set snapshot and delta kinds.
-    for kind in [0, 19, 20, 23, u16::MAX] {
+    for kind in [0, 19, 20, 25, u16::MAX] {
         let invalid = SegmentIndexPage {
             entries: vec![SegmentIndexEntry {
                 namespace: SEGMENT_NAMESPACE_METADATA,

@@ -12,9 +12,9 @@
 
 use wheat_core::{
     ApplicationRecord, ApplicationResultRecord, CanonicalObjectError, Change, Conflict, ContentId,
-    DirectoryEntry, DirectoryNode, EditFailure, EditOperation, EditRecord, ObjectId,
-    RepositoryEnvelopeRecord, RepositoryStateRecord, RevisionRecord, ViewLabelManifestRecord,
-    ViewRecord,
+    DirectoryChunkNode, DirectoryEntry, DirectoryNode, EditFailure, EditOperation, EditRecord,
+    ObjectId, RepositoryEnvelopeRecord, RepositoryStateRecord, RevisionRecord,
+    ViewLabelManifestRecord, ViewRecord,
 };
 
 use crate::{
@@ -147,6 +147,14 @@ pub(crate) enum TreeSite<'a> {
     Directory(&'a str),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChunkSite<'a> {
+    /// A child chunk of the node.
+    Chunk,
+    /// The subdirectory with this name.
+    Directory(&'a str),
+}
+
 pub(crate) fn tree<'a, E>(
     node: &'a DirectoryNode,
     mut f: impl FnMut(Ref<TreeSite<'a>>) -> Result<(), E>,
@@ -155,6 +163,30 @@ pub(crate) fn tree<'a, E>(
         match entry {
             DirectoryEntry::Directory(id) => {
                 f(Ref::Object(TreeSite::Directory(name), (*id).into()))?;
+            }
+            DirectoryEntry::File(value) => f(Ref::Content(value.content))?,
+        }
+    }
+    Ok(())
+}
+
+/// The references of a wide directory's chunk node: its child chunks, then its
+/// entries' subdirectories and blobs. Unlike other radix nodes, what it refers to
+/// does not depend on where it sits.
+pub(crate) fn directory_chunk<'a, E>(
+    node: &'a DirectoryChunkNode,
+    mut f: impl FnMut(Ref<ChunkSite<'a>>) -> Result<(), E>,
+) -> Result<(), E> {
+    for child in &node.children {
+        f(Ref::Object(ChunkSite::Chunk, child.child.into()))?;
+    }
+    for (_, chunk_entry) in &node.entries {
+        match chunk_entry.entry {
+            DirectoryEntry::Directory(id) => {
+                f(Ref::Object(
+                    ChunkSite::Directory(&chunk_entry.name),
+                    id.into(),
+                ))?;
             }
             DirectoryEntry::File(value) => f(Ref::Content(value.content))?,
         }
@@ -628,6 +660,13 @@ where
         ObjectKind::Tree => tree(&wheat_core::decode_directory_node(bytes)?, |reference| {
             f(plain(reference))
         }),
+        ObjectKind::ChunkedTree => f(Reference::Object(
+            wheat_core::decode_chunked_tree(bytes)?.root.into(),
+        )),
+        ObjectKind::DirectoryChunkNode => directory_chunk(
+            &wheat_core::decode_directory_chunk_node(bytes)?,
+            |reference| f(plain(reference)),
+        ),
         ObjectKind::Revision => {
             revision(&wheat_core::decode_revision_record(bytes)?, |reference| {
                 f(plain(reference))

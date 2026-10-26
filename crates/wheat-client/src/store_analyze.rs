@@ -53,6 +53,8 @@ fn kind_name(kind: u16) -> &'static str {
             ObjectKind::ViewLineageMapNode => "ViewLineageMapNode",
             ObjectKind::ProjectedCommitSetNode => "ProjectedCommitSetNode",
             ObjectKind::ChangeSetNode => "ChangeSetNode",
+            ObjectKind::ChunkedTree => "ChunkedTree",
+            ObjectKind::DirectoryChunkNode => "DirectoryChunkNode",
         })
         .unwrap_or("Unknown")
 }
@@ -70,7 +72,13 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn is_git_equivalent_kind(kind: u16) -> bool {
     matches!(
         ObjectKind::from_code(kind),
-        Some(ObjectKind::Tree | ObjectKind::Revision | ObjectKind::ViewLabelManifest)
+        Some(
+            ObjectKind::Tree
+                | ObjectKind::ChunkedTree
+                | ObjectKind::DirectoryChunkNode
+                | ObjectKind::Revision
+                | ObjectKind::ViewLabelManifest
+        )
     )
 }
 

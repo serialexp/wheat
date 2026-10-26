@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApplicationId, ApplicationMapId, CanonicalObjectError, ChangeMapId, ChangeObjectId,
-    ChangeSetId, ConflictSetId, ContentMapId, ContentSetId, ProjectedCommitSetId, RetainedSetId,
-    ViewLineageMapId,
+    ChangeSetId, ConflictSetId, ContentMapId, ContentSetId, DirectoryChunkId, DirectoryEntry,
+    ProjectedCommitSetId, RetainedSetId, TreeId, ViewLineageMapId,
 };
 
 macro_rules! child {
@@ -25,6 +25,87 @@ child!(RetainedSetChild, RetainedSetId);
 child!(ProjectedCommitSetChild, ProjectedCommitSetId);
 child!(ChangeSetChild, ChangeSetId);
 child!(ViewLineageMapChild, ViewLineageMapId);
+
+/// One child of a [`DirectoryChunkNode`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryChunkChild {
+    pub edge: u8,
+    pub child: DirectoryChunkId,
+}
+
+/// An entry of a wide directory: its name and what the name holds. It sits in the
+/// directory's radix at `directory_name_key(name)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryChunkEntry {
+    pub name: String,
+    pub entry: DirectoryEntry,
+}
+
+/// A node of a wide directory's radix over the BLAKE3 hash of each entry's name
+/// ([`crate::directory_name_key`]). Every node branches at least twice: the root
+/// holds more than [`crate::FLAT_DIRECTORY_MAX_ENTRIES`] entries and a single entry
+/// below it is inlined in its parent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryChunkNode {
+    pub prefix: Vec<u8>,
+    pub children: Vec<DirectoryChunkChild>,
+    /// Inline entries: the rest of each entry's key, with the entry.
+    pub entries: Vec<(Vec<u8>, DirectoryChunkEntry)>,
+}
+
+impl DirectoryChunkNode {
+    pub fn new(
+        prefix: Vec<u8>,
+        mut children: Vec<DirectoryChunkChild>,
+        mut entries: Vec<(Vec<u8>, DirectoryChunkEntry)>,
+    ) -> Result<Self, CanonicalObjectError> {
+        children.sort_by_key(|child| child.edge);
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let node = Self {
+            prefix,
+            children,
+            entries,
+        };
+        crate::wire::validate_directory_chunk_node(&node)?;
+        Ok(node)
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::directory_chunk_node_bytes(self)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> DirectoryChunkId {
+        DirectoryChunkId::of_canonical_bytes(&self.canonical_bytes())
+    }
+}
+
+/// A directory of more than [`crate::FLAT_DIRECTORY_MAX_ENTRIES`] entries: how many
+/// it holds and the root of their radix. Its ID is the directory's [`TreeId`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkedTree {
+    pub count: u64,
+    pub root: DirectoryChunkId,
+}
+
+impl ChunkedTree {
+    pub fn new(count: u64, root: DirectoryChunkId) -> Result<Self, CanonicalObjectError> {
+        let tree = Self { count, root };
+        crate::wire::validate_chunked_tree(&tree)?;
+        Ok(tree)
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::chunked_tree_bytes(self)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> TreeId {
+        TreeId::of_canonical_bytes(&self.canonical_bytes())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationMapNode {

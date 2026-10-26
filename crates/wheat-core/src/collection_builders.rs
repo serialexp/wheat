@@ -15,11 +15,19 @@ use crate::{
     RevisionMapChild, RevisionMapId, RevisionMapNode, ViewId, ViewLineageMapChild,
     ViewLineageMapId, ViewLineageMapNode,
 };
+use crate::{
+    CanonicalObjectError, ChunkedTree, DirectoryChunkChild, DirectoryChunkEntry, DirectoryChunkId,
+    DirectoryChunkNode, DirectoryEntry, DirectoryNode, FLAT_DIRECTORY_MAX_ENTRIES, TreeId,
+    directory_name_key,
+};
 
 trait RadixShape {
     type Key: Ord;
-    type Value: Copy;
+    type Value: Clone;
     type Id: Copy + Into<ObjectId>;
+    /// The most entries sharing their next key byte that stay inline in a node;
+    /// a larger group becomes a child.
+    const BUCKET: usize = 1;
 
     fn key_bytes(key: &Self::Key) -> &[u8];
     fn node(
@@ -55,7 +63,13 @@ where
     let prefix = first[depth..end_prefix].to_vec();
     if end_prefix == key_len {
         debug_assert_eq!(entries.len(), 1);
-        return emit_node::<S, F>(prefix, Some(entries[0].1), Vec::new(), Vec::new(), emit);
+        return emit_node::<S, F>(
+            prefix,
+            Some(entries[0].1.clone()),
+            Vec::new(),
+            Vec::new(),
+            emit,
+        );
     }
 
     let mut children = Vec::new();
@@ -65,10 +79,12 @@ where
         let edge = S::key_bytes(&entries[start].0)[end_prefix];
         let end = start
             + entries[start..].partition_point(|(key, _)| S::key_bytes(key)[end_prefix] == edge);
-        if end - start == 1 {
-            // Single-entry group: inline it instead of creating a child node.
-            let suffix = S::key_bytes(&entries[start].0)[end_prefix..].to_vec();
-            inline_entries.push((suffix, entries[start].1));
+        if end - start <= S::BUCKET {
+            // A small group stays inline instead of becoming a child node.
+            for (key, value) in &entries[start..end] {
+                let suffix = S::key_bytes(key)[end_prefix..].to_vec();
+                inline_entries.push((suffix, value.clone()));
+            }
         } else {
             let child = build_subtree::<S, F>(end_prefix + 1, &entries[start..end], emit);
             children.push((edge, child));
@@ -263,6 +279,84 @@ impl RadixShape for ViewLineageShape {
         let bytes = node.canonical_bytes();
         (ViewLineageMapId::of_canonical_bytes(&bytes), bytes)
     }
+}
+
+struct DirectoryChunkShape;
+impl RadixShape for DirectoryChunkShape {
+    type Key = [u8; 32];
+    type Value = DirectoryChunkEntry;
+    type Id = DirectoryChunkId;
+    const BUCKET: usize = crate::DIRECTORY_CHUNK_BUCKET;
+
+    fn key_bytes(key: &Self::Key) -> &[u8] {
+        key
+    }
+
+    fn node(
+        prefix: Vec<u8>,
+        value: Option<Self::Value>,
+        children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
+    ) -> (Self::Id, Vec<u8>) {
+        // A chunked directory has more than one entry, so its radix never ends in a
+        // terminal root.
+        assert!(value.is_none(), "a directory chunk node holds no value");
+        let node = DirectoryChunkNode::new(
+            prefix,
+            children
+                .into_iter()
+                .map(|(edge, child)| DirectoryChunkChild { edge, child })
+                .collect(),
+            entries,
+        )
+        .expect("builder produces a valid directory chunk node");
+        let bytes = node.canonical_bytes();
+        (DirectoryChunkId::of_canonical_bytes(&bytes), bytes)
+    }
+}
+
+/// Builds one directory in its canonical layout and emits its objects: a flat
+/// `TreeV1` of at most [`FLAT_DIRECTORY_MAX_ENTRIES`] entries, or a [`ChunkedTree`]
+/// over a radix of chunk nodes. Two names with the same [`directory_name_key`]
+/// cannot share a chunked directory and are refused.
+pub fn build_directory(
+    entries: BTreeMap<String, DirectoryEntry>,
+    mut emit: impl FnMut(CanonicalObject),
+) -> Result<TreeId, CanonicalObjectError> {
+    if entries.len() <= FLAT_DIRECTORY_MAX_ENTRIES {
+        let node = DirectoryNode::new(entries)?;
+        let bytes = node.canonical_bytes();
+        let id = TreeId::of_canonical_bytes(&bytes);
+        emit(CanonicalObject {
+            id: id.into(),
+            bytes,
+        });
+        return Ok(id);
+    }
+    let count = entries.len() as u64;
+    let mut keyed = Vec::with_capacity(entries.len());
+    for (name, entry) in entries {
+        crate::validate_directory_component(&name)?;
+        keyed.push((
+            directory_name_key(&name),
+            DirectoryChunkEntry { name, entry },
+        ));
+    }
+    keyed.sort_unstable_by_key(|(key, _)| *key);
+    if keyed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(CanonicalObjectError::InvalidCollection(
+            "two directory names have the same key",
+        ));
+    }
+    let root = build_sorted::<DirectoryChunkShape, _>(keyed, &mut emit);
+    let tree = ChunkedTree::new(count, root)?;
+    let bytes = tree.canonical_bytes();
+    let id = TreeId::of_canonical_bytes(&bytes);
+    emit(CanonicalObject {
+        id: id.into(),
+        bytes,
+    });
+    Ok(id)
 }
 
 macro_rules! set_shape {

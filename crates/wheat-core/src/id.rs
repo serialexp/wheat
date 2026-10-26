@@ -116,6 +116,7 @@ digest_id!(RetainedSetId);
 digest_id!(ProjectedCommitSetId);
 digest_id!(ChangeSetId);
 digest_id!(ViewLineageMapId);
+digest_id!(DirectoryChunkId);
 
 /// A member of a [`ProjectedCommitSetId`] set: application `application` projects as
 /// the Git SHA-1 commit `commit`. The commit leads, so the members for one commit are
@@ -197,6 +198,7 @@ object_id_from!(
     ProjectedCommitSetId,
     ChangeSetId,
     ViewLineageMapId,
+    DirectoryChunkId,
 );
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

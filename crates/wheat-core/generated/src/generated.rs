@@ -32,6 +32,8 @@ pub enum WheatObject {
     ViewLineageMapNodeV1(ViewLineageMapNodeV1Output),
     ProjectedCommitSetNodeV1(ProjectedCommitSetNodeV1Output),
     ChangeSetNodeV1(ChangeSetNodeV1Output),
+    ChunkedTreeV1(ChunkedTreeV1Output),
+    DirectoryChunkNodeV1(DirectoryChunkNodeV1Output),
 }
 
 impl WheatObject {
@@ -334,6 +336,26 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
             }
+            WheatObject::ChunkedTreeV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_varlength(v.count, "leb128_canonical")?;
+                v.root.encode_into(encoder)?;
+            }
+            WheatObject::DirectoryChunkNodeV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_varlength(v.prefix.len() as u64, "leb128_canonical")?;
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_varlength(v.children.len() as u64, "leb128_canonical")?;
+                for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_varlength(v.entries.len() as u64, "leb128_canonical")?;
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
+            }
         }
         Ok(())
     }
@@ -425,6 +447,14 @@ impl WheatObject {
         } else if value == 0x1401 {
             Ok(WheatObject::ChangeSetNodeV1(
                 ChangeSetNodeV1Output::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x1501 {
+            Ok(WheatObject::ChunkedTreeV1(
+                ChunkedTreeV1Output::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x1601 {
+            Ok(WheatObject::DirectoryChunkNodeV1(
+                DirectoryChunkNodeV1Output::decode_with_decoder(decoder)?,
             ))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
@@ -1084,6 +1114,34 @@ impl ViewLabelManifestId {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryChunkId {
+    pub digest: Digest256,
+}
+
+impl DirectoryChunkId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self { digest })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TreeV1Input {
     pub entries: Vec<DirectoryEntryV1>,
 }
@@ -1443,6 +1501,257 @@ impl From<DirectoryEntryRefV1Input> for DirectoryEntryRefV1Output {
             entry_kind: 1u8,
             directory: i.directory,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkedTreeV1Input {
+    pub count: u64,
+    pub root: DirectoryChunkId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkedTreeV1Output {
+    pub wire_tag: u16,
+    pub count: u64,
+    pub root: DirectoryChunkId,
+}
+
+pub type ChunkedTreeV1 = ChunkedTreeV1Output;
+
+impl ChunkedTreeV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(5377);
+        encoder.write_varlength(self.count, "leb128_canonical")?;
+        self.root.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl ChunkedTreeV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 5377u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 5377, got {}",
+                wire_tag
+            )));
+        }
+        let count = decoder.read_varlength("leb128_canonical")?;
+        let root = DirectoryChunkId::decode_with_decoder(decoder)?;
+        Ok(Self {
+            wire_tag,
+            count,
+            root,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ChunkedTreeV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ChunkedTreeV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ChunkedTreeV1Output> for ChunkedTreeV1Input {
+    fn from(o: ChunkedTreeV1Output) -> Self {
+        Self {
+            count: o.count,
+            root: o.root,
+        }
+    }
+}
+
+impl From<ChunkedTreeV1Input> for ChunkedTreeV1Output {
+    fn from(i: ChunkedTreeV1Input) -> Self {
+        Self {
+            wire_tag: 5377u16,
+            count: i.count,
+            root: i.root,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryChunkNodeV1Input {
+    pub prefix: Vec<u8>,
+    pub children: Vec<DirectoryChunkChildV1>,
+    pub entries: Vec<DirectoryChunkEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryChunkNodeV1Output {
+    pub wire_tag: u16,
+    pub prefix: Vec<u8>,
+    pub children: Vec<DirectoryChunkChildV1>,
+    pub entries: Vec<DirectoryChunkEntryV1>,
+}
+
+pub type DirectoryChunkNodeV1 = DirectoryChunkNodeV1Output;
+
+impl DirectoryChunkNodeV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(5633);
+        encoder.write_varlength(self.prefix.len() as u64, "leb128_canonical")?;
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_varlength(self.children.len() as u64, "leb128_canonical")?;
+        for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_varlength(self.entries.len() as u64, "leb128_canonical")?;
+        for item in &self.entries {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl DirectoryChunkNodeV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 5633u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 5633, got {}",
+                wire_tag
+            )));
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let prefix = decoder.read_bytes_vec(length)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
+        for _ in 0..length {
+            let item = DirectoryChunkChildV1::decode_with_decoder(decoder)?;
+            children.push(item);
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 35));
+        for _ in 0..length {
+            let item = DirectoryChunkEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            prefix,
+            children,
+            entries,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        DirectoryChunkNodeV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        DirectoryChunkNodeV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<DirectoryChunkNodeV1Output> for DirectoryChunkNodeV1Input {
+    fn from(o: DirectoryChunkNodeV1Output) -> Self {
+        Self {
+            prefix: o.prefix,
+            children: o.children,
+            entries: o.entries,
+        }
+    }
+}
+
+impl From<DirectoryChunkNodeV1Input> for DirectoryChunkNodeV1Output {
+    fn from(i: DirectoryChunkNodeV1Input) -> Self {
+        Self {
+            wire_tag: 5633u16,
+            prefix: i.prefix,
+            children: i.children,
+            entries: i.entries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryChunkChildV1 {
+    pub edge: u8,
+    pub child: DirectoryChunkId,
+}
+
+impl DirectoryChunkChildV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.edge);
+        self.child.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edge = decoder.read_byte()?;
+        let child = DirectoryChunkId::decode_with_decoder(decoder)?;
+        Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryChunkEntryV1 {
+    pub suffix: Vec<u8>,
+    pub entry: DirectoryEntryV1,
+}
+
+impl DirectoryChunkEntryV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_varlength(self.suffix.len() as u64, "leb128_canonical")?;
+        for item in &self.suffix {
+            encoder.write_byte(*item);
+        }
+        self.entry.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let suffix = decoder.read_bytes_vec(length)?;
+        let entry = DirectoryEntryV1::decode_with_decoder(decoder)?;
+        Ok(Self { suffix, entry })
     }
 }
 

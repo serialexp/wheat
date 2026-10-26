@@ -13,6 +13,9 @@ use crate::{
     RevisionId, RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance, Timestamp,
     Tree, TreeId, ViewLineageMapChild, ViewLineageMapNode,
 };
+use crate::{
+    ChunkedTree, DirectoryChunkChild, DirectoryChunkEntry, DirectoryChunkId, DirectoryChunkNode,
+};
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CanonicalObjectError {
@@ -57,6 +60,8 @@ pub enum CanonicalObjectKind {
     ViewLineageMapNode,
     ProjectedCommitSetNode,
     ChangeSetNode,
+    ChunkedTree,
+    DirectoryChunkNode,
 }
 
 pub fn validate_canonical_object(
@@ -235,6 +240,22 @@ pub fn validate_directory_component(name: &str) -> Result<(), CanonicalObjectErr
     Ok(())
 }
 
+/// The most entries a directory holds as one `TreeV1`; a directory with more is a
+/// [`ChunkedTree`]. Each set of entries has exactly one of the two layouts.
+pub const FLAT_DIRECTORY_MAX_ENTRIES: usize = 256;
+
+/// The most entries of a wide directory's chunk node that share their next key byte
+/// and stay inline; a larger group becomes a child node. Buckets keep a directory
+/// just past [`FLAT_DIRECTORY_MAX_ENTRIES`] in one node instead of one per collision.
+pub const DIRECTORY_CHUNK_BUCKET: usize = 2;
+
+/// Where a wide directory's entry `name` sits in its radix: the BLAKE3-256 hash of
+/// the name, so entries spread evenly whatever their names look like.
+#[must_use]
+pub fn directory_name_key(name: &str) -> [u8; 32] {
+    *blake3::hash(name.as_bytes()).as_bytes()
+}
+
 pub fn decode_directory_node(bytes: &[u8]) -> Result<DirectoryNode, CanonicalObjectError> {
     let object = decode_validated(bytes)?;
     let wire::WheatObject::TreeV1(tree) = object else {
@@ -246,21 +267,217 @@ pub fn decode_directory_node(bytes: &[u8]) -> Result<DirectoryNode, CanonicalObj
     let entries = tree
         .entries
         .into_iter()
-        .map(|entry| {
-            let value = match entry.value {
-                wire::DirectoryEntryValueV1::FileEntryV1(file) => {
-                    DirectoryEntry::File(file_value_domain(&file.value)?)
-                }
-                wire::DirectoryEntryValueV1::DirectoryEntryRefV1(directory) => {
-                    DirectoryEntry::Directory(TreeId::from_digest(digest_domain(
-                        &directory.directory.digest,
-                    )?))
-                }
-            };
-            Ok((entry.name, value))
-        })
+        .map(|entry| Ok((entry.name, directory_entry_domain(&entry.value)?)))
         .collect::<Result<BTreeMap<_, _>, CanonicalObjectError>>()?;
     Ok(DirectoryNode { entries })
+}
+
+pub fn decode_chunked_tree(bytes: &[u8]) -> Result<ChunkedTree, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::ChunkedTreeV1(tree) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::ChunkedTree,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(ChunkedTree {
+        count: tree.count,
+        root: DirectoryChunkId::from_digest(digest_domain(&tree.root.digest)?),
+    })
+}
+
+pub fn decode_directory_chunk_node(
+    bytes: &[u8],
+) -> Result<DirectoryChunkNode, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::DirectoryChunkNodeV1(node) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::DirectoryChunkNode,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(DirectoryChunkNode {
+        prefix: node.prefix,
+        children: node
+            .children
+            .iter()
+            .map(|child| {
+                Ok(DirectoryChunkChild {
+                    edge: child.edge,
+                    child: DirectoryChunkId::from_digest(digest_domain(&child.child.digest)?),
+                })
+            })
+            .collect::<Result<_, CanonicalObjectError>>()?,
+        entries: node
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let value = directory_entry_domain(&entry.entry.value)?;
+                Ok((
+                    entry.suffix,
+                    DirectoryChunkEntry {
+                        name: entry.entry.name,
+                        entry: value,
+                    },
+                ))
+            })
+            .collect::<Result<_, CanonicalObjectError>>()?,
+    })
+}
+
+fn directory_entry_domain(
+    value: &wire::DirectoryEntryValueV1,
+) -> Result<DirectoryEntry, CanonicalObjectError> {
+    Ok(match value {
+        wire::DirectoryEntryValueV1::FileEntryV1(file) => {
+            DirectoryEntry::File(file_value_domain(&file.value)?)
+        }
+        wire::DirectoryEntryValueV1::DirectoryEntryRefV1(directory) => DirectoryEntry::Directory(
+            TreeId::from_digest(digest_domain(&directory.directory.digest)?),
+        ),
+    })
+}
+
+fn directory_entry_wire(name: &str, entry: &DirectoryEntry) -> wire::DirectoryEntryV1 {
+    wire::DirectoryEntryV1 {
+        name: name.to_owned(),
+        value: match entry {
+            DirectoryEntry::File(value) => wire::DirectoryEntryValueV1::FileEntryV1(
+                wire::FileEntryV1Input {
+                    value: file_value(*value),
+                }
+                .into(),
+            ),
+            DirectoryEntry::Directory(directory) => {
+                wire::DirectoryEntryValueV1::DirectoryEntryRefV1(
+                    wire::DirectoryEntryRefV1Input {
+                        directory: tree_id_wire(*directory),
+                    }
+                    .into(),
+                )
+            }
+        },
+    }
+}
+
+/// A chunk node's shape, from its prefix, child edges and `(suffix, name)` entries.
+///
+/// A chunk radix keeps a bucket of up to [`DIRECTORY_CHUNK_BUCKET`] entries that share
+/// their next key byte inline, and only a larger bucket becomes a child. So: entries
+/// are valid names filed under the tail of their own [`directory_name_key`], sorted,
+/// all ending at the same key depth; no bucket exceeds the limit or shares its byte
+/// with a child; and the node branches on at least two bytes, so its prefix is
+/// maximal. The bytes before the suffix depend on where the node sits, and a child
+/// without children of its own must hold more than one bucket's worth: both are for
+/// a reader walking from the root to check.
+fn validate_directory_chunk_shape<'a>(
+    prefix: &[u8],
+    edges: &[u8],
+    entries: impl ExactSizeIterator<Item = (&'a [u8], &'a str)>,
+) -> Result<(), CanonicalObjectError> {
+    const NAME: &str = "directory chunk node";
+    let invalid = || CanonicalObjectError::InvalidCollection(NAME);
+    validate_sorted_unique_by(edges, |edge| edge, NAME)?;
+    let mut previous: Option<&[u8]> = None;
+    let mut bucket = 0;
+    let mut branches = edges.len();
+    for (suffix, name) in entries {
+        validate_directory_component(name)?;
+        let key = directory_name_key(name);
+        if suffix.is_empty()
+            || suffix.len() > key.len()
+            || key[key.len() - suffix.len()..] != *suffix
+        {
+            return Err(CanonicalObjectError::InvalidCollection(
+                "directory chunk entry is not filed under its name's key",
+            ));
+        }
+        match previous {
+            Some(previous) if previous.len() != suffix.len() || previous >= suffix => {
+                return Err(invalid());
+            }
+            Some(previous) if previous[0] == suffix[0] => bucket += 1,
+            _ => {
+                if edges.binary_search(&suffix[0]).is_ok() {
+                    return Err(invalid());
+                }
+                bucket = 1;
+                branches += 1;
+            }
+        }
+        if bucket > DIRECTORY_CHUNK_BUCKET {
+            return Err(invalid());
+        }
+        previous = Some(suffix);
+    }
+    if branches < 2 || prefix.len() >= 32 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_directory_chunk_node(
+    node: &DirectoryChunkNode,
+) -> Result<(), CanonicalObjectError> {
+    validate_directory_chunk_shape(
+        &node.prefix,
+        &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        node.entries
+            .iter()
+            .map(|(suffix, entry)| (suffix.as_slice(), entry.name.as_str())),
+    )
+}
+
+/// A chunked directory holds more entries than a flat one may.
+pub(crate) fn validate_chunked_tree(tree: &ChunkedTree) -> Result<(), CanonicalObjectError> {
+    validate_chunked_count(tree.count)
+}
+
+fn validate_chunked_count(count: u64) -> Result<(), CanonicalObjectError> {
+    if count <= FLAT_DIRECTORY_MAX_ENTRIES as u64 {
+        return Err(CanonicalObjectError::InvalidCollection(
+            "a chunked directory holds more than 256 entries",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn directory_chunk_node_bytes(node: &DirectoryChunkNode) -> Vec<u8> {
+    validate_directory_chunk_node(node)
+        .expect("directory chunk node violates canonical invariants");
+    encode(wire::WheatObject::DirectoryChunkNodeV1(
+        wire::DirectoryChunkNodeV1Input {
+            prefix: node.prefix.clone(),
+            children: node
+                .children
+                .iter()
+                .map(|c| wire::DirectoryChunkChildV1 {
+                    edge: c.edge,
+                    child: directory_chunk_id(c.child),
+                })
+                .collect(),
+            entries: node
+                .entries
+                .iter()
+                .map(|(suffix, entry)| wire::DirectoryChunkEntryV1 {
+                    suffix: suffix.clone(),
+                    entry: directory_entry_wire(&entry.name, &entry.entry),
+                })
+                .collect(),
+        }
+        .into(),
+    ))
+}
+
+pub(crate) fn chunked_tree_bytes(tree: &ChunkedTree) -> Vec<u8> {
+    validate_chunked_tree(tree).expect("chunked tree violates canonical invariants");
+    encode(wire::WheatObject::ChunkedTreeV1(
+        wire::ChunkedTreeV1Input {
+            count: tree.count,
+            root: directory_chunk_id(tree.root),
+        }
+        .into(),
+    ))
 }
 
 pub fn decode_revision_map_node(bytes: &[u8]) -> Result<RevisionMapNode, CanonicalObjectError> {
@@ -971,25 +1188,7 @@ pub(crate) fn directory_node_bytes(node: &DirectoryNode) -> Vec<u8> {
             entries: node
                 .entries
                 .iter()
-                .map(|(name, entry)| wire::DirectoryEntryV1 {
-                    name: name.clone(),
-                    value: match entry {
-                        DirectoryEntry::File(value) => wire::DirectoryEntryValueV1::FileEntryV1(
-                            wire::FileEntryV1Input {
-                                value: file_value(*value),
-                            }
-                            .into(),
-                        ),
-                        DirectoryEntry::Directory(directory) => {
-                            wire::DirectoryEntryValueV1::DirectoryEntryRefV1(
-                                wire::DirectoryEntryRefV1Input {
-                                    directory: tree_id_wire(*directory),
-                                }
-                                .into(),
-                            )
-                        }
-                    },
-                })
+                .map(|(name, entry)| directory_entry_wire(name, entry))
                 .collect(),
         }
         .into(),
@@ -1734,6 +1933,21 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "change set node",
             )?;
         }
+        wire::WheatObject::ChunkedTreeV1(tree) => validate_chunked_count(tree.count)?,
+        wire::WheatObject::DirectoryChunkNodeV1(node) => {
+            validate_directory_chunk_shape(
+                &node.prefix,
+                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                node.entries
+                    .iter()
+                    .map(|entry| (entry.suffix.as_slice(), entry.entry.name.as_str())),
+            )?;
+            for entry in &node.entries {
+                if let wire::DirectoryEntryValueV1::FileEntryV1(file) = &entry.entry.value {
+                    validate_file_value(&file.value)?;
+                }
+            }
+        }
         wire::WheatObject::RepositoryStateV1(_) | wire::WheatObject::RepositoryEnvelopeV1(_) => {}
         wire::WheatObject::ViewLabelManifestV1(manifest) => {
             validate_sorted_unique_by(
@@ -1778,6 +1992,8 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
             CanonicalObjectKind::ProjectedCommitSetNode
         }
         wire::WheatObject::ChangeSetNodeV1(_) => CanonicalObjectKind::ChangeSetNode,
+        wire::WheatObject::ChunkedTreeV1(_) => CanonicalObjectKind::ChunkedTree,
+        wire::WheatObject::DirectoryChunkNodeV1(_) => CanonicalObjectKind::DirectoryChunkNode,
     }
 }
 
@@ -2088,6 +2304,7 @@ wire_digest_id!(
     ViewLabelManifestId
 );
 wire_digest_id!(content_map_id, ContentMapId, ContentMapId);
+wire_digest_id!(directory_chunk_id, DirectoryChunkId, DirectoryChunkId);
 
 fn digest(bytes: &[u8; 32]) -> wire::Digest256 {
     wire::Digest256 {
