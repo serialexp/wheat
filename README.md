@@ -65,6 +65,9 @@ Any `wheat` command can report its own timing:
   to stderr when the command ends.
 - `WHEAT_TRACE=trace.json wheat ...` writes a Chrome trace event timeline. Open it in
   [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`.
+- `WHEAT_STORE_STATS=stats.json wheat ...` writes how many objects and content blobs
+  the command read from its store, and their bytes. Benchmark cases use it to count a
+  command's work (`label_move`).
 
 `wheat-server` honours the same variables and reports when stopped with Ctrl-C. Under
 `wheat-bench quick`, each case process records its own spans, which covers the

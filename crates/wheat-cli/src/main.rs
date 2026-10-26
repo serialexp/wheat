@@ -734,10 +734,14 @@ fn main() -> ExitCode {
     };
     let format = OutputFormat::from(cli.format);
     let command = command_name(&cli.command);
-    match tracing::info_span!("command", command).in_scope(|| execute(cli)) {
+    let code = match tracing::info_span!("command", command).in_scope(|| execute(cli)) {
         Ok(success) => emit_success(format, &success),
         Err(error) => emit_error(format, command, &error),
+    };
+    if let Err(error) = wheat_client::store_stats::write() {
+        eprintln!("wheat: writing WHEAT_STORE_STATS failed: {error}");
     }
+    code
 }
 
 fn command_name(command: &Command) -> &'static str {

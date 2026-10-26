@@ -324,6 +324,13 @@ budget passes, but by only about 0.7 s.
   skip the unchanged ones, so `status` and `changes` are linear in the changes the
   label holds. A diff of the two revision maps (`RevisionMapStore::delta`, as
   `forward` uses) would read only what differs.
+- `[ ]` **Whole-workspace clean checks read every directory chunk (2026-10-26).** In
+  the `label_move` benchmark, before its history changes rewrote a fixed set of files,
+  a `history/` directory of 500 files took `publish`, `pull` and `refresh` from no
+  `DirectoryChunkNode` reads to 81 (`WHEAT_STORE_STATS`): the clean check and `status`
+  compare every tracked file against the view's tree, so they are linear in the
+  workspace even when nothing changed. Find whether the check can skip directories
+  whose chunks match what the workspace last materialized.
 - `[ ]` **`wheat-server::fetch_test a_wanted_object_too_large_for_a_batch_comes_in_chunks`
   failed once in a full workspace run (2026-10-26).** It passed alone 5 times and in 6
   loaded runs of the store and server suites; the failing run's output was not kept.

@@ -3616,6 +3616,7 @@ mod tests {
         let objects = wheat_store::PackedObjectStore::open(root.path().join("storage")).unwrap();
         let content = objects.content_store();
         let repository = LocalRepository {
+            counted: None,
             store_id: Uuid::nil(),
             objects,
             content,

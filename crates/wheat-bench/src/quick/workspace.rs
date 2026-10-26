@@ -107,6 +107,34 @@ impl Workspace {
         measure::run(&mut command, &self.scratch)
     }
 
+    /// Like [`Self::ok_in_stores`], and the objects the command read from its store
+    /// (`WHEAT_STORE_STATS`).
+    pub(crate) fn counted_in_stores(
+        &self,
+        directory: &Path,
+        stores: &Path,
+        arguments: &[&str],
+    ) -> Result<(Captured, u64)> {
+        let stats = self.scratch.join("store-stats.json");
+        let mut command = crate::wheat_command(&self.wheat);
+        command
+            .current_dir(directory)
+            .args(arguments)
+            .env("WHEAT_STORE_HOME", stores)
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("WHEAT_STORE_STATS", &stats);
+        let captured = measure::run(&mut command, &self.scratch)?;
+        captured.ensure_success(&format!("wheat {}", arguments.join(" ")))?;
+        let totals: serde_json::Value = serde_json::from_slice(
+            &fs::read(&stats).with_context(|| format!("read {}", stats.display()))?,
+        )?;
+        fs::remove_file(&stats)?;
+        let reads = totals["object_gets"]
+            .as_u64()
+            .with_context(|| format!("no object_gets in {totals}"))?;
+        Ok((captured, reads))
+    }
+
     /// The directory the workspace was initialized in.
     pub(crate) fn root(&self) -> &Path {
         &self.root

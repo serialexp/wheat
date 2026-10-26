@@ -1,23 +1,5 @@
 # Current task
 
-## 2026-10-22: label moves (@lucky-raven) — plan `docs/design/wheat-label-moves.md`
-
-Review 4 (Codex and Antigravity) is folded into the plan, with Bart's decisions 14–16
-(squash stops at branch points; a separate merge meter; `label move` rebinds only
-when the target is the workspace's effective view). Steps 1–3 are done (see the
-plan's "Order of work"); the merge budget meters walk steps instead of recursion depth
-(Bart, 2026-10-26). The store parts of steps 5, 8 and 9 are done too: `LabelMove` in
-the mutation publication, `union_envelopes_under(…, LabelPolicy::Fetch)` and
-`backward_label`. calm-lynx cleared step 4 (`materialize_active_workspace` in
-main.rs, `authenticate_target` in materialization.rs) and step 10
-(`prepare_tag_push(force_with_lease)` in main.rs's push_tag()) on 2026-10-26; PM them
-again before starting, as main.rs may have moved. Step 9's `force_labels` goes in
-the protocol schema plus the request-digest input in `wheat-objects.bs.json5`, which
-calm-lynx has in flight (directory chunk node), so it waits for that to land.
-
-Paused 2026-10-26 for Bart's Gothab hosting items, now done: content blob store,
-size + label moves, repository create/delete (ce23889), browsing reads (70ce056).
-
 ## 2026-10-22: desktop client (@calm-lynx) — Bart: "read the design for the wheat gui and try to build that"
 
 Design: Claude Design project `0dfb95ac-…` (see CLAUDE.md), comp `Wheat Client.dc.html`.

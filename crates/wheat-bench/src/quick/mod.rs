@@ -27,6 +27,7 @@ mod head_receipts;
 mod history;
 mod import_resume_wide;
 mod increment_validate;
+mod label_move;
 mod latency_proxy;
 mod materialize_wide;
 mod packed_append;
@@ -83,6 +84,7 @@ pub const CASES: &[&str] = &[
     head_receipts::NAME,
     client_history::NAME,
     browse_history::NAME,
+    label_move::NAME,
 ];
 
 /// How big the cases are.
@@ -241,6 +243,7 @@ pub fn run_case(
         head_receipts::NAME => head_receipts::run(&context),
         client_history::NAME => client_history::run(&context),
         browse_history::NAME => browse_history::run(&context),
+        label_move::NAME => label_move::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),
     }
 }

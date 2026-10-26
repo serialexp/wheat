@@ -662,3 +662,12 @@ size for `just test`; release run; results under `bench/results/`.
    without it `tag_exists` names the flag. `wheat push --tag` accepts
    `--force-with-lease` and reports `replaced_tag_oid`. Test in `git_push_tag.rs`.
 11. Race test, docs, benchmark, TODO bookkeeping.
+   **Done 2026-10-26**: the race test is `two_writers_moving_the_label_meet_through_pull`
+   (`label_publish.rs`, with step 9). The benchmark is the `label_move` case: publish,
+   pull, `label move` and refresh at 50 and 500 history changes and 10 and 100
+   revisions, counting the objects each reads from its store (`WHEAT_STORE_STATS`, new
+   for it). Reads grow with the logarithm of the history, in steps as collections gain
+   a level; the contract allows 25% per doubling (one judgement call, Bart did not
+   answer in time; measured up to about 21%, against about 270% if linear). Its history
+   changes rewrite ten files, because a growing tree makes the whole-workspace clean
+   check read every directory chunk (in TODO.md).

@@ -11,6 +11,9 @@ use crate::workspace_metadata::STORE_METADATA_FILE;
 
 /// Every local store keeps its objects and content in one packed store under `storage/`.
 pub struct LocalRepository {
+    /// Counts the store's reads under `WHEAT_STORE_STATS`. Declared before `objects`, so
+    /// it is dropped while the store is still open.
+    pub counted: Option<crate::store_stats::Counted>,
     pub store_id: uuid::Uuid,
     pub objects: PackedObjectStore,
     pub content: ContentStore,
@@ -48,9 +51,15 @@ pub fn projection_path(root: &Path) -> Result<PathBuf> {
 #[tracing::instrument(name = "open_store", level = "debug", skip_all)]
 pub fn open(root: &Path) -> Result<LocalRepository> {
     let store_id = crate::workspace_metadata::StoreMetadata::read(root)?.store_id;
-    let objects = PackedObjectStore::open(storage_path(root)?)?;
+    let (objects, counted) = if crate::store_stats::enabled() {
+        let (objects, trace) = PackedObjectStore::open_traced(storage_path(root)?)?;
+        (objects, Some(crate::store_stats::Counted::new(trace)))
+    } else {
+        (PackedObjectStore::open(storage_path(root)?)?, None)
+    };
     let content = objects.content_store();
     Ok(LocalRepository {
+        counted,
         store_id,
         objects,
         content,

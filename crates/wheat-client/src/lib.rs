@@ -34,6 +34,7 @@ pub mod squash;
 pub mod squash_attribution;
 pub mod store_analyze;
 pub mod store_lookup;
+pub mod store_stats;
 pub mod sys;
 pub mod workspace;
 pub mod workspace_clone;
