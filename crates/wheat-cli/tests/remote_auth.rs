@@ -70,6 +70,7 @@ fn serve_with_token_file() -> Fixture {
                 repositories: [("team/repo".to_owned(), Access::Read)].into(),
             }],
         }),
+        ..FileConfig::default()
     })
     .unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();

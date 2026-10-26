@@ -1015,9 +1015,19 @@ token_hashes = ["<wheat-server hash-token output>"]
 [auth.principals.repositories]
 "*" = "read"                 # exact names win over "*"
 "serialexp/wheat" = "force"  # read < publish < force
+
+[limits]                     # optional; these are the defaults
+session_setup_seconds = 10   # from accept until the caller is authenticated
+max_connections = 512        # past this, new connections are closed at once
 ```
 
 The file holds BLAKE3 hashes of tokens, never tokens.
+
+A connection has `session_setup_seconds` to get through the WebSocket upgrade,
+`ClientHello` and the access provider's answer; a client that says nothing, or the
+wrong protocol, is disconnected when it runs out. `handle_connection` enforces this,
+so an embedder gets it as well. The connection cap belongs to the standalone
+server's accept loop; an embedder that accepts connections itself sets its own.
 `openssl rand -hex 32 | tee token | wheat-server hash-token` makes a token and
 its hash.
 

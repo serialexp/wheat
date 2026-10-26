@@ -88,6 +88,7 @@ fn token_file() -> ServerConfig {
                 principal("stranger", None),
             ],
         }),
+        ..FileConfig::default()
     })
     .unwrap()
 }

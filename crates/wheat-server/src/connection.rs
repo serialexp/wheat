@@ -2,11 +2,17 @@
 //!
 //! Drives the WebSocket through: upgrade (the path names the repository) → handshake
 //! → repository state → fetch/publish.
+//!
+//! Everything before the caller is authenticated, from the upgrade to the access
+//! provider's answer, shares one deadline ([`ServerConfig::session_setup_timeout`]),
+//! so a client that connects and then says nothing, or says it slowly, is
+//! disconnected instead of holding the connection open.
 
 use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use tokio::net::TcpStream;
+use tokio::time::{Instant, timeout_at};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -30,6 +36,8 @@ use crate::wire::{
 const FORBIDDEN: u16 = 403;
 /// Error code for an unknown repository, and for one the principal may not see.
 const NOT_FOUND: u16 = 404;
+/// Error code for a session that was not set up by its deadline.
+const SETUP_TIMED_OUT: u16 = 408;
 
 /// Run one client connection to completion.
 pub async fn handle_connection(
@@ -42,6 +50,7 @@ pub async fn handle_connection(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     debug!(peer = %peer, "new connection");
+    let deadline = Instant::now() + config.session_setup_timeout;
 
     let allowed_origins = &config.allowed_origins;
     let mut upgrade = None;
@@ -64,10 +73,15 @@ pub async fn handle_connection(
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_MESSAGE_SIZE));
-    let mut ws = match accept_hdr_async_with_config(stream, check_upgrade, Some(limits)).await {
-        Ok(ws) => ws,
-        Err(e) => {
+    let accept = accept_hdr_async_with_config(stream, check_upgrade, Some(limits));
+    let mut ws = match timeout_at(deadline, accept).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
             warn!(peer = %peer, error = %e, "WebSocket handshake failed");
+            return;
+        }
+        Err(_) => {
+            info!(peer = %peer, "connection closed: no WebSocket upgrade before the deadline");
             return;
         }
     };
@@ -76,7 +90,7 @@ pub async fn handle_connection(
         return;
     };
 
-    if let Err(e) = run_session(&mut ws, &registry, &config, &peer, &upgrade).await {
+    if let Err(e) = run_session(&mut ws, &registry, &config, &peer, &upgrade, deadline).await {
         info!(peer = %peer, error = %e, "session ended with error");
     } else {
         debug!(peer = %peer, "session closed cleanly");
@@ -184,16 +198,15 @@ async fn send_forbidden(
     .await
 }
 
-/// The main session loop.
-async fn run_session(
+/// Set up the session: exchange hellos and authenticate the upgrade request.
+/// Returns the principal, or `None` when the session was refused and the client
+/// told why.
+async fn establish(
     ws: &mut WebSocketStream<TcpStream>,
-    registry: &Registry,
     config: &ServerConfig,
     peer: &str,
     upgrade: &Upgrade,
-) -> Result<(), ConnectionError> {
-    // --- Session setup ---
-
+) -> Result<Option<Principal>, ConnectionError> {
     // 1. Send ServerHello.
     send(
         ws,
@@ -244,7 +257,7 @@ async fn run_session(
             }),
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     }
 
     // The capabilities the session uses: only ones the server offered.
@@ -289,7 +302,7 @@ async fn run_session(
                 }),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -315,6 +328,41 @@ async fn run_session(
         capabilities = ?capabilities.to_vec(),
         "session established (v1)"
     );
+    Ok(Some(principal))
+}
+
+/// The main session loop.
+async fn run_session(
+    ws: &mut WebSocketStream<TcpStream>,
+    registry: &Registry,
+    config: &ServerConfig,
+    peer: &str,
+    upgrade: &Upgrade,
+    deadline: Instant,
+) -> Result<(), ConnectionError> {
+    // --- Session setup ---
+    // The deadline that bounded the upgrade also bounds the rest of the setup.
+
+    let principal = match timeout_at(deadline, establish(ws, config, peer, upgrade)).await {
+        Ok(principal) => principal?,
+        Err(_) => {
+            // Tell the client why, but do not wait on one that does not read.
+            let message = "session setup took too long";
+            let refusal = send_error(
+                ws,
+                0,
+                SETUP_TIMED_OUT,
+                connection_error_scope(),
+                false,
+                message,
+            );
+            let _ = tokio::time::timeout(CLOSE_WAIT, refusal).await;
+            return Err(ConnectionError::Protocol(message));
+        }
+    };
+    let Some(principal) = principal else {
+        return Ok(());
+    };
 
     // --- Repository open ---
     // The upgrade request's path named the repository; its state follows the session.

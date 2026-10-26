@@ -1,9 +1,10 @@
 //! The standalone server's TOML config file (`wheat-server --config <file>`).
 //!
 //! It is operator-written configuration, not a Wheat storage record, so it is
-//! TOML rather than BinSchema. Today it holds only the `[auth]` table; with no
-//! `[auth]` table the server runs open and loopback-only.
+//! TOML rather than BinSchema. It holds the `[auth]` table, without which the
+//! server runs open and loopback-only, and the `[limits]` table.
 
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -19,6 +20,22 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 pub struct FileConfig {
     /// Authentication and per-repository access. Absent means open, loopback-only.
     pub auth: Option<AuthConfig>,
+    /// Limits on connections.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// Limits on connections. One left out keeps its default (see
+/// [`crate::server::ServerConfig`]); zero is refused, since it would turn every
+/// client away.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Seconds a connection has from being accepted until its caller is
+    /// authenticated.
+    pub session_setup_seconds: Option<NonZeroU64>,
+    /// Most connections open at once.
+    pub max_connections: Option<NonZeroUsize>,
 }
 
 impl FileConfig {
@@ -63,7 +80,19 @@ mod tests {
 
     #[test]
     fn empty_file_has_no_auth() {
-        assert_eq!(FileConfig::parse("").unwrap(), FileConfig { auth: None });
+        assert_eq!(FileConfig::parse("").unwrap(), FileConfig::default());
+    }
+
+    #[test]
+    fn parses_limits_and_refuses_zero() {
+        let config =
+            FileConfig::parse("[limits]\nsession_setup_seconds = 3\nmax_connections = 64\n")
+                .unwrap();
+        assert_eq!(config.limits.session_setup_seconds, NonZeroU64::new(3));
+        assert_eq!(config.limits.max_connections, NonZeroUsize::new(64));
+        assert!(FileConfig::parse("[limits]\nsession_setup_seconds = 0\n").is_err());
+        assert!(FileConfig::parse("[limits]\nmax_connections = 0\n").is_err());
+        assert!(FileConfig::parse("[limits]\nmax_sessions = 1\n").is_err());
     }
 
     #[test]

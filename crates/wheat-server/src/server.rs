@@ -2,14 +2,25 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::access::{AccessProvider, AuthConfigError, OpenLoopbackAccess, TokenFileAccess};
 use crate::config::FileConfig;
 use crate::connection;
 use crate::registry::Registry;
+
+/// How long a connection has, by default, from being accepted until its caller is
+/// authenticated.
+pub const DEFAULT_SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many connections the server holds open at once by default.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
+/// How long the accept loop pauses after `accept` fails. Running out of file
+/// descriptors fails every `accept` at once, and retrying straight away would spin.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 
 /// Server-wide configuration.
 pub struct ServerConfig {
@@ -22,6 +33,16 @@ pub struct ServerConfig {
     /// the server through a visitor's browser. Requests without `Origin`
     /// (non-browser clients) are not affected.
     pub allowed_origins: Vec<String>,
+    /// How long a connection has from being accepted until its caller is
+    /// authenticated: the WebSocket upgrade, `ClientHello` and the access
+    /// provider's answer together. A client that takes longer, or sends nothing,
+    /// is disconnected, so connections nobody has authenticated cannot pile up.
+    /// [`connection::handle_connection`] enforces it, so embedders get it too.
+    pub session_setup_timeout: Duration,
+    /// Most connections [`run`] and [`run_until`] hold open at once. Past it, a
+    /// new connection is closed as soon as it is accepted. An embedder that calls
+    /// [`connection::handle_connection`] itself sets its own limit.
+    pub max_connections: usize,
 }
 
 impl ServerConfig {
@@ -36,19 +57,28 @@ impl ServerConfig {
             server_id: fresh_server_id(),
             access,
             allowed_origins,
+            session_setup_timeout: DEFAULT_SESSION_SETUP_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
     /// Build the config from the TOML config file. No `[auth]` table means open
-    /// and loopback-only.
+    /// and loopback-only; a limit the `[limits]` table leaves out keeps its default.
     pub fn from_file(file: &FileConfig) -> Result<Self, AuthConfigError> {
-        Ok(match &file.auth {
+        let mut config = match &file.auth {
             None => Self::new(),
             Some(auth) => Self::with_access(
                 Arc::new(TokenFileAccess::new(auth)?),
                 auth.allowed_origins.clone(),
             ),
-        })
+        };
+        if let Some(seconds) = file.limits.session_setup_seconds {
+            config.session_setup_timeout = Duration::from_secs(seconds.get());
+        }
+        if let Some(connections) = file.limits.max_connections {
+            config.max_connections = connections.get();
+        }
+        Ok(config)
     }
 
     /// Refuse to serve an open provider on a non-loopback address. `run` and
@@ -104,18 +134,56 @@ pub async fn run(
         info!(repo = name, "serving repository");
     }
 
+    accept_connections(listener, registry, config).await
+}
+
+/// Accept connections for ever, serving each on its own task while fewer than
+/// [`ServerConfig::max_connections`] are open, and closing it straight away
+/// otherwise.
+async fn accept_connections(
+    listener: TcpListener,
+    registry: Arc<Registry>,
+    config: Arc<ServerConfig>,
+) -> ! {
+    let slots = Arc::new(Semaphore::new(config.max_connections));
+    // Whether the last connection was turned away, so a flood logs once, not per
+    // connection.
+    let mut full = false;
     loop {
         match listener.accept().await {
-            Ok((stream, _peer)) => spawn_connection(stream, &registry, &config),
+            Ok((stream, peer)) => match Arc::clone(&slots).try_acquire_owned() {
+                Ok(slot) => {
+                    full = false;
+                    spawn_connection(stream, slot, &registry, &config);
+                }
+                Err(_) => {
+                    if !full {
+                        warn!(
+                            peer = %peer,
+                            limit = config.max_connections,
+                            "closing new connections: too many are open"
+                        );
+                        full = true;
+                    }
+                    drop(stream);
+                }
+            },
             Err(e) => {
                 error!(error = %e, "accept failed");
+                tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
             }
         }
     }
 }
 
-/// Serves one accepted connection on its own task.
-fn spawn_connection(stream: TcpStream, registry: &Arc<Registry>, config: &Arc<ServerConfig>) {
+/// Serves one accepted connection on its own task, which holds `slot` until the
+/// connection ends.
+fn spawn_connection(
+    stream: TcpStream,
+    slot: OwnedSemaphorePermit,
+    registry: &Arc<Registry>,
+    config: &Arc<ServerConfig>,
+) {
     // Nagle's algorithm would hold back the tail of a reply until the client's
     // delayed ACK, which costs every request/reply round tens of milliseconds.
     if let Err(e) = stream.set_nodelay(true) {
@@ -125,6 +193,7 @@ fn spawn_connection(stream: TcpStream, registry: &Arc<Registry>, config: &Arc<Se
     let config = Arc::clone(config);
     tokio::spawn(async move {
         connection::handle_connection(stream, registry, config).await;
+        drop(slot);
     });
 }
 
@@ -151,16 +220,7 @@ pub async fn run_until(
     let _ = ready.send(bound_addr);
 
     tokio::select! {
-        _ = async {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _peer)) => spawn_connection(stream, &registry, &config),
-                    Err(e) => {
-                        error!(error = %e, "accept failed");
-                    }
-                }
-            }
-        } => {}
+        _ = accept_connections(listener, registry, config) => {}
         _ = shutdown => {
             info!("shutdown signal received");
         }
