@@ -241,9 +241,14 @@ async fn plan<O: ImmutableObjectStore>(
                 }
             };
             ensure!(
-                active_changes.contains(&change),
-                CliFailure::invalid(format!("change {change} is not active in this workspace"))
+                revisions.contains_key(&change),
+                CliFailure::invalid(format!("change {change} is not in this workspace's view"))
             );
+            if !active_changes.contains(&change) {
+                // The basis holds the change as the view does: that revision is
+                // squash's boundary, and nothing comes after it.
+                return Ok(None);
+            }
             [change].into_iter().collect()
         }
         Scope::Stack => revisions

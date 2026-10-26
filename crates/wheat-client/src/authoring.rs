@@ -120,24 +120,20 @@ pub fn add(
     };
 
     let expected = local.heads.read()?;
-    let active = runtime.block_on(active_changes::inspect(
-        &local,
-        expected,
-        context.workspace.basis,
-        context.workspace.effective_view(),
-        context.workspace.selected_change,
-    ))?;
     let change = request
         .change
         .or(context.workspace.selected_change)
         .context("workspace has no selected change; run `wheat change new` or pass --change")?;
-    let destination = active
-        .changes
-        .iter()
-        .find(|candidate| candidate.change == change)
-        .with_context(|| format!("change {change} is not active in this workspace"))?;
+    let destination = runtime
+        .block_on(active_changes::in_view(
+            &local,
+            expected,
+            context.workspace.effective_view(),
+            change,
+        ))?
+        .with_context(|| format!("change {change} is not in this workspace's view"))?;
     let predecessor = request.predecessor.unwrap_or(destination.revision);
-    let title = destination.title.clone();
+    let title = destination.title;
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
     let (_, revision_metadata) = authoring_metadata::metadata(
         user,
@@ -398,18 +394,14 @@ pub fn select_change(
     ))?;
     selection_recovery::recover(&context.root, &local, &mut context.workspace)?;
     let head = local.heads.read()?;
-    let active = runtime.block_on(active_changes::inspect(
-        &local,
-        head,
-        context.workspace.basis,
-        context.workspace.effective_view(),
-        context.workspace.selected_change,
-    ))?;
-    let title = active
-        .changes
-        .into_iter()
-        .find(|candidate| candidate.change == change)
-        .with_context(|| format!("change {change} is not active in this workspace"))?
+    let title = runtime
+        .block_on(active_changes::in_view(
+            &local,
+            head,
+            context.workspace.effective_view(),
+            change,
+        ))?
+        .with_context(|| format!("change {change} is not in this workspace's view"))?
         .title;
     context.workspace.selected_change = Some(change);
     context

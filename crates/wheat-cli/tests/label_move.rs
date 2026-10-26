@@ -256,3 +256,46 @@ fn an_interruption_after_the_head_moves_completes_the_rebind() {
     assert_eq!(metadata.observed_label_binding, view(&frontier));
     assert_eq!(metadata.selected_frontier, None);
 }
+/// Decision 9: a change the label holds can still be revised, selected and squashed.
+#[test]
+fn a_change_the_label_holds_can_be_revised_selected_and_squashed() {
+    let local = Local::new();
+    local.change("a.txt");
+    let change = local.metadata().selected_change.unwrap().to_string();
+    local.ok_json(&["label", "move", "main"]);
+    let held = local.label_view("main");
+
+    // Nothing above the label's revision to squash.
+    let squashed = local.ok_json(&["change", "squash", &change]);
+    assert_eq!(squashed["no_op"], true, "{squashed}");
+    local.ok_json(&["change", "select", &change]);
+
+    for value in ["second", "third"] {
+        std::fs::write(local.workspace.join("a.txt"), value).unwrap();
+        local.ok_json(&["add", "a.txt", "--change", &change, "--message", value]);
+    }
+    let revised = local.metadata();
+    assert_eq!(revised.basis, view(&held));
+    let frontier = revised
+        .selected_frontier
+        .expect("the revision is a frontier");
+    assert_eq!(local.label_view("main"), held);
+
+    // The two new revisions collapse; the label's stays.
+    let squashed = local.ok_json(&["change", "squash", &change]);
+    assert_eq!(squashed["no_op"], false, "{squashed}");
+    assert_eq!(
+        squashed["rewritten"],
+        serde_json::json!([change]),
+        "{squashed}"
+    );
+    assert_ne!(local.metadata().selected_frontier, Some(frontier));
+
+    // The revised view is forward from the label's.
+    let moved = local.ok_json(&["label", "move", "main"]);
+    assert_eq!(moved["rebound"], true, "{moved}");
+    assert_eq!(
+        std::fs::read_to_string(local.workspace.join("a.txt")).unwrap(),
+        "third"
+    );
+}

@@ -611,6 +611,10 @@ size for `just test`; release run; results under `bench/results/`.
    Tests in `crates/wheat-cli/tests/label_move.rs`, including interruptions before and
    after the CAS (checkpoints `label-move-staged`, `label-move-published`).
 6. Authoring on label-held changes.
+   **Done 2026-10-26**: `add` and `change select` look the change up in the effective
+   view (`active_changes::in_view`, one revision-map lookup instead of collecting the
+   basis's whole map); `change squash` accepts any change of the view and is a no-op
+   for one the basis holds unrevised. Test in `crates/wheat-cli/tests/label_move.rs`.
 7. integrate/pull/refresh move the label; `--keep-label`; one-frontier rule.
 8. Fetch label rules (store + CLI).
    **Store part done 2026-10-26**: `merge_labels(base, local, remote, LabelPolicy)`

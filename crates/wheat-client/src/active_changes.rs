@@ -181,6 +181,54 @@ pub async fn inspect(
     })
 }
 
+/// A change of the workspace's view and its revision there.
+#[derive(Clone, Debug)]
+pub struct ViewChange {
+    pub revision: RevisionId,
+    pub title: String,
+}
+
+/// `change` as `view` holds it, active or not: authoring may revise any change of the
+/// workspace's view, including those its label holds. A lookup in the view's revision
+/// map, not a walk of it.
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn in_view(
+    repository: &LocalRepository,
+    head: RepositoryHead,
+    view: ViewId,
+    change: ChangeId,
+) -> Result<Option<ViewChange>> {
+    let reader = RepositoryReader::new(&repository.objects, &repository.content);
+    let envelope = reader.envelope(head.envelope).await?;
+    let state = reader.state(envelope.state).await?;
+    let view = reader.view(view).await?;
+    let Some(revision) = RevisionMapStore::new(&repository.objects)
+        .get(view.revisions, change)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let object = ChangeMapStore::new(&repository.objects)
+        .get(state.changes, change)
+        .await?
+        .ok_or_else(|| {
+            CliFailure::corrupt("view revision refers to an unindexed logical change")
+        })?;
+    let record = reader.change(object).await?;
+    if record.id != change {
+        return Err(CliFailure::corrupt(
+            "change-map key does not match logical change identity",
+        ));
+    }
+    if record.metadata.title.len() > MAX_TITLE_BYTES {
+        return Err(CliFailure::limit("change title exceeds the command limit"));
+    }
+    Ok(Some(ViewChange {
+        revision,
+        title: record.metadata.title,
+    }))
+}
+
 async fn collect_revisions<S: wheat_store::ImmutableObjectStore>(
     revisions: &RevisionMapStore<'_, S>,
     root: wheat_core::RevisionMapId,

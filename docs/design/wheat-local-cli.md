@@ -800,6 +800,12 @@ The selected frontier, or the basis when none exists, is the effective view.
 dependency order and marks the selected logical change. Explicit `add --change A`
 is a one-operation override and does not replace selected change B.
 
+`add`, `change select` and `change squash` accept any change of the effective view,
+not only the active ones (2026-10-26, decision 9 of `wheat-label-moves.md`): a change
+the label holds, for example after a publish moved the label, is revised like any
+other, and the result is a frontier that revises a basis change. Squashing such a
+change collapses only the revisions after the basis's; with none it does nothing.
+
 Captured changes are repository graph state, not disposable workspace state. They
 remain retained when another label is activated and reappear when switching back
 to a basis/frontier that reaches them. By contrast, uncaptured filesystem edits
