@@ -6,12 +6,14 @@ Review 4 (Codex and Antigravity) is folded into the plan, with Bart's decisions 
 (squash stops at branch points; a separate merge meter; `label move` rebinds only
 when the target is the workspace's effective view). Steps 1–3 are done (see the
 plan's "Order of work"); the merge budget meters walk steps instead of recursion depth
-(Bart, 2026-10-26). Next: step 4, `materialize` from the workspace's pinned basis
-instead of re-resolving the label (`materialize_active_workspace` in
-`crates/wheat-cli/src/main.rs`), and the materialization journal's
-`authenticate_target` (`crates/wheat-client/src/materialization.rs`) checking
-`basis == observed_label_binding` and retention instead of the label. Both are
-@calm-lynx's areas: PM them first.
+(Bart, 2026-10-26). The store parts of steps 5, 8 and 9 are done too: `LabelMove` in
+the mutation publication, `union_envelopes_under(…, LabelPolicy::Fetch)` and
+`backward_label`. Everything left touches @calm-lynx's areas (`main.rs`,
+wheat-client) or the protocol schema they are about to regenerate; on 2026-10-26 I
+PM'd them asking about step 4 (`materialize_active_workspace` in main.rs,
+`authenticate_target` in materialization.rs), the `force_labels` schema field, and
+step 10's `prepare_tag_push(force_with_lease)` argument in main.rs's push_tag().
+Wait for their reply before touching any of those.
 
 ## 2026-10-22: desktop client (@calm-lynx) — Bart: "read the design for the wheat gui and try to build that"
 
