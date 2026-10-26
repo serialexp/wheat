@@ -1140,6 +1140,9 @@
       sequence: [
         { name: "cas", type: "PendingRepositoryCasV1" },
         { name: "selected_change", type: "optional", value_type: "ChangeId" },
+        // The operation moves the workspace's label to the resulting frontier, so the
+        // workspace rebinds there once the CAS lands.
+        { name: "rebinds", type: "bool" },
       ],
     },
     // `.wheat/workspace.meta`: a workspace's binding to its store and label.

@@ -844,6 +844,20 @@ than one, switching requires an explicit frontier; it never synthesizes a union 
 silently composes every tip. Captured graph changes survive switching and reappear
 when reached again, while any uncaptured filesystem edit blocks the switch.
 
+**Moving a label (2026-10-26, `docs/design/wheat-label-moves.md`).**
+`wheat label move <name> [--view <view>] [--force] [--expected-head …]` binds a label
+to another retained view, by default the workspace's effective view. The move must be
+forward (the new view holds every change the old one holds, at a revision that
+integrating the old one into would not change) and must leave no descendant frontier
+of the old view uncovered; otherwise it is refused (`label_move_refused`, exit 2)
+naming the change or the frontiers, and `--force` makes it anyway. Moving the
+workspace's active label to the workspace's effective view rebinds the workspace:
+basis and observed binding become that view and no frontier is selected; the files
+do not change. The rebind is staged in the workspace metadata before the head's CAS
+and finished after it, so the next command completes or discards an interrupted one.
+A move elsewhere leaves the workspace's basis and selection as they were: the label
+moved away from it, and `refresh`, `integrate`, `pull` or `switch` re-read it.
+
 Label advancement and consolidation of multiple frontiers are explicit deferred
 work. When designed, stack editing and integration should expose dependency
 changes and application outcomes directly. Revising the bottom of `A -> B -> C`

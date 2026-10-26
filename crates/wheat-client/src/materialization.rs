@@ -3148,7 +3148,10 @@ fn ignore_not_found(result: io::Result<()>) -> Result<()> {
     }
 }
 
-fn checkpoint(name: &str) -> Result<()> {
+/// A point where a test may interrupt or pause the process (the
+/// `WHEAT_TEST_MATERIALIZATION_*` variables). Other workspace operations with crash
+/// points use it too.
+pub(crate) fn checkpoint(name: &str) -> Result<()> {
     let fail_selected = std::env::var_os(TEST_CHECKPOINT_ENV);
     let pause_selected = std::env::var_os(TEST_PAUSE_ENV);
     if fail_selected.as_deref() != Some(OsStr::new(name))

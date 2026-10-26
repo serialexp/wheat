@@ -8917,6 +8917,7 @@ impl PendingRepositoryCasV1 {
 pub struct PendingRepositoryOperationV1 {
     pub cas: PendingRepositoryCasV1,
     pub selected_change: Option<ChangeId>,
+    pub rebinds: bool,
 }
 
 impl PendingRepositoryOperationV1 {
@@ -8934,6 +8935,7 @@ impl PendingRepositoryOperationV1 {
         } else {
             encoder.write_uint8(0);
         }
+        encoder.write_byte(if self.rebinds { 1 } else { 0 });
         Ok(())
     }
 
@@ -8950,9 +8952,11 @@ impl PendingRepositoryOperationV1 {
         } else {
             None
         };
+        let rebinds = decoder.read_byte()? != 0;
         Ok(Self {
             cas,
             selected_change,
+            rebinds,
         })
     }
 }

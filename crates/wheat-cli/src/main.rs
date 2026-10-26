@@ -372,6 +372,22 @@ enum LabelCommand {
         #[arg(long, value_parser = label_service::parse_expected_head)]
         expected_head: Option<wheat_store::RepositoryHead>,
     },
+    /// Move a label to another view. The move must be forward (the new view has every
+    /// change the label's view has, as it has it or later) and must leave no frontier of
+    /// the label's view behind. Moving this workspace's label to the view it shows
+    /// makes the workspace follow the label there.
+    Move {
+        name: String,
+        /// Exact retained view; defaults to the workspace's selected view.
+        #[arg(long)]
+        view: Option<String>,
+        /// Move the label even when the move is not forward or leaves frontiers behind.
+        #[arg(long)]
+        force: bool,
+        /// Full repository head CAS guard: <generation>:<envelope>.
+        #[arg(long, value_parser = label_service::parse_expected_head)]
+        expected_head: Option<wheat_store::RepositoryHead>,
+    },
     /// Delete a label, unless it is selected by the current workspace.
     Delete {
         name: String,
@@ -706,6 +722,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Labels => "labels",
         Command::Label(LabelCommand::Create { .. }) => "label.create",
         Command::Label(LabelCommand::Rename { .. }) => "label.rename",
+        Command::Label(LabelCommand::Move { .. }) => "label.move",
         Command::Label(LabelCommand::Delete { .. }) => "label.delete",
         Command::Conflicts => "conflicts",
         Command::Diff(_) => "diff",
@@ -974,6 +991,19 @@ fn execute(cli: Cli) -> Result<Success> {
                     reject_selected_label_mutation(context.as_ref(), &old, "rename")?;
                     label_service::rename(&local, old, new, expected_head)
                 }
+                LabelCommand::Move {
+                    name,
+                    view,
+                    force,
+                    expected_head,
+                } => move_label(
+                    context,
+                    &local,
+                    name,
+                    parse_optional_view(view)?,
+                    force,
+                    expected_head,
+                ),
                 LabelCommand::Delete {
                     name,
                     expected_head,
@@ -1533,6 +1563,45 @@ fn reject_selected_label_mutation(
         )));
     }
     Ok(())
+}
+
+/// `wheat label move`, inside the workspace's lock when there is one, so the workspace
+/// it may rebind has finished any interrupted operation first.
+fn move_label(
+    context: Option<discovery::ResolvedWorkspace>,
+    repository: &wheat_client::local::LocalRepository,
+    name: String,
+    view: Option<ViewId>,
+    force: bool,
+    expected_head: Option<wheat_store::RepositoryHead>,
+) -> Result<Success> {
+    let Some(mut context) = context else {
+        let view = view.ok_or_else(|| {
+            CliFailure::invalid("label move without a workspace requires an explicit --view")
+        })?;
+        return label_service::move_label(repository, name, view, force, expected_head, None);
+    };
+    let _lock = materialization::WorkspaceLock::acquire(&context.root)?;
+    context.workspace = WorkspaceMetadata::read(&context.root)?;
+    runtime()?.block_on(materialization::recover_locked(
+        &context.root,
+        repository,
+        &mut context.workspace,
+    ))?;
+    selection_recovery::recover(&context.root, repository, &mut context.workspace)?;
+    let view = view.unwrap_or_else(|| context.workspace.effective_view());
+    label_service::move_label(
+        repository,
+        name,
+        view,
+        force,
+        expected_head,
+        Some(label_service::MovingWorkspace {
+            root: &context.root,
+            store_root: &context.store_root,
+            metadata: &mut context.workspace,
+        }),
+    )
 }
 
 fn materialize_active_workspace(
@@ -2113,6 +2182,7 @@ fn resolve(
         proposed_head: publication.proposed().into(),
         resulting_frontier,
         selected_change: metadata.selected_change,
+        rebinds: false,
     });
     workspace_registry_service::reconcile(workspace_root, store_root, &metadata)?;
     metadata

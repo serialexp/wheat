@@ -603,6 +603,13 @@ size for `just test`; release run; results under `bench/results/`.
    none); the label keeps its annotation and provenance; refused with
    `RepositoryMutationError::LabelMoved` (CLI class `label_moved`, exit 3) when the
    label does not name `from`, and when the state does not retain `to`.
+   **CLI part done 2026-10-26**: `wheat label move` (`label_service::move_label`), its
+   checks in `crates/wheat-client/src/label_move.rs` (`check`, `MoveRefusal`) for the
+   later commands to share, refused as `label_move_refused` (exit 2). The rebind is a
+   pending repository operation with `rebinds` set (a new field of
+   `PendingRepositoryOperationV1`), completed or discarded by `selection_recovery`.
+   Tests in `crates/wheat-cli/tests/label_move.rs`, including interruptions before and
+   after the CAS (checkpoints `label-move-staged`, `label-move-published`).
 6. Authoring on label-held changes.
 7. integrate/pull/refresh move the label; `--keep-label`; one-frontier rule.
 8. Fetch label rules (store + CLI).

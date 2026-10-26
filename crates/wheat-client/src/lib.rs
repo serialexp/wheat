@@ -17,6 +17,7 @@ pub mod history;
 pub mod ignore_import;
 pub mod import_trace;
 pub mod inspection;
+pub mod label_move;
 pub mod label_service;
 pub mod local;
 pub mod log_inspection;

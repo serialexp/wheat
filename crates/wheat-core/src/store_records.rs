@@ -139,8 +139,18 @@ pub struct WorkspaceMetadataRecord {
     pub selected_frontier: Option<ViewId>,
     pub materialized: Option<MaterializedRootsRecord>,
     pub selected_change: Option<ChangeId>,
-    /// The compare-and-swap in flight and the change it leaves selected.
-    pub pending_repository_operation: Option<(PendingRepositoryCasRecord, Option<ChangeId>)>,
+    pub pending_repository_operation: Option<PendingRepositoryOperationRecord>,
+}
+
+/// A workspace's repository compare-and-swap in flight, and how it leaves the workspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingRepositoryOperationRecord {
+    pub cas: PendingRepositoryCasRecord,
+    /// The change the workspace has selected afterwards.
+    pub selected_change: Option<ChangeId>,
+    /// The operation moves the workspace's label to the resulting frontier, so the
+    /// workspace rebinds there.
+    pub rebinds: bool,
 }
 
 /// `workspaces/<workspace id>.pin` in a store: the roots a workspace keeps alive.
@@ -644,12 +654,13 @@ pub fn encode_workspace_metadata(
             selected_frontier: record.selected_frontier.map(view_wire),
             materialized: record.materialized.map(materialized_wire),
             selected_change: record.selected_change.map(change_wire),
-            pending_repository_operation: record.pending_repository_operation.map(
-                |(cas, selected_change)| wire::PendingRepositoryOperationV1 {
-                    cas: cas_wire(cas),
-                    selected_change: selected_change.map(change_wire),
-                },
-            ),
+            pending_repository_operation: record.pending_repository_operation.map(|operation| {
+                wire::PendingRepositoryOperationV1 {
+                    cas: cas_wire(operation.cas),
+                    selected_change: operation.selected_change.map(change_wire),
+                    rebinds: operation.rebinds,
+                }
+            }),
         }
         .encode(),
     )
@@ -673,10 +684,11 @@ pub fn decode_workspace_metadata(
         pending_repository_operation: w
             .pending_repository_operation
             .map(|operation| {
-                Ok::<_, StoreRecordError>((
-                    cas_domain(operation.cas)?,
-                    operation.selected_change.map(change_domain).transpose()?,
-                ))
+                Ok::<_, StoreRecordError>(PendingRepositoryOperationRecord {
+                    cas: cas_domain(operation.cas)?,
+                    selected_change: operation.selected_change.map(change_domain).transpose()?,
+                    rebinds: operation.rebinds,
+                })
             })
             .transpose()?,
     };

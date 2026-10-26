@@ -69,6 +69,10 @@ pub enum CliFailure {
     /// `--allow-dot-git`.
     #[error("{0}")]
     DotGitPaths(String),
+    /// A label move that is not forward or would leave frontiers behind, which needs
+    /// `--force`.
+    #[error("{0}")]
+    LabelMoveRefused(String),
 }
 
 impl CliFailure {
@@ -102,6 +106,10 @@ impl CliFailure {
 
     pub fn dot_git(message: impl Into<String>) -> Error {
         Self::DotGitPaths(message.into()).into()
+    }
+
+    pub fn label_move_refused(message: impl Into<String>) -> Error {
+        Self::LabelMoveRefused(message.into()).into()
     }
 }
 

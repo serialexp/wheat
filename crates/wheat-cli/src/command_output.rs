@@ -371,6 +371,7 @@ fn classify(error: &Error) -> Classification {
                 CliFailure::TransportFailure(_) => class("transport", "transport_failure", true, 8),
                 CliFailure::EditsWouldMove(_) => class("input", "edits_would_move", false, 2),
                 CliFailure::DotGitPaths(_) => class("input", "dot_git_paths", false, 2),
+                CliFailure::LabelMoveRefused(_) => class("input", "label_move_refused", false, 2),
             };
         }
         if let Some(import) = cause.downcast_ref::<ImportError>() {

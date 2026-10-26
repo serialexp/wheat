@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{
-    ChangeId, MaterializedRootsRecord, PendingRepositoryCasRecord, RepositoryEnvelopeId,
-    RepositoryRootRecord, StoreMetadataRecord, TreeId, ViewId, WorkspaceMetadataRecord,
-    decode_store_metadata, decode_workspace_metadata, encode_store_metadata,
-    encode_workspace_metadata,
+    ChangeId, MaterializedRootsRecord, PendingRepositoryCasRecord,
+    PendingRepositoryOperationRecord, RepositoryEnvelopeId, RepositoryRootRecord,
+    StoreMetadataRecord, TreeId, ViewId, WorkspaceMetadataRecord, decode_store_metadata,
+    decode_workspace_metadata, encode_store_metadata, encode_workspace_metadata,
 };
 use wheat_store::RepositoryHead;
 
@@ -53,6 +53,10 @@ pub struct PendingRepositoryOperation {
     pub proposed_head: SerializedHead,
     pub resulting_frontier: ViewId,
     pub selected_change: Option<ChangeId>,
+    /// The operation moves the workspace's label to `resulting_frontier`, so the
+    /// workspace rebinds there: basis and observed binding become that view and it
+    /// selects no frontier.
+    pub rebinds: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -199,6 +203,21 @@ impl WorkspaceMetadata {
         self.selected_frontier.unwrap_or(self.basis)
     }
 
+    /// Applies the pending repository operation's outcome once its CAS installed the
+    /// proposed head, and clears it.
+    pub fn complete_repository_operation(&mut self) {
+        let Some(pending) = self.pending_repository_operation.take() else {
+            return;
+        };
+        if pending.rebinds {
+            self.basis = pending.resulting_frontier;
+            self.observed_label_binding = pending.resulting_frontier;
+        }
+        self.selected_frontier =
+            (pending.resulting_frontier != self.basis).then_some(pending.resulting_frontier);
+        self.selected_change = pending.selected_change;
+    }
+
     /// The metadata file of the workspace at `root`.
     pub fn path(root: &Path) -> PathBuf {
         root.join(".wheat").join(WORKSPACE_METADATA_FILE)
@@ -226,14 +245,15 @@ impl WorkspaceMetadata {
             selected_frontier: record.selected_frontier,
             materialized: record.materialized.map(MaterializedState::from),
             selected_change: record.selected_change,
-            pending_repository_operation: record.pending_repository_operation.map(
-                |(cas, selected_change)| PendingRepositoryOperation {
-                    expected_head: cas.expected_head.into(),
-                    proposed_head: cas.proposed_head.into(),
-                    resulting_frontier: cas.resulting_frontier,
-                    selected_change,
-                },
-            ),
+            pending_repository_operation: record.pending_repository_operation.map(|operation| {
+                PendingRepositoryOperation {
+                    expected_head: operation.cas.expected_head.into(),
+                    proposed_head: operation.cas.proposed_head.into(),
+                    resulting_frontier: operation.cas.resulting_frontier,
+                    selected_change: operation.selected_change,
+                    rebinds: operation.rebinds,
+                }
+            }),
         })
     }
 
@@ -259,15 +279,14 @@ impl WorkspaceMetadata {
                 .map(MaterializedRootsRecord::from),
             selected_change: self.selected_change,
             pending_repository_operation: self.pending_repository_operation.as_ref().map(
-                |operation| {
-                    (
-                        PendingRepositoryCasRecord {
-                            expected_head: operation.expected_head.into(),
-                            proposed_head: operation.proposed_head.into(),
-                            resulting_frontier: operation.resulting_frontier,
-                        },
-                        operation.selected_change,
-                    )
+                |operation| PendingRepositoryOperationRecord {
+                    cas: PendingRepositoryCasRecord {
+                        expected_head: operation.expected_head.into(),
+                        proposed_head: operation.proposed_head.into(),
+                        resulting_frontier: operation.resulting_frontier,
+                    },
+                    selected_change: operation.selected_change,
+                    rebinds: operation.rebinds,
                 },
             ),
         })?)
@@ -409,6 +428,7 @@ mod tests {
             },
             resulting_frontier: basis,
             selected_change: None,
+            rebinds: true,
         });
         metadata.initialize(root.path()).unwrap();
         assert_eq!(WorkspaceMetadata::read(root.path()).unwrap(), metadata);

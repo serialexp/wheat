@@ -345,7 +345,11 @@ fn workspace(full: bool) -> WorkspaceMetadataRecord {
         selected_frontier: full.then(|| ViewId::from_digest([6; 32])),
         materialized: full.then(|| materialized(7)),
         selected_change: full.then(|| ChangeId::from_bytes([8; 16])),
-        pending_repository_operation: full.then(|| (cas(9), Some(ChangeId::from_bytes([10; 16])))),
+        pending_repository_operation: full.then(|| PendingRepositoryOperationRecord {
+            cas: cas(9),
+            selected_change: Some(ChangeId::from_bytes([10; 16])),
+            rebinds: true,
+        }),
     }
 }
 
@@ -414,7 +418,11 @@ fn workspace_metadata_round_trips_with_and_without_optional_roots() {
     }
     // A pending operation that leaves no change selected is its own state.
     let mut record = workspace(true);
-    record.pending_repository_operation = Some((cas(1), None));
+    record.pending_repository_operation = Some(PendingRepositoryOperationRecord {
+        cas: cas(1),
+        selected_change: None,
+        rebinds: false,
+    });
     let bytes = encode_workspace_metadata(&record).unwrap();
     assert_eq!(decode_workspace_metadata(&bytes).unwrap(), record);
 }

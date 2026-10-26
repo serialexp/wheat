@@ -216,6 +216,7 @@ pub fn add(
         proposed_head: publication.proposed().into(),
         resulting_frontier,
         selected_change: context.workspace.selected_change,
+        rebinds: false,
     });
     match &settlement {
         // Root the settled pin before metadata can reference it. If the
@@ -351,6 +352,7 @@ pub fn create_change(
         proposed_head: publication.proposed().into(),
         resulting_frontier,
         selected_change: Some(change),
+        rebinds: false,
     });
     workspace_registry_service::reconcile(&context.root, &context.store_root, &context.workspace)?;
     context
