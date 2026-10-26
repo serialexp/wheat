@@ -353,6 +353,7 @@ mod directory;
 #[path = "merkle_tree/final_update.rs"]
 mod final_update;
 
+pub use directory::{ChunkWalk, StoredDirectory, WalkedChunk};
 pub(crate) use directory::{Directory, ReadCount, ReadLimits};
 
 pub struct MerkleTreeStore<'a, S> {

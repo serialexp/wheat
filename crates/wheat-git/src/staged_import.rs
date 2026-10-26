@@ -1,7 +1,7 @@
 //! Resumable import into immutable storage. This module deliberately does not publish a repository head.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
 };
 
@@ -9,15 +9,15 @@ use gix::bstr::ByteSlice;
 use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{
-    ApplicationResultRecord, AppliedEditEvidence, ByteRange, ChangeId, ChangeProposal, ObjectId,
-    SourceProvenance, Tree,
+    ApplicationResultRecord, AppliedEditEvidence, ByteRange, ChangeId, ChangeProposal,
+    DirectoryChunkId, DirectoryEntry, ObjectId, SourceProvenance, Tree, TreeId,
     edit_application::{ApplicationLimits, ApplicationOutcome, apply_edits},
     encode_git_import_source,
 };
 use wheat_store::{
-    ApplicationMapStore, CommitWriterError, ConflictSetStore, ContentMapStore, ContentStore,
-    ContentStoreError, ImmutableObjectStore, MerkleTreeStore, PersistedCommitWriter,
-    RepositoryReader, RevisionMapStore, TreePathShape,
+    ApplicationMapStore, ChunkWalk, CommitWriterError, ConflictSetStore, ContentMapStore,
+    ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
+    PersistedCommitWriter, RepositoryReader, RevisionMapStore, StoredDirectory, TreePathShape,
 };
 
 use crate::{
@@ -377,32 +377,111 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
     })
 }
 
+/// A step of [`authenticate_tree_once`]: open a directory, or record its receipt and
+/// those of the chunks it read once everything below it has authenticated.
+enum TreeStep {
+    Open(TreeId),
+    Close(TreeId, Vec<(DirectoryChunkId, ChunkReceipt)>),
+}
+
+/// A wide directory's chunk, authenticated with the chunks below it: its entries are
+/// filed under `key_above`, and it holds `entries` of them.
+struct ChunkReceipt {
+    key_above: Vec<u8>,
+    entries: u64,
+}
+
 async fn authenticate_tree_once<O: ImmutableObjectStore>(
     trees: &MerkleTreeStore<'_, O>,
-    root: wheat_core::TreeId,
+    root: TreeId,
     receipts: &mut ProofReceipts,
-    pending: &mut Vec<(wheat_core::TreeId, bool)>,
+    pending: &mut Vec<TreeStep>,
 ) -> Result<(), CommitWriterError> {
     pending.clear();
-    pending.push((root, false));
-    while let Some((tree, visited)) = pending.pop() {
-        let object_id = tree.into();
-        if receipts.contains(3, object_id) {
+    pending.push(TreeStep::Open(root));
+    while let Some(step) = pending.pop() {
+        let tree = match step {
+            TreeStep::Open(tree) => tree,
+            TreeStep::Close(tree, chunks) => {
+                // Record only after every descendant has authenticated successfully.
+                for (chunk, receipt) in chunks {
+                    receipts.record_chunk(chunk, receipt);
+                }
+                receipts.record(3, tree.into());
+                continue;
+            }
+        };
+        if receipts.contains(3, tree.into()) {
             continue;
         }
-        if visited {
-            // Record only after every descendant has authenticated successfully.
-            receipts.record(3, object_id);
-            continue;
-        }
-        let node = trees.read_node(tree).await?;
-        pending.push((tree, true));
-        pending.extend(node.entries.values().filter_map(|entry| match entry {
-            wheat_core::DirectoryEntry::Directory(child) => Some((*child, false)),
-            wheat_core::DirectoryEntry::File(_) => None,
-        }));
+        let close = pending.len();
+        pending.push(TreeStep::Close(tree, Vec::new()));
+        let chunks = match trees.read_stored_directory(tree).await? {
+            StoredDirectory::Flat(node) => {
+                pending.extend(node.entries.values().filter_map(open_subdirectory));
+                Vec::new()
+            }
+            StoredDirectory::Chunked(header) => {
+                authenticate_chunks_once(trees, &header, receipts, pending).await?
+            }
+        };
+        pending[close] = TreeStep::Close(tree, chunks);
     }
     Ok(())
+}
+
+fn open_subdirectory(entry: &DirectoryEntry) -> Option<TreeStep> {
+    match entry {
+        DirectoryEntry::Directory(child) => Some(TreeStep::Open(*child)),
+        DirectoryEntry::File(_) => None,
+    }
+}
+
+/// Reads the chunks of `header` that have no receipt at the key they are reached at,
+/// queues the subdirectories they hold, and checks the header's count. Returns the
+/// receipts of the chunks read, to record once those subdirectories authenticate.
+async fn authenticate_chunks_once<O: ImmutableObjectStore>(
+    trees: &MerkleTreeStore<'_, O>,
+    header: &wheat_core::ChunkedTree,
+    receipts: &ProofReceipts,
+    pending: &mut Vec<TreeStep>,
+) -> Result<Vec<(DirectoryChunkId, ChunkReceipt)>, CommitWriterError> {
+    let mut below = HashMap::new();
+    // Each chunk read with its own entries and its children, after its parent.
+    let mut read = Vec::new();
+    let mut walk = ChunkWalk::new(header);
+    while let Some((id, key)) = walk.next_chunk() {
+        if let Some(receipt) = receipts.chunk(id)
+            && receipt.key_above == key
+        {
+            below.insert(id, receipt.entries);
+            continue;
+        }
+        let key_above = key.to_vec();
+        let chunk = walk.read(trees).await?;
+        pending.extend(
+            chunk
+                .entries
+                .iter()
+                .filter_map(|entry| open_subdirectory(&entry.entry)),
+        );
+        read.push((id, key_above, chunk.entries.len() as u64, chunk.children));
+    }
+    let mut chunks = Vec::with_capacity(read.len());
+    for (id, key_above, mut entries, children) in read.into_iter().rev() {
+        for child in children {
+            entries += below[&child];
+        }
+        below.insert(id, entries);
+        chunks.push((id, ChunkReceipt { key_above, entries }));
+    }
+    if below[&header.root] != header.count {
+        return Err(MerkleTreeError::MalformedDirectory(
+            "the entry count does not match the entries",
+        )
+        .into());
+    }
+    Ok(chunks)
 }
 
 /// Authenticates each content-map node once per invocation, at the key position it
@@ -599,6 +678,8 @@ struct ProofReceipts {
     /// Kind, key position (radix nodes are validated relative to it; 0 for
     /// everything else), and object.
     successful: HashSet<(u8, usize, ObjectId)>,
+    /// Wide directories' chunks.
+    chunks: HashMap<DirectoryChunkId, ChunkReceipt>,
 }
 
 impl ProofReceipts {
@@ -606,6 +687,17 @@ impl ProofReceipts {
         Self {
             max,
             successful: HashSet::new(),
+            chunks: HashMap::new(),
+        }
+    }
+
+    fn chunk(&self, id: DirectoryChunkId) -> Option<&ChunkReceipt> {
+        self.chunks.get(&id)
+    }
+
+    fn record_chunk(&mut self, id: DirectoryChunkId, receipt: ChunkReceipt) {
+        if self.successful.len() + self.chunks.len() < self.max {
+            self.chunks.insert(id, receipt);
         }
     }
 
@@ -624,7 +716,7 @@ impl ProofReceipts {
     fn record_at(&mut self, kind: u8, position: usize, id: ObjectId) {
         // Bounded proof memoization is an optimization only; when full, repeat
         // verification rather than retaining unbounded state.
-        if self.successful.len() < self.max {
+        if self.successful.len() + self.chunks.len() < self.max {
             self.successful.insert((kind, position, id));
         }
     }
@@ -633,7 +725,7 @@ impl ProofReceipts {
 /// Reusable traversal stacks for one invocation's proofs.
 #[derive(Default)]
 struct ProofWork {
-    trees: Vec<(wheat_core::TreeId, bool)>,
+    trees: Vec<TreeStep>,
     /// Content-map nodes with the key position each is reached at.
     content_maps: Vec<(wheat_core::ContentMapId, usize, bool)>,
 }
@@ -910,14 +1002,21 @@ mod tests {
     struct CountingStore {
         inner: ObjectStoreAdapter,
         content_map_reads: AtomicUsize,
+        directory_reads: AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl ImmutableObjectStore for CountingStore {
         async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
             let object = self.inner.get(id).await?;
-            if object.kind == ObjectKind::ContentMapNode {
-                self.content_map_reads.fetch_add(1, Ordering::Relaxed);
+            match object.kind {
+                ObjectKind::ContentMapNode => {
+                    self.content_map_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                ObjectKind::Tree | ObjectKind::ChunkedTree | ObjectKind::DirectoryChunkNode => {
+                    self.directory_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
             }
             Ok(object)
         }
@@ -939,7 +1038,67 @@ mod tests {
         CountingStore {
             inner: ObjectStoreAdapter::new(Arc::new(InMemory::new()), name),
             content_map_reads: AtomicUsize::new(0),
+            directory_reads: AtomicUsize::new(0),
         }
+    }
+
+    /// A directory of 1,000 files, file `f7` holding `seven`.
+    async fn wide(trees: &MerkleTreeStore<'_, CountingStore>, seven: u32) -> TreeId {
+        let mut entries: BTreeMap<String, DirectoryEntry> = (0..1_000)
+            .map(|index| {
+                let file = wheat_core::FileValue {
+                    content: content(index),
+                    kind: wheat_core::FileKind::Regular,
+                };
+                (format!("f{index}"), DirectoryEntry::File(file))
+            })
+            .collect();
+        if let Some(DirectoryEntry::File(file)) = entries.get_mut("f7") {
+            file.content = content(seven);
+        }
+        trees
+            .write_node(&wheat_core::DirectoryNode { entries })
+            .await
+            .unwrap()
+    }
+
+    /// A second version of a wide directory reads only its header and the chunks
+    /// it changed.
+    #[tokio::test]
+    async fn wide_directory_chunks_are_authenticated_once() {
+        let objects = counting("wide-directory");
+        let trees = MerkleTreeStore::new(&objects);
+        let before = wide(&trees, 7).await;
+        let after = wide(&trees, 10_000).await;
+        let mut receipts = ProofReceipts::new(PROOF_RECEIPTS);
+        let mut pending = Vec::new();
+
+        authenticate_tree_once(&trees, before, &mut receipts, &mut pending)
+            .await
+            .unwrap();
+        objects.directory_reads.store(0, Ordering::Relaxed);
+        authenticate_tree_once(&trees, after, &mut receipts, &mut pending)
+            .await
+            .unwrap();
+        let changed = objects.directory_reads.load(Ordering::Relaxed);
+        // The header and the chunks on `f7`'s key path.
+        assert!(changed <= 4, "{changed} objects read for a one-file change");
+
+        // A header over those chunks with another count is refused.
+        let StoredDirectory::Chunked(header) = trees.read_stored_directory(after).await.unwrap()
+        else {
+            panic!("1,000 files are chunked");
+        };
+        let miscounted = wheat_core::ChunkedTree::new(header.count + 1, header.root).unwrap();
+        objects
+            .put_if_absent(miscounted.id().into(), &miscounted.canonical_bytes())
+            .await
+            .unwrap();
+        assert!(
+            authenticate_tree_once(&trees, miscounted.id(), &mut receipts, &mut pending)
+                .await
+                .is_err()
+        );
     }
 
     /// A second map sharing all but one path with an authenticated one reads only that

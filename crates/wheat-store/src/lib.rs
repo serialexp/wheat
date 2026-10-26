@@ -118,10 +118,10 @@ pub use loose::{
     ImmutableObjectStore, LooseObjectStore, ObjectKind, ObjectStoreError, StoredObject,
 };
 pub use merkle_tree::{
-    DirectoryPage, FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore, TreeContentCursor,
-    TreeContentWalkLimits, TreeDiff, TreeDiffCursor, TreeDiffLimits, TreeEdit, TreeFile,
-    TreeListing, TreePathFilter, TreePathLimits, TreePathSelection, TreePathShape,
-    TreeSelectionLimits, TreeWalkLimits,
+    ChunkWalk, DirectoryPage, FinalTreeUpdateLimits, MerkleTreeError, MerkleTreeStore,
+    StoredDirectory, TreeContentCursor, TreeContentWalkLimits, TreeDiff, TreeDiffCursor,
+    TreeDiffLimits, TreeEdit, TreeFile, TreeListing, TreePathFilter, TreePathLimits,
+    TreePathSelection, TreePathShape, TreeSelectionLimits, TreeWalkLimits, WalkedChunk,
 };
 pub use mutation_publication::{
     LabelMove, PreparedMutationPublication, finalize_mutation_publication,

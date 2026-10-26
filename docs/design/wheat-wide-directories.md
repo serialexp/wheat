@@ -1,12 +1,12 @@
 # Wheat wide directories — Design
 
-Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 to 6
-and the switch-on landed, so every writer stores a directory wider than 256
-entries chunked, under a benchmark contract. Per-chunk memoization in full
-verification and import (measured: needed) and the docs remain. A tree-format
-change, so it lands before the V1 format freeze.
+Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 to 6,
+the switch-on and per-chunk receipts in full verification and import landed, so
+every writer stores a directory wider than 256 entries chunked, under a benchmark
+contract. The docs and TODO.md remain. A tree-format change, so it lands before
+the V1 format freeze.
 Owner: bart
-Last updated: 2026-10-26 (step 6)
+Last updated: 2026-10-26 (per-chunk receipts)
 
 ## Implementation status
 
@@ -136,10 +136,7 @@ land and move them from Outstanding to Done.
   10,000-file history took 20 s, against 116 s with one record per directory.
   `bootstrap_validate` gained the same flat history (to 10,000), which measured
   the memoization question below.
-
-### Outstanding
-
-- [ ] **Per-chunk memoization in verification and import (measure first, in
+- [x] **Per-chunk memoization in verification and import (measure first, in
   step 6).** `repository_verify`'s `authenticate_tree` and `tree`, and staged
   import's `authenticate_tree_once`, memoize per tree, so each new version of a
   wide directory reads all its chunks: the bytes a flat `TreeV1` costs today, in
@@ -156,6 +153,28 @@ land and move them from Outstanding to Done.
   content walk (`tree`) 35.6 s. Both are quadratic in this shape, as they were
   with one `TreeV1` per directory. Incremental validation (`validate_bootstrap`)
   is not affected: 5.6 s flat against 6.4 s spread.
+
+  Bart was asked to choose between per-chunk receipts, diffing each view's tree
+  against its lineage parent's (which leaves the revision and application
+  content walks, 35 s of it, quadratic), and leaving it; the question timed out,
+  and per-chunk receipts were built as the default. Overrule it there if needed.
+  A `ChunkWalk` in the store, which `directory_entries` uses too, lets a walk
+  skip a chunk it proved before at the same key bytes or read it, checking its
+  entries' keys. The verification scratch records, when a directory completes,
+  each chunk read with the key bytes above it, the entries below it and their
+  greatest subdirectory height (`verified_chunk_auth`), and per aggregate that
+  its files were checked (`verified_chunk_semantics`). A proved chunk counts
+  only when it is reached at the key it was proved at, so a forged tree cannot
+  reuse a receipt elsewhere, and the header's count is summed from the receipts.
+  Staged import keeps the same receipts, without height, in its bounded
+  `ProofReceipts`. Tests count reads: a new version reads its header and changed
+  chunks only (both walks), a chunk under another key is refused, a wrong count
+  over proved chunks is refused, and heights carry through proved chunks. The
+  flat history's full validation now takes 16.6 s at 10,000 changes (spread:
+  17.5 s).
+
+### Outstanding
+
 - [ ] **Docs and TODO.md.** Close "A change in a large directory reads and
   writes the whole directory" and update `server-native-source-control-store.md`
   ("deterministic shards for exceptionally wide directories").

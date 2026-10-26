@@ -5,8 +5,20 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{
     ApplicationMapId, ChangeId, ChangeObjectId, ConflictId, ConflictSetId, ContentId, ContentSetId,
-    ObjectId, RetainedSetId, RevisionMapId, TreeId,
+    DirectoryChunkId, ObjectId, RetainedSetId, RevisionMapId, TreeId,
 };
+
+/// What proving a wide directory's chunk found: see `verified_chunk_auth`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChunkProof {
+    /// The key bytes above the chunk where it was proved.
+    pub key_above: Vec<u8>,
+    /// The entries in the chunk and the chunks below it.
+    pub entries: u64,
+    /// The greatest height of a subdirectory among those entries, plus one; zero
+    /// when they are all files.
+    pub height: usize,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum RadixReceiptKind {
@@ -28,6 +40,11 @@ const INSERT_TREE_AUTH: &str = include_str!("verification_sql/insert_tree_auth.s
 const CONTAINS_TREE_AUTH: &str = include_str!("verification_sql/contains_tree_auth.sql");
 const INSERT_TREE_SEMANTICS: &str = include_str!("verification_sql/insert_tree_semantics.sql");
 const CONTAINS_TREE_SEMANTICS: &str = include_str!("verification_sql/contains_tree_semantics.sql");
+const INSERT_CHUNK_AUTH: &str = include_str!("verification_sql/insert_chunk_auth.sql");
+const CONTAINS_CHUNK_AUTH: &str = include_str!("verification_sql/contains_chunk_auth.sql");
+const INSERT_CHUNK_SEMANTICS: &str = include_str!("verification_sql/insert_chunk_semantics.sql");
+const CONTAINS_CHUNK_SEMANTICS: &str =
+    include_str!("verification_sql/contains_chunk_semantics.sql");
 const INSERT_RADIX_NODE: &str = include_str!("verification_sql/insert_radix_node.sql");
 const CONTAINS_RADIX_NODE: &str = include_str!("verification_sql/contains_radix_node.sql");
 const INSERT_MAP_PAIR: &str = include_str!("verification_sql/insert_map_pair.sql");
@@ -195,6 +212,70 @@ impl VerificationScratch {
             .prepare_cached(INSERT_TREE_SEMANTICS)?
             .execute(params![
                 tree.as_bytes().as_slice(),
+                aggregate.as_bytes().as_slice()
+            ])?;
+        Ok(())
+    }
+
+    pub(crate) fn chunk_proof(
+        &self,
+        chunk: DirectoryChunkId,
+    ) -> Result<Option<ChunkProof>, VerificationScratchError> {
+        match self
+            .connection()
+            .prepare_cached(CONTAINS_CHUNK_AUTH)?
+            .query_row([chunk.as_bytes().as_slice()], |row| {
+                Ok(ChunkProof {
+                    key_above: row.get(0)?,
+                    entries: row.get(1)?,
+                    height: row.get(2)?,
+                })
+            }) {
+            Ok(proof) => Ok(Some(proof)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn record_chunk_proof(
+        &self,
+        chunk: DirectoryChunkId,
+        proof: &ChunkProof,
+    ) -> Result<(), VerificationScratchError> {
+        self.connection()
+            .prepare_cached(INSERT_CHUNK_AUTH)?
+            .execute(params![
+                chunk.as_bytes().as_slice(),
+                proof.key_above,
+                proof.entries,
+                proof.height
+            ])?;
+        Ok(())
+    }
+
+    pub(crate) fn chunk_semantics_verified(
+        &self,
+        chunk: DirectoryChunkId,
+        aggregate: ContentSetId,
+    ) -> Result<bool, VerificationScratchError> {
+        Ok(self
+            .connection()
+            .prepare_cached(CONTAINS_CHUNK_SEMANTICS)?
+            .query_row(
+                params![chunk.as_bytes().as_slice(), aggregate.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?)
+    }
+
+    pub(crate) fn record_chunk_semantics(
+        &self,
+        chunk: DirectoryChunkId,
+        aggregate: ContentSetId,
+    ) -> Result<(), VerificationScratchError> {
+        self.connection()
+            .prepare_cached(INSERT_CHUNK_SEMANTICS)?
+            .execute(params![
+                chunk.as_bytes().as_slice(),
                 aggregate.as_bytes().as_slice()
             ])?;
         Ok(())

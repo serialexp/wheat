@@ -1,6 +1,6 @@
 //! Inventory-driven verification with a per-run disk-backed membership and memo index.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     num::NonZeroUsize,
     sync::Mutex,
 };
@@ -9,13 +9,14 @@ use async_trait::async_trait;
 use lru::LruCache;
 
 use crate::{
-    ConflictSetStore, ContentSetStore, ContentStoreError, ImmutableObjectStore, MerkleTreeStore,
-    ObjectStoreError, RepositoryPublicationError, RepositoryReader, RetainedSetStore, StoredObject,
+    ChunkWalk, ConflictSetStore, ContentSetStore, ContentStoreError, ImmutableObjectStore,
+    MerkleTreeStore, ObjectStoreError, RepositoryPublicationError, RepositoryReader,
+    RetainedSetStore, StoredDirectory, StoredObject,
     application_map::ApplicationCollection,
     radix::{ContextWalkStep, DiffLimits, PairedContextWalkStep, Store as RadixStore},
     revision_map::RevisionCollection,
     semantic_checks::{Checks, Membership, Retained, invalid},
-    verification_scratch::{RadixReceiptKind, VerificationScratch},
+    verification_scratch::{ChunkProof, RadixReceiptKind, VerificationScratch},
 };
 use wheat_core::*;
 type Result<T> = std::result::Result<T, RepositoryPublicationError>;
@@ -130,6 +131,52 @@ impl<O: ImmutableObjectStore> ImmutableObjectStore for CachedObjects<'_, O> {
     }
 }
 
+/// A directory being authenticated: the subdirectories still to visit, the
+/// greatest height of those visited plus one, and for a chunked directory what
+/// proving its chunks takes once they are done.
+struct AuthFrame {
+    tree: TreeId,
+    subdirectories: std::vec::IntoIter<TreeId>,
+    height: usize,
+    chunks: Option<ChunkAuth>,
+}
+
+/// A chunked directory's chunks: the entries and height below each proved before,
+/// and those read now, each after its parent.
+struct ChunkAuth {
+    count: u64,
+    root: DirectoryChunkId,
+    proved: HashMap<DirectoryChunkId, (u64, usize)>,
+    read: Vec<ReadChunk>,
+}
+
+struct ReadChunk {
+    id: DirectoryChunkId,
+    key_above: Vec<u8>,
+    /// The entries in the chunk itself.
+    entries: u64,
+    subdirectories: Vec<TreeId>,
+    children: Vec<DirectoryChunkId>,
+}
+
+/// A directory whose files are being checked against an aggregate: the entries
+/// still to check, and for a chunked directory the chunks they came from, to
+/// record once they all pass.
+struct ContentFrame {
+    tree: TreeId,
+    entries: std::vec::IntoIter<DirectoryEntry>,
+    chunks: Vec<DirectoryChunkId>,
+}
+
+fn subdirectories<'e>(entries: impl Iterator<Item = &'e DirectoryEntry>) -> Vec<TreeId> {
+    entries
+        .filter_map(|entry| match entry {
+            DirectoryEntry::Directory(id) => Some(*id),
+            DirectoryEntry::File(_) => None,
+        })
+        .collect()
+}
+
 struct Verifier<'a, 'r, O, F> {
     reader: &'r RepositoryReader<'a, O>,
     scratch: VerificationScratch,
@@ -177,7 +224,8 @@ where
 
     /// Authenticate each distinct tree node once per validation run. The receipt
     /// carries height so reuse beneath a deeper directory cannot bypass the
-    /// verification depth limit.
+    /// verification depth limit. A wide directory's chunks have receipts of their
+    /// own, so a new version of one reads only the chunks it changed.
     #[tracing::instrument(level = "debug", skip_all)]
     async fn authenticate_tree(&self, root: TreeId) -> Result<()> {
         const MAX_DIRECTORY_DEPTH: usize = 1023;
@@ -189,17 +237,12 @@ where
         }
 
         let trees = MerkleTreeStore::new(self.reader.objects);
-        let mut stack = vec![(
-            root,
-            trees.read_node(root).await?.entries.into_values(),
-            0usize,
-        )];
+        let mut stack = vec![self.open_auth_frame(&trees, root).await?];
         while !stack.is_empty() {
             let child_depth = stack.len();
-            let (node, frame, height) = stack.last_mut().expect("checked non-empty stack");
-            match frame.next() {
-                Some(DirectoryEntry::File(_)) => {}
-                Some(DirectoryEntry::Directory(child)) => {
+            let frame = stack.last_mut().expect("checked non-empty stack");
+            match frame.subdirectories.next() {
+                Some(child) => {
                     if let Some(child_height) = self.scratch.tree_height(child)? {
                         if child_depth
                             .checked_add(child_height)
@@ -207,30 +250,128 @@ where
                         {
                             return Err(invalid("directory depth exceeds verification limit"));
                         }
-                        *height = (*height).max(child_height + 1);
+                        frame.height = frame.height.max(child_height + 1);
                     } else {
-                        stack.push((
-                            child,
-                            trees.read_node(child).await?.entries.into_values(),
-                            0,
-                        ));
+                        let child = self.open_auth_frame(&trees, child).await?;
+                        stack.push(child);
                     }
                 }
                 None => {
-                    let node = *node;
-                    let height = *height;
-                    if stack.len() - 1 + height > MAX_DIRECTORY_DEPTH {
+                    let frame = stack.pop().expect("a frame is on the stack");
+                    let tree = frame.tree;
+                    let (height, chunks) = self.close_auth_frame(frame)?;
+                    if stack.len() + height > MAX_DIRECTORY_DEPTH {
                         return Err(invalid("directory depth exceeds verification limit"));
                     }
-                    self.scratch.record_tree_height(node, height)?;
-                    stack.pop();
-                    if let Some((_, _, parent_height)) = stack.last_mut() {
-                        *parent_height = (*parent_height).max(height + 1);
+                    for (chunk, proof) in &chunks {
+                        self.scratch.record_chunk_proof(*chunk, proof)?;
+                    }
+                    self.scratch.record_tree_height(tree, height)?;
+                    if let Some(parent) = stack.last_mut() {
+                        parent.height = parent.height.max(height + 1);
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Reads directory `tree` to authenticate it: a chunked one's chunks except those
+    /// proved before at the same key.
+    async fn open_auth_frame(
+        &self,
+        trees: &MerkleTreeStore<'_, O>,
+        tree: TreeId,
+    ) -> Result<AuthFrame> {
+        let (subdirectories, chunks) = match trees.read_stored_directory(tree).await? {
+            StoredDirectory::Flat(node) => (subdirectories(node.entries.values()), None),
+            StoredDirectory::Chunked(header) => {
+                let mut subdirectories_read = Vec::new();
+                let mut proved = HashMap::new();
+                let mut read = Vec::new();
+                let mut walk = ChunkWalk::new(&header);
+                while let Some((id, key)) = walk.next_chunk() {
+                    if let Some(proof) = self.scratch.chunk_proof(id)?
+                        && proof.key_above == key
+                    {
+                        proved.insert(id, (proof.entries, proof.height));
+                        continue;
+                    }
+                    let key_above = key.to_vec();
+                    let chunk = walk.read(trees).await?;
+                    let subdirectories =
+                        subdirectories(chunk.entries.iter().map(|entry| &entry.entry));
+                    subdirectories_read.extend_from_slice(&subdirectories);
+                    read.push(ReadChunk {
+                        id,
+                        key_above,
+                        entries: chunk.entries.len() as u64,
+                        subdirectories,
+                        children: chunk.children,
+                    });
+                }
+                (
+                    subdirectories_read,
+                    Some(ChunkAuth {
+                        count: header.count,
+                        root: header.root,
+                        proved,
+                        read,
+                    }),
+                )
+            }
+        };
+        Ok(AuthFrame {
+            tree,
+            subdirectories: subdirectories.into_iter(),
+            height: 0,
+            chunks,
+        })
+    }
+
+    /// The height of the directory `frame` authenticated, whose subdirectories all
+    /// have receipts now, and the proofs of the chunks it read, which its tree's
+    /// count is checked against.
+    fn close_auth_frame(
+        &self,
+        frame: AuthFrame,
+    ) -> Result<(usize, Vec<(DirectoryChunkId, ChunkProof)>)> {
+        let Some(chunks) = frame.chunks else {
+            return Ok((frame.height, Vec::new()));
+        };
+        let mut below = chunks.proved;
+        let mut proofs = Vec::with_capacity(chunks.read.len());
+        // Each chunk was read after its parent, so in reverse its children come first.
+        for chunk in chunks.read.into_iter().rev() {
+            let mut entries = chunk.entries;
+            let mut height = 0;
+            for subdirectory in chunk.subdirectories {
+                let subdirectory = self
+                    .scratch
+                    .tree_height(subdirectory)?
+                    .ok_or_else(|| invalid("a subdirectory has no receipt"))?;
+                height = height.max(subdirectory + 1);
+            }
+            for child in chunk.children {
+                let (child_entries, child_height) = below[&child];
+                entries += child_entries;
+                height = height.max(child_height);
+            }
+            below.insert(chunk.id, (entries, height));
+            proofs.push((
+                chunk.id,
+                ChunkProof {
+                    key_above: chunk.key_above,
+                    entries,
+                    height,
+                },
+            ));
+        }
+        let (entries, height) = below[&chunks.root];
+        if entries != chunks.count {
+            return Err(invalid("a chunked tree's count does not match its entries"));
+        }
+        Ok((height, proofs))
     }
 
     /// Every file of the tree names content in the aggregate.
@@ -241,24 +382,60 @@ where
             return Ok(());
         }
         let trees = MerkleTreeStore::new(self.reader.objects);
-        let mut stack = vec![(root, trees.read_node(root).await?.entries.into_values())];
-        while let Some((node, frame)) = stack.last_mut() {
-            match frame.next() {
+        let mut stack = vec![self.open_content_frame(&trees, root, aggregate).await?];
+        while let Some(frame) = stack.last_mut() {
+            match frame.entries.next() {
                 None => {
                     // Only memoize a subtree after every descendant passed against
                     // this exact aggregate.
-                    self.scratch.record_tree_semantics(*node, aggregate)?;
+                    for chunk in &frame.chunks {
+                        self.scratch.record_chunk_semantics(*chunk, aggregate)?;
+                    }
+                    self.scratch.record_tree_semantics(frame.tree, aggregate)?;
                     stack.pop();
                 }
                 Some(DirectoryEntry::File(value)) => self.scratch.content(value.content).await?,
                 Some(DirectoryEntry::Directory(id)) => {
                     if !self.scratch.tree_semantics_verified(id, aggregate)? {
-                        stack.push((id, trees.read_node(id).await?.entries.into_values()));
+                        let child = self.open_content_frame(&trees, id, aggregate).await?;
+                        stack.push(child);
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Reads directory `tree` to check its files: a chunked one's chunks except those
+    /// checked against `aggregate` before. The tree is authenticated already.
+    async fn open_content_frame(
+        &self,
+        trees: &MerkleTreeStore<'_, O>,
+        tree: TreeId,
+        aggregate: ContentSetId,
+    ) -> Result<ContentFrame> {
+        let mut chunks = Vec::new();
+        let entries = match trees.read_stored_directory(tree).await? {
+            StoredDirectory::Flat(node) => node.entries.into_values().collect(),
+            StoredDirectory::Chunked(header) => {
+                let mut entries = Vec::new();
+                let mut walk = ChunkWalk::new(&header);
+                while let Some((id, _)) = walk.next_chunk() {
+                    if self.scratch.chunk_semantics_verified(id, aggregate)? {
+                        continue;
+                    }
+                    let chunk = walk.read(trees).await?;
+                    entries.extend(chunk.entries.into_iter().map(|entry| entry.entry));
+                    chunks.push(id);
+                }
+                entries
+            }
+        };
+        Ok(ContentFrame {
+            tree,
+            entries: entries.into_iter(),
+            chunks,
+        })
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -803,6 +980,260 @@ mod tree_depth_tests {
         };
         verifier.authenticate_tree(shallow).await.unwrap();
         assert!(verifier.authenticate_tree(deep).await.is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod wide_directory_tests {
+    //! A wide directory's chunks have receipts of their own: a new version of the
+    //! directory reads the chunks it changed, and a receipt only vouches for a chunk
+    //! at the key it was proved at.
+
+    use std::{
+        collections::HashSet,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+    use crate::{ContentStore, LooseObjectStore};
+
+    const FILES: u32 = 1_000;
+
+    /// An object store counting the objects read through it.
+    struct Counting {
+        inner: LooseObjectStore,
+        reads: AtomicUsize,
+    }
+
+    impl Counting {
+        fn take(&self) -> usize {
+            self.reads.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableObjectStore for Counting {
+        async fn put_if_absent(
+            &self,
+            id: ObjectId,
+            bytes: &[u8],
+        ) -> std::result::Result<(), ObjectStoreError> {
+            self.inner.put_if_absent(id, bytes).await
+        }
+
+        async fn get(&self, id: ObjectId) -> std::result::Result<StoredObject, ObjectStoreError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(id).await
+        }
+
+        async fn exists_many(
+            &self,
+            ids: &[ObjectId],
+        ) -> std::result::Result<Vec<bool>, ObjectStoreError> {
+            self.inner.exists_many(ids).await
+        }
+    }
+
+    struct Fixture {
+        _objects: tempfile::TempDir,
+        _content: tempfile::TempDir,
+        objects: Counting,
+        content: ContentStore,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let objects = tempfile::tempdir().unwrap();
+            let content = tempfile::tempdir().unwrap();
+            Self {
+                objects: Counting {
+                    inner: LooseObjectStore::new(objects.path()),
+                    reads: AtomicUsize::new(0),
+                },
+                content: ContentStore::new(content.path()),
+                _objects: objects,
+                _content: content,
+            }
+        }
+
+        fn trees(&self) -> MerkleTreeStore<'_, Counting> {
+            MerkleTreeStore::new(&self.objects)
+        }
+
+        /// A directory of [`FILES`] files, `extra` beside them.
+        async fn wide(&self, extra: impl IntoIterator<Item = (String, DirectoryEntry)>) -> TreeId {
+            let mut entries: BTreeMap<String, DirectoryEntry> = (0..FILES)
+                .map(|index| (format!("f{index}"), file(index)))
+                .collect();
+            entries.extend(extra);
+            let id = self
+                .trees()
+                .write_node(&DirectoryNode { entries })
+                .await
+                .unwrap();
+            self.objects.take();
+            id
+        }
+
+        /// The chunks of chunked directory `id`.
+        async fn chunks(&self, id: TreeId) -> HashSet<DirectoryChunkId> {
+            let trees = self.trees();
+            let StoredDirectory::Chunked(header) = trees.read_stored_directory(id).await.unwrap()
+            else {
+                panic!("{id} is not chunked");
+            };
+            let mut walk = ChunkWalk::new(&header);
+            let mut chunks = HashSet::new();
+            while let Some((chunk, _)) = walk.next_chunk() {
+                chunks.insert(chunk);
+                walk.read(&trees).await.unwrap();
+            }
+            self.objects.take();
+            chunks
+        }
+    }
+
+    fn file(index: u32) -> DirectoryEntry {
+        DirectoryEntry::File(FileValue {
+            content: ContentId::of(&index.to_le_bytes()),
+            kind: FileKind::Regular,
+        })
+    }
+
+    fn verifier<'a, 'r>(
+        reader: &'r RepositoryReader<'a, Counting>,
+    ) -> Verifier<'a, 'r, Counting, impl FnMut(RepositoryValidationPhase)> {
+        Verifier {
+            reader,
+            scratch: VerificationScratch::new().unwrap(),
+            observer: |_| {},
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_version_of_a_wide_directory_reads_only_its_changed_chunks() {
+        let fixture = Fixture::new();
+        let before = fixture.wide([]).await;
+        let after = fixture.wide([("f7".to_owned(), file(FILES))]).await;
+        let changed = fixture.chunks(after).await.len()
+            - fixture
+                .chunks(after)
+                .await
+                .intersection(&fixture.chunks(before).await)
+                .count();
+        assert!(changed < 4, "one file changes the chunks on its key path");
+
+        let reader = RepositoryReader::new(&fixture.objects, &fixture.content);
+        let verifier = verifier(&reader);
+        let aggregate = ContentSetId::from_digest([1; 32]);
+        for index in 0..=FILES {
+            verifier
+                .scratch
+                .insert_content(ContentId::of(&index.to_le_bytes()))
+                .unwrap();
+        }
+        verifier.tree(before, aggregate).await.unwrap();
+        fixture.objects.take();
+
+        // Authentication reads the header and the changed chunks, and so does the
+        // content check after it.
+        verifier.tree(after, aggregate).await.unwrap();
+        assert_eq!(fixture.objects.take(), 2 * (1 + changed));
+        assert_eq!(verifier.scratch.tree_height(after).unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_proved_chunk_carries_the_height_below_it() {
+        let fixture = Fixture::new();
+        let trees = fixture.trees();
+        let leaf = trees.write_node(&DirectoryNode::default()).await.unwrap();
+        let middle = trees
+            .write_node(&DirectoryNode {
+                entries: BTreeMap::from([("leaf".to_owned(), DirectoryEntry::Directory(leaf))]),
+            })
+            .await
+            .unwrap();
+        let before = fixture
+            .wide([("sub".to_owned(), DirectoryEntry::Directory(middle))])
+            .await;
+        // A change on another key path keeps the chunk holding `sub`.
+        let after = fixture
+            .wide([
+                ("sub".to_owned(), DirectoryEntry::Directory(middle)),
+                ("f7".to_owned(), file(FILES)),
+            ])
+            .await;
+
+        let reader = RepositoryReader::new(&fixture.objects, &fixture.content);
+        let verifier = verifier(&reader);
+        verifier.authenticate_tree(before).await.unwrap();
+        verifier.authenticate_tree(after).await.unwrap();
+        assert_eq!(verifier.scratch.tree_height(before).unwrap(), Some(2));
+        assert_eq!(verifier.scratch.tree_height(after).unwrap(), Some(2));
+    }
+
+    /// `tree` with its root chunk's first two children swapped, so each is reached
+    /// under the other's key.
+    async fn swapped(fixture: &Fixture, tree: TreeId) -> TreeId {
+        let trees = fixture.trees();
+        let StoredDirectory::Chunked(header) = trees.read_stored_directory(tree).await.unwrap()
+        else {
+            panic!("{tree} is not chunked");
+        };
+        let root = fixture.objects.get(header.root.into()).await.unwrap();
+        let mut node = decode_directory_chunk_node(&root.canonical_bytes).unwrap();
+        let (first, second) = (node.children[0].child, node.children[1].child);
+        node.children[0].child = second;
+        node.children[1].child = first;
+        let node = DirectoryChunkNode::new(node.prefix, node.children, node.entries).unwrap();
+        fixture
+            .objects
+            .put_if_absent(node.id().into(), &node.canonical_bytes())
+            .await
+            .unwrap();
+        let header = ChunkedTree::new(header.count, node.id()).unwrap();
+        fixture
+            .objects
+            .put_if_absent(header.id().into(), &header.canonical_bytes())
+            .await
+            .unwrap();
+        header.id()
+    }
+
+    #[tokio::test]
+    async fn a_chunk_proved_under_one_key_is_refused_under_another() {
+        let fixture = Fixture::new();
+        let honest = fixture.wide([]).await;
+        let forged = swapped(&fixture, honest).await;
+        let reader = RepositoryReader::new(&fixture.objects, &fixture.content);
+
+        assert!(verifier(&reader).authenticate_tree(forged).await.is_err());
+        let verifier = verifier(&reader);
+        verifier.authenticate_tree(honest).await.unwrap();
+        assert!(verifier.authenticate_tree(forged).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_header_over_proved_chunks_still_has_its_count_checked() {
+        let fixture = Fixture::new();
+        let honest = fixture.wide([]).await;
+        let trees = fixture.trees();
+        let StoredDirectory::Chunked(header) = trees.read_stored_directory(honest).await.unwrap()
+        else {
+            panic!("{honest} is not chunked");
+        };
+        let miscounted = ChunkedTree::new(header.count + 1, header.root).unwrap();
+        fixture
+            .objects
+            .put_if_absent(miscounted.id().into(), &miscounted.canonical_bytes())
+            .await
+            .unwrap();
+
+        let reader = RepositoryReader::new(&fixture.objects, &fixture.content);
+        let verifier = verifier(&reader);
+        verifier.authenticate_tree(honest).await.unwrap();
+        assert!(verifier.authenticate_tree(miscounted.id()).await.is_err());
     }
 }
 

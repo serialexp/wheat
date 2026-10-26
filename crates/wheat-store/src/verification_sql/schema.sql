@@ -39,6 +39,24 @@ CREATE TABLE verified_tree_semantics (
     PRIMARY KEY (tree_id, aggregate_id)
 ) WITHOUT ROWID;
 
+-- A wide directory's chunk, proved with the subtree of chunks below it: its
+-- entries are filed under the key bytes above it, which a chunk reused elsewhere
+-- must be reached at again, and the receipt carries the entries below it (for
+-- the tree's count) and the greatest height of their subdirectories.
+CREATE TABLE verified_chunk_auth (
+    chunk_id BLOB PRIMARY KEY NOT NULL,
+    key_above BLOB NOT NULL,
+    entries INTEGER NOT NULL,
+    height INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- Every file below a chunk names content in the aggregate.
+CREATE TABLE verified_chunk_semantics (
+    chunk_id BLOB NOT NULL,
+    aggregate_id BLOB NOT NULL,
+    PRIMARY KEY (chunk_id, aggregate_id)
+) WITHOUT ROWID;
+
 -- One tree's file-content multiplicities, compared against its view's content
 -- map when a lineage edge cannot be checked by diff. Disk-backed so a large tree
 -- stays bounded in memory.

@@ -159,6 +159,99 @@ impl Directory {
     }
 }
 
+/// A directory as it is stored: a flat record's entries, or a chunked tree's header,
+/// whose chunks a [`ChunkWalk`] reads.
+pub enum StoredDirectory {
+    Flat(DirectoryNode),
+    Chunked(ChunkedTree),
+}
+
+/// A depth-first walk over a chunked directory's chunks that its caller steers, so a
+/// walk that proves something about each chunk can skip the ones it proved before.
+/// [`Self::next_chunk`] names the next chunk and the key bytes above it. The caller then
+/// either [`Self::read`]s it, which checks that each of its entries is filed under
+/// its name's key and queues the chunks below it, or asks for the next, skipping
+/// the chunk and everything below it.
+pub struct ChunkWalk {
+    /// Chunks to visit, with the length of the key above the edge to each and the
+    /// edge's byte.
+    stack: Vec<(DirectoryChunkId, usize, Option<u8>)>,
+    /// The key bytes above the chunk `next_chunk` returned.
+    key: Vec<u8>,
+    current: Option<DirectoryChunkId>,
+}
+
+/// What a [`ChunkWalk`] read in one chunk.
+pub struct WalkedChunk {
+    pub entries: Vec<DirectoryChunkEntry>,
+    pub children: Vec<DirectoryChunkId>,
+}
+
+impl ChunkWalk {
+    pub fn new(tree: &ChunkedTree) -> Self {
+        Self {
+            stack: vec![(tree.root, 0, None)],
+            key: Vec::with_capacity(32),
+            current: None,
+        }
+    }
+
+    /// The next chunk, and the key bytes above it, or `None` when the walk is done.
+    pub fn next_chunk(&mut self) -> Option<(DirectoryChunkId, &[u8])> {
+        let (id, above, edge) = self.stack.pop()?;
+        // Chunks pop depth first, so a chunk's ancestors' bytes are still in place.
+        self.key.truncate(above);
+        self.key.extend(edge);
+        self.current = Some(id);
+        Some((id, &self.key))
+    }
+
+    /// Reads the chunk [`Self::next_chunk`] returned.
+    ///
+    /// # Panics
+    ///
+    /// When `next_chunk` has not returned a chunk since the last read.
+    pub async fn read<S: ImmutableObjectStore>(
+        &mut self,
+        trees: &MerkleTreeStore<'_, S>,
+    ) -> Result<WalkedChunk, MerkleTreeError> {
+        let id = self.current.take().expect("a read follows next_chunk");
+        let chunk = trees
+            .read_chunk(
+                id,
+                self.key.len(),
+                ReadLimits::UNBOUNDED,
+                &mut ReadCount::default(),
+            )
+            .await?;
+        self.visit(chunk.node)
+    }
+
+    /// Checks `node`, the chunk [`Self::next_chunk`] returned, and queues its children.
+    fn visit(&mut self, node: ChunkNode) -> Result<WalkedChunk, MerkleTreeError> {
+        self.current = None;
+        self.key.extend_from_slice(&node.prefix);
+        let end = self.key.len();
+        let mut entries = Vec::with_capacity(node.entries.len());
+        for (_, entry) in node.entries {
+            // The node checked that the suffix ends the name's key; this checks the
+            // bytes above it.
+            if directory_name_key(&entry.name)[..end] != self.key[..] {
+                return Err(MerkleTreeError::MalformedDirectory(
+                    "an entry is filed under another name's key",
+                ));
+            }
+            entries.push(entry);
+        }
+        let mut children = Vec::with_capacity(node.children.len());
+        for (edge, child) in node.children.into_iter().rev() {
+            self.stack.push((child, end, Some(edge)));
+            children.push(child);
+        }
+        Ok(WalkedChunk { entries, children })
+    }
+}
+
 /// The entries two directories hold, in name order, for pairing by name. Entries
 /// both hold alike may be left out.
 pub(crate) struct DirectoryDiff {
@@ -219,6 +312,21 @@ impl<S: ImmutableObjectStore> MerkleTreeStore<'_, S> {
             }
             .into()),
         }
+    }
+
+    /// Reads directory `id` as it is stored: a chunked one's chunks are left for a
+    /// [`ChunkWalk`].
+    pub async fn read_stored_directory(
+        &self,
+        id: TreeId,
+    ) -> Result<StoredDirectory, MerkleTreeError> {
+        let directory = self
+            .open_directory(id, ReadLimits::UNBOUNDED, &mut ReadCount::default())
+            .await?;
+        Ok(match directory {
+            Directory::Flat(node) => StoredDirectory::Flat(node),
+            Directory::Chunked { tree, .. } => StoredDirectory::Chunked(tree),
+        })
     }
 
     /// Reads directory `id` whole, in name order.
@@ -427,32 +535,15 @@ impl<S: ImmutableObjectStore> MerkleTreeStore<'_, S> {
             Directory::Chunked { tree, chunks } => (tree, chunks),
         };
         let mut entries = BTreeMap::new();
-        // The key bytes above the node being read. Nodes pop depth first, so a
-        // node's ancestors' bytes are still in place when it is reached.
-        let mut key = Vec::with_capacity(32);
-        let mut stack = vec![(tree.root, 0, None)];
-        while let Some((id, above, edge)) = stack.pop() {
-            key.truncate(above);
-            key.extend(edge);
+        let mut walk = ChunkWalk::new(&tree);
+        while let Some((id, key)) = walk.next_chunk() {
             // Lookups read chunks at the same positions.
             let node = match chunks.remove(&id) {
                 Some(chunk) => chunk.node,
                 None => self.read_chunk(id, key.len(), limits, count).await?.node,
             };
-            key.extend_from_slice(&node.prefix);
-            let end = key.len();
-            for (_, entry) in node.entries {
-                // The node checked that the suffix ends the name's key; this checks
-                // the bytes above it.
-                if directory_name_key(&entry.name)[..end] != key[..] {
-                    return Err(MerkleTreeError::MalformedDirectory(
-                        "an entry is filed under another name's key",
-                    ));
-                }
+            for entry in walk.visit(node)?.entries {
                 entries.insert(entry.name, entry.entry);
-            }
-            for (edge, child) in node.children.into_iter().rev() {
-                stack.push((child, end, Some(edge)));
             }
         }
         if entries.len() as u64 != tree.count {
