@@ -3621,6 +3621,8 @@ mod tests {
             objects,
             content,
             heads: wheat_store::LocalPublicationStore::new(root.path().join("repository.head")),
+            frontiers: wheat_store::FrontierIndex::open(&root.path().join("frontiers.sqlite"))
+                .unwrap(),
         };
         // Twelve 12 MiB files with one file over the bound in the middle.
         let sizes = (0..12)

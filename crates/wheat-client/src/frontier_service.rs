@@ -1,10 +1,13 @@
 //! Authenticated, bounded workspace-label frontier resolution.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use serde::Serialize;
-use wheat_core::ViewId;
+use wheat_core::{RepositoryStateRecord, ViewId, ViewLabel};
 use wheat_store::{
-    PublicationStore, RepositoryHead, RepositoryReader, ViewLineageLimits, ViewLineageMapStore,
+    FrontierIndex, ImmutableObjectStore, PublicationStore, RepositoryHead, RepositoryReader,
+    ViewLineageLimits,
 };
 
 use crate::{
@@ -116,9 +119,12 @@ async fn resolve_at_head<O: wheat_store::ImmutableObjectStore>(
         .get(label)
         .map(|binding| binding.view)
         .ok_or_else(|| CliFailure::invalid(format!("unknown Wheat label {label}")))?;
-    let frontiers = ViewLineageMapStore::new(&repository.objects)
-        .descendant_frontiers(state.view_lineage, basis, ViewLineageLimits::default())
-        .await?;
+    let frontiers = LabelFrontiers {
+        index: &repository.frontiers,
+        labels: &labels.labels,
+    }
+    .of(&repository.objects, &state, basis)
+    .await?;
     let selected_frontier = match requested {
         Some(requested) if requested == basis => None,
         Some(requested) => {
@@ -158,6 +164,35 @@ async fn resolve_at_head<O: wheat_store::ImmutableObjectStore>(
     })
 }
 
+/// Where a command finds a view's descendant frontiers: the store's frontier index,
+/// which keeps them for the views `labels` point at.
+#[derive(Clone, Copy)]
+pub struct LabelFrontiers<'a> {
+    pub index: &'a FrontierIndex,
+    pub labels: &'a BTreeMap<String, ViewLabel>,
+}
+
+impl LabelFrontiers<'_> {
+    /// `view`'s descendant frontiers in `state`.
+    pub async fn of<O: ImmutableObjectStore>(
+        &self,
+        objects: &O,
+        state: &RepositoryStateRecord,
+        view: ViewId,
+    ) -> Result<Vec<ViewId>> {
+        Ok(self
+            .index
+            .frontiers(
+                objects,
+                state.view_lineage,
+                self.labels.values().map(|label| label.view),
+                view,
+                ViewLineageLimits::default(),
+            )
+            .await?)
+    }
+}
+
 #[tracing::instrument(name = "frontier_list", level = "debug", skip_all)]
 pub async fn list(repository: &LocalRepository, label: &str) -> Result<FrontierList> {
     let head = repository.heads.read()?;
@@ -174,9 +209,12 @@ pub async fn list(repository: &LocalRepository, label: &str) -> Result<FrontierL
         .map(|value| value.view)
         .ok_or_else(|| CliFailure::invalid(format!("unknown Wheat label {label}")))?;
     reader.retained_view(&state, basis).await?;
-    let frontiers = ViewLineageMapStore::new(&repository.objects)
-        .descendant_frontiers(state.view_lineage, basis, ViewLineageLimits::default())
-        .await?;
+    let frontiers = LabelFrontiers {
+        index: &repository.frontiers,
+        labels: &labels.labels,
+    }
+    .of(&repository.objects, &state, basis)
+    .await?;
     anyhow::ensure!(
         repository.heads.read()? == head,
         "repository head changed while listing label frontiers"

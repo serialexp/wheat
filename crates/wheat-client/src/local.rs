@@ -3,7 +3,7 @@ use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 use wheat_core::{Repository, RevisionId, RevisionRecord, Tree};
 use wheat_store::{
-    ContentStore, ImmutableObjectStore, LocalPublicationStore, PackedObjectStore,
+    ContentStore, FrontierIndex, ImmutableObjectStore, LocalPublicationStore, PackedObjectStore,
     RepositoryPublisher, RepositoryReader,
 };
 
@@ -18,7 +18,12 @@ pub struct LocalRepository {
     pub objects: PackedObjectStore,
     pub content: ContentStore,
     pub heads: LocalPublicationStore,
+    /// The labels' descendant frontiers, cached next to the store.
+    pub frontiers: FrontierIndex,
 }
+
+/// The frontier index's file in a store; a cache the store can always rebuild.
+const FRONTIER_INDEX_FILE: &str = "frontiers.sqlite";
 
 pub fn content_store(root: &Path) -> Result<ContentStore> {
     Ok(PackedObjectStore::open(storage_path(root)?)?.content_store())
@@ -64,6 +69,7 @@ pub fn open(root: &Path) -> Result<LocalRepository> {
         objects,
         content,
         heads: LocalPublicationStore::new(root.join("repository.head")),
+        frontiers: FrontierIndex::open(&root.join(FRONTIER_INDEX_FILE))?,
     })
 }
 

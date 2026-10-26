@@ -14,6 +14,7 @@ use wheat_store::{
 
 use crate::{
     authoring_metadata::display_timestamp,
+    frontier_service::LabelFrontiers,
     label_move,
     local::{LocalRepository, runtime},
     outcome::{CliFailure, Success},
@@ -286,9 +287,19 @@ pub fn move_label(
         }
         if !force {
             let mut budget = MergeBudget::STANDARD;
-            let refusal =
-                label_move::check(&reader, &repository.objects, &state, from, to, &mut budget)
-                    .await?;
+            let refusal = label_move::check(
+                &reader,
+                &repository.objects,
+                LabelFrontiers {
+                    index: &repository.frontiers,
+                    labels: &labels,
+                },
+                &state,
+                from,
+                to,
+                &mut budget,
+            )
+            .await?;
             if !refusal.is_empty() {
                 return Err(CliFailure::label_move_refused(format!(
                     "cannot move label {name} to view {to}: {}; {hint}",

@@ -193,6 +193,39 @@ async fn traversal_does_not_scan_unrelated_retained_history() {
     );
 }
 
+/// A walk looks up every view below the basis, and the lookups share the map's upper
+/// levels; each map node is read once, so a chain of views costs a read per child set
+/// plus the map, not the chain times the map's depth.
+#[tokio::test]
+async fn a_walk_reads_each_map_node_once() {
+    const CHAIN: u32 = 2_000;
+    let objects = CountingStore::new(ObjectStoreAdapter::new(
+        Arc::new(InMemory::new()),
+        "view-lineage-walk-nodes",
+    ));
+    let lineage = ViewLineageMapStore::new(&objects);
+    let root = lineage
+        .insert_edges(
+            lineage.empty_root().await.unwrap(),
+            (1..=CHAIN).map(|tip| (view(tip - 1), view(tip))),
+        )
+        .await
+        .unwrap();
+    objects.reset_reads();
+    assert_eq!(
+        lineage
+            .descendant_frontiers(root, view(0), limits())
+            .await
+            .unwrap(),
+        vec![view(CHAIN)]
+    );
+    let reads = objects.reads();
+    assert!(
+        reads < 2 * CHAIN as usize,
+        "a walk over {CHAIN} views read {reads} objects"
+    );
+}
+
 #[tokio::test]
 async fn validates_complete_graph_and_monotonic_extensions() {
     let objects = CountingStore::new(ObjectStoreAdapter::new(

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use thiserror::Error;
 use wheat_core::{
@@ -7,8 +7,19 @@ use wheat_core::{
 };
 
 use crate::{
-    CollectionError, ImmutableObjectStore, ObjectKind, ObjectStoreError, RetainedSetStore, radix,
+    CollectionError, ImmutableObjectStore, ObjectKind, ObjectStoreError, RetainedSetDelta,
+    RetainedSetDeltaLimits, RetainedSetStore, radix,
 };
+
+/// How one lineage differs from an earlier one.
+pub(crate) enum LineageGrowth {
+    /// The later lineage holds every edge of the earlier one; these are the edges it
+    /// adds, by parent. A parent the later lineage adds with no children maps to an
+    /// empty list.
+    Grew(BTreeMap<ViewId, Vec<ViewId>>),
+    /// The later lineage drops an edge of the earlier one.
+    Dropped,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ViewLineageLimits {
@@ -173,6 +184,11 @@ struct Budget {
     decoded_bytes: usize,
     reachable_views: usize,
     edges: usize,
+    /// The map nodes one operation has decoded, by ID and radix position. A walk looks
+    /// up every view it visits, and the lookups share the map's upper levels: kept
+    /// here, each node is read and counted once, so a walk costs at most the map,
+    /// not the views it visits times the map's depth.
+    decoded_map_nodes: HashMap<(ViewLineageMapId, usize), ViewLineageMapNode>,
 }
 
 impl Budget {
@@ -363,6 +379,51 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
             .map_err(|error| ViewLineageError::from(error.into_unbounded()))
     }
 
+    /// The edges `new` adds to `old`, or [`LineageGrowth::Dropped`] when it drops one.
+    /// Costs what the two lineages differ by, as [`Self::parent_delta`] does.
+    pub(crate) async fn growth(
+        &self,
+        old: ViewLineageMapId,
+        new: ViewLineageMapId,
+    ) -> Result<LineageGrowth, ViewLineageError> {
+        let unbounded = RetainedSetDeltaLimits {
+            max_changes: usize::MAX,
+            max_nodes: usize::MAX,
+            max_pending: usize::MAX,
+        };
+        let mut added = BTreeMap::new();
+        for entry in self.parent_delta(old, new).await? {
+            match entry {
+                radix::DiffEntry::Added(parent, children) => {
+                    let mut cursor = self.retained.cursor(children).await?;
+                    let mut members = Vec::new();
+                    while let Some(child) = cursor.next().await? {
+                        members.push(ViewId::from_digest(*child.as_bytes()));
+                    }
+                    added.insert(parent, members);
+                }
+                radix::DiffEntry::Changed(parent, old_children, new_children) => {
+                    let mut members = Vec::new();
+                    for change in self
+                        .retained
+                        .delta(old_children, new_children, unbounded)
+                        .await?
+                    {
+                        match change {
+                            RetainedSetDelta::Added(child) => {
+                                members.push(ViewId::from_digest(*child.as_bytes()));
+                            }
+                            RetainedSetDelta::Removed(_) => return Ok(LineageGrowth::Dropped),
+                        }
+                    }
+                    added.insert(parent, members);
+                }
+                radix::DiffEntry::Removed(..) => return Ok(LineageGrowth::Dropped),
+            }
+        }
+        Ok(LineageGrowth::Grew(added))
+    }
+
     /// Authenticates the complete map and all referenced child sets.
     pub async fn validate(
         &self,
@@ -495,32 +556,50 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
         Ok(false)
     }
 
+    /// The views with no children reachable from `basis`, `basis` aside, sorted. A
+    /// forward walk over every view below `basis`; the frontier index
+    /// (`crate::FrontierIndex`) answers the same question without it.
     pub async fn descendant_frontiers(
         &self,
         root: ViewLineageMapId,
         basis: ViewId,
         limits: ViewLineageLimits,
     ) -> Result<Vec<ViewId>, ViewLineageError> {
+        let mut frontiers = self
+            .descendants(root, basis, limits)
+            .await?
+            .into_iter()
+            .filter_map(|(view, tip)| tip.then_some(view))
+            .collect::<Vec<_>>();
+        if frontiers.len() > limits.max_frontiers {
+            return Err(ViewLineageError::FrontierLimitExceeded {
+                limit: limits.max_frontiers,
+            });
+        }
+        frontiers.sort_unstable();
+        Ok(frontiers)
+    }
+
+    /// Every view reachable from `basis`, `basis` aside, each with whether it is a tip
+    /// (has no children). A forward walk over all of them.
+    pub(crate) async fn descendants(
+        &self,
+        root: ViewLineageMapId,
+        basis: ViewId,
+        limits: ViewLineageLimits,
+    ) -> Result<Vec<(ViewId, bool)>, ViewLineageError> {
         let mut budget = Budget::default();
         let mut pending = BTreeSet::from([basis]);
         let mut visited = BTreeSet::new();
-        let mut frontiers = Vec::new();
+        let mut descendants = Vec::new();
         while let Some(view) = pending.pop_first() {
             if !visited.insert(view) {
                 continue;
             }
             budget.reachable(limits)?;
             let children = self.children(root, view, limits, &mut budget).await?;
-            if children.is_empty() {
-                if view != basis {
-                    if frontiers.len() == limits.max_frontiers {
-                        return Err(ViewLineageError::FrontierLimitExceeded {
-                            limit: limits.max_frontiers,
-                        });
-                    }
-                    frontiers.push(view);
-                }
-                continue;
+            if view != basis {
+                descendants.push((view, children.is_empty()));
             }
             for child in children {
                 if !visited.contains(&child) {
@@ -528,8 +607,18 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
                 }
             }
         }
-        frontiers.sort_unstable();
-        Ok(frontiers)
+        Ok(descendants)
+    }
+
+    /// `view`'s children in `root`, none when it has none.
+    pub(crate) async fn children_of(
+        &self,
+        root: ViewLineageMapId,
+        view: ViewId,
+        limits: ViewLineageLimits,
+    ) -> Result<Vec<ViewId>, ViewLineageError> {
+        self.children(root, view, limits, &mut Budget::default())
+            .await
     }
 
     fn insert_vertex(
@@ -622,11 +711,15 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
     ) -> Result<Option<RetainedSetId>, ViewLineageError> {
         let mut position = 0usize;
         loop {
-            let (node, decoded_bytes) = self
-                .inner
-                .read_public_at_with_size(node_id, position)
-                .await?;
-            budget.decoded_map(decoded_bytes, limits)?;
+            if !budget.decoded_map_nodes.contains_key(&(node_id, position)) {
+                let (node, decoded_bytes) = self
+                    .inner
+                    .read_public_at_with_size(node_id, position)
+                    .await?;
+                budget.decoded_map(decoded_bytes, limits)?;
+                budget.decoded_map_nodes.insert((node_id, position), node);
+            }
+            let node = &budget.decoded_map_nodes[&(node_id, position)];
             let bytes = key.as_bytes();
             if bytes[position..].get(..node.prefix.len()) != Some(node.prefix.as_slice()) {
                 return Ok(None);

@@ -295,15 +295,6 @@ budget passes, but by only about 0.7 s.
   the release numbers are in.
 - `[ ]` **Move `WHEAT_IMPORT_PROFILE` (wheat-git) onto tracing spans**, so there is one
   profiler instead of two.
-- `[ ]` **`descendant_frontiers` walks every view since the label basis (2026-09-26).**
-  Switch, refresh, clone, init and `frontier list` find frontiers with a forward walk
-  of the view lineage from the basis, so they are linear in the history since the
-  basis. The lineage only stores parent → children links. Mutations no longer do this
-  (see TODO_DONE.md); a fix here likely needs parent links or a frontier index stored
-  with the label (option B from the mutation fix, a format change). Since the label
-  moves (2026-10-26) `publish`, `fetch`, `integrate` and `label move` run it as well;
-  moving labels keeps the distance short in normal use, but a label left in place
-  while work piles up on it does not.
 - `[ ]` **`active_changes::inspect` collects the basis's whole revision map
   (2026-10-26).** `collect_revisions` reads every change's entry of the basis view to
   skip the unchanged ones, so `status` and `changes` are linear in the changes the

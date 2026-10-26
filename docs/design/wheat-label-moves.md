@@ -545,7 +545,9 @@ size for `just test`; release run; results under `bench/results/`.
 ## Follow-ups (TODO.md)
 
 - `descendant_frontiers` is linear in the views since the label's view; label moves
-  keep that distance short in normal use, but publish and fetch now run it.
+  keep that distance short in normal use, but publish and fetch now run it. Done
+  2026-10-27: the commands ask the local frontier index instead
+  (`docs/design/wheat-frontier-index.md`).
 - `active_changes` collects the basis's whole revision map per command
   (`collect_revisions`), linear in changes.
 - Combined revisions still carry no subsumption or resolution evidence.

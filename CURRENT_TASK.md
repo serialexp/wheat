@@ -3,12 +3,10 @@
 ## 2026-10-26: V1 format blockers (@calm-lynx) — Bart: "lets work through all the blockers in order"
 
 Done and pushed: varints, durable JSON → BinSchema, wide directories (chunking, design
-doc complete), handshake capabilities (ebe6d94). Left: blocker 5, the frontier index.
-`docs/design/wheat-frontier-index.md` lays out four options. Only option 1 (a local
-SQLite index) needs no format change, which would take it off the V1 list. The
-question to Bart timed out on 2026-10-26, so nothing is chosen or built. Next: Bart
-picks an option, then implement it at every lineage writer and add the benchmark case
-the doc lists.
+doc complete), handshake capabilities (ebe6d94), and blocker 5, the frontier index:
+Bart chose option 1 on 2026-10-27, a local SQLite cache (`frontiers.sqlite` in each
+store), so it is no format change (`docs/design/wheat-frontier-index.md`, complete).
+No format blockers are left on the list.
 
 ## 2026-10-22: desktop client (@calm-lynx) — Bart: "read the design for the wheat gui and try to build that"
 

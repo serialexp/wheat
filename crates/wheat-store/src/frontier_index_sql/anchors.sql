@@ -1,0 +1,1 @@
+SELECT view FROM anchor

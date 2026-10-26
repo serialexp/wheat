@@ -2985,13 +2985,17 @@ fn refuse_hiding_frontiers<O: ImmutableObjectStore>(
             .map(|pin| pin.stable.selected_frontier.unwrap_or(pin.stable.basis))
             .collect();
     let hidden = runtime()?.block_on(async {
-        let state = reader
-            .state(reader.envelope(local_head.envelope).await?.state)
-            .await?;
+        let envelope = reader.envelope(local_head.envelope).await?;
+        let state = reader.state(envelope.state).await?;
+        let labels = reader.view_label_manifest(envelope.labels).await?.labels;
         let mut budget = MergeBudget::STANDARD;
         label_move::hidden_by_fetch(
             reader,
             objects,
+            wheat_client::frontier_service::LabelFrontiers {
+                index: &local.frontiers,
+                labels: &labels,
+            },
             &state,
             &union.label_changes,
             &shown,

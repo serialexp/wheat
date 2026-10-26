@@ -547,6 +547,19 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Revise/compose cost at stack depth (2026-09-25)
 
+- `[x]` **`descendant_frontiers` walks every view since the label basis (2026-09-26).**
+  Switch, refresh, clone, init, `frontier list`, and since the label moves `publish`,
+  `fetch`, `integrate` and `label move`, found a label's frontiers with a forward walk
+  of the view lineage, linear in the history under the label. Done 2026-10-27 with a
+  local SQLite frontier index (`docs/design/wheat-frontier-index.md`,
+  `crates/wheat-store/src/frontier_index.rs`), no format change: it holds every view
+  below each label's view and brings itself up to date from the lineage edges added
+  since. Bench case `label_frontiers` (release): 7 objects read after one more change
+  at 1,000, 10,000 and 30,000 changes, against 1,243, 10,955 and 35,358 for the walk.
+  The benchmark also found the walk failing at about 28,000 views below a label (the
+  256 MiB decoded-byte limit, from decoding the map's upper levels once per view); it
+  now decodes each map node once.
+
 - `[x]` **`open` walks every view since the basis on each mutation (2026-09-26).**
   `PersistedRepositoryMutator::open` checked the effective view with
   `ViewLineageMapStore::is_descendant(basis, effective)`, a forward search over every

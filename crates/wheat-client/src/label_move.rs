@@ -7,10 +7,9 @@ use anyhow::Result;
 use std::collections::BTreeSet;
 
 use wheat_core::{RepositoryStateRecord, ViewId, ViewRecord};
-use wheat_store::{
-    ImmutableObjectStore, LabelChange, MergeBudget, NotForward, RepositoryReader,
-    ViewLineageLimits, ViewLineageMapStore,
-};
+use wheat_store::{ImmutableObjectStore, LabelChange, MergeBudget, NotForward, RepositoryReader};
+
+use crate::frontier_service::LabelFrontiers;
 
 /// Why a move from one view to another may not happen without being forced.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -55,6 +54,7 @@ impl MoveRefusal {
 pub async fn check<O: ImmutableObjectStore>(
     reader: &RepositoryReader<'_, O>,
     objects: &O,
+    label_frontiers: LabelFrontiers<'_>,
     state: &RepositoryStateRecord,
     from: ViewId,
     to: ViewId,
@@ -65,9 +65,7 @@ pub async fn check<O: ImmutableObjectStore>(
     }
     let target = reader.retained_view(state, to).await?;
     let source = reader.retained_view(state, from).await?;
-    let frontiers = ViewLineageMapStore::new(objects)
-        .descendant_frontiers(state.view_lineage, from, ViewLineageLimits::default())
-        .await?;
+    let frontiers = label_frontiers.of(objects, state, from).await?;
     check_target(reader, &source, &target, to, frontiers, budget).await
 }
 
@@ -113,11 +111,13 @@ pub struct HiddenByFetch {
 /// frontiers the new view does not cover, or the local view itself when it has none
 /// and is not covered). A deleted label hides its local view's descendant frontiers,
 /// the local work built on it; its own view is the remote's to drop. `state` is the
-/// local state before the fetch; `reader` also reads what the fetch staged.
+/// local state before the fetch, and `label_frontiers` its labels'; `reader` also reads what
+/// the fetch staged.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn hidden_by_fetch<O: ImmutableObjectStore>(
     reader: &RepositoryReader<'_, O>,
     objects: &O,
+    label_frontiers: LabelFrontiers<'_>,
     state: &RepositoryStateRecord,
     changes: &[LabelChange],
     shown: &BTreeSet<ViewId>,
@@ -128,13 +128,7 @@ pub async fn hidden_by_fetch<O: ImmutableObjectStore>(
         let Some(before) = &change.before else {
             continue;
         };
-        let frontiers = ViewLineageMapStore::new(objects)
-            .descendant_frontiers(
-                state.view_lineage,
-                before.view,
-                ViewLineageLimits::default(),
-            )
-            .await?;
+        let frontiers = label_frontiers.of(objects, state, before.view).await?;
         let mut views = match &change.after {
             Some(after) if after.view == before.view => continue,
             Some(after) => {
