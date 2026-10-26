@@ -72,16 +72,19 @@ pub(crate) struct Node<I, V> {
     pub entries: Vec<(Vec<u8>, V)>,
 }
 
-/// Checks a node's shape at key byte `position`, for keys of `key_len` bytes: the
-/// prefix stays within the key, children and inline entries end exactly at full
-/// depth, a value only sits on a terminal root at full depth (a single entry below
-/// the root is inlined in its parent), and an interior node branches at least twice
-/// (only an empty root may be bare). With the edge checks done at decoding, this
-/// leaves one encoding per set of entries.
+/// Checks a node's shape at key byte `position`, for keys of `key_len` bytes in a
+/// collection whose buckets hold up to `bucket` entries: the prefix stays within the
+/// key, children and inline entries end exactly at full depth, a value only sits on
+/// a terminal root at full depth (a single entry below the root is inlined in its
+/// parent), an interior node branches on at least two bytes (only an empty root may
+/// be bare), and a node below the root without children holds more than one bucket
+/// (a smaller group is inlined in its parent). With the bucket and edge checks done
+/// at decoding, this leaves one encoding per set of entries.
 pub(crate) fn validate_node_at<I, V>(
     node: &Node<I, V>,
     position: usize,
     key_len: usize,
+    bucket: usize,
 ) -> Result<(), Error> {
     let end = position
         .checked_add(node.prefix.len())
@@ -98,7 +101,16 @@ pub(crate) fn validate_node_at<I, V>(
     {
         return Err(Error::InvalidChildDepth);
     }
-    let total_branches = node.children.len() + node.entries.len();
+    // Entries are sorted, so a bucket's entries are adjacent.
+    let entry_bytes = node
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(index, (suffix, _))| {
+            *index == 0 || node.entries[index - 1].0.first() != suffix.first()
+        })
+        .count();
+    let total_branches = node.children.len() + entry_bytes;
     if node.value.is_some() {
         // Terminal: the root, at full key depth, no children or entries.
         if position != 0 || end != key_len || total_branches != 0 {
@@ -106,6 +118,7 @@ pub(crate) fn validate_node_at<I, V>(
         }
     } else if total_branches == 1
         || (total_branches == 0 && !(position == 0 && node.prefix.is_empty()))
+        || (position != 0 && node.children.is_empty() && node.entries.len() <= bucket)
     {
         return Err(Error::InvalidTerminalNode);
     }
@@ -115,10 +128,14 @@ pub(crate) fn validate_node_at<I, V>(
 pub(crate) trait Collection: Send + Sync {
     type Id: Copy + Eq + Into<ObjectId> + Send + Sync;
     type Key: Key;
-    type Value: Copy + Eq + Send + Sync;
+    type Value: Clone + Eq + Send + Sync;
     type PublicNode: Clone + Send;
 
     const KIND: ObjectKind;
+    /// The most entries sharing their next key byte that stay inline in a node; a
+    /// larger group becomes a child. At most 2: a diff pairs a bucket with a child
+    /// as one synthetic node, which two entries always split from cleanly.
+    const BUCKET: usize = 1;
     fn decode(bytes: &[u8]) -> Result<Self::PublicNode, CanonicalObjectError>;
     fn unpack(node: Self::PublicNode) -> Node<Self::Id, Self::Value>;
     fn build(node: Node<Self::Id, Self::Value>) -> Result<Self::PublicNode, CanonicalObjectError>;
@@ -145,9 +162,10 @@ type UpdateFuture<'a, I, V> =
 enum Updated<I, V> {
     /// The subtree's node; the original one when nothing changed.
     Node(I),
-    /// A single entry is left: its key bytes from the subtree's position on. The
-    /// parent inlines it, because a canonical child holds at least two entries.
-    Leaf(Vec<u8>, V),
+    /// At most one bucket of entries is left: their key bytes from the subtree's
+    /// position on, in key order. The parent inlines them, because a canonical child
+    /// holds more than a bucket.
+    Bucket(Vec<(Vec<u8>, V)>),
     /// No entries are left.
     Pruned,
 }
@@ -214,6 +232,8 @@ enum DiffSide<C: Collection> {
 enum DiffTask<C: Collection> {
     Pair(DiffSide<C>, DiffSide<C>, usize, Option<u8>),
     One(DiffSide<C>, usize, Option<u8>, bool),
+    /// Entry diffs, in key order, that sort between their node's queued subtrees.
+    Emit(Vec<DiffEntry<C::Key, C::Value>>),
 }
 
 pub(crate) struct Cursor<'a, S, C: Collection> {
@@ -386,7 +406,8 @@ where
     }
 
     fn validate_at(&self, node: &Node<C::Id, C::Value>, position: usize) -> Result<(), Error> {
-        validate_node_at(node, position, C::Key::LEN)
+        const { assert!(C::BUCKET == 1 || C::BUCKET == 2) };
+        validate_node_at(node, position, C::Key::LEN, C::BUCKET)
     }
 
     async fn root(&self, id: C::Id) -> Result<Node<C::Id, C::Value>, Error> {
@@ -558,7 +579,7 @@ where
                 .entries
                 .binary_search_by(|(s, _)| s.as_slice().cmp(suffix))
             {
-                return Ok(Some(node.entries[index].1));
+                return Ok(Some(node.entries[index].1.clone()));
             }
             let edge = key.bytes()[end];
             let Ok(index) = node.children.binary_search_by_key(&edge, |child| child.0) else {
@@ -598,7 +619,7 @@ where
         if initially_empty {
             let present = edits
                 .iter()
-                .filter_map(|(key, value)| value.map(|value| (*key, value)))
+                .filter_map(|(key, value)| value.clone().map(|value| (*key, value)))
                 .collect::<Vec<_>>();
             return if present.is_empty() {
                 Ok(root)
@@ -609,63 +630,60 @@ where
         // One pass for the whole batch: each node on a changed path is written once.
         match self.update_node(Some(root), initial, 0, &edits).await? {
             Updated::Node(id) => Ok(id),
-            Updated::Leaf(..) | Updated::Pruned => {
+            Updated::Bucket(..) | Updated::Pruned => {
                 unreachable!("update_node writes the root itself")
             }
         }
     }
 
-    /// Entries that replace a branch at byte `end` of their keys: none drops it, one
-    /// is inlined, more become a child.
+    /// Entries that replace a branch at byte `end` of their keys, all sharing that
+    /// byte and in key order: none drops it, up to a bucket are inlined, more become a
+    /// child.
     async fn place(
         &self,
         end: usize,
-        present: &[(C::Key, C::Value)],
+        present: Vec<(C::Key, C::Value)>,
         children: &mut Children<C>,
         entries: &mut Vec<(Vec<u8>, C::Value)>,
     ) -> Result<(), Error> {
-        match present {
-            [] => {}
-            [(key, value)] => {
-                let suffix = key.bytes()[end..].to_vec();
-                let index = entries
-                    .binary_search_by_key(&suffix[0], |(entry, _)| entry[0])
-                    .unwrap_err();
-                entries.insert(index, (suffix, *value));
-            }
-            _ => {
-                let edge = present[0].0.bytes()[end];
-                let child = self.build_subtree(end + 1, present).await?;
-                let index = children
-                    .binary_search_by_key(&edge, |(edge, _)| *edge)
-                    .unwrap_err();
-                children.insert(index, (edge, Child::Stored(child)));
-            }
+        if present.is_empty() {
+            return Ok(());
+        }
+        let edge = present[0].0.bytes()[end];
+        if present.len() <= C::BUCKET {
+            let index = entries.partition_point(|(entry, _)| entry[0] < edge);
+            entries.splice(
+                index..index,
+                present
+                    .into_iter()
+                    .map(|(key, value)| (key.bytes()[end..].to_vec(), value)),
+            );
+        } else {
+            let child = self.build_subtree(end + 1, &present).await?;
+            let index = children
+                .binary_search_by_key(&edge, |(edge, _)| *edge)
+                .unwrap_err();
+            children.insert(index, (edge, Child::Stored(child)));
         }
         Ok(())
     }
 
-    /// A single entry left at `position`: the root holds it as a terminal node, any
-    /// other subtree hands it to its parent to inline, so nothing non-canonical is
-    /// written.
-    async fn leaf(
+    /// At most a bucket of entries left at `position`, as key bytes from there on: the
+    /// root is rebuilt from them, any other subtree hands them to its parent to
+    /// inline, so nothing non-canonical is written.
+    async fn bucket(
         &self,
         position: usize,
-        rest: Vec<u8>,
-        value: C::Value,
+        rest: Vec<(Vec<u8>, C::Value)>,
     ) -> Result<Updated<C::Id, C::Value>, Error> {
         if position != 0 {
-            return Ok(Updated::Leaf(rest, value));
+            return Ok(Updated::Bucket(rest));
         }
-        Ok(Updated::Node(
-            self.write(Node {
-                prefix: rest,
-                value: Some(value),
-                children: Vec::new(),
-                entries: Vec::new(),
-            })
-            .await?,
-        ))
+        let present: Vec<_> = rest
+            .into_iter()
+            .map(|(key, value)| (C::Key::from_bytes(&key), value))
+            .collect();
+        Ok(Updated::Node(self.build_subtree(0, &present).await?))
     }
 
     /// No entries left at `position`: the root becomes the empty root.
@@ -695,11 +713,11 @@ where
                     .unwrap_or_default();
                 key.extend_from_slice(&node.prefix);
                 let key = C::Key::from_bytes(&key);
-                let mut present = BTreeMap::from([(key, value)]);
-                for &(edit, value) in edits {
+                let mut present = BTreeMap::from([(key, value.clone())]);
+                for (edit, value) in edits {
                     match value {
-                        Some(value) => present.insert(edit, value),
-                        None => present.remove(&edit),
+                        Some(value) => present.insert(*edit, value.clone()),
+                        None => present.remove(edit),
                     };
                 }
                 if let Some(original) = original
@@ -708,14 +726,17 @@ where
                 {
                     return Ok(Updated::Node(original));
                 }
-                let present: Vec<_> = present.into_iter().collect();
-                return match present.as_slice() {
-                    [] => self.pruned(position).await,
-                    [(key, value)] => {
-                        self.leaf(position, key.bytes()[position..].to_vec(), *value)
-                            .await
-                    }
-                    _ => Ok(Updated::Node(self.build_subtree(position, &present).await?)),
+                return if present.is_empty() {
+                    self.pruned(position).await
+                } else if present.len() <= C::BUCKET {
+                    let rest = present
+                        .into_iter()
+                        .map(|(key, value)| (key.bytes()[position..].to_vec(), value))
+                        .collect();
+                    self.bucket(position, rest).await
+                } else {
+                    let present: Vec<_> = present.into_iter().collect();
+                    Ok(Updated::Node(self.build_subtree(position, &present).await?))
                 };
             }
             let common = edits
@@ -779,49 +800,59 @@ where
                             changed |= Some(id) != child_original;
                             children.insert(index, (edge, Child::Stored(id)));
                         }
-                        Updated::Leaf(rest, value) => {
-                            // One entry left below this edge: inline it.
+                        Updated::Bucket(rest) => {
+                            // A bucket left below this edge: inline it.
                             changed = true;
-                            let mut suffix = Vec::with_capacity(1 + rest.len());
-                            suffix.push(edge);
-                            suffix.extend_from_slice(&rest);
-                            let index = entries
-                                .binary_search_by_key(&edge, |(entry, _)| entry[0])
-                                .unwrap_err();
-                            entries.insert(index, (suffix, value));
+                            let index = entries.partition_point(|(entry, _)| entry[0] < edge);
+                            entries.splice(
+                                index..index,
+                                rest.into_iter().map(|(rest, value)| {
+                                    let mut suffix = Vec::with_capacity(1 + rest.len());
+                                    suffix.push(edge);
+                                    suffix.extend_from_slice(&rest);
+                                    (suffix, value)
+                                }),
+                            );
                         }
                         Updated::Pruned => changed = true,
                     }
-                } else if let Ok(index) = entries.binary_search_by_key(&edge, |(entry, _)| entry[0])
-                {
-                    // The group meets an inline entry: merge them.
-                    let (suffix, value) = entries.remove(index);
-                    let mut key = group[0].0.bytes()[..end].to_vec();
-                    key.extend_from_slice(&suffix);
-                    let key = C::Key::from_bytes(&key);
-                    let mut present = BTreeMap::from([(key, value)]);
-                    for &(edit, value) in group {
+                } else {
+                    // The group meets the inline bucket at this byte, if any: merge them.
+                    let first = entries.partition_point(|(entry, _)| entry[0] < edge);
+                    let last =
+                        first + entries[first..].partition_point(|(entry, _)| entry[0] == edge);
+                    let bucket: Vec<_> = entries.drain(first..last).collect();
+                    let mut present = BTreeMap::new();
+                    for (suffix, value) in &bucket {
+                        let mut key = group[0].0.bytes()[..end].to_vec();
+                        key.extend_from_slice(suffix);
+                        present.insert(C::Key::from_bytes(&key), value.clone());
+                    }
+                    for (edit, value) in group {
                         match value {
-                            Some(value) => present.insert(edit, value),
-                            None => present.remove(&edit),
+                            Some(value) => present.insert(*edit, value.clone()),
+                            None => present.remove(edit),
                         };
                     }
-                    if present.len() == 1 && present.get(&key) == Some(&value) {
-                        entries.insert(index, (suffix, value));
+                    if present.len() == bucket.len()
+                        && present
+                            .iter()
+                            .zip(&bucket)
+                            .all(|((key, value), (suffix, old))| {
+                                key.bytes()[end..] == suffix[..] && value == old
+                            })
+                    {
+                        entries.splice(first..first, bucket);
                         continue;
                     }
                     changed = true;
-                    let present: Vec<_> = present.into_iter().collect();
-                    self.place(end, &present, &mut children, &mut entries)
-                        .await?;
-                } else {
-                    let present: Vec<_> = group
-                        .iter()
-                        .filter_map(|(key, value)| value.map(|value| (*key, value)))
-                        .collect();
-                    changed |= !present.is_empty();
-                    self.place(end, &present, &mut children, &mut entries)
-                        .await?;
+                    self.place(
+                        end,
+                        present.into_iter().collect(),
+                        &mut children,
+                        &mut entries,
+                    )
+                    .await?;
                 }
             }
             if !changed && let Some(original) = original {
@@ -830,11 +861,13 @@ where
 
             match (children.len(), entries.len()) {
                 (0, 0) => self.pruned(position).await,
-                (0, 1) => {
-                    // A single entry left: this subtree is now that entry.
-                    let (suffix, value) = entries.pop().expect("one entry");
-                    prefix.extend_from_slice(&suffix);
-                    self.leaf(position, prefix, value).await
+                (0, count) if count <= C::BUCKET => {
+                    // At most a bucket left: this subtree is now those entries.
+                    let rest = entries
+                        .into_iter()
+                        .map(|(suffix, value)| ([prefix.as_slice(), &suffix].concat(), value))
+                        .collect();
+                    self.bucket(position, rest).await
                 }
                 (1, 0) => {
                     // A single child left: merge it into this node.
@@ -910,12 +943,12 @@ where
                     if let Some(edge) = edge {
                         key[position - 1] = edge;
                     }
-                    let (node, skip) = self
+                    let (mut node, skip) = self
                         .diff_load(side, position, &mut nodes_read, limits)
                         .await?;
                     let end = position + node.prefix.len() - skip;
                     key[position..end].copy_from_slice(&node.prefix[skip..]);
-                    if let Some(value) = node.value {
+                    if let Some(value) = node.value.take() {
                         Self::diff_emit(
                             &mut changes,
                             if added {
@@ -926,21 +959,25 @@ where
                             limits,
                         )?;
                     }
-                    // Emit inline entries.
-                    for (suffix, value) in &node.entries {
-                        key[end..end + suffix.len()].copy_from_slice(suffix);
-                        Self::diff_emit(
-                            &mut changes,
-                            if added {
-                                DiffEntry::Added(C::Key::from_bytes(&key), *value)
-                            } else {
-                                DiffEntry::Removed(C::Key::from_bytes(&key), *value)
-                            },
-                            limits,
-                        )?;
-                    }
-                    for &(edge, id) in node.children.iter().rev() {
-                        pending.push(DiffTask::One(DiffSide::Id(id), end + 1, Some(edge), added));
+                    let branches = node_branches(&node);
+                    let (left, right) = if added {
+                        (Vec::new(), branches)
+                    } else {
+                        (branches, Vec::new())
+                    };
+                    Self::diff_branches(
+                        &mut key,
+                        end,
+                        (left, &node.entries),
+                        (right, &node.entries),
+                        &mut pending,
+                        &mut changes,
+                        limits,
+                    )?;
+                }
+                DiffTask::Emit(entries) => {
+                    for entry in entries {
+                        Self::diff_emit(&mut changes, entry, limits)?;
                     }
                 }
                 DiffTask::Pair(left_side, right_side, position, edge) => {
@@ -1003,478 +1040,71 @@ where
                         pending.push(first);
                     } else if common == left_prefix.len() && common == right_prefix.len() {
                         let end = position + common;
-                        match (left.value, right.value) {
+                        match (&left.value, &right.value) {
                             (Some(old), Some(new)) if old != new => Self::diff_emit(
                                 &mut changes,
-                                DiffEntry::Changed(C::Key::from_bytes(&key), old, new),
+                                DiffEntry::Changed(
+                                    C::Key::from_bytes(&key),
+                                    old.clone(),
+                                    new.clone(),
+                                ),
                                 limits,
                             )?,
                             (Some(old), None) => Self::diff_emit(
                                 &mut changes,
-                                DiffEntry::Removed(C::Key::from_bytes(&key), old),
+                                DiffEntry::Removed(C::Key::from_bytes(&key), old.clone()),
                                 limits,
                             )?,
                             (None, Some(new)) => Self::diff_emit(
                                 &mut changes,
-                                DiffEntry::Added(C::Key::from_bytes(&key), new),
+                                DiffEntry::Added(C::Key::from_bytes(&key), new.clone()),
                                 limits,
                             )?,
                             _ => {}
                         }
-                        // Merge-diff all branches (children + entries) from both sides
-                        // by discriminating byte. A byte can be a child on one side
-                        // and an inline entry on the other (structural difference),
-                        // so we must cross-match.
-                        #[derive(Clone, Copy)]
-                        enum Branch<I, V: Copy> {
-                            Child(u8, I),
-                            Entry(u8, V), // first suffix byte + value
-                        }
-                        impl<I: Copy, V: Copy> Branch<I, V> {
-                            fn byte(&self) -> u8 {
-                                match self {
-                                    Branch::Child(b, _) | Branch::Entry(b, _) => *b,
-                                }
-                            }
-                        }
-                        // Collect and sort by discriminating byte (they're already
-                        // sorted within each list; merge is O(n)).
-                        let left_branches: Vec<Branch<C::Id, C::Value>> = {
-                            let mut v =
-                                Vec::with_capacity(left.children.len() + left.entries.len());
-                            let mut ci = 0;
-                            let mut ei = 0;
-                            loop {
-                                let cb = left.children.get(ci).map(|c| c.0);
-                                let eb = left.entries.get(ei).and_then(|(s, _)| s.first().copied());
-                                match (cb, eb) {
-                                    (Some(c), Some(e)) if c < e => {
-                                        v.push(Branch::Child(c, left.children[ci].1));
-                                        ci += 1;
-                                    }
-                                    (Some(_), Some(e)) => {
-                                        v.push(Branch::Entry(e, left.entries[ei].1));
-                                        ei += 1;
-                                    }
-                                    (Some(c), None) => {
-                                        v.push(Branch::Child(c, left.children[ci].1));
-                                        ci += 1;
-                                    }
-                                    (None, Some(e)) => {
-                                        v.push(Branch::Entry(e, left.entries[ei].1));
-                                        ei += 1;
-                                    }
-                                    (None, None) => break,
-                                }
-                            }
-                            v
-                        };
-                        let right_branches: Vec<Branch<C::Id, C::Value>> = {
-                            let mut v =
-                                Vec::with_capacity(right.children.len() + right.entries.len());
-                            let mut ci = 0;
-                            let mut ei = 0;
-                            loop {
-                                let cb = right.children.get(ci).map(|c| c.0);
-                                let eb =
-                                    right.entries.get(ei).and_then(|(s, _)| s.first().copied());
-                                match (cb, eb) {
-                                    (Some(c), Some(e)) if c < e => {
-                                        v.push(Branch::Child(c, right.children[ci].1));
-                                        ci += 1;
-                                    }
-                                    (Some(_), Some(e)) => {
-                                        v.push(Branch::Entry(e, right.entries[ei].1));
-                                        ei += 1;
-                                    }
-                                    (Some(c), None) => {
-                                        v.push(Branch::Child(c, right.children[ci].1));
-                                        ci += 1;
-                                    }
-                                    (None, Some(e)) => {
-                                        v.push(Branch::Entry(e, right.entries[ei].1));
-                                        ei += 1;
-                                    }
-                                    (None, None) => break,
-                                }
-                            }
-                            v
-                        };
-                        // Now merge-diff the two branch lists by byte.
-                        // Entry diffs are collected here (loop is reverse, but
-                        // entries must be emitted in forward key order).
-                        let mut deferred_entry_diffs: Vec<DiffEntry<C::Key, C::Value>> = Vec::new();
-                        let mut lbi = left_branches.len();
-                        let mut rbi = right_branches.len();
-                        let left_entry_by_byte = |byte: u8| -> Option<usize> {
-                            left.entries.binary_search_by(|(s, _)| s[0].cmp(&byte)).ok()
-                        };
-                        let right_entry_by_byte = |byte: u8| -> Option<usize> {
-                            right
-                                .entries
-                                .binary_search_by(|(s, _)| s[0].cmp(&byte))
-                                .ok()
-                        };
-                        while lbi != 0 || rbi != 0 {
-                            let lb = lbi.checked_sub(1).map(|i| &left_branches[i]);
-                            let rb = rbi.checked_sub(1).map(|i| &right_branches[i]);
-                            match (lb, rb) {
-                                (Some(l), Some(r)) if l.byte() == r.byte() => {
-                                    let byte = l.byte();
-                                    lbi -= 1;
-                                    rbi -= 1;
-                                    match (l, r) {
-                                        (Branch::Child(_, li), Branch::Child(_, ri)) => {
-                                            if li != ri {
-                                                pending.push(DiffTask::Pair(
-                                                    DiffSide::Id(*li),
-                                                    DiffSide::Id(*ri),
-                                                    end + 1,
-                                                    Some(byte),
-                                                ));
-                                            }
-                                        }
-                                        (Branch::Entry(_, lv), Branch::Entry(_, rv)) => {
-                                            // Both are entries — compare full suffixes.
-                                            let lei = left_entry_by_byte(byte).unwrap();
-                                            let rei = right_entry_by_byte(byte).unwrap();
-                                            let (ls, _) = &left.entries[lei];
-                                            let (rs, _) = &right.entries[rei];
-                                            if ls == rs {
-                                                if lv != rv {
-                                                    key[end..end + ls.len()].copy_from_slice(ls);
-                                                    deferred_entry_diffs.push(DiffEntry::Changed(
-                                                        C::Key::from_bytes(&key),
-                                                        *lv,
-                                                        *rv,
-                                                    ));
-                                                }
-                                            } else {
-                                                // Same first byte, different suffixes.
-                                                key[end..end + ls.len()].copy_from_slice(ls);
-                                                deferred_entry_diffs.push(DiffEntry::Removed(
-                                                    C::Key::from_bytes(&key),
-                                                    *lv,
-                                                ));
-                                                key[end..end + rs.len()].copy_from_slice(rs);
-                                                deferred_entry_diffs.push(DiffEntry::Added(
-                                                    C::Key::from_bytes(&key),
-                                                    *rv,
-                                                ));
-                                            }
-                                        }
-                                        (Branch::Child(_, id), Branch::Entry(_, rv)) => {
-                                            // Left has a child, right has an entry.
-                                            // Pair: make entry a synthetic node.
-                                            let rei = right_entry_by_byte(byte).unwrap();
-                                            let (rs, _) = &right.entries[rei];
-                                            let entry_node = Node {
-                                                prefix: rs[1..].to_vec(),
-                                                value: Some(*rv),
-                                                children: Vec::new(),
-                                                entries: Vec::new(),
-                                            };
-                                            pending.push(DiffTask::Pair(
-                                                DiffSide::Id(*id),
-                                                DiffSide::Loaded(entry_node, 0),
-                                                end + 1,
-                                                Some(byte),
-                                            ));
-                                        }
-                                        (Branch::Entry(_, lv), Branch::Child(_, id)) => {
-                                            // Left has an entry, right has a child.
-                                            let lei = left_entry_by_byte(byte).unwrap();
-                                            let (ls, _) = &left.entries[lei];
-                                            let entry_node = Node {
-                                                prefix: ls[1..].to_vec(),
-                                                value: Some(*lv),
-                                                children: Vec::new(),
-                                                entries: Vec::new(),
-                                            };
-                                            pending.push(DiffTask::Pair(
-                                                DiffSide::Loaded(entry_node, 0),
-                                                DiffSide::Id(*id),
-                                                end + 1,
-                                                Some(byte),
-                                            ));
-                                        }
-                                    }
-                                }
-                                (Some(l), Some(r)) if l.byte() > r.byte() => {
-                                    lbi -= 1;
-                                    let byte = l.byte();
-                                    match l {
-                                        Branch::Child(_, id) => {
-                                            pending.push(DiffTask::One(
-                                                DiffSide::Id(*id),
-                                                end + 1,
-                                                Some(byte),
-                                                false,
-                                            ));
-                                        }
-                                        Branch::Entry(_, val) => {
-                                            let lei = left_entry_by_byte(byte).unwrap();
-                                            let (ls, _) = &left.entries[lei];
-                                            key[end..end + ls.len()].copy_from_slice(ls);
-                                            deferred_entry_diffs.push(DiffEntry::Removed(
-                                                C::Key::from_bytes(&key),
-                                                *val,
-                                            ));
-                                        }
-                                    }
-                                }
-                                (Some(_), Some(r)) => {
-                                    rbi -= 1;
-                                    let byte = r.byte();
-                                    match r {
-                                        Branch::Child(_, id) => {
-                                            pending.push(DiffTask::One(
-                                                DiffSide::Id(*id),
-                                                end + 1,
-                                                Some(byte),
-                                                true,
-                                            ));
-                                        }
-                                        Branch::Entry(_, val) => {
-                                            let rei = right_entry_by_byte(byte).unwrap();
-                                            let (rs, _) = &right.entries[rei];
-                                            key[end..end + rs.len()].copy_from_slice(rs);
-                                            deferred_entry_diffs.push(DiffEntry::Added(
-                                                C::Key::from_bytes(&key),
-                                                *val,
-                                            ));
-                                        }
-                                    }
-                                }
-                                (Some(l), None) => {
-                                    lbi -= 1;
-                                    let byte = l.byte();
-                                    match l {
-                                        Branch::Child(_, id) => {
-                                            pending.push(DiffTask::One(
-                                                DiffSide::Id(*id),
-                                                end + 1,
-                                                Some(byte),
-                                                false,
-                                            ));
-                                        }
-                                        Branch::Entry(_, val) => {
-                                            let lei = left_entry_by_byte(byte).unwrap();
-                                            let (ls, _) = &left.entries[lei];
-                                            key[end..end + ls.len()].copy_from_slice(ls);
-                                            deferred_entry_diffs.push(DiffEntry::Removed(
-                                                C::Key::from_bytes(&key),
-                                                *val,
-                                            ));
-                                        }
-                                    }
-                                }
-                                (None, Some(r)) => {
-                                    rbi -= 1;
-                                    let byte = r.byte();
-                                    match r {
-                                        Branch::Child(_, id) => {
-                                            pending.push(DiffTask::One(
-                                                DiffSide::Id(*id),
-                                                end + 1,
-                                                Some(byte),
-                                                true,
-                                            ));
-                                        }
-                                        Branch::Entry(_, val) => {
-                                            let rei = right_entry_by_byte(byte).unwrap();
-                                            let (rs, _) = &right.entries[rei];
-                                            key[end..end + rs.len()].copy_from_slice(rs);
-                                            deferred_entry_diffs.push(DiffEntry::Added(
-                                                C::Key::from_bytes(&key),
-                                                *val,
-                                            ));
-                                        }
-                                    }
-                                }
-                                (None, None) => break,
-                            }
-                        }
-                        // Emit deferred entry diffs in forward (key-sorted) order.
-                        // The loop above ran high→low, so reverse.
-                        for entry_diff in deferred_entry_diffs.into_iter().rev() {
-                            Self::diff_emit(&mut changes, entry_diff, limits)?;
-                        }
+                        let left_branches = node_branches(&left);
+                        let right_branches = node_branches(&right);
+                        Self::diff_branches(
+                            &mut key,
+                            end,
+                            (left_branches, &left.entries),
+                            (right_branches, &right.entries),
+                            &mut pending,
+                            &mut changes,
+                            limits,
+                        )?;
                     } else if common == left_prefix.len() {
+                        // The right's prefix runs past the left's: from the left's end
+                        // the right is one branch, on its next prefix byte.
                         let end = position + common;
-                        let edge = right_prefix[common];
-                        let matching = left
-                            .children
-                            .binary_search_by_key(&edge, |child| child.0)
-                            .ok();
-                        // Check if any left entry has first byte matching the right's edge.
-                        let matching_entry = left
-                            .entries
-                            .binary_search_by(|(suffix, _)| suffix[0].cmp(&edge))
-                            .ok();
-                        let mut divergent = Some(right);
-                        for (index, &(child_edge, id)) in left.children.iter().enumerate().rev() {
-                            if matching.is_none()
-                                && matching_entry.is_none()
-                                && child_edge < edge
-                                && divergent.is_some()
-                            {
-                                pending.push(DiffTask::One(
-                                    DiffSide::Loaded(
-                                        divergent.take().expect("divergent side is queued once"),
-                                        right_skip + common + 1,
-                                    ),
-                                    end + 1,
-                                    Some(edge),
-                                    true,
-                                ));
-                            }
-                            pending.push(if Some(index) == matching {
-                                DiffTask::Pair(
-                                    DiffSide::Id(id),
-                                    DiffSide::Loaded(
-                                        divergent.take().expect("matching side is queued once"),
-                                        right_skip + common + 1,
-                                    ),
-                                    end + 1,
-                                    Some(edge),
-                                )
-                            } else {
-                                DiffTask::One(DiffSide::Id(id), end + 1, Some(child_edge), false)
-                            });
-                        }
-                        // Emit only-left inline entries, except the one that
-                        // matches the right's edge — that gets paired with
-                        // the right subtree as a synthetic terminal node.
-                        for (i, (suffix, value)) in left.entries.iter().enumerate() {
-                            if Some(i) == matching_entry {
-                                // Convert the entry into a synthetic terminal node
-                                // and pair it with the right subtree.
-                                let entry_node = Node {
-                                    prefix: suffix[1..].to_vec(),
-                                    value: Some(*value),
-                                    children: Vec::new(),
-                                    entries: Vec::new(),
-                                };
-                                if let Some(right) = divergent.take() {
-                                    pending.push(DiffTask::Pair(
-                                        DiffSide::Loaded(entry_node, 0),
-                                        DiffSide::Loaded(right, right_skip + common + 1),
-                                        end + 1,
-                                        Some(edge),
-                                    ));
-                                } else {
-                                    // Right was already enqueued as a child match —
-                                    // shouldn't happen since entries and children are
-                                    // disjoint, but handle gracefully.
-                                    key[end..end + suffix.len()].copy_from_slice(suffix);
-                                    Self::diff_emit(
-                                        &mut changes,
-                                        DiffEntry::Removed(C::Key::from_bytes(&key), *value),
-                                        limits,
-                                    )?;
-                                }
-                            } else {
-                                key[end..end + suffix.len()].copy_from_slice(suffix);
-                                Self::diff_emit(
-                                    &mut changes,
-                                    DiffEntry::Removed(C::Key::from_bytes(&key), *value),
-                                    limits,
-                                )?;
-                            }
-                        }
-                        if let Some(divergent) = divergent {
-                            pending.push(DiffTask::One(
-                                DiffSide::Loaded(divergent, right_skip + common + 1),
-                                end + 1,
-                                Some(edge),
-                                true,
-                            ));
-                        }
+                        let divergent = Branch::Subtree(
+                            right_prefix[common],
+                            DiffSide::Loaded(right, right_skip + common + 1),
+                        );
+                        Self::diff_branches(
+                            &mut key,
+                            end,
+                            (node_branches(&left), &left.entries),
+                            (vec![divergent], &[]),
+                            &mut pending,
+                            &mut changes,
+                            limits,
+                        )?;
                     } else {
                         let end = position + common;
-                        let edge = left_prefix[common];
-                        let matching = right
-                            .children
-                            .binary_search_by_key(&edge, |child| child.0)
-                            .ok();
-                        let matching_entry = right
-                            .entries
-                            .binary_search_by(|(suffix, _)| suffix[0].cmp(&edge))
-                            .ok();
-                        let mut divergent = Some(left);
-                        for (index, &(child_edge, id)) in right.children.iter().enumerate().rev() {
-                            if matching.is_none()
-                                && matching_entry.is_none()
-                                && child_edge < edge
-                                && divergent.is_some()
-                            {
-                                pending.push(DiffTask::One(
-                                    DiffSide::Loaded(
-                                        divergent.take().expect("divergent side is queued once"),
-                                        left_skip + common + 1,
-                                    ),
-                                    end + 1,
-                                    Some(edge),
-                                    false,
-                                ));
-                            }
-                            pending.push(if Some(index) == matching {
-                                DiffTask::Pair(
-                                    DiffSide::Loaded(
-                                        divergent.take().expect("matching side is queued once"),
-                                        left_skip + common + 1,
-                                    ),
-                                    DiffSide::Id(id),
-                                    end + 1,
-                                    Some(edge),
-                                )
-                            } else {
-                                DiffTask::One(DiffSide::Id(id), end + 1, Some(child_edge), true)
-                            });
-                        }
-                        // Handle right inline entries — pair matching ones with the
-                        // left subtree, emit non-matching as Added.
-                        for (i, (suffix, value)) in right.entries.iter().enumerate() {
-                            if Some(i) == matching_entry {
-                                let entry_node = Node {
-                                    prefix: suffix[1..].to_vec(),
-                                    value: Some(*value),
-                                    children: Vec::new(),
-                                    entries: Vec::new(),
-                                };
-                                if let Some(left) = divergent.take() {
-                                    pending.push(DiffTask::Pair(
-                                        DiffSide::Loaded(left, left_skip + common + 1),
-                                        DiffSide::Loaded(entry_node, 0),
-                                        end + 1,
-                                        Some(edge),
-                                    ));
-                                } else {
-                                    key[end..end + suffix.len()].copy_from_slice(suffix);
-                                    Self::diff_emit(
-                                        &mut changes,
-                                        DiffEntry::Added(C::Key::from_bytes(&key), *value),
-                                        limits,
-                                    )?;
-                                }
-                            } else {
-                                key[end..end + suffix.len()].copy_from_slice(suffix);
-                                Self::diff_emit(
-                                    &mut changes,
-                                    DiffEntry::Added(C::Key::from_bytes(&key), *value),
-                                    limits,
-                                )?;
-                            }
-                        }
-                        if let Some(divergent) = divergent {
-                            pending.push(DiffTask::One(
-                                DiffSide::Loaded(divergent, left_skip + common + 1),
-                                end + 1,
-                                Some(edge),
-                                false,
-                            ));
-                        }
+                        let divergent = Branch::Subtree(
+                            left_prefix[common],
+                            DiffSide::Loaded(left, left_skip + common + 1),
+                        );
+                        Self::diff_branches(
+                            &mut key,
+                            end,
+                            (vec![divergent], &[]),
+                            (node_branches(&right), &right.entries),
+                            &mut pending,
+                            &mut changes,
+                            limits,
+                        )?;
                     }
                 }
             }
@@ -1506,6 +1136,102 @@ where
                 Ok((self.read_at(id, position).await?, 0))
             }
         }
+    }
+
+    /// Diffs the branches below key byte `end` of two nodes, each given as its
+    /// branches and the inline entries its buckets index. A byte can hold a subtree
+    /// on one side and a bucket on the other; the bucket then pairs with the subtree
+    /// as the node it would be.
+    ///
+    /// Branches are handled high to low, so the subtrees they queue pop low to high.
+    /// Entry diffs wait until the next subtree is queued, then go in front of it as
+    /// one [`DiffTask::Emit`]; those below every subtree are emitted at once. The
+    /// diff so stays in key order.
+    fn diff_branches(
+        key: &mut [u8],
+        end: usize,
+        (mut left, left_entries): SideBranches<'_, C>,
+        (mut right, right_entries): SideBranches<'_, C>,
+        pending: &mut Vec<DiffTask<C>>,
+        changes: &mut Vec<DiffEntry<C::Key, C::Value>>,
+        limits: DiffLimits,
+    ) -> Result<(), DiffError> {
+        use std::cmp::Ordering;
+        // Highest key first.
+        let mut deferred = Vec::new();
+        let mut bucket = Vec::new();
+        loop {
+            let order = match (left.last(), right.last()) {
+                (None, None) => break,
+                (Some(l), Some(r)) => l.byte().cmp(&r.byte()),
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+            };
+            let (l, r) = match order {
+                Ordering::Equal => (left.pop(), right.pop()),
+                Ordering::Greater => (left.pop(), None),
+                Ordering::Less => (None, right.pop()),
+            };
+            let byte = l
+                .as_ref()
+                .or(r.as_ref())
+                .expect("one side has the branch")
+                .byte();
+            let task = match (l, r) {
+                (Some(Branch::Subtree(_, l)), Some(Branch::Subtree(_, r))) => {
+                    if let (DiffSide::Id(l), DiffSide::Id(r)) = (&l, &r)
+                        && l == r
+                    {
+                        continue;
+                    }
+                    DiffTask::Pair(l, r, end + 1, Some(byte))
+                }
+                (Some(Branch::Subtree(_, l)), Some(Branch::Bucket(_, r))) => DiffTask::Pair(
+                    l,
+                    DiffSide::Loaded(synthetic(&right_entries[r]), 0),
+                    end + 1,
+                    Some(byte),
+                ),
+                (Some(Branch::Bucket(_, l)), Some(Branch::Subtree(_, r))) => DiffTask::Pair(
+                    DiffSide::Loaded(synthetic(&left_entries[l]), 0),
+                    r,
+                    end + 1,
+                    Some(byte),
+                ),
+                (Some(Branch::Subtree(_, l)), None) => DiffTask::One(l, end + 1, Some(byte), false),
+                (None, Some(Branch::Subtree(_, r))) => DiffTask::One(r, end + 1, Some(byte), true),
+                (Some(Branch::Bucket(_, l)), Some(Branch::Bucket(_, r))) => {
+                    diff_buckets::<C>(key, end, &left_entries[l], &right_entries[r], &mut bucket);
+                    deferred.extend(bucket.drain(..).rev());
+                    continue;
+                }
+                (Some(Branch::Bucket(_, l)), None) => {
+                    for (suffix, value) in left_entries[l].iter().rev() {
+                        key[end..end + suffix.len()].copy_from_slice(suffix);
+                        deferred.push(DiffEntry::Removed(C::Key::from_bytes(key), value.clone()));
+                    }
+                    continue;
+                }
+                (None, Some(Branch::Bucket(_, r))) => {
+                    for (suffix, value) in right_entries[r].iter().rev() {
+                        key[end..end + suffix.len()].copy_from_slice(suffix);
+                        deferred.push(DiffEntry::Added(C::Key::from_bytes(key), value.clone()));
+                    }
+                    continue;
+                }
+                (None, None) => unreachable!("one side has the branch"),
+            };
+            if !deferred.is_empty() {
+                let mut run = std::mem::take(&mut deferred);
+                run.reverse();
+                pending.push(DiffTask::Emit(run));
+            }
+            pending.push(task);
+        }
+        for entry in deferred.into_iter().rev() {
+            Self::diff_emit(changes, entry, limits)?;
+        }
+        Ok(())
     }
 
     fn diff_emit(
@@ -1563,7 +1289,7 @@ where
                 return self
                     .write(Node {
                         prefix,
-                        value: Some(entries[0].1),
+                        value: Some(entries[0].1.clone()),
                         children: Vec::new(),
                         entries: Vec::new(),
                     })
@@ -1577,10 +1303,11 @@ where
                 let edge = entries[start].0.bytes()[end];
                 let group_end =
                     start + entries[start..].partition_point(|(key, _)| key.bytes()[end] == edge);
-                if group_end - start == 1 {
-                    // Single-entry group: inline it instead of creating a child node.
-                    let suffix = entries[start].0.bytes()[end..].to_vec();
-                    inline_entries.push((suffix, entries[start].1));
+                if group_end - start <= C::BUCKET {
+                    // A small group stays inline instead of becoming a child node.
+                    for (key, value) in &entries[start..group_end] {
+                        inline_entries.push((key.bytes()[end..].to_vec(), value.clone()));
+                    }
                 } else {
                     let child = self
                         .build_subtree(end + 1, &entries[start..group_end])
@@ -1601,6 +1328,130 @@ where
 
     pub(crate) async fn contains_node(&self, id: C::Id) -> Result<bool, Error> {
         Ok(self.objects.exists_many(&[id.into()]).await?[0])
+    }
+}
+
+/// One branch of a node being diffed, by its byte: a subtree, or the range of a
+/// bucket of the node's inline entries.
+enum Branch<C: Collection> {
+    Subtree(u8, DiffSide<C>),
+    Bucket(u8, std::ops::Range<usize>),
+}
+
+impl<C: Collection> Branch<C> {
+    fn byte(&self) -> u8 {
+        match self {
+            Branch::Subtree(byte, _) | Branch::Bucket(byte, _) => *byte,
+        }
+    }
+}
+
+/// One side's branches below a byte, with the inline entries its buckets index.
+type SideBranches<'n, C> = (Vec<Branch<C>>, &'n [(Vec<u8>, <C as Collection>::Value)]);
+
+/// A node's branches in byte order: its children, and its inline entries grouped
+/// into buckets by their first byte. Children and buckets never share a byte.
+fn node_branches<C: Collection>(node: &Node<C::Id, C::Value>) -> Vec<Branch<C>> {
+    let mut branches = Vec::with_capacity(node.children.len() + node.entries.len());
+    let mut child = 0;
+    let mut entry = 0;
+    while child < node.children.len() || entry < node.entries.len() {
+        let entry_byte = node.entries.get(entry).map(|(suffix, _)| suffix[0]);
+        match node.children.get(child) {
+            Some(&(edge, id)) if entry_byte.is_none_or(|byte| edge < byte) => {
+                branches.push(Branch::Subtree(edge, DiffSide::Id(id)));
+                child += 1;
+            }
+            _ => {
+                let byte = entry_byte.expect("an entry is left");
+                let range = bucket_range(&node.entries[entry..], byte);
+                let range = entry + range.start..entry + range.end;
+                entry = range.end;
+                branches.push(Branch::Bucket(byte, range));
+            }
+        }
+    }
+    branches
+}
+
+/// The entries whose suffix starts with `byte`; entries are sorted by suffix.
+fn bucket_range<V>(entries: &[(Vec<u8>, V)], byte: u8) -> std::ops::Range<usize> {
+    let start = entries.partition_point(|(suffix, _)| suffix[0] < byte);
+    start..start + entries[start..].partition_point(|(suffix, _)| suffix[0] == byte)
+}
+
+/// A bucket of one or two entries as the node a child would be, one byte below them:
+/// one entry is a terminal value, two split right after their common prefix.
+fn synthetic<I, V: Clone>(bucket: &[(Vec<u8>, V)]) -> Node<I, V> {
+    match bucket {
+        [(suffix, value)] => Node {
+            prefix: suffix[1..].to_vec(),
+            value: Some(value.clone()),
+            children: Vec::new(),
+            entries: Vec::new(),
+        },
+        [(first, first_value), (second, second_value)] => {
+            let common = first[1..]
+                .iter()
+                .zip(&second[1..])
+                .take_while(|(left, right)| left == right)
+                .count();
+            Node {
+                prefix: first[1..1 + common].to_vec(),
+                value: None,
+                children: Vec::new(),
+                entries: vec![
+                    (first[1 + common..].to_vec(), first_value.clone()),
+                    (second[1 + common..].to_vec(), second_value.clone()),
+                ],
+            }
+        }
+        _ => unreachable!("a bucket holds one or two entries"),
+    }
+}
+
+/// The differences between two buckets on the same byte, in key order.
+fn diff_buckets<C: Collection>(
+    key: &mut [u8],
+    end: usize,
+    left: &[(Vec<u8>, C::Value)],
+    right: &[(Vec<u8>, C::Value)],
+    out: &mut Vec<DiffEntry<C::Key, C::Value>>,
+) {
+    let (mut l, mut r) = (0, 0);
+    while l < left.len() || r < right.len() {
+        let order = match (left.get(l), right.get(r)) {
+            (Some((ls, _)), Some((rs, _))) => ls.cmp(rs),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, _) => std::cmp::Ordering::Greater,
+        };
+        match order {
+            std::cmp::Ordering::Equal => {
+                let ((suffix, old), (_, new)) = (&left[l], &right[r]);
+                if old != new {
+                    key[end..end + suffix.len()].copy_from_slice(suffix);
+                    out.push(DiffEntry::Changed(
+                        C::Key::from_bytes(key),
+                        old.clone(),
+                        new.clone(),
+                    ));
+                }
+                l += 1;
+                r += 1;
+            }
+            std::cmp::Ordering::Less => {
+                let (suffix, old) = &left[l];
+                key[end..end + suffix.len()].copy_from_slice(suffix);
+                out.push(DiffEntry::Removed(C::Key::from_bytes(key), old.clone()));
+                l += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                let (suffix, new) = &right[r];
+                key[end..end + suffix.len()].copy_from_slice(suffix);
+                out.push(DiffEntry::Added(C::Key::from_bytes(key), new.clone()));
+                r += 1;
+            }
+        }
     }
 }
 
@@ -1645,7 +1496,7 @@ impl<S: ImmutableObjectStore, C: Collection> ContextWalk<'_, S, C> {
             }
             if !frame.yielded_value {
                 frame.yielded_value = true;
-                if let Some(value) = frame.node.value {
+                if let Some(value) = frame.node.value.clone() {
                     return Ok(Some(ContextWalkStep::Entry {
                         key: C::Key::from_bytes(&self.key),
                         value,
@@ -1681,7 +1532,7 @@ impl<S: ImmutableObjectStore, C: Collection> ContextWalk<'_, S, C> {
                     // Entry first — its discriminating byte < child edge.
                     let (suffix, value) = &frame.node.entries[frame.entry_index];
                     self.key[end..end + suffix.len()].copy_from_slice(suffix);
-                    let value = *value;
+                    let value = value.clone();
                     frame.entry_index += 1;
                     return Ok(Some(ContextWalkStep::Entry {
                         key: C::Key::from_bytes(&self.key),
@@ -1708,7 +1559,7 @@ impl<S: ImmutableObjectStore, C: Collection> ContextWalk<'_, S, C> {
                 (None, Some(_)) => {
                     let (suffix, value) = &frame.node.entries[frame.entry_index];
                     self.key[end..end + suffix.len()].copy_from_slice(suffix);
-                    let value = *value;
+                    let value = value.clone();
                     frame.entry_index += 1;
                     return Ok(Some(ContextWalkStep::Entry {
                         key: C::Key::from_bytes(&self.key),
@@ -1843,7 +1694,7 @@ where
 
             if !frame.yielded_value {
                 frame.yielded_value = true;
-                if let Some(left) = frame.left.value {
+                if let Some(left) = frame.left.value.clone() {
                     if self.entries_emitted == self.max_changes {
                         return Err(DiffError::ChangeLimitExceeded {
                             limit: self.max_changes,
@@ -1856,7 +1707,7 @@ where
                                 && node.children.is_empty()
                                 && node.entries.is_empty() =>
                         {
-                            node.value
+                            node.value.clone()
                         }
                         _ => None,
                     };
@@ -1899,7 +1750,7 @@ where
                 // Inline entry — yield it directly.
                 let (suffix, left_value) = &frame.left.entries[frame.entry_index];
                 self.key[end..end + suffix.len()].copy_from_slice(suffix);
-                let left_value = *left_value;
+                let left_value = left_value.clone();
                 frame.entry_index += 1;
                 if self.entries_emitted == self.max_changes {
                     return Err(DiffError::ChangeLimitExceeded {
@@ -1914,7 +1765,7 @@ where
                         node.entries
                             .binary_search_by(|(s, _)| s.as_slice().cmp(suffix.as_slice()))
                             .ok()
-                            .map(|idx| node.entries[idx].1)
+                            .map(|idx| node.entries[idx].1.clone())
                     }
                     _ => None,
                 };
@@ -2015,7 +1866,7 @@ impl<S: ImmutableObjectStore, C: Collection> Cursor<'_, S, C> {
             self.key[*position..end].copy_from_slice(&node.prefix);
             if !*yielded {
                 *yielded = true;
-                if let Some(value) = node.value {
+                if let Some(value) = node.value.clone() {
                     return Ok(Some((C::Key::from_bytes(&self.key), value)));
                 }
             }
@@ -2038,7 +1889,7 @@ impl<S: ImmutableObjectStore, C: Collection> Cursor<'_, S, C> {
                     // ee < ce (disjoint, and ce < ee was false above).
                     let (suffix, value) = &node.entries[*entry_index];
                     self.key[end..end + suffix.len()].copy_from_slice(suffix);
-                    let value = *value;
+                    let value = value.clone();
                     *entry_index += 1;
                     return Ok(Some((C::Key::from_bytes(&self.key), value)));
                 }
@@ -2053,7 +1904,7 @@ impl<S: ImmutableObjectStore, C: Collection> Cursor<'_, S, C> {
                 (None, Some(_)) => {
                     let (suffix, value) = &node.entries[*entry_index];
                     self.key[end..end + suffix.len()].copy_from_slice(suffix);
-                    let value = *value;
+                    let value = value.clone();
                     *entry_index += 1;
                     return Ok(Some((C::Key::from_bytes(&self.key), value)));
                 }
@@ -2130,6 +1981,42 @@ mod paired_context_tests {
         assert_eq!(
             entries,
             [(app_a, Some(revision_a)), (app_b, Some(revision_b))]
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_diff_lists_a_child_before_a_later_inline_entry() {
+        // The root holds a child on byte 1 (two keys) and an inline entry on byte 9:
+        // the child's change sorts first, though the entry is on the root itself.
+        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "paired-diff-order");
+        let revisions = Store::<_, RevisionCollection>::new(&objects);
+        let (low, sibling, high) = (change(1, 1), change(1, 2), change(9, 0));
+        let revision = |n| RevisionId::from_digest([n; 32]);
+        let empty = revisions.empty_root().await.unwrap();
+        let left = revisions
+            .update_batch(
+                empty,
+                [
+                    (low, Some(revision(1))),
+                    (sibling, Some(revision(2))),
+                    (high, Some(revision(3))),
+                ],
+            )
+            .await
+            .unwrap();
+        let right = revisions
+            .update_batch(left, [(low, Some(revision(4))), (high, Some(revision(5)))])
+            .await
+            .unwrap();
+        assert_eq!(
+            revisions
+                .paired_diff(left, right, DiffLimits::unbounded())
+                .await
+                .unwrap(),
+            [
+                DiffEntry::Changed(low, revision(1), revision(4)),
+                DiffEntry::Changed(high, revision(3), revision(5)),
+            ]
         );
     }
 
@@ -2307,24 +2194,38 @@ mod shape_tests {
 
     #[test]
     fn entries_must_hold_exactly_the_rest_of_the_key() {
-        assert!(validate_node_at(&node(2, 0, &[6, 6]), 0, 8).is_ok());
-        assert!(validate_node_at(&node(2, 1, &[5]), 1, 8).is_ok());
+        assert!(validate_node_at(&node(2, 0, &[6, 6]), 0, 8, 1).is_ok());
+        assert!(validate_node_at(&node(2, 1, &[5]), 1, 8, 1).is_ok());
         for bad in [&[6, 5][..], &[6, 7], &[0, 6]] {
             assert!(matches!(
-                validate_node_at(&node(2, 0, bad), 0, 8),
+                validate_node_at(&node(2, 0, bad), 0, 8, 1),
                 Err(Error::InvalidChildDepth)
             ));
         }
     }
 
     #[test]
+    fn a_childless_node_below_the_root_holds_more_than_one_bucket() {
+        // Two single-entry branches: a node for buckets of one, inlined for two.
+        assert!(validate_node_at(&node(2, 0, &[5, 5]), 1, 8, 1).is_ok());
+        assert!(matches!(
+            validate_node_at(&node(2, 0, &[5, 5]), 1, 8, 2),
+            Err(Error::InvalidTerminalNode)
+        ));
+        assert!(validate_node_at(&node(2, 0, &[5, 5, 5]), 1, 8, 2).is_ok());
+        // The root and nodes with children are exempt.
+        assert!(validate_node_at(&node(2, 0, &[6, 6]), 0, 8, 2).is_ok());
+        assert!(validate_node_at(&node(2, 1, &[5]), 1, 8, 2).is_ok());
+    }
+
+    #[test]
     fn nothing_branches_below_full_depth() {
         assert!(matches!(
-            validate_node_at(&node(8, 2, &[]), 0, 8),
+            validate_node_at(&node(8, 2, &[]), 0, 8, 1),
             Err(Error::InvalidChildDepth)
         ));
         assert!(matches!(
-            validate_node_at(&node(7, 1, &[0]), 1, 8),
+            validate_node_at(&node(7, 1, &[0]), 1, 8, 1),
             Err(Error::InvalidChildDepth)
         ));
     }

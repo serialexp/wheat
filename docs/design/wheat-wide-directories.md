@@ -1,10 +1,11 @@
 # Wheat wide directories — Design
 
-Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 and
-1 landed (format, validation, core builder; not yet used by `tree_objects` or the
-store). A tree-format change, so it lands before the V1 format freeze.
+Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0, 1
+and 1b landed (format, validation, core builder, bucketed radix in the store; not
+yet used by `tree_objects` or the store's tree code). A tree-format change, so it
+lands before the V1 format freeze.
 Owner: bart
-Last updated: 2026-10-26 (step 1)
+Last updated: 2026-10-26 (step 1b)
 
 ## Implementation status
 
@@ -34,17 +35,25 @@ land and move them from Outstanding to Done.
   validation of both (count above 256, bucket rule, every entry's suffix the tail
   of its name's key), the reference builder `build_directory`, and the
   references `object_graph` follows.
+- [x] **Step 1b — radix buckets in the store.** `radix.rs` takes a
+  per-collection `Collection::BUCKET` (1 for every existing collection, 2 for the
+  new `DirectoryChunkCollection`) in `validate_node_at`, updates and diffs, and
+  `Collection::Value` relaxes from `Copy` to `Clone`. A reader below the root also
+  checks the rule's non-local half: a node without children holds more than `B`
+  entries. A diff pairs a bucket with a subtree on the same byte as the node the
+  bucket would be, which is why `B` is at most 2. Tests in `directory_chunks.rs`
+  check that incremental updates land on the IDs `build_directory` makes and that
+  diffs match the entry sets.
+- [x] **Extended beyond the plan — key-ordered radix diffs.** `paired_diff`
+  promised key order but emitted a node's inline entry diffs before its child
+  subtrees, for every collection. Entry diffs now queue between the subtrees they
+  sort between.
 
 ### Outstanding
 
 - [ ] **Switch-on.** `wire::tree_objects` builds with `build_directory`, and
   `TreeV1` refuses more than 256 entries. Lands with steps 3 and 5, once the store
   reads and writes chunks, so no two writers disagree on a tree's ID.
-- [ ] **Step 1b — radix buckets in the store.** `radix.rs` gains the
-  per-collection bucket (1 for every existing collection) in `validate_node_at`,
-  updates, diffs and walks, and `Collection::Value` relaxes from `Copy` to `Clone`.
-  A reader below the root also checks the rule's non-local half: a node without
-  children holds more than `B` entries.
 - [ ] **Step 2 — store reads.** One directory reader in `merkle_tree.rs` that
   hides the layout: name lookup, sorted multi-lookup, ordered iteration, and a
   two-directory diff. Move every reader in [Callers](#callers) onto it.

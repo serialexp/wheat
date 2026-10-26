@@ -28,6 +28,7 @@ mod codec;
 pub use codec::HARD_LOGICAL_RECORD_BYTES;
 mod content_io;
 mod delta;
+mod directory_chunks;
 mod durability;
 mod increment_validation;
 pub use increment_validation::{Arrival, IncrementBudget, IncrementReport};

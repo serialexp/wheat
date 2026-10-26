@@ -547,7 +547,7 @@ pub(crate) fn radix<E: From<MalformedRadix>>(
         id,
         position: above.len(),
     };
-    radix::validate_node_at(node, above.len(), kind.key_len()).map_err(|_| malformed())?;
+    radix::validate_node_at(node, above.len(), kind.key_len(), 1).map_err(|_| malformed())?;
     let keys = node
         .value
         .iter()
