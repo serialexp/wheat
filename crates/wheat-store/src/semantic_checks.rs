@@ -8,7 +8,9 @@ use crate::{
     ApplicationMapDelta, ApplicationMapDeltaLimits, ApplicationMapStore, ChangeSetStore,
     CollectionError, ConflictSetStore, ContentMapDelta, ContentMapError, ContentMapStore,
     ImmutableObjectStore, MerkleTreeStore, RepositoryPublicationError, RepositoryReader,
-    RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapStore, TreeDiffLimits, radix,
+    RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapStore, TreeDiffLimits,
+    merkle_tree::{ReadCount, ReadLimits},
+    radix,
     verification_scratch::VerificationScratch,
 };
 use wheat_core::*;
@@ -163,24 +165,20 @@ where
             if target_id == result_id {
                 continue;
             }
-            let target = match target_id {
-                Some(id) => Some(trees.read_node(id).await?),
-                None => None,
-            };
-            let result = match result_id {
-                Some(id) => Some(trees.read_node(id).await?),
-                None => None,
-            };
-            let names = target
-                .as_ref()
-                .into_iter()
-                .flat_map(|node| node.entries.keys())
-                .chain(
-                    result
-                        .as_ref()
-                        .into_iter()
-                        .flat_map(|node| node.entries.keys()),
+            // Entries both sides hold alike need no check, so the diff may leave
+            // them out (it does for two wide directories).
+            let diff = trees
+                .directory_diff(
+                    target_id,
+                    result_id,
+                    ReadLimits::UNBOUNDED,
+                    &mut ReadCount::default(),
                 )
+                .await?;
+            let names = diff
+                .old
+                .keys()
+                .chain(diff.new.keys())
                 .collect::<BTreeSet<_>>();
             for name in names {
                 let path = if prefix.is_empty() {
@@ -188,8 +186,8 @@ where
                 } else {
                     format!("{prefix}/{name}")
                 };
-                let left = target.as_ref().and_then(|node| node.entries.get(name));
-                let right = result.as_ref().and_then(|node| node.entries.get(name));
+                let left = diff.old.get(name);
+                let right = diff.new.get(name);
                 let exact = touched.contains(&path);
                 let below_touched = has_touched_descendant(touched, &path);
                 match (left, right) {

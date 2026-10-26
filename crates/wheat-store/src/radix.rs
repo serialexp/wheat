@@ -399,10 +399,31 @@ where
         Ok((public, decoded_bytes))
     }
 
-    async fn read_at(&self, id: C::Id, position: usize) -> Result<Node<C::Id, C::Value>, Error> {
-        let node = C::unpack(self.read_public(id).await?);
+    /// Reads the node `id` at key byte `position`, checks its shape there, and
+    /// returns it with its canonical size.
+    pub(crate) async fn read_at_with_size(
+        &self,
+        id: C::Id,
+        position: usize,
+    ) -> Result<(Node<C::Id, C::Value>, usize), Error> {
+        let object = self.objects.get(id.into()).await?;
+        if object.kind != C::KIND {
+            return Err(ObjectStoreError::WrongKind {
+                id: id.into(),
+                expected: C::KIND,
+                actual: object.kind,
+            }
+            .into());
+        }
+        let node = C::unpack(C::decode(&object.canonical_bytes)?);
         self.validate_at(&node, position)?;
-        Ok(node)
+        Ok((node, object.canonical_bytes.len()))
+    }
+
+    async fn read_at(&self, id: C::Id, position: usize) -> Result<Node<C::Id, C::Value>, Error> {
+        self.read_at_with_size(id, position)
+            .await
+            .map(|(node, _)| node)
     }
 
     fn validate_at(&self, node: &Node<C::Id, C::Value>, position: usize) -> Result<(), Error> {
@@ -922,8 +943,20 @@ where
         right: C::Id,
         limits: DiffLimits,
     ) -> Result<Vec<DiffEntry<C::Key, C::Value>>, DiffError> {
+        self.paired_diff_counted(left, right, limits)
+            .await
+            .map(|(changes, _)| changes)
+    }
+
+    /// [`Self::paired_diff`], with the number of nodes it read.
+    pub(crate) async fn paired_diff_counted(
+        &self,
+        left: C::Id,
+        right: C::Id,
+        limits: DiffLimits,
+    ) -> Result<(Vec<DiffEntry<C::Key, C::Value>>, usize), DiffError> {
         if left == right {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         let mut pending = Vec::with_capacity(C::Key::LEN * 2);
@@ -1114,7 +1147,7 @@ where
                 });
             }
         }
-        Ok(changes)
+        Ok((changes, nodes_read))
     }
 
     async fn diff_load(

@@ -21,13 +21,6 @@ impl radix::Key for DirectoryNameKey {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the wide-directory reader (step 2) is its first user"
-    )
-)]
 pub(crate) struct DirectoryChunkCollection;
 impl radix::Collection for DirectoryChunkCollection {
     type Id = DirectoryChunkId;

@@ -1,11 +1,11 @@
 # Wheat wide directories — Design
 
-Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0, 1
-and 1b landed (format, validation, core builder, bucketed radix in the store; not
-yet used by `tree_objects` or the store's tree code). A tree-format change, so it
-lands before the V1 format freeze.
+Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0, 1,
+1b and 2 landed (format, validation, core builder, bucketed radix, the store's
+directory reader). Nothing writes chunked directories yet (steps 3 and 5, then
+the switch-on). A tree-format change, so it lands before the V1 format freeze.
 Owner: bart
-Last updated: 2026-10-26 (step 1b)
+Last updated: 2026-10-26 (step 2)
 
 ## Implementation status
 
@@ -48,15 +48,28 @@ land and move them from Outstanding to Done.
   promised key order but emitted a node's inline entry diffs before its child
   subtrees, for every collection. Entry diffs now queue between the subtrees they
   sort between.
+- [x] **Step 2 — store reads.** `merkle_tree/directory.rs` opens a `TreeId` as
+  either layout:
+  - `directory_get` looks a name up along its key path, caching the chunks it
+    read per open directory, so `path_shapes` reads each chunk at most once;
+  - `directory_entries` lists a directory in name order; a chunked one is read
+    whole, checking each entry's key path and the header's count;
+  - `directory_diff` compares two chunked directories through the radix diff,
+    reading only the chunks where they differ.
+
+  `lookup`, `list_directory`, `path_shapes`, `walk_path`, `select_paths`,
+  `walk_files`, `content_cursor`, `TreeDiffCursor`, `read_node` (and so
+  hydration, full verification, Git export's reads) and `verify_untouched` use
+  it, sharing one node, entry and byte accounting (`ReadLimits`/`ReadCount`)
+  instead of five copies. Tests in `wheat-store/tests/wide_directories.rs`
+  count the reads of a lookup, a sorted batch and a diff. The object-graph walks
+  that decode `TreeV1` themselves are step 4.
 
 ### Outstanding
 
 - [ ] **Switch-on.** `wire::tree_objects` builds with `build_directory`, and
   `TreeV1` refuses more than 256 entries. Lands with steps 3 and 5, once the store
   reads and writes chunks, so no two writers disagree on a tree's ID.
-- [ ] **Step 2 — store reads.** One directory reader in `merkle_tree.rs` that
-  hides the layout: name lookup, sorted multi-lookup, ordered iteration, and a
-  two-directory diff. Move every reader in [Callers](#callers) onto it.
 - [ ] **Step 3 — store writes.** `edit_node` and `final_update::apply` update a
   chunked directory along the touched chunks only, converting between flat and
   chunked when a directory crosses `T`.

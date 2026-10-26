@@ -8,11 +8,10 @@ use std::{
 
 use thiserror::Error;
 use wheat_core::{
-    DirectoryEntry, DirectoryNode, FileValue, ObjectId, TreeId, decode_directory_node,
-    validate_directory_component,
+    DirectoryEntry, DirectoryNode, FileValue, ObjectId, TreeId, validate_directory_component,
 };
 
-use crate::{ImmutableObjectStore, ObjectKind, ObjectStoreError};
+use crate::{ImmutableObjectStore, ObjectStoreError};
 
 #[derive(Debug, Error)]
 pub enum MerkleTreeError {
@@ -58,6 +57,8 @@ pub enum MerkleTreeError {
     EditPathBytesExceeded { size: usize, limit: usize },
     #[error("tree update stages {size} node bytes, exceeding the {limit}-byte limit")]
     StagedNodeBytesExceeded { size: usize, limit: usize },
+    #[error("wide directory is malformed: {0}")]
+    MalformedDirectory(&'static str),
 }
 
 /// Resource bounds for a complete Merkle tree walk.
@@ -328,8 +329,33 @@ impl Default for FinalTreeUpdateLimits {
     }
 }
 
+macro_rules! read_limits {
+    ($($limits:ty),*) => {$(
+        impl From<$limits> for ReadLimits {
+            fn from(limits: $limits) -> Self {
+                Self {
+                    max_nodes: limits.max_nodes,
+                    max_entries: limits.max_entries,
+                    max_node_bytes: limits.max_node_bytes,
+                }
+            }
+        }
+    )*};
+}
+read_limits!(
+    TreeWalkLimits,
+    TreePathLimits,
+    TreeSelectionLimits,
+    TreeContentWalkLimits,
+    TreeDiffLimits
+);
+
+#[path = "merkle_tree/directory.rs"]
+mod directory;
 #[path = "merkle_tree/final_update.rs"]
 mod final_update;
+
+pub(crate) use directory::{Directory, ReadCount, ReadLimits};
 
 pub struct MerkleTreeStore<'a, S> {
     objects: &'a S,
@@ -423,8 +449,7 @@ pub struct TreeContentCursor<'a, S> {
         std::collections::btree_map::IntoValues<String, DirectoryEntry>,
         usize,
     )>,
-    nodes: usize,
-    entries: usize,
+    count: ReadCount,
     buffered_entries: usize,
     files: usize,
     exhausted: bool,
@@ -435,8 +460,7 @@ pub struct TreeDiffCursor<'a, S> {
     limits: TreeDiffLimits,
     work: Vec<DiffWork>,
     path: String,
-    nodes: usize,
-    entries: usize,
+    count: ReadCount,
     changes: usize,
     buffered_entries: usize,
     exhausted: bool,
@@ -463,97 +487,10 @@ where
         Ok(id)
     }
 
+    /// Reads directory `id` whole, in name order, whichever its layout.
     pub async fn read_node(&self, id: TreeId) -> Result<DirectoryNode, MerkleTreeError> {
-        let object = self.objects.get(id.into()).await?;
-        if object.kind != ObjectKind::Tree {
-            return Err(ObjectStoreError::WrongKind {
-                id: id.into(),
-                expected: ObjectKind::Tree,
-                actual: object.kind,
-            }
-            .into());
-        }
-        Ok(decode_directory_node(&object.canonical_bytes)?)
-    }
-
-    async fn read_path_node(
-        &self,
-        id: TreeId,
-        limits: TreePathLimits,
-        nodes: &mut usize,
-        entries: &mut usize,
-    ) -> Result<DirectoryNode, MerkleTreeError> {
-        if *nodes == limits.max_nodes {
-            return Err(MerkleTreeError::NodeLimitExceeded {
-                limit: limits.max_nodes,
-            });
-        }
-        *nodes += 1;
-        let object = self.objects.get(id.into()).await?;
-        if object.kind != ObjectKind::Tree {
-            return Err(ObjectStoreError::WrongKind {
-                id: id.into(),
-                expected: ObjectKind::Tree,
-                actual: object.kind,
-            }
-            .into());
-        }
-        let size = object.canonical_bytes.len();
-        if size > limits.max_node_bytes {
-            return Err(MerkleTreeError::NodeBytesExceeded {
-                size,
-                limit: limits.max_node_bytes,
-            });
-        }
-        let node = decode_directory_node(&object.canonical_bytes)?;
-        let total = entries.saturating_add(node.entries.len());
-        if total > limits.max_entries {
-            return Err(MerkleTreeError::EntryLimitExceeded {
-                limit: limits.max_entries,
-            });
-        }
-        *entries = total;
-        Ok(node)
-    }
-
-    async fn read_selection_node(
-        &self,
-        id: TreeId,
-        limits: TreeSelectionLimits,
-        nodes: &mut usize,
-        entries: &mut usize,
-    ) -> Result<DirectoryNode, MerkleTreeError> {
-        if *nodes == limits.max_nodes {
-            return Err(MerkleTreeError::NodeLimitExceeded {
-                limit: limits.max_nodes,
-            });
-        }
-        *nodes += 1;
-        let object = self.objects.get(id.into()).await?;
-        if object.kind != ObjectKind::Tree {
-            return Err(ObjectStoreError::WrongKind {
-                id: id.into(),
-                expected: ObjectKind::Tree,
-                actual: object.kind,
-            }
-            .into());
-        }
-        let size = object.canonical_bytes.len();
-        if size > limits.max_node_bytes {
-            return Err(MerkleTreeError::NodeBytesExceeded {
-                size,
-                limit: limits.max_node_bytes,
-            });
-        }
-        let node = decode_directory_node(&object.canonical_bytes)?;
-        let total = entries.saturating_add(node.entries.len());
-        if total > limits.max_entries {
-            return Err(MerkleTreeError::EntryLimitExceeded {
-                limit: limits.max_entries,
-            });
-        }
-        *entries = total;
-        Ok(node)
+        self.read_directory(id, ReadLimits::UNBOUNDED, &mut ReadCount::default())
+            .await
     }
 
     pub async fn lookup(
@@ -564,17 +501,23 @@ where
         if path.is_empty() {
             return Err(MerkleTreeError::EmptyPath);
         }
-        let mut node = self.read_node(root).await?;
+        let (limits, mut count) = (ReadLimits::UNBOUNDED, ReadCount::default());
+        let mut directory = self.open_directory(root, limits, &mut count).await?;
         for (index, component) in path.iter().enumerate() {
             validate_directory_component(component)?;
-            let Some(entry) = node.entries.get(component) else {
+            let Some(entry) = self
+                .directory_get(&mut directory, component, limits, &mut count)
+                .await?
+            else {
                 return Ok(None);
             };
             let last = index + 1 == path.len();
             match (entry, last) {
-                (DirectoryEntry::File(content), true) => return Ok(Some(*content)),
+                (DirectoryEntry::File(content), true) => return Ok(Some(content)),
                 (DirectoryEntry::Directory(_), true) => return Ok(None),
-                (DirectoryEntry::Directory(child), false) => node = self.read_node(*child).await?,
+                (DirectoryEntry::Directory(child), false) => {
+                    directory = self.open_directory(child, limits, &mut count).await?;
+                }
                 (DirectoryEntry::File(_), false) => return Ok(None),
             }
         }
@@ -582,8 +525,8 @@ where
     }
 
     /// Lists the directory at `path` (the root when empty): its first `limit` entries
-    /// whose names sort after `after`. Reads one node per path component. A page
-    /// decodes the whole listed directory, so it costs that directory's size, not
+    /// whose names sort after `after`. Looks each path component up by name. A page
+    /// reads the whole listed directory, so it costs that directory's size, not
     /// `limit`.
     pub async fn list_directory(
         &self,
@@ -592,20 +535,28 @@ where
         after: Option<&str>,
         limit: NonZeroUsize,
     ) -> Result<TreeListing, MerkleTreeError> {
-        let mut node = self.read_node(root).await?;
+        let (limits, mut count) = (ReadLimits::UNBOUNDED, ReadCount::default());
+        let mut directory = self.open_directory(root, limits, &mut count).await?;
         for (index, component) in path.iter().enumerate() {
             validate_directory_component(component)?;
             let last = index + 1 == path.len();
-            match node.entries.remove(component) {
+            match self
+                .directory_get(&mut directory, component, limits, &mut count)
+                .await?
+            {
                 None => return Ok(TreeListing::Absent),
                 Some(DirectoryEntry::File(value)) if last => return Ok(TreeListing::File(value)),
                 Some(DirectoryEntry::File(_)) => return Ok(TreeListing::Absent),
-                Some(DirectoryEntry::Directory(child)) => node = self.read_node(child).await?,
+                Some(DirectoryEntry::Directory(child)) => {
+                    directory = self.open_directory(child, limits, &mut count).await?;
+                }
             }
         }
+        let listed = self
+            .directory_entries(directory, limits, &mut count)
+            .await?;
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
-        let mut entries = node
-            .entries
+        let mut entries = listed
             .range::<str, _>((start, Bound::Unbounded))
             .map(|(name, entry)| (name.clone(), *entry));
         let page = entries.by_ref().take(limit.get()).collect::<Vec<_>>();
@@ -646,10 +597,10 @@ where
 
     /// Classifies many paths with one shared traversal.
     ///
-    /// Results follow `paths`. The directories along the previous path stay decoded and are
-    /// reused by the next one, so lexically sorted `paths` read each directory node at most
-    /// once instead of once per path below it. Memory holds one decoded node per open
-    /// directory level.
+    /// Results follow `paths`. The directories along the previous path stay open and are
+    /// reused by the next one, so lexically sorted `paths` read each directory node (and
+    /// each chunk of a wide directory) at most once instead of once per path below it.
+    /// Memory holds one open directory per level.
     pub async fn path_shapes(
         &self,
         root: TreeId,
@@ -659,8 +610,9 @@ where
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        let root_node = self.read_node(root).await?;
-        let mut open: Vec<(&str, DirectoryNode)> = Vec::new();
+        let (limits, mut count) = (ReadLimits::UNBOUNDED, ReadCount::default());
+        let mut root_directory = self.open_directory(root, limits, &mut count).await?;
+        let mut open: Vec<(&str, Directory)> = Vec::new();
         let mut components: Vec<&str> = Vec::new();
         let mut results = Vec::with_capacity(paths.len());
         for path in paths {
@@ -681,8 +633,13 @@ where
             open.truncate(shared);
             let mut blocked = None;
             for (depth, directory) in directories.iter().enumerate().skip(shared) {
-                let node = open.last().map_or(&root_node, |(_, node)| node);
-                let child = match node.entries.get(*directory) {
+                let parent = open
+                    .last_mut()
+                    .map_or(&mut root_directory, |(_, parent)| parent);
+                let child = match self
+                    .directory_get(parent, directory, limits, &mut count)
+                    .await?
+                {
                     None => {
                         blocked = Some(TreePathShape::Absent);
                         break;
@@ -691,18 +648,26 @@ where
                         blocked = Some(TreePathShape::BelowFile { depth });
                         break;
                     }
-                    Some(DirectoryEntry::Directory(child)) => *child,
+                    Some(DirectoryEntry::Directory(child)) => child,
                 };
-                open.push((directory, self.read_node(child).await?));
+                open.push((
+                    directory,
+                    self.open_directory(child, limits, &mut count).await?,
+                ));
             }
-            let shape = blocked.unwrap_or_else(|| {
-                let node = open.last().map_or(&root_node, |(_, node)| node);
-                match node.entries.get(*leaf) {
-                    Some(DirectoryEntry::File(value)) => TreePathShape::File(*value),
-                    Some(DirectoryEntry::Directory(_)) => TreePathShape::Directory,
-                    None => TreePathShape::Absent,
+            let shape = match blocked {
+                Some(shape) => shape,
+                None => {
+                    let parent = open
+                        .last_mut()
+                        .map_or(&mut root_directory, |(_, parent)| parent);
+                    match self.directory_get(parent, leaf, limits, &mut count).await? {
+                        Some(DirectoryEntry::File(value)) => TreePathShape::File(value),
+                        Some(DirectoryEntry::Directory(_)) => TreePathShape::Directory,
+                        None => TreePathShape::Absent,
+                    }
                 }
-            });
+            };
             results.push(shape);
         }
         Ok(results)
@@ -740,20 +705,21 @@ where
             full_path.push_str(component);
         }
 
-        let mut nodes = 0usize;
-        let mut entries = 0usize;
+        let read_limits = ReadLimits::from(limits);
+        let mut count = ReadCount::default();
         let mut depth = 0usize;
-        let mut node = self
-            .read_path_node(root, limits, &mut nodes, &mut entries)
-            .await?;
-        if node.entries.len() > limits.max_buffered_entries {
+        let mut directory = self.open_directory(root, read_limits, &mut count).await?;
+        if directory.decoded_entries() > limits.max_buffered_entries {
             return Err(MerkleTreeError::BufferedEntriesExceeded {
                 limit: limits.max_buffered_entries,
             });
         }
 
         for (index, component) in path.iter().enumerate() {
-            let Some(entry) = node.entries.remove(component) else {
+            let Some(entry) = self
+                .directory_get(&mut directory, component, read_limits, &mut count)
+                .await?
+            else {
                 return Ok(TreePathSelection::Missing);
             };
             let last = index + 1 == path.len();
@@ -775,10 +741,8 @@ where
                             limit: limits.max_depth,
                         });
                     }
-                    node = self
-                        .read_path_node(child, limits, &mut nodes, &mut entries)
-                        .await?;
-                    if node.entries.len() > limits.max_buffered_entries {
+                    directory = self.open_directory(child, read_limits, &mut count).await?;
+                    if directory.decoded_entries() > limits.max_buffered_entries {
                         return Err(MerkleTreeError::BufferedEntriesExceeded {
                             limit: limits.max_buffered_entries,
                         });
@@ -788,6 +752,16 @@ where
                     }
                 }
             }
+        }
+        let node = DirectoryNode {
+            entries: self
+                .directory_entries(directory, read_limits, &mut count)
+                .await?,
+        };
+        if node.entries.len() > limits.max_buffered_entries {
+            return Err(MerkleTreeError::BufferedEntriesExceeded {
+                limit: limits.max_buffered_entries,
+            });
         }
 
         struct WalkFrame {
@@ -847,9 +821,7 @@ where
                             limit: limits.max_depth,
                         });
                     }
-                    let child_node = self
-                        .read_path_node(child, limits, &mut nodes, &mut entries)
-                        .await?;
+                    let child_node = self.read_directory(child, read_limits, &mut count).await?;
                     let buffered = buffered_entries.saturating_add(child_node.entries.len());
                     if buffered > limits.max_buffered_entries {
                         return Err(MerkleTreeError::BufferedEntriesExceeded {
@@ -951,11 +923,9 @@ where
             &selectors[selector_index][span.start..span.end]
         };
 
-        let mut nodes = 0usize;
-        let mut entries = 0usize;
-        let root_node = self
-            .read_selection_node(root, limits, &mut nodes, &mut entries)
-            .await?;
+        let read_limits = ReadLimits::from(limits);
+        let mut count = ReadCount::default();
+        let root_node = self.read_directory(root, read_limits, &mut count).await?;
         let mut buffered_entries = root_node.entries.len();
         if buffered_entries > limits.max_buffered_entries {
             return Err(MerkleTreeError::BufferedEntriesExceeded {
@@ -1056,9 +1026,7 @@ where
                             selected = true;
                         }
                     }
-                    let child_node = self
-                        .read_selection_node(child, limits, &mut nodes, &mut entries)
-                        .await?;
+                    let child_node = self.read_directory(child, read_limits, &mut count).await?;
                     let buffered = buffered_entries.saturating_add(child_node.entries.len());
                     if buffered > limits.max_buffered_entries {
                         return Err(MerkleTreeError::BufferedEntriesExceeded {
@@ -1095,12 +1063,10 @@ where
         root: TreeId,
         limits: TreeWalkLimits,
     ) -> Result<Vec<TreeFile>, MerkleTreeError> {
-        let mut nodes = 0usize;
-        let mut entries = 0usize;
+        let read_limits = ReadLimits::from(limits);
+        let mut count = ReadCount::default();
         let mut retained_path_bytes = 0usize;
-        let root_node = self
-            .read_walk_node(root, limits, &mut nodes, &mut entries)
-            .await?;
+        let root_node = self.read_directory(root, read_limits, &mut count).await?;
         let mut files = Vec::new();
         let mut pending = BTreeMap::new();
         for (path, entry) in root_node.entries {
@@ -1166,9 +1132,7 @@ where
                             limit: limits.max_depth,
                         });
                     }
-                    let child_node = self
-                        .read_walk_node(child, limits, &mut nodes, &mut entries)
-                        .await?;
+                    let child_node = self.read_directory(child, read_limits, &mut count).await?;
                     let buffered = pending.len().saturating_add(child_node.entries.len());
                     if buffered > limits.max_buffered_entries {
                         return Err(MerkleTreeError::BufferedEntriesExceeded {
@@ -1199,44 +1163,6 @@ where
         }
 
         Ok(files)
-    }
-
-    async fn read_walk_node(
-        &self,
-        id: TreeId,
-        limits: TreeWalkLimits,
-        nodes: &mut usize,
-        entries: &mut usize,
-    ) -> Result<DirectoryNode, MerkleTreeError> {
-        if *nodes == limits.max_nodes {
-            return Err(MerkleTreeError::NodeLimitExceeded {
-                limit: limits.max_nodes,
-            });
-        }
-        *nodes += 1;
-        let object = self.objects.get(id.into()).await?;
-        if object.kind != ObjectKind::Tree {
-            return Err(ObjectStoreError::WrongKind {
-                id: id.into(),
-                expected: ObjectKind::Tree,
-                actual: object.kind,
-            }
-            .into());
-        }
-        if object.canonical_bytes.len() > limits.max_node_bytes {
-            return Err(MerkleTreeError::NodeBytesExceeded {
-                size: object.canonical_bytes.len(),
-                limit: limits.max_node_bytes,
-            });
-        }
-        let node = decode_directory_node(&object.canonical_bytes)?;
-        *entries = entries.saturating_add(node.entries.len());
-        if *entries > limits.max_entries {
-            return Err(MerkleTreeError::EntryLimitExceeded {
-                limit: limits.max_entries,
-            });
-        }
-        Ok(node)
     }
 
     #[tracing::instrument(name = "tree_apply_edits", level = "debug", skip_all, fields(edits = edits.len()))]
@@ -1337,8 +1263,7 @@ where
             store: self,
             limits,
             stack: Vec::with_capacity(32),
-            nodes: 0,
-            entries: 0,
+            count: ReadCount::default(),
             buffered_entries: 0,
             files: 0,
             exhausted: false,
@@ -1373,8 +1298,7 @@ where
             limits,
             work,
             path: String::new(),
-            nodes: 0,
-            entries: 0,
+            count: ReadCount::default(),
             changes: 0,
             buffered_entries: 0,
             exhausted: false,
@@ -1389,41 +1313,16 @@ where
 
 impl<S: ImmutableObjectStore> TreeContentCursor<'_, S> {
     async fn read_node(&mut self, id: TreeId) -> Result<DirectoryNode, MerkleTreeError> {
-        if self.nodes == self.limits.max_nodes {
-            return Err(MerkleTreeError::NodeLimitExceeded {
-                limit: self.limits.max_nodes,
-            });
-        }
-        self.nodes += 1;
-        let object = self.store.objects.get(id.into()).await?;
-        if object.kind != ObjectKind::Tree {
-            return Err(ObjectStoreError::WrongKind {
-                id: id.into(),
-                expected: ObjectKind::Tree,
-                actual: object.kind,
-            }
-            .into());
-        }
-        if object.canonical_bytes.len() > self.limits.max_node_bytes {
-            return Err(MerkleTreeError::NodeBytesExceeded {
-                size: object.canonical_bytes.len(),
-                limit: self.limits.max_node_bytes,
-            });
-        }
-        let node = decode_directory_node(&object.canonical_bytes)?;
-        let entries = self.entries.saturating_add(node.entries.len());
-        if entries > self.limits.max_entries {
-            return Err(MerkleTreeError::EntryLimitExceeded {
-                limit: self.limits.max_entries,
-            });
-        }
+        let node = self
+            .store
+            .read_directory(id, self.limits.into(), &mut self.count)
+            .await?;
         let buffered = self.buffered_entries.saturating_add(node.entries.len());
         if buffered > self.limits.max_buffered_entries {
             return Err(MerkleTreeError::BufferedEntriesExceeded {
                 limit: self.limits.max_buffered_entries,
             });
         }
-        self.entries = entries;
         self.buffered_entries = buffered;
         Ok(node)
     }
@@ -1490,47 +1389,13 @@ impl<S: ImmutableObjectStore> TreeDiffCursor<'_, S> {
         self
     }
 
-    async fn read_node(&mut self, id: TreeId) -> Result<DirectoryNode, MerkleTreeError> {
-        if self.nodes == self.limits.max_nodes {
-            return Err(MerkleTreeError::NodeLimitExceeded {
-                limit: self.limits.max_nodes,
-            });
-        }
-        self.nodes += 1;
-        let object = self.objects.get(id.into()).await?;
-        if object.kind != ObjectKind::Tree {
-            return Err(ObjectStoreError::WrongKind {
-                id: id.into(),
-                expected: ObjectKind::Tree,
-                actual: object.kind,
-            }
-            .into());
-        }
-        let size = object.canonical_bytes.len();
-        if size > self.limits.max_node_bytes {
-            return Err(MerkleTreeError::NodeBytesExceeded {
-                size,
-                limit: self.limits.max_node_bytes,
-            });
-        }
-        Ok(decode_directory_node(&object.canonical_bytes)?)
-    }
-
-    fn account_node(&mut self, node: &DirectoryNode) -> Result<(), MerkleTreeError> {
-        let count = node.entries.len();
-        let entries = self.entries.saturating_add(count);
-        if entries > self.limits.max_entries {
-            return Err(MerkleTreeError::EntryLimitExceeded {
-                limit: self.limits.max_entries,
-            });
-        }
+    fn account_entries(&mut self, count: usize) -> Result<(), MerkleTreeError> {
         let buffered = self.buffered_entries.saturating_add(count);
         if buffered > self.limits.max_buffered_entries {
             return Err(MerkleTreeError::BufferedEntriesExceeded {
                 limit: self.limits.max_buffered_entries,
             });
         }
-        self.entries = entries;
         self.buffered_entries = buffered;
         Ok(())
     }
@@ -1604,25 +1469,15 @@ impl<S: ImmutableObjectStore> TreeDiffCursor<'_, S> {
                             limit: self.limits.max_depth,
                         });
                     }
-                    let old_node = match old {
-                        Some(id) => Some(self.read_node(id).await?),
-                        None => None,
-                    };
-                    let new_node = match new {
-                        Some(id) => Some(self.read_node(id).await?),
-                        None => None,
-                    };
-                    if let Some(node) = &old_node {
-                        self.account_node(node)?;
-                    }
-                    if let Some(node) = &new_node {
-                        self.account_node(node)?;
-                    }
+                    let diff = MerkleTreeStore::new(self.objects)
+                        .directory_diff(old, new, self.limits.into(), &mut self.count)
+                        .await?;
+                    self.account_entries(diff.old.len() + diff.new.len())?;
                     self.work.push(DiffWork::Entries(DiffFrame {
                         prefix_len,
                         depth,
-                        old: old_node.unwrap_or_default().entries.into_iter().peekable(),
-                        new: new_node.unwrap_or_default().entries.into_iter().peekable(),
+                        old: diff.old.into_iter().peekable(),
+                        new: diff.new.into_iter().peekable(),
                     }));
                 }
                 DiffWork::Entries(mut frame) => {
