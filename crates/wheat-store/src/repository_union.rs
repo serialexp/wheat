@@ -48,14 +48,15 @@ pub struct LabelMerge {
     pub both_moved: Vec<String>,
 }
 
-/// A label whose value in a joined envelope differs from the local side's.
+/// A label whose value differs between two envelopes: a fetch's local side and the
+/// envelope it joins to, or a publish's old head and new one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LabelChange {
     pub name: String,
-    /// None when the local side lacks it.
-    pub local: Option<ViewLabel>,
-    /// None when the joined envelope lacks it.
-    pub joined: Option<ViewLabel>,
+    /// None when the label is added.
+    pub before: Option<ViewLabel>,
+    /// None when the label is removed.
+    pub after: Option<ViewLabel>,
 }
 
 /// An envelope joining two sides, and its labels that differ from the local side's.
@@ -345,37 +346,61 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         local: RepositoryEnvelopeId,
         joined: RepositoryEnvelopeId,
     ) -> Result<EnvelopeUnion> {
-        let mut label_changes = Vec::new();
-        if joined != local {
-            let (here, there) = (self.envelope(local).await?, self.envelope(joined).await?);
-            if here.labels != there.labels {
-                label_changes = changed_labels(
-                    &self.view_label_manifest(here.labels).await?,
-                    &self.view_label_manifest(there.labels).await?,
-                );
-            }
-        }
         Ok(EnvelopeUnion {
             envelope: joined,
-            label_changes,
+            label_changes: self.label_changes(Some(local), joined).await?,
         })
+    }
+
+    /// The labels whose value differs between envelope `before` and envelope `after`,
+    /// sorted by name: what a publish moving a repository's head from `before` to
+    /// `after` does to its labels. Without `before` (a repository's first publish),
+    /// every label of `after` is added.
+    ///
+    /// Reads the two envelopes and, when their label manifests differ, the two
+    /// manifests: the cost follows the number of labels, not the history.
+    pub async fn label_changes(
+        &self,
+        before: Option<RepositoryEnvelopeId>,
+        after: RepositoryEnvelopeId,
+    ) -> Result<Vec<LabelChange>> {
+        if before == Some(after) {
+            return Ok(Vec::new());
+        }
+        let there = self.envelope(after).await?;
+        let before_labels = match before {
+            Some(before) => {
+                let here = self.envelope(before).await?;
+                if here.labels == there.labels {
+                    return Ok(Vec::new());
+                }
+                self.view_label_manifest(here.labels).await?
+            }
+            None => ViewLabelManifestRecord {
+                labels: BTreeMap::new(),
+            },
+        };
+        Ok(changed_labels(
+            &before_labels,
+            &self.view_label_manifest(there.labels).await?,
+        ))
     }
 }
 
-/// The labels of `joined` whose value differs from `local`'s, sorted by name.
+/// The labels whose value differs between `before` and `after`, sorted by name.
 fn changed_labels(
-    local: &ViewLabelManifestRecord,
-    joined: &ViewLabelManifestRecord,
+    before: &ViewLabelManifestRecord,
+    after: &ViewLabelManifestRecord,
 ) -> Vec<LabelChange> {
-    let names: BTreeSet<&String> = local.labels.keys().chain(joined.labels.keys()).collect();
+    let names: BTreeSet<&String> = before.labels.keys().chain(after.labels.keys()).collect();
     names
         .into_iter()
         .filter_map(|name| {
-            let (here, there) = (local.labels.get(name), joined.labels.get(name));
+            let (here, there) = (before.labels.get(name), after.labels.get(name));
             (here != there).then(|| LabelChange {
                 name: name.clone(),
-                local: here.cloned(),
-                joined: there.cloned(),
+                before: here.cloned(),
+                after: there.cloned(),
             })
         })
         .collect()

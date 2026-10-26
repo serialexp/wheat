@@ -58,7 +58,8 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   moves and the bytes uploaded; and a post-publish notification with the same, called
   once the head is durable (for its push journal, webhooks, CI and search). Labels
   live inside the envelope, so the label moves need computing from the two label
-  manifests; expose that as a store call.
+  manifests: `RepositoryReader::label_changes(old, new)` does that (2026-10-26); the
+  hooks themselves are still to do.
 - `[ ]` **The registry must open and close repositories.** Beyond being pluggable (item
   under the design-doc audit), a host serving thousands of repositories opens them on
   demand and evicts idle ones. Opening holds `catalog.lock` exclusively, so eviction

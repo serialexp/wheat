@@ -443,8 +443,8 @@ async fn fetched(
 fn moved(local: ViewId, joined: ViewId) -> Vec<LabelChange> {
     vec![LabelChange {
         name: "main".to_owned(),
-        local: Some(local.into()),
-        joined: Some(joined.into()),
+        before: Some(local.into()),
+        after: Some(joined.into()),
     }]
 }
 
@@ -539,4 +539,91 @@ async fn a_backward_label_between_two_heads_is_named() {
         matches!(found.not_forward, NotForward::Missing { .. }),
         "{found:?}"
     );
+}
+
+/// What a publish from one head to another does to the labels: added, removed, moved
+/// or re-annotated, each with both values, and nothing when the manifests agree.
+#[tokio::test]
+async fn the_label_changes_between_two_heads_are_listed() {
+    let (fixture, [l, c, d, j]) = grown_apart_and_joined().await;
+    let reader = fixture.reader();
+    let state = reader
+        .envelope(fixture.head().envelope)
+        .await
+        .unwrap()
+        .state;
+    let envelope = |labels: Vec<(&'static str, ViewLabel)>| {
+        let labels = ViewLabelManifestRecord {
+            labels: labels
+                .into_iter()
+                .map(|(name, label)| (name.to_owned(), label))
+                .collect(),
+        };
+        let publisher =
+            RepositoryPublisher::new(&fixture.objects, &fixture.content, &fixture.heads);
+        async move { publisher.prepare_envelope(state, &labels).await.unwrap() }
+    };
+    let change = |name: &str, before: Option<ViewLabel>, after: Option<ViewLabel>| LabelChange {
+        name: name.to_owned(),
+        before,
+        after,
+    };
+
+    let old = envelope(vec![
+        ("gone", l.into()),
+        ("main", c.into()),
+        ("same", d.into()),
+        ("tag", d.into()),
+    ])
+    .await;
+    let new = envelope(vec![
+        ("added", d.into()),
+        ("main", j.into()),
+        ("same", d.into()),
+        ("tag", annotated(d)),
+    ])
+    .await;
+    assert_eq!(
+        reader.label_changes(Some(old), new).await.unwrap(),
+        vec![
+            change("added", None, Some(d.into())),
+            change("gone", Some(l.into()), None),
+            change("main", Some(c.into()), Some(j.into())),
+            change("tag", Some(d.into()), Some(annotated(d))),
+        ]
+    );
+
+    // A first publish adds every label.
+    assert_eq!(
+        reader.label_changes(None, old).await.unwrap(),
+        vec![
+            change("gone", None, Some(l.into())),
+            change("main", None, Some(c.into())),
+            change("same", None, Some(d.into())),
+            change("tag", None, Some(d.into())),
+        ]
+    );
+
+    // Envelopes sharing one manifest differ in no label, and their manifests aren't
+    // read.
+    let shared = envelope(vec![("main", c.into())]).await;
+    fixture.create(fixture.base, j, "z", b"z").await;
+    let later = RepositoryPublisher::new(&fixture.objects, &fixture.content, &fixture.heads)
+        .prepare_envelope(
+            reader
+                .envelope(fixture.head().envelope)
+                .await
+                .unwrap()
+                .state,
+            &ViewLabelManifestRecord::new([("main", c)]).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(later, shared);
+    let before = fixture.objects.reads.load(Ordering::Relaxed);
+    assert_eq!(
+        reader.label_changes(Some(shared), later).await.unwrap(),
+        Vec::new()
+    );
+    assert_eq!(fixture.objects.reads.load(Ordering::Relaxed) - before, 2);
 }
