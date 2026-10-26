@@ -591,14 +591,16 @@ struct PushArgs {
     /// Full destination branch ref, for example refs/heads/main.
     #[arg(long, required_unless_present = "tag")]
     to: Option<String>,
-    /// Push annotated label tags/<TAG> as Git tag refs/tags/<TAG>. The tag is only
-    /// created, never moved, and its commit must already be on a remote branch.
-    #[arg(long, conflicts_with_all = ["to", "source", "force_with_lease"])]
+    /// Push annotated label tags/<TAG> as Git tag refs/tags/<TAG>. Its commit must
+    /// already be on a remote branch. A remote tag that differs (the label moved) is
+    /// replaced only with --force-with-lease.
+    #[arg(long, conflicts_with_all = ["to", "source"])]
     tag: Option<String>,
     /// Advanced source override: label:<name> or an exact retained view ID.
     #[arg(long)]
     source: Option<PushSource>,
-    /// Replace an unknown/diverged destination only if it still has the observed OID.
+    /// Replace an unknown/diverged destination, or a differing remote tag, only if it
+    /// still has the observed OID.
     #[arg(long)]
     force_with_lease: bool,
 }
@@ -1335,11 +1337,13 @@ fn execute(cli: Cli) -> Result<Success> {
         Command::Push(PushArgs {
             remote,
             tag: Some(tag),
+            force_with_lease,
             ..
         }) => push_tag(
             &resolve_store_root(&requested_workspace, cli.store.as_deref())?,
             &remote,
             &tag,
+            force_with_lease,
         ),
         Command::Push(mut arguments) => {
             let store_root = if arguments.source.is_none() {
@@ -1904,7 +1908,12 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
 }
 
 /// `wheat push --tag <tag>`: publish annotated label `tags/<tag>` as `refs/tags/<tag>`.
-fn push_tag(root: &std::path::Path, remote: &str, tag: &str) -> Result<Success> {
+fn push_tag(
+    root: &std::path::Path,
+    remote: &str,
+    tag: &str,
+    force_with_lease: bool,
+) -> Result<Success> {
     let label_name = format!("tags/{tag}");
     let local = open(root)?;
     let _operation = rewrite_transaction::StoreOperationGuard::acquire(root, &local)?;
@@ -1942,6 +1951,7 @@ fn push_tag(root: &std::path::Path, remote: &str, tag: &str) -> Result<Success> 
         &projection_path(root)?,
         remote,
         tag,
+        force_with_lease,
     ))?;
     if local.heads.read()? != expected {
         return Err(CliFailure::stale(
@@ -1951,11 +1961,17 @@ fn push_tag(root: &std::path::Path, remote: &str, tag: &str) -> Result<Success> 
     let tag_ref = prepared.tag_ref.clone();
     let tag_object = prepared.tag_object;
     let commit = prepared.commit;
+    let replaced = prepared
+        .replaces
+        .as_ref()
+        .map(|replaced| replaced.as_str().to_owned());
     let up_to_date = wheat_git::bridge::publish_tag(prepared)?.is_none();
-    let human = if up_to_date {
-        format!("{tag_ref} is already tag {tag_object} for commit {commit}\n")
-    } else {
-        format!("pushed {tag_ref} as tag {tag_object} for commit {commit}\n")
+    let human = match (&replaced, up_to_date) {
+        (_, true) => format!("{tag_ref} is already tag {tag_object} for commit {commit}\n"),
+        (Some(replaced), false) => format!(
+            "replaced {tag_ref} (was tag {replaced}) with tag {tag_object} for commit {commit}\n"
+        ),
+        (None, false) => format!("pushed {tag_ref} as tag {tag_object} for commit {commit}\n"),
     };
     Success::new(
         "push",
@@ -1966,6 +1982,7 @@ fn push_tag(root: &std::path::Path, remote: &str, tag: &str) -> Result<Success> 
             "tag_oid": tag_object.to_string(),
             "commit_oid": commit.to_string(),
             "up_to_date": up_to_date,
+            "replaced_tag_oid": replaced,
         }),
         human,
     )

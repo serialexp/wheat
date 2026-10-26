@@ -337,6 +337,74 @@ fn a_tag_is_refused_off_every_remote_branch_or_over_a_different_tag() {
     assert!(!invalid.status.success());
 }
 
+// A moved annotated label makes a different tag object; it replaces the remote tag
+// only when asked to.
+#[test]
+fn a_moved_tag_label_replaces_the_remote_tag_only_with_force_with_lease() {
+    let root = tempfile::tempdir().unwrap();
+    let repository = root.path().join("repository");
+    let remote = bare(&root.path().join("remote.git"));
+    let remote_path = Path::new(&remote);
+    succeed(wheat(&repository, &["init", repository.to_str().unwrap()]));
+    change(&repository, "one", "first");
+    let first_view = effective_view(&repository);
+    push_main(&repository, &remote);
+    change(&repository, "two", "second");
+    let second_view = effective_view(&repository);
+    push_main(&repository, &remote);
+    tag_label(&repository, "v1", &first_view, "Release 1");
+    let first = push_tag(&repository, &remote, "v1");
+    let first_tag = first["tag_oid"].as_str().unwrap().to_owned();
+
+    succeed(wheat(&repository, &["label", "delete", "tags/v1"]));
+    tag_label(&repository, "v1", &second_view, "Release 1, again");
+    let refused_move = wheat(
+        &repository,
+        &["--format=json", "push", &remote, "--tag", "v1"],
+    );
+    assert_eq!(refused(&refused_move), "tag_exists");
+    assert!(
+        json(&refused_move)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--force-with-lease")
+    );
+    assert_eq!(
+        git(Some(remote_path), &["rev-parse", "refs/tags/v1"]),
+        first_tag
+    );
+
+    let replaced = json(&succeed(wheat(
+        &repository,
+        &[
+            "--format=json",
+            "push",
+            &remote,
+            "--tag",
+            "v1",
+            "--force-with-lease",
+        ],
+    )))["result"]
+        .clone();
+    assert_eq!(replaced["up_to_date"], false);
+    assert_eq!(replaced["replaced_tag_oid"], first_tag.as_str());
+    let second_tag = replaced["tag_oid"].as_str().unwrap();
+    assert_ne!(second_tag, first_tag);
+    assert_eq!(
+        git(Some(remote_path), &["rev-parse", "refs/tags/v1"]),
+        second_tag
+    );
+    assert_eq!(
+        git(Some(remote_path), &["rev-parse", "v1^{commit}"]),
+        git(Some(remote_path), &["rev-parse", "main"])
+    );
+
+    // Already there: nothing to replace.
+    let again = push_tag(&repository, &remote, "v1");
+    assert_eq!(again["up_to_date"], true);
+    assert_eq!(again["replaced_tag_oid"], serde_json::Value::Null);
+}
+
 #[test]
 fn tags_on_imported_history_name_the_original_commits() {
     let root = tempfile::tempdir().unwrap();

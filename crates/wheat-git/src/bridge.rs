@@ -14,9 +14,9 @@ use crate::{
         ExportAnchor, ExportError, ExportOptions, ExportResult, export_revision_history, write_tag,
     },
     push::{
-        PushError, PushMode, PushReport, RemoteState, cache_observed_ref, fetch_remote_heads,
-        is_ancestor, observe_remote_ref, observe_remote_tag, push_ref, push_tag,
-        remote_heads_contain,
+        PushError, PushMode, PushReport, RemoteOid, RemoteState, cache_observed_ref,
+        fetch_remote_heads, is_ancestor, observe_remote_ref, observe_remote_tag, push_ref,
+        push_tag, remote_heads_contain,
     },
 };
 
@@ -35,6 +35,9 @@ pub struct PreparedTagPush {
     pub commit: gix::ObjectId,
     /// The remote already has exactly this tag object.
     pub up_to_date: bool,
+    /// The remote tag object this push replaces, when the label moved and the caller
+    /// allowed replacing it.
+    pub replaces: Option<RemoteOid>,
     remote_url: String,
     _lock: ProjectionLock,
 }
@@ -74,7 +77,10 @@ pub enum BridgeError {
         "tag {tag} would point at commit {commit}, which is on no branch of the remote; push the branch first"
     )]
     TagCommitNotOnRemoteBranch { tag: String, commit: String },
-    #[error("remote already has {tag} as tag object {remote}, not {local}; tags are never moved")]
+    #[error(
+        "remote already has {tag} as tag object {remote}, not {local}; pass --force-with-lease \
+         to replace it"
+    )]
     TagExists {
         tag: String,
         remote: String,
@@ -173,7 +179,9 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
 /// stored `annotation`: the same label gives the same object IDs on any machine, any
 /// time. The tag is refused unless its commit is already reachable from a branch on
 /// the remote, which catches any drift between this rule and how the branch was
-/// pushed. An existing remote tag is accepted only if it is this exact tag object.
+/// pushed. An existing remote tag is accepted if it is this exact tag object, and
+/// replaced (under a lease on what was observed) only with `force_with_lease`: a moved
+/// annotated label makes a different tag object.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_tag_push<O: ImmutableObjectStore>(
     objects: &O,
@@ -185,6 +193,7 @@ pub async fn prepare_tag_push<O: ImmutableObjectStore>(
     projection_path: &Path,
     remote_url: &str,
     name: &str,
+    force_with_lease: bool,
 ) -> Result<PreparedTagPush, BridgeError> {
     let tag_ref = format!("refs/tags/{name}");
     let lock = ProjectionLock::acquire(projection_path)?;
@@ -214,9 +223,10 @@ pub async fn prepare_tag_push<O: ImmutableObjectStore>(
         return Err(not_on_branch(commit));
     }
     let tag_object = write_tag(&git, commit, name, annotation)?;
-    let up_to_date = match &remote_state {
-        RemoteState::Absent => false,
-        RemoteState::Present(remote) if remote.object_id()? == tag_object => true,
+    let (up_to_date, replaces) = match remote_state {
+        RemoteState::Absent => (false, None),
+        RemoteState::Present(remote) if remote.object_id()? == tag_object => (true, None),
+        RemoteState::Present(remote) if force_with_lease => (false, Some(remote)),
         RemoteState::Present(remote) => {
             return Err(BridgeError::TagExists {
                 tag: tag_ref,
@@ -244,6 +254,7 @@ pub async fn prepare_tag_push<O: ImmutableObjectStore>(
         tag_object,
         commit,
         up_to_date,
+        replaces,
         remote_url: remote_url.into(),
         _lock: lock,
     })
@@ -259,6 +270,7 @@ pub fn publish_tag(prepared: PreparedTagPush) -> Result<Option<PushReport>, Brid
         &prepared.remote_url,
         &prepared.source_ref,
         &prepared.tag_ref,
+        prepared.replaces.as_ref(),
     )?;
     if !report.accepted() {
         let detail = report.stderr.to_string_lossy();

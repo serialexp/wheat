@@ -488,22 +488,22 @@ pub fn push_ref(
     push_validated(projection, remote_url, source, destination, mode)
 }
 
-/// Create one tag on the remote from a local ref naming the tag object. The push is
-/// create-only: an existing remote tag is never moved.
+/// Push one tag to the remote from a local ref naming the tag object. Without
+/// `replaces` the push only creates: the remote must not have the tag. With it, the
+/// remote tag is replaced only while it is still that exact object.
 pub fn push_tag(
     projection: &Path,
     remote_url: &str,
     source: &str,
     tag: &str,
+    replaces: Option<&RemoteOid>,
 ) -> Result<PushReport, PushError> {
     validate_tag(tag)?;
-    push_validated(
-        projection,
-        remote_url,
-        source,
-        tag,
-        PushMode::ForceWithLeaseAbsent,
-    )
+    let mode = match replaces {
+        Some(observed) => PushMode::ForceWithLease(observed.clone()),
+        None => PushMode::ForceWithLeaseAbsent,
+    };
+    push_validated(projection, remote_url, source, tag, mode)
 }
 
 fn push_validated(

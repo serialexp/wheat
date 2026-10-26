@@ -160,9 +160,9 @@ both lists.
 - [x] **Git push commit messages come from the change.** (2026-09-26) See "Git
   compatibility workflow".
 - [x] **Annotated labels and `wheat push --tag`.** (2026-09-26) Labels can carry a
-  tagger, date and message; `push --tag` publishes them as create-only annotated Git
-  tags whose object IDs are the same on every push, guarded by remote-branch
-  reachability. Extended beyond the original plan: squash refuses to move an
+  tagger, date and message; `push --tag` publishes them as annotated Git tags whose
+  object IDs are the same on every push, guarded by remote-branch reachability. A
+  moved label replaces its remote tag only with `--force-with-lease` (2026-10-26). Extended beyond the original plan: squash refuses to move an
   annotated label. See "Git compatibility workflow".
 
 ### Outstanding
@@ -959,8 +959,11 @@ change, so:
   1,024 branches, else `too_many_remote_branches`). The tag is refused
   (`tag_commit_not_on_remote_branch`) unless its commit is reachable from one of
   them, so a tag can't point at a commit no branch has;
-- the push is create-only. The same tag object already on the remote is "up to
-  date"; a different one is refused (`tag_exists`). There is no force option.
+- the same tag object already on the remote is "up to date"; a different one
+  (the label moved, or someone else made the tag) is refused (`tag_exists`) unless
+  `--force-with-lease`, which replaces it while the remote still has the tag object
+  this push observed (JSON `replaced_tag_oid`). Without a tag on the remote the push
+  only creates.
 
 A tag push costs three Git processes (`ls-remote`, one fetch, one
 `for-each-ref --contains`) whatever the branch count. Import still turns a Git tag

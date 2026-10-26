@@ -618,4 +618,8 @@ size for `just test`; release run; results under `bench/results/`.
    budget)` names the first label `new` moved to a view not forward from `old`'s
    (`BackwardLabel`), for `commit.rs` to refuse unless `force_labels`.
 10. Git bridge tag replacement.
+   **Done 2026-10-26**: `prepare_tag_push(…, force_with_lease)` replaces a differing
+   remote tag under a lease on the observed tag object (`PreparedTagPush::replaces`);
+   without it `tag_exists` names the flag. `wheat push --tag` accepts
+   `--force-with-lease` and reports `replaced_tag_oid`. Test in `git_push_tag.rs`.
 11. Race test, docs, benchmark, TODO bookkeeping.
