@@ -7,13 +7,17 @@
 //! once cold (nothing of it read yet in this process) and [`SAMPLES`] more times,
 //! recording the objects and bytes a read takes and the median wall time.
 //!
-//! A load reads each change's revision and change records and walks the revision
-//! map once; the change map's nodes on the way to each change stay cached, so a load
-//! reads about four objects per change at any size. At [`LARGEST`] changes it may
-//! read at most [`READS_PER_CHANGE`] objects and [`BYTES_PER_CHANGE`] bytes per change
-//! (the map nodes it reads grow with the history), and finish within
-//! [`LOAD_BUDGET_SECONDS`]. Measured 2026-10-22 (release): 4.01 reads, 11.9 KB and
-//! 0.62 s at 20,000 changes; 4.07 reads and 7.1 KB per change at 1,000.
+//! A load reads each change's revision and change records, looks the change up in
+//! the change map and walks the revision map once, so it reads a few objects per
+//! change, growing only with the maps' depth. Change IDs are version 7 UUIDs, which
+//! start with their creation time, so the maps' depth follows how far apart in time
+//! the changes were made: this history's changes are one second apart (see
+//! `history::change_id`), and at 20,000 changes their IDs differ from the third
+//! byte on, one level deeper than at 5,000. At [`LARGEST`] changes a load may read at
+//! most [`READS_PER_CHANGE`] objects and [`BYTES_PER_CHANGE`] bytes per change (the
+//! map nodes it reads grow with the history), and finish within
+//! [`LOAD_BUDGET_SECONDS`]. Measured 2026-10-26 (release): 5.02 reads, 9.2 KB and
+//! 0.59 s at 20,000 changes; 4.02 reads and 3.9 KB per change at 1,000.
 
 use std::{fs, path::Path, time::Instant};
 
@@ -32,7 +36,7 @@ const SAMPLES: usize = 3;
 /// The history size the budgets are checked at.
 const LARGEST: usize = 20_000;
 const LOAD_BUDGET_SECONDS: f64 = 1.0;
-const READS_PER_CHANGE: f64 = 5.0;
+const READS_PER_CHANGE: f64 = 6.0;
 const BYTES_PER_CHANGE: f64 = 16_384.0;
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {

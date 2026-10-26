@@ -158,6 +158,33 @@ pub(crate) fn rewrite(
     ))
 }
 
+/// Change number `index`'s ID: a version 7 UUID as `wheat change new` would mint it
+/// for a change made `index` seconds after the first, with its random bits drawn from
+/// `index`. `ChangeId::new` reads the clock, so the maps keyed by change ID, and the
+/// reads a case counts, would differ with how fast the history was built.
+fn change_id(index: usize) -> ChangeId {
+    const FIRST_MILLIS: u64 = 1_760_000_000_000;
+    let millis = FIRST_MILLIS + index as u64 * 1_000;
+    let mut random = [0; 16];
+    random[..8].copy_from_slice(&split_mix(index as u64).to_be_bytes());
+    random[8..].copy_from_slice(&split_mix(!(index as u64)).to_be_bytes());
+    let mut bytes = [0; 16];
+    bytes[..6].copy_from_slice(&millis.to_be_bytes()[2..]);
+    bytes[6] = 0x70 | (random[0] & 0x0f);
+    bytes[7] = random[1];
+    bytes[8] = 0x80 | (random[2] & 0x3f);
+    bytes[9..].copy_from_slice(&random[3..10]);
+    ChangeId::from_bytes(bytes)
+}
+
+/// SplitMix64's output function: spreads consecutive inputs over the whole range.
+fn split_mix(value: u64) -> u64 {
+    let mut z = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// Where change number `index` of a history built by [`create_at`] puts its file.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Layout {
@@ -231,7 +258,7 @@ where
             base,
             effective,
             ChangeProposal {
-                id: ChangeId::new(),
+                id: change_id(index),
                 metadata: ChangeMetadata {
                     title: format!("Change {index}"),
                     creator: author(),
