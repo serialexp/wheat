@@ -1,6 +1,7 @@
 //! Per-connection state machine.
 //!
-//! Drives the WebSocket through: handshake → repository open → fetch/publish.
+//! Drives the WebSocket through: upgrade (the path names the repository) → handshake
+//! → repository state → fetch/publish.
 
 use std::{sync::Arc, time::Duration};
 
@@ -16,7 +17,7 @@ use tracing::{debug, info, warn};
 use wheat_protocol::*;
 use wheat_store::RepositoryReader;
 
-use crate::access::{Access, MAX_AUTH_TOKEN_BYTES, Principal};
+use crate::access::{Access, Principal};
 use crate::receipt::PublishKey;
 use crate::registry::Registry;
 use crate::server::ServerConfig;
@@ -43,22 +44,39 @@ pub async fn handle_connection(
     debug!(peer = %peer, "new connection");
 
     let allowed_origins = &config.allowed_origins;
+    let mut upgrade = None;
     #[allow(clippy::result_large_err)] // The error type is fixed by tungstenite's callback.
-    let check_origin =
-        |request: &Request, response: Response| check_origin(request, response, allowed_origins);
+    let check_upgrade = |request: &Request, response: Response| {
+        let repository = repository_name(request.uri().path()).map_err(|error| {
+            refusal(
+                StatusCode::BAD_REQUEST,
+                format!("invalid repository path: {error}"),
+            )
+        })?;
+        let response = check_origin(request, response, allowed_origins)?;
+        upgrade = Some(Upgrade {
+            repository,
+            request: copy_request(request),
+        });
+        Ok(response)
+    };
     // Refuse an oversized message while it arrives, not after it is in memory.
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_MESSAGE_SIZE));
-    let mut ws = match accept_hdr_async_with_config(stream, check_origin, Some(limits)).await {
+    let mut ws = match accept_hdr_async_with_config(stream, check_upgrade, Some(limits)).await {
         Ok(ws) => ws,
         Err(e) => {
             warn!(peer = %peer, error = %e, "WebSocket handshake failed");
             return;
         }
     };
+    let Some(upgrade) = upgrade else {
+        warn!(peer = %peer, "WebSocket handshake finished without its request");
+        return;
+    };
 
-    if let Err(e) = run_session(&mut ws, &registry, &config, &peer).await {
+    if let Err(e) = run_session(&mut ws, &registry, &config, &peer, &upgrade).await {
         info!(peer = %peer, error = %e, "session ended with error");
     } else {
         debug!(peer = %peer, "session closed cleanly");
@@ -105,9 +123,34 @@ fn check_origin(
     if allowed {
         return Ok(response);
     }
-    let mut refusal = ErrorResponse::new(Some("origin not allowed".to_owned()));
-    *refusal.status_mut() = StatusCode::FORBIDDEN;
-    Err(refusal)
+    Err(refusal(
+        StatusCode::FORBIDDEN,
+        "origin not allowed".to_owned(),
+    ))
+}
+
+/// What a WebSocket upgrade request asked for: the repository its path names, and
+/// the request itself, for the access provider.
+struct Upgrade {
+    repository: String,
+    request: Request,
+}
+
+/// `request` without its body, which an upgrade request does not have.
+fn copy_request(request: &Request) -> Request {
+    let mut copy = Request::new(());
+    *copy.method_mut() = request.method().clone();
+    *copy.uri_mut() = request.uri().clone();
+    *copy.version_mut() = request.version();
+    *copy.headers_mut() = request.headers().clone();
+    copy
+}
+
+/// An answer refusing the upgrade with `status`.
+fn refusal(status: StatusCode, message: String) -> ErrorResponse {
+    let mut refusal = ErrorResponse::new(Some(message));
+    *refusal.status_mut() = status;
+    refusal
 }
 
 /// Ask the provider for the principal's access to `repository`.
@@ -147,6 +190,7 @@ async fn run_session(
     registry: &Registry,
     config: &ServerConfig,
     peer: &str,
+    upgrade: &Upgrade,
 ) -> Result<(), ConnectionError> {
     // --- Session setup ---
 
@@ -216,17 +260,13 @@ async fn run_session(
         }
     };
 
-    // 3. Authenticate the bearer token.
-    let principal = if client_hello.auth_token.len() > MAX_AUTH_TOKEN_BYTES {
-        Err("authentication token is too long")
-    } else {
-        match config.access.authenticate(&client_hello.auth_token).await {
-            Ok(Some(principal)) => Ok(principal),
-            Ok(None) => Err("authentication failed"),
-            Err(e) => {
-                warn!(peer = %peer, error = %e, "access provider could not authenticate");
-                Err("authentication is unavailable")
-            }
+    // 3. Authenticate the upgrade request.
+    let principal = match config.access.authenticate(&upgrade.request).await {
+        Ok(Some(principal)) => Ok(principal),
+        Ok(None) => Err("authentication failed"),
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "access provider could not authenticate");
+            Err("authentication is unavailable")
         }
     };
     let principal = match principal {
@@ -277,88 +317,66 @@ async fn run_session(
     );
 
     // --- Repository open ---
+    // The upgrade request's path named the repository; its state follows the session.
 
-    let (entry, repository) = match recv(ws).await? {
-        WheatProtocolMessage::RepositoryOpen(ro) => {
-            // A repository the principal may not read looks the same as one that
-            // does not exist, so its existence does not leak.
-            let readable = repository_access(config, &principal, &ro.name)
-                .await?
-                .is_some();
-            match registry.get(&ro.name).filter(|_| readable) {
-                Some(entry) => {
-                    // Read the current head and build RepositoryState.
-                    let head = entry.heads.head().await.map_err(|e| {
-                        ConnectionError::Internal(format!("failed to read head: {e}"))
-                    })?;
-                    let reader = RepositoryReader::new(&entry.store, &entry.content);
-                    let envelope = reader.envelope(head.envelope).await.map_err(|e| {
-                        ConnectionError::Internal(format!("failed to read envelope: {e}"))
-                    })?;
-                    let labels_manifest = reader
-                        .view_label_manifest(envelope.labels)
-                        .await
-                        .map_err(|e| {
-                            ConnectionError::Internal(format!("failed to read labels: {e}"))
-                        })?;
-
-                    let labels: Vec<LabelEntry> = labels_manifest
-                        .labels
-                        .iter()
-                        .take(10_000)
-                        .map(|(name, label)| LabelEntry {
-                            name: name.clone(),
-                            view_id: Digest256 {
-                                bytes: label.view.as_bytes().to_vec(),
-                            },
-                        })
-                        .collect();
-                    let truncated = labels_manifest.labels.len() > 10_000;
-
-                    send(
-                        ws,
-                        &WheatProtocolMessage::RepositoryState(RepositoryStateOutput {
-                            message_type: 0x11,
-                            head_generation: head.generation,
-                            head_envelope: Digest256 {
-                                bytes: head.envelope.as_bytes().to_vec(),
-                            },
-                            labels,
-                            labels_truncated: truncated,
-                        }),
-                    )
-                    .await?;
-
-                    info!(peer = %peer, repo = %ro.name, generation = head.generation, "repository opened");
-                    (entry, ro.name)
-                }
-                None => {
-                    send_error(
-                        ws,
-                        0,
-                        NOT_FOUND,
-                        operation_error_scope(),
-                        false,
-                        &format!("repository '{}' not found", ro.name),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            }
-        }
-        _ => {
-            send_error(
-                ws,
-                0,
-                1,
-                connection_error_scope(),
-                false,
-                "expected RepositoryOpen after session setup",
-            )
-            .await?;
-            return Err(ConnectionError::Protocol("expected RepositoryOpen"));
-        }
+    let repository = upgrade.repository.clone();
+    // A repository the principal may not read looks the same as one that does not
+    // exist, so its existence does not leak.
+    let readable = repository_access(config, &principal, &repository)
+        .await?
+        .is_some();
+    let Some(entry) = registry.get(&repository).filter(|_| readable) else {
+        send_error(
+            ws,
+            0,
+            NOT_FOUND,
+            operation_error_scope(),
+            false,
+            &format!("repository '{repository}' not found"),
+        )
+        .await?;
+        return Ok(());
     };
+    let head = entry
+        .heads
+        .head()
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
+    let reader = RepositoryReader::new(&entry.store, &entry.content);
+    let envelope = reader
+        .envelope(head.envelope)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read envelope: {e}")))?;
+    let labels_manifest = reader
+        .view_label_manifest(envelope.labels)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read labels: {e}")))?;
+    let labels: Vec<LabelEntry> = labels_manifest
+        .labels
+        .iter()
+        .take(10_000)
+        .map(|(name, label)| LabelEntry {
+            name: name.clone(),
+            view_id: Digest256 {
+                bytes: label.view.as_bytes().to_vec(),
+            },
+        })
+        .collect();
+    let truncated = labels_manifest.labels.len() > 10_000;
+    send(
+        ws,
+        &WheatProtocolMessage::RepositoryState(RepositoryStateOutput {
+            message_type: 0x11,
+            head_generation: head.generation,
+            head_envelope: Digest256 {
+                bytes: head.envelope.as_bytes().to_vec(),
+            },
+            labels,
+            labels_truncated: truncated,
+        }),
+    )
+    .await?;
+    info!(peer = %peer, repo = %repository, generation = head.generation, "repository opened");
 
     // --- Main command loop ---
     // Read the head fresh on each operation to avoid stale cache issues

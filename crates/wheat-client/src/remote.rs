@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, header::AUTHORIZATION};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use url::{Host, Url};
@@ -34,7 +36,8 @@ pub struct WheatUrl {
     pub scheme: &'static str,
     /// Canonical `host` or `host:port` (IPv6 hosts in brackets).
     pub authority: String,
-    /// WebSocket URL: `ws://host:port` or `wss://host:port`.
+    /// WebSocket URL: `ws://host:port/owner/repo` or `wss://host:port/owner/repo`; its
+    /// path names the repository.
     pub ws_url: String,
     /// Repository name extracted from the URL path (e.g. `owner/repo`).
     pub repo_name: String,
@@ -117,102 +120,19 @@ pub fn parse_wheat_url(input: &str) -> Result<WheatUrl> {
         None => canonical_host,
     };
 
-    // Validate the original escaped path before `url` can normalize it.
-    // Encoded slashes and backslashes could otherwise change repository
-    // boundaries downstream.
-    if contains_forbidden_path_escape(raw_path) {
-        bail!("invalid wheat URL: encoded path separators or NUL are not allowed");
-    }
-    let raw_repo_path = raw_path
-        .strip_prefix('/')
-        .with_context(|| "invalid wheat URL: repository path is not absolute")?;
-    let mut repo_segments = Vec::new();
-    for segment in raw_repo_path.split('/') {
-        let decoded = percent_decode_segment(segment)?;
-        if decoded.is_empty() || decoded == "." || decoded == ".." {
-            bail!("invalid wheat URL: empty or dot repository path segment");
-        }
-        if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
-            bail!("invalid wheat URL: repository path contains a separator or NUL");
-        }
-        repo_segments.push(decoded);
-    }
-    if repo_segments.is_empty() {
-        bail!("invalid wheat URL: empty repository name");
-    }
-    let repo_name = repo_segments.join("/");
-    let canonical_path = repo_segments
-        .iter()
-        .map(|segment| encode_identity_segment(segment))
-        .collect::<Vec<_>>()
-        .join("/");
+    // Read the original escaped path, before `url` can normalize it: encoded slashes
+    // and backslashes could otherwise change repository boundaries downstream.
+    let repo_name =
+        repository_name(raw_path).map_err(|error| anyhow::anyhow!("invalid wheat URL: {error}"))?;
+    let path = repository_path(&repo_name);
 
     Ok(WheatUrl {
         scheme: wheat_scheme,
-        ws_url: format!("{ws_scheme}://{authority}"),
+        ws_url: format!("{ws_scheme}://{authority}{path}"),
         repo_name,
-        canonical_identity: format!("{wheat_scheme}://{authority}/{canonical_path}"),
+        canonical_identity: format!("{wheat_scheme}://{authority}{path}"),
         authority,
     })
-}
-
-fn contains_forbidden_path_escape(path: &str) -> bool {
-    path.as_bytes().windows(3).any(|bytes| {
-        bytes[0] == b'%'
-            && matches!(
-                (bytes[1].to_ascii_lowercase(), bytes[2].to_ascii_lowercase()),
-                (b'2', b'f') | (b'5', b'c') | (b'0', b'0')
-            )
-    })
-}
-
-fn percent_decode_segment(segment: &str) -> Result<String> {
-    let mut decoded = Vec::with_capacity(segment.len());
-    let bytes = segment.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                bail!("invalid wheat URL: malformed percent escape in repository path");
-            }
-            let high = hex_value(bytes[index + 1]).with_context(
-                || "invalid wheat URL: malformed percent escape in repository path",
-            )?;
-            let low = hex_value(bytes[index + 2]).with_context(
-                || "invalid wheat URL: malformed percent escape in repository path",
-            )?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).context("invalid wheat URL: repository path is not UTF-8")
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn encode_identity_segment(segment: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[(byte >> 4) as usize]));
-            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
-        }
-    }
-    encoded
 }
 
 #[cfg(test)]
@@ -223,7 +143,7 @@ mod url_tests {
     #[test]
     fn canonicalizes_host_and_escapes_without_changing_repo_case() {
         let parsed = parse_wheat_url("wheat+tls://EXAMPLE.COM:443/Owner/R%C3%A9po").unwrap();
-        assert_eq!(parsed.ws_url, "wss://example.com:443");
+        assert_eq!(parsed.ws_url, "wss://example.com:443/Owner/R%C3%A9po");
         assert_eq!(parsed.repo_name, "Owner/Répo");
         assert_eq!(
             parsed.canonical_identity(),
@@ -410,15 +330,20 @@ fn content_id_to_digest(id: ContentId) -> Digest256 {
 // Connect and handshake
 // ---------------------------------------------------------------------------
 
-/// Connect to a wheat-server, sending `token` (empty for none) as the bearer token,
-/// and open the repository `url` names. Returns the session and the repository's
-/// state.
-///
-/// `RepositoryOpen` goes out with `ClientHello`, without waiting for the session,
-/// so opening costs one round trip after the WebSocket upgrade instead of two. A
-/// refused session ends with the open unread; the server reads and drops it.
+/// Connect to a wheat-server for the repository `url` names, sending `token` (empty
+/// for none) as the upgrade request's bearer token. Returns the session and the
+/// repository's state, which the server sends once the session is established.
 pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteRepoState)> {
     let ws_url = url.ws_url.as_str();
+    let mut request = ws_url
+        .into_client_request()
+        .with_context(|| format!("invalid WebSocket URL {ws_url}"))?;
+    if !token.is_empty() {
+        let mut value = HeaderValue::from_bytes(&[b"Bearer ", token].concat())
+            .context("the token from credential.helper holds bytes an HTTP header cannot carry")?;
+        value.set_sensitive(true);
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
     // Refuse an oversized message while it arrives, not after it is in memory.
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_SIZE))
@@ -426,7 +351,7 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
     // Nagle's algorithm would hold back the tail of a message until the server's
     // delayed ACK, which costs every request/reply round tens of milliseconds.
     let disable_nagle = true;
-    let (mut ws, _) = connect_async_with_config(ws_url, Some(limits), disable_nagle)
+    let (mut ws, _) = connect_async_with_config(request, Some(limits), disable_nagle)
         .await
         .with_context(|| format!("failed to connect to {ws_url}"))?;
 
@@ -452,18 +377,9 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
         &WheatProtocolMessage::ClientHello(ClientHelloOutput {
             message_type: 0x02,
             selected_version: 1,
-            auth_token: token.to_vec(),
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
             capabilities: capabilities.to_vec(),
-        }),
-    )
-    .await?;
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: url.repo_name.clone(),
         }),
     )
     .await?;
@@ -498,7 +414,7 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
     Ok((WheatSession { ws, capabilities }, state))
 }
 
-/// Reads the reply to `RepositoryOpen` for the repository `name`.
+/// Reads the state of the repository `name`, which the server sends after the session.
 async fn repository_state(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     name: &str,

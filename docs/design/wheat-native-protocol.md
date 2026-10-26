@@ -116,7 +116,8 @@ top of them.
   incremental. There is no named or multi-remote configuration. The push still
   sends whole objects; sending deltas against the objects the client has is
   not started.)
-- [~] **Phase 1 — authentication.** Bearer token auth in `ClientHello`, TLS
+- [~] **Phase 1 — authentication.** Bearer token auth on the WebSocket upgrade
+  request (`Authorization: Bearer`; in `ClientHello` until 2026-10-27), TLS
   required, localhost-only default when no auth is configured. Standalone
   server refuses non-loopback binding without explicit auth config. Origin
   validation for browser WebSocket connections. (2026-09-26: done except TLS.
@@ -656,14 +657,12 @@ idle disconnects.
 ```text
 Client                          Server
   │                               │
-  ├─ Connect (WebSocket + TLS) ──>│
-  │                               │
+  ├─ Connect (WebSocket + TLS) ──>│  GET /owner/repo,
+  │                               │  Authorization: Bearer <token>
   │<──── ServerHello ────────────┤  version_min, version_max,
   │                               │  server_id, capabilities
-  ├─ ClientHello ────────────────>│  selected_version, auth_token,
+  ├─ ClientHello ────────────────>│  selected_version,
   │                               │  receive_window, capabilities
-  ├─ RepositoryOpen ─────────────>│  repo_name (sent with ClientHello,
-  │                               │  without waiting for the session)
   │                               │
   │<──── SessionEstablished ─────┤  selected_version, receive_window,
   │                               │  status: ok | version_mismatch |
@@ -676,13 +675,23 @@ Client                          Server
   ├─ Close ──────────────────────>│
 ```
 
-**Pipelined open:** The client sends `RepositoryOpen` right behind
-`ClientHello`, so opening a repository costs one round trip after the
-WebSocket upgrade. A refused session leaves the open unread. The server ends
-every connection with a closing handshake and reads and drops what the client
-sent after it stopped listening, for up to 10 seconds, because closing a socket
-with bytes unread resets the connection, and the client could lose the reply
-that says why it ended.
+**The path names the repository:** The upgrade request's path is the
+repository's name, each segment percent-encoded (`wheat://host/owner/repo`
+connects to `ws://host/owner/repo`; `wheat_protocol::repository_path` and
+`repository_name`). A connection is for one repository, and the server sends its
+`RepositoryState` as soon as the session is established, so opening a repository
+costs one round trip after the WebSocket upgrade. A front door (Gothab) routes a
+connection to the repository's host from the upgrade request alone, without
+decoding Wheat messages. The server refuses a path that names no repository, or
+names one ambiguously (an empty, `.` or `..` segment, an encoded `/`, `\` or NUL),
+with HTTP 400 on the upgrade. A repository the principal may not read looks the
+same as one that does not exist: an `Error` 404 after `SessionEstablished`.
+
+**Closing:** The server ends every connection with a closing handshake and reads
+and drops what the client sent after it stopped listening, for up to 10 seconds,
+because closing a socket with bytes unread resets the connection, and the client
+could lose the reply that says why it ended. A client may send a request right
+behind `ClientHello`; a refused session leaves it unread.
 
 **Version negotiation:** `ServerHello` advertises a version range.
 `ClientHello` selects one version within that range. `SessionEstablished`
@@ -697,10 +706,14 @@ session uses, each from the offer; the server refuses the session with an
 further message. A new optional message type or behaviour is switched on by a
 capability, so peers that predate it keep working within one protocol version.
 
-**Authentication:** Connections require TLS. The `auth_token` field in
-`ClientHello` carries a bearer token. The server validates the token and
-binds the session to a principal (user or service account). Unauthenticated
-connections are rejected with `auth_failed`. The standalone v1 server
+**Authentication:** Connections require TLS. The upgrade request carries a
+bearer token in its `Authorization` header, where a front door can check it
+without decoding Wheat. The server hands the whole upgrade request (path and
+headers) to its `AccessProvider`, which binds the session to a principal (user or
+service account): the standalone server's provider reads the bearer token, and an
+embedder's provider can instead trust a header its own front door set once it
+authenticated the caller. Unauthenticated connections are rejected with
+`auth_failed`. The standalone v1 server
 defaults to **localhost-only binding** (127.0.0.1) when no auth
 configuration is provided; binding to non-loopback addresses requires
 explicit auth configuration. This prevents accidentally exposing an open
@@ -739,7 +752,6 @@ ServerHello
 
 ClientHello
   selected_version: u16
-  auth_token: bytes (length-prefixed, max 8 KiB)
   receive_window_bytes: u32                   // flow control
   receive_window_messages: u16
   capabilities: array<string, max=64>         // from ServerHello's offer
@@ -755,10 +767,7 @@ SessionEstablished
 
 // --- Repository ---
 
-RepositoryOpen
-  name: string (max 256 bytes)
-
-RepositoryState
+RepositoryState                               // sent after SessionEstablished
   head_generation: u64
   head_envelope: bytes[32]
   labels: array<{ name: string (max 256), view_id: bytes[32] }, max=10000>
@@ -1014,8 +1023,10 @@ its hash.
 
 ### Embedded in Gothab
 
-Gothab mounts the wheat protocol handler on a route (e.g. `/wheat/ws`) behind
-its existing authentication middleware. The repository registry is the Postgres
+Gothab routes a Wheat connection by its upgrade request: the path names the
+repository, so the front door picks the repository's host without decoding Wheat,
+and its authentication middleware checks the `Authorization` header and passes the
+caller on in a header of its own, which Gothab's `AccessProvider` reads. The repository registry is the Postgres
 `repositories` table. Object storage uses the existing blobstore configuration
 per namespace. No separate binary — the protocol handler is a library called
 from gothab-server.
@@ -1237,8 +1248,8 @@ lifecycle, batching, and error handling. This is enough to build:
 
 1. Build the standalone `wheat-server` with local and S3 backends,
    including segment-aware fetch planning and bounded segment cache.
-2. Implement bearer-token authentication in `ClientHello`. Standalone
-   server defaults to localhost-only without auth config.
+2. Implement bearer-token authentication (now on the upgrade request).
+   Standalone server defaults to localhost-only without auth config.
 3. Add `wheat clone`, `wheat fetch`, and `wheat publish` to the CLI,
    using iterative root-first discovery for fetch.
 4. Generate the TypeScript client from the same binschema schema.
@@ -1254,7 +1265,7 @@ lifecycle, batching, and error handling. This is enough to build:
 2. Server-side authorization: read vs publish permissions, namespace/
    repository access control, publish-gate enforcement.
 3. Fork-network structural-object reachability (see open question 4).
-4. Integrate with gothab-server: mount protocol handler on `/wheat/ws`,
+4. Integrate with gothab-server: route Wheat upgrades by repository path,
    use Postgres repository registry and existing blobstore config.
 
 ### Phase 3 — production hardening

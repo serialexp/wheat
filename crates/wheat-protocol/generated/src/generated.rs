@@ -15,7 +15,6 @@ pub enum WheatProtocolMessage {
     ServerHello(ServerHelloOutput),
     ClientHello(ClientHelloOutput),
     SessionEstablished(SessionEstablishedOutput),
-    RepositoryOpen(RepositoryOpenOutput),
     RepositoryState(RepositoryStateOutput),
     ListLabels(ListLabelsOutput),
     ListLabelsResult(ListLabelsResultOutput),
@@ -71,10 +70,6 @@ impl WheatProtocolMessage {
             WheatProtocolMessage::ClientHello(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint16(v.selected_version, Endianness::BigEndian);
-                encoder.write_varlength(v.auth_token.len() as u64, "leb128_canonical")?;
-                for item in &v.auth_token {
-                    encoder.write_uint8(*item);
-                }
                 encoder.write_uint32(v.receive_window_bytes, Endianness::BigEndian);
                 encoder.write_uint16(v.receive_window_messages, Endianness::BigEndian);
                 encoder.write_varlength(v.capabilities.len() as u64, "leb128_canonical")?;
@@ -95,14 +90,6 @@ impl WheatProtocolMessage {
                 encoder.write_uint16(v.supported_range_max, Endianness::BigEndian);
                 encoder.write_varlength(v.message.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.message.as_bytes();
-                for &b in string_bytes.iter() {
-                    encoder.write_uint8(b);
-                }
-            }
-            WheatProtocolMessage::RepositoryOpen(v) => {
-                encoder.write_uint8(v.message_type);
-                encoder.write_varlength(v.name.len() as u64, "leb128_canonical")?;
-                let string_bytes: &[u8] = v.name.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
                 }
@@ -344,10 +331,6 @@ impl WheatProtocolMessage {
         } else if value == 0x03 {
             Ok(WheatProtocolMessage::SessionEstablished(
                 SessionEstablishedOutput::decode_with_decoder(decoder)?,
-            ))
-        } else if value == 0x10 {
-            Ok(WheatProtocolMessage::RepositoryOpen(
-                RepositoryOpenOutput::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x11 {
             Ok(WheatProtocolMessage::RepositoryState(
@@ -742,7 +725,6 @@ impl From<ServerHelloInput> for ServerHelloOutput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientHelloInput {
     pub selected_version: u16,
-    pub auth_token: Vec<u8>,
     pub receive_window_bytes: u32,
     pub receive_window_messages: u16,
     pub capabilities: Vec<std::string::String>,
@@ -752,7 +734,6 @@ pub struct ClientHelloInput {
 pub struct ClientHelloOutput {
     pub message_type: u8,
     pub selected_version: u16,
-    pub auth_token: Vec<u8>,
     pub receive_window_bytes: u32,
     pub receive_window_messages: u16,
     pub capabilities: Vec<std::string::String>,
@@ -770,10 +751,6 @@ impl ClientHelloInput {
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(2);
         encoder.write_u16_be(self.selected_version);
-        encoder.write_varlength(self.auth_token.len() as u64, "leb128_canonical")?;
-        for item in &self.auth_token {
-            encoder.write_byte(*item);
-        }
         encoder.write_u32_be(self.receive_window_bytes);
         encoder.write_u16_be(self.receive_window_messages);
         encoder.write_varlength(self.capabilities.len() as u64, "leb128_canonical")?;
@@ -802,8 +779,6 @@ impl ClientHelloOutput {
             )));
         }
         let selected_version = decoder.read_u16_be()?;
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let auth_token = decoder.read_bytes_vec(length)?;
         let receive_window_bytes = decoder.read_u32_be()?;
         let receive_window_messages = decoder.read_u16_be()?;
         let length = decoder.read_varlength("leb128_canonical")? as usize;
@@ -818,7 +793,6 @@ impl ClientHelloOutput {
         Ok(Self {
             message_type,
             selected_version,
-            auth_token,
             receive_window_bytes,
             receive_window_messages,
             capabilities,
@@ -836,7 +810,6 @@ impl From<ClientHelloOutput> for ClientHelloInput {
     fn from(o: ClientHelloOutput) -> Self {
         Self {
             selected_version: o.selected_version,
-            auth_token: o.auth_token,
             receive_window_bytes: o.receive_window_bytes,
             receive_window_messages: o.receive_window_messages,
             capabilities: o.capabilities,
@@ -849,7 +822,6 @@ impl From<ClientHelloInput> for ClientHelloOutput {
         Self {
             message_type: 2u8,
             selected_version: i.selected_version,
-            auth_token: i.auth_token,
             receive_window_bytes: i.receive_window_bytes,
             receive_window_messages: i.receive_window_messages,
             capabilities: i.capabilities,
@@ -1209,80 +1181,6 @@ impl From<SessionEstablishedInput> for SessionEstablishedOutput {
             supported_range_min: i.supported_range_min,
             supported_range_max: i.supported_range_max,
             message: i.message,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RepositoryOpenInput {
-    pub name: std::string::String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RepositoryOpenOutput {
-    pub message_type: u8,
-    pub name: std::string::String,
-}
-
-pub type RepositoryOpen = RepositoryOpenOutput;
-
-impl RepositoryOpenInput {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_byte(16);
-        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
-        let string_bytes: &[u8] = self.name.as_bytes();
-        for &b in string_bytes.iter() {
-            encoder.write_byte(b);
-        }
-        Ok(())
-    }
-}
-
-impl RepositoryOpenOutput {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let message_type = decoder.read_byte()?;
-        if message_type != 16u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 16, got {}",
-                message_type
-            )));
-        }
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let bytes = decoder.read_bytes_vec(length)?;
-        let name = std::string::String::from_utf8(bytes)
-            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
-        Ok(Self { message_type, name })
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        RepositoryOpenInput::from(self.clone()).encode()
-    }
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        RepositoryOpenInput::from(self.clone()).encode_into(encoder)
-    }
-}
-
-impl From<RepositoryOpenOutput> for RepositoryOpenInput {
-    fn from(o: RepositoryOpenOutput) -> Self {
-        Self { name: o.name }
-    }
-}
-
-impl From<RepositoryOpenInput> for RepositoryOpenOutput {
-    fn from(i: RepositoryOpenInput) -> Self {
-        Self {
-            message_type: 16u8,
-            name: i.name,
         }
     }
 }

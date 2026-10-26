@@ -1,11 +1,12 @@
 //! Who may connect, and what they may do with each repository.
 //!
 //! The server asks an [`AccessProvider`] twice: once per session to turn the
-//! `ClientHello` bearer token into a [`Principal`], and before every repository
+//! WebSocket upgrade request into a [`Principal`], and before every repository
 //! operation to learn that principal's [`Access`] to the repository. Embedders
-//! (for example Gothab) plug in their own provider; the standalone server uses
-//! [`OpenLoopbackAccess`] when it has no auth configuration and
-//! [`TokenFileAccess`] when it does.
+//! (for example Gothab) plug in their own provider, which can trust whatever its front
+//! door put on the request; the standalone server uses [`OpenLoopbackAccess`] when it
+//! has no auth configuration and [`TokenFileAccess`], reading the `Authorization:
+//! Bearer` header, when it does.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -13,9 +14,12 @@ use std::fmt;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
-/// Largest bearer token the server will look at. The wire field allows 64 KiB;
-/// the protocol design caps tokens at 8 KiB.
+/// The WebSocket upgrade request a session began with, without a body.
+pub type UpgradeRequest = tokio_tungstenite::tungstenite::handshake::server::Request;
+
+/// Largest bearer token the server will look at, as the protocol design caps tokens.
 pub const MAX_AUTH_TOKEN_BYTES: usize = 8 * 1024;
 
 /// The repository name that matches every repository in a token file.
@@ -66,8 +70,12 @@ impl std::error::Error for AccessError {}
 /// Authentication and per-repository authorization for the native protocol.
 #[async_trait]
 pub trait AccessProvider: Send + Sync {
-    /// Check a `ClientHello` bearer token. `Ok(None)` rejects the session.
-    async fn authenticate(&self, token: &[u8]) -> Result<Option<Principal>, AccessError>;
+    /// Who sent the upgrade `request` (its headers, for example
+    /// [`bearer_token`]). `Ok(None)` rejects the session.
+    async fn authenticate(
+        &self,
+        request: &UpgradeRequest,
+    ) -> Result<Option<Principal>, AccessError>;
 
     /// The highest access `principal` has to `repository`, or `None` for none.
     /// Asked before every operation, so revocation takes effect mid-session.
@@ -91,7 +99,10 @@ pub struct OpenLoopbackAccess;
 
 #[async_trait]
 impl AccessProvider for OpenLoopbackAccess {
-    async fn authenticate(&self, _token: &[u8]) -> Result<Option<Principal>, AccessError> {
+    async fn authenticate(
+        &self,
+        _request: &UpgradeRequest,
+    ) -> Result<Option<Principal>, AccessError> {
         Ok(Some(Principal {
             name: "anonymous".to_owned(),
         }))
@@ -237,6 +248,15 @@ impl TokenFileAccess {
     }
 }
 
+/// The token of `request`'s `Authorization: Bearer` header, if it has one.
+pub fn bearer_token(request: &UpgradeRequest) -> Option<&[u8]> {
+    let value = request.headers().get(AUTHORIZATION)?.as_bytes();
+    let (scheme, token) = value.split_at(value.iter().position(|&byte| byte == b' ')?);
+    scheme
+        .eq_ignore_ascii_case(b"bearer")
+        .then(|| token.trim_ascii_start())
+}
+
 /// The hex BLAKE3 hash of a token, as written in `token_hashes`.
 pub fn token_hash_hex(token: &[u8]) -> String {
     blake3::hash(token).to_hex().to_string()
@@ -244,7 +264,13 @@ pub fn token_hash_hex(token: &[u8]) -> String {
 
 #[async_trait]
 impl AccessProvider for TokenFileAccess {
-    async fn authenticate(&self, token: &[u8]) -> Result<Option<Principal>, AccessError> {
+    async fn authenticate(
+        &self,
+        request: &UpgradeRequest,
+    ) -> Result<Option<Principal>, AccessError> {
+        let Some(token) = bearer_token(request) else {
+            return Ok(None);
+        };
         if token.is_empty() || token.len() > MAX_AUTH_TOKEN_BYTES {
             return Ok(None);
         }
@@ -290,6 +316,34 @@ mod tests {
         }
     }
 
+    /// An upgrade request carrying `authorization`, if any.
+    fn upgrade(authorization: Option<&[u8]>) -> UpgradeRequest {
+        let mut request = UpgradeRequest::new(());
+        if let Some(value) = authorization {
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        request
+    }
+
+    fn bearer(token: &[u8]) -> UpgradeRequest {
+        upgrade(Some(&[b"Bearer ", token].concat()))
+    }
+
+    #[test]
+    fn the_bearer_token_is_read_from_the_authorization_header() {
+        assert_eq!(bearer_token(&bearer(b"t0k3n")), Some(&b"t0k3n"[..]));
+        assert_eq!(
+            bearer_token(&upgrade(Some(b"bearer  spaced"))),
+            Some(&b"spaced"[..])
+        );
+        assert_eq!(bearer_token(&upgrade(Some(b"Basic dXNlcg=="))), None);
+        assert_eq!(bearer_token(&upgrade(Some(b"Bearer"))), None);
+        assert_eq!(bearer_token(&upgrade(None)), None);
+    }
+
     #[tokio::test]
     async fn tokens_map_to_their_principal() {
         let access = TokenFileAccess::new(&AuthConfig {
@@ -301,15 +355,16 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            access.authenticate(b"alice-2").await.unwrap(),
+            access.authenticate(&bearer(b"alice-2")).await.unwrap(),
             Some(named("alice"))
         );
         assert_eq!(
-            access.authenticate(b"bob-1").await.unwrap(),
+            access.authenticate(&bearer(b"bob-1")).await.unwrap(),
             Some(named("bob"))
         );
-        assert_eq!(access.authenticate(b"carol").await.unwrap(), None);
-        assert_eq!(access.authenticate(b"").await.unwrap(), None);
+        assert_eq!(access.authenticate(&bearer(b"carol")).await.unwrap(), None);
+        assert_eq!(access.authenticate(&bearer(b"")).await.unwrap(), None);
+        assert_eq!(access.authenticate(&upgrade(None)).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -324,7 +379,7 @@ mod tests {
             }],
         })
         .unwrap();
-        assert_eq!(access.authenticate(&big).await.unwrap(), None);
+        assert_eq!(access.authenticate(&bearer(&big)).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -417,7 +472,7 @@ mod tests {
     async fn open_access_lets_anyone_do_anything() {
         let open = OpenLoopbackAccess;
         assert!(open.is_open());
-        let who = open.authenticate(b"").await.unwrap().unwrap();
+        let who = open.authenticate(&upgrade(None)).await.unwrap().unwrap();
         assert_eq!(
             open.access(&who, "any/repo").await.unwrap(),
             Some(Access::Force)

@@ -23,6 +23,7 @@
 
 mod capabilities;
 mod content_batch;
+mod repository_path;
 mod transfer_receiver;
 
 pub use capabilities::{
@@ -30,6 +31,7 @@ pub use capabilities::{
     accept_capabilities, select_capabilities,
 };
 pub use content_batch::{ContentBatcher, content_chunks};
+pub use repository_path::{RepositoryPathError, repository_name, repository_path};
 pub use transfer_receiver::{TransferError, TransferReceiver};
 pub use wheat_protocol_generated::generated::*;
 pub use wheat_protocol_generated::{BitOrder, BitStreamDecoder, BitStreamEncoder};

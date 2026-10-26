@@ -131,8 +131,8 @@ async fn serve_history(changes: usize) -> Served {
 
 impl Served {
     async fn session(&self) -> Ws {
-        let mut ws = connect_and_handshake(self.addr).await;
-        let (_, head) = open_repo(&mut ws, REPO).await;
+        let mut ws = connect_and_handshake(self.addr, REPO).await;
+        let (_, head) = open_repo(&mut ws).await;
         assert_eq!(head, self.head);
         ws
     }

@@ -249,8 +249,8 @@ impl Publishing {
 
     /// Opens a session and asks the server to publish `proposed` on its base head.
     async fn request(&self, proposed: RepositoryEnvelopeId) -> Ws {
-        let mut ws = connect_and_handshake(self.addr).await;
-        assert_eq!(open_repo(&mut ws, REPO).await, self.base);
+        let mut ws = connect_and_handshake(self.addr, REPO).await;
+        assert_eq!(open_repo(&mut ws).await, self.base);
         request_publish(&mut ws, OP, proposed, self.base, false).await;
         ws
     }
@@ -258,8 +258,8 @@ impl Publishing {
     /// Like [`Self::request`], but leaves the push and its `PublishPushEnd` to the
     /// caller.
     async fn request_pushing(&self, proposed: RepositoryEnvelopeId) -> Ws {
-        let mut ws = connect_and_handshake(self.addr).await;
-        assert_eq!(open_repo(&mut ws, REPO).await, self.base);
+        let mut ws = connect_and_handshake(self.addr, REPO).await;
+        assert_eq!(open_repo(&mut ws).await, self.base);
         request_publish_pushing(&mut ws, OP, proposed, self.base, false).await;
         ws
     }
@@ -297,8 +297,8 @@ impl Publishing {
 
     /// The server's head is where it was before the publish.
     async fn assert_head_unchanged(&self) {
-        let mut ws = connect_and_handshake(self.addr).await;
-        assert_eq!(open_repo(&mut ws, REPO).await, self.base, "head moved");
+        let mut ws = connect_and_handshake(self.addr, REPO).await;
+        assert_eq!(open_repo(&mut ws).await, self.base, "head moved");
     }
 
     /// The server holds every object and blob of `envelope`.

@@ -11,7 +11,9 @@ use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{ContentStore, LocalPublicationStore, PackedObjectStore, RepositoryPublisher};
 
-use support::{connect_and_handshake, edit, fetch_complete, fetch_request, recv_msg, send_msg};
+use support::{
+    connect_and_handshake, edit, fetch_complete, fetch_request, open_repo, recv_msg, send_msg,
+};
 
 fn stores(root: &std::path::Path) -> (PackedObjectStore, ContentStore, LocalPublicationStore) {
     let objects = PackedObjectStore::open(root.join("storage")).unwrap();
@@ -75,18 +77,9 @@ async fn session_setup_and_repo_open() {
     let _repo = setup_repo(dir.path()).await;
 
     let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
-    let mut ws = connect_and_handshake(addr).await;
+    let mut ws = connect_and_handshake(addr, "test/repo").await;
 
-    // Open repository.
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: "test/repo".to_string(),
-        }),
-    )
-    .await;
-
+    // The path named the repository; its state follows the session.
     let state = recv_msg(&mut ws).await;
     match state {
         WheatProtocolMessage::RepositoryState(rs) => {
@@ -107,30 +100,13 @@ async fn fetch_objects() {
     let _repo = setup_repo(dir.path()).await;
 
     let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
-    let mut ws = connect_and_handshake(addr).await;
-
-    // Open.
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: "test/repo".to_string(),
-        }),
-    )
-    .await;
-    let state = recv_msg(&mut ws).await;
-    let head_envelope = match &state {
-        WheatProtocolMessage::RepositoryState(rs) => rs.head_envelope.clone(),
-        other => panic!("expected RepositoryState, got {other:?}"),
-    };
+    let mut ws = connect_and_handshake(addr, "test/repo").await;
+    let (_, head) = open_repo(&mut ws).await;
+    let head_envelope = support::digest(head.as_bytes());
 
     // Fetch with no `since`: the server pushes the whole closure, then says how
     // much it pushed.
-    send_msg(
-        &mut ws,
-        &fetch_request(1, support::envelope_id(&head_envelope), None),
-    )
-    .await;
+    send_msg(&mut ws, &fetch_request(1, head, None)).await;
     let mut all_objects = Vec::new();
     loop {
         match recv_msg(&mut ws).await {
@@ -175,17 +151,8 @@ async fn repo_not_found() {
     let _repo = setup_repo(dir.path()).await;
 
     let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
-    let mut ws = connect_and_handshake(addr).await;
-
-    // Try to open a non-existent repository.
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: "nonexistent/repo".to_string(),
-        }),
-    )
-    .await;
+    // A path naming a repository the server does not have.
+    let mut ws = connect_and_handshake(addr, "nonexistent/repo").await;
 
     let error = recv_msg(&mut ws).await;
     match error {
@@ -200,6 +167,27 @@ async fn repo_not_found() {
     let _ = shutdown.send(());
 }
 
+/// A path that names no repository, or names one ambiguously, is refused on the
+/// upgrade request, before any Wheat message.
+#[tokio::test]
+async fn an_invalid_repository_path_is_refused_on_the_upgrade() {
+    use tokio_tungstenite::tungstenite::{Error, http::StatusCode};
+
+    let dir = tempfile::tempdir().unwrap();
+    let _repo = setup_repo(dir.path()).await;
+    let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
+    for path in ["", "/test//repo", "/test%2Frepo", "/test/../repo"] {
+        match tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await {
+            Err(Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}")
+            }
+            Err(other) => panic!("{path}: expected an HTTP refusal, got {other}"),
+            Ok(_) => panic!("{path}: the upgrade was accepted"),
+        }
+    }
+    let _ = shutdown.send(());
+}
+
 /// The server offers the capabilities it supports, and refuses a session that asks
 /// for one it did not offer.
 #[tokio::test]
@@ -207,7 +195,7 @@ async fn a_capability_the_server_did_not_offer_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let _repo = setup_repo(dir.path()).await;
     let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/test/repo"))
         .await
         .unwrap();
     match recv_msg(&mut ws).await {
@@ -221,7 +209,6 @@ async fn a_capability_the_server_did_not_offer_is_refused() {
         &WheatProtocolMessage::ClientHello(ClientHelloOutput {
             message_type: 0x02,
             selected_version: 1,
-            auth_token: vec![],
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
             capabilities: vec!["not-offered".to_owned()],
@@ -246,7 +233,7 @@ async fn a_message_over_the_limit_is_refused_before_it_ends() {
     let dir = tempfile::tempdir().unwrap();
     let _repo = setup_repo(dir.path()).await;
     let (addr, shutdown) = start_server(dir.path(), "test/repo").await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/test/repo"))
         .await
         .unwrap();
     assert!(matches!(

@@ -130,7 +130,8 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     clone.record(&mut recorder, "clone");
 
     // Opening the session takes two round trips (the WebSocket upgrade, then
-    // `ClientHello` with `RepositoryOpen`) and closing it one. The publish pushes its
+    // `ClientHello`, answered with the session and the repository's state) and
+    // closing it one. The publish pushes its
     // difference with the request, so the walk needs no rounds: one trip carries the
     // push, one the commit. A blob over the push threshold adds its content round.
     recorder.at_most("small.publish.round_trips", 5.0, "count");

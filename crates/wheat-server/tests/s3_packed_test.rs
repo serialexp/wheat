@@ -306,8 +306,8 @@ async fn publish_clone_through_s3() {
     );
 
     // --- Step 2: Initialize genesis on the S3-backed server ---
-    // We need a valid genesis state on S3 for the server to read at
-    // RepositoryOpen. We do this by creating an empty repo directly
+    // We need a valid genesis state on S3 for the server to read when a
+    // session opens. We do this by creating an empty repo directly
     // on the RemotePackedStore.
     let s3_dir = tempfile::tempdir().unwrap();
     let s3_head_dir = s3_dir.path().join("server");
@@ -337,8 +337,8 @@ async fn publish_clone_through_s3() {
     let (addr, shutdown) = start_s3_server(&config, &s3_head_dir, "bench/repo").await;
     eprintln!("S3-backed server listening on {addr}");
 
-    let mut ws = connect_and_handshake(addr).await;
-    let (server_gen, server_env) = open_repo(&mut ws, "bench/repo").await;
+    let mut ws = connect_and_handshake(addr, "bench/repo").await;
+    let (server_gen, server_env) = open_repo(&mut ws).await;
     eprintln!("server state: generation={server_gen}");
 
     // Publish local repo to S3 server.
@@ -394,8 +394,8 @@ async fn publish_clone_through_s3() {
     std::fs::create_dir(&clone_path).unwrap();
     let (clone_objects, clone_content, clone_heads) = local_stores(&clone_path);
 
-    let mut ws = connect_and_handshake(addr).await;
-    let (clone_gen, env_id) = open_repo(&mut ws, "bench/repo").await;
+    let mut ws = connect_and_handshake(addr, "bench/repo").await;
+    let (clone_gen, env_id) = open_repo(&mut ws).await;
     assert_eq!(
         clone_gen, published_generation,
         "server should be at published generation"
@@ -502,8 +502,8 @@ async fn publish_clone_s3_benchmark() {
     // --- Publish ---
     let publish_start = std::time::Instant::now();
 
-    let mut ws = connect_and_handshake(addr).await;
-    let (server_gen, server_env) = open_repo(&mut ws, "bench/repo").await;
+    let mut ws = connect_and_handshake(addr, "bench/repo").await;
+    let (server_gen, server_env) = open_repo(&mut ws).await;
 
     request_publish(
         &mut ws,
@@ -565,8 +565,8 @@ async fn publish_clone_s3_benchmark() {
 
     let clone_start = std::time::Instant::now();
 
-    let mut ws = connect_and_handshake(addr).await;
-    let (clone_gen, env_id) = open_repo(&mut ws, "bench/repo").await;
+    let mut ws = connect_and_handshake(addr, "bench/repo").await;
+    let (clone_gen, env_id) = open_repo(&mut ws).await;
     assert_eq!(clone_gen, published_gen);
 
     let fetched = fetch_objects(&mut ws, 2, &clone_objects, env_id, None).await;

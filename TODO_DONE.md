@@ -65,6 +65,18 @@ Finished items, moved here from `TODO.md` under the same headings.
   `RepositoryHeadRecord` is the local backend's own encoding (Bart: backends get their
   own representation); `LocalPublicationStore` implements the trait. Tested with an
   in-memory table backend in `group_commit_test.rs`.
+- `[x]` **(format) The repository is named only inside the protocol (2026-10-27).**
+  The WebSocket path names the repository (`ws://host/owner/repo`, the wheat URL's
+  path; `wheat_protocol::{repository_path, repository_name}` shared by client and
+  server), and `RepositoryOpen` is gone: the server sends `RepositoryState` once the
+  session is established, and refuses an ambiguous path with HTTP 400 on the upgrade.
+  The token moved from `ClientHello.auth_token` to the upgrade request's
+  `Authorization: Bearer` header, and `AccessProvider::authenticate` gets the whole
+  upgrade request, so Gothab's front door routes by path, checks the header, and
+  names the caller in a header of its own that its provider trusts (Bart's choices:
+  path `/{owner/repo}`, no name in the protocol, header only, provider sees the
+  request). Tests: `protocol_test.rs`, `access_test.rs`
+  (`a_provider_can_trust_its_front_door_for_who_is_calling`).
 
 ## Desktop client (2026-10-22)
 

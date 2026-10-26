@@ -115,8 +115,8 @@ async fn clone_round_trip() {
 
     let (clone_objects, clone_content, clone_heads) = stores(&clone_path);
 
-    let mut ws = connect_and_handshake(addr).await;
-    let (generation, env_id) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(addr, "test/repo").await;
+    let (generation, env_id) = open_repo(&mut ws).await;
 
     // A clone gets everything in the push and has nothing left to ask for.
     let fetched = fetch_objects(&mut ws, 1, &clone_objects, env_id, None).await;
@@ -192,8 +192,8 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
     std::fs::create_dir(&clone_path).unwrap();
     let (clone_objects, clone_content, clone_heads) = stores(&clone_path);
 
-    let mut ws = connect_and_handshake(addr).await;
-    let (generation, env_id) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(addr, "test/repo").await;
+    let (generation, env_id) = open_repo(&mut ws).await;
 
     fetch_objects(&mut ws, 1, &clone_objects, env_id, None).await;
     fetch_content(&mut ws, 2, &clone_objects, &clone_content, env_id).await;
@@ -281,8 +281,8 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
 
     // Now publish to the server.
     ws.close(None).await.ok();
-    let mut ws = connect_and_handshake(addr).await;
-    let (server_gen, server_env) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(addr, "test/repo").await;
+    let (server_gen, server_env) = open_repo(&mut ws).await;
     assert_eq!(
         server_gen, generation,
         "server should be at original generation"
@@ -419,8 +419,8 @@ async fn assert_upload_refused(phase: &mut ContentPhase, reason: &str) {
     );
     assert_eq!(pr.new_generation, phase.generation);
 
-    let mut ws = connect_and_handshake(phase.addr).await;
-    let (server_gen, _) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(phase.addr, "test/repo").await;
+    let (server_gen, _) = open_repo(&mut ws).await;
     assert_eq!(server_gen, phase.generation, "head must not move");
     ws.close(None).await.ok();
 }
@@ -445,8 +445,8 @@ async fn publish_round_trip() {
 
     // Verify: reconnect and check the server's head advanced.
     phase.ws.close(None).await.ok();
-    let mut ws = connect_and_handshake(phase.addr).await;
-    let (new_server_gen, _new_server_env) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(phase.addr, "test/repo").await;
+    let (new_server_gen, _new_server_env) = open_repo(&mut ws).await;
     assert!(
         new_server_gen > generation,
         "server generation should have advanced from {generation} to {new_server_gen}"
@@ -476,8 +476,8 @@ async fn publish_reassembles_chunked_content() {
     // A fresh clone gets the reassembled bytes back.
     let clone_dir = tempfile::tempdir().unwrap();
     let (clone_objects, clone_content, _) = stores(clone_dir.path());
-    let mut ws = connect_and_handshake(phase.addr).await;
-    let (_, env_id) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(phase.addr, "test/repo").await;
+    let (_, env_id) = open_repo(&mut ws).await;
     fetch_objects(&mut ws, 1, &clone_objects, env_id, None).await;
     fetch_content(&mut ws, 2, &clone_objects, &clone_content, env_id).await;
     assert_eq!(
@@ -558,8 +558,8 @@ async fn fetch_after_server_advance() {
     std::fs::create_dir(&clone_path).unwrap();
     let (clone_objects, clone_content, clone_heads) = stores(&clone_path);
 
-    let mut ws = connect_and_handshake(addr).await;
-    let (gen1, env1_id) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(addr, "test/repo").await;
+    let (gen1, env1_id) = open_repo(&mut ws).await;
     fetch_objects(&mut ws, 1, &clone_objects, env1_id, None).await;
     fetch_content(&mut ws, 2, &clone_objects, &clone_content, env1_id).await;
     let head1 = RepositoryHead {
@@ -633,8 +633,8 @@ async fn fetch_after_server_advance() {
     }
 
     // Now fetch the update.
-    let mut ws = connect_and_handshake(addr).await;
-    let (gen2, env2_id) = open_repo(&mut ws, "test/repo").await;
+    let mut ws = connect_and_handshake(addr, "test/repo").await;
+    let (gen2, env2_id) = open_repo(&mut ws).await;
     assert!(gen2 > gen1, "server should have advanced");
 
     // Only what the first fetch lacks comes over, and nothing is left to ask for.

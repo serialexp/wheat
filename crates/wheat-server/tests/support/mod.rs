@@ -76,9 +76,12 @@ pub async fn recv_msg(ws: &mut Ws) -> WheatProtocolMessage {
     }
 }
 
-/// Connects without a token and waits for the session to be set up.
-pub async fn connect_and_handshake(addr: SocketAddr) -> Ws {
-    let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+/// Connects to the repository `name` without a token and waits for the session to be
+/// set up.
+pub async fn connect_and_handshake(addr: SocketAddr, name: &str) -> Ws {
+    let (mut ws, _) = connect_async(format!("ws://{addr}{}", repository_path(name)))
+        .await
+        .unwrap();
 
     let server_hello = recv_msg(&mut ws).await;
     assert!(
@@ -90,7 +93,6 @@ pub async fn connect_and_handshake(addr: SocketAddr) -> Ws {
         &WheatProtocolMessage::ClientHello(ClientHelloOutput {
             message_type: 0x02,
             selected_version: 1,
-            auth_token: vec![],
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
             capabilities: vec![],
@@ -107,16 +109,9 @@ pub async fn connect_and_handshake(addr: SocketAddr) -> Ws {
     ws
 }
 
-/// Opens `name`. Returns the server's head generation and envelope.
-pub async fn open_repo(ws: &mut Ws, name: &str) -> (u64, RepositoryEnvelopeId) {
-    send_msg(
-        ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: name.to_string(),
-        }),
-    )
-    .await;
+/// The state of the repository the session is for, which the server sends once the
+/// session is set up. Returns the server's head generation and envelope.
+pub async fn open_repo(ws: &mut Ws) -> (u64, RepositoryEnvelopeId) {
     match recv_msg(ws).await {
         WheatProtocolMessage::RepositoryState(rs) => {
             (rs.head_generation, envelope_id(&rs.head_envelope))

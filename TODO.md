@@ -17,15 +17,6 @@ memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
 listing the bucket, opening a packed store costing O(store), the remote catalog head
 being JSON, and `wheat gc` / server-authoritative remote maintenance.
 
-- `[ ]` **(format) The repository is named only inside the protocol.** The client
-  connects to `{scheme}://{authority}` with no path (`ws_url`,
-  `crates/wheat-client/src/remote.rs`) and names the repository in `RepositoryOpen`
-  after the handshake. A front door that routes each repository to its host must then
-  terminate the WebSocket and parse `ClientHello` and `RepositoryOpen` before it knows
-  where to forward. Options: put the repository in the URL path as well (the
-  `/wheat/ws` mount in `wheat-native-protocol.md` assumes a path); or keep it in the
-  protocol and have embedders proxy at message level. Decide whether `RepositoryOpen`
-  stays the authority once the path names the repository too.
 - `[ ]` **(format) `RepositoryState` stops at 10,000 labels.** Repository open sends at
   most 10,000 labels with a `truncated` flag (`connection.rs`), and `ListLabels`,
   which would page the rest, is in the schema but not served. Gothab repositories can

@@ -32,8 +32,8 @@
         { type: "ClientHello",           when: "value == 0x02" },
         { type: "SessionEstablished",    when: "value == 0x03" },
 
-        // Repository (0x10–0x13)
-        { type: "RepositoryOpen",        when: "value == 0x10" },
+        // Repository (0x11–0x13). The WebSocket path names the repository, and the
+        // server sends its RepositoryState once the session is established.
         { type: "RepositoryState",       when: "value == 0x11" },
         { type: "ListLabels",            when: "value == 0x12" },
         { type: "ListLabelsResult",      when: "value == 0x13" },
@@ -145,7 +145,8 @@
       sequence: [
         { name: "message_type", type: "uint8", const: 0x02 },
         { name: "selected_version", type: "uint16" },
-        { name: "auth_token", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
+        // The client authenticates on the WebSocket upgrade request (an
+        // `Authorization: Bearer` header), not here.
         { name: "receive_window_bytes", type: "uint32" },
         { name: "receive_window_messages", type: "uint16" },
         // The capabilities from ServerHello this session uses; the server refuses
@@ -190,13 +191,6 @@
     // ─────────────────────────────────────────────────────────────────────
     // Repository messages
     // ─────────────────────────────────────────────────────────────────────
-
-    RepositoryOpen: {
-      sequence: [
-        { name: "message_type", type: "uint8", const: 0x10 },
-        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
-      ],
-    },
 
     RepositoryState: {
       sequence: [

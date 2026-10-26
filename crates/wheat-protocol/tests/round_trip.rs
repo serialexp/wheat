@@ -5,9 +5,8 @@ use wheat_protocol::{
     ErrorScopeConnectionOutput, FetchCompleteOutput, FetchPushEndOutput, FetchRequestOutput,
     ObjectBatchOutput, ObjectChunkOutput, ObjectEntry, ObjectWantOutput, ObjectWantReplyOutput,
     PublishPushEndOutput, PublishRequestOutput, PublishResultOutput, PublishResultStatus,
-    PublishStatusOkOutput, RepositoryOpenOutput, ServerHelloOutput, SessionEstablishedOutput,
-    SessionEstablishedStatus, SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message,
-    encode_message,
+    PublishStatusOkOutput, ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus,
+    SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message, encode_message,
 };
 
 fn zero_digest() -> Digest256 {
@@ -41,7 +40,6 @@ fn client_hello_round_trip() {
     let msg = WheatProtocolMessage::ClientHello(ClientHelloOutput {
         message_type: 0x02,
         selected_version: 1,
-        auth_token: b"token".to_vec(),
         receive_window_bytes: 16 * 1024 * 1024,
         receive_window_messages: 256,
         capabilities: vec!["resume".to_string(), "lazy-content".to_string()],
@@ -214,16 +212,6 @@ fn session_established_round_trip() {
 #[test]
 fn decode_empty_is_error() {
     assert!(decode_message(&[]).is_err());
-}
-
-#[test]
-fn repository_open_round_trip() {
-    let msg = WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-        message_type: 0x10,
-        name: "aeolun/wheat-test".to_string(),
-    });
-    let decoded = round_trip(msg.clone());
-    assert_eq!(msg, decoded);
 }
 
 #[test]

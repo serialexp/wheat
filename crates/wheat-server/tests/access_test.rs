@@ -11,6 +11,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use wheat_core::{
@@ -19,7 +20,8 @@ use wheat_core::{
 };
 use wheat_protocol::*;
 use wheat_server::access::{
-    Access, AccessError, AccessProvider, AuthConfig, Principal, PrincipalConfig, token_hash_hex,
+    Access, AccessError, AccessProvider, AuthConfig, Principal, PrincipalConfig, UpgradeRequest,
+    token_hash_hex,
 };
 use wheat_server::config::FileConfig;
 use wheat_server::registry::Registry;
@@ -131,9 +133,46 @@ async fn recv_msg(ws: &mut Ws) -> WheatProtocolMessage {
     }
 }
 
-/// Connect, send `token`, and return the socket with the SessionEstablished reply.
+/// The upgrade request for the repository `repo`, with `headers` on it.
+fn upgrade(addr: SocketAddr, repo: &str, headers: &[(&str, &[u8])]) -> UpgradeRequest {
+    let mut request = format!("ws://{addr}{}", repository_path(repo))
+        .into_client_request()
+        .unwrap();
+    for &(name, value) in headers {
+        request.headers_mut().insert(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_bytes(value).unwrap(),
+        );
+    }
+    request
+}
+
+/// The `Authorization` header carrying `token`, or none for an empty one.
+fn bearer(token: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    if token.is_empty() {
+        return Vec::new();
+    }
+    vec![("authorization", [b"Bearer ", token].concat())]
+}
+
+/// Connect to `REPO` with `token`, and return the socket with the SessionEstablished
+/// reply.
 async fn hello(addr: SocketAddr, token: &[u8]) -> (Ws, SessionEstablishedOutput) {
-    let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+    hello_to(addr, token, REPO).await
+}
+
+async fn hello_to(addr: SocketAddr, token: &[u8], repo: &str) -> (Ws, SessionEstablishedOutput) {
+    let headers = bearer(token);
+    let headers: Vec<_> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_slice()))
+        .collect();
+    hello_with(upgrade(addr, repo, &headers)).await
+}
+
+/// Connect with `request`, and return the socket with the SessionEstablished reply.
+async fn hello_with(request: UpgradeRequest) -> (Ws, SessionEstablishedOutput) {
+    let (mut ws, _) = connect_async(request).await.unwrap();
     assert!(matches!(
         recv_msg(&mut ws).await,
         WheatProtocolMessage::ServerHello(_)
@@ -143,7 +182,6 @@ async fn hello(addr: SocketAddr, token: &[u8]) -> (Ws, SessionEstablishedOutput)
         &WheatProtocolMessage::ClientHello(ClientHelloOutput {
             message_type: 0x02,
             selected_version: 1,
-            auth_token: token.to_vec(),
             receive_window_bytes: 16 * 1024 * 1024,
             receive_window_messages: 256,
             capabilities: vec![],
@@ -156,22 +194,15 @@ async fn hello(addr: SocketAddr, token: &[u8]) -> (Ws, SessionEstablishedOutput)
     }
 }
 
-/// Log in with `token` and open `repo`. Returns the socket and the reply.
+/// Log in with `token` to `repo`. Returns the socket and what the server sent after
+/// the session: the repository's state, or an error.
 async fn open(addr: SocketAddr, token: &[u8], repo: &str) -> (Ws, WheatProtocolMessage) {
-    let (mut ws, se) = hello(addr, token).await;
+    let (mut ws, se) = hello_to(addr, token, repo).await;
     assert!(
         matches!(se.status, SessionEstablishedStatus::SessionStatusOk(_)),
         "login failed: {}",
         se.message
     );
-    send_msg(
-        &mut ws,
-        &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-            message_type: 0x10,
-            name: repo.to_owned(),
-        }),
-    )
-    .await;
     let reply = recv_msg(&mut ws).await;
     (ws, reply)
 }
@@ -264,23 +295,25 @@ async fn unknown_empty_and_oversized_tokens_are_refused() {
     }
 }
 
-/// A client sends `RepositoryOpen` with its `ClientHello`, without waiting for the
-/// session. When the token is refused, that request is still unread: the server
+/// A client may send a request right behind its `ClientHello`, without waiting for
+/// the session. When the token is refused, that request is still unread: the server
 /// must close the connection with a closing handshake, not reset it, or the client
 /// can lose the refusal.
 #[tokio::test]
 async fn a_refused_session_ends_cleanly_with_a_request_behind_it() {
     let server = start(token_file()).await;
     for _ in 0..20 {
-        let (mut ws, _) = connect_async(format!("ws://{}", server.addr))
-            .await
-            .unwrap();
+        let request = upgrade(
+            server.addr,
+            REPO,
+            &[("authorization", b"Bearer not-a-token")],
+        );
+        let (mut ws, _) = connect_async(request).await.unwrap();
         send_msg(
             &mut ws,
             &WheatProtocolMessage::ClientHello(ClientHelloOutput {
                 message_type: 0x02,
                 selected_version: 1,
-                auth_token: b"not-a-token".to_vec(),
                 receive_window_bytes: 16 * 1024 * 1024,
                 receive_window_messages: 256,
                 capabilities: vec![],
@@ -289,9 +322,11 @@ async fn a_refused_session_ends_cleanly_with_a_request_behind_it() {
         .await;
         send_msg(
             &mut ws,
-            &WheatProtocolMessage::RepositoryOpen(RepositoryOpenOutput {
-                message_type: 0x10,
-                name: REPO.to_owned(),
+            &WheatProtocolMessage::FetchRequest(FetchRequestOutput {
+                message_type: 0x20,
+                op_id: 1,
+                want_envelope: Digest256 { bytes: vec![0; 32] },
+                since_envelope: Digest256 { bytes: vec![0; 32] },
             }),
         )
         .await;
@@ -500,7 +535,9 @@ async fn force_access_can_force() {
 }
 
 async fn upgrade_with_origin(addr: SocketAddr, origin: Option<&str>) -> Result<(), String> {
-    let mut request = format!("ws://{addr}").into_client_request().unwrap();
+    let mut request = format!("ws://{addr}{}", repository_path(REPO))
+        .into_client_request()
+        .unwrap();
     if let Some(origin) = origin {
         request
             .headers_mut()
@@ -557,6 +594,67 @@ async fn the_open_server_refuses_non_loopback_addresses() {
     );
 }
 
+/// A provider behind a front door that has authenticated the caller already and names
+/// them in a header of its own, as Gothab does: the server only reads the header.
+struct FrontDoor;
+
+const FRONT_DOOR_USER: &str = "x-front-door-user";
+
+#[async_trait]
+impl AccessProvider for FrontDoor {
+    async fn authenticate(
+        &self,
+        request: &UpgradeRequest,
+    ) -> Result<Option<Principal>, AccessError> {
+        Ok(request
+            .headers()
+            .get(FRONT_DOOR_USER)
+            .and_then(|user| user.to_str().ok())
+            .map(|user| Principal {
+                name: user.to_owned(),
+            }))
+    }
+
+    async fn access(
+        &self,
+        principal: &Principal,
+        repository: &str,
+    ) -> Result<Option<Access>, AccessError> {
+        Ok((principal.name == "alice" && repository == REPO).then_some(Access::Read))
+    }
+}
+
+#[tokio::test]
+async fn a_provider_can_trust_its_front_door_for_who_is_calling() {
+    let server = start(ServerConfig::with_access(Arc::new(FrontDoor), vec![])).await;
+
+    let (mut ws, se) = hello_with(upgrade(server.addr, REPO, &[(FRONT_DOOR_USER, b"alice")])).await;
+    assert!(
+        matches!(se.status, SessionEstablishedStatus::SessionStatusOk(_)),
+        "{se:?}"
+    );
+    assert!(matches!(
+        recv_msg(&mut ws).await,
+        WheatProtocolMessage::RepositoryState(_)
+    ));
+
+    let (mut ws, se) = hello_with(upgrade(server.addr, REPO, &[(FRONT_DOOR_USER, b"bob")])).await;
+    assert!(matches!(
+        se.status,
+        SessionEstablishedStatus::SessionStatusOk(_)
+    ));
+    match recv_msg(&mut ws).await {
+        WheatProtocolMessage::Error(error) => assert_eq!(error.code, 404),
+        other => panic!("expected a 404 for bob, got {other:?}"),
+    }
+
+    let (_ws, se) = hello_with(upgrade(server.addr, REPO, &[])).await;
+    assert!(matches!(
+        se.status,
+        SessionEstablishedStatus::SessionStatusAuthFailed(_)
+    ));
+}
+
 /// A custom provider, as an embedder would plug in. Access can be revoked
 /// while a session is open, and authentication can fail outright.
 struct Revocable {
@@ -566,7 +664,10 @@ struct Revocable {
 
 #[async_trait]
 impl AccessProvider for Revocable {
-    async fn authenticate(&self, _token: &[u8]) -> Result<Option<Principal>, AccessError> {
+    async fn authenticate(
+        &self,
+        _request: &UpgradeRequest,
+    ) -> Result<Option<Principal>, AccessError> {
         if self.broken {
             return Err(AccessError("database is down".to_owned()));
         }
