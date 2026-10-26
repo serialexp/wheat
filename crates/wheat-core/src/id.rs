@@ -52,6 +52,20 @@ impl FromStr for ChangeId {
     }
 }
 
+/// What an object's canonical bytes are hashed after, and a file's content after. The
+/// two are prefix-free, so no file's content can have an object's ID, whatever bytes it
+/// holds.
+const OBJECT_DOMAIN: &[u8] = b"wheat-object\0";
+const CONTENT_DOMAIN: &[u8] = b"wheat-content\0";
+
+/// The BLAKE3 hash of `bytes` after `domain`.
+fn domain_hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
 macro_rules! digest_id {
     ($name:ident) => {
         #[derive(
@@ -62,7 +76,7 @@ macro_rules! digest_id {
         impl $name {
             #[must_use]
             pub fn of_canonical_bytes(bytes: &[u8]) -> Self {
-                Self(*blake3::hash(bytes).as_bytes())
+                Self(domain_hash(OBJECT_DOMAIN, bytes))
             }
 
             #[must_use]
@@ -218,7 +232,16 @@ impl ContentId {
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
         CONTENT_BYTES_HASHED.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        Self(*blake3::hash(bytes).as_bytes())
+        Self(domain_hash(CONTENT_DOMAIN, bytes))
+    }
+
+    /// A hasher that, fed a file's bytes, finishes with their content ID's digest: for
+    /// content read in pieces.
+    #[must_use]
+    pub fn hasher() -> blake3::Hasher {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CONTENT_DOMAIN);
+        hasher
     }
 
     #[must_use]
@@ -272,4 +295,30 @@ fn parse_digest(value: &str) -> Result<[u8; 32], ParseDigestIdError> {
         bytes[index] = u8::from_str_radix(encoded, 16).map_err(|_| ParseDigestIdError)?;
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_and_objects_of_the_same_bytes_have_different_ids() {
+        let bytes = b"the same bytes";
+        let content = ContentId::of(bytes);
+        let object = ObjectId::of_canonical_bytes(bytes);
+        assert_ne!(content.as_bytes(), object.as_bytes());
+        assert_ne!(content.as_bytes(), blake3::hash(bytes).as_bytes());
+        assert_ne!(object.as_bytes(), blake3::hash(bytes).as_bytes());
+    }
+
+    #[test]
+    fn the_content_hasher_matches_content_ids() {
+        let mut hasher = ContentId::hasher();
+        hasher.update(b"in ");
+        hasher.update(b"pieces");
+        assert_eq!(
+            hasher.finalize().as_bytes(),
+            ContentId::of(b"in pieces").as_bytes()
+        );
+    }
 }

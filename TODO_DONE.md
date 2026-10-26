@@ -47,6 +47,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   head), so a served repository diffs without a workspace. A wide directory's page
   still decodes the whole directory; chunked directories keep that cost (see
   `docs/design/wheat-wide-directories.md`).
+- `[x]` **(format) Object and content IDs are domain-separated (2026-10-27).** An
+  object's ID is BLAKE3 of `wheat-object\0` and its canonical bytes, a content ID
+  BLAKE3 of `wheat-content\0` and the content (`crates/wheat-core/src/id.rs`;
+  `ContentId::hasher` for content read in pieces), so no file's content can have an
+  object's ID, and a store holding both needs no kind column. Every ID changes:
+  repositories and Git import journals written before this need making again.
+  Sharing content with Gothab's Git blobs, keyed by Git OID, is not Wheat's concern
+  (Bart): if Gothab wants to deduplicate, its blob table gets a BLAKE3 representation
+  of Git content, and Wheat keeps its IDs.
 
 ## Desktop client (2026-10-22)
 

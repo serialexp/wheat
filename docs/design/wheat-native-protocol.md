@@ -284,9 +284,12 @@ providing these trait implementations against their own infrastructure.
 
 ### Object identity and transfer
 
-Wheat objects are content-addressed: `ObjectId = blake3(canonical_bytes)`.
-The canonical bytes are the binschema-encoded form defined in the existing
-wheat object schema.
+Wheat objects are content-addressed: `ObjectId = blake3("wheat-object\0" ||
+canonical_bytes)`. The canonical bytes are the binschema-encoded form defined in
+the existing wheat object schema. File content is addressed as `ContentId =
+blake3("wheat-content\0" || bytes)`. The two prefixes keep the ID spaces apart: no
+file's content has an object's ID, so a store or table holding both needs no
+separate kind column.
 
 #### Fetch: push the difference, then pull the gaps
 
@@ -364,7 +367,8 @@ local work and takes the remote envelope as it is.
   overflow it.
 - An object over 8 MiB goes as `ObjectChunk`s of at most 4 MiB. No object is
   over 1 GiB (`MAX_OBJECT_SIZE`).
-- The receiver validates `blake3(bytes) == id` on receipt for every object.
+- The receiver validates `ObjectId::of_canonical_bytes(bytes) == id` on receipt
+  for every object.
   A mismatch is a fatal protocol error: the fetch fails, or the publish is
   refused. Nobody silently retries or continues.
 
@@ -550,7 +554,7 @@ retained history (757s on a representative repo). Instead it validates only
 the *transition*:
 
 - Every new object (not already in the store) has valid canonical encoding
-  and `blake3(bytes) == id`.
+  and `ObjectId::of_canonical_bytes(bytes) == id`.
 - The proposed envelope references a valid state whose views, changes,
   revisions, and applications form a complete closure — all referenced
   ObjectIds exist in the store (pre-existing or newly uploaded).

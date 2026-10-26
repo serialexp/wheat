@@ -34,12 +34,6 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   needs the head, the receipts and the compare-and-advance behind one trait the
   server is given. Decide whether `RepositoryHeadRecord` stays a stored format every
   backend writes, or becomes the local backend's own encoding.
-- `[ ]` **(format) Object and content IDs are not domain-separated.** `ContentId` is
-  BLAKE3 of the file bytes and `ObjectId` BLAKE3 of canonical bytes, with no domain
-  separation (`crates/wheat-core/src/id.rs`). Decide whether to separate them before
-  the formats freeze. Sharing content with Gothab's Git blobs, keyed by Git OID, is
-  not Wheat's concern (Bart, 2026-10-27): if Gothab wants to deduplicate, its blob
-  table gets a BLAKE3 representation of Git content too, and Wheat keeps its IDs.
 - `[ ]` **(format) `RepositoryState` stops at 10,000 labels.** Repository open sends at
   most 10,000 labels with a `truncated` flag (`connection.rs`), and `ListLabels`,
   which would page the rest, is in the schema but not served. Gothab repositories can

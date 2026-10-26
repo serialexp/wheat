@@ -37,8 +37,8 @@ impl StreamingCapture {
     #[must_use]
     pub fn new(retain_limit: usize) -> Self {
         Self {
-            raw: blake3::Hasher::new(),
-            canonical: blake3::Hasher::new(),
+            raw: crate::ContentId::hasher(),
+            canonical: crate::ContentId::hasher(),
             raw_bytes: 0,
             canonical_bytes: 0,
             // Reserve once: growth during `update` would otherwise reallocate on
@@ -365,7 +365,7 @@ mod tests {
                             assert_eq!(result.kind, CaptureKind::Text);
                             assert_eq!(
                                 result.digest,
-                                *blake3::hash(expected.as_bytes()).as_bytes()
+                                *crate::ContentId::of(expected.as_bytes()).as_bytes()
                             );
                             assert_eq!(result.bytes, expected.len());
                             assert_eq!(
@@ -375,7 +375,7 @@ mod tests {
                         }
                         CapturedBytes::Binary(expected) => {
                             assert_eq!(result.kind, CaptureKind::Binary);
-                            assert_eq!(result.digest, *blake3::hash(&expected).as_bytes());
+                            assert_eq!(result.digest, *crate::ContentId::of(&expected).as_bytes());
                             assert_eq!(result.bytes, expected.len());
                             assert_eq!(result.retained, None);
                         }
@@ -395,7 +395,7 @@ mod tests {
             b"text that had been retained\r\nlate nul\0and all bytes after classification\r\n";
         let result = stream.finish();
         assert_eq!(result.kind, CaptureKind::Binary);
-        assert_eq!(result.digest, *blake3::hash(raw).as_bytes());
+        assert_eq!(result.digest, *crate::ContentId::of(raw).as_bytes());
         assert_eq!(result.bytes, raw.len());
         assert_eq!(result.retained, None);
     }
@@ -412,7 +412,10 @@ mod tests {
             panic!("fixture must be text")
         };
         assert_eq!(result.kind, CaptureKind::Text);
-        assert_eq!(result.digest, *blake3::hash(expected.as_bytes()).as_bytes());
+        assert_eq!(
+            result.digest,
+            *crate::ContentId::of(expected.as_bytes()).as_bytes()
+        );
         assert_eq!(result.bytes, expected.len());
         assert_eq!(result.retained.as_deref(), Some(expected.as_bytes()));
     }

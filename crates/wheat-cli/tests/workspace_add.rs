@@ -106,6 +106,18 @@ fn subsumed(output: &Output) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The `before` context `edits` printed for the edit `id`.
+fn edit_before(output: &Output, id: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with(id))
+        .unwrap_or_else(|| panic!("no edit {id} in {stdout}"));
+    let start = line.find(" before=").expect("a guarded-text edit") + " before=".len();
+    let end = line.find(" expected=").expect("a guarded-text edit");
+    line[start..end].to_owned()
+}
+
 fn edit_ids(output: &Output) -> Vec<String> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -278,19 +290,22 @@ fn independent_guarded_components_have_exact_lineage_and_undo_has_none() {
     assert_eq!(ids(&shown, "preserved"), Vec::<String>::new());
     assert_eq!(ids(&shown, "removed"), old_ids);
     assert_eq!(ids(&shown, "added"), replacement_ids);
-    assert_eq!(
-        subsumed(&shown),
-        vec![
-            (
-                ids(&shown, "removed")[0].clone(),
-                ids(&shown, "added")[0].clone()
-            ),
-            (
-                ids(&shown, "removed")[1].clone(),
-                ids(&shown, "added")[1].clone()
-            ),
-        ]
+    // Each old edit is subsumed by exactly one new edit, the one at the same place
+    // in the file, whichever way their IDs sort.
+    let pairs = subsumed(&shown);
+    let mut sources = pairs.iter().map(|(old, _)| old.clone()).collect::<Vec<_>>();
+    let mut targets = pairs.iter().map(|(_, new)| new.clone()).collect::<Vec<_>>();
+    sources.sort();
+    targets.sort();
+    assert_eq!(sources, ids(&shown, "removed"));
+    assert_eq!(targets, ids(&shown, "added"));
+    assert_ne!(
+        edit_before(&old, &old_ids[0]),
+        edit_before(&old, &old_ids[1])
     );
+    for (old_id, new_id) in &pairs {
+        assert_eq!(edit_before(&old, old_id), edit_before(&shown, new_id));
+    }
 
     fs::write(dir.path().join("file"), base_text).unwrap();
     let undone = ok(

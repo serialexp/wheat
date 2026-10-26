@@ -1,7 +1,9 @@
 {
   // Canonical immutable-object encoding for the Wheat prototype.
   //
-  // Object identity is BLAKE3-256 over the complete encoded WheatObject bytes.
+  // Object identity is BLAKE3-256 over "wheat-object\0" followed by the complete
+  // encoded WheatObject bytes; content identity is BLAKE3-256 over "wheat-content\0"
+  // followed by the content, so no content can have an object's ID.
   // The first uint16 is (object kind << 8) | encoding version. Assigning a new
   // wire tag for an incompatible encoding keeps old bytes and identities valid.
   // Arrays that model maps or sets MUST be sorted and unique before encoding;
@@ -57,14 +59,14 @@
     },
     ContentId: {
       sequence: [
-        // The BLAKE3-256 digest of the content.
+        // The BLAKE3-256 digest of "wheat-content\0" followed by the content.
         { name: "digest", type: "Digest256" },
       ],
     },
     // Change identity is stable collaboration identity, not object identity.
     ChangeId: { sequence: [{ name: "uuid", type: "Uuid128" }] },
     // Every other metadata ID is the BLAKE3-256 address of the referenced
-    // object's complete canonical WheatObject encoding.
+    // object's complete canonical WheatObject encoding, after "wheat-object\0".
     RevisionId: { sequence: [{ name: "digest", type: "Digest256" }] },
     EditId: { sequence: [{ name: "digest", type: "Digest256" }] },
     TreeId: { sequence: [{ name: "digest", type: "Digest256" }] },
