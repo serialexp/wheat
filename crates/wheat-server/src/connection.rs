@@ -126,7 +126,7 @@ async fn repository_access(
 /// Tell the client that it lacks `needed` access for this operation.
 async fn send_forbidden(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     needed: Access,
     repository: &str,
 ) -> Result<(), ConnectionError> {

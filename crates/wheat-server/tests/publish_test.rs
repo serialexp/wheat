@@ -38,7 +38,7 @@ use support::{
 };
 
 const REPO: &str = "test/repo";
-const OP: u32 = 1;
+const OP: u64 = 1;
 
 /// A server holding a one-change repository, and a client holding the same
 /// repository that it grows and publishes.
@@ -434,7 +434,7 @@ async fn push(ws: &mut Ws, objects: Vec<(ObjectId, Vec<u8>)>, blobs: &[Vec<u8>])
     for blob in blobs {
         push_blob(ws, ContentId::of(blob), blob.clone()).await;
     }
-    send_msg(ws, &push_end(OP, count as u32, blobs.len() as u32)).await;
+    send_msg(ws, &push_end(OP, count as u64, blobs.len() as u64)).await;
 }
 
 /// The values of `files`.
@@ -497,11 +497,11 @@ async fn a_published_blob_is_hashed_once() {
     // pushes every blob, so it reads none back to answer a round.
     let before = wheat_core::content_bytes_hashed();
     let mut ws = publishing.request_pushing(proposed).await;
-    let objects = difference.len() as u32;
+    let objects = difference.len() as u64;
     send_whole(&mut ws, difference).await;
     let blobs = ids.iter().copied().zip(values(&files));
     send_msg(&mut ws, &content_batch(OP, blobs)).await;
-    send_msg(&mut ws, &push_end(OP, objects, files.len() as u32)).await;
+    send_msg(&mut ws, &push_end(OP, objects, files.len() as u64)).await;
     let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
     assert!(rounds.is_empty(), "{rounds:?}");
     let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
@@ -622,7 +622,7 @@ async fn a_pushed_blob_that_does_not_match_its_id_is_refused() {
         .propose(&[("notes.txt".to_owned(), notes.clone())])
         .await;
     let difference = publishing.difference(proposed).await;
-    let count = difference.len() as u32;
+    let count = difference.len() as u64;
     let mut ws = publishing.request_pushing(proposed).await;
     send_whole(&mut ws, difference).await;
     push_blob(&mut ws, ContentId::of(&notes), b"not the notes".to_vec()).await;

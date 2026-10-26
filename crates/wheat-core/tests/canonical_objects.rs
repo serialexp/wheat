@@ -110,6 +110,23 @@ fn directory_nodes_round_trip_with_canonical_component_order() {
 }
 
 #[test]
+fn length_prefixes_have_one_encoding() {
+    let node = DirectoryNode::new([(
+        "README.md".to_owned(),
+        DirectoryEntry::File(content("readme")),
+    )])
+    .unwrap();
+    let bytes = node.canonical_bytes();
+    // The wire tag, then the entry count as a one-byte varint, then the name's
+    // length, also one byte.
+    assert_eq!(&bytes[..4], &[1, 1, 1, 9]);
+    // The same count spelled with a redundant continuation byte decodes to the
+    // same node, so accepting it would give that node a second ID.
+    let over_long = [&bytes[..2], &[0x81, 0x00], &bytes[3..]].concat();
+    assert!(decode_directory_node(&over_long).is_err());
+}
+
+#[test]
 fn revision_map_nodes_round_trip_with_canonical_edges() {
     let node = RevisionMapNode::new(
         vec![3, 4, 5],
@@ -241,7 +258,7 @@ fn canonical_revision_has_a_pinned_encoding_and_id() {
 
     assert_eq!(
         hex(&revision.canonical_bytes()),
-        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005cbd0c6ba0145f6989c7c51e548e22aecf242ad1224b12f11ff0dba43491f48f00000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff60000000000000001c5a1e43cf710947af7add28e119fc2713b16f4f292c70d619a25acbc0ee95ff6000000000000000000000000698e871a850b91550b4b566205c4f93d956bd143e8c5a3828829d31ab5fa89a6"
+        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000f2f9a30543244aa41a84747c31613658cff8a2095ddddc0dfa2055ee60f1213c0100c28dd307fa7f11769f6900266a2e2b3ebbf64739f9d883b91bab6bcbf2bd59000100c28dd307fa7f11769f6900266a2e2b3ebbf64739f9d883b91bab6bcbf2bd590000009f512093da3c037ee09b05e3b3d6b67768b8cd028fee2047b78673629c1b4071"
     );
     // Revision ID is BLAKE3 of the canonical bytes above.
     let expected_id = wheat_core::RevisionId::of_canonical_bytes(&revision.canonical_bytes());

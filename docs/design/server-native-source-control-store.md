@@ -616,8 +616,9 @@ field explicit binary framing rather than maintaining handwritten delimiter
 encodings. Immutable tree, change, revision, application, conflict, view, and
 content-manifest objects each begin with a two-byte `(object kind, encoding
 version)` tag and are hashed over their complete canonical encoded bytes. Native
-content references carry an algorithm tag; all map/set-shaped arrays must be
-sorted and unique before encoding and are validated by `wheat-core`.
+content references are bare BLAKE3-256 digests; length prefixes and small
+integers are canonical (minimal) LEB128 varints; all map/set-shaped arrays must
+be sorted and unique before encoding and are validated by `wheat-core`.
 
 The schema is currently experimental. Until the **lock the native schema**
 decision gate is checked, `V1` names and tags identify the current prototype

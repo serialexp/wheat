@@ -72,8 +72,6 @@ pub enum ContentGenerationWireError {
     Decode(String),
     #[error("content generation manifest is not exactly and canonically encoded")]
     NonCanonicalEncoding,
-    #[error("content generation manifest contains an invalid content-id algorithm")]
-    InvalidContentIdAlgorithm,
     #[error("content generation manifest digest is not 32 bytes")]
     InvalidDigest,
 }
@@ -349,15 +347,11 @@ fn entry_domain(
 
 fn content_id_wire(id: ContentId) -> wire::ContentId {
     wire::ContentId {
-        algorithm: 1,
         digest: digest_wire(*id.as_bytes()),
     }
 }
 
 fn content_id_domain(id: wire::ContentId) -> Result<ContentId, ContentGenerationWireError> {
-    if id.algorithm != 1 {
-        return Err(ContentGenerationWireError::InvalidContentIdAlgorithm);
-    }
     Ok(ContentId::from_digest(digest_domain(id.digest)?))
 }
 

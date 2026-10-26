@@ -216,21 +216,12 @@ fn binary_index_and_shard_reject_oversized_counts_and_noncanonical_bytes() {
             .contains("digest")
     );
 
-    // Shard header is 22 bytes; a ContentId starts with its algorithm discriminator.
-    let wrong_algorithm = malformed(&shard, &|b| b[22] = 2);
-    assert!(
-        forge_shard(&index, 0, &wrong_algorithm)
-            .decode_shard(0, &wrong_algorithm)
-            .unwrap_err()
-            .to_string()
-            .contains("content-id algorithm")
-    );
-
-    // The sole entry's optional-base discriminator follows the fixed 33-byte
-    // ContentId, digest, and three u64 fields. Claim a base then cut its ID.
+    // The shard header is 22 bytes. The sole entry's optional-base discriminator
+    // follows the 32-byte ContentId, digest, and three u64 fields. Claim a base
+    // then cut its ID.
     let truncated_optional_base = malformed(&shard, &|b| {
-        b[22 + 33 + 32 + 24] = 1;
-        b.truncate(22 + 33 + 32 + 24 + 1);
+        b[22 + 32 + 32 + 24] = 1;
+        b.truncate(22 + 32 + 32 + 24 + 1);
     });
     assert!(wheat_core::decode_content_generation_shard(&truncated_optional_base).is_err());
 }

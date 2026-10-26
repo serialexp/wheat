@@ -47,7 +47,7 @@ pub struct Pushed {
 #[tracing::instrument(name = "publish_push", level = "debug", skip_all)]
 pub async fn receive_push(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     keep: bool,
 ) -> Result<Pushed, ConnectionError> {
     match read_push(ws, op_id, keep).await? {
@@ -63,7 +63,7 @@ pub async fn receive_push(
 /// [`receive_push`] up to the first rule the push breaks, which it returns.
 async fn read_push(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     keep: bool,
 ) -> Result<Result<Pushed, &'static str>, ConnectionError> {
     let mut pushed = Pushed::default();
@@ -100,9 +100,7 @@ async fn read_push(
                 }
             }
             WheatProtocolMessage::PublishPushEnd(end) if end.op_id == op_id => {
-                if u64::from(end.pushed_objects) != objects
-                    || u64::from(end.pushed_contents) != contents
-                {
+                if end.pushed_objects != objects || end.pushed_contents != contents {
                     return Ok(Err("PublishPushEnd counts differ from what was pushed"));
                 }
                 debug!(op_id, objects, contents, bytes, "publish: push received");
@@ -391,7 +389,7 @@ async fn commit(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &Arc<RepositoryEntry>,
     staged: &Staged<'_>,
-    op_id: u32,
+    op_id: u64,
     key: PublishKey,
     expected: RepositoryHead,
     proposed: RepositoryEnvelopeId,
@@ -405,7 +403,7 @@ async fn commit(
 /// was not.
 async fn answer(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     key: PublishKey,
     accepted: Result<Accepted, CommitFailure>,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
@@ -455,7 +453,7 @@ async fn answer(
 /// Send the publish back as stale: the client must fetch first.
 async fn stale(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     head: &RepositoryHead,
     message: &str,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
@@ -477,7 +475,7 @@ async fn stale(
 /// Refuse the publish: tell the client, leave the head where it is.
 async fn reject(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     current_head: &RepositoryHead,
     message: &str,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
@@ -521,7 +519,7 @@ const STAGED_BYTES: usize = 64 * 1024 * 1024;
 async fn receive_objects(
     ws: &mut WebSocketStream<TcpStream>,
     staged: &Staged<'_>,
-    op_id: u32,
+    op_id: u64,
     current_head: &RepositoryHead,
     proposed: RepositoryEnvelopeId,
     pushed: &mut HashMap<ObjectId, Vec<u8>>,
@@ -616,7 +614,7 @@ async fn receive_objects(
 async fn receive_round(
     ws: &mut WebSocketStream<TcpStream>,
     staged: &Staged<'_>,
-    op_id: u32,
+    op_id: u64,
     ids: &[ObjectId],
 ) -> Result<Option<String>, ConnectionError> {
     let mut receiver = TransferReceiver::new(ids.iter().copied(), MAX_OBJECT_SIZE);

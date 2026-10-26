@@ -72,15 +72,20 @@ fn content_map_nodes_roundtrip_and_refuse_zero_counts() {
     assert!(ContentMapNode::new(vec![7; 32], Some(0), vec![], vec![]).is_err());
     let entries = |second: u32| vec![(vec![0; 32], 1), (vec![1; 32], second)];
     assert!(ContentMapNode::new(vec![], None, vec![], entries(0)).is_err());
-    // The same refusal on the read side: the last four bytes are the second
-    // entry's count.
-    let mut zeroed = ContentMapNode::new(vec![], None, vec![], entries(1))
+    // The same refusal on the read side: the last byte is the second entry's
+    // count, a one-byte varint.
+    let canonical = ContentMapNode::new(vec![], None, vec![], entries(1))
         .unwrap()
         .canonical_bytes();
-    let length = zeroed.len();
-    assert_eq!(zeroed[length - 4..], 1u32.to_be_bytes());
-    zeroed[length - 4..].fill(0);
-    assert!(decode_content_map_node(&zeroed).is_err());
+    let count = canonical.len() - 1;
+    assert_eq!(canonical[count], 1);
+    let with_count = |encoded: &[u8]| [&canonical[..count], encoded].concat();
+    assert!(decode_content_map_node(&with_count(&[0])).is_err());
+    // One count has one encoding: an over-long varint for 1 would give the same
+    // node a second ID.
+    assert!(decode_content_map_node(&with_count(&[0x81, 0x00])).is_err());
+    // Counts are 32-bit in memory, so 2^32 is refused, not truncated.
+    assert!(decode_content_map_node(&with_count(&[0x80, 0x80, 0x80, 0x80, 0x10])).is_err());
 }
 
 #[test]

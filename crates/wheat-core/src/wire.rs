@@ -14,8 +14,6 @@ use crate::{
     Tree, TreeId, ViewLineageMapChild, ViewLineageMapNode,
 };
 
-const BLAKE3_256: u8 = 1;
-
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CanonicalObjectError {
     #[error("Wheat object does not decode: {0}")]
@@ -24,8 +22,6 @@ pub enum CanonicalObjectError {
     NonCanonicalEncoding,
     #[error("Wheat object violates a canonical collection invariant: {0}")]
     InvalidCollection(&'static str),
-    #[error("Wheat content ID uses unsupported algorithm {0}")]
-    UnsupportedContentAlgorithm(u8),
     #[error("Wheat object has kind {actual:?}, expected {expected:?}")]
     WrongKind {
         expected: CanonicalObjectKind,
@@ -512,7 +508,7 @@ pub fn decode_content_map_node(bytes: &[u8]) -> Result<ContentMapNode, Canonical
     };
     Ok(ContentMapNode {
         prefix: node.prefix,
-        value: node.value.first().copied(),
+        value: node.value.first().map(|&count| narrow_count(count)),
         children: node
             .children
             .into_iter()
@@ -526,9 +522,14 @@ pub fn decode_content_map_node(bytes: &[u8]) -> Result<ContentMapNode, Canonical
         entries: node
             .entries
             .into_iter()
-            .map(|entry| (entry.suffix, entry.value))
+            .map(|entry| (entry.suffix, narrow_count(entry.value)))
             .collect(),
     })
+}
+
+/// A content map count, which validation has checked fits in 32 bits.
+fn narrow_count(count: u64) -> u32 {
+    u32::try_from(count).expect("validated content map count")
 }
 
 pub fn decode_view_lineage_map_node(
@@ -855,7 +856,7 @@ pub(crate) fn content_map_node_bytes(node: &ContentMapNode) -> Vec<u8> {
     encode(wire::WheatObject::ContentMapNodeV1(
         wire::ContentMapNodeV1Input {
             prefix: node.prefix.clone(),
-            value: node.value.into_iter().collect(),
+            value: node.value.into_iter().map(u64::from).collect(),
             children: node
                 .children
                 .iter()
@@ -869,7 +870,7 @@ pub(crate) fn content_map_node_bytes(node: &ContentMapNode) -> Vec<u8> {
                 .iter()
                 .map(|(suffix, value)| wire::ContentMapEntryV1 {
                     suffix: suffix.clone(),
-                    value: *value,
+                    value: u64::from(*value),
                 })
                 .collect(),
         }
@@ -1404,10 +1405,6 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             match &edit.operation {
                 wire::EditOperationV1::GuardedTextEditV1(value) => {
                     guarded_file_kind(value.kind.value)?;
-                    validate_content_id(&value.before)?;
-                    validate_content_id(&value.expected)?;
-                    validate_content_id(&value.replacement)?;
-                    validate_content_id(&value.after)?;
                     if value.expected == value.replacement {
                         return Err(CanonicalObjectError::InvalidCollection(
                             "guarded text edit must not be a no-op",
@@ -1549,6 +1546,14 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
             if node.value.contains(&0) || node.entries.iter().any(|entry| entry.value == 0) {
                 return Err(CanonicalObjectError::InvalidCollection(
                     "content map counts are at least 1",
+                ));
+            }
+            let too_large = |count: u64| u32::try_from(count).is_err();
+            if node.value.iter().copied().any(too_large)
+                || node.entries.iter().any(|entry| too_large(entry.value))
+            {
+                return Err(CanonicalObjectError::InvalidCollection(
+                    "content map counts fit in 32 bits",
                 ));
             }
             let efb: Vec<u8> = node
@@ -1919,25 +1924,13 @@ fn validate_sorted_unique_by<T, K: Ord + ?Sized>(
 }
 
 fn validate_file_value(value: &wire::FileValueV1) -> Result<(), CanonicalObjectError> {
-    validate_content_id(&value.content)?;
     if value.kind.value > 2 {
         return Err(CanonicalObjectError::Decode("invalid file kind".into()));
     }
     Ok(())
 }
 
-fn validate_content_id(content: &wire::ContentId) -> Result<(), CanonicalObjectError> {
-    if content.algorithm == BLAKE3_256 {
-        Ok(())
-    } else {
-        Err(CanonicalObjectError::UnsupportedContentAlgorithm(
-            content.algorithm,
-        ))
-    }
-}
-
 fn content_id_domain(content: &wire::ContentId) -> Result<ContentId, CanonicalObjectError> {
-    validate_content_id(content)?;
     Ok(ContentId::from_digest(digest_domain(&content.digest)?))
 }
 
@@ -2033,7 +2026,6 @@ fn file_value(value: FileValue) -> wire::FileValueV1 {
 
 fn content_id(value: ContentId) -> wire::ContentId {
     wire::ContentId {
-        algorithm: BLAKE3_256,
         digest: digest(value.as_bytes()),
     }
 }

@@ -98,7 +98,7 @@
     // A labelled view pointer.
     LabelEntry: {
       sequence: [
-        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "view_id", type: "Digest256" },
       ],
     },
@@ -107,7 +107,7 @@
     ObjectEntry: {
       sequence: [
         { name: "id", type: "Digest256" },
-        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
       ],
     },
 
@@ -115,7 +115,7 @@
     ContentEntry: {
       sequence: [
         { name: "id", type: "Digest256" },
-        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
       ],
     },
 
@@ -133,8 +133,8 @@
           name: "capabilities",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
-          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+          length_type: "varlength", length_encoding: "leb128_canonical",
+          items: { type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         },
       ],
     },
@@ -143,7 +143,7 @@
       sequence: [
         { name: "message_type", type: "uint8", const: 0x02 },
         { name: "selected_version", type: "uint16" },
-        { name: "auth_token", type: "bytes", kind: "length_prefixed", length_type: "uint16" },
+        { name: "auth_token", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "receive_window_bytes", type: "uint32" },
         { name: "receive_window_messages", type: "uint16" },
       ],
@@ -172,7 +172,7 @@
         // Supported range included on version_mismatch so client can retry.
         { name: "supported_range_min", type: "uint16" },
         { name: "supported_range_max", type: "uint16" },
-        { name: "message", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
       ],
     },
 
@@ -183,20 +183,20 @@
     RepositoryOpen: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x10 },
-        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
       ],
     },
 
     RepositoryState: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x11 },
-        { name: "head_generation", type: "uint64" },
+        { name: "head_generation", type: "varlength", encoding: "leb128_canonical" },
         { name: "head_envelope", type: "Digest256" },
         {
           name: "labels",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "LabelEntry" },
         },
         { name: "labels_truncated", type: "bool" },
@@ -206,23 +206,23 @@
     ListLabels: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x12 },
-        { name: "op_id", type: "uint32" },
-        { name: "cursor", type: "bytes", kind: "length_prefixed", length_type: "uint16" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "cursor", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
       ],
     },
 
     ListLabelsResult: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x13 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "labels",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "LabelEntry" },
         },
-        { name: "next_cursor", type: "bytes", kind: "length_prefixed", length_type: "uint16" },
+        { name: "next_cursor", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
       ],
     },
 
@@ -239,7 +239,7 @@
     FetchRequest: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x20 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         { name: "want_envelope", type: "Digest256" },
         { name: "since_envelope", type: "Digest256" },
       ],
@@ -251,13 +251,13 @@
     ObjectBatch: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x21 },
-        { name: "op_id", type: "uint32" },
-        { name: "sequence", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "sequence", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "objects",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ObjectEntry" },
         },
       ],
@@ -269,13 +269,13 @@
     ObjectWant: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x22 },
-        { name: "op_id", type: "uint32" },
-        { name: "want_sequence", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "want_sequence", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "ids",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "Digest256" },
         },
       ],
@@ -284,7 +284,7 @@
     FetchComplete: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x23 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
@@ -293,8 +293,8 @@
     FetchPushEnd: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x24 },
-        { name: "op_id", type: "uint32" },
-        { name: "pushed_objects", type: "uint64" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "pushed_objects", type: "varlength", encoding: "leb128_canonical" },
         { name: "incremental", type: "bool" },
       ],
     },
@@ -307,13 +307,13 @@
     ObjectWantReply: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x25 },
-        { name: "op_id", type: "uint32" },
-        { name: "want_sequence", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "want_sequence", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "objects",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ObjectEntry" },
         },
       ],
@@ -325,10 +325,10 @@
     ObjectChunk: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x26 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         { name: "object_id", type: "Digest256" },
-        { name: "offset", type: "uint64" },
-        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "offset", type: "varlength", encoding: "leb128_canonical" },
+        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "is_final", type: "bool" },
       ],
     },
@@ -340,12 +340,12 @@
     ContentFetchRequest: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x30 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "content_ids",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "Digest256" },
         },
       ],
@@ -354,13 +354,13 @@
     ContentBatch: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x31 },
-        { name: "op_id", type: "uint32" },
-        { name: "sequence", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "sequence", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "contents",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ContentEntry" },
         },
       ],
@@ -369,10 +369,10 @@
     ContentChunk: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x32 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         { name: "content_id", type: "Digest256" },
-        { name: "offset", type: "uint64" },
-        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "offset", type: "varlength", encoding: "leb128_canonical" },
+        { name: "data", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "is_final", type: "bool" },
       ],
     },
@@ -380,10 +380,10 @@
     ContentRedirect: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x33 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         { name: "content_id", type: "Digest256" },
-        { name: "url", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
-        { name: "expires_seconds", type: "uint32" },
+        { name: "url", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "expires_seconds", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
@@ -394,10 +394,10 @@
     PublishRequest: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x40 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         { name: "publish_key", type: "Uuid128" },
         { name: "envelope_id", type: "Digest256" },
-        { name: "expected_generation", type: "uint64" },
+        { name: "expected_generation", type: "varlength", encoding: "leb128_canonical" },
         { name: "expected_envelope", type: "Digest256" },
         { name: "force", type: "bool" },
       ],
@@ -411,12 +411,12 @@
     ObjectsNeeded: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x41 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "ids",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "Digest256" },
         },
       ],
@@ -427,7 +427,7 @@
     ObjectsComplete: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x42 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
@@ -437,12 +437,12 @@
     ContentNeeded: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x43 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "content_ids",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint16",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "Digest256" },
         },
       ],
@@ -454,14 +454,14 @@
     ContentUploadComplete: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x46 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
     ContentComplete: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x4a },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
@@ -473,24 +473,24 @@
     PublishPushEnd: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x4b },
-        { name: "op_id", type: "uint32" },
-        { name: "pushed_objects", type: "uint32" },
-        { name: "pushed_contents", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "pushed_objects", type: "varlength", encoding: "leb128_canonical" },
+        { name: "pushed_contents", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
     PublishCommit: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x47 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
     PublishProgress: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x48 },
-        { name: "op_id", type: "uint32" },
-        { name: "phase", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "phase", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         // 0-100 = percent, 255 = indeterminate.
         { name: "percent", type: "uint8" },
       ],
@@ -516,12 +516,12 @@
     PublishResult: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x49 },
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         { name: "receipt_id", type: "Uuid128" },
         { name: "status", type: "PublishResultStatus" },
-        { name: "new_generation", type: "uint64" },
+        { name: "new_generation", type: "varlength", encoding: "leb128_canonical" },
         { name: "new_envelope", type: "Digest256" },
-        { name: "message", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
       ],
     },
 
@@ -533,9 +533,9 @@
       sequence: [
         { name: "message_type", type: "uint8", const: 0x60 },
         // op_id=0 is connection-level credit (before any operation opens).
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         // Acknowledges all batches up to this sequence for the op_id.
-        { name: "ack_through_sequence", type: "uint32" },
+        { name: "ack_through_sequence", type: "varlength", encoding: "leb128_canonical" },
         // Additive window: additional bytes the receiver can accept.
         { name: "window_bytes", type: "uint32" },
         // Additive window: additional messages the receiver can accept.
@@ -562,11 +562,11 @@
       sequence: [
         { name: "message_type", type: "uint8", const: 0x70 },
         // op_id=0 means connection-scoped.
-        { name: "op_id", type: "uint32" },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
         { name: "code", type: "uint16" },
         { name: "scope", type: "ErrorScope" },
         { name: "retryable", type: "bool" },
-        { name: "message", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         // Optional: which object caused the error (empty digest = not applicable).
         { name: "object_id", type: "Digest256" },
       ],

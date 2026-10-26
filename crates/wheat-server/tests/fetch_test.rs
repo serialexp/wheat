@@ -173,7 +173,7 @@ async fn assert_complete(objects: &LooseObjectStore, closure: &HashSet<ObjectId>
 /// in the order they came.
 async fn take_push(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     want: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
 ) -> Vec<ObjectId> {
@@ -199,7 +199,7 @@ async fn take_push(
     }
 }
 
-fn expect_error(message: WheatProtocolMessage, op_id: u32, code: u16) -> ErrorOutput {
+fn expect_error(message: WheatProtocolMessage, op_id: u64, code: u16) -> ErrorOutput {
     match message {
         WheatProtocolMessage::Error(error) => {
             assert_eq!(
@@ -448,7 +448,7 @@ async fn a_wanted_object_too_large_for_a_batch_comes_in_chunks() {
     send_msg(&mut ws, &fetch_complete(1)).await;
 }
 
-fn content_fetch(op_id: u32, ids: &[ContentId]) -> WheatProtocolMessage {
+fn content_fetch(op_id: u64, ids: &[ContentId]) -> WheatProtocolMessage {
     WheatProtocolMessage::ContentFetchRequest(ContentFetchRequestOutput {
         message_type: 0x30,
         op_id,

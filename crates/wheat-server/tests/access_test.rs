@@ -233,7 +233,7 @@ fn is_permission_denial(result: &PublishResultOutput) -> bool {
         && result.message.contains("permission denied")
 }
 
-fn fetch_request(op_id: u32, state: &RepositoryStateOutput) -> WheatProtocolMessage {
+fn fetch_request(op_id: u64, state: &RepositoryStateOutput) -> WheatProtocolMessage {
     WheatProtocolMessage::FetchRequest(FetchRequestOutput {
         message_type: 0x20,
         op_id,

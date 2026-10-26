@@ -87,11 +87,16 @@ external review.
   to 437 MiB and wall time from 183 s to 48.5 s. See
   [Planning from stored records](#planning-from-stored-records).
 
+- [x] **Phase 3 — wire encoding compaction (2026-10-26).** Object and
+  protocol length prefixes are canonical LEB128 varints, the ContentId
+  algorithm byte is gone, and small scalars (revision generation,
+  application position, view size and weight, byte ranges, content-map
+  counts, protocol op IDs, sequences and generations) are varints too.
+  Physical store records keep their fixed widths. Count narrowing was
+  dropped: a varint count under 128 is already one byte. See
+  [Phase 3](#phase-3--wire-encoding-compaction).
+
 ### Outstanding
-- [ ] **Phase 3 — wire encoding compaction.** Switch binschema length
-  prefixes from fixed `uint32` to varint, drop the always-1 ContentId
-  algorithm byte, and shrink low-cardinality arrays to `uint8`/`uint16`
-  counts. This is essentially free since the types are generated.
 - [ ] **Phase 4b — destructive GC.** Reclaim only objects and content already
   unreachable from every authority in the collection scope. GC must use exact,
   fail-closed marking, include transitive delta-base `ContentId`s, and respect
@@ -179,13 +184,11 @@ Add two new codecs:
 |---|---|---|
 | Raw | 0 | `[logical bytes]` |
 | Zstd | 1 | `[zstd frame]` |
-| Delta | 2 | `[33-byte base ContentId] [delta patch]` |
-| DeltaZstd | 3 | `[33-byte base ContentId] [zstd(delta patch)]` |
+| Delta | 2 | `[32-byte base ContentId] [delta patch]` |
+| DeltaZstd | 3 | `[32-byte base ContentId] [zstd(delta patch)]` |
 
-The base reference is 33 bytes (1-byte algorithm + 32-byte digest)
-matching the current `ContentId` wire format. If Phase 3 drops the
-algorithm byte, this becomes 32 bytes — but Phase 0 does not depend
-on Phase 3.
+The base reference is the base's 32-byte BLAKE3 digest, the `ContentId`
+wire format since Phase 3.
 
 The **envelope header** (22 bytes: magic + version + codec +
 stored_length + logical_length) is unchanged — `stored_length` is
@@ -404,22 +407,35 @@ drop to ~1.5–2× relative to git. Exact ratios need measurement.
 
 ## Phase 3 — Wire encoding compaction
 
+Done 2026-10-26. Changing the canonical encoding changed every object ID,
+so existing stores are re-imported.
+
 ### Changes to the binschema schema
 
-Update the existing types in `wheat-objects.bs.json5` and re-run
-`wheat-gen-schema`. The implementation cost is just editing the schema
-— the generated code follows automatically. Note: changing canonical
-encoding changes object IDs, so this is a clean-slate change — all
-existing objects must be re-encoded.
+**1. Varint length prefixes.** Every `length_prefixed` array, string and
+bytes field in `wheat-objects.bs.json5` (object types only) and
+`wheat-protocol.bs.json5` uses `length_type: "varlength", length_encoding:
+"leb128_canonical"`. BinSchema gained varlength length prefixes in all its
+generators (binschema c6f735b) and the `leb128_canonical` encoding
+(ae96d04).
 
-**1. Varint length prefixes.** Replace `length_type: "uint32"` with
-`length_type: "varint"` (LEB128 unsigned) on all arrays and strings.
-Most arrays have 0–5 elements: this saves 3 bytes per field (1 byte
-varint vs 4 bytes uint32). With 59 `uint32` length-prefix writes in
-the generated code, that's ~170 bytes per commit's worth of objects.
+`leb128_canonical` decodes only the minimal form. Plain LEB128 also
+accepts over-long spellings (`81 00` for 1), and since an object's ID is
+the hash of its bytes, accepting one would give the same object a second
+ID. Wheat's canonical check (decode, then require every byte consumed)
+does not catch that by itself.
 
-Prerequisite: the binschema code generator must support varint length
-types. If it doesn't yet, this needs to be added first.
+Physical store records (segments, active log, catalog, content
+generations, store control records) keep fixed widths: several are read at
+fixed offsets or bounded by size before decoding, and they do not affect
+object identity, so they can change later with a migration.
+
+**Varint scalars.** Fields that are usually small are varints too:
+`RevisionV1.generation`, `ApplicationV1.position`, `ViewV1.size` and
+`weight`, `ByteRangeV1.start`/`end`, and content-map counts (still at
+most `u32::MAX`, which validation checks). In the protocol: `op_id`,
+sequences, generations, offsets, pushed counts and `expires_seconds`. The
+handshake's version and window fields keep fixed widths.
 
 **2. Drop the ContentId algorithm byte.** Currently every ContentId is
 `[1-byte algorithm = 1] [32-byte digest]` = 33 bytes. The algorithm is
@@ -431,8 +447,9 @@ This saves 1 byte per file entry in every tree — a tree with 100 files
 saves 100 bytes. It also shrinks Phase 0's delta base reference from
 33 to 32 bytes.
 
-**3. Compact array counts for low-cardinality fields.** Several arrays
-are structurally bounded to small counts:
+**3. Compact array counts for low-cardinality fields.** Dropped: with
+varint prefixes a count under 128 is already one byte, so a fixed `uint8`
+would only save a byte for counts 128–255. The original proposal was:
 
 - `predecessors` (0 or 1 element) → optional flag (1 byte vs 4)
 - `dependencies` (typically 0–3) → `uint8` count
@@ -443,26 +460,17 @@ are structurally bounded to small counts:
 Each saves 1–3 bytes per field, adding up across the thousands of
 objects in a repository.
 
-### Quantified savings
+### Measured savings
 
-Per tree entry:
-- Before: 4 (name len) + name + 1 (kind) + 1 (algorithm) + 32 (digest) + 1 (file kind) = 39 + name
-- After: 1 (name len varint) + name + 1 (kind) + 32 (digest) + 1 (file kind) = 35 + name
-- Saving: **4 bytes per entry** (~10%)
+`wheat-quick` (release, 2026-10-26) against the 2026-10-21 run:
 
-Per trie node (2 children, 4-byte prefix):
-- Before: 2 (tag) + 4 (prefix len) + 4 (prefix) + 1 (present) + 4 (children len) + 2×33 = 81 bytes
-- After: 2 (tag) + 1 (prefix len) + 4 (prefix) + 1 (present) + 1 (children len) + 2×33 = 75 bytes
-- Saving: **6 bytes per node** (~7%)
-
-Per revision (typical single-file change):
-- Before: ~500 bytes
-- After: ~470 bytes (many 4→1 byte length prefixes)
-- Saving: **~30 bytes** (~6%)
-
-Across a 50-change repository with ~1337 objects, the total savings
-from Phase 3 alone are roughly **5–10 KB** (~5–8% of structural data).
-Modest, but free because the schema regeneration is mechanical.
+- Canonical object bytes (`packed_append.*.canonical_bytes`): −11.9%.
+- Snapshot object bytes: −9.9% (`snapshot_export.large`), −6.1% (`small`).
+- Bytes pushed per change by fetch (`fetch_incremental`): −4.2% to −7.6%.
+- Protocol traffic (`remote_latency`): −8.6% to −9.6% for the object-heavy
+  directions; content-dominated transfers (clone, large blobs) are within 1%.
+- Active segment bytes (`packed_append.*.active_segment_bytes`): −3.2%, as
+  segment framing kept its fixed widths.
 
 ## Phase 4 — Repack and GC
 

@@ -139,7 +139,7 @@ pub fn envelope_id(d: &Digest256) -> RepositoryEnvelopeId {
 }
 
 pub fn fetch_request(
-    op_id: u32,
+    op_id: u64,
     want: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
 ) -> WheatProtocolMessage {
@@ -151,7 +151,7 @@ pub fn fetch_request(
     })
 }
 
-pub fn object_want(op_id: u32, want_sequence: u32, ids: &[ObjectId]) -> WheatProtocolMessage {
+pub fn object_want(op_id: u64, want_sequence: u64, ids: &[ObjectId]) -> WheatProtocolMessage {
     WheatProtocolMessage::ObjectWant(ObjectWantOutput {
         message_type: 0x22,
         op_id,
@@ -160,7 +160,7 @@ pub fn object_want(op_id: u32, want_sequence: u32, ids: &[ObjectId]) -> WheatPro
     })
 }
 
-pub fn fetch_complete(op_id: u32) -> WheatProtocolMessage {
+pub fn fetch_complete(op_id: u64) -> WheatProtocolMessage {
     WheatProtocolMessage::FetchComplete(FetchCompleteOutput {
         message_type: 0x23,
         op_id,
@@ -172,7 +172,7 @@ pub fn fetch_complete(op_id: u32) -> WheatProtocolMessage {
 pub struct Fetched {
     pub pushed: u64,
     pub pulled: u64,
-    pub wants: u32,
+    pub wants: u64,
     pub incremental: bool,
     /// Pushed objects [`fetch_objects_keeping`] threw away.
     pub dropped: u64,
@@ -183,7 +183,7 @@ pub struct Fetched {
 /// Fetches the closure of `want` into `objects`.
 pub async fn fetch_objects<O: ImmutableObjectStore>(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
     want: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
@@ -195,7 +195,7 @@ pub async fn fetch_objects<O: ImmutableObjectStore>(
 /// `keep(n)` says so, to act out a push that lost objects.
 pub async fn fetch_objects_keeping<O: ImmutableObjectStore>(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
     want: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
@@ -268,9 +268,9 @@ pub async fn fetch_objects_keeping<O: ImmutableObjectStore>(
 /// those came as chunks.
 async fn pull<O: ImmutableObjectStore>(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
-    want_sequence: u32,
+    want_sequence: u64,
     ids: &[ObjectId],
 ) -> (u64, u64) {
     send_msg(ws, &object_want(op_id, want_sequence, ids)).await;
@@ -326,7 +326,7 @@ pub enum Upload {
 /// is asked for twice.
 pub async fn upload_objects<O: ImmutableObjectStore>(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
     upload: Upload,
 ) -> Vec<usize> {
@@ -377,7 +377,7 @@ pub async fn upload_objects<O: ImmutableObjectStore>(
     }
 }
 
-pub fn object_batch(op_id: u32, objects: Vec<ObjectEntry>) -> WheatProtocolMessage {
+pub fn object_batch(op_id: u64, objects: Vec<ObjectEntry>) -> WheatProtocolMessage {
     WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
         message_type: 0x21,
         op_id,
@@ -387,7 +387,7 @@ pub fn object_batch(op_id: u32, objects: Vec<ObjectEntry>) -> WheatProtocolMessa
 }
 
 pub fn object_chunk(
-    op_id: u32,
+    op_id: u64,
     id: ObjectId,
     offset: usize,
     data: &[u8],
@@ -406,7 +406,7 @@ pub fn object_chunk(
 /// Ends a publish's up-front push of `objects` objects and `contents` blobs.
 /// One `ContentBatch` of `blobs`, each under its claimed ID.
 pub fn content_batch(
-    op_id: u32,
+    op_id: u64,
     blobs: impl IntoIterator<Item = (ContentId, Vec<u8>)>,
 ) -> WheatProtocolMessage {
     WheatProtocolMessage::ContentBatch(ContentBatchOutput {
@@ -423,7 +423,7 @@ pub fn content_batch(
     })
 }
 
-pub fn push_end(op_id: u32, objects: u32, contents: u32) -> WheatProtocolMessage {
+pub fn push_end(op_id: u64, objects: u64, contents: u64) -> WheatProtocolMessage {
     WheatProtocolMessage::PublishPushEnd(PublishPushEndOutput {
         message_type: 0x4b,
         op_id,
@@ -436,7 +436,7 @@ pub fn push_end(op_id: u32, objects: u32, contents: u32) -> WheatProtocolMessage
 /// with an empty push, so the server asks for everything.
 pub async fn request_publish(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     envelope: RepositoryEnvelopeId,
     expected: (u64, RepositoryEnvelopeId),
     force: bool,
@@ -449,7 +449,7 @@ pub async fn request_publish(
 /// [`push_end`].
 pub async fn request_publish_pushing(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     envelope: RepositoryEnvelopeId,
     expected: (u64, RepositoryEnvelopeId),
     force: bool,
@@ -472,7 +472,7 @@ pub async fn request_publish_pushing(
 /// Fetches the content of `envelope` that `content` lacks. Returns how much.
 pub async fn fetch_content<O: ImmutableObjectStore>(
     ws: &mut Ws,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
     content: &ContentStore,
     envelope: RepositoryEnvelopeId,

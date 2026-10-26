@@ -15,8 +15,6 @@ use crate::{
     Timestamp, TreeId, ViewId, validate_canonical_object,
 };
 
-const BLAKE3_256: u8 = 1;
-
 /// The persisted, non-materialized representation of a change revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionRecord {
@@ -464,11 +462,6 @@ fn file_value_domain(value: &binschema::FileValueV1) -> Result<FileValue, Canoni
 }
 
 fn content_id_domain(id: &binschema::ContentId) -> Result<ContentId, CanonicalObjectError> {
-    if id.algorithm != BLAKE3_256 {
-        return Err(CanonicalObjectError::UnsupportedContentAlgorithm(
-            id.algorithm,
-        ));
-    }
     Ok(ContentId::from_digest(digest_domain(&id.digest)?))
 }
 
@@ -612,7 +605,6 @@ fn file_value_wire(value: FileValue) -> binschema::FileValueV1 {
 
 fn content_id_wire(id: ContentId) -> binschema::ContentId {
     binschema::ContentId {
-        algorithm: BLAKE3_256,
         digest: digest_wire(id.as_bytes()),
     }
 }

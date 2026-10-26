@@ -150,7 +150,7 @@ async fn clone_round_trip() {
 }
 
 /// The op id of every publish in these tests.
-const PUBLISH_OP: u32 = 3;
+const PUBLISH_OP: u64 = 3;
 
 /// A publish driven up to its content phase: the server's `ContentNeeded`
 /// has arrived and nothing has been uploaded yet.

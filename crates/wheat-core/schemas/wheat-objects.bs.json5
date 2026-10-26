@@ -55,8 +55,7 @@
     },
     ContentId: {
       sequence: [
-        // 1 = BLAKE3-256. The algorithm tag is part of every reference.
-        { name: "algorithm", type: "uint8" },
+        // The BLAKE3-256 digest of the content.
         { name: "digest", type: "Digest256" },
       ],
     },
@@ -91,7 +90,7 @@
           name: "entries",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "DirectoryEntryV1" },
         },
       ],
@@ -102,7 +101,7 @@
           name: "name",
           type: "string",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           encoding: "utf8",
         },
         { name: "value", type: "DirectoryEntryValueV1" },
@@ -143,8 +142,8 @@
 
     ActorV1: {
       sequence: [
-        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
-        { name: "email", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "email", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
       ],
     },
     TimestampV1: {
@@ -155,20 +154,20 @@
     },
     SourceProvenanceV1: {
       sequence: [
-        { name: "system", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
-        { name: "object_id", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
-        { name: "parent_object_ids", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SourceObjectIdV1" } },
+        { name: "system", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "object_id", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
+        { name: "parent_object_ids", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "SourceObjectIdV1" } },
       ],
     },
     SourceObjectIdV1: {
       sequence: [
-        { name: "bytes", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "bytes", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
       ],
     },
     ChangeMetadataV1: {
       sequence: [
-        { name: "title", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
-        { name: "description", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "title", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "description", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "creator", type: "ActorV1" },
         { name: "created_at", type: "TimestampV1" },
         { name: "provenance", type: "optional", value_type: "SourceProvenanceV1" },
@@ -176,7 +175,7 @@
     },
     RevisionMetadataV1: {
       sequence: [
-        { name: "message", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "author", type: "ActorV1" },
         { name: "authored_at", type: "TimestampV1" },
         { name: "committer", type: "ActorV1" },
@@ -207,7 +206,7 @@
           name: "predecessors",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "RevisionId" },
         },
         {
@@ -216,41 +215,41 @@
           name: "combines",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "RevisionId" },
         },
         // 1 + the largest generation among the predecessor and `combines`; 0 with none.
-        { name: "generation", type: "uint64" },
+        { name: "generation", type: "varlength", encoding: "leb128_canonical" },
         {
           name: "dependencies",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ChangeId" },
         },
         { name: "authored_against", type: "ViewId" },
-        { name: "edits", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+        { name: "edits", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } },
         { name: "transition", type: "EditTransitionV1" },
         { name: "resulting_tree", type: "TreeId" },
       ],
     },
     EditTransitionV1: {
       sequence: [
-        { name: "preserved", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
-        { name: "added", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
-        { name: "removed", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
-        { name: "subsumed", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditSubsumptionV1" } },
-        { name: "resolutions", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ConflictResolutionEvidenceV1" } },
+        { name: "preserved", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } },
+        { name: "added", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } },
+        { name: "removed", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } },
+        { name: "subsumed", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditSubsumptionV1" } },
+        { name: "resolutions", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ConflictResolutionEvidenceV1" } },
       ],
     },
     EditSubsumptionV1: { sequence: [
       { name: "source", type: "EditId" },
-      { name: "replacements", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+      { name: "replacements", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } },
     ] },
     ConflictResolutionEvidenceV1: { sequence: [
       { name: "application", type: "ApplicationId" },
-      { name: "conflicted_edits", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
-      { name: "replacement_edits", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } },
+      { name: "conflicted_edits", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } },
+      { name: "replacement_edits", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } },
     ] },
 
     ApplicationV1: {
@@ -259,14 +258,14 @@
         { name: "revision_id", type: "RevisionId" },
         { name: "target_view", type: "ViewId" },
         // The change's index in the result view's canonical order: the target's size.
-        { name: "position", type: "uint64" },
+        { name: "position", type: "varlength", encoding: "leb128_canonical" },
         {
           // Zero or one element: the target's producing application, none on the
           // base. An array for the same reason as RevisionV1's predecessors.
           name: "previous",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ApplicationId" },
         },
         {
@@ -274,7 +273,7 @@
           name: "skip",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ApplicationId" },
         },
         {
@@ -283,11 +282,11 @@
           name: "window_max",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ChangeId" },
         },
         { name: "result", type: "ApplicationResultV1" },
-        { name: "applied", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "AppliedEditEntryV1" } },
+        { name: "applied", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "AppliedEditEntryV1" } },
       ],
     },
     ApplicationResultV1: {
@@ -320,21 +319,21 @@
           name: "edits",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "FailedEditEntryV1" },
         },
       ],
     },
-    ByteRangeV1: { sequence: [{ name: "start", type: "uint64" }, { name: "end", type: "uint64" }] },
+    ByteRangeV1: { sequence: [{ name: "start", type: "varlength", encoding: "leb128_canonical" }, { name: "end", type: "varlength", encoding: "leb128_canonical" }] },
     AppliedEditEntryV1: { sequence: [{ name: "edit", type: "EditId" }, { name: "evidence", type: "AppliedEditEvidenceV1" }] },
     AppliedEditEvidenceV1: { sequence: [
-      { name: "target", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
-      { name: "read", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ByteRangeV1" } },
-      { name: "write", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ByteRangeV1" } },
+      { name: "target", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "FileValueV1" } },
+      { name: "read", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ByteRangeV1" } },
+      { name: "write", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ByteRangeV1" } },
     ] },
     FailedEditEntryV1: { sequence: [{ name: "edit", type: "EditId" }, { name: "evidence", type: "FailedEditEvidenceV1" }] },
     FailedEditEvidenceV1: { sequence: [
-      { name: "target", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
+      { name: "target", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "FileValueV1" } },
       { name: "reason", type: "EditFailureV1" },
     ] },
     EditFailureV1: { type: "discriminated_union", discriminator: { peek: "uint8" }, variants: [
@@ -344,7 +343,7 @@
     ] },
     NoMatchFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 0 }] },
     AmbiguousFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 1 }] },
-    InterferenceFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 2 }, { name: "with", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "EditId" } }] },
+    InterferenceFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 2 }, { name: "with", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "EditId" } }] },
     KindMismatchFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 3 }] },
     ExpectedFileMismatchFailureV1: { sequence: [{ name: "failure_kind", type: "uint8", const: 4 }] },
 
@@ -361,19 +360,19 @@
         // new change on the frontier depends on.
         { name: "tips", type: "ChangeSetId" },
         // The number of changes in `revisions`.
-        { name: "size", type: "uint64" },
+        { name: "size", type: "varlength", encoding: "leb128_canonical" },
         {
           // Zero or one element: the last change in the canonical order, none for
           // the base. An array for the same reason as RevisionV1's predecessors.
           name: "last",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "ChangeId" },
         },
         // The sum over its changes of 1 + their revision's generation. Every lineage
         // edge increases it.
-        { name: "weight", type: "uint64" },
+        { name: "weight", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
@@ -381,10 +380,10 @@
     ContentMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0701 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
-        { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint32" } },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentMapChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentMapEntryV1" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "varlength", encoding: "leb128_canonical" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ContentMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ContentMapEntryV1" } },
       ],
     },
     ContentMapChildV1: {
@@ -395,28 +394,28 @@
     },
     ContentMapEntryV1: {
       sequence: [
-        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
-        { name: "value", type: "uint32" },
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
+        { name: "value", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
     RevisionMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0901 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
         {
           // Zero or one element. A value is legal only after consuming all 16 key bytes.
           name: "value",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "RevisionId" },
         },
         {
           name: "children",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "RevisionMapChildV1" },
         },
         {
@@ -425,7 +424,7 @@
           name: "entries",
           type: "array",
           kind: "length_prefixed",
-          length_type: "uint32",
+          length_type: "varlength", length_encoding: "leb128_canonical",
           items: { type: "RevisionMapEntryV1" },
         },
       ],
@@ -438,7 +437,7 @@
     },
     RevisionMapEntryV1: {
       sequence: [
-        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "value", type: "RevisionId" },
       ],
     },
@@ -446,10 +445,10 @@
     ChangeMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x1101 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
-        { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeObjectId" } },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeMapChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeMapEntryV1" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ChangeObjectId" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ChangeMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ChangeMapEntryV1" } },
       ],
     },
     ChangeMapChildV1: {
@@ -460,7 +459,7 @@
     },
     ChangeMapEntryV1: {
       sequence: [
-        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "value", type: "ChangeObjectId" },
       ],
     },
@@ -468,10 +467,10 @@
     ApplicationMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0a01 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
-        { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationId" } },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationMapChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ApplicationMapEntryV1" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ApplicationId" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ApplicationMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ApplicationMapEntryV1" } },
       ],
     },
     ApplicationMapChildV1: {
@@ -482,7 +481,7 @@
     },
     ApplicationMapEntryV1: {
       sequence: [
-        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "value", type: "ApplicationId" },
       ],
     },
@@ -490,10 +489,10 @@
     ViewLineageMapNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x1201 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
-        { name: "value", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "RetainedSetId" } },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ViewLineageMapChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ViewLineageMapEntryV1" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "RetainedSetId" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ViewLineageMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ViewLineageMapEntryV1" } },
       ],
     },
     ViewLineageMapChildV1: {
@@ -504,7 +503,7 @@
     },
     ViewLineageMapEntryV1: {
       sequence: [
-        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "value", type: "RetainedSetId" },
       ],
     },
@@ -512,11 +511,11 @@
     ConflictSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0b01 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
         { name: "present", type: "bool" },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ConflictSetChildV1" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ConflictSetChildV1" } },
         // Inline entries: key suffixes for members inlined into this node.
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "SetEntryV1" } },
       ],
     },
     ConflictSetChildV1: {
@@ -530,10 +529,10 @@
     ContentSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0c01 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
         { name: "present", type: "bool" },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentSetChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ContentSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "SetEntryV1" } },
       ],
     },
     ContentSetChildV1: {
@@ -546,10 +545,10 @@
     RetainedSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0d01 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
         { name: "present", type: "bool" },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "RetainedSetChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "RetainedSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "SetEntryV1" } },
       ],
     },
     RetainedSetChildV1: {
@@ -566,10 +565,10 @@
     ProjectedCommitSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x1301 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
         { name: "present", type: "bool" },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ProjectedCommitSetChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ProjectedCommitSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "SetEntryV1" } },
       ],
     },
     ProjectedCommitSetChildV1: {
@@ -583,10 +582,10 @@
     ChangeSetNodeV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x1401 },
-        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "uint8" } },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
         { name: "present", type: "bool" },
-        { name: "children", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ChangeSetChildV1" } },
-        { name: "entries", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "SetEntryV1" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ChangeSetChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "SetEntryV1" } },
       ],
     },
     ChangeSetChildV1: {
@@ -599,7 +598,7 @@
     // Shared inline entry type for set nodes (no value, just suffix).
     SetEntryV1: {
       sequence: [
-        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "suffix", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
       ],
     },
 
@@ -624,16 +623,16 @@
     ViewLabelManifestV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x0e01 },
-        { name: "labels", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ViewLabelManifestEntryV1" } },
+        { name: "labels", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ViewLabelManifestEntryV1" } },
       ],
     },
     ViewLabelManifestEntryV1: {
       sequence: [
-        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "view", type: "ViewId" },
         // Zero or one full source ref (for example `refs/heads/main`). Native
         // labels remain short (`main`); this field only records import provenance.
-        { name: "original_git_refs", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" } },
+        { name: "original_git_refs", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" } },
         // Present on a label that is published as an annotated Git tag. Stored
         // so the tag object is the same wherever and whenever it is pushed.
         { name: "annotation", type: "optional", value_type: "LabelAnnotationV1" },
@@ -643,7 +642,7 @@
       sequence: [
         { name: "tagger", type: "ActorV1" },
         { name: "tagged_at", type: "TimestampV1" },
-        { name: "message", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
       ],
     },
     RepositoryEnvelopeV1: {
@@ -659,7 +658,7 @@
     EditV1: {
       sequence: [
         { name: "wire_tag", type: "uint16", const: 0x1001 },
-        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "operation", type: "EditOperationV1" },
       ],
     },
@@ -688,8 +687,8 @@
         { name: "operation_kind", type: "uint8", const: 1 },
         // Zero or one element. Arrays avoid the generator's unsupported optional
         // fields directly inside discriminated-union variants.
-        { name: "expected", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
-        { name: "replacement", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileValueV1" } },
+        { name: "expected", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "FileValueV1" } },
+        { name: "replacement", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "FileValueV1" } },
       ],
     },
 

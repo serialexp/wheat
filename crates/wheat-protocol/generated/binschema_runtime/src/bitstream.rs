@@ -315,12 +315,13 @@ impl BitStreamEncoder {
     }
 
     /// Write variable-length integer with specified encoding
-    /// Supported encodings: "der", "leb128", "ebml", "vlq"
+    /// Supported encodings: "der", "leb128", "leb128_canonical", "ebml", "vlq"
     #[inline]
     pub fn write_varlength(&mut self, value: u64, encoding: &str) -> Result<()> {
         match encoding {
             "der" => self.write_varlength_der(value),
-            "leb128" => self.write_varlength_leb128(value),
+            // The encoder always writes minimal LEB128, which is the canonical form.
+            "leb128" | "leb128_canonical" => self.write_varlength_leb128(value),
             "ebml" => self.write_varlength_ebml(value),
             "vlq" => self.write_varlength_vlq(value),
             _ => Err(BinSchemaError::InvalidValue(format!(
@@ -888,12 +889,13 @@ impl<'a> BitStreamDecoder<'a> {
     }
 
     /// Reads a variable-length integer with specified encoding
-    /// Supported encodings: "der", "leb128", "ebml", "vlq"
+    /// Supported encodings: "der", "leb128", "leb128_canonical", "ebml", "vlq"
     #[inline]
     pub fn read_varlength(&mut self, encoding: &str) -> Result<u64> {
         match encoding {
             "der" => self.read_varlength_der(),
-            "leb128" => self.read_varlength_leb128(),
+            "leb128" => self.read_leb128(false),
+            "leb128_canonical" => self.read_leb128(true),
             "ebml" => self.read_varlength_ebml(),
             "vlq" => self.read_varlength_vlq(),
             _ => Err(BinSchemaError::InvalidValue(format!(
@@ -974,25 +976,45 @@ impl<'a> BitStreamDecoder<'a> {
     /// LEB128 encoding: 7 bits per byte, continuation bit in MSB, little-endian
     #[inline]
     fn read_varlength_leb128(&mut self) -> Result<u64> {
+        self.read_leb128(false)
+    }
+
+    /// Unsigned LEB128 limited to 64 bits. The tenth byte may only carry bit 63;
+    /// later bytes may only pad (plain form). The canonical form also rejects
+    /// over-long encodings (a multi-byte encoding whose last byte is 0x00) and
+    /// any byte past the tenth, so each value has exactly one encoding.
+    #[inline]
+    fn read_leb128(&mut self, canonical: bool) -> Result<u64> {
         let mut result = 0u64;
-        let mut shift = 0u32;
+        let mut index = 0u32;
 
         loop {
             let byte = self.read_uint8()?;
-            result |= ((byte & 0x7F) as u64) << shift;
-            shift += 7;
-
-            if shift > 64 {
+            let payload = byte & 0x7F;
+            let allowed = match index {
+                0..=8 => 0x7F,
+                9 => 0x01,
+                _ => 0x00,
+            };
+            if payload & !allowed != 0 || (canonical && index == 9 && byte & 0x80 != 0) {
                 return Err(BinSchemaError::InvalidEncoding(
                     "LEB128 value too large".to_string(),
                 ));
             }
+            if index < 10 {
+                result |= (payload as u64) << (7 * index);
+            }
 
             if (byte & 0x80) == 0 {
-                break;
+                if canonical && byte == 0 && index > 0 {
+                    return Err(BinSchemaError::InvalidEncoding(
+                        "LEB128 encoding is not minimal (over-long form)".to_string(),
+                    ));
+                }
+                return Ok(result);
             }
+            index += 1;
         }
-        Ok(result)
     }
 
     /// EBML encoding: Leading zeros indicate width, self-synchronizing
@@ -1182,6 +1204,83 @@ impl<'a> BitStreamDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_leb(bytes: &[u8], encoding: &str) -> Result<u64> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        decoder.read_varlength(encoding)
+    }
+
+    const U64_MAX_LEB: [u8; 10] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+
+    #[test]
+    fn canonical_leb128_round_trips_minimal_forms() {
+        for value in [0u64, 127, 128, 16383, 16384, u64::MAX] {
+            let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+            encoder.write_varlength(value, "leb128_canonical").unwrap();
+            let bytes = encoder.finish();
+            assert_eq!(read_leb(&bytes, "leb128_canonical").unwrap(), value);
+        }
+        assert_eq!(
+            read_leb(&U64_MAX_LEB, "leb128_canonical").unwrap(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn canonical_leb128_rejects_over_long_forms() {
+        let over_long: [&[u8]; 4] = [
+            &[0x80, 0x00],
+            &[0x81, 0x00],
+            &[0xff, 0x00],
+            &[0x80, 0x80, 0x00],
+        ];
+        for bytes in over_long {
+            assert!(
+                matches!(
+                    read_leb(bytes, "leb128_canonical"),
+                    Err(BinSchemaError::InvalidEncoding(_))
+                ),
+                "{bytes:02x?}"
+            );
+            // Plain LEB128 accepts the padded form.
+            assert!(read_leb(bytes, "leb128").is_ok(), "{bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn leb128_rejects_values_above_64_bits() {
+        let tenth_too_big = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        let padded_past_ten = [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
+        ];
+        let cases: [&[u8]; 2] = [&tenth_too_big, &padded_past_ten];
+        for bytes in cases {
+            for encoding in ["leb128", "leb128_canonical"] {
+                assert!(
+                    matches!(
+                        read_leb(bytes, encoding),
+                        Err(BinSchemaError::InvalidEncoding(_))
+                    ),
+                    "{encoding} {bytes:02x?}"
+                );
+            }
+        }
+        assert_eq!(read_leb(&U64_MAX_LEB, "leb128").unwrap(), u64::MAX);
+        // An eleventh byte is never canonical, even one that carries no bits.
+        let eleven_bytes = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x81, 0x00,
+        ];
+        assert!(matches!(
+            read_leb(&eleven_bytes, "leb128_canonical"),
+            Err(BinSchemaError::InvalidEncoding(_))
+        ));
+        assert_eq!(read_leb(&eleven_bytes, "leb128").unwrap(), u64::MAX);
+        // Padding past the tenth byte that carries no bits is still plain LEB128.
+        let padded_zero = [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+        ];
+        assert_eq!(read_leb(&padded_zero, "leb128").unwrap(), 0);
+    }
 
     #[test]
     fn capacity_hint_sized_is_capped_by_how_many_items_the_bytes_left_hold() {

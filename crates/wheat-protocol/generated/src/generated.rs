@@ -60,9 +60,9 @@ impl WheatProtocolMessage {
                 for item in &v.server_id {
                     encoder.write_uint8(*item);
                 }
-                encoder.write_uint16(v.capabilities.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.capabilities.len() as u64, "leb128_canonical")?;
                 for item in &v.capabilities {
-                    encoder.write_uint16(item.len() as u16, Endianness::BigEndian);
+                    encoder.write_varlength(item.len() as u64, "leb128_canonical")?;
                     for b in item.as_bytes() {
                         encoder.write_uint8(*b);
                     }
@@ -71,7 +71,7 @@ impl WheatProtocolMessage {
             WheatProtocolMessage::ClientHello(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_uint16(v.selected_version, Endianness::BigEndian);
-                encoder.write_uint16(v.auth_token.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.auth_token.len() as u64, "leb128_canonical")?;
                 for item in &v.auth_token {
                     encoder.write_uint8(*item);
                 }
@@ -86,7 +86,7 @@ impl WheatProtocolMessage {
                 v.status.encode_into(encoder)?;
                 encoder.write_uint16(v.supported_range_min, Endianness::BigEndian);
                 encoder.write_uint16(v.supported_range_max, Endianness::BigEndian);
-                encoder.write_uint16(v.message.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.message.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.message.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
@@ -94,7 +94,7 @@ impl WheatProtocolMessage {
             }
             WheatProtocolMessage::RepositoryOpen(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint16(v.name.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.name.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.name.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
@@ -102,9 +102,9 @@ impl WheatProtocolMessage {
             }
             WheatProtocolMessage::RepositoryState(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint64(v.head_generation, Endianness::BigEndian);
+                encoder.write_varlength(v.head_generation, "leb128_canonical")?;
                 v.head_envelope.encode_into(encoder)?;
-                encoder.write_uint16(v.labels.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.labels.len() as u64, "leb128_canonical")?;
                 for item in &v.labels {
                     item.encode_into(encoder)?;
                 }
@@ -112,73 +112,73 @@ impl WheatProtocolMessage {
             }
             WheatProtocolMessage::ListLabels(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint16(v.cursor.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.cursor.len() as u64, "leb128_canonical")?;
                 for item in &v.cursor {
                     encoder.write_uint8(*item);
                 }
             }
             WheatProtocolMessage::ListLabelsResult(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint16(v.labels.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.labels.len() as u64, "leb128_canonical")?;
                 for item in &v.labels {
                     item.encode_into(encoder)?;
                 }
-                encoder.write_uint16(v.next_cursor.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.next_cursor.len() as u64, "leb128_canonical")?;
                 for item in &v.next_cursor {
                     encoder.write_uint8(*item);
                 }
             }
             WheatProtocolMessage::FetchRequest(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
                 v.want_envelope.encode_into(encoder)?;
                 v.since_envelope.encode_into(encoder)?;
             }
             WheatProtocolMessage::ObjectBatch(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint32(v.sequence, Endianness::BigEndian);
-                encoder.write_uint16(v.objects.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.sequence, "leb128_canonical")?;
+                encoder.write_varlength(v.objects.len() as u64, "leb128_canonical")?;
                 for item in &v.objects {
                     item.encode_into(encoder)?;
                 }
             }
             WheatProtocolMessage::ObjectWant(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint32(v.want_sequence, Endianness::BigEndian);
-                encoder.write_uint16(v.ids.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.want_sequence, "leb128_canonical")?;
+                encoder.write_varlength(v.ids.len() as u64, "leb128_canonical")?;
                 for item in &v.ids {
                     item.encode_into(encoder)?;
                 }
             }
             WheatProtocolMessage::FetchComplete(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
             }
             WheatProtocolMessage::FetchPushEnd(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint64(v.pushed_objects, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.pushed_objects, "leb128_canonical")?;
                 encoder.write_uint8(if v.incremental { 1 } else { 0 });
             }
             WheatProtocolMessage::ObjectWantReply(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint32(v.want_sequence, Endianness::BigEndian);
-                encoder.write_uint16(v.objects.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.want_sequence, "leb128_canonical")?;
+                encoder.write_varlength(v.objects.len() as u64, "leb128_canonical")?;
                 for item in &v.objects {
                     item.encode_into(encoder)?;
                 }
             }
             WheatProtocolMessage::ObjectChunk(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
                 v.object_id.encode_into(encoder)?;
-                encoder.write_uint64(v.offset, Endianness::BigEndian);
-                encoder.write_uint32(v.data.len() as u32, Endianness::BigEndian);
+                encoder.write_varlength(v.offset, "leb128_canonical")?;
+                encoder.write_varlength(v.data.len() as u64, "leb128_canonical")?;
                 for item in &v.data {
                     encoder.write_uint8(*item);
                 }
@@ -186,27 +186,27 @@ impl WheatProtocolMessage {
             }
             WheatProtocolMessage::ContentFetchRequest(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint16(v.content_ids.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.content_ids.len() as u64, "leb128_canonical")?;
                 for item in &v.content_ids {
                     item.encode_into(encoder)?;
                 }
             }
             WheatProtocolMessage::ContentBatch(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint32(v.sequence, Endianness::BigEndian);
-                encoder.write_uint16(v.contents.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.sequence, "leb128_canonical")?;
+                encoder.write_varlength(v.contents.len() as u64, "leb128_canonical")?;
                 for item in &v.contents {
                     item.encode_into(encoder)?;
                 }
             }
             WheatProtocolMessage::ContentChunk(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
                 v.content_id.encode_into(encoder)?;
-                encoder.write_uint64(v.offset, Endianness::BigEndian);
-                encoder.write_uint32(v.data.len() as u32, Endianness::BigEndian);
+                encoder.write_varlength(v.offset, "leb128_canonical")?;
+                encoder.write_varlength(v.data.len() as u64, "leb128_canonical")?;
                 for item in &v.data {
                     encoder.write_uint8(*item);
                 }
@@ -214,56 +214,56 @@ impl WheatProtocolMessage {
             }
             WheatProtocolMessage::ContentRedirect(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
                 v.content_id.encode_into(encoder)?;
-                encoder.write_uint16(v.url.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.url.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.url.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
                 }
-                encoder.write_uint32(v.expires_seconds, Endianness::BigEndian);
+                encoder.write_varlength(v.expires_seconds, "leb128_canonical")?;
             }
             WheatProtocolMessage::PublishRequest(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
                 v.publish_key.encode_into(encoder)?;
                 v.envelope_id.encode_into(encoder)?;
-                encoder.write_uint64(v.expected_generation, Endianness::BigEndian);
+                encoder.write_varlength(v.expected_generation, "leb128_canonical")?;
                 v.expected_envelope.encode_into(encoder)?;
                 encoder.write_uint8(if v.force { 1 } else { 0 });
             }
             WheatProtocolMessage::ObjectsNeeded(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint16(v.ids.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.ids.len() as u64, "leb128_canonical")?;
                 for item in &v.ids {
                     item.encode_into(encoder)?;
                 }
             }
             WheatProtocolMessage::ObjectsComplete(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
             }
             WheatProtocolMessage::ContentNeeded(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint16(v.content_ids.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.content_ids.len() as u64, "leb128_canonical")?;
                 for item in &v.content_ids {
                     item.encode_into(encoder)?;
                 }
             }
             WheatProtocolMessage::ContentUploadComplete(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
             }
             WheatProtocolMessage::PublishCommit(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
             }
             WheatProtocolMessage::PublishProgress(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint16(v.phase.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.phase.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.phase.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
@@ -272,12 +272,12 @@ impl WheatProtocolMessage {
             }
             WheatProtocolMessage::PublishResult(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
                 v.receipt_id.encode_into(encoder)?;
                 v.status.encode_into(encoder)?;
-                encoder.write_uint64(v.new_generation, Endianness::BigEndian);
+                encoder.write_varlength(v.new_generation, "leb128_canonical")?;
                 v.new_envelope.encode_into(encoder)?;
-                encoder.write_uint16(v.message.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.message.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.message.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
@@ -285,28 +285,28 @@ impl WheatProtocolMessage {
             }
             WheatProtocolMessage::ContentComplete(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
             }
             WheatProtocolMessage::PublishPushEnd(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint32(v.pushed_objects, Endianness::BigEndian);
-                encoder.write_uint32(v.pushed_contents, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.pushed_objects, "leb128_canonical")?;
+                encoder.write_varlength(v.pushed_contents, "leb128_canonical")?;
             }
             WheatProtocolMessage::Credit(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
-                encoder.write_uint32(v.ack_through_sequence, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.ack_through_sequence, "leb128_canonical")?;
                 encoder.write_uint32(v.window_bytes, Endianness::BigEndian);
                 encoder.write_uint16(v.window_messages, Endianness::BigEndian);
             }
             WheatProtocolMessage::Error(v) => {
                 encoder.write_uint8(v.message_type);
-                encoder.write_uint32(v.op_id, Endianness::BigEndian);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
                 encoder.write_uint16(v.code, Endianness::BigEndian);
                 v.scope.encode_into(encoder)?;
                 encoder.write_uint8(if v.retryable { 1 } else { 0 });
-                encoder.write_uint16(v.message.len() as u16, Endianness::BigEndian);
+                encoder.write_varlength(v.message.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.message.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
@@ -528,7 +528,7 @@ impl LabelEntry {
     }
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_u16_be(self.name.len() as u16);
+        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.name.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
@@ -543,7 +543,7 @@ impl LabelEntry {
     }
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let name = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
@@ -567,7 +567,7 @@ impl ObjectEntry {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         self.id.encode_into(encoder)?;
-        encoder.write_u32_be(self.data.len() as u32);
+        encoder.write_varlength(self.data.len() as u64, "leb128_canonical")?;
         for item in &self.data {
             encoder.write_byte(*item);
         }
@@ -581,7 +581,7 @@ impl ObjectEntry {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let id = Digest256::decode_with_decoder(decoder)?;
-        let length = decoder.read_u32_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let data = decoder.read_bytes_vec(length)?;
         Ok(Self { id, data })
     }
@@ -602,7 +602,7 @@ impl ContentEntry {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         self.id.encode_into(encoder)?;
-        encoder.write_u32_be(self.data.len() as u32);
+        encoder.write_varlength(self.data.len() as u64, "leb128_canonical")?;
         for item in &self.data {
             encoder.write_byte(*item);
         }
@@ -616,7 +616,7 @@ impl ContentEntry {
 
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let id = Digest256::decode_with_decoder(decoder)?;
-        let length = decoder.read_u32_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let data = decoder.read_bytes_vec(length)?;
         Ok(Self { id, data })
     }
@@ -655,9 +655,9 @@ impl ServerHelloInput {
         for item in &self.server_id {
             encoder.write_byte(*item);
         }
-        encoder.write_u16_be(self.capabilities.len() as u16);
+        encoder.write_varlength(self.capabilities.len() as u64, "leb128_canonical")?;
         for item in &self.capabilities {
-            encoder.write_u16_be(item.len() as u16);
+            encoder.write_varlength(item.len() as u64, "leb128_canonical")?;
             for b in item.as_bytes() {
                 encoder.write_byte(*b);
             }
@@ -683,10 +683,10 @@ impl ServerHelloOutput {
         let protocol_version_min = decoder.read_u16_be()?;
         let protocol_version_max = decoder.read_u16_be()?;
         let server_id = decoder.read_bytes_vec(32)?;
-        let length = decoder.read_u16_be()? as usize;
-        let mut capabilities = Vec::with_capacity(decoder.capacity_hint_sized(length, 2));
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut capabilities = Vec::with_capacity(decoder.capacity_hint(length));
         for _ in 0..length {
-            let str_len = decoder.read_u16_be()? as usize;
+            let str_len = decoder.read_varlength("leb128_canonical")? as usize;
             let str_bytes = decoder.read_bytes_vec(str_len)?;
             let item = std::string::String::from_utf8(str_bytes)
                 .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
@@ -760,7 +760,7 @@ impl ClientHelloInput {
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(2);
         encoder.write_u16_be(self.selected_version);
-        encoder.write_u16_be(self.auth_token.len() as u16);
+        encoder.write_varlength(self.auth_token.len() as u64, "leb128_canonical")?;
         for item in &self.auth_token {
             encoder.write_byte(*item);
         }
@@ -785,7 +785,7 @@ impl ClientHelloOutput {
             )));
         }
         let selected_version = decoder.read_u16_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let auth_token = decoder.read_bytes_vec(length)?;
         let receive_window_bytes = decoder.read_u32_be()?;
         let receive_window_messages = decoder.read_u16_be()?;
@@ -1103,7 +1103,7 @@ impl SessionEstablishedInput {
         self.status.encode_into(encoder)?;
         encoder.write_u16_be(self.supported_range_min);
         encoder.write_u16_be(self.supported_range_max);
-        encoder.write_u16_be(self.message.len() as u16);
+        encoder.write_varlength(self.message.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.message.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
@@ -1132,7 +1132,7 @@ impl SessionEstablishedOutput {
         let status = SessionEstablishedStatus::decode_with_decoder(decoder)?;
         let supported_range_min = decoder.read_u16_be()?;
         let supported_range_max = decoder.read_u16_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let message = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
@@ -1206,7 +1206,7 @@ impl RepositoryOpenInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(16);
-        encoder.write_u16_be(self.name.len() as u16);
+        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.name.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
@@ -1229,7 +1229,7 @@ impl RepositoryOpenOutput {
                 message_type
             )));
         }
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let name = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
@@ -1286,9 +1286,9 @@ impl RepositoryStateInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(17);
-        encoder.write_u64_be(self.head_generation);
+        encoder.write_varlength(self.head_generation, "leb128_canonical")?;
         self.head_envelope.encode_into(encoder)?;
-        encoder.write_u16_be(self.labels.len() as u16);
+        encoder.write_varlength(self.labels.len() as u64, "leb128_canonical")?;
         for item in &self.labels {
             item.encode_into(encoder)?;
         }
@@ -1311,10 +1311,10 @@ impl RepositoryStateOutput {
                 message_type
             )));
         }
-        let head_generation = decoder.read_u64_be()?;
+        let head_generation = decoder.read_varlength("leb128_canonical")?;
         let head_envelope = Digest256::decode_with_decoder(decoder)?;
-        let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = LabelEntry::decode_with_decoder(decoder)?;
             labels.push(item);
@@ -1361,14 +1361,14 @@ impl From<RepositoryStateInput> for RepositoryStateOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListLabelsInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub cursor: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListLabelsOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub cursor: Vec<u8>,
 }
 
@@ -1383,8 +1383,8 @@ impl ListLabelsInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(18);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u16_be(self.cursor.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.cursor.len() as u64, "leb128_canonical")?;
         for item in &self.cursor {
             encoder.write_byte(*item);
         }
@@ -1406,8 +1406,8 @@ impl ListLabelsOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let cursor = decoder.read_bytes_vec(length)?;
         Ok(Self {
             message_type,
@@ -1444,7 +1444,7 @@ impl From<ListLabelsInput> for ListLabelsOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListLabelsResultInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub labels: Vec<LabelEntry>,
     pub next_cursor: Vec<u8>,
 }
@@ -1452,7 +1452,7 @@ pub struct ListLabelsResultInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListLabelsResultOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub labels: Vec<LabelEntry>,
     pub next_cursor: Vec<u8>,
 }
@@ -1468,12 +1468,12 @@ impl ListLabelsResultInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(19);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u16_be(self.labels.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.labels.len() as u64, "leb128_canonical")?;
         for item in &self.labels {
             item.encode_into(encoder)?;
         }
-        encoder.write_u16_be(self.next_cursor.len() as u16);
+        encoder.write_varlength(self.next_cursor.len() as u64, "leb128_canonical")?;
         for item in &self.next_cursor {
             encoder.write_byte(*item);
         }
@@ -1495,14 +1495,14 @@ impl ListLabelsResultOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 34));
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = LabelEntry::decode_with_decoder(decoder)?;
             labels.push(item);
         }
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let next_cursor = decoder.read_bytes_vec(length)?;
         Ok(Self {
             message_type,
@@ -1542,7 +1542,7 @@ impl From<ListLabelsResultInput> for ListLabelsResultOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchRequestInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub want_envelope: Digest256,
     pub since_envelope: Digest256,
 }
@@ -1550,7 +1550,7 @@ pub struct FetchRequestInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchRequestOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub want_envelope: Digest256,
     pub since_envelope: Digest256,
 }
@@ -1566,7 +1566,7 @@ impl FetchRequestInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(32);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         self.want_envelope.encode_into(encoder)?;
         self.since_envelope.encode_into(encoder)?;
         Ok(())
@@ -1587,7 +1587,7 @@ impl FetchRequestOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         let want_envelope = Digest256::decode_with_decoder(decoder)?;
         let since_envelope = Digest256::decode_with_decoder(decoder)?;
         Ok(Self {
@@ -1628,16 +1628,16 @@ impl From<FetchRequestInput> for FetchRequestOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectBatchInput {
-    pub op_id: u32,
-    pub sequence: u32,
+    pub op_id: u64,
+    pub sequence: u64,
     pub objects: Vec<ObjectEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectBatchOutput {
     pub message_type: u8,
-    pub op_id: u32,
-    pub sequence: u32,
+    pub op_id: u64,
+    pub sequence: u64,
     pub objects: Vec<ObjectEntry>,
 }
 
@@ -1652,9 +1652,9 @@ impl ObjectBatchInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(33);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u32_be(self.sequence);
-        encoder.write_u16_be(self.objects.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.sequence, "leb128_canonical")?;
+        encoder.write_varlength(self.objects.len() as u64, "leb128_canonical")?;
         for item in &self.objects {
             item.encode_into(encoder)?;
         }
@@ -1676,10 +1676,10 @@ impl ObjectBatchOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let sequence = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
-        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let sequence = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ObjectEntry::decode_with_decoder(decoder)?;
             objects.push(item);
@@ -1722,16 +1722,16 @@ impl From<ObjectBatchInput> for ObjectBatchOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectWantInput {
-    pub op_id: u32,
-    pub want_sequence: u32,
+    pub op_id: u64,
+    pub want_sequence: u64,
     pub ids: Vec<Digest256>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectWantOutput {
     pub message_type: u8,
-    pub op_id: u32,
-    pub want_sequence: u32,
+    pub op_id: u64,
+    pub want_sequence: u64,
     pub ids: Vec<Digest256>,
 }
 
@@ -1746,9 +1746,9 @@ impl ObjectWantInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(34);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u32_be(self.want_sequence);
-        encoder.write_u16_be(self.ids.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.want_sequence, "leb128_canonical")?;
+        encoder.write_varlength(self.ids.len() as u64, "leb128_canonical")?;
         for item in &self.ids {
             item.encode_into(encoder)?;
         }
@@ -1770,9 +1770,9 @@ impl ObjectWantOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let want_sequence = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let want_sequence = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let mut ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
@@ -1816,13 +1816,13 @@ impl From<ObjectWantInput> for ObjectWantOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchCompleteInput {
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchCompleteOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 pub type FetchComplete = FetchCompleteOutput;
@@ -1836,7 +1836,7 @@ impl FetchCompleteInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(35);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         Ok(())
     }
 }
@@ -1855,7 +1855,7 @@ impl FetchCompleteOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         Ok(Self {
             message_type,
             op_id,
@@ -1886,7 +1886,7 @@ impl From<FetchCompleteInput> for FetchCompleteOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchPushEndInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub pushed_objects: u64,
     pub incremental: bool,
 }
@@ -1894,7 +1894,7 @@ pub struct FetchPushEndInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchPushEndOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub pushed_objects: u64,
     pub incremental: bool,
 }
@@ -1910,8 +1910,8 @@ impl FetchPushEndInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(36);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u64_be(self.pushed_objects);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.pushed_objects, "leb128_canonical")?;
         encoder.write_byte(if self.incremental { 1 } else { 0 });
         Ok(())
     }
@@ -1931,8 +1931,8 @@ impl FetchPushEndOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let pushed_objects = decoder.read_u64_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let pushed_objects = decoder.read_varlength("leb128_canonical")?;
         let incremental = decoder.read_byte()? != 0;
         Ok(Self {
             message_type,
@@ -1972,16 +1972,16 @@ impl From<FetchPushEndInput> for FetchPushEndOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectWantReplyInput {
-    pub op_id: u32,
-    pub want_sequence: u32,
+    pub op_id: u64,
+    pub want_sequence: u64,
     pub objects: Vec<ObjectEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectWantReplyOutput {
     pub message_type: u8,
-    pub op_id: u32,
-    pub want_sequence: u32,
+    pub op_id: u64,
+    pub want_sequence: u64,
     pub objects: Vec<ObjectEntry>,
 }
 
@@ -1996,9 +1996,9 @@ impl ObjectWantReplyInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(37);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u32_be(self.want_sequence);
-        encoder.write_u16_be(self.objects.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.want_sequence, "leb128_canonical")?;
+        encoder.write_varlength(self.objects.len() as u64, "leb128_canonical")?;
         for item in &self.objects {
             item.encode_into(encoder)?;
         }
@@ -2020,10 +2020,10 @@ impl ObjectWantReplyOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let want_sequence = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
-        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let want_sequence = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut objects = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ObjectEntry::decode_with_decoder(decoder)?;
             objects.push(item);
@@ -2066,7 +2066,7 @@ impl From<ObjectWantReplyInput> for ObjectWantReplyOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectChunkInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub object_id: Digest256,
     pub offset: u64,
     pub data: Vec<u8>,
@@ -2076,7 +2076,7 @@ pub struct ObjectChunkInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectChunkOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub object_id: Digest256,
     pub offset: u64,
     pub data: Vec<u8>,
@@ -2094,10 +2094,10 @@ impl ObjectChunkInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(38);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         self.object_id.encode_into(encoder)?;
-        encoder.write_u64_be(self.offset);
-        encoder.write_u32_be(self.data.len() as u32);
+        encoder.write_varlength(self.offset, "leb128_canonical")?;
+        encoder.write_varlength(self.data.len() as u64, "leb128_canonical")?;
         for item in &self.data {
             encoder.write_byte(*item);
         }
@@ -2120,10 +2120,10 @@ impl ObjectChunkOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         let object_id = Digest256::decode_with_decoder(decoder)?;
-        let offset = decoder.read_u64_be()?;
-        let length = decoder.read_u32_be()? as usize;
+        let offset = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let data = decoder.read_bytes_vec(length)?;
         let is_final = decoder.read_byte()? != 0;
         Ok(Self {
@@ -2170,14 +2170,14 @@ impl From<ObjectChunkInput> for ObjectChunkOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentFetchRequestInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_ids: Vec<Digest256>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentFetchRequestOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_ids: Vec<Digest256>,
 }
 
@@ -2192,8 +2192,8 @@ impl ContentFetchRequestInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(48);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u16_be(self.content_ids.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.content_ids.len() as u64, "leb128_canonical")?;
         for item in &self.content_ids {
             item.encode_into(encoder)?;
         }
@@ -2215,8 +2215,8 @@ impl ContentFetchRequestOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let mut content_ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
@@ -2257,16 +2257,16 @@ impl From<ContentFetchRequestInput> for ContentFetchRequestOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentBatchInput {
-    pub op_id: u32,
-    pub sequence: u32,
+    pub op_id: u64,
+    pub sequence: u64,
     pub contents: Vec<ContentEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentBatchOutput {
     pub message_type: u8,
-    pub op_id: u32,
-    pub sequence: u32,
+    pub op_id: u64,
+    pub sequence: u64,
     pub contents: Vec<ContentEntry>,
 }
 
@@ -2281,9 +2281,9 @@ impl ContentBatchInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(49);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u32_be(self.sequence);
-        encoder.write_u16_be(self.contents.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.sequence, "leb128_canonical")?;
+        encoder.write_varlength(self.contents.len() as u64, "leb128_canonical")?;
         for item in &self.contents {
             item.encode_into(encoder)?;
         }
@@ -2305,10 +2305,10 @@ impl ContentBatchOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let sequence = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
-        let mut contents = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let sequence = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut contents = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
         for _ in 0..length {
             let item = ContentEntry::decode_with_decoder(decoder)?;
             contents.push(item);
@@ -2351,7 +2351,7 @@ impl From<ContentBatchInput> for ContentBatchOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentChunkInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_id: Digest256,
     pub offset: u64,
     pub data: Vec<u8>,
@@ -2361,7 +2361,7 @@ pub struct ContentChunkInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentChunkOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_id: Digest256,
     pub offset: u64,
     pub data: Vec<u8>,
@@ -2379,10 +2379,10 @@ impl ContentChunkInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(50);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         self.content_id.encode_into(encoder)?;
-        encoder.write_u64_be(self.offset);
-        encoder.write_u32_be(self.data.len() as u32);
+        encoder.write_varlength(self.offset, "leb128_canonical")?;
+        encoder.write_varlength(self.data.len() as u64, "leb128_canonical")?;
         for item in &self.data {
             encoder.write_byte(*item);
         }
@@ -2405,10 +2405,10 @@ impl ContentChunkOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         let content_id = Digest256::decode_with_decoder(decoder)?;
-        let offset = decoder.read_u64_be()?;
-        let length = decoder.read_u32_be()? as usize;
+        let offset = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let data = decoder.read_bytes_vec(length)?;
         let is_final = decoder.read_byte()? != 0;
         Ok(Self {
@@ -2455,19 +2455,19 @@ impl From<ContentChunkInput> for ContentChunkOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentRedirectInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_id: Digest256,
     pub url: std::string::String,
-    pub expires_seconds: u32,
+    pub expires_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentRedirectOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_id: Digest256,
     pub url: std::string::String,
-    pub expires_seconds: u32,
+    pub expires_seconds: u64,
 }
 
 pub type ContentRedirect = ContentRedirectOutput;
@@ -2481,14 +2481,14 @@ impl ContentRedirectInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(51);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         self.content_id.encode_into(encoder)?;
-        encoder.write_u16_be(self.url.len() as u16);
+        encoder.write_varlength(self.url.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.url.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
         }
-        encoder.write_u32_be(self.expires_seconds);
+        encoder.write_varlength(self.expires_seconds, "leb128_canonical")?;
         Ok(())
     }
 }
@@ -2507,13 +2507,13 @@ impl ContentRedirectOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         let content_id = Digest256::decode_with_decoder(decoder)?;
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let url = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
-        let expires_seconds = decoder.read_u32_be()?;
+        let expires_seconds = decoder.read_varlength("leb128_canonical")?;
         Ok(Self {
             message_type,
             op_id,
@@ -2555,7 +2555,7 @@ impl From<ContentRedirectInput> for ContentRedirectOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishRequestInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub publish_key: Uuid128,
     pub envelope_id: Digest256,
     pub expected_generation: u64,
@@ -2566,7 +2566,7 @@ pub struct PublishRequestInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishRequestOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub publish_key: Uuid128,
     pub envelope_id: Digest256,
     pub expected_generation: u64,
@@ -2585,10 +2585,10 @@ impl PublishRequestInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(64);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         self.publish_key.encode_into(encoder)?;
         self.envelope_id.encode_into(encoder)?;
-        encoder.write_u64_be(self.expected_generation);
+        encoder.write_varlength(self.expected_generation, "leb128_canonical")?;
         self.expected_envelope.encode_into(encoder)?;
         encoder.write_byte(if self.force { 1 } else { 0 });
         Ok(())
@@ -2609,10 +2609,10 @@ impl PublishRequestOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         let publish_key = Uuid128::decode_with_decoder(decoder)?;
         let envelope_id = Digest256::decode_with_decoder(decoder)?;
-        let expected_generation = decoder.read_u64_be()?;
+        let expected_generation = decoder.read_varlength("leb128_canonical")?;
         let expected_envelope = Digest256::decode_with_decoder(decoder)?;
         let force = decoder.read_byte()? != 0;
         Ok(Self {
@@ -2662,14 +2662,14 @@ impl From<PublishRequestInput> for PublishRequestOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectsNeededInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub ids: Vec<Digest256>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectsNeededOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub ids: Vec<Digest256>,
 }
 
@@ -2684,8 +2684,8 @@ impl ObjectsNeededInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(65);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u16_be(self.ids.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.ids.len() as u64, "leb128_canonical")?;
         for item in &self.ids {
             item.encode_into(encoder)?;
         }
@@ -2707,8 +2707,8 @@ impl ObjectsNeededOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let mut ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
@@ -2749,13 +2749,13 @@ impl From<ObjectsNeededInput> for ObjectsNeededOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectsCompleteInput {
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectsCompleteOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 pub type ObjectsComplete = ObjectsCompleteOutput;
@@ -2769,7 +2769,7 @@ impl ObjectsCompleteInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(66);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         Ok(())
     }
 }
@@ -2788,7 +2788,7 @@ impl ObjectsCompleteOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         Ok(Self {
             message_type,
             op_id,
@@ -2819,14 +2819,14 @@ impl From<ObjectsCompleteInput> for ObjectsCompleteOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentNeededInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_ids: Vec<Digest256>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentNeededOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub content_ids: Vec<Digest256>,
 }
 
@@ -2841,8 +2841,8 @@ impl ContentNeededInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(67);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u16_be(self.content_ids.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.content_ids.len() as u64, "leb128_canonical")?;
         for item in &self.content_ids {
             item.encode_into(encoder)?;
         }
@@ -2864,8 +2864,8 @@ impl ContentNeededOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let mut content_ids = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
         for _ in 0..length {
             let item = Digest256::decode_with_decoder(decoder)?;
@@ -2906,13 +2906,13 @@ impl From<ContentNeededInput> for ContentNeededOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentUploadCompleteInput {
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentUploadCompleteOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 pub type ContentUploadComplete = ContentUploadCompleteOutput;
@@ -2926,7 +2926,7 @@ impl ContentUploadCompleteInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(70);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         Ok(())
     }
 }
@@ -2945,7 +2945,7 @@ impl ContentUploadCompleteOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         Ok(Self {
             message_type,
             op_id,
@@ -2976,13 +2976,13 @@ impl From<ContentUploadCompleteInput> for ContentUploadCompleteOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentCompleteInput {
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentCompleteOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 pub type ContentComplete = ContentCompleteOutput;
@@ -2996,7 +2996,7 @@ impl ContentCompleteInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(74);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         Ok(())
     }
 }
@@ -3015,7 +3015,7 @@ impl ContentCompleteOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         Ok(Self {
             message_type,
             op_id,
@@ -3046,17 +3046,17 @@ impl From<ContentCompleteInput> for ContentCompleteOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishPushEndInput {
-    pub op_id: u32,
-    pub pushed_objects: u32,
-    pub pushed_contents: u32,
+    pub op_id: u64,
+    pub pushed_objects: u64,
+    pub pushed_contents: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishPushEndOutput {
     pub message_type: u8,
-    pub op_id: u32,
-    pub pushed_objects: u32,
-    pub pushed_contents: u32,
+    pub op_id: u64,
+    pub pushed_objects: u64,
+    pub pushed_contents: u64,
 }
 
 pub type PublishPushEnd = PublishPushEndOutput;
@@ -3070,9 +3070,9 @@ impl PublishPushEndInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(75);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u32_be(self.pushed_objects);
-        encoder.write_u32_be(self.pushed_contents);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.pushed_objects, "leb128_canonical")?;
+        encoder.write_varlength(self.pushed_contents, "leb128_canonical")?;
         Ok(())
     }
 }
@@ -3091,9 +3091,9 @@ impl PublishPushEndOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let pushed_objects = decoder.read_u32_be()?;
-        let pushed_contents = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let pushed_objects = decoder.read_varlength("leb128_canonical")?;
+        let pushed_contents = decoder.read_varlength("leb128_canonical")?;
         Ok(Self {
             message_type,
             op_id,
@@ -3132,13 +3132,13 @@ impl From<PublishPushEndInput> for PublishPushEndOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishCommitInput {
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishCommitOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
 }
 
 pub type PublishCommit = PublishCommitOutput;
@@ -3152,7 +3152,7 @@ impl PublishCommitInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(71);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         Ok(())
     }
 }
@@ -3171,7 +3171,7 @@ impl PublishCommitOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         Ok(Self {
             message_type,
             op_id,
@@ -3202,7 +3202,7 @@ impl From<PublishCommitInput> for PublishCommitOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishProgressInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub phase: std::string::String,
     pub percent: u8,
 }
@@ -3210,7 +3210,7 @@ pub struct PublishProgressInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishProgressOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub phase: std::string::String,
     pub percent: u8,
 }
@@ -3226,8 +3226,8 @@ impl PublishProgressInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(72);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u16_be(self.phase.len() as u16);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.phase.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.phase.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
@@ -3251,8 +3251,8 @@ impl PublishProgressOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let length = decoder.read_u16_be()? as usize;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let phase = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
@@ -3664,7 +3664,7 @@ impl From<PublishStatusErrorInput> for PublishStatusErrorOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishResultInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub receipt_id: Uuid128,
     pub status: PublishResultStatus,
     pub new_generation: u64,
@@ -3675,7 +3675,7 @@ pub struct PublishResultInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishResultOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub receipt_id: Uuid128,
     pub status: PublishResultStatus,
     pub new_generation: u64,
@@ -3694,12 +3694,12 @@ impl PublishResultInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(73);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         self.receipt_id.encode_into(encoder)?;
         self.status.encode_into(encoder)?;
-        encoder.write_u64_be(self.new_generation);
+        encoder.write_varlength(self.new_generation, "leb128_canonical")?;
         self.new_envelope.encode_into(encoder)?;
-        encoder.write_u16_be(self.message.len() as u16);
+        encoder.write_varlength(self.message.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.message.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
@@ -3722,12 +3722,12 @@ impl PublishResultOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         let receipt_id = Uuid128::decode_with_decoder(decoder)?;
         let status = PublishResultStatus::decode_with_decoder(decoder)?;
-        let new_generation = decoder.read_u64_be()?;
+        let new_generation = decoder.read_varlength("leb128_canonical")?;
         let new_envelope = Digest256::decode_with_decoder(decoder)?;
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let message = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
@@ -3778,8 +3778,8 @@ impl From<PublishResultInput> for PublishResultOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreditInput {
-    pub op_id: u32,
-    pub ack_through_sequence: u32,
+    pub op_id: u64,
+    pub ack_through_sequence: u64,
     pub window_bytes: u32,
     pub window_messages: u16,
 }
@@ -3787,8 +3787,8 @@ pub struct CreditInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreditOutput {
     pub message_type: u8,
-    pub op_id: u32,
-    pub ack_through_sequence: u32,
+    pub op_id: u64,
+    pub ack_through_sequence: u64,
     pub window_bytes: u32,
     pub window_messages: u16,
 }
@@ -3804,8 +3804,8 @@ impl CreditInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(96);
-        encoder.write_u32_be(self.op_id);
-        encoder.write_u32_be(self.ack_through_sequence);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.ack_through_sequence, "leb128_canonical")?;
         encoder.write_u32_be(self.window_bytes);
         encoder.write_u16_be(self.window_messages);
         Ok(())
@@ -3826,8 +3826,8 @@ impl CreditOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
-        let ack_through_sequence = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let ack_through_sequence = decoder.read_varlength("leb128_canonical")?;
         let window_bytes = decoder.read_u32_be()?;
         let window_messages = decoder.read_u16_be()?;
         Ok(Self {
@@ -4039,7 +4039,7 @@ impl From<ErrorScopeOperationInput> for ErrorScopeOperationOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErrorInput {
-    pub op_id: u32,
+    pub op_id: u64,
     pub code: u16,
     pub scope: ErrorScope,
     pub retryable: bool,
@@ -4050,7 +4050,7 @@ pub struct ErrorInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErrorOutput {
     pub message_type: u8,
-    pub op_id: u32,
+    pub op_id: u64,
     pub code: u16,
     pub scope: ErrorScope,
     pub retryable: bool,
@@ -4069,11 +4069,11 @@ impl ErrorInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(112);
-        encoder.write_u32_be(self.op_id);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
         encoder.write_u16_be(self.code);
         self.scope.encode_into(encoder)?;
         encoder.write_byte(if self.retryable { 1 } else { 0 });
-        encoder.write_u16_be(self.message.len() as u16);
+        encoder.write_varlength(self.message.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.message.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
@@ -4097,11 +4097,11 @@ impl ErrorOutput {
                 message_type
             )));
         }
-        let op_id = decoder.read_u32_be()?;
+        let op_id = decoder.read_varlength("leb128_canonical")?;
         let code = decoder.read_u16_be()?;
         let scope = ErrorScope::decode_with_decoder(decoder)?;
         let retryable = decoder.read_byte()? != 0;
-        let length = decoder.read_u16_be()? as usize;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let message = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;

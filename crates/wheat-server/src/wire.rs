@@ -52,7 +52,7 @@ pub async fn recv(
 /// Send an Error message to the client.
 pub async fn send_error(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     code: u16,
     scope: ErrorScope,
     retryable: bool,
@@ -76,7 +76,7 @@ pub async fn send_error(
 /// Send an operation-scoped, non-retryable Error about one object.
 pub async fn send_object_error(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     code: u16,
     message: &str,
     object: ObjectId,
@@ -129,7 +129,7 @@ pub fn digest_to_content_id(d: &Digest256) -> Result<ContentId, ConnectionError>
 /// Build a PublishResult message for a publish that was not published, which has no
 /// receipt.
 pub fn publish_result(
-    op_id: u32,
+    op_id: u64,
     status: PublishResultStatus,
     generation: u64,
     envelope: &[u8; 32],
@@ -141,7 +141,7 @@ pub fn publish_result(
 /// Build the PublishResult of a publish published in `head`: `already_committed` when
 /// it was published by an earlier sending with the same key.
 pub fn publish_published(
-    op_id: u32,
+    op_id: u64,
     repeated: bool,
     receipt: [u8; 16],
     head: RepositoryHead,
@@ -164,7 +164,7 @@ pub fn publish_published(
 }
 
 fn result_with_receipt(
-    op_id: u32,
+    op_id: u64,
     status: PublishResultStatus,
     receipt: [u8; 16],
     generation: u64,

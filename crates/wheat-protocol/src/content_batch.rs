@@ -10,15 +10,15 @@ use crate::{
 /// [`MAX_CONTENT_BATCH_SIZE`] and [`MAX_CONTENT_BATCH_ITEMS`]. It closes a batch
 /// before a blob would push it past either, so no message outgrows the limits.
 pub struct ContentBatcher {
-    op_id: u32,
-    sequence: u32,
+    op_id: u64,
+    sequence: u64,
     contents: Vec<ContentEntry>,
     bytes: usize,
 }
 
 impl ContentBatcher {
     #[must_use]
-    pub fn new(op_id: u32) -> Self {
+    pub fn new(op_id: u64) -> Self {
         Self {
             op_id,
             sequence: 0,
@@ -29,7 +29,7 @@ impl ContentBatcher {
 
     /// The operation the batches belong to.
     #[must_use]
-    pub fn op_id(&self) -> u32 {
+    pub fn op_id(&self) -> u64 {
         self.op_id
     }
 
@@ -73,7 +73,7 @@ impl ContentBatcher {
 /// Blob `id` as `ContentChunk` messages of at most [`MAX_CONTENT_CHUNK_SIZE`] bytes
 /// each, in order.
 pub fn content_chunks<'a>(
-    op_id: u32,
+    op_id: u64,
     id: &'a Digest256,
     data: &'a [u8],
 ) -> impl Iterator<Item = WheatProtocolMessage> + 'a {
@@ -141,7 +141,7 @@ mod tests {
         sent.extend(batcher.finish());
         let sizes: Vec<usize> = sent.iter().map(|batch| contents(batch).len()).collect();
         assert_eq!(sizes, [MAX_CONTENT_BATCH_ITEMS, MAX_CONTENT_BATCH_ITEMS, 1]);
-        let sequences: Vec<u32> = sent
+        let sequences: Vec<u64> = sent
             .iter()
             .map(|batch| match batch {
                 WheatProtocolMessage::ContentBatch(batch) => batch.sequence,

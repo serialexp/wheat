@@ -68,7 +68,7 @@ pub async fn handle_fetch(
     .await?;
     debug!(op_id, pushed, "fetch: push done");
 
-    let mut next_want = 0u32;
+    let mut next_want = 0u64;
     loop {
         match recv(ws).await? {
             WheatProtocolMessage::ObjectWant(wanted) if wanted.op_id == op_id => {
@@ -100,7 +100,7 @@ pub async fn handle_fetch(
 
 async fn fetch_error(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     code: u16,
     message: &str,
 ) -> Result<(), ConnectionError> {
@@ -126,7 +126,7 @@ async fn is_envelope<S: ImmutableObjectStore + ?Sized>(
 async fn push(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &RepositoryEntry,
-    op_id: u32,
+    op_id: u64,
     since: Option<RepositoryEnvelopeId>,
     want: RepositoryEnvelopeId,
 ) -> Result<Option<u64>, ConnectionError> {
@@ -161,14 +161,14 @@ async fn push(
 /// Groups pushed objects into `ObjectBatch` messages, and sends objects too large
 /// for one as `ObjectChunk`s.
 struct BatchSender {
-    op_id: u32,
-    sequence: u32,
+    op_id: u64,
+    sequence: u64,
     objects: Vec<ObjectEntry>,
     bytes: usize,
 }
 
 impl BatchSender {
-    fn new(op_id: u32) -> Self {
+    fn new(op_id: u64) -> Self {
         Self {
             op_id,
             sequence: 0,
@@ -228,7 +228,7 @@ fn object_entry(object: &StoredObject) -> ObjectEntry {
 
 async fn send_chunks(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     object: &StoredObject,
 ) -> Result<(), ConnectionError> {
     let bytes = &object.canonical_bytes;
@@ -261,7 +261,7 @@ async fn send_chunks(
 async fn answer_want(
     ws: &mut WebSocketStream<TcpStream>,
     entry: &RepositoryEntry,
-    op_id: u32,
+    op_id: u64,
     wanted: &ObjectWantOutput,
 ) -> Result<bool, ConnectionError> {
     let mut objects = Vec::new();
@@ -394,7 +394,7 @@ fn content_digest(id: wheat_core::ContentId) -> Digest256 {
 /// Send an operation-scoped, non-retryable Error about one blob.
 async fn send_content_error(
     ws: &mut WebSocketStream<TcpStream>,
-    op_id: u32,
+    op_id: u64,
     code: u16,
     message: &str,
     id: wheat_core::ContentId,

@@ -99,7 +99,7 @@ fn publish_push_end_round_trips() {
         message_type: 0x4b,
         op_id: 7,
         pushed_objects: 300,
-        pushed_contents: u32::MAX,
+        pushed_contents: u64::MAX,
     });
     assert_eq!(round_trip(msg.clone()), msg);
 }

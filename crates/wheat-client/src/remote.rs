@@ -546,7 +546,7 @@ pub struct FetchedObjects {
     /// Objects the client asked for afterwards.
     pub pulled: u64,
     /// `ObjectWant` round trips.
-    pub wants: u32,
+    pub wants: u64,
     /// Whether the server left out what `since` covers.
     pub incremental: bool,
 }
@@ -561,7 +561,7 @@ pub struct FetchedObjects {
 /// the walk asks for more.
 pub async fn fetch_objects<O: ImmutableObjectStore>(
     session: &mut WheatSession,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
     want: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
@@ -681,9 +681,9 @@ fn check_object_id(id: ObjectId, data: &[u8]) -> Result<()> {
 /// arrived; the server may answer only the front of the list.
 async fn pull<O: ImmutableObjectStore>(
     session: &mut WheatSession,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
-    want_sequence: u32,
+    want_sequence: u64,
     ids: &[ObjectId],
 ) -> Result<u64> {
     send_msg(
@@ -746,7 +746,7 @@ pub struct FetchedContent {
 /// Fetched content is staged with the objects in `stage`.
 pub async fn fetch_content<S: RepositoryStore + ?Sized>(
     session: &mut WheatSession,
-    op_id: u32,
+    op_id: u64,
     stage: &RepositoryStage<'_, S>,
     envelope_id: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
@@ -871,7 +871,7 @@ pub async fn fetch_content<S: RepositoryStore + ?Sized>(
 /// lost, is not published twice: the server answers it as it did the first sending.
 pub async fn publish<O: ImmutableObjectStore>(
     session: &mut WheatSession,
-    op_id: u32,
+    op_id: u64,
     publish_key: [u8; 16],
     objects: &O,
     content: &ContentStore,
@@ -988,8 +988,8 @@ pub async fn publish<O: ImmutableObjectStore>(
 /// What one up-front push sent.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PushedDifference {
-    objects: u32,
-    contents: u32,
+    objects: u64,
+    contents: u64,
     bytes: usize,
 }
 
@@ -1003,7 +1003,7 @@ struct PushedDifference {
 #[tracing::instrument(name = "publish_push", level = "debug", skip_all)]
 async fn push_difference<O: ImmutableObjectStore>(
     session: &mut WheatSession,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
     content: &ContentStore,
     local: RepositoryEnvelopeId,
@@ -1125,7 +1125,7 @@ async fn push_blob(
 /// the batch limits, and each object too large for a batch as `ObjectChunk`s.
 async fn upload_objects<O: ImmutableObjectStore>(
     session: &mut WheatSession,
-    op_id: u32,
+    op_id: u64,
     objects: &O,
     ids: &[Digest256],
 ) -> Result<()> {
@@ -1164,7 +1164,7 @@ async fn upload_objects<O: ImmutableObjectStore>(
 
 async fn send_object_batch(
     session: &mut WheatSession,
-    op_id: u32,
+    op_id: u64,
     objects: Vec<ObjectEntry>,
 ) -> Result<()> {
     send_msg(
@@ -1181,7 +1181,7 @@ async fn send_object_batch(
 
 /// One object as `ObjectChunk` messages of at most `MAX_OBJECT_CHUNK_SIZE` bytes.
 fn object_chunks(
-    op_id: u32,
+    op_id: u64,
     id: ObjectId,
     data: &[u8],
 ) -> impl Iterator<Item = WheatProtocolMessage> + '_ {
