@@ -78,7 +78,7 @@ mod verification_scratch;
 pub use repository_reader::RepositoryReader;
 mod revision_map;
 mod revision_merge;
-pub use revision_merge::MergeBudget;
+pub use revision_merge::{MergeBudget, MergeWork};
 mod semantic_checks;
 mod sets;
 mod snapshot;

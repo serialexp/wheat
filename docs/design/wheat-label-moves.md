@@ -121,8 +121,12 @@ transitively; `anc*(r)` includes `r`.
   history can walk most of this change's revision history. That is still
   independent of other changes and of repository size. Virtual bases are memoized
   per command (keyed by the sorted parent set). Bounded by
-  `MergeBudget { max_revision_reads, max_recursion_depth, max_edits }`; over budget
-  is an error naming the change, not a wrong merge.
+  `MergeBudget { max_revision_reads, max_walk_steps, max_edits }`; over budget
+  is an error naming the change, not a wrong merge. The budget meters work, not the
+  history's shape (decided 2026-10-26, replacing a recursion-depth limit of 16):
+  virtual bases re-walk revisions already read, which the read meter does not see,
+  so every revision a walk takes and every parent it follows is a step, and nested
+  merges are bounded by the steps their walks take.
 
 ### Edit merge
 
@@ -200,7 +204,7 @@ revision with `combines` (full, bootstrap and incremental validation):
   merge parent cannot "remove" edits.
 
 Cost: one merge per new combined revision. Merge work (revision reads for the
-merge-base walks, edits compared, virtual-base recursion) is metered by `MergeBudget`
+merge-base walks, walk steps, edits compared) is metered by `MergeBudget`
 (decision 15), not by `IncrementBudget`'s object-read meter, so an honest merge with a
 distant base does not exhaust the increment's allowance. Reads the merge makes do not
 pass through `Metered`. Each combined revision's check gets its own
@@ -260,7 +264,7 @@ impl RepositoryReader {
   generation), then the merge.
 - Reads: revision records only; edit sets come from the records.
 - `MergeBudget` is shared by every check of one command or publish (review 2,
-  item 11): revision reads, edits compared, map-diff entries, recursion depth.
+  item 11): revision reads, walk steps, edits compared, map-diff entries.
 - The revision-map diff is the existing `RevisionMapStore::delta`
   (`revision_map.rs:223`), which already runs over `radix::paired_diff`.
 
@@ -550,8 +554,8 @@ size for `just test`; release run; results under `bench/results/`.
 1. Merge bases over the DAG; pairwise in-memory edit merge in `join_revisions`; the
    merge check in validation; squash's boundary. Regression tests first.
    **Done 2026-10-22**: `crates/wheat-store/src/revision_merge.rs` (`RevisionMerge`,
-   `MergeBudget::STANDARD` = 4,096 revision reads, recursion depth 16, 2^20 edits
-   compared; `check_combination` in full, bootstrap and incremental validation);
+   `MergeBudget::STANDARD` = 4,096 revision reads, 2^18 walk steps, 2^20 edits
+   compared (a recursion depth of 16 at first, replaced by walk steps 2026-10-26); `check_combination` in full, bootstrap and incremental validation);
    `RepositoryReader::squash_boundary` and `SquashStops` in `repository_rewrite.rs`,
    called by the client's squash with every authority root's revision as held;
    `validate_boundary` refuses collapsing a combined revision. Bench case
@@ -559,8 +563,11 @@ size for `just test`; release run; results under `bench/results/`.
    and 67 objects, validating it 93, 94 and 118 (log growth of the collections, 0.016
    and 0.025 reads per line revision; contract 0.1). Criss-cross rounds 4 and 12: 88
    and 180 reads joining, 193 and 436 validating. Each criss-cross round nests one
-   virtual base, so more than 16 rounds of distinct combinations of one change exceed
-   the recursion depth and integration refuses, naming the change.
+   virtual base; the bench's shape walks to the change's first revision at every
+   level, so the merge's walk steps and edits grow with the square of the rounds:
+   25,173 steps and 56,167 edits at 64 rounds (contracts 8 and 18 per round squared),
+   so about two hundred such rounds fit in the standard budget. Twenty rounds, past the
+   old depth limit, join and validate (`repository_integration.rs`).
 2. `forward` + tests + read counts.
 3. Integrate with lacking frontiers and the basis lineage edge.
 4. Materialize from the pinned basis; the journal's binding check. (Full validation

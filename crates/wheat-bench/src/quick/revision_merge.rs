@@ -12,9 +12,13 @@
 //!
 //! `crisscross`: each round combines the two sides' revisions twice, differently, and
 //! revises each combination, so the next join has two best bases, which merge into a
-//! virtual base first, which has two of its own: one level per round. That work grows
-//! with the rounds, bounded by `MergeBudget::max_recursion_depth`; it is recorded to
-//! see the slope, without a contract.
+//! virtual base first, which has two of its own: one level per round. Every round
+//! combines a revision of the change's first one, so each level's walk goes down to it,
+//! and the walk steps and edits of checking the join's merge grow with the square of
+//! the rounds. At the deepest size, per round squared, they are at most
+//! [`WALK_STEPS_PER_ROUND_SQUARED`] and [`EDITS_PER_ROUND_SQUARED`]. At the measured
+//! rates that size takes a tenth of `MergeBudget::STANDARD`'s walk steps, and a
+//! criss-cross of about two hundred rounds fits inside it.
 
 use std::{fs, path::Path, time::Instant};
 
@@ -24,7 +28,7 @@ use wheat_core::{
     FileValue, RevisionEdits, RevisionId, RevisionMetadata, Timestamp, ViewId,
 };
 use wheat_store::{
-    ContentStore, IncrementBudget, LocalPublicationStore, PersistedRepositoryMutator,
+    ContentStore, IncrementBudget, LocalPublicationStore, MergeWork, PersistedRepositoryMutator,
     PublicationStore, RepositoryHead, RepositoryReader, RevisionMapStore,
 };
 
@@ -35,11 +39,16 @@ use super::{
 
 pub(crate) const NAME: &str = "revision_merge";
 const LINES: [usize; 3] = [10, 100, 1_000];
-const ROUNDS: [usize; 2] = [4, 12];
+const ROUNDS: [usize; 3] = [4, 12, 64];
 /// Reads added per revision the line grew by. Measured 2026-10-22 (release): joining 51
 /// reads after 10 and 100 revisions and 67 after 1,000 (0.016 per revision);
 /// validating 93, 94 and 118 (0.025).
 const READS_PER_LINE_REVISION: f64 = 0.1;
+/// Work of checking a criss-crossed join's merge, per round squared. Measured
+/// 2026-10-26 (release) at 4, 12 and 64 rounds: 149, 991 and 25,173 walk steps (6.1 at
+/// 64), and 277, 2,113 and 56,167 edits (13.7).
+const WALK_STEPS_PER_ROUND_SQUARED: f64 = 8.0;
+const EDITS_PER_ROUND_SQUARED: f64 = 18.0;
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let lines = context.scale.pick(LINES.to_vec(), vec![10, 30]);
@@ -57,7 +66,25 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     }
     for round in &rounds {
         let root = context.scratch.join(format!("crisscross{round}"));
-        runtime.block_on(measure_crisscross(&root, *round, &mut recorder))?;
+        let work = runtime.block_on(measure_crisscross(&root, *round, &mut recorder))?;
+        if Some(round) == ROUNDS.last() {
+            let squared = (*round * *round) as f64;
+            for (name, value, limit) in [
+                (
+                    "crisscross.merge.walk_steps_per_round_squared",
+                    work.walk_steps,
+                    WALK_STEPS_PER_ROUND_SQUARED,
+                ),
+                (
+                    "crisscross.merge.edits_per_round_squared",
+                    work.edits,
+                    EDITS_PER_ROUND_SQUARED,
+                ),
+            ] {
+                recorder.value(name, value as f64 / squared, "count");
+                recorder.at_most(name, limit, "count");
+            }
+        }
     }
     if let (Some(first), Some(last)) = (measured.first(), measured.last())
         && lines.last() == LINES.last()
@@ -96,7 +123,7 @@ async fn measure_line(root: &Path, line: usize, recorder: &mut Recorder) -> Resu
     let left = change.revise(tip, Step::Add("left"), 1_000_000).await?;
     let right = change.revise(tip, Step::Add("right"), 2_000_000).await?;
     let step = format!("line{line}");
-    let (reads, validate_reads) = change
+    let (reads, validate_reads, _) = change
         .measure_join(&[tip, left, right], &step, recorder)
         .await?;
     eprintln!("{NAME}: line of {line} revisions joined");
@@ -104,7 +131,12 @@ async fn measure_line(root: &Path, line: usize, recorder: &mut Recorder) -> Resu
 }
 
 /// Builds `rounds` rounds of criss-crossed combinations and joins the last two sides.
-async fn measure_crisscross(root: &Path, rounds: usize, recorder: &mut Recorder) -> Result<()> {
+/// Returns the work of checking the join's merge.
+async fn measure_crisscross(
+    root: &Path,
+    rounds: usize,
+    recorder: &mut Recorder,
+) -> Result<MergeWork> {
     let (change, first) = Change::create(root).await?;
     let mut left = change.revise(first, Step::Add("a"), 100).await?;
     let mut right = change.revise(first, Step::Add("b"), 200).await?;
@@ -123,11 +155,11 @@ async fn measure_crisscross(root: &Path, rounds: usize, recorder: &mut Recorder)
             .await?;
         at += 3;
     }
-    change
+    let (_, _, work) = change
         .measure_join(&[left, right], &format!("crisscross{rounds}"), recorder)
         .await?;
     eprintln!("{NAME}: {rounds} criss-crossed rounds joined");
-    Ok(())
+    Ok(work)
 }
 
 /// How a revision changes its predecessor's edits.
@@ -273,13 +305,14 @@ impl Change {
     }
 
     /// Joins `frontiers`, which must combine the change, and validates the join as an
-    /// increment, recording the reads and time of both under `step`.
+    /// increment, recording the reads and time of both under `step`, and the work of
+    /// checking the join's merge. Returns the reads of both and that work.
     async fn measure_join(
         &self,
         frontiers: &[ViewId],
         step: &str,
         recorder: &mut Recorder,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64, MergeWork)> {
         let before = self.head()?;
         self.objects.take();
         let started = Instant::now();
@@ -306,6 +339,18 @@ impl Change {
             validate_reads as f64,
             "count",
         );
-        Ok((reads, validate_reads))
+        let joined = self
+            .reader()
+            .revision(self.revision_in(outcome.resulting_view).await?)
+            .await?;
+        let work = self.reader().check_combination(&joined).await?;
+        for (meter, value) in [
+            ("revision_reads", work.revision_reads),
+            ("walk_steps", work.walk_steps),
+            ("edits", work.edits),
+        ] {
+            recorder.value(&format!("{step}.merge.{meter}"), value as f64, "count");
+        }
+        Ok((reads, validate_reads, work))
     }
 }

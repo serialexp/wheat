@@ -20,7 +20,10 @@
 //!
 //! The work follows the revisions between the inputs and their bases, never the
 //! change's whole history unless the inputs share none of it, and is bounded by a
-//! [`MergeBudget`]: over budget is an error naming the change, not a wrong merge.
+//! [`MergeBudget`]: over budget is an error naming the change, not a wrong merge. The
+//! budget meters work, not the history's shape: a criss-cross of criss-crosses walks the
+//! revisions it has already read again for each virtual base, and those walks count
+//! steps however deep the bases nest.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -37,19 +40,27 @@ type Result<T> = std::result::Result<T, RepositoryPublicationError>;
 pub struct MergeBudget {
     /// Revision records read.
     pub max_revision_reads: u64,
-    /// How deep virtual bases may nest: a criss-cross whose bases are themselves
-    /// criss-crossed, and so on.
-    pub max_recursion_depth: u32,
-    /// Edits compared, summed over every merge step.
+    /// Revisions taken and parents followed by the walks down the ancestry, summed over
+    /// every walk, including those over records already read.
+    pub max_walk_steps: u64,
+    /// Edits compared or collected, summed over every merge step.
     pub max_edits: u64,
 }
 
 impl MergeBudget {
     pub const STANDARD: Self = Self {
         max_revision_reads: 4096,
-        max_recursion_depth: 16,
+        max_walk_steps: 1 << 18,
         max_edits: 1 << 20,
     };
+}
+
+/// The work one merge took, metered as [`MergeBudget`] bounds it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MergeWork {
+    pub revision_reads: u64,
+    pub walk_steps: u64,
+    pub edits: u64,
 }
 
 /// The order revisions merge in, and so which one a combined revision follows: by
@@ -92,8 +103,7 @@ pub(crate) struct RevisionMerge<'r, 'a, O> {
     reader: &'r RepositoryReader<'a, O>,
     change: ChangeId,
     budget: MergeBudget,
-    reads: u64,
-    edits_compared: u64,
+    work: MergeWork,
     records: HashMap<RevisionId, RevisionRecord>,
     virtuals: Vec<VirtualRevision>,
     /// Merges already made, by their inputs, so a base shared by several steps is
@@ -111,8 +121,7 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
             reader,
             change,
             budget,
-            reads: 0,
-            edits_compared: 0,
+            work: MergeWork::default(),
             records: HashMap::new(),
             virtuals: Vec::new(),
             merged: HashMap::new(),
@@ -126,13 +135,38 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
         }
     }
 
+    pub(crate) fn work(&self) -> MergeWork {
+        self.work
+    }
+
+    /// Counts one step of a walk.
+    fn step(&mut self) -> Result<()> {
+        if self.work.walk_steps >= self.budget.max_walk_steps {
+            return Err(self.over_budget("walk steps"));
+        }
+        self.work.walk_steps += 1;
+        Ok(())
+    }
+
+    /// Counts `count` edits compared or collected.
+    fn charge_edits(&mut self, count: usize) -> Result<()> {
+        self.work.edits = self
+            .work
+            .edits
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        if self.work.edits > self.budget.max_edits {
+            return Err(self.over_budget("edits compared"));
+        }
+        Ok(())
+    }
+
     /// `id`'s record, read once per merge.
     pub(crate) async fn record(&mut self, id: RevisionId) -> Result<&RevisionRecord> {
         if !self.records.contains_key(&id) {
-            if self.reads >= self.budget.max_revision_reads {
+            if self.work.revision_reads >= self.budget.max_revision_reads {
                 return Err(self.over_budget("revision reads"));
             }
-            self.reads += 1;
+            self.work.revision_reads += 1;
             let record = self.reader.revision(id).await?;
             if record.change_id != self.change {
                 return Err(RepositoryPublicationError::InvalidReferences(
@@ -185,18 +219,25 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
     /// records them; a combined one's are its parents' edits it does not hold.
     async fn removed(&mut self, node: Node) -> Result<BTreeSet<EditId>> {
         match node {
-            Node::Virtual(index) => Ok(self.virtuals[index].removed.clone()),
+            Node::Virtual(index) => {
+                self.charge_edits(self.virtuals[index].removed.len())?;
+                Ok(self.virtuals[index].removed.clone())
+            }
             Node::Stored(id) => {
                 let record = &self.records[&id];
                 if record.combines.is_empty() {
-                    return Ok(record.transition.removed.clone());
+                    let count = record.transition.removed.len();
+                    self.charge_edits(count)?;
+                    return Ok(self.records[&id].transition.removed.clone());
                 }
                 let parents = self.parents(node);
                 let mut removed = BTreeSet::new();
                 for parent in parents {
                     self.load(parent).await?;
+                    self.charge_edits(self.edits(parent).len())?;
                     removed.extend(self.edits(parent).iter().copied());
                 }
+                self.charge_edits(self.edits(node).len())?;
                 for edit in self.edits(node) {
                     removed.remove(edit);
                 }
@@ -228,6 +269,7 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
             }
         }
         while live > 0 {
+            self.step()?;
             let (_, node) = queue.pop_last().expect("live revisions are queued");
             let mut mark = marks[&node];
             if mark & STALE == 0 {
@@ -244,6 +286,7 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
                 }
             }
             for parent in self.parents(node) {
+                self.step()?;
                 self.load(parent).await?;
                 let before = marks.get(&parent).copied().unwrap_or(0);
                 let after = before | mark;
@@ -265,7 +308,7 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
     }
 
     /// Merges two revisions over their merge base, as a virtual revision.
-    async fn merge_two(&mut self, left: Node, right: Node, depth: u32) -> Result<Node> {
+    async fn merge_two(&mut self, left: Node, right: Node) -> Result<Node> {
         if let Some(merged) = self.merged.get(&(left, right)) {
             return Ok(*merged);
         }
@@ -274,25 +317,18 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
             [] => BTreeSet::new(),
             [base] => self.edits(*base).clone(),
             bases => {
-                if depth >= self.budget.max_recursion_depth {
-                    return Err(self.over_budget("recursion depth"));
-                }
+                // Every nested merge walks at least its two inputs, so the walk-step
+                // budget bounds how deep this goes.
                 let mut bases = bases.to_vec();
                 bases.sort();
                 let mut virtual_base = bases[0];
                 for next in &bases[1..] {
-                    virtual_base = Box::pin(self.merge_two(virtual_base, *next, depth + 1)).await?;
+                    virtual_base = Box::pin(self.merge_two(virtual_base, *next)).await?;
                 }
                 self.edits(virtual_base).clone()
             }
         };
-        let compared = self.edits(left).len() + self.edits(right).len() + base.len();
-        self.edits_compared = self
-            .edits_compared
-            .saturating_add(u64::try_from(compared).unwrap_or(u64::MAX));
-        if self.edits_compared > self.budget.max_edits {
-            return Err(self.over_budget("edits compared"));
-        }
+        self.charge_edits(self.edits(left).len() + self.edits(right).len() + base.len())?;
         let (left_edits, right_edits) = (self.edits(left), self.edits(right));
         let [left_removed, right_removed] = &walk.removed;
         let mut edits = BTreeSet::new();
@@ -342,7 +378,7 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
         for input in rest {
             let input = Node::Stored(*input);
             self.load(input).await?;
-            merged = self.merge_two(merged, input, 0).await?;
+            merged = self.merge_two(merged, input).await?;
         }
         Ok(self.edits(merged).clone())
     }
@@ -360,6 +396,7 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
             queue.insert((generation, *input));
         }
         while let Some((_, id)) = queue.pop_last() {
+            self.step()?;
             let record = self.record(id).await?;
             let parents = record
                 .predecessor
@@ -368,6 +405,7 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
                 .copied()
                 .collect::<Vec<_>>();
             for parent in parents {
+                self.step()?;
                 if !reached.insert(parent) {
                     continue;
                 }
@@ -391,10 +429,20 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
     /// their merge. Without the first, a revision could combine a revision with its own
     /// descendant, and that descendant's removals would look new to a later merge. A
     /// revision combining nothing passes. The merge is bounded by its own
-    /// [`MergeBudget`], not by the caller's.
-    pub(crate) async fn check_combination(&self, revision: &RevisionRecord) -> Result<()> {
+    /// [`MergeBudget::STANDARD`], not by the caller's.
+    pub async fn check_combination(&self, revision: &RevisionRecord) -> Result<MergeWork> {
+        self.check_combination_within(revision, MergeBudget::STANDARD)
+            .await
+    }
+
+    /// [`Self::check_combination`] within `budget`; returns the work it took.
+    pub async fn check_combination_within(
+        &self,
+        revision: &RevisionRecord,
+        budget: MergeBudget,
+    ) -> Result<MergeWork> {
         if revision.combines.is_empty() {
-            return Ok(());
+            return Ok(MergeWork::default());
         }
         let invalid = RepositoryPublicationError::InvalidReferences;
         let predecessor = revision
@@ -403,7 +451,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
         if revision.combines.contains(&predecessor) {
             return Err(invalid("a combined revision combines its own predecessor"));
         }
-        let mut merge = RevisionMerge::new(self, revision.change_id, MergeBudget::STANDARD);
+        let mut merge = RevisionMerge::new(self, revision.change_id, budget);
         let parents = std::iter::once(predecessor)
             .chain(revision.combines.iter().copied())
             .collect::<Vec<_>>();
@@ -431,6 +479,6 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                 "a combined revision's edits are not the merge of the revisions it combines",
             ));
         }
-        Ok(())
+        Ok(merge.work())
     }
 }

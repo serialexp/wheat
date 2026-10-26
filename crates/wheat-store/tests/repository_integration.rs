@@ -1138,3 +1138,133 @@ async fn joining_revisions_reads_down_to_where_they_meet() {
         "reads grew with the change's history: {reads:?}"
     );
 }
+/// Builds `rounds` rounds of criss-crossed combinations of one change: each round
+/// combines the two sides twice, differently, and revises each combination, so joining
+/// the last two sides finds two best bases, whose merge finds two of its own, one level
+/// per round. Returns the change and the two sides.
+async fn criss_cross(fixture: &Fixture, rounds: usize) -> (ChangeId, ViewId, ViewId) {
+    let base = fixture.base;
+    let (c, first) = fixture.create(base, base, "s", b"s").await;
+    let mut left = revise(fixture, base, first, c, Revision::Add("a"), 100).await;
+    let mut right = revise(fixture, base, first, c, Revision::Add("b"), 200).await;
+    let mut at = 300;
+    for round in 0..rounds {
+        let third = format!("c{round}");
+        let third = revise(fixture, base, first, c, Revision::Add(&third), at).await;
+        let one = fixture.integrate(base, &[left, right]).await.unwrap();
+        let other = fixture
+            .integrate(base, &[left, right, third])
+            .await
+            .unwrap();
+        let (l, r) = (format!("l{round}"), format!("r{round}"));
+        left = revise(
+            fixture,
+            base,
+            one.resulting_view,
+            c,
+            Revision::Add(&l),
+            at + 1,
+        )
+        .await;
+        right = revise(
+            fixture,
+            base,
+            other.resulting_view,
+            c,
+            Revision::Add(&r),
+            at + 2,
+        )
+        .await;
+        at += 3;
+    }
+    (c, left, right)
+}
+
+/// Twenty rounds of criss-crosses nest virtual bases twenty deep, past the sixteen a
+/// depth limit allowed; the merge is bounded by its work instead.
+#[tokio::test]
+async fn criss_crossed_rounds_merge_however_deep_their_bases_nest() {
+    const ROUNDS: usize = 20;
+    let fixture = Fixture::new().await;
+    let (c, left, right) = criss_cross(&fixture, ROUNDS).await;
+
+    let outcome = fixture
+        .integrate(fixture.base, &[left, right])
+        .await
+        .unwrap();
+
+    let mut paths = vec!["s".to_owned(), "a".to_owned(), "b".to_owned()];
+    for round in 0..ROUNDS {
+        paths.extend([
+            format!("c{round}"),
+            format!("l{round}"),
+            format!("r{round}"),
+        ]);
+    }
+    let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    assert_eq!(
+        present(&fixture, outcome.resulting_view, &paths).await,
+        paths
+    );
+    let joined = revision_in(&fixture, outcome.resulting_view, c).await;
+    assert!(!joined.combines.is_empty());
+    fixture.validate().await;
+}
+
+/// A combination checked within a budget one short of the work it takes, in any
+/// meter, is refused naming that meter; within exactly that work it passes.
+#[tokio::test]
+async fn a_combination_over_any_merge_budget_is_refused_naming_it() {
+    let fixture = Fixture::new().await;
+    let (c, left, right) = criss_cross(&fixture, 3).await;
+    let outcome = fixture
+        .integrate(fixture.base, &[left, right])
+        .await
+        .unwrap();
+    let joined = revision_in(&fixture, outcome.resulting_view, c).await;
+    let reader = fixture.reader();
+    let work = reader.check_combination(&joined).await.unwrap();
+    let exact = MergeBudget {
+        max_revision_reads: work.revision_reads,
+        max_walk_steps: work.walk_steps,
+        max_edits: work.edits,
+    };
+    assert_eq!(
+        reader
+            .check_combination_within(&joined, exact)
+            .await
+            .unwrap(),
+        work
+    );
+
+    for (budget, meter) in [
+        (
+            MergeBudget {
+                max_revision_reads: work.revision_reads - 1,
+                ..exact
+            },
+            "revision reads",
+        ),
+        (
+            MergeBudget {
+                max_walk_steps: work.walk_steps - 1,
+                ..exact
+            },
+            "walk steps",
+        ),
+        (
+            MergeBudget {
+                max_edits: work.edits - 1,
+                ..exact
+            },
+            "edits compared",
+        ),
+    ] {
+        match reader.check_combination_within(&joined, budget).await {
+            Err(RepositoryPublicationError::MergeOverBudget { change, limit }) => {
+                assert_eq!((change, limit), (c, meter));
+            }
+            other => panic!("{meter}: expected over budget, got {other:?}"),
+        }
+    }
+}
