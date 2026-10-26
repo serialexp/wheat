@@ -343,7 +343,8 @@ fn unwrap_mutation<'a>(
         | RepositoryMutationError::RevisionsDoNotCombine { .. }
         | RepositoryMutationError::TooManyRevisions { .. }
         | RepositoryMutationError::NothingToAppend
-        | RepositoryMutationError::AppendedChain(_) => cause,
+        | RepositoryMutationError::AppendedChain(_)
+        | RepositoryMutationError::LabelMoved { .. } => cause,
     }
 }
 
@@ -520,11 +521,14 @@ fn classify(error: &Error) -> Classification {
                 PublicationError::Io(_) => class("io", "io_failure", true, 8),
             };
         }
-        if cause
-            .downcast_ref::<RepositoryMutationError>()
-            .is_some_and(|mutation| matches!(mutation, RepositoryMutationError::Stale { .. }))
-        {
-            return class("state", "repository_head_changed", true, 3);
+        match cause.downcast_ref::<RepositoryMutationError>() {
+            Some(RepositoryMutationError::Stale { .. }) => {
+                return class("state", "repository_head_changed", true, 3);
+            }
+            Some(RepositoryMutationError::LabelMoved { .. }) => {
+                return class("state", "label_moved", true, 3);
+            }
+            _ => {}
         }
         if let Some(rewrite) = cause.downcast_ref::<RepositoryRewriteError>() {
             return match rewrite {
@@ -687,6 +691,24 @@ mod tests {
         ))
         .into();
         assert_eq!(classify(&missing).code, "missing_object");
+    }
+
+    /// A label that no longer names the view a move was checked from is stale state:
+    /// reading the label again and retrying may succeed.
+    #[test]
+    fn a_label_that_moved_classifies_as_stale_state() {
+        let view = wheat_core::ViewId::from_digest([1; 32]);
+        let moved: Error = RepositoryMutationError::LabelMoved {
+            name: "main".to_owned(),
+            expected: view,
+            actual: None,
+        }
+        .into();
+        let classified = classify(&moved);
+        assert_eq!(
+            (classified.code, classified.retryable, classified.exit),
+            ("label_moved", true, 3)
+        );
     }
 
     #[test]

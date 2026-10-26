@@ -588,6 +588,12 @@ size for `just test`; release run; results under `bench/results/`.
 4. Materialize from the pinned basis; the journal's binding check. (Full validation
    already left the read paths in the prerequisite.)
 5. Label move in mutation publication; `label move`; workspace rebind.
+   **Store part done 2026-10-26**: `LabelMove { name, from, to }`,
+   `prepare_mutation_publication_moving_label` and
+   `PersistedRepositoryMutator::publish_moving_label` (the old entry points pass
+   none); the label keeps its annotation and provenance; refused with
+   `RepositoryMutationError::LabelMoved` (CLI class `label_moved`, exit 3) when the
+   label does not name `from`, and when the state does not retain `to`.
 6. Authoring on label-held changes.
 7. integrate/pull/refresh move the label; `--keep-label`; one-frontier rule.
 8. Fetch label rules (store + CLI).

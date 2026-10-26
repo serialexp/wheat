@@ -118,7 +118,8 @@ pub use merkle_tree::{
     TreeWalkLimits,
 };
 pub use mutation_publication::{
-    PreparedMutationPublication, finalize_mutation_publication, prepare_mutation_publication,
+    LabelMove, PreparedMutationPublication, finalize_mutation_publication,
+    prepare_mutation_publication, prepare_mutation_publication_moving_label,
 };
 pub use object_store_adapter::{
     ObjectStoreAdapter, ObjectStoreAdapterBuildError, S3ObjectStoreConfig,

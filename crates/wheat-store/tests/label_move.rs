@@ -229,3 +229,164 @@ async fn checking_a_move_reads_what_differs_not_the_other_changes() {
     ];
     assert_eq!(reads[0], reads[1], "{reads:?}");
 }
+/// Sets the label `name` to `label` in a publication of its own.
+async fn set_label(fixture: &Fixture, name: &str, label: ViewLabel) {
+    let reader = fixture.reader();
+    let envelope = reader.envelope(fixture.head().envelope).await.unwrap();
+    let mut labels = reader
+        .view_label_manifest(envelope.labels)
+        .await
+        .unwrap()
+        .labels;
+    labels.insert(name.to_owned(), label);
+    let manifest = ViewLabelManifestRecord::new(labels).unwrap();
+    let publisher = RepositoryPublisher::new(&fixture.objects, &fixture.content, &fixture.heads);
+    let root = publisher
+        .stage_envelope(envelope.state, &manifest)
+        .await
+        .unwrap();
+    publisher
+        .publish_envelope(fixture.head(), root)
+        .await
+        .unwrap();
+}
+
+async fn label(fixture: &Fixture, name: &str) -> Option<ViewLabel> {
+    let reader = fixture.reader();
+    let envelope = reader.envelope(fixture.head().envelope).await.unwrap();
+    reader
+        .view_label_manifest(envelope.labels)
+        .await
+        .unwrap()
+        .labels
+        .remove(name)
+}
+
+fn annotated(view: ViewId) -> ViewLabel {
+    ViewLabel {
+        view,
+        original_git_ref: Some("refs/tags/v1".to_owned()),
+        annotation: Some(LabelAnnotation {
+            tagger: Actor {
+                name: "Ada".to_owned(),
+                email: "ada@example.com".to_owned(),
+            },
+            tagged_at: Timestamp::default(),
+            message: "first".to_owned(),
+        }),
+    }
+}
+
+/// C and D grew apart from L, and the annotated label `v1` names C. Returns the
+/// fixture, C and D.
+async fn joined_beside_a_label() -> (Fixture, ViewId, ViewId) {
+    let fixture = Fixture::new().await;
+    let base = fixture.base;
+    let (_, l) = fixture.create(base, base, "l", b"l").await;
+    let (_, d) = fixture.create(base, l, "y", b"y").await;
+    let (_, c) = fixture.create(base, l, "x", b"x").await;
+    set_label(&fixture, "v1", annotated(c)).await;
+    (fixture, c, d)
+}
+
+#[tokio::test]
+async fn a_mutation_moves_a_label_in_its_own_publication() {
+    let (fixture, c, d) = joined_beside_a_label().await;
+    let before = fixture.head();
+    let (prepared, outcome) = fixture.mutator().integrate(before, c, &[d]).await.unwrap();
+    let joined = outcome.resulting_view;
+    assert_eq!(forward(&fixture, c, joined).await, None);
+
+    let after = fixture
+        .mutator()
+        .publish_moving_label(
+            prepared,
+            Some(&LabelMove {
+                name: "v1".to_owned(),
+                from: c,
+                to: joined,
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(after.generation, before.generation + 1);
+    assert_eq!(label(&fixture, "v1").await, Some(annotated(joined)));
+    fixture.validate().await;
+}
+
+#[tokio::test]
+async fn a_two_phase_publication_moves_a_label_with_the_mutation() {
+    let (fixture, c, d) = joined_beside_a_label().await;
+    let before = fixture.head();
+    let (prepared, outcome) = fixture.mutator().integrate(before, c, &[d]).await.unwrap();
+    let joined = outcome.resulting_view;
+
+    let publication = prepare_mutation_publication_moving_label(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        before,
+        prepared,
+        Some(&LabelMove {
+            name: "v1".to_owned(),
+            from: c,
+            to: joined,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(label(&fixture, "v1").await, Some(annotated(c)));
+    finalize_mutation_publication(&fixture.heads, publication).unwrap();
+
+    assert_eq!(label(&fixture, "v1").await, Some(annotated(joined)));
+    fixture.validate().await;
+}
+
+/// A label that no longer names the view the move was checked from, or does not exist,
+/// or a target the mutation does not retain, refuses the publication as a whole.
+#[tokio::test]
+async fn a_label_move_that_no_longer_holds_refuses_the_publication() {
+    let (fixture, c, d) = joined_beside_a_label().await;
+    set_label(&fixture, "v1", annotated(d)).await;
+    let before = fixture.head();
+    let unretained = ViewId::from_digest([7; 32]);
+    for (name, to, refused) in [
+        ("v1", None, Some(Some(d))),
+        ("v2", None, Some(None)),
+        ("v1", Some(unretained), None),
+    ] {
+        let (prepared, outcome) = fixture.mutator().integrate(before, c, &[d]).await.unwrap();
+        let from = if refused.is_some() { c } else { d };
+        let result = fixture
+            .mutator()
+            .publish_moving_label(
+                prepared,
+                Some(&LabelMove {
+                    name: name.to_owned(),
+                    from,
+                    to: to.unwrap_or(outcome.resulting_view),
+                }),
+            )
+            .await;
+        match (result, refused) {
+            (
+                Err(RepositoryMutationError::LabelMoved {
+                    name: refused_name,
+                    expected,
+                    actual,
+                }),
+                Some(named),
+            ) => assert_eq!((refused_name.as_str(), expected, actual), (name, c, named)),
+            (
+                Err(RepositoryMutationError::Publication(
+                    RepositoryPublicationError::InvalidReferences(_),
+                )),
+                None,
+            ) => {}
+            (other, _) => panic!("{name}: expected a refusal, got {other:?}"),
+        }
+        assert_eq!(fixture.head(), before);
+    }
+    assert_eq!(label(&fixture, "v1").await, Some(annotated(d)));
+}

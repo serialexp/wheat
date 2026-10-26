@@ -65,6 +65,12 @@ pub enum RepositoryMutationError {
     NothingToAppend,
     #[error("appended change {0} must depend exactly on the change before it")]
     AppendedChain(ChangeId),
+    #[error("label {name} was to move from view {expected}, but it names {actual:?}")]
+    LabelMoved {
+        name: String,
+        expected: ViewId,
+        actual: Option<ViewId>,
+    },
 }
 
 type Result<T> = std::result::Result<T, RepositoryMutationError>;
@@ -670,8 +676,17 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         Ok((prepared, outcome))
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn publish(&self, prepared: PreparedRepositoryMutation) -> Result<RepositoryHead> {
+        self.publish_moving_label(prepared, None).await
+    }
+
+    /// [`Self::publish`], moving `label_move`'s label in the same envelope.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn publish_moving_label(
+        &self,
+        prepared: PreparedRepositoryMutation,
+        label_move: Option<&crate::LabelMove>,
+    ) -> Result<RepositoryHead> {
         let actual = self
             .publications
             .read()
@@ -684,8 +699,16 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
         let reader = RepositoryReader::new(self.objects, self.content);
         let old = reader.envelope(prepared.expected.envelope).await?;
+        let labels = crate::mutation_publication::labels_after(
+            self.objects,
+            self.content,
+            old.labels,
+            prepared.state,
+            label_move,
+        )
+        .await?;
         let envelope = RepositoryPublisher::new(self.objects, self.content, self.publications)
-            .prepare_envelope_unchecked(prepared.state, old.labels)
+            .prepare_envelope_unchecked(prepared.state, labels)
             .await?;
         let proposed = prepared
             .expected
