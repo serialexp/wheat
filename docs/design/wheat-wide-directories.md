@@ -1,12 +1,11 @@
 # Wheat wide directories — Design
 
-Status: partial (2026-10-26): option A, threshold 256, buckets of 2; steps 0 to 6,
-the switch-on and per-chunk receipts in full verification and import landed, so
-every writer stores a directory wider than 256 entries chunked, under a benchmark
-contract. The docs and TODO.md remain. A tree-format change, so it lands before
-the V1 format freeze.
+Status: complete (2026-10-26): option A, threshold 256, buckets of 2; every
+writer stores a directory wider than 256 entries chunked, readers, walks, the Git
+bridge, verification and import handle both layouts, under a benchmark contract.
+Per-chunk receipts were a default taken when Bart's answer timed out (see Done).
 Owner: bart
-Last updated: 2026-10-26 (per-chunk receipts)
+Last updated: 2026-10-26 (complete)
 
 ## Implementation status
 
@@ -173,11 +172,13 @@ land and move them from Outstanding to Done.
   flat history's full validation now takes 16.6 s at 10,000 changes (spread:
   17.5 s).
 
+- [x] **Docs and TODO.md.** "A change in a large directory reads and writes the
+  whole directory" moved to `TODO_DONE.md`; `server-native-source-control-store.md`
+  points here instead of promising "deterministic shards".
+
 ### Outstanding
 
-- [ ] **Docs and TODO.md.** Close "A change in a large directory reads and
-  writes the whole directory" and update `server-native-source-control-store.md`
-  ("deterministic shards for exceptionally wide directories").
+_(nothing)_
 
 ## Why this exists
 

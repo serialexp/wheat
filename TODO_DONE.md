@@ -553,6 +553,19 @@ Finished items, moved here from `TODO.md` under the same headings.
   run: `bench/results/wheat-quick/20261015-063823-755112269a29.tsv`. The previous
   run is 0581f94, so the comparison spans other commits too.
 
+## Benchmarks (2026-09-25)
+
+- `[x]` **A change in a large directory reads and writes the whole directory
+  (2026-10-22).** A directory wider than 256 entries is now a `ChunkedTreeV1` header
+  over a radix of chunks keyed by the BLAKE3 hash of each name
+  (`docs/design/wheat-wide-directories.md`), so a change reads and writes the chunks
+  on its key path. `increment_validate`'s flat history runs to 100,000 files under
+  the same logarithmic contract as the spread one: validating a one-change
+  publication reads 584 KB at 100,000 files (5.0 MB at 10,000 before), and a create
+  takes 7.3 ms and writes 172 KB. Full validation and staged import keep a receipt
+  per chunk, so a new version of a wide directory is proved in the chunks it
+  changed.
+
 ## Explicit history collapse, repack, and GC
 
 - `[x]` **Read-only `wheat` commands cost a full validation (~30 s on Gothab).**

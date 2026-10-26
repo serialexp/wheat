@@ -1329,8 +1329,9 @@ ViewV1 {
 so a change created on top of the view depends on exactly those without reading the
 view's history.
 
-Each root names an immutable Merkle collection. Trees are directory nodes (with
-deterministic shards for exceptionally wide directories), so changing
+Each root names an immutable Merkle collection. Trees are directory nodes (a
+directory wider than 256 entries is a radix of chunks keyed by the hash of each
+name; see `wheat-wide-directories.md`), so changing
 `src/auth.rs` writes the content, its containing directory path, and a new root
 while reusing every unaffected subtree. Revision selections, application
 selections, conflict indexes, and content manifests likewise use explicit
