@@ -32,7 +32,7 @@ mod durability;
 mod increment_validation;
 pub use increment_validation::{Arrival, IncrementBudget, IncrementReport};
 mod label_move;
-pub use label_move::NotForward;
+pub use label_move::{BackwardLabel, NotForward};
 mod loose;
 mod merkle_tree;
 mod metadata_repack;

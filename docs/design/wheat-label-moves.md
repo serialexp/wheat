@@ -605,5 +605,8 @@ size for `just test`; release run; results under `bench/results/`.
    `union_envelopes` keeps the publish policy and reads nothing for label changes.
    The CLI (`native_fetch` in `main.rs`) still calls `union_envelopes`.
 9. Protocol field, server label checks and limits, publish moving the label.
+   **Store part done 2026-10-26**: `RepositoryReader::backward_label(old, new,
+   budget)` names the first label `new` moved to a view not forward from `old`'s
+   (`BackwardLabel`), for `commit.rs` to refuse unless `force_labels`.
 10. Git bridge tag replacement.
 11. Race test, docs, benchmark, TODO bookkeeping.

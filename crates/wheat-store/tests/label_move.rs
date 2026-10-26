@@ -502,3 +502,41 @@ async fn a_publish_refuses_a_label_both_sides_moved() {
         "{error}"
     );
 }
+/// Between two heads, only a label naming different views in both is a move: a
+/// forward move passes, a backward one is named with why, and created or deleted
+/// labels are not checked.
+#[tokio::test]
+async fn a_backward_label_between_two_heads_is_named() {
+    let (fixture, [l, c, d, j]) = grown_apart_and_joined().await;
+    let reader = fixture.reader();
+    let state = reader
+        .envelope(fixture.head().envelope)
+        .await
+        .unwrap()
+        .state;
+    let envelope = |labels: &[(&str, ViewId)]| {
+        let labels = ViewLabelManifestRecord::new(labels.iter().copied()).unwrap();
+        let publisher =
+            RepositoryPublisher::new(&fixture.objects, &fixture.content, &fixture.heads);
+        async move { publisher.prepare_envelope(state, &labels).await.unwrap() }
+    };
+    let reader = &reader;
+    let backward = |old, new| async move {
+        let mut budget = MergeBudget::STANDARD;
+        reader.backward_label(old, new, &mut budget).await.unwrap()
+    };
+
+    let old = envelope(&[("main", c), ("gone", l), ("same", d)]).await;
+    let forward_moves = envelope(&[("main", j), ("new", d), ("same", d)]).await;
+    assert_eq!(backward(old, forward_moves).await, None);
+    assert_eq!(backward(old, old).await, None);
+
+    // D lacks the change C added.
+    let backward_move = envelope(&[("main", d), ("same", d)]).await;
+    let found = backward(old, backward_move).await.unwrap();
+    assert_eq!((found.name.as_str(), found.from, found.to), ("main", c, d));
+    assert!(
+        matches!(found.not_forward, NotForward::Missing { .. }),
+        "{found:?}"
+    );
+}

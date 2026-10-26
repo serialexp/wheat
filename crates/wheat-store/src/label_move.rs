@@ -12,7 +12,7 @@
 //! views' whole history. Every check of one command or publish shares one
 //! [`MergeBudget`].
 
-use wheat_core::{ChangeId, ViewRecord};
+use wheat_core::{ChangeId, RepositoryEnvelopeId, ViewId, ViewRecord};
 
 use crate::{
     ImmutableObjectStore, MergeBudget, RepositoryPublicationError, RepositoryReader,
@@ -35,7 +35,49 @@ pub enum NotForward {
     },
 }
 
+/// A label one head moved to a view that is not forward from where it was.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackwardLabel {
+    pub name: String,
+    pub from: ViewId,
+    pub to: ViewId,
+    pub not_forward: NotForward,
+}
+
 impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
+    /// The first label, by name, that `new` names a different view than `old` does
+    /// and that is not forward from it. Labels `new` creates or deletes are not moves.
+    /// Every check shares `budget`.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn backward_label(
+        &self,
+        old: RepositoryEnvelopeId,
+        new: RepositoryEnvelopeId,
+        budget: &mut MergeBudget,
+    ) -> Result<Option<BackwardLabel>> {
+        let (old, new) = (self.envelope(old).await?, self.envelope(new).await?);
+        if old.labels == new.labels {
+            return Ok(None);
+        }
+        let old = self.view_label_manifest(old.labels).await?;
+        let new = self.view_label_manifest(new.labels).await?;
+        for (name, label) in &new.labels {
+            let Some(was) = old.labels.get(name).filter(|was| was.view != label.view) else {
+                continue;
+            };
+            let (from, to) = (self.view(was.view).await?, self.view(label.view).await?);
+            if let Some(not_forward) = self.forward(&from, &to, budget).await? {
+                return Ok(Some(BackwardLabel {
+                    name: name.clone(),
+                    from: was.view,
+                    to: label.view,
+                    not_forward,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Whether a label naming `from` may move to `to`; what is left of `budget` after
     /// the merges it takes stays in it for the command's next check.
     #[tracing::instrument(level = "debug", skip_all)]
