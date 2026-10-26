@@ -13,6 +13,18 @@ Finished items, moved here from `TODO.md` under the same headings.
   in its blobstore. S3 content goes through the same path (`ObjectStoreBlobs`). Found
   on the way: the packed store's `content_gets` trace counter had counted nothing
   since reads moved to `get_stored` (eba97a7); it counts there now.
+- `[x]` **No repository size or per-publish byte count.** A packed store keeps its
+  size as files change: the catalog's SQLite index records every loose file (pending
+  before a write or removal, settled by what is on disk after, a crash's leftovers
+  settled at open), and `PackedObjectStore::stored_bytes` adds segments, the content
+  generation and loose files without listing anything. A publish's bytes: the stage
+  counts what it was given (`RepositoryStage::received`), and
+  `RepositoryStore::put_publication` returns what the store did not hold before
+  (`StoredWrite`), exact for a packed store and looked up item by item for separate
+  stores; `PendingPublications::store` splits a group commit's write per
+  publication. The server does not pass them on yet (publish hooks item). On the way,
+  retiring repacked content at open looks only at the recorded loose files instead of
+  one `unlink` per manifest entry, and open removes what crashed writes left behind.
 
 ## Desktop client (2026-10-22)
 

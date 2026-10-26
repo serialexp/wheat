@@ -33,7 +33,7 @@ use crate::{
     ContentRepackPlan, ContentStore, ContentStoreError, Durability, ImmutableObjectStore,
     LocalPublicationStore, LooseObjectStore, ObjectKind, ObjectStoreError,
     PreparedContentGeneration, PublicationStore, RepositoryHead, RepositoryReader, RepositoryStore,
-    RepositoryStoreError, StoredObject, content_generation_index_path,
+    RepositoryStoreError, StoredObject, StoredWrite, content_generation_index_path,
     content_generation_shard_manifest_path, content_generation_shard_pack_path,
     content_repack::{plan_content_repack, prepare_content_repack},
     metadata_repack::{HistoryPlan, HistoryPlanLimits, MetadataDeltaPlan, plan_history_deltas},
@@ -185,23 +185,25 @@ impl fmt::Debug for PackedObjectStore {
     }
 }
 
+/// Loose files a write added, with their lengths.
+type AddedFiles = Vec<([u8; 32], u64)>;
+
 impl PackedEngine {
     /// Runs `write`, which writes loose files of `kind` for `ids`, recorded in the
     /// catalog around it: pending before, settled by what is on disk after, whether
-    /// or not `write` succeeded.
-    fn writing_loose<T, E>(
+    /// or not `write` succeeded. Returns the files it added, with their lengths.
+    fn writing_loose<E>(
         &self,
         kind: LooseKind,
         ids: &[[u8; 32]],
         error: impl Fn(CatalogError) -> E,
-        write: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
+        write: impl FnOnce() -> Result<(), E>,
+    ) -> Result<AddedFiles, E> {
         let recorded = self.intend_loose_writes(kind, ids).map_err(&error)?;
         let written = write();
         let settled = self.settle_loose(kind, &recorded).map_err(&error);
-        let value = written?;
-        settled?;
-        Ok(value)
+        written?;
+        settled
     }
 
     fn intend_loose_writes(
@@ -215,22 +217,31 @@ impl PackedEngine {
         self.catalog.exclusive()?.intend_loose_writes(kind, ids)
     }
 
-    /// Settles `recorded` by what is on disk now.
-    fn settle_loose(&self, kind: LooseKind, recorded: &[[u8; 32]]) -> Result<(), CatalogError> {
+    /// Settles `recorded` by what is on disk now, and returns the files that are
+    /// there, with their lengths.
+    fn settle_loose(
+        &self,
+        kind: LooseKind,
+        recorded: &[[u8; 32]],
+    ) -> Result<AddedFiles, CatalogError> {
         if recorded.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let files = self.loose.lengths(kind, recorded)?;
-        self.catalog.exclusive()?.settle_loose(kind, &files)
+        self.catalog.exclusive()?.settle_loose(kind, &files)?;
+        Ok(files
+            .into_iter()
+            .filter_map(|(id, length)| Some((id, length?)))
+            .collect())
     }
 
-    /// Stores delta envelopes as loose content files.
+    /// Stores delta envelopes as loose content files, and returns the files added.
     fn put_loose_envelopes(
         &self,
         envelopes: &[(ContentId, Vec<u8>)],
-    ) -> Result<(), ContentStoreError> {
+    ) -> Result<AddedFiles, ContentStoreError> {
         let Some((first, _)) = envelopes.first() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let first = *first;
         let ids = envelopes
@@ -271,11 +282,12 @@ impl PackedEngine {
     }
 
     /// Stores the blobs of `contents` too large for a segment as loose files.
-    /// Returns the catalog records of the rest, for the caller to append.
+    /// Returns the catalog records of the rest, for the caller to append, and the
+    /// loose files added.
     fn content_records<'c>(
         &self,
         contents: impl ExactSizeIterator<Item = VerifiedContent<&'c [u8]>> + Clone,
-    ) -> Result<Vec<CheckedRecord<'c>>, ContentStoreError> {
+    ) -> Result<(Vec<CheckedRecord<'c>>, AddedFiles), ContentStoreError> {
         if let Some(trace) = &self.trace {
             trace.content_put_batch(
                 contents.len(),
@@ -291,24 +303,25 @@ impl PackedEngine {
                 records.push(CheckedRecord::content(content));
             }
         }
-        if let Some(first) = loose.first() {
-            let first = first.id();
-            let ids = loose
-                .iter()
-                .map(|content| *content.id().as_bytes())
-                .collect::<Vec<_>>();
-            self.writing_loose(
-                LooseKind::Content,
-                &ids,
-                |error| content_catalog_error(first, error),
-                || {
-                    loose
-                        .iter()
-                        .try_for_each(|content| self.content.put_many(&[*content], 1))
-                },
-            )?;
-        }
-        Ok(records)
+        let Some(first) = loose.first() else {
+            return Ok((records, Vec::new()));
+        };
+        let first = first.id();
+        let ids = loose
+            .iter()
+            .map(|content| *content.id().as_bytes())
+            .collect::<Vec<_>>();
+        let added = self.writing_loose(
+            LooseKind::Content,
+            &ids,
+            |error| content_catalog_error(first, error),
+            || {
+                loose
+                    .iter()
+                    .try_for_each(|content| self.content.put_many(&[*content], 1))
+            },
+        )?;
+        Ok((records, added))
     }
 
     /// Runs `lookup` against the published content generation's reader, or returns
@@ -848,12 +861,13 @@ impl PackedObjectStore {
     }
 
     /// Checks `objects` and stores the ones too large for a segment as loose files.
-    /// Returns the catalog records of the rest, for the caller to append.
+    /// Returns the catalog records of the rest, for the caller to append, and the
+    /// loose files added.
     async fn object_records<'o>(
         &self,
         objects: &'o [(ObjectId, Vec<u8>)],
         concurrency: usize,
-    ) -> Result<Vec<CheckedRecord<'o>>, ObjectStoreError> {
+    ) -> Result<(Vec<CheckedRecord<'o>>, AddedFiles), ObjectStoreError> {
         if let Some(trace) = &self.engine.trace {
             trace.object_put_batch(
                 objects.len(),
@@ -873,24 +887,24 @@ impl PackedObjectStore {
                 records.push(record);
             }
         }
-        if !loose.is_empty() {
-            let ids = loose
-                .iter()
-                .map(|(id, _)| *id.as_bytes())
-                .collect::<Vec<_>>();
-            let recorded = self
-                .engine
-                .intend_loose_writes(LooseKind::Object, &ids)
-                .map_err(object_catalog_error)?;
-            let written = self.engine.objects.put_batch(&loose, concurrency).await;
-            let settled = self
-                .engine
-                .settle_loose(LooseKind::Object, &recorded)
-                .map_err(object_catalog_error);
-            written?;
-            settled?;
+        if loose.is_empty() {
+            return Ok((records, Vec::new()));
         }
-        Ok(records)
+        let ids = loose
+            .iter()
+            .map(|(id, _)| *id.as_bytes())
+            .collect::<Vec<_>>();
+        let recorded = self
+            .engine
+            .intend_loose_writes(LooseKind::Object, &ids)
+            .map_err(object_catalog_error)?;
+        let written = self.engine.objects.put_batch(&loose, concurrency).await;
+        let settled = self
+            .engine
+            .settle_loose(LooseKind::Object, &recorded)
+            .map_err(object_catalog_error);
+        written?;
+        Ok((records, settled?))
     }
 }
 
@@ -1553,8 +1567,8 @@ impl RepositoryStore for PackedObjectStore {
         &self,
         objects: &[(ObjectId, Vec<u8>)],
         content: &[ContentItem<'_>],
-    ) -> Result<(), RepositoryStoreError> {
-        let mut records = self
+    ) -> Result<StoredWrite, RepositoryStoreError> {
+        let (mut records, loose_objects) = self
             .object_records(objects, LOOSE_WRITE_CONCURRENCY)
             .await?;
         let content_store = PackedObjectStore::content_store(self);
@@ -1576,15 +1590,41 @@ impl RepositoryStore for PackedObjectStore {
             }
             whole.push(item.content);
         }
-        self.engine.put_loose_envelopes(&deltas)?;
-        records.extend(self.engine.content_records(whole.iter().copied())?);
-        if !records.is_empty() {
+        let loose_deltas = self.engine.put_loose_envelopes(&deltas)?;
+        let (content_records, loose_content) =
+            self.engine.content_records(whole.iter().copied())?;
+        records.extend(content_records);
+        let added = if records.is_empty() {
+            Vec::new()
+        } else {
             self.engine
                 .catalog
                 .put_records(&records)
-                .map_err(object_catalog_error)?;
+                .map_err(object_catalog_error)?
+        };
+        let mut write = StoredWrite {
+            objects: loose_objects
+                .into_iter()
+                .map(|(id, bytes)| (ObjectId::from_digest(id), bytes))
+                .collect(),
+            content: loose_deltas
+                .into_iter()
+                .chain(loose_content)
+                .map(|(id, bytes)| (ContentId::from_digest(id), bytes))
+                .collect(),
+        };
+        for record in added {
+            if record.namespace == CONTENT_NAMESPACE {
+                write
+                    .content
+                    .push((ContentId::from_digest(record.digest), record.stored_length));
+            } else {
+                write
+                    .objects
+                    .push((ObjectId::from_digest(record.digest), record.stored_length));
+            }
         }
-        Ok(())
+        Ok(write)
     }
 }
 
@@ -1599,7 +1639,7 @@ impl ImmutableObjectStore for PackedObjectStore {
         objects: &[(ObjectId, Vec<u8>)],
         concurrency: usize,
     ) -> Result<(), ObjectStoreError> {
-        let records = self.object_records(objects, concurrency).await?;
+        let (records, _) = self.object_records(objects, concurrency).await?;
         if !records.is_empty() {
             self.engine
                 .catalog
@@ -1657,7 +1697,7 @@ impl ImmutableObjectStore for PackedObjectStore {
 #[async_trait]
 impl ContentBackend for PackedEngine {
     fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError> {
-        let records = self.content_records(contents.iter().copied())?;
+        let (records, _) = self.content_records(contents.iter().copied())?;
         if let Some(first) = records.first() {
             self.catalog.put_records(&records).map_err(|error| {
                 content_catalog_error(ContentId::from_digest(first.digest), error)
@@ -1699,7 +1739,7 @@ impl ContentBackend for PackedEngine {
         // delta chains through get_stored, which checks both the packed catalog
         // and loose files, so a delta whose base lives in a packed segment
         // resolves correctly.
-        self.put_loose_envelopes(envelopes)
+        self.put_loose_envelopes(envelopes).map(drop)
     }
 
     fn supports_raw_envelopes(&self) -> bool {

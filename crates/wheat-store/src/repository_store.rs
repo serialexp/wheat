@@ -2,8 +2,11 @@
 //! receives can be stored in one write.
 
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -35,12 +38,47 @@ pub trait RepositoryStore: ImmutableObjectStore {
     /// backend keeps both in one place, otherwise content first. On success the
     /// objects are as durable as after [`ImmutableObjectStore::put_batch`] (so a
     /// store that buffers objects still needs [`ImmutableObjectStore::seal`]) and the
-    /// content as after [`ContentStore::put_many_with_bases`].
+    /// content as after [`ContentStore::put_many_with_bases`]. Returns what the
+    /// store did not hold before.
     async fn put_publication(
         &self,
         objects: &[(ObjectId, Vec<u8>)],
         content: &[ContentItem<'_>],
-    ) -> Result<(), RepositoryStoreError>;
+    ) -> Result<StoredWrite, RepositoryStoreError>;
+}
+
+/// What a write added to a store: each object and content it did not hold before,
+/// with the bytes the store keeps for it. A store that cannot tell gives the
+/// object's canonical length or the content's logical length instead.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoredWrite {
+    pub objects: Vec<(ObjectId, u64)>,
+    pub content: Vec<(ContentId, u64)>,
+}
+
+impl StoredWrite {
+    #[must_use]
+    pub fn object_bytes(&self) -> u64 {
+        self.objects.iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    #[must_use]
+    pub fn content_bytes(&self) -> u64 {
+        self.content.iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    fn append(&mut self, other: Self) {
+        self.objects.extend(other.objects);
+        self.content.extend(other.content);
+    }
+}
+
+/// Bytes a [`RepositoryStage`] was given: objects' canonical bytes and content's
+/// logical bytes, each time they were given, whether or not the store held them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReceivedBytes {
+    pub objects: u64,
+    pub content: u64,
 }
 
 /// Writers used by a store that writes blobs or objects one at a time.
@@ -48,19 +86,43 @@ const WRITE_CONCURRENCY: usize = 8;
 
 /// [`RepositoryStore::put_publication`] as two writes, content then objects, for
 /// stores that keep them apart.
+///
+/// Neither store says what it added, so each item is looked up first: one
+/// [`ContentStore::contains`] per content, which also skips writing what is there,
+/// and one [`ImmutableObjectStore::exists_many`] for the objects.
 pub async fn put_separately<O: ImmutableObjectStore + ?Sized>(
     objects_store: &O,
     content_store: &ContentStore,
     objects: &[(ObjectId, Vec<u8>)],
     content: &[ContentItem<'_>],
-) -> Result<(), RepositoryStoreError> {
+) -> Result<StoredWrite, RepositoryStoreError> {
+    let mut write = StoredWrite::default();
     if !content.is_empty() {
-        content_store.put_many_with_bases(content, WRITE_CONCURRENCY)?;
+        let mut seen = HashSet::with_capacity(content.len());
+        let missing = content
+            .iter()
+            .filter(|item| seen.insert(item.id()) && !content_store.contains(item.id()))
+            .copied()
+            .collect::<Vec<_>>();
+        content_store.put_many_with_bases(&missing, WRITE_CONCURRENCY)?;
+        write.content = missing
+            .iter()
+            .map(|item| (item.id(), item.bytes().len() as u64))
+            .collect();
     }
     if !objects.is_empty() {
+        let ids = objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let present = objects_store.exists_many(&ids).await?;
         objects_store.put_batch(objects, WRITE_CONCURRENCY).await?;
+        let mut seen = HashSet::with_capacity(objects.len());
+        write.objects = objects
+            .iter()
+            .zip(present)
+            .filter(|((id, _), present)| !present && seen.insert(*id))
+            .map(|((id, bytes), _)| (*id, bytes.len() as u64))
+            .collect();
     }
-    Ok(())
+    Ok(write)
 }
 
 /// An object store and a content store that are kept apart, as one
@@ -124,7 +186,7 @@ impl<O: ImmutableObjectStore> RepositoryStore for SeparateRepositoryStore<O> {
         &self,
         objects: &[(ObjectId, Vec<u8>)],
         content: &[ContentItem<'_>],
-    ) -> Result<(), RepositoryStoreError> {
+    ) -> Result<StoredWrite, RepositoryStoreError> {
         put_separately(&self.objects, &self.content, objects, content).await
     }
 }
@@ -170,7 +232,7 @@ impl RepositoryStore for Box<dyn RepositoryStore> {
         &self,
         objects: &[(ObjectId, Vec<u8>)],
         content: &[ContentItem<'_>],
-    ) -> Result<(), RepositoryStoreError> {
+    ) -> Result<StoredWrite, RepositoryStoreError> {
         (**self).put_publication(objects, content).await
     }
 }
@@ -183,33 +245,89 @@ impl RepositoryStore for Box<dyn RepositoryStore> {
 /// the limits is anything written early, and dropping the stage stores nothing
 /// more. Content written through [`Self::content`] rather than
 /// [`Self::put_content`] is stored at once.
+///
+/// The stage counts what it was given ([`Self::received`]) and what its writes
+/// added to the store ([`Self::stored`]; [`PendingPublications::store`] for what
+/// [`Self::take`] took).
 pub struct RepositoryStage<'a, S: ?Sized> {
     store: &'a S,
     objects: BatchObjectStore<'a, S>,
     staged: Arc<StagedContent>,
     content: ContentStore,
+    max_objects: usize,
+    max_object_bytes: usize,
     max_content_bytes: usize,
+    received_objects: AtomicU64,
+    received_content: AtomicU64,
+    stored: Mutex<StoredWrite>,
 }
 
 impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
     /// Holds up to `max_objects` objects of up to `max_bytes` in total, and content
-    /// of up to `max_bytes`.
+    /// of up to `max_bytes`, storing everything once either is reached (so one
+    /// object or one put's content may go over).
     ///
     /// # Panics
     /// Panics if either limit is zero.
     #[must_use]
     pub fn new(store: &'a S, max_objects: usize, max_bytes: usize) -> Self {
+        assert!(max_objects != 0, "stage object limit must be nonzero");
+        assert!(max_bytes != 0, "stage byte limit must be nonzero");
         let staged = Arc::new(StagedContent {
             stored: store.content_store(),
             blobs: Mutex::default(),
         });
         Self {
             store,
-            objects: BatchObjectStore::new(store, max_objects, max_bytes),
+            // The stage flushes through `put_publication`, which says what it added,
+            // so the buffer is never to write on its own.
+            objects: BatchObjectStore::new(store, usize::MAX, usize::MAX),
             content: staged.stored.overlaid(staged.clone()),
             staged,
+            max_objects,
+            max_object_bytes: max_bytes,
             max_content_bytes: max_bytes,
+            received_objects: AtomicU64::new(0),
+            received_content: AtomicU64::new(0),
+            stored: Mutex::default(),
         }
+    }
+
+    /// The bytes given to this stage so far.
+    #[must_use]
+    pub fn received(&self) -> ReceivedBytes {
+        ReceivedBytes {
+            objects: self.received_objects.load(Ordering::Relaxed),
+            content: self.received_content.load(Ordering::Relaxed),
+        }
+    }
+
+    /// What this stage's writes added to the store so far.
+    pub fn stored(&self) -> Result<StoredWrite, RepositoryStoreError> {
+        Ok(self.lock_stored()?.clone())
+    }
+
+    fn lock_stored(&self) -> Result<std::sync::MutexGuard<'_, StoredWrite>, ContentStoreError> {
+        self.stored
+            .lock()
+            .map_err(|_| ContentStoreError::Io(std::io::Error::other("stage counts poisoned")))
+    }
+
+    fn receive_object(&self, bytes: usize) {
+        self.received_objects
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Stores everything staged once the staged objects reach a limit.
+    async fn flush_full_objects(&self) -> Result<(), ObjectStoreError> {
+        let (count, bytes) = self.objects.pending_size().await;
+        if count < self.max_objects && bytes < self.max_object_bytes {
+            return Ok(());
+        }
+        self.flush().await.map_err(|error| match error {
+            RepositoryStoreError::Objects(error) => error,
+            RepositoryStoreError::Content(error) => ObjectStoreError::Backend(error.to_string()),
+        })
     }
 
     /// The store's content with the staged content in it.
@@ -226,9 +344,12 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
     ) -> Result<(), RepositoryStoreError> {
         let full = {
             let mut blobs = self.staged.lock()?;
+            let mut received = 0_u64;
             for (content, base) in items {
+                received += content.len() as u64;
                 blobs.insert(content, base);
             }
+            self.received_content.fetch_add(received, Ordering::Relaxed);
             blobs.bytes >= self.max_content_bytes
         };
         if full {
@@ -252,11 +373,12 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
             .iter()
             .map(|(_, blob)| blob.item())
             .collect::<Vec<_>>();
-        self.store.put_publication(&objects, &items).await?;
+        let write = self.store.put_publication(&objects, &items).await?;
         pending.written();
         self.staged
             .lock()?
             .written(content.iter().map(|(id, _)| *id));
+        self.lock_stored()?.append(write);
         Ok(())
     }
 
@@ -268,6 +390,7 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
         Ok(Arc::new(StagedPublication {
             objects: pending.take(),
             content,
+            stored: std::mem::take(&mut *self.lock_stored()?),
         }))
     }
 }
@@ -277,6 +400,8 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
 pub struct StagedPublication {
     objects: BTreeMap<ObjectId, Vec<u8>>,
     content: BTreeMap<ContentId, Arc<StagedBlob>>,
+    /// What the stage's flushes had added before it was taken.
+    stored: StoredWrite,
 }
 
 /// Publications accepted but not yet stored, readable in the meantime through
@@ -303,12 +428,19 @@ impl PendingPublications {
         self.publications.is_empty()
     }
 
-    /// Stores every publication held in one write.
+    /// Stores every publication held in one write. Returns what each publication
+    /// added to the store, in the order they were pushed, counting its stage's
+    /// flushes too; an item two of them held counts for the first.
     #[tracing::instrument(name = "pending_store", level = "debug", skip_all)]
     pub async fn store<S: RepositoryStore + ?Sized>(
         &self,
         store: &S,
-    ) -> Result<(), RepositoryStoreError> {
+    ) -> Result<Vec<StoredWrite>, RepositoryStoreError> {
+        let mut added = self
+            .publications
+            .iter()
+            .map(|publication| publication.stored.clone())
+            .collect::<Vec<_>>();
         let mut objects = BTreeMap::new();
         let mut content = BTreeMap::new();
         for publication in &self.publications {
@@ -316,7 +448,7 @@ impl PendingPublications {
             content.extend(publication.content.iter());
         }
         if objects.is_empty() && content.is_empty() {
-            return Ok(());
+            return Ok(added);
         }
         let objects = objects
             .into_iter()
@@ -326,7 +458,25 @@ impl PendingPublications {
             .into_values()
             .map(|blob| blob.item())
             .collect::<Vec<_>>();
-        store.put_publication(&objects, &content).await
+        let write = store.put_publication(&objects, &content).await?;
+        for (id, bytes) in write.objects {
+            if let Some(holder) = self.holder(|publication| publication.objects.contains_key(&id)) {
+                added[holder].objects.push((id, bytes));
+            }
+        }
+        for (id, bytes) in write.content {
+            if let Some(holder) = self.holder(|publication| publication.content.contains_key(&id)) {
+                added[holder].content.push((id, bytes));
+            }
+        }
+        Ok(added)
+    }
+
+    /// The index of the first publication `holds`.
+    fn holder(&self, holds: impl Fn(&StagedPublication) -> bool) -> Option<usize> {
+        self.publications
+            .iter()
+            .position(|publication| holds(publication))
     }
 
     /// `stage` with these publications beneath it: reads find what they hold, and
@@ -423,15 +573,23 @@ impl<S: RepositoryStore + ?Sized> ImmutableObjectStore for RepositoryStage<'_, S
         id: ObjectId,
         canonical_bytes: &[u8],
     ) -> Result<(), ObjectStoreError> {
-        self.objects.put_if_absent(id, canonical_bytes).await
+        self.receive_object(canonical_bytes.len());
+        self.objects.put_if_absent(id, canonical_bytes).await?;
+        self.flush_full_objects().await
     }
 
     async fn put_batch(
         &self,
         objects: &[(ObjectId, Vec<u8>)],
-        concurrency: usize,
+        _concurrency: usize,
     ) -> Result<(), ObjectStoreError> {
-        self.objects.put_batch(objects, concurrency).await
+        // Staging copies each object into memory; there is nothing to overlap.
+        self.receive_object(objects.iter().map(|(_, bytes)| bytes.len()).sum());
+        for (id, bytes) in objects {
+            self.objects.put_if_absent(*id, bytes).await?;
+            self.flush_full_objects().await?;
+        }
+        Ok(())
     }
 
     async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {

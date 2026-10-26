@@ -20,7 +20,7 @@ use crate::packed::segment::{
 };
 use crate::{
     ContentItem, ContentStore, ImmutableObjectStore, ObjectKind, ObjectStoreError, RepositoryStore,
-    RepositoryStoreError, StoredObject, put_separately,
+    RepositoryStoreError, StoredObject, StoredWrite, put_separately,
 };
 
 const DEFAULT_SEGMENT_CACHE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
@@ -256,7 +256,7 @@ impl RepositoryStore for RemotePackedStore {
         &self,
         objects: &[(ObjectId, Vec<u8>)],
         content: &[ContentItem<'_>],
-    ) -> Result<(), RepositoryStoreError> {
+    ) -> Result<StoredWrite, RepositoryStoreError> {
         put_separately(
             self,
             &RemotePackedStore::content_store(self),

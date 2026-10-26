@@ -58,8 +58,10 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   moves and the bytes uploaded; and a post-publish notification with the same, called
   once the head is durable (for its push journal, webhooks, CI and search). Labels
   live inside the envelope, so the label moves need computing from the two label
-  manifests: `RepositoryReader::label_changes(old, new)` does that (2026-10-26); the
-  hooks themselves are still to do.
+  manifests: `RepositoryReader::label_changes(old, new)` does that (2026-10-26). The
+  bytes are counted too: `RepositoryStage::received`, and what the store added from
+  `RepositoryStage::stored` or `PendingPublications::store` (2026-10-26). The hooks
+  themselves are still to do.
 - `[ ]` **The registry must open and close repositories.** Beyond being pluggable (item
   under the design-doc audit), a host serving thousands of repositories opens them on
   demand and evicts idle ones. Opening holds `catalog.lock` exclusively, so eviction
@@ -73,10 +75,6 @@ being JSON, and `wheat gc` / server-authoritative remote maintenance.
   up to object storage and moves them between hosts (drain, snapshot, stage,
   activate). Wheat needs a way to quiesce one repository (finish the group commit,
   refuse new publishes) and take a consistent copy of its store and head, then resume.
-- `[ ]` **No repository size or per-publish byte count.** Quotas and billing need a
-  repository's stored bytes and each publish's uploaded bytes; neither is reported.
-  `PackedObjectStore::stored_bytes` now reports the first, kept as files change
-  (2026-10-26).
 - `[ ]` **Server-side reads for browsing.** Gothab's repository pages read a label's
   tree, a file, history and diffs without a workspace, bounded and paged. wheat-client
   has typed history, diff and changes reads; check which work against a served store

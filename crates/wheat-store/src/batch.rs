@@ -137,6 +137,12 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
         PendingObjects(self.pending.lock().await)
     }
 
+    /// How many objects are buffered, and their bytes.
+    pub(crate) async fn pending_size(&self) -> (usize, usize) {
+        let pending = self.pending.lock().await;
+        (pending.objects.len(), pending.bytes)
+    }
+
     async fn flush_locked(&self, pending: &mut Pending) -> Result<(), ObjectStoreError> {
         if pending.objects.is_empty() {
             return Ok(());

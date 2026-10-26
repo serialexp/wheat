@@ -89,7 +89,7 @@ impl RepositoryStore for GatedStore {
         &self,
         objects: &[(ObjectId, Vec<u8>)],
         content: &[ContentItem<'_>],
-    ) -> Result<(), RepositoryStoreError> {
+    ) -> Result<wheat_store::StoredWrite, RepositoryStoreError> {
         self.gate.arrived.notify_one();
         self.gate.permits.acquire().await.unwrap().forget();
         let failing = self

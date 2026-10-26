@@ -348,7 +348,10 @@ impl SharedCatalog {
     }
 
     /// See [`PackedCatalog::put_records`].
-    pub(crate) fn put_records(&self, records: &[CheckedRecord<'_>]) -> Result<(), CatalogError> {
+    pub(crate) fn put_records(
+        &self,
+        records: &[CheckedRecord<'_>],
+    ) -> Result<Vec<AddedRecord>, CatalogError> {
         let mut exclusive = self.exclusive()?;
         if exclusive.durability == Durability::Deferred {
             return exclusive.put_records(records);
@@ -358,13 +361,14 @@ impl SharedCatalog {
             mut catalog,
         } = exclusive;
         let mut put = catalog.begin_durable_put(records)?;
+        let added = put.added();
         while let Some(job) = catalog.next_append(&mut put)? {
             drop(catalog);
             let outcome = job.run();
             catalog = self.lock()?;
             catalog.finish_put_append(&put, outcome)?;
         }
-        Ok(())
+        Ok(added)
     }
 
     /// Runs `read` beside any append in progress, or after it when the read needs
@@ -418,6 +422,32 @@ impl SharedCatalog {
 /// The prepared records of a durable put that are still to be appended.
 struct DurablePut<'a> {
     prepared: Vec<PreparedSegmentRecord<'a>>,
+}
+
+impl DurablePut<'_> {
+    /// The records this put adds: those the catalog did not hold.
+    fn added(&self) -> Vec<AddedRecord> {
+        self.prepared.iter().map(AddedRecord::of).collect()
+    }
+}
+
+/// A record a put added to the catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AddedRecord {
+    pub(crate) namespace: u8,
+    pub(crate) digest: [u8; 32],
+    /// The bytes its payload takes in the segment.
+    pub(crate) stored_length: u64,
+}
+
+impl AddedRecord {
+    fn of(record: &PreparedSegmentRecord<'_>) -> Self {
+        Self {
+            namespace: record.logical.namespace,
+            digest: record.logical.digest,
+            stored_length: record.stored_length(),
+        }
+    }
 }
 
 /// The durable I/O of one append, done without the catalog: the frame written
@@ -801,7 +831,8 @@ impl PackedCatalog {
         Ok(())
     }
 
-    /// Appends records according to the selected durability policy.
+    /// Appends records according to the selected durability policy, and returns
+    /// the ones the catalog did not hold before.
     ///
     /// Durable stores republish a crash-safe authenticated active tail. Deferred
     /// stores append payloads once to an unpublished bulk file and only emit its
@@ -809,20 +840,24 @@ impl PackedCatalog {
     pub(crate) fn put_records(
         &mut self,
         records: &[CheckedRecord<'_>],
-    ) -> Result<(), CatalogError> {
+    ) -> Result<Vec<AddedRecord>, CatalogError> {
         if self.durability == Durability::Deferred {
             return self.put_records_deferred(records);
         }
         self.put_records_durable(records)
     }
 
-    fn put_records_durable(&mut self, records: &[CheckedRecord<'_>]) -> Result<(), CatalogError> {
+    fn put_records_durable(
+        &mut self,
+        records: &[CheckedRecord<'_>],
+    ) -> Result<Vec<AddedRecord>, CatalogError> {
         let mut put = self.begin_durable_put(records)?;
+        let added = put.added();
         while let Some(job) = self.next_append(&mut put)? {
             let outcome = job.run();
             self.finish_put_append(&put, outcome)?;
         }
-        Ok(())
+        Ok(added)
     }
 
     /// Prepares the `records` this catalog lacks, for [`Self::next_append`].
@@ -1031,10 +1066,14 @@ impl PackedCatalog {
         Ok(())
     }
 
-    fn put_records_deferred(&mut self, records: &[CheckedRecord<'_>]) -> Result<(), CatalogError> {
+    fn put_records_deferred(
+        &mut self,
+        records: &[CheckedRecord<'_>],
+    ) -> Result<Vec<AddedRecord>, CatalogError> {
         if self.poisoned {
             return Err(CatalogError::Poisoned);
         }
+        let mut added = Vec::new();
         if let Some(trace) = &self.trace {
             trace.deferred_put(records.len());
         }
@@ -1053,6 +1092,7 @@ impl PackedCatalog {
             }
             let prepared = prepare_record(*checked)?;
             let record_length = prepared.stored_length();
+            let record = AddedRecord::of(&prepared);
             if self.bulk.is_none() {
                 self.create_bulk()?;
             }
@@ -1101,8 +1141,9 @@ impl PackedCatalog {
                 .checked_add(1)
                 .ok_or(CatalogError::Corrupt("locator count overflow"))?;
             self.poisoned = false;
+            added.push(record);
         }
-        Ok(())
+        Ok(added)
     }
 
     fn create_bulk(&mut self) -> Result<(), CatalogError> {

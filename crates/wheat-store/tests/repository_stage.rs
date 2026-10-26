@@ -272,3 +272,160 @@ async fn a_failed_flush_keeps_everything_staged_for_a_retry() {
     assert!(store.get(object_id).await.is_ok());
     assert_eq!(store.content_store().get(content_id).unwrap(), bytes);
 }
+
+/// The bytes of every file under `path`.
+fn file_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .map(|entry| entry.unwrap())
+        .map(|entry| {
+            if entry.file_type().unwrap().is_dir() {
+                file_bytes(&entry.path())
+            } else {
+                entry.metadata().unwrap().len()
+            }
+        })
+        .sum()
+}
+
+fn ids<T: Copy>(added: &[(T, u64)]) -> Vec<T> {
+    added.iter().map(|(id, _)| *id).collect()
+}
+
+/// A stage counts every byte it is given, and a packed store says which of them it
+/// did not hold, with the bytes it keeps for each.
+#[tokio::test]
+async fn a_stage_counts_what_it_received_and_what_the_store_added() {
+    const LOOSE_THRESHOLD: usize = 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackedObjectStore::open_with_loose_threshold(dir.path(), LOOSE_THRESHOLD).unwrap();
+    let (held_id, held) = blob("content the store holds already");
+    store.content_store().put(&held).unwrap();
+    let (object_id, object_bytes) = object();
+    let (new_id, new) = blob("new content");
+    let large = vec![b'x'; 2 * LOOSE_THRESHOLD];
+    let large_id = ContentId::of(&large);
+    let loose_before = file_bytes(&dir.path().join("loose-content"));
+
+    let stage = RepositoryStage::new(&store, 16, 1 << 20);
+    stage.put_if_absent(object_id, &object_bytes).await.unwrap();
+    stage.put_if_absent(object_id, &object_bytes).await.unwrap();
+    stage
+        .put_content([
+            (VerifiedContent::new(held.clone()), None),
+            (VerifiedContent::new(new.clone()), None),
+            (VerifiedContent::new(large.clone()), None),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        stage.received(),
+        ReceivedBytes {
+            objects: 2 * object_bytes.len() as u64,
+            content: (held.len() + new.len() + large.len()) as u64,
+        }
+    );
+    assert_eq!(stage.stored().unwrap(), StoredWrite::default());
+
+    stage.flush().await.unwrap();
+    let stored = stage.stored().unwrap();
+    assert_eq!(ids(&stored.objects), [object_id]);
+    assert!(stored.object_bytes() > 0);
+    let mut content = ids(&stored.content);
+    content.sort();
+    let mut expected = vec![new_id, large_id];
+    expected.sort();
+    assert_eq!(content, expected, "{held_id} was held already");
+    // The large blob is a loose file: what it keeps is that file.
+    let large_bytes = stored
+        .content
+        .iter()
+        .find(|(id, _)| *id == large_id)
+        .unwrap()
+        .1;
+    assert_eq!(
+        large_bytes,
+        file_bytes(&dir.path().join("loose-content")) - loose_before
+    );
+
+    // Writing it all again adds nothing.
+    let again = RepositoryStage::new(&store, 16, 1 << 20);
+    again.put_if_absent(object_id, &object_bytes).await.unwrap();
+    again
+        .put_content([(VerifiedContent::new(large), None)])
+        .await
+        .unwrap();
+    again.flush().await.unwrap();
+    assert_eq!(again.stored().unwrap(), StoredWrite::default());
+}
+
+/// A stage that fills up stores what it holds through the same write, so the count
+/// includes it.
+#[tokio::test]
+async fn a_full_stage_counts_what_it_stored_early() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackedObjectStore::open(dir.path()).unwrap();
+    let (object_id, object_bytes) = object();
+
+    let stage = RepositoryStage::new(&store, 1, 1 << 20);
+    stage.put_if_absent(object_id, &object_bytes).await.unwrap();
+    assert!(store.get(object_id).await.is_ok());
+    assert_eq!(ids(&stage.stored().unwrap().objects), [object_id]);
+}
+
+/// Publications stored together each get what they added, an item two of them
+/// held going to the first.
+#[tokio::test]
+async fn pending_publications_each_get_what_they_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackedObjectStore::open(dir.path()).unwrap();
+    let (object_id, object_bytes) = object();
+    let (blob_id, blob_bytes) = blob("second's content");
+
+    let first = RepositoryStage::new(&store, 16, 1 << 20);
+    first.put_if_absent(object_id, &object_bytes).await.unwrap();
+    let second = RepositoryStage::new(&store, 16, 1 << 20);
+    second
+        .put_if_absent(object_id, &object_bytes)
+        .await
+        .unwrap();
+    second
+        .put_content([(VerifiedContent::new(blob_bytes), None)])
+        .await
+        .unwrap();
+    let mut pending = PendingPublications::default();
+    pending.push(first.take().await.unwrap());
+    pending.push(second.take().await.unwrap());
+
+    let added = pending.store(&store).await.unwrap();
+    assert_eq!(added.len(), 2);
+    assert_eq!(ids(&added[0].objects), [object_id]);
+    assert!(added[0].content.is_empty());
+    assert!(added[1].objects.is_empty());
+    assert_eq!(ids(&added[1].content), [blob_id]);
+}
+
+/// Stores kept apart do not say what they added, so each item is looked up first.
+#[tokio::test]
+async fn a_separate_store_reports_only_what_it_lacked() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SeparateRepositoryStore::new(
+        LooseObjectStore::new(dir.path().join("objects")),
+        ContentStore::new(dir.path().join("content")),
+    );
+    let (object_id, object_bytes) = object();
+    let (blob_id, blob_bytes) = blob("separate content");
+    let objects = [(object_id, object_bytes.clone())];
+    let content = [ContentItem::new(
+        VerifiedContent::new(blob_bytes.as_slice()),
+        None,
+    )];
+
+    let first = store.put_publication(&objects, &content).await.unwrap();
+    assert_eq!(first.objects, [(object_id, object_bytes.len() as u64)]);
+    assert_eq!(first.content, [(blob_id, blob_bytes.len() as u64)]);
+    let second = store.put_publication(&objects, &content).await.unwrap();
+    assert_eq!(second, StoredWrite::default());
+}
