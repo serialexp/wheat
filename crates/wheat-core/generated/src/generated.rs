@@ -34,6 +34,7 @@ pub enum WheatObject {
     ChangeSetNodeV1(ChangeSetNodeV1Output),
     ChunkedTreeV1(ChunkedTreeV1Output),
     DirectoryChunkNodeV1(DirectoryChunkNodeV1Output),
+    HistoryMapNodeV1(HistoryMapNodeV1Output),
 }
 
 impl WheatObject {
@@ -121,6 +122,7 @@ impl WheatObject {
                 v.unresolved_conflicts.encode_into(encoder)?;
                 v.required_content.encode_into(encoder)?;
                 v.tips.encode_into(encoder)?;
+                v.history.encode_into(encoder)?;
                 encoder.write_varlength(v.size, "leb128_canonical")?;
                 encoder.write_varlength(v.last.len() as u64, "leb128_canonical")?;
                 for item in &v.last {
@@ -356,6 +358,25 @@ impl WheatObject {
                     item.encode_into(encoder)?;
                 }
             }
+            WheatObject::HistoryMapNodeV1(v) => {
+                encoder.write_uint16(v.wire_tag, Endianness::BigEndian);
+                encoder.write_varlength(v.prefix.len() as u64, "leb128_canonical")?;
+                for item in &v.prefix {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_varlength(v.value.len() as u64, "leb128_canonical")?;
+                for item in &v.value {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_varlength(v.children.len() as u64, "leb128_canonical")?;
+                for item in &v.children {
+                    item.encode_into(encoder)?;
+                }
+                encoder.write_varlength(v.entries.len() as u64, "leb128_canonical")?;
+                for item in &v.entries {
+                    item.encode_into(encoder)?;
+                }
+            }
         }
         Ok(())
     }
@@ -455,6 +476,10 @@ impl WheatObject {
         } else if value == 0x1601 {
             Ok(WheatObject::DirectoryChunkNodeV1(
                 DirectoryChunkNodeV1Output::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x1701 {
+            Ok(WheatObject::HistoryMapNodeV1(
+                HistoryMapNodeV1Output::decode_with_decoder(decoder)?,
             ))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
@@ -1119,6 +1144,34 @@ pub struct DirectoryChunkId {
 }
 
 impl DirectoryChunkId {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self { digest })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryMapId {
+    pub digest: Digest256,
+}
+
+impl HistoryMapId {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3523,6 +3576,7 @@ pub struct ViewV1Input {
     pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentMapId,
     pub tips: ChangeSetId,
+    pub history: HistoryMapId,
     pub size: u64,
     pub last: Vec<ChangeId>,
     pub weight: u64,
@@ -3537,6 +3591,7 @@ pub struct ViewV1Output {
     pub unresolved_conflicts: ConflictSetId,
     pub required_content: ContentMapId,
     pub tips: ChangeSetId,
+    pub history: HistoryMapId,
     pub size: u64,
     pub last: Vec<ChangeId>,
     pub weight: u64,
@@ -3559,6 +3614,7 @@ impl ViewV1Input {
         self.unresolved_conflicts.encode_into(encoder)?;
         self.required_content.encode_into(encoder)?;
         self.tips.encode_into(encoder)?;
+        self.history.encode_into(encoder)?;
         encoder.write_varlength(self.size, "leb128_canonical")?;
         encoder.write_varlength(self.last.len() as u64, "leb128_canonical")?;
         for item in &self.last {
@@ -3589,6 +3645,7 @@ impl ViewV1Output {
         let unresolved_conflicts = ConflictSetId::decode_with_decoder(decoder)?;
         let required_content = ContentMapId::decode_with_decoder(decoder)?;
         let tips = ChangeSetId::decode_with_decoder(decoder)?;
+        let history = HistoryMapId::decode_with_decoder(decoder)?;
         let size = decoder.read_varlength("leb128_canonical")?;
         let length = decoder.read_varlength("leb128_canonical")? as usize;
         let mut last = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
@@ -3605,6 +3662,7 @@ impl ViewV1Output {
             unresolved_conflicts,
             required_content,
             tips,
+            history,
             size,
             last,
             weight,
@@ -3627,6 +3685,7 @@ impl From<ViewV1Output> for ViewV1Input {
             unresolved_conflicts: o.unresolved_conflicts,
             required_content: o.required_content,
             tips: o.tips,
+            history: o.history,
             size: o.size,
             last: o.last,
             weight: o.weight,
@@ -3644,6 +3703,7 @@ impl From<ViewV1Input> for ViewV1Output {
             unresolved_conflicts: i.unresolved_conflicts,
             required_content: i.required_content,
             tips: i.tips,
+            history: i.history,
             size: i.size,
             last: i.last,
             weight: i.weight,
@@ -5303,6 +5363,189 @@ impl ChangeSetChildV1 {
         let edge = decoder.read_byte()?;
         let child = ChangeSetId::decode_with_decoder(decoder)?;
         Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryMapNodeV1Input {
+    pub prefix: Vec<u8>,
+    pub value: Vec<ApplicationId>,
+    pub children: Vec<HistoryMapChildV1>,
+    pub entries: Vec<ApplicationMapEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryMapNodeV1Output {
+    pub wire_tag: u16,
+    pub prefix: Vec<u8>,
+    pub value: Vec<ApplicationId>,
+    pub children: Vec<HistoryMapChildV1>,
+    pub entries: Vec<ApplicationMapEntryV1>,
+}
+
+pub type HistoryMapNodeV1 = HistoryMapNodeV1Output;
+
+impl HistoryMapNodeV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u16_be(5889);
+        encoder.write_varlength(self.prefix.len() as u64, "leb128_canonical")?;
+        for item in &self.prefix {
+            encoder.write_byte(*item);
+        }
+        encoder.write_varlength(self.value.len() as u64, "leb128_canonical")?;
+        for item in &self.value {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_varlength(self.children.len() as u64, "leb128_canonical")?;
+        for item in &self.children {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_varlength(self.entries.len() as u64, "leb128_canonical")?;
+        for item in &self.entries {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl HistoryMapNodeV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let wire_tag = decoder.read_u16_be()?;
+        if wire_tag != 5889u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 5889, got {}",
+                wire_tag
+            )));
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let prefix = decoder.read_bytes_vec(length)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut value = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
+        for _ in 0..length {
+            let item = ApplicationId::decode_with_decoder(decoder)?;
+            value.push(item);
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut children = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
+        for _ in 0..length {
+            let item = HistoryMapChildV1::decode_with_decoder(decoder)?;
+            children.push(item);
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut entries = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
+        for _ in 0..length {
+            let item = ApplicationMapEntryV1::decode_with_decoder(decoder)?;
+            entries.push(item);
+        }
+        Ok(Self {
+            wire_tag,
+            prefix,
+            value,
+            children,
+            entries,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        HistoryMapNodeV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        HistoryMapNodeV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<HistoryMapNodeV1Output> for HistoryMapNodeV1Input {
+    fn from(o: HistoryMapNodeV1Output) -> Self {
+        Self {
+            prefix: o.prefix,
+            value: o.value,
+            children: o.children,
+            entries: o.entries,
+        }
+    }
+}
+
+impl From<HistoryMapNodeV1Input> for HistoryMapNodeV1Output {
+    fn from(i: HistoryMapNodeV1Input) -> Self {
+        Self {
+            wire_tag: 5889u16,
+            prefix: i.prefix,
+            value: i.value,
+            children: i.children,
+            entries: i.entries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryMapChildV1 {
+    pub edge: u8,
+    pub child: HistoryMapId,
+}
+
+impl HistoryMapChildV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(self.edge);
+        self.child.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let edge = decoder.read_byte()?;
+        let child = HistoryMapId::decode_with_decoder(decoder)?;
+        Ok(Self { edge, child })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryKeyV1 {
+    pub time: u64,
+    pub change: ChangeId,
+}
+
+impl HistoryKeyV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be(self.time);
+        self.change.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let time = decoder.read_u64_be()?;
+        let change = ChangeId::decode_with_decoder(decoder)?;
+        Ok(Self { time, change })
     }
 }
 

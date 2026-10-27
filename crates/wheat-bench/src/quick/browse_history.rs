@@ -1,23 +1,28 @@
-//! Paging a served repository's history newest first, as a host's history page does.
+//! Paging a served repository's history newest first, as a host's history page does,
+//! in canonical order and by commit time.
 //!
 //! `wheat_store::RepositoryBrowser::history` finds a page's first change through the
 //! view's application skip chain (O(log n) reads), then follows each application's
 //! `previous`, reading its application, revision and change and looking the change
-//! up in the change map. So a page costs about the same at any depth and any history
-//! size. Changes are created on the frontier and published one at a time, as in
-//! `client_history`. At each checkpoint the newest page and a page from the middle
-//! of the history are read [`SAMPLES`] times each, recording the objects the first
-//! read takes and the median wall time. At [`LARGEST`] changes a page of [`PAGE`]
-//! may read at most [`READS_PER_PAGE`] objects and take [`PAGE_BUDGET_SECONDS`].
+//! up in the change map. `history_by_time` finds it through the view's history map
+//! (O(log n) node reads) and reads the same objects per change. So a page costs about
+//! the same at any depth and any history size. Changes are created on the frontier
+//! and published one at a time, as in `client_history`, each committed a minute
+//! after the one before. At each checkpoint the newest page and a page from the
+//! middle of the history are read [`SAMPLES`] times each in both orders, recording
+//! the objects the first read takes and the median wall time. At [`LARGEST`] changes
+//! a page of [`PAGE`] may read at most [`READS_PER_PAGE`] objects and take
+//! [`PAGE_BUDGET_SECONDS`].
 
 use std::{fs, num::NonZeroUsize, path::Path, time::Instant};
 
 use anyhow::Result;
+use wheat_core::HistoryKey;
 use wheat_store::{LocalPublicationStore, PersistedRepositoryMutator, RepositoryBrowser};
 
 use super::{
     CaseContext, CaseOutput, Recorder,
-    history::{Counting, Layout, Scratch, create_at},
+    history::{Counting, Layout, Scratch, change_id, committed_at, create_at},
 };
 use crate::measure;
 
@@ -49,7 +54,7 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         &mut recorder,
     ))?;
 
-    for page in ["newest", "middle"] {
+    for page in ["newest", "middle", "newest_by_time", "middle_by_time"] {
         let step = format!("n{LARGEST}.{page}");
         recorder.at_most(&format!("{step}.wall"), PAGE_BUDGET_SECONDS, "s");
         recorder.at_most(&format!("{step}.reads"), READS_PER_PAGE, "count");
@@ -98,6 +103,36 @@ async fn measure_pages(root: &Path, checkpoints: &[usize], recorder: &mut Record
                 anyhow::ensure!(
                     history.items.len() == PAGE.min(before.map_or(size, |at| at as usize)),
                     "the {name} page holds {} changes",
+                    history.items.len()
+                );
+                if sample == 0 {
+                    reads = objects.take().0;
+                }
+            }
+            objects.take();
+            recorder.wall(&step, measure::median(walls));
+            recorder.value(&format!("{step}.reads"), reads as f64, "count");
+        }
+        // The middle page by time starts at the change made halfway, which is also
+        // the one committed halfway.
+        let middle = size / 2;
+        let middle_key = HistoryKey::new(committed_at(middle).seconds, change_id(middle));
+        for (name, from) in [
+            ("newest_by_time", None),
+            ("middle_by_time", Some(middle_key)),
+        ] {
+            let step = format!("n{size}.{name}");
+            objects.take();
+            let mut walls = Vec::with_capacity(SAMPLES);
+            let mut reads = 0;
+            for sample in 0..SAMPLES {
+                let started = Instant::now();
+                let history = browser.history_by_time(effective, from, page).await?;
+                walls.push(started.elapsed().as_secs_f64());
+                let expected = PAGE.min(from.map_or(size, |_| middle + 1));
+                anyhow::ensure!(
+                    history.items.len() == expected,
+                    "the {name} page holds {} changes, not {expected}",
                     history.items.len()
                 );
                 if sample == 0 {

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ApplicationId, ApplicationMapId, CanonicalObjectError, ChangeMapId, ChangeObjectId,
     ChangeSetId, ConflictSetId, ContentMapId, ContentSetId, DirectoryChunkId, DirectoryEntry,
-    ProjectedCommitSetId, RetainedSetId, TreeId, ViewLineageMapId,
+    HistoryMapId, ProjectedCommitSetId, RetainedSetId, TreeId, ViewLineageMapId,
 };
 
 macro_rules! child {
@@ -25,6 +25,7 @@ child!(RetainedSetChild, RetainedSetId);
 child!(ProjectedCommitSetChild, ProjectedCommitSetId);
 child!(ChangeSetChild, ChangeSetId);
 child!(ViewLineageMapChild, ViewLineageMapId);
+child!(HistoryMapChild, HistoryMapId);
 
 /// One child of a [`DirectoryChunkNode`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +144,47 @@ impl ApplicationMapNode {
     #[must_use]
     pub fn id(&self) -> ApplicationMapId {
         ApplicationMapId::of_canonical_bytes(&self.canonical_bytes())
+    }
+}
+
+/// A node of a view's history map: [`crate::HistoryKey`] → the application that
+/// applied the change.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoryMapNode {
+    pub prefix: Vec<u8>,
+    pub value: Option<ApplicationId>,
+    pub children: Vec<HistoryMapChild>,
+    /// Inline entries: key suffixes with values inlined into this node.
+    pub entries: Vec<(Vec<u8>, ApplicationId)>,
+}
+
+impl HistoryMapNode {
+    pub fn new(
+        prefix: Vec<u8>,
+        value: Option<ApplicationId>,
+        mut children: Vec<HistoryMapChild>,
+        mut entries: Vec<(Vec<u8>, ApplicationId)>,
+    ) -> Result<Self, CanonicalObjectError> {
+        children.sort_by_key(|child| child.edge);
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let node = Self {
+            prefix,
+            value,
+            children,
+            entries,
+        };
+        crate::wire::validate_history_map_node(&node)?;
+        Ok(node)
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::wire::history_map_node_bytes(self)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> HistoryMapId {
+        HistoryMapId::of_canonical_bytes(&self.canonical_bytes())
     }
 }
 

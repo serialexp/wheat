@@ -333,6 +333,7 @@ fn unwrap_mutation<'a>(
         RepositoryMutationError::Applications(inner) => inner,
         RepositoryMutationError::Collections(inner) => inner,
         RepositoryMutationError::ContentMap(inner) => inner,
+        RepositoryMutationError::History(inner) => inner,
         RepositoryMutationError::ViewLineage(inner) => inner,
         RepositoryMutationError::Trees(inner) => inner,
         RepositoryMutationError::Objects(inner) => inner,

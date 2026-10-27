@@ -1322,12 +1322,15 @@ ViewV1 {
   unresolved_conflicts: ConflictIndexId,
   required_content: ContentManifestId,
   tips: ChangeSetId,
+  history: HistoryMapId,
 }
 ```
 
 `tips` is the set of the view's changes that none of its other changes depend on,
 so a change created on top of the view depends on exactly those without reading the
-view's history.
+view's history. `history` maps each change, keyed by its revision's committed_at
+and then its ChangeId (bits inverted, so newest first), to its application: a
+host's history page reads a page of it from any point in O(log n) node reads.
 
 Each root names an immutable Merkle collection. Trees are directory nodes (a
 directory wider than 256 entries is a radix of chunks keyed by the hash of each

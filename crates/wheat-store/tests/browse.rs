@@ -226,6 +226,132 @@ async fn a_history_page_reads_a_bounded_number_of_objects() {
     assert!(deep <= bound, "a page at position 40 read {deep} objects");
 }
 
+/// A history of `times.len()` changes on one line, the `i`th committed at `times[i]`.
+/// Returns each change, oldest first in canonical order, and the tip.
+async fn timed_line(fixture: &Fixture, times: &[i64]) -> (Vec<ChangeId>, ViewId) {
+    let mut changes = Vec::with_capacity(times.len());
+    let mut tip = fixture.base;
+    for (index, time) in times.iter().enumerate() {
+        let (change, view) = fixture
+            .create_committed_at(
+                fixture.base,
+                tip,
+                &format!("dir/f{index}"),
+                format!("v{index}").as_bytes(),
+                *time,
+            )
+            .await;
+        changes.push(change);
+        tip = view;
+    }
+    (changes, tip)
+}
+
+/// Every change of `tip`, a page of `page` at a time, by commit time.
+async fn pages_by_time(
+    browser: &RepositoryBrowser<'_, CountingStore>,
+    tip: ViewId,
+    page: usize,
+) -> Vec<HistoryItem> {
+    let mut items = Vec::new();
+    let mut from = None;
+    loop {
+        let page = browser
+            .history_by_time(tip, from, limit(page))
+            .await
+            .unwrap();
+        assert!(!page.items.is_empty());
+        items.extend(page.items);
+        match page.next {
+            Some(next) => from = Some(next),
+            None => return items,
+        }
+    }
+}
+
+/// Paging by time follows commit times, not the order changes were made in: newest
+/// first, and within one second by highest change ID first.
+#[tokio::test]
+async fn history_pages_by_time_walk_a_view_newest_committed_first() {
+    let fixture = Fixture::new().await;
+    let times = [
+        50,
+        -20,
+        900,
+        50,
+        7,
+        900,
+        0,
+        1_700_000_000,
+        50,
+        -3_000_000_000,
+        7,
+    ];
+    let (changes, tip) = timed_line(&fixture, &times).await;
+    let browser = browser(&fixture).await;
+
+    let mut expected: Vec<(i64, ChangeId)> = times.iter().copied().zip(changes).collect();
+    expected.sort_by(|left, right| right.cmp(left));
+    for page in [1, 3, 4, times.len(), times.len() + 1] {
+        let items = pages_by_time(&browser, tip, page).await;
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.committed_at.seconds, item.change))
+                .collect::<Vec<_>>(),
+            expected,
+            "pages of {page}"
+        );
+    }
+    // Each item is the change as the view holds it, at its place in canonical order.
+    let canonical = browser
+        .history(tip, None, limit(times.len()))
+        .await
+        .unwrap();
+    for item in pages_by_time(&browser, tip, 5).await {
+        assert!(canonical.items.contains(&item), "{item:?}");
+    }
+    // The base view has no history.
+    let base = browser
+        .history_by_time(fixture.base, None, limit(3))
+        .await
+        .unwrap();
+    assert_eq!(base, TimeHistoryPage::default());
+}
+
+/// A page by time reads O(log n) history-map nodes to find its first change and a few
+/// objects per change, so a page deep in a long history costs about what the newest
+/// page does.
+#[tokio::test]
+async fn a_history_page_by_time_reads_a_bounded_number_of_objects() {
+    let fixture = Fixture::new().await;
+    // Commit times out of canonical order, so the map is not filled in key order.
+    let times: Vec<i64> = (0..96).map(|index| (index * 37) % 96).collect();
+    let (_, tip) = timed_line(&fixture, &times).await;
+    let browser = browser(&fixture).await;
+    let middle = pages_by_time(&browser, tip, 96).await[40].time_key();
+    let reads = |from| {
+        let fixture = &fixture;
+        let browser = &browser;
+        async move {
+            let start = fixture.objects.reads.load(Ordering::Relaxed);
+            let page = browser.history_by_time(tip, from, limit(4)).await.unwrap();
+            assert_eq!(page.items.len(), 4);
+            fixture.objects.reads.load(Ordering::Relaxed) - start
+        }
+    };
+
+    let newest = reads(None).await;
+    let deep = reads(Some(middle)).await;
+
+    // Each item reads its application, revision and change, plus a change-map lookup
+    // of a node or two; the view check and the history-map path add O(log n). Reading
+    // every change would be at least 3 × 96 objects.
+    let bound = 4 * 5 + 96_u64.ilog2() as usize + 3;
+    assert!(newest <= bound, "the newest page read {newest} objects");
+    assert!(deep <= bound, "a page from the middle read {deep} objects");
+}
+
 #[tokio::test]
 async fn files_are_read_at_a_path_within_a_bound() {
     let fixture = Fixture::new().await;

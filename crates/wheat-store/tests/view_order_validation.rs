@@ -894,6 +894,23 @@ async fn applied_after_y(
             .insert(target.tips, change)
             .await
             .unwrap(),
+        history: HistoryMapStore::new(&history.objects)
+            .insert(
+                target.history,
+                HistoryKey::new(
+                    reader
+                        .revision(revision)
+                        .await
+                        .unwrap()
+                        .metadata
+                        .committed_at
+                        .seconds,
+                    change,
+                ),
+                application.id(),
+            )
+            .await
+            .unwrap(),
         order: target.order.then(change, 0).unwrap(),
     };
     history.put(view.id().into(), &view.canonical_bytes()).await;
@@ -998,6 +1015,69 @@ async fn a_view_with_other_tips_is_refused() {
             reason
                 .as_ref()
                 .is_some_and(|reason| reason.contains("view tips")),
+            "{reason:?}"
+        );
+    }
+}
+
+/// A history map missing the last change, holding it at another commit time or
+/// naming another application for it is refused by full and incremental validation
+/// alike.
+#[tokio::test]
+async fn a_view_with_another_history_is_refused() {
+    let chain = Chain::new().await;
+    let history = &chain.history;
+    let reader = history.reader();
+    let maps = HistoryMapStore::new(&history.objects);
+    let made = reader.view(chain.with_yzk).await.unwrap();
+    let last = history.application_in(chain.with_yzk, chain.k).await;
+    let parent_record = reader.view(last.target_view).await.unwrap();
+    let committed_at = reader
+        .revision(last.revision_id)
+        .await
+        .unwrap()
+        .metadata
+        .committed_at
+        .seconds;
+    let applications = ApplicationMapStore::new(&history.objects);
+    let application = applications
+        .get(made.applications, chain.k)
+        .await
+        .unwrap()
+        .unwrap();
+    let another = applications
+        .get(made.applications, chain.y)
+        .await
+        .unwrap()
+        .unwrap();
+    let forged_histories = [
+        parent_record.history,
+        maps.insert(
+            parent_record.history,
+            HistoryKey::new(committed_at + 1, chain.k),
+            application,
+        )
+        .await
+        .unwrap(),
+        maps.insert(
+            parent_record.history,
+            HistoryKey::new(committed_at, chain.k),
+            another,
+        )
+        .await
+        .unwrap(),
+    ];
+    for forged_history in forged_histories {
+        let forged = ViewRecord {
+            history: forged_history,
+            ..made
+        };
+        let state = history.retaining_view(&forged, last.target_view).await;
+        let reason = history.refusal(state).await;
+        assert!(
+            reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("composition parent's plus one change")),
             "{reason:?}"
         );
     }

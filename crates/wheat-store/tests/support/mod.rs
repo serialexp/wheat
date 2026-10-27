@@ -121,6 +121,19 @@ impl Fixture {
         path: &str,
         bytes: &[u8],
     ) -> (ChangeId, ViewId) {
+        self.create_committed_at(basis, effective, path, bytes, 0)
+            .await
+    }
+
+    /// [`Self::create`], with the revision committed at `committed_at` seconds.
+    pub async fn create_committed_at(
+        &self,
+        basis: ViewId,
+        effective: ViewId,
+        path: &str,
+        bytes: &[u8],
+        committed_at: i64,
+    ) -> (ChangeId, ViewId) {
         self.content.put(bytes).unwrap();
         let change = self.next_change();
         let (prepared, outcome) = self
@@ -133,7 +146,13 @@ impl Fixture {
                     id: change,
                     metadata: ChangeMetadata::default(),
                     dependencies: Default::default(),
-                    revision_metadata: RevisionMetadata::default(),
+                    revision_metadata: RevisionMetadata {
+                        committed_at: Timestamp {
+                            seconds: committed_at,
+                            offset_minutes: 0,
+                        },
+                        ..RevisionMetadata::default()
+                    },
                     edits: exact(path, None, bytes),
                 },
             )

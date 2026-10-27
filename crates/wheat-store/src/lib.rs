@@ -18,6 +18,8 @@ pub use content_generation::{
     read_content_generation, read_content_generation_index,
 };
 mod content_map;
+mod history_map;
+pub use history_map::{HistoryMapCursor, HistoryMapDelta, HistoryMapError, HistoryMapStore};
 mod content_repack;
 pub use content_repack::{
     ContentGenerationTarget, ContentHistoryPair, ContentRepackAnalysis, ContentRepackError,
@@ -60,7 +62,9 @@ mod browse;
 mod publication;
 mod radix;
 mod repository_directory;
-pub use browse::{BrowseError, BrowsedFile, HistoryItem, HistoryPage, RepositoryBrowser};
+pub use browse::{
+    BrowseError, BrowsedFile, HistoryItem, HistoryPage, RepositoryBrowser, TimeHistoryPage,
+};
 mod repository_envelope;
 mod repository_hydration;
 mod repository_integration;

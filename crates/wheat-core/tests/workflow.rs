@@ -546,6 +546,7 @@ fn view_identity_covers_the_application_and_conflict_manifest() {
         BTreeMap::from([(change, application.id)]),
         BTreeSet::from([conflict.id]),
         BTreeSet::from([change]),
+        BTreeMap::from([(wheat_core::HistoryKey::new(0, change), application.id)]),
         order,
     );
     assert_ne!(plain.id, manifested.id);

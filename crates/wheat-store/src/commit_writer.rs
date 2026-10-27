@@ -6,15 +6,16 @@ use thiserror::Error;
 use wheat_core::{
     ApplicationId, ApplicationRecord, ApplicationResultRecord, AppliedEditEvidence, ByteRange,
     CanonicalObjectError, Change, ChangeId, ChangeObjectId, ChangeProposal, ContentIo, EditId,
-    RevisionId, RevisionRecord, Tree, ViewId, ViewOrder, ViewRecord, decode_view_record,
+    HistoryKey, RevisionId, RevisionRecord, Tree, ViewId, ViewOrder, ViewRecord,
+    decode_view_record,
     edit_application::{ApplicationError, ApplicationLimits, ApplicationOutcome, apply_edits},
 };
 
 use crate::{
     ApplicationMapError, ApplicationMapStore, ChangeSetStore, CollectionError, ConflictSetStore,
-    ContentMapError, ContentMapStore, ContentStore, ContentStoreError, ImmutableObjectStore,
-    MerkleTreeError, MerkleTreeStore, ObjectKind, ObjectStoreError, RevisionMapError,
-    RevisionMapStore, TreeEdit, merkle_tree::TreePathShape,
+    ContentMapError, ContentMapStore, ContentStore, ContentStoreError, HistoryMapError,
+    HistoryMapStore, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, ObjectKind,
+    ObjectStoreError, RevisionMapError, RevisionMapStore, TreeEdit, merkle_tree::TreePathShape,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +42,8 @@ pub enum CommitWriterError {
     Sets(#[from] CollectionError),
     #[error("content map operation failed")]
     ContentMap(#[from] ContentMapError),
+    #[error("history map operation failed")]
+    History(#[from] HistoryMapError),
     #[error("canonical object is invalid")]
     Canonical(#[from] CanonicalObjectError),
     #[error("proposal has more than one dependency")]
@@ -101,6 +104,7 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         let unresolved_conflicts = ConflictSetStore::new(self.objects).empty_root().await?;
         let required_content = ContentMapStore::new(self.objects).empty_root().await?;
         let tips = ChangeSetStore::new(self.objects).empty_root().await?;
+        let history = HistoryMapStore::new(self.objects).empty_root().await?;
         let view = ViewRecord {
             tree,
             revisions,
@@ -108,6 +112,7 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             unresolved_conflicts,
             required_content,
             tips,
+            history,
             order: ViewOrder::BASE,
         };
         self.put(view.id().into(), &view.canonical_bytes()).await?;
@@ -303,6 +308,13 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
         let tips = ChangeSetStore::new(self.objects)
             .after(parent_record.tips, proposal.id, &revision.dependencies)
             .await?;
+        let history = HistoryMapStore::new(self.objects)
+            .insert(
+                parent_record.history,
+                HistoryKey::new(revision.metadata.committed_at.seconds, proposal.id),
+                application_id,
+            )
+            .await?;
         let view = ViewRecord {
             tree: resulting_tree,
             revisions: revision_root,
@@ -310,6 +322,7 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
             unresolved_conflicts: parent_record.unresolved_conflicts,
             required_content,
             tips,
+            history,
             order: parent_record
                 .order
                 .then(proposal.id, revision.generation)

@@ -262,7 +262,7 @@ fn canonical_revision_has_a_pinned_encoding_and_id() {
 
     assert_eq!(
         hex(&revision.canonical_bytes()),
-        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000cbc51994dde3e245bb134c0fc09a77f4e7c9401e6184464d8dad9bda3e13e1aa01d9557d2d8be3598b0e298539c8c549b570e5593a06b69d00bb07d15c9e0d15170001d9557d2d8be3598b0e298539c8c549b570e5593a06b69d00bb07d15c9e0d151700000018830a356613784876607ffb6e82419a11ef3a9523a5b1baeab7754c8113eb61"
+        "030101890f2d3c4b7a689abcdef012345678000000000000000000000000000000000000000000000000000000000000cd4c98e2fb9a60df8963b68364d390c71b13d57b766d96f1cd837e73de8ad04901d9557d2d8be3598b0e298539c8c549b570e5593a06b69d00bb07d15c9e0d15170001d9557d2d8be3598b0e298539c8c549b570e5593a06b69d00bb07d15c9e0d151700000018830a356613784876607ffb6e82419a11ef3a9523a5b1baeab7754c8113eb61"
     );
     // Revision ID is the object-domain BLAKE3 of the canonical bytes above.
     let expected_id = wheat_core::RevisionId::of_canonical_bytes(&revision.canonical_bytes());
@@ -330,6 +330,7 @@ fn revision_parents_and_view_order_are_checked_on_decode() {
         unresolved_conflicts: wheat_core::ConflictSetId::from_digest([8; 32]),
         required_content: wheat_core::ContentMapId::from_digest([9; 32]),
         tips: wheat_core::ChangeSetId::from_digest([10; 32]),
+        history: wheat_core::HistoryMapId::from_digest([11; 32]),
         order: ViewOrder::BASE,
     };
     let change = ChangeId::from_bytes([2; 16]);
@@ -549,7 +550,30 @@ fn conflict_edits_are_canonicalized_before_identity() {
         BTreeMap::new(),
         BTreeSet::from([conflict_id]),
         BTreeSet::new(),
+        BTreeMap::new(),
         ViewOrder::BASE,
     );
     assert_ne!(view.id, manifested.id);
+}
+
+/// History keys order newest first, then by highest change ID, across the whole
+/// range of seconds, and give back the time and change they were made from.
+#[test]
+fn history_keys_order_newest_first() {
+    let low = wheat_core::ChangeId::from_bytes([1; 16]);
+    let high = wheat_core::ChangeId::from_bytes([0xfe; 16]);
+    let mut keys = Vec::new();
+    for seconds in [i64::MIN, -3_000_000_000, -1, 0, 1, 1_700_000_000, i64::MAX] {
+        for change in [low, high] {
+            let key = wheat_core::HistoryKey::new(seconds, change);
+            assert_eq!(key.committed_at(), seconds);
+            assert_eq!(key.change(), change);
+            keys.push(((seconds, change), key));
+        }
+    }
+    let mut by_key = keys.clone();
+    by_key.sort_by_key(|(_, key)| *key);
+    let mut newest_first = keys;
+    newest_first.sort_by(|(left, _), (right, _)| right.cmp(left));
+    assert_eq!(by_key, newest_first);
 }

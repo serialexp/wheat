@@ -46,6 +46,8 @@ pub enum RepositoryPublicationError {
     #[error(transparent)]
     Applications(#[from] crate::ApplicationMapError),
     #[error(transparent)]
+    History(#[from] crate::HistoryMapError),
+    #[error(transparent)]
     Tree(#[from] crate::MerkleTreeError),
     #[error(transparent)]
     VerificationScratch(#[from] crate::verification_scratch::VerificationScratchError),

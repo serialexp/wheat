@@ -34,6 +34,8 @@ pub enum RepositoryMutationError {
     #[error(transparent)]
     ContentMap(#[from] crate::ContentMapError),
     #[error(transparent)]
+    History(#[from] crate::HistoryMapError),
+    #[error(transparent)]
     ViewLineage(#[from] crate::ViewLineageError),
     #[error(transparent)]
     Trees(#[from] MerkleTreeError),
@@ -229,6 +231,15 @@ pub(crate) struct PendingRevision {
     pub(crate) dependencies: BTreeSet<ChangeId>,
     pub(crate) metadata: RevisionMetadata,
     pub(crate) edits: RevisionEdits,
+}
+
+/// The revision a composition step applies.
+pub(crate) struct StepRevision<'a> {
+    pub(crate) id: RevisionId,
+    pub(crate) generation: u64,
+    pub(crate) dependencies: &'a BTreeSet<ChangeId>,
+    /// When the revision was committed: where the change goes in the view's history.
+    pub(crate) committed_at: Timestamp,
 }
 
 #[derive(Default)]
@@ -907,7 +918,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let mut view = self.prefix_view(active, prefix).await?;
         let mut authored = BTreeMap::new();
         for change in order.into_iter().skip(prefix) {
-            let (revision_id, generation, dependencies, edits) =
+            let (revision_id, generation, dependencies, committed_at, edits) =
                 if let Some(revision) = pending.remove(&change) {
                     let (authored_against, tree) = match authored_at.get(&change) {
                         Some(position) => *position,
@@ -948,15 +959,23 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                     self.persist_edits(&revision.edits.edits, fresh).await?;
                     let revision_id = self.put_revision(&record, fresh).await?;
                     let dependencies = record.dependencies.clone();
+                    let committed_at = record.metadata.committed_at;
                     active.revisions.insert(change, (revision_id, record));
                     authored.insert(change, revision_id);
-                    (revision_id, generation, dependencies, revision.edits.edits)
+                    (
+                        revision_id,
+                        generation,
+                        dependencies,
+                        committed_at,
+                        revision.edits.edits,
+                    )
                 } else {
                     let (revision_id, revision) = &active.revisions[&change];
                     (
                         *revision_id,
                         revision.generation,
                         revision.dependencies.clone(),
+                        revision.metadata.committed_at,
                         self.load_edits(revision).await?,
                     )
                 };
@@ -964,9 +983,12 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 .apply_step(
                     view,
                     change,
-                    revision_id,
-                    generation,
-                    &dependencies,
+                    StepRevision {
+                        id: revision_id,
+                        generation,
+                        dependencies: &dependencies,
+                        committed_at,
+                    },
                     &edits,
                     fresh,
                 )
@@ -991,19 +1013,22 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
     }
 
-    /// Applies one change's revision, of `generation` and depending on `dependencies`,
-    /// onto `view` and records the resulting view.
+    /// Applies one change's revision `step` onto `view` and records the resulting view.
     #[tracing::instrument(level = "debug", skip_all, fields(change = %change))]
     pub(crate) async fn apply_step(
         &self,
         view: ViewRecord,
         change: ChangeId,
-        revision_id: RevisionId,
-        generation: u64,
-        dependencies: &BTreeSet<ChangeId>,
+        step: StepRevision<'_>,
         edits: &BTreeMap<EditId, EditRecord>,
         fresh: &mut Fresh,
     ) -> Result<ViewRecord> {
+        let StepRevision {
+            id: revision_id,
+            generation,
+            dependencies,
+            committed_at,
+        } = step;
         let order =
             view.order
                 .then(change, generation)
@@ -1050,6 +1075,13 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let tips = crate::ChangeSetStore::new(self.objects)
             .after(view.tips, change, dependencies)
             .await?;
+        let history = crate::HistoryMapStore::new(self.objects)
+            .insert(
+                view.history,
+                HistoryKey::new(committed_at.seconds, change),
+                application_id,
+            )
+            .await?;
         let parent = view.id();
         let next = ViewRecord {
             tree,
@@ -1058,6 +1090,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             unresolved_conflicts: conflict_root,
             required_content: content,
             tips,
+            history,
             order,
         };
         self.put_view(&next, fresh).await?;

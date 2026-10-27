@@ -44,6 +44,7 @@
         { type: "ChangeSetNodeV1", when: "value == 0x1401" },
         { type: "ChunkedTreeV1", when: "value == 0x1501" },
         { type: "DirectoryChunkNodeV1", when: "value == 0x1601" },
+        { type: "HistoryMapNodeV1", when: "value == 0x1701" },
       ],
     },
 
@@ -87,6 +88,7 @@
     RepositoryStateId: { sequence: [{ name: "digest", type: "Digest256" }] },
     ViewLabelManifestId: { sequence: [{ name: "digest", type: "Digest256" }] },
     DirectoryChunkId: { sequence: [{ name: "digest", type: "Digest256" }] },
+    HistoryMapId: { sequence: [{ name: "digest", type: "Digest256" }] },
 
     TreeV1: {
       sequence: [
@@ -397,6 +399,9 @@
         // The changes in `revisions` no other change in `revisions` depends on: what a
         // new change on the frontier depends on.
         { name: "tips", type: "ChangeSetId" },
+        // Each change in `revisions`, by when its revision was committed, newest
+        // first, to the application that applied it: the view's history by time.
+        { name: "history", type: "HistoryMapId" },
         // The number of changes in `revisions`.
         { name: "size", type: "varlength", encoding: "leb128_canonical" },
         {
@@ -630,6 +635,34 @@
       sequence: [
         { name: "edge", type: "uint8" },
         { name: "child", type: "ChangeSetId" },
+      ],
+    },
+
+    // Radix map from a history key to an ApplicationId: a view's history by time. A
+    // key is 24 bytes, the revision's committed_at seconds (sign bit flipped,
+    // big-endian) and then the ChangeId, all bits inverted, so keys run newest first
+    // and, within a second, by highest ChangeId first.
+    HistoryMapNodeV1: {
+      sequence: [
+        { name: "wire_tag", type: "uint16", const: 0x1701 },
+        { name: "prefix", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "uint8" } },
+        { name: "value", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ApplicationId" } },
+        { name: "children", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "HistoryMapChildV1" } },
+        { name: "entries", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "ApplicationMapEntryV1" } },
+      ],
+    },
+    HistoryMapChildV1: {
+      sequence: [
+        { name: "edge", type: "uint8" },
+        { name: "child", type: "HistoryMapId" },
+      ],
+    },
+    // A history-map key before its bits are inverted: the committed_at seconds with
+    // the sign bit flipped, so unsigned order is time order, then the ChangeId.
+    HistoryKeyV1: {
+      sequence: [
+        { name: "time", type: "uint64" },
+        { name: "change", type: "ChangeId" },
       ],
     },
 

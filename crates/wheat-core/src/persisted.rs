@@ -1,7 +1,7 @@
 use crate::{
     ApplicationMapId, ChangeMapId, ChangeSetId, ConflictSetId, ContentMapId, ContentSetId,
-    ProjectedCommitSetId, RepositoryStateId, RetainedSetId, RevisionMapId, TreeId, ViewId,
-    ViewLineageMapId, ViewOrder,
+    HistoryMapId, ProjectedCommitSetId, RepositoryStateId, RetainedSetId, RevisionMapId, TreeId,
+    ViewId, ViewLineageMapId, ViewOrder,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +15,9 @@ pub struct ViewRecord {
     /// The changes in `revisions` that no other change in `revisions` depends on: the
     /// dependencies of a new change created on the frontier.
     pub tips: ChangeSetId,
+    /// Each change in `revisions` by when its revision was committed, newest first, to
+    /// the application that applied it.
+    pub history: HistoryMapId,
     pub order: ViewOrder,
 }
 

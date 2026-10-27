@@ -6,8 +6,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplicationId, ChangeId, ConflictId, ContentId, ContentSetId, EditId, EditRecord, RevisionId,
-    ViewId,
+    ApplicationId, ChangeId, ConflictId, ContentId, ContentSetId, EditId, EditRecord, HistoryKey,
+    RevisionId, ViewId,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -753,11 +753,14 @@ pub struct RepositoryView {
     pub required_content: BTreeMap<ContentId, u32>,
     /// The selected changes no other selected change depends on.
     pub tips: BTreeSet<ChangeId>,
+    /// Each selected change by when its revision was committed, newest first, to its
+    /// application.
+    pub history: BTreeMap<HistoryKey, ApplicationId>,
     pub order: ViewOrder,
 }
 
 impl RepositoryView {
-    /// A view with no applications, conflicts or tips, as the base is.
+    /// A view with no applications, conflicts, tips or history, as the base is.
     #[must_use]
     pub fn new(tree: Tree, frontier: BTreeMap<ChangeId, RevisionId>, order: ViewOrder) -> Self {
         Self::from_manifest(
@@ -766,6 +769,7 @@ impl RepositoryView {
             BTreeMap::new(),
             BTreeSet::new(),
             BTreeSet::new(),
+            BTreeMap::new(),
             order,
         )
     }
@@ -777,6 +781,7 @@ impl RepositoryView {
         applications: BTreeMap<ChangeId, ApplicationId>,
         unresolved_conflicts: BTreeSet<ConflictId>,
         tips: BTreeSet<ChangeId>,
+        history: BTreeMap<HistoryKey, ApplicationId>,
         order: ViewOrder,
     ) -> Self {
         let mut required_content = BTreeMap::new();
@@ -791,6 +796,7 @@ impl RepositoryView {
             unresolved_conflicts,
             required_content,
             tips,
+            history,
             order,
         };
         view.id = ViewId::of_canonical_bytes(&crate::wire::view_bytes(&view));
@@ -812,6 +818,21 @@ impl RepositoryView {
         }
         tips.insert(change);
         tips
+    }
+
+    /// The history after `application` applies `change`, whose revision was committed
+    /// at `committed_at`, onto this view: one more entry, since a view selects each
+    /// change once.
+    #[must_use]
+    pub fn history_after(
+        &self,
+        change: ChangeId,
+        committed_at: Timestamp,
+        application: ApplicationId,
+    ) -> BTreeMap<HistoryKey, ApplicationId> {
+        let mut history = self.history.clone();
+        history.insert(HistoryKey::new(committed_at.seconds, change), application);
+        history
     }
 
     #[must_use]

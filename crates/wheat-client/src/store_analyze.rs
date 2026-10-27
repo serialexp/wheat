@@ -55,6 +55,7 @@ fn kind_name(kind: u16) -> &'static str {
             ObjectKind::ChangeSetNode => "ChangeSetNode",
             ObjectKind::ChunkedTree => "ChunkedTree",
             ObjectKind::DirectoryChunkNode => "DirectoryChunkNode",
+            ObjectKind::HistoryMapNode => "HistoryMapNode",
         })
         .unwrap_or("Unknown")
 }

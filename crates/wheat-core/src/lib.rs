@@ -37,13 +37,13 @@ pub use collection::{
     ApplicationMapChild, ApplicationMapNode, ChangeMapChild, ChangeMapNode, ChangeSetChild,
     ChangeSetNode, ChunkedTree, ConflictSetChild, ConflictSetNode, ContentMapChild, ContentMapNode,
     ContentSetChild, ContentSetNode, DirectoryChunkChild, DirectoryChunkEntry, DirectoryChunkNode,
-    ProjectedCommitSetChild, ProjectedCommitSetNode, RetainedSetChild, RetainedSetNode,
-    ViewLineageMapChild, ViewLineageMapNode,
+    HistoryMapChild, HistoryMapNode, ProjectedCommitSetChild, ProjectedCommitSetNode,
+    RetainedSetChild, RetainedSetNode, ViewLineageMapChild, ViewLineageMapNode,
 };
 pub use collection_builders::{
     build_application_map, build_change_map, build_change_set, build_conflict_set,
-    build_content_map, build_content_set, build_directory, build_projected_commit_set,
-    build_retained_set, build_revision_map, build_view_lineage_map,
+    build_content_map, build_content_set, build_directory, build_history_map,
+    build_projected_commit_set, build_retained_set, build_revision_map, build_view_lineage_map,
 };
 pub use content_generation_wire::{
     CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationWireEntry, ContentGenerationWireError,
@@ -58,9 +58,9 @@ pub use hydration::{hydrate_application, hydrate_revision};
 pub use id::{
     ApplicationId, ApplicationMapId, ChangeId, ChangeMapId, ChangeObjectId, ChangeSetId,
     ConflictId, ConflictSetId, ContentId, ContentMapId, ContentSetId, DirectoryChunkId, EditId,
-    ObjectId, ParseContentIdError, ParseDigestIdError, ProjectedCommit, ProjectedCommitSetId,
-    RepositoryEnvelopeId, RepositoryStateId, RetainedSetId, RevisionId, RevisionMapId, TreeId,
-    ViewId, ViewLabelManifestId, ViewLineageMapId, content_bytes_hashed,
+    HistoryKey, HistoryMapId, ObjectId, ParseContentIdError, ParseDigestIdError, ProjectedCommit,
+    ProjectedCommitSetId, RepositoryEnvelopeId, RepositoryStateId, RetainedSetId, RevisionId,
+    RevisionMapId, TreeId, ViewId, ViewLabelManifestId, ViewLineageMapId, content_bytes_hashed,
 };
 pub use model::{
     Actor, Application, ApplicationOrder, ApplicationResult, AppliedEditEvidence, ByteRange,
@@ -123,7 +123,7 @@ pub use wire::{
     MAX_DIRECTORY_COMPONENT_BYTES, decode_application_map_node, decode_change_map_node,
     decode_change_set_node, decode_chunked_tree, decode_conflict_set_node, decode_content_map_node,
     decode_content_set_node, decode_directory_chunk_node, decode_directory_node,
-    decode_projected_commit_set_node, decode_repository_envelope_record,
+    decode_history_map_node, decode_projected_commit_set_node, decode_repository_envelope_record,
     decode_repository_state_record, decode_retained_set_node, decode_revision_map_node,
     decode_view_label_manifest_record, decode_view_lineage_map_node, decode_view_record,
     directory_name_key, validate_canonical_object, validate_directory_component,

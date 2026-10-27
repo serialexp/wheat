@@ -13,6 +13,7 @@ pub fn build_view_record(
     let unresolved_conflicts =
         crate::build_conflict_set(view.unresolved_conflicts.iter().copied(), &mut *sink);
     let tips = crate::build_change_set(view.tips.iter().copied(), &mut *sink);
+    let history = crate::build_history_map(view.history.iter().map(|(k, v)| (*k, *v)), &mut *sink);
     let required_content = crate::build_content_map(
         view.required_content
             .iter()
@@ -26,6 +27,7 @@ pub fn build_view_record(
         unresolved_conflicts,
         required_content,
         tips,
+        history,
         order: view.order,
     }
 }

@@ -185,6 +185,8 @@ enum Role {
     ProjectedCommits,
     /// A view's tips.
     Tips,
+    /// A view's history by time.
+    History,
     /// A wide directory's chunks.
     Directory,
 }
@@ -206,6 +208,7 @@ impl Role {
             Self::AggregateContent => RadixKind::ContentSet,
             Self::ProjectedCommits => RadixKind::ProjectedCommitSet,
             Self::Tips => RadixKind::ChangeSet,
+            Self::History => RadixKind::HistoryMap,
             Self::Directory => RadixKind::Directory,
         }
     }
@@ -1140,7 +1143,9 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             }
             Role::ChangeMap => self.push_entity(target, Entity::Change, false),
             Role::RevisionMap => self.push_entity(target, Entity::Revision, false),
-            Role::ApplicationMap => self.push_entity(target, Entity::Application, false),
+            Role::ApplicationMap | Role::History => {
+                self.push_entity(target, Entity::Application, false)
+            }
             Role::Directory => {
                 let old = match old {
                     OldValue::Present(old) => old,
@@ -1453,6 +1458,12 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
                 ViewSite::Tips => {
                     self.push_radix_root(id, Role::Tips, old_field(|old| old.tips.into()), None)
                 }
+                ViewSite::History => self.push_radix_root(
+                    id,
+                    Role::History,
+                    old_field(|old| old.history.into()),
+                    None,
+                ),
             }
         })
     }

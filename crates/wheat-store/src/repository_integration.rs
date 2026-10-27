@@ -210,26 +210,33 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         for change in &order {
             let joining = joined.remove(change).expect("ordered change");
             let dependencies = joining.dependencies().clone();
-            let (revision, generation, edits) = match joining {
-                Joined::Existing(revision, record) => {
-                    (revision, record.generation, self.load_edits(&record).await?)
-                }
+            let (revision, generation, committed_at, edits) = match joining {
+                Joined::Existing(revision, record) => (
+                    revision,
+                    record.generation,
+                    record.metadata.committed_at,
+                    self.load_edits(&record).await?,
+                ),
                 Joined::Combined(combination) => {
                     let generation = combination.generation;
+                    let committed_at = combination.metadata.committed_at;
                     let (revision, edits) = self
                         .author_combination(*change, combination, &view, &mut fresh)
                         .await?;
                     combined.insert(*change, revision);
-                    (revision, generation, edits)
+                    (revision, generation, committed_at, edits)
                 }
             };
             let next = self
                 .apply_step(
                     view,
                     *change,
-                    revision,
-                    generation,
-                    &dependencies,
+                    crate::repository_mutation::StepRevision {
+                        id: revision,
+                        generation,
+                        dependencies: &dependencies,
+                        committed_at,
+                    },
                     &edits,
                     &mut fresh,
                 )

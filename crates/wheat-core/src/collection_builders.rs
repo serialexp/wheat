@@ -10,10 +10,10 @@ use crate::{
     ChangeId, ChangeMapChild, ChangeMapId, ChangeMapNode, ChangeObjectId, ChangeSetChild,
     ChangeSetId, ChangeSetNode, ConflictId, ConflictSetChild, ConflictSetId, ConflictSetNode,
     ContentId, ContentMapChild, ContentMapId, ContentMapNode, ContentSetChild, ContentSetId,
-    ContentSetNode, ObjectId, ProjectedCommit, ProjectedCommitSetChild, ProjectedCommitSetId,
-    ProjectedCommitSetNode, RetainedSetChild, RetainedSetId, RetainedSetNode, RevisionId,
-    RevisionMapChild, RevisionMapId, RevisionMapNode, ViewId, ViewLineageMapChild,
-    ViewLineageMapId, ViewLineageMapNode,
+    ContentSetNode, HistoryKey, HistoryMapChild, HistoryMapId, HistoryMapNode, ObjectId,
+    ProjectedCommit, ProjectedCommitSetChild, ProjectedCommitSetId, ProjectedCommitSetNode,
+    RetainedSetChild, RetainedSetId, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapId,
+    RevisionMapNode, ViewId, ViewLineageMapChild, ViewLineageMapId, ViewLineageMapNode,
 };
 use crate::{
     CanonicalObjectError, ChunkedTree, DirectoryChunkChild, DirectoryChunkEntry, DirectoryChunkId,
@@ -216,6 +216,37 @@ impl RadixShape for ApplicationShape {
         .expect("builder produces a valid application-map node");
         let bytes = node.canonical_bytes();
         (ApplicationMapId::of_canonical_bytes(&bytes), bytes)
+    }
+}
+
+struct HistoryShape;
+impl RadixShape for HistoryShape {
+    type Key = HistoryKey;
+    type Value = ApplicationId;
+    type Id = HistoryMapId;
+
+    fn key_bytes(key: &Self::Key) -> &[u8] {
+        key.as_bytes()
+    }
+
+    fn node(
+        prefix: Vec<u8>,
+        value: Option<Self::Value>,
+        children: Vec<(u8, Self::Id)>,
+        entries: Vec<(Vec<u8>, Self::Value)>,
+    ) -> (Self::Id, Vec<u8>) {
+        let node = HistoryMapNode::new(
+            prefix,
+            value,
+            children
+                .into_iter()
+                .map(|(edge, child)| HistoryMapChild { edge, child })
+                .collect(),
+            entries,
+        )
+        .expect("builder produces a valid history-map node");
+        let bytes = node.canonical_bytes();
+        (HistoryMapId::of_canonical_bytes(&bytes), bytes)
     }
 }
 
@@ -472,6 +503,20 @@ pub fn build_application_map(
         .into_iter()
         .collect();
     build_sorted::<ApplicationShape, _>(entries, emit)
+}
+
+/// Builds a canonical history map. If a key occurs more than once, its last
+/// application in iteration order wins.
+pub fn build_history_map(
+    entries: impl IntoIterator<Item = (HistoryKey, ApplicationId)>,
+    emit: impl FnMut(CanonicalObject),
+) -> HistoryMapId {
+    let entries = entries
+        .into_iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    build_sorted::<HistoryShape, _>(entries, emit)
 }
 
 /// Builds the canonical parent-view to child-view-set map and emits both object families.

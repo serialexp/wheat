@@ -1,20 +1,21 @@
 //! Reads for browsing a repository without a workspace, as a host's repository pages
 //! do: a label's view, a directory's entries, a file's bytes, and a view's history,
-//! newest first, a page at a time. Every read is bounded by its page or byte limit
-//! rather than by the repository's size.
+//! newest first in canonical order or by commit time, a page at a time. Every read is
+//! bounded by its page or byte limit rather than by the repository's size.
 
 use std::num::NonZeroUsize;
 
 use thiserror::Error;
 use wheat_core::{
-    Actor, ApplicationId, ApplicationResultRecord, ChangeId, FileValue, RepositoryStateRecord,
-    RevisionId, Timestamp, TreeId, ViewId, ViewLabelManifestRecord, ViewRecord,
+    Actor, ApplicationId, ApplicationRecord, ApplicationResultRecord, ChangeId, FileValue,
+    HistoryKey, RepositoryStateRecord, RevisionId, Timestamp, TreeId, ViewId,
+    ViewLabelManifestRecord, ViewRecord,
 };
 
 use crate::{
-    ChangeMapStore, ContentStore, ContentStoreError, ImmutableObjectStore, MerkleTreeError,
-    MerkleTreeStore, RepositoryHead, RepositoryPublicationError, RepositoryReader,
-    RetainedSetStore, TreeListing,
+    ChangeMapStore, ContentStore, ContentStoreError, HistoryMapError, HistoryMapStore,
+    ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, RepositoryHead,
+    RepositoryPublicationError, RepositoryReader, RetainedSetStore, TreeListing,
 };
 
 #[derive(Debug, Error)]
@@ -31,6 +32,8 @@ pub enum BrowseError {
     Read(#[from] RepositoryPublicationError),
     #[error(transparent)]
     Tree(#[from] MerkleTreeError),
+    #[error(transparent)]
+    History(#[from] HistoryMapError),
     #[error(transparent)]
     Content(#[from] ContentStoreError),
 }
@@ -65,12 +68,30 @@ pub struct HistoryItem {
     pub committed_at: Timestamp,
 }
 
-/// A page of history, newest first.
+impl HistoryItem {
+    /// The item's key in its view's history by time.
+    #[must_use]
+    pub fn time_key(&self) -> HistoryKey {
+        HistoryKey::new(self.committed_at.seconds, self.change)
+    }
+}
+
+/// A page of history in canonical order, newest first.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HistoryPage {
     pub items: Vec<HistoryItem>,
     /// The `before` for the next page; none after the oldest change.
     pub next: Option<u64>,
+}
+
+/// A page of history by commit time, newest first; within a second, by highest
+/// change ID first.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TimeHistoryPage {
+    pub items: Vec<HistoryItem>,
+    /// The `from` for the next page, the key of its first change; none after the
+    /// oldest change.
+    pub next: Option<HistoryKey>,
 }
 
 /// Browsing reads at one repository head.
@@ -194,56 +215,101 @@ impl<'a, O: ImmutableObjectStore> RepositoryBrowser<'a, O> {
         else {
             return Err(BrowseError::IdentityMismatch("application order"));
         };
-        let changes = ChangeMapStore::new(self.reader.objects);
         let mut items = Vec::with_capacity(limit.get().min(1024));
         loop {
-            if application.id() != id || application.order.position != first - items.len() as u64 {
+            if application.order.position != first - items.len() as u64 {
                 return Err(BrowseError::IdentityMismatch("application"));
             }
-            let revision = self.reader.revision(application.revision_id).await?;
-            if revision.id() != application.revision_id {
-                return Err(BrowseError::IdentityMismatch("revision"));
-            }
-            let change_object = changes
-                .get(self.state.changes, revision.change_id)
-                .await
-                .map_err(RepositoryPublicationError::from)?
-                .ok_or(BrowseError::IdentityMismatch("change map"))?;
-            let change = self.reader.change(change_object).await?;
-            if change.id != revision.change_id {
-                return Err(BrowseError::IdentityMismatch("change"));
-            }
-            let (tree, conflicted) = match application.result {
-                ApplicationResultRecord::Clean { tree } => (tree, false),
-                ApplicationResultRecord::Conflicted { partial_tree, .. } => (partial_tree, true),
-            };
-            items.push(HistoryItem {
-                position: application.order.position,
-                application: id,
-                parent: application.target_view,
-                tree,
-                conflicted,
-                change: revision.change_id,
-                title: change.metadata.title,
-                creator: change.metadata.creator,
-                revision: application.revision_id,
-                message: revision.metadata.message,
-                author: revision.metadata.author,
-                committed_at: revision.metadata.committed_at,
-            });
-            let position = application.order.position;
+            let previous = application.order.previous;
+            let item = self.item(id, application).await?;
+            let position = item.position;
+            items.push(item);
             if position == 0 || items.len() == limit.get() {
                 return Ok(HistoryPage {
                     items,
                     next: (position > 0).then_some(position),
                 });
             }
-            id = application
-                .order
-                .previous
-                .ok_or(BrowseError::IdentityMismatch("application order"))?;
+            id = previous.ok_or(BrowseError::IdentityMismatch("application order"))?;
             application = self.reader.application(id).await?;
         }
+    }
+
+    /// Up to `limit` of `view`'s changes by when their revisions were committed, newest
+    /// first, from `from` on (from the newest when `None`). Finding the first costs
+    /// O(log n) node reads in the view's history map and each change a few object
+    /// reads, so a page does not read the whole history.
+    #[tracing::instrument(name = "browse_history_by_time", level = "debug", skip_all)]
+    pub async fn history_by_time(
+        &self,
+        view: ViewId,
+        from: Option<HistoryKey>,
+        limit: NonZeroUsize,
+    ) -> Result<TimeHistoryPage, BrowseError> {
+        let record = self.view(view).await?;
+        let history = HistoryMapStore::new(self.reader.objects);
+        let mut cursor = match from {
+            Some(from) => history.cursor_from(record.history, from).await?,
+            None => history.cursor(record.history).await?,
+        };
+        let mut items = Vec::with_capacity(limit.get().min(1024));
+        while let Some((key, id)) = cursor.next().await? {
+            if items.len() == limit.get() {
+                return Ok(TimeHistoryPage {
+                    items,
+                    next: Some(key),
+                });
+            }
+            let application = self.reader.application(id).await?;
+            let item = self.item(id, application).await?;
+            if item.time_key() != key {
+                return Err(BrowseError::IdentityMismatch("history"));
+            }
+            items.push(item);
+        }
+        Ok(TimeHistoryPage { items, next: None })
+    }
+
+    /// The history item for application `id`: reads its revision and change.
+    async fn item(
+        &self,
+        id: ApplicationId,
+        application: ApplicationRecord,
+    ) -> Result<HistoryItem, BrowseError> {
+        if application.id() != id {
+            return Err(BrowseError::IdentityMismatch("application"));
+        }
+        let revision = self.reader.revision(application.revision_id).await?;
+        if revision.id() != application.revision_id {
+            return Err(BrowseError::IdentityMismatch("revision"));
+        }
+        let change_object = ChangeMapStore::new(self.reader.objects)
+            .get(self.state.changes, revision.change_id)
+            .await
+            .map_err(RepositoryPublicationError::from)?
+            .ok_or(BrowseError::IdentityMismatch("change map"))?;
+        let change = self.reader.change(change_object).await?;
+        if change.id != revision.change_id {
+            return Err(BrowseError::IdentityMismatch("change"));
+        }
+        let (tree, conflicted) = match application.result {
+            ApplicationResultRecord::Clean { tree } => (tree, false),
+            ApplicationResultRecord::Conflicted { partial_tree, .. } => (partial_tree, true),
+        };
+        Ok(HistoryItem {
+            position: application.order.position,
+            application: id,
+            parent: application.target_view,
+            tree,
+            conflicted,
+            change: revision.change_id,
+            title: change.metadata.title,
+            creator: change.metadata.creator,
+            revision: application.revision_id,
+            message: revision.metadata.message,
+            author: revision.metadata.author,
+            committed_at: revision.metadata.committed_at,
+        })
     }
 }
 

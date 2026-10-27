@@ -1,9 +1,9 @@
 //! Explicit reference-model hydration. Unlike lazy reads, this intentionally
 //! loads retained history into memory and is not the streaming-import path.
 use crate::{
-    ApplicationMapStore, ChangeSetStore, ConflictSetStore, ContentMapStore, ImmutableObjectStore,
-    MerkleTreeStore, RepositoryPublicationError, RepositoryReader, RetainedSetStore,
-    RevisionMapStore,
+    ApplicationMapStore, ChangeSetStore, ConflictSetStore, ContentMapStore, HistoryMapStore,
+    ImmutableObjectStore, MerkleTreeStore, RepositoryPublicationError, RepositoryReader,
+    RetainedSetStore, RevisionMapStore,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use wheat_core::*;
@@ -100,6 +100,13 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
             while let Some(change) = cursor.next().await? {
                 tips.insert(change);
             }
+            let mut history = BTreeMap::new();
+            let mut cursor = HistoryMapStore::new(self.objects)
+                .cursor(record.history)
+                .await?;
+            while let Some((key, application)) = cursor.next().await? {
+                history.insert(key, application);
+            }
             views.push(RepositoryView {
                 id,
                 order: record.order,
@@ -109,6 +116,7 @@ impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
                 unresolved_conflicts,
                 required_content,
                 tips,
+                history,
             });
         }
         let mut revisions = Vec::new();

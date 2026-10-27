@@ -23,6 +23,7 @@ use crate::{
     change_map::ChangeCollection,
     content_map::ContentMapCollection,
     directory_chunks::DirectoryChunkCollection,
+    history_map::HistoryCollection,
     radix::{self, Collection, Key as _, Node},
     revision_map::RevisionCollection,
     sets::{
@@ -110,8 +111,8 @@ pub(crate) fn state<E>(
     Ok(())
 }
 
-/// The fields of a view. The revisions, applications, unresolved conflicts, content
-/// and tips are roots of radix collections.
+/// The fields of a view. The revisions, applications, unresolved conflicts, content,
+/// tips and history are roots of radix collections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ViewSite {
     Tree,
@@ -120,6 +121,7 @@ pub(crate) enum ViewSite {
     UnresolvedConflicts,
     RequiredContent,
     Tips,
+    History,
 }
 
 pub(crate) fn view<E>(
@@ -136,6 +138,7 @@ pub(crate) fn view<E>(
         ),
         (ViewSite::RequiredContent, record.required_content.into()),
         (ViewSite::Tips, record.tips.into()),
+        (ViewSite::History, record.history.into()),
     ] {
         f(Ref::Object(site, id))?;
     }
@@ -398,6 +401,8 @@ pub(crate) enum RadixKind {
     ProjectedCommitSet,
     /// A view's tips: change IDs, which name no object.
     ChangeSet,
+    /// A view's history: committed time ‖ change → its application.
+    HistoryMap,
     /// A wide directory: the hash of a name → its entry, which refers to a tree when
     /// it is a subdirectory. A file's blob is not listed: walks gather blobs from the
     /// directory nodes themselves ([`directory_chunk`]).
@@ -417,6 +422,7 @@ impl RadixKind {
             Self::ContentSet => ObjectKind::ContentSetNode,
             Self::ProjectedCommitSet => ObjectKind::ProjectedCommitSetNode,
             Self::ChangeSet => ObjectKind::ChangeSetNode,
+            Self::HistoryMap => ObjectKind::HistoryMapNode,
             Self::Directory => ObjectKind::DirectoryChunkNode,
         }
     }
@@ -433,6 +439,7 @@ impl RadixKind {
             Self::ContentSet => <ContentCollection as Collection>::Key::LEN,
             Self::ProjectedCommitSet => <ProjectedCommitCollection as Collection>::Key::LEN,
             Self::ChangeSet => <ChangeSetCollection as Collection>::Key::LEN,
+            Self::HistoryMap => <HistoryCollection as Collection>::Key::LEN,
             Self::Directory => <DirectoryChunkCollection as Collection>::Key::LEN,
         }
     }
@@ -457,6 +464,7 @@ impl RadixKind {
             Self::ContentSet => uniform::<ContentCollection>(bytes),
             Self::ProjectedCommitSet => uniform::<ProjectedCommitCollection>(bytes),
             Self::ChangeSet => uniform::<ChangeSetCollection>(bytes),
+            Self::HistoryMap => uniform::<HistoryCollection>(bytes),
             Self::Directory => uniform::<DirectoryChunkCollection>(bytes),
         }
     }
@@ -682,7 +690,8 @@ where
                     | ViewSite::Revisions
                     | ViewSite::Applications
                     | ViewSite::UnresolvedConflicts
-                    | ViewSite::Tips => Reference::RadixRoot(id),
+                    | ViewSite::Tips
+                    | ViewSite::History => Reference::RadixRoot(id),
                 },
                 Ref::Content(id) => Reference::Content(id),
             })
@@ -731,6 +740,7 @@ where
             follow_radix(RadixKind::ProjectedCommitSet, stored, radix_path, f)
         }
         ObjectKind::ChangeSetNode => follow_radix(RadixKind::ChangeSet, stored, radix_path, f),
+        ObjectKind::HistoryMapNode => follow_radix(RadixKind::HistoryMap, stored, radix_path, f),
     }
 }
 

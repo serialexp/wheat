@@ -1099,6 +1099,7 @@ impl Repository {
                 applications,
                 conflicts,
                 target.tips_after(proposal.id, &proposal.dependencies),
+                target.history_after(proposal.id, revision.metadata.committed_at, application.id),
                 order_after(&target, proposal.id, revision.generation)?,
             );
 
@@ -1291,6 +1292,7 @@ impl Repository {
             applications,
             conflicts,
             target.tips_after(change, &revision.dependencies),
+            target.history_after(change, revision.metadata.committed_at, application.id),
             order,
         );
         self.applications.insert(application.id, application);

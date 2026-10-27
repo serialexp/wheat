@@ -59,15 +59,18 @@ Out: snapshot import (already fully validated); Git import (local code, trusted)
 Written down here because the validator proves them per increment and local commands
 rely on them:
 
-- **I1 Composition.** The base view has empty maps, no conflicts, no tips, and a
+- **I1 Composition.** The base view has empty maps, no conflicts, no tips, no
+  history, and a
   required content map equal to its tree's content. Every other view `V` is `T + A`:
   one application `A` of change `k`'s revision on a parent view `T`, where `V`'s
   revision and application maps are `T`'s plus key `k`, `V.tree` is `A`'s result
   tree, `V`'s conflicts are `T`'s plus `A`'s conflict if any, `V`'s required content
-  is `T`'s adjusted by the tree change, and `V`'s tips are `T`'s without `k`'s
-  dependencies and with `k`. The revision is `k`'s and its dependencies are in `T`.
-  So a view's tips are its changes that none of its other changes depend on: what a
-  new change on top of it depends on.
+  is `T`'s adjusted by the tree change, `V`'s tips are `T`'s without `k`'s
+  dependencies and with `k`, and `V`'s history is `T`'s plus key (`k`'s revision's
+  committed_at, `k`) naming `A`. The revision is `k`'s and its dependencies are in
+  `T`. So a view's tips are its changes that none of its other changes depend on:
+  what a new change on top of it depends on; and its history lists its changes by
+  commit time, newest first, which is how a host pages them.
 - **I2 Canonical order.** In I1, `k` is last in the canonical order (topological by
   dependencies, ties by lowest ChangeId) of `T`'s changes plus `k`. Equivalently:
   every change of `T` that comes after `k`'s last dependency in `T`'s canonical order
@@ -311,6 +314,8 @@ updater give the same root as building the final entries from scratch.
    - Tips: the set diff `T.tips → V.tips` is exactly `k` added and each of `k`'s
      dependencies that is in `T.tips` removed (contains lookups, and a diff that
      stops past that many entries).
+   - History: the map diff `T.history → V.history` is exactly the key
+     (committed_at, `k`) added, naming `A` (a diff that stops at a second entry).
    - I2 via the order index.
 6. **Lineage (I3):** from the lineage map diff, every added or changed lineage-map
    key is retained by `new` and its child set is non-empty (review 3, item 4: an
@@ -572,6 +577,10 @@ and writes the whole directory".
    changes nothing else in the view depends on, kept by every composition step and
    checked by the shared composition check as above, so a new change on top of a view
    finds its dependencies without loading the view's history. Done.
+   History on views (`ViewRecord.history`, a `HistoryMapNode` radix map from
+   committed_at ‖ ChangeId, inverted so keys run newest first, to the application):
+   kept by every composition step and checked the same way, so a host pages a view's
+   history by time in O(log n) reads per page. Done (2026-10-27).
 7. Forced fallback, bootstrap mode, budgets. Budgets done (3a518b6):
    `validate_increment(old, new, budget)`. Finding what was added (the retained, map
    and lineage deltas and the new view records) is unmetered, since it reads in

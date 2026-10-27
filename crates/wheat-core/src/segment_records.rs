@@ -204,6 +204,7 @@ impl SegmentIndexEntry {
             crate::CanonicalObjectKind::ChangeSetNode => 22,
             crate::CanonicalObjectKind::ChunkedTree => 23,
             crate::CanonicalObjectKind::DirectoryChunkNode => 24,
+            crate::CanonicalObjectKind::HistoryMapNode => 25,
         }
     }
 
@@ -232,6 +233,7 @@ impl SegmentIndexEntry {
             22 => crate::CanonicalObjectKind::ChangeSetNode,
             23 => crate::CanonicalObjectKind::ChunkedTree,
             24 => crate::CanonicalObjectKind::DirectoryChunkNode,
+            25 => crate::CanonicalObjectKind::HistoryMapNode,
             _ => return None,
         })
     }

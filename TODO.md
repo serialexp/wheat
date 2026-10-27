@@ -13,15 +13,9 @@ authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
 formats freeze. Items already listed elsewhere that this also needs: blocking disk work on async threads, chunked uploads reassembled in
 memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
-listing the bucket, opening a packed store costing O(store), the remote catalog head
-being JSON, and `wheat gc` / server-authoritative remote maintenance.
+listing the bucket, opening a packed store costing O(store), and `wheat gc` /
+server-authoritative remote maintenance.
 
-- `[ ]` **Browsing history is in canonical order, not by time.**
-  `RepositoryBrowser::history` pages a view newest first along its canonical order
-  (dependencies first, ties by lowest change ID), which is cheap at any depth. Paging
-  by commit time, as `wheat log` and the desktop sort, would need an index on
-  `committed_at` in the view; today that order needs every change read and sorted.
-  Add one if Gothab's history page wants time order.
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network; there is no
   library operation to create a fork that shares its parent's storage.
@@ -36,7 +30,10 @@ through `crates/wheat-client`; `--fixture` shows the comp's demo data.
   `client_history`: 0.64 s, 4 reads and 11.9 KB per change at 20,000; the bytes per
   change grow because every change-map lookup re-reads its nodes, which get larger
   with the history). The Changes list doesn't page (`older_changes` is 0 live), and
-  graph layout and filtering are linear per load / keystroke.
+  graph layout and filtering are linear per load / keystroke. Each view now keeps its
+  changes by commit time (`ViewRecord.history`), which
+  `RepositoryBrowser::history_by_time` pages in O(log n) reads; `wheat log` and the
+  desktop's history (`wheat-client/src/history.rs`) still read and sort every change.
 - [ ] Live gaps: Refresh and frontier switching say to use `wheat refresh` /
   `wheat switch` (`switch_workspace` and friends are still in wheat-cli's main.rs);
   a capture that would move edits out of later changes is refused, for want of a

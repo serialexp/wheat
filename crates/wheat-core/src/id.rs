@@ -131,6 +131,7 @@ digest_id!(ProjectedCommitSetId);
 digest_id!(ChangeSetId);
 digest_id!(ViewLineageMapId);
 digest_id!(DirectoryChunkId);
+digest_id!(HistoryMapId);
 
 /// A member of a [`ProjectedCommitSetId`] set: application `application` projects as
 /// the Git SHA-1 commit `commit`. The commit leads, so the members for one commit are
@@ -179,6 +180,50 @@ impl ProjectedCommit {
     }
 }
 
+/// A key of a view's history map ([`HistoryMapId`]): when a change's revision was
+/// committed, and the change. Keys order newest first and, within a second, by highest
+/// ChangeId first, so a cursor over the map reads the history by time from the newest
+/// change on. The bytes are the committed_at seconds with the sign bit flipped,
+/// big-endian, then the ChangeId, all inverted.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct HistoryKey([u8; HistoryKey::LEN]);
+
+impl HistoryKey {
+    /// Bytes of a key: the time, then the change.
+    pub const LEN: usize = 8 + 16;
+
+    #[must_use]
+    pub fn new(committed_at: i64, change: ChangeId) -> Self {
+        let time = committed_at.cast_unsigned() ^ (1 << 63);
+        Self(crate::wire::history_key_bytes(time, change).map(|byte| !byte))
+    }
+
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; Self::LEN] {
+        &self.0
+    }
+
+    /// The committed_at seconds.
+    #[must_use]
+    pub fn committed_at(&self) -> i64 {
+        (self.parts().0 ^ (1 << 63)).cast_signed()
+    }
+
+    #[must_use]
+    pub fn change(&self) -> ChangeId {
+        self.parts().1
+    }
+
+    fn parts(&self) -> (u64, ChangeId) {
+        crate::wire::history_key_parts(&self.0.map(|byte| !byte))
+    }
+}
+
 macro_rules! object_id_from {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -213,6 +258,7 @@ object_id_from!(
     ChangeSetId,
     ViewLineageMapId,
     DirectoryChunkId,
+    HistoryMapId,
 );
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

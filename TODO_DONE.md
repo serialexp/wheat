@@ -4,6 +4,16 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **Browsing history is in canonical order, not by time.** Each view now keeps
+  a history map (`ViewRecord.history`, `HistoryMapNode`), keyed by its revisions'
+  committed_at and change ID with the bits inverted so keys run newest first, to each
+  change's application. Every composition step inserts one entry and the shared
+  composition check validates it by a map diff (Bart's choice, 2026-10-27: in the view
+  record, so the client can use it too). `RepositoryBrowser::history_by_time` pages it
+  from any key in O(log n) node reads plus a few object reads per change (tests in
+  `crates/wheat-store/tests/browse.rs`; bench case `browse_history` records pages by
+  time next to canonical ones). One index serves both directions; oldest first would
+  need a reverse radix cursor, which nothing asks for yet.
 - `[x]` **No consistent snapshot of a live served repository.**
   `Registry::quiesce(name)` (`crates/wheat-server/src/quiesce.rs`) refuses new
   publishes with a retryable operation Error (code 503) and waits for every publish

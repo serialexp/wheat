@@ -7,8 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     ApplicationMapDelta, ApplicationMapDeltaLimits, ApplicationMapStore, ChangeSetStore,
     CollectionError, ConflictSetStore, ContentMapDelta, ContentMapError, ContentMapStore,
-    ImmutableObjectStore, MerkleTreeStore, RepositoryPublicationError, RepositoryReader,
-    RevisionMapDelta, RevisionMapDeltaLimits, RevisionMapStore, TreeDiffLimits,
+    HistoryMapDelta, HistoryMapStore, ImmutableObjectStore, MerkleTreeStore,
+    RepositoryPublicationError, RepositoryReader, RevisionMapDelta, RevisionMapDeltaLimits,
+    RevisionMapStore, TreeDiffLimits,
     merkle_tree::{ReadCount, ReadLimits},
     radix,
     verification_scratch::VerificationScratch,
@@ -666,7 +667,17 @@ where
             .await?
             .next()
             .await?;
-        if revisions.is_some() || applications.is_some() || conflicts.is_some() || tips.is_some() {
+        let history = HistoryMapStore::new(self.reader.objects)
+            .cursor(view.history)
+            .await?
+            .next()
+            .await?;
+        if revisions.is_some()
+            || applications.is_some()
+            || conflicts.is_some()
+            || tips.is_some()
+            || history.is_some()
+        {
             return Err(invalid("base view selects changes"));
         }
         Ok(())
@@ -676,9 +687,9 @@ where
     /// target of its last change `k`'s application `A`) with `A` added. There is an edge
     /// `T → view` (`has_edge_from(T)`), its maps are `T`'s plus `k` and nothing else,
     /// `k`'s revision is `A`'s and of change `k`, its tree is `A`'s result, its size,
-    /// last change and weight follow `T`'s, and its tips are `T`'s without the
-    /// revision's dependencies and with `k`. The caller checks the conflicts and the
-    /// content map.
+    /// last change and weight follow `T`'s, its tips are `T`'s without the revision's
+    /// dependencies and with `k`, and its history is `T`'s with `k` at the revision's
+    /// commit time. The caller checks the conflicts and the content map.
     ///
     /// The map diffs stop at a second difference, so each reads the path to `k`; the
     /// tips diff stops past the revision's dependencies and `k`.
@@ -765,6 +776,23 @@ where
         if applications
             != [ApplicationMapDelta::Added {
                 change,
+                application: application_id,
+            }]
+        {
+            return Err(not_composed());
+        }
+        let history = match HistoryMapStore::new(self.reader.objects)
+            .delta(parent.history, view.history, 1)
+            .await
+        {
+            Err(crate::HistoryMapError::DeltaChangeLimitExceeded { .. }) => {
+                return Err(not_composed());
+            }
+            delta => delta?,
+        };
+        if history
+            != [HistoryMapDelta::Added {
+                key: HistoryKey::new(revision.metadata.committed_at.seconds, change),
                 application: application_id,
             }]
         {
@@ -1080,6 +1108,7 @@ mod content_map_tests {
             applications: ApplicationMapId::from_digest([0; 32]),
             unresolved_conflicts: ConflictSetId::from_digest([0; 32]),
             tips: ChangeSetId::from_digest([0; 32]),
+            history: HistoryMapId::from_digest([0; 32]),
             required_content,
             order: ViewOrder::BASE,
         }
@@ -1225,9 +1254,9 @@ mod content_map_tests {
         .await;
     }
 
-    /// The base view selects nothing, so it has no tips either.
+    /// The base view selects nothing, so it has no tips or history either.
     #[tokio::test]
-    async fn the_base_view_has_no_tips() {
+    async fn the_base_view_has_no_tips_or_history() {
         let dir = tempfile::tempdir().unwrap();
         let objects = LooseObjectStore::new(dir.path());
         let tips = ChangeSetStore::new(&objects);
@@ -1240,6 +1269,7 @@ mod content_map_tests {
                 .unwrap(),
             unresolved_conflicts: ConflictSetStore::new(&objects).empty_root().await.unwrap(),
             tips: empty,
+            history: HistoryMapStore::new(&objects).empty_root().await.unwrap(),
             ..view(tree(&objects, &[]).await, map(&objects, &[]).await)
         };
         let tipped = ViewRecord {
@@ -1249,9 +1279,21 @@ mod content_map_tests {
                 .unwrap(),
             ..base
         };
+        let with_history = ViewRecord {
+            history: HistoryMapStore::new(&objects)
+                .insert(
+                    base.history,
+                    HistoryKey::new(0, ChangeId::from_bytes([1; 16])),
+                    ApplicationId::from_digest([2; 32]),
+                )
+                .await
+                .unwrap(),
+            ..base
+        };
         with_checks(&objects, async |checks, _| {
             checks.base(&base).await.unwrap();
             assert!(checks.base(&tipped).await.is_err());
+            assert!(checks.base(&with_history).await.is_err());
         })
         .await;
     }

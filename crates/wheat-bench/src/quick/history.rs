@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use wheat_core::{
     Actor, ChangeId, ChangeMetadata, ChangeProposal, ContentId, EditId, EditOperation, EditRecord,
     EditTransition, FileKind, FileValue, ObjectId, Repository, RevisionEdits, RevisionMetadata,
-    Tree, ViewId,
+    Timestamp, Tree, ViewId,
 };
 use wheat_store::{
     ContentStore, Durability, ImmutableObjectStore, LocalPublicationStore, ObjectStoreError,
@@ -175,7 +175,7 @@ pub(crate) fn rewrite(
 /// for a change made `index` seconds after the first, with its random bits drawn from
 /// `index`. `ChangeId::new` reads the clock, so the maps keyed by change ID, and the
 /// reads a case counts, would differ with how fast the history was built.
-fn change_id(index: usize) -> ChangeId {
+pub(crate) fn change_id(index: usize) -> ChangeId {
     const FIRST_MILLIS: u64 = 1_760_000_000_000;
     let millis = FIRST_MILLIS + index as u64 * 1_000;
     let mut random = [0; 16];
@@ -254,6 +254,7 @@ where
                 revision_metadata: RevisionMetadata {
                     author: author(),
                     committer: author(),
+                    committed_at: committed_at(index),
                     ..RevisionMetadata::default()
                 },
                 edits,
@@ -261,4 +262,13 @@ where
         )
         .await?;
     Ok((mutator.publish(prepared).await?, outcome.resulting_view))
+}
+
+/// When change `index`'s revision was committed: a minute after the one before.
+pub(crate) fn committed_at(index: usize) -> Timestamp {
+    const FIRST_SECONDS: i64 = 1_760_000_000;
+    Timestamp {
+        seconds: FIRST_SECONDS + index as i64 * 60,
+        offset_minutes: 0,
+    }
 }

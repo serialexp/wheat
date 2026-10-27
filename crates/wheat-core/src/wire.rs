@@ -8,10 +8,11 @@ use crate::{
     ChangeId, ChangeMapChild, ChangeMapNode, ChangeMetadata, ChangeRevision, ChangeSetChild,
     ChangeSetNode, Conflict, ConflictSetChild, ConflictSetNode, ContentId, ContentMapChild,
     ContentMapId, ContentMapNode, ContentSetChild, ContentSetId, ContentSetNode, DirectoryEntry,
-    DirectoryNode, EditOperation, EditRecord, FileKind, FileValue, ProjectedCommitSetChild,
-    ProjectedCommitSetNode, RepositoryState, RepositoryView, RetainedSetChild, RetainedSetNode,
-    RevisionId, RevisionMapChild, RevisionMapNode, RevisionMetadata, SourceProvenance, Timestamp,
-    Tree, TreeId, ViewLineageMapChild, ViewLineageMapNode,
+    DirectoryNode, EditOperation, EditRecord, FileKind, FileValue, HistoryMapChild, HistoryMapNode,
+    ProjectedCommitSetChild, ProjectedCommitSetNode, RepositoryState, RepositoryView,
+    RetainedSetChild, RetainedSetNode, RevisionId, RevisionMapChild, RevisionMapNode,
+    RevisionMetadata, SourceProvenance, Timestamp, Tree, TreeId, ViewLineageMapChild,
+    ViewLineageMapNode,
 };
 use crate::{
     ChunkedTree, DirectoryChunkChild, DirectoryChunkEntry, DirectoryChunkId, DirectoryChunkNode,
@@ -63,6 +64,7 @@ pub enum CanonicalObjectKind {
     ChangeSetNode,
     ChunkedTree,
     DirectoryChunkNode,
+    HistoryMapNode,
 }
 
 pub fn validate_canonical_object(
@@ -134,6 +136,7 @@ pub fn decode_view_record(bytes: &[u8]) -> Result<crate::ViewRecord, CanonicalOb
         )?),
         required_content: ContentMapId::from_digest(digest_domain(&v.required_content.digest)?),
         tips: crate::ChangeSetId::from_digest(digest_domain(&v.tips.digest)?),
+        history: crate::HistoryMapId::from_digest(digest_domain(&v.history.digest)?),
         order: crate::ViewOrder {
             size: v.size,
             last: v
@@ -843,6 +846,46 @@ pub fn decode_application_map_node(
     })
 }
 
+pub fn decode_history_map_node(bytes: &[u8]) -> Result<HistoryMapNode, CanonicalObjectError> {
+    let object = decode_validated(bytes)?;
+    let wire::WheatObject::HistoryMapNodeV1(node) = object else {
+        return Err(CanonicalObjectError::WrongKind {
+            expected: CanonicalObjectKind::HistoryMapNode,
+            actual: object_kind(&object),
+        });
+    };
+    Ok(HistoryMapNode {
+        prefix: node.prefix,
+        value: node.value.first().map(|value| {
+            crate::ApplicationId::from_digest(
+                digest_domain(&value.digest).expect("validated digest"),
+            )
+        }),
+        children: node
+            .children
+            .into_iter()
+            .map(|child| HistoryMapChild {
+                edge: child.edge,
+                child: crate::HistoryMapId::from_digest(
+                    digest_domain(&child.child.digest).expect("validated digest"),
+                ),
+            })
+            .collect(),
+        entries: node
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.suffix.clone(),
+                    crate::ApplicationId::from_digest(
+                        digest_domain(&entry.value.digest).expect("validated digest"),
+                    ),
+                )
+            })
+            .collect(),
+    })
+}
+
 fn validate_radix_node(
     prefix: &[u8],
     terminal: bool,
@@ -919,6 +962,21 @@ pub(crate) fn validate_application_map_node(
         &entry_first_bytes,
         16,
         "application map node",
+    )
+}
+pub(crate) fn validate_history_map_node(node: &HistoryMapNode) -> Result<(), CanonicalObjectError> {
+    let entry_first_bytes: Vec<u8> = node
+        .entries
+        .iter()
+        .filter_map(|(suffix, _)| suffix.first().copied())
+        .collect();
+    validate_radix_node(
+        &node.prefix,
+        node.value.is_some(),
+        &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+        &entry_first_bytes,
+        crate::HistoryKey::LEN,
+        "history map node",
     )
 }
 pub(crate) fn validate_conflict_set_node(
@@ -1063,6 +1121,33 @@ pub(crate) fn application_map_node_bytes(node: &ApplicationMapNode) -> Vec<u8> {
                 .map(|c| wire::ApplicationMapChildV1 {
                     edge: c.edge,
                     child: application_map_id(c.child),
+                })
+                .collect(),
+            entries: node
+                .entries
+                .iter()
+                .map(|(suffix, value)| wire::ApplicationMapEntryV1 {
+                    suffix: suffix.clone(),
+                    value: application_id(*value),
+                })
+                .collect(),
+        }
+        .into(),
+    ))
+}
+
+pub(crate) fn history_map_node_bytes(node: &HistoryMapNode) -> Vec<u8> {
+    validate_history_map_node(node).expect("history map node violates canonical invariants");
+    encode(wire::WheatObject::HistoryMapNodeV1(
+        wire::HistoryMapNodeV1Input {
+            prefix: node.prefix.clone(),
+            value: node.value.into_iter().map(application_id).collect(),
+            children: node
+                .children
+                .iter()
+                .map(|c| wire::HistoryMapChildV1 {
+                    edge: c.edge,
+                    child: history_map_id(c.child),
                 })
                 .collect(),
             entries: node
@@ -1503,6 +1588,7 @@ pub(crate) fn view_record_bytes(record: &crate::ViewRecord) -> Vec<u8> {
             unresolved_conflicts: conflict_set_id(record.unresolved_conflicts),
             required_content: content_map_id(record.required_content),
             tips: change_set_id(record.tips),
+            history: history_map_id(record.history),
             size: record.order.size,
             last: record.order.last.into_iter().map(change_id).collect(),
             weight: record.order.weight,
@@ -1840,6 +1926,24 @@ fn validate_object(object: &wire::WheatObject) -> Result<(), CanonicalObjectErro
                 "application map node",
             )?;
         }
+        wire::WheatObject::HistoryMapNodeV1(node) => {
+            if node.value.len() > 1 {
+                return Err(CanonicalObjectError::InvalidCollection("history map value"));
+            }
+            let efb: Vec<u8> = node
+                .entries
+                .iter()
+                .filter_map(|e| e.suffix.first().copied())
+                .collect();
+            validate_radix_node(
+                &node.prefix,
+                !node.value.is_empty(),
+                &node.children.iter().map(|c| c.edge).collect::<Vec<_>>(),
+                &efb,
+                crate::HistoryKey::LEN,
+                "history map node",
+            )?;
+        }
         wire::WheatObject::ConflictSetNodeV1(node) => {
             let efb: Vec<u8> = node
                 .entries
@@ -1996,6 +2100,7 @@ fn object_kind(object: &wire::WheatObject) -> CanonicalObjectKind {
         wire::WheatObject::ChangeSetNodeV1(_) => CanonicalObjectKind::ChangeSetNode,
         wire::WheatObject::ChunkedTreeV1(_) => CanonicalObjectKind::ChunkedTree,
         wire::WheatObject::DirectoryChunkNodeV1(_) => CanonicalObjectKind::DirectoryChunkNode,
+        wire::WheatObject::HistoryMapNodeV1(_) => CanonicalObjectKind::HistoryMapNode,
     }
 }
 
@@ -2217,6 +2322,26 @@ fn revision_metadata(value: &RevisionMetadata) -> wire::RevisionMetadataV1 {
     }
 }
 
+/// The bytes of a history-map key before inversion: `time`, then `change`.
+pub(crate) fn history_key_bytes(time: u64, change: ChangeId) -> [u8; crate::HistoryKey::LEN] {
+    wire::HistoryKeyV1 {
+        time,
+        change: change_id(change),
+    }
+    .encode()
+    .expect("a history key encodes")
+    .try_into()
+    .expect("a history key is a time and a change")
+}
+
+/// The time and change of history-map key bytes before inversion.
+pub(crate) fn history_key_parts(bytes: &[u8; crate::HistoryKey::LEN]) -> (u64, ChangeId) {
+    let key = wire::HistoryKeyV1::decode(bytes).expect("a history key decodes");
+    let change = crate::semantic_records::change_id_domain(&key.change)
+        .expect("a history key holds a change");
+    (key.time, change)
+}
+
 fn change_id(value: ChangeId) -> wire::ChangeId {
     wire::ChangeId {
         uuid: wire::Uuid128 {
@@ -2286,6 +2411,7 @@ wire_digest_id!(
     ProjectedCommitSetId
 );
 wire_digest_id!(change_set_id, crate::ChangeSetId, ChangeSetId);
+wire_digest_id!(history_map_id, crate::HistoryMapId, HistoryMapId);
 wire_digest_id!(
     view_lineage_map_id,
     crate::ViewLineageMapId,
