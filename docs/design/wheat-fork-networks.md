@@ -65,7 +65,8 @@ and move them from Outstanding to Done.
 - [ ] **Moving a standalone network.** `NetworkDirectory::copy_to` copies the pool
   and the heads, not the content they reach, which is in `<repos-dir>/content`. A
   copy to another repositories directory needs that content too (the closure's
-  `required_content`, or the content store whole).
+  `required_content`, or the content store whole). Designed with GC in
+  `wheat-network-maintenance.md`.
 - [ ] **Adopting a standalone repository.** A `RepositoryDirectory` (what `wheat
   import` writes) cannot be moved into a repositories directory; before networks it
   could be renamed to `<repos-dir>/<owner>/<repo>`. Needs a crash-safe move into a

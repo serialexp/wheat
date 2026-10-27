@@ -22,7 +22,9 @@ server-authoritative remote maintenance.
   `wheat_store::RepositoriesDirectory` lays them out, with `fork` and one content
   store for every network. Open: Gothab's opener, adopting a standalone repository,
   deleting a fork while its network is served, and moving a standalone network with
-  its content. Design and phases: `docs/design/wheat-fork-networks.md`.
+  its content. Design and phases: `docs/design/wheat-fork-networks.md`; moving,
+  adoption, deletion while served and GC: `docs/design/wheat-network-maintenance.md`
+  (draft, open questions for Bart).
 - `[ ]` **Delta content stored one envelope at a time.**
   `ContentStore::put_many_with_bases` stores each delta-encoded blob with its own
   `put_raw_envelope`, one backend write (a synced loose file, or a blob upload) per
