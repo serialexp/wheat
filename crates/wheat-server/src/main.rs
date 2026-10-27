@@ -25,7 +25,7 @@ use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::Subscriber
 
 use wheat_server::access::{MAX_AUTH_TOKEN_BYTES, token_hash_hex};
 use wheat_server::config::FileConfig;
-use wheat_server::registry::Registry;
+use wheat_server::registry::{Registry, RegistryLimits};
 use wheat_server::server::{ServerConfig, run};
 
 #[derive(Clone, Debug, Default, clap::ValueEnum)]
@@ -60,8 +60,17 @@ struct Cli {
     /// a packed store (storage/, repository.head) — auto-detected. For
     /// `--store s3-packed`, the repository.head is read from this directory
     /// while objects and content are stored on S3.
-    #[arg(long, required = true)]
+    #[arg(
+        long,
+        required_unless_present = "repos_dir",
+        conflicts_with = "repos_dir"
+    )]
     data_dir: Option<PathBuf>,
+
+    /// Serve every repository under this directory, `owner/repo` from
+    /// `<dir>/owner/repo`, each opened when first asked for and closed when idle.
+    #[arg(long, conflicts_with_all = ["name", "store"])]
+    repos_dir: Option<PathBuf>,
 
     /// TOML config file. Its `[auth]` table lists principals, their token
     /// hashes and their access per repository.
@@ -98,14 +107,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", hash_token_from_stdin()?);
         return Ok(());
     }
-    let data_dir = cli.data_dir.expect("clap requires --data-dir when serving");
-
     let file_config = match &cli.config {
         Some(path) => FileConfig::load(path)?,
         None => FileConfig::default(),
     };
     let server_config = ServerConfig::from_file(&file_config)?;
     server_config.check_listen_address(cli.listen)?;
+
+    if let Some(repos_dir) = &cli.repos_dir {
+        // A mistyped path would otherwise serve nothing, answering every session that
+        // its repository does not exist.
+        if !repos_dir.is_dir() {
+            return Err(format!("--repos-dir {} is not a directory", repos_dir.display()).into());
+        }
+        let registry = Registry::from_repos_dir(repos_dir, RegistryLimits::default());
+        return serve(cli.listen, registry, server_config).await;
+    }
+    let data_dir = cli
+        .data_dir
+        .expect("clap requires --data-dir without --repos-dir");
 
     let repo_name = cli.name.clone().unwrap_or_else(|| {
         data_dir
@@ -125,8 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    serve(cli.listen, registry, server_config).await
+}
+
+/// Serves `registry` until interrupted.
+async fn serve(
+    listen: SocketAddr,
+    registry: Registry,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
-        served = run(cli.listen, registry, server_config) => served?,
+        served = run(listen, registry, config) => served?,
         stopped = tokio::signal::ctrl_c() => {
             stopped?;
             tracing::info!("interrupted; stopping");

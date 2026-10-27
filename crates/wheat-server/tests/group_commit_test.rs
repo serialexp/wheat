@@ -722,6 +722,8 @@ struct Table {
     head: RepositoryHead,
     receipts: HashMap<[u8; 16], PublishReceiptRecord>,
     advances: usize,
+    /// Another host is the repository's primary now: advances are refused.
+    fenced: bool,
 }
 
 impl TableHeads {
@@ -730,7 +732,12 @@ impl TableHeads {
             head,
             receipts: HashMap::new(),
             advances: 0,
+            fenced: false,
         })))
+    }
+
+    fn set_fenced(&self, fenced: bool) {
+        self.0.lock().unwrap().fenced = fenced;
     }
 
     fn advances(&self) -> usize {
@@ -760,6 +767,11 @@ impl HeadStore for TableHeads {
         _now: u64,
     ) -> Result<(), PublicationError> {
         let mut table = self.0.lock().unwrap();
+        if table.fenced {
+            return Err(PublicationError::Io(std::io::Error::other(
+                "this host is no longer the primary",
+            )));
+        }
         if table.head != expected {
             return Err(PublicationError::Stale {
                 expected,
@@ -827,6 +839,68 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
     assert!(again.repeated());
     assert_eq!(again.durable().await.unwrap(), head);
     assert_eq!(table.advances(), 1);
+}
+
+#[tokio::test]
+async fn a_head_store_that_fences_this_host_out_fails_the_publish_unacknowledged() {
+    let server = server().await;
+    let initial = server.initial;
+    let table = TableHeads::new(initial);
+    let entry = Arc::new(RepositoryEntry::new(
+        Box::new(server.objects.clone()),
+        table.clone(),
+    ));
+    // The primary moved to another host after this publish was sent.
+    table.set_fenced(true);
+    let (sender, mut notices) = tokio::sync::mpsc::unbounded_channel();
+    let hooks: Arc<dyn PublishHooks> = Arc::new(Announced(sender));
+    let (stage, proposed) = propose(&server, initial, "first.txt").await;
+    let accepted = commit::accept(
+        &entry,
+        &stage,
+        key(1, proposed),
+        initial.envelope,
+        proposed,
+        false,
+        false,
+        announcement(&hooks, initial, proposed),
+    )
+    .await
+    .unwrap();
+    match accepted.durable().await {
+        Err(CommitFailure::Failed { head, message }) => {
+            assert_eq!(head, initial);
+            assert!(message.contains("no longer the primary"), "{message}");
+        }
+        other => panic!("expected the advance to fail, got {other:?}"),
+    }
+    assert_eq!(table.head().await.unwrap(), initial);
+    assert_eq!(table.advances(), 0);
+
+    // Nothing was announced: the first batch announced is the next durable one.
+    table.set_fenced(false);
+    let (stage, next) = propose(&server, initial, "next.txt").await;
+    let accepted = commit::accept(
+        &entry,
+        &stage,
+        key(2, next),
+        initial.envelope,
+        next,
+        false,
+        false,
+        announcement(&hooks, initial, next),
+    )
+    .await
+    .unwrap();
+    accepted.durable().await.unwrap();
+    let batch = notices.recv().await.unwrap();
+    assert_eq!(batch.before, initial);
+    let proposed: Vec<_> = batch
+        .publishes
+        .iter()
+        .map(|published| published.publish.proposed)
+        .collect();
+    assert_eq!(proposed, [next]);
 }
 
 #[tokio::test]

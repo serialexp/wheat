@@ -4,6 +4,22 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **The registry must open and close repositories.** `Registry::with_opener`
+  takes a `RepositoryOpener` (Bart's choice, 2026-10-27) and opens a repository when
+  a session first asks for it; two sessions asking at once open it once. A session
+  holds its `Arc<RepositoryEntry>` while it runs, and that is the lease: a repository
+  nothing holds is closed after `RegistryLimits::idle` (`close_idle`, which
+  `server::run` calls periodically) or, past `max_open`, least recently used first.
+  Closing drops its stores under the registry's lock, which releases `catalog.lock`
+  before anyone can open it again. A name not found is not remembered. Fencing goes
+  through the `HeadStore` (Bart's choice): a publish is acknowledged only once
+  `HeadStore::advance` moved the head, so an advance that refuses a stale primary
+  refuses the publish; `PublicationError::Io` now carries its cause into the message
+  the client gets. Opening still costs O(store); that stays its own item under the
+  security and performance scan. Tests: `crates/wheat-server/tests/registry_test.rs`
+  (lazy open, hidden and pending names, idle close releasing the lock, LRU past the
+  limit, one open for concurrent sessions) and `group_commit_test.rs` (a fenced head
+  store fails the publish, unannounced).
 - `[x]` **No hooks around a publish.** `ServerConfig::publish_hooks` takes a
   `PublishHooks` (`crates/wheat-server/src/hooks.rs`). `check` runs once the upload
   is complete and the client asked to commit, before the join and outside the commit
@@ -470,6 +486,10 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **The repository registry is not pluggable (2026-09-26).** An embedder passes
+  its own `RepositoryOpener` to `Registry::with_opener`; `DirectoryOpener` serves
+  `owner/repo` from a directory, which `wheat-server --repos-dir` uses (2026-10-27,
+  with the registry item under Hosting on Gothab).
 - `[x]` **Full validation and the mutator disagree on conflict resolutions
   (2026-10-21).** A resolution had to name exactly the conflict's failed edits in
   full validation, but only some of them in the mutator and wheat-core, and full

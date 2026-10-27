@@ -437,7 +437,15 @@ async fn run_session(
     let readable = repository_access(config, &principal, &repository)
         .await?
         .is_some();
-    let Some(entry) = registry.get(&repository).filter(|_| readable) else {
+    // Nothing is opened for a principal who may not read it.
+    let entry = if readable {
+        registry.get(&repository).await.map_err(|e| {
+            ConnectionError::Internal(format!("failed to open repository '{repository}': {e}"))
+        })?
+    } else {
+        None
+    };
+    let Some(entry) = entry else {
         send_error(
             ws,
             0,

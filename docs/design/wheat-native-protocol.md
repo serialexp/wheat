@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-10-26
+Last updated: 2026-10-27
 
 ## Implementation status
 
@@ -41,7 +41,7 @@ top of them.
   phase were reworked around `StructuralDelta`; before that, fetch sent the
   whole structural closure every time and publish could move its head with
   objects missing.) Registry supports single-repo (`--data-dir`)
-  and multi-repo (`--repos`) modes. 3 integration tests (session setup, fetch,
+  and multi-repo (`--repos-dir`, opened on demand) modes. 3 integration tests (session setup, fetch,
   repo not found). Server helper `run_until()` supports in-process test use
   with port-0 binding and shutdown signaling.
 
@@ -1053,6 +1053,21 @@ head before and after, and each publish with what it added to the store. Batches
 are told in order, and the next batch waits for the call, so slow work belongs in a
 queue. A notice lost to a crash between the head moving and the call shows as a
 gap in the head's generations.
+
+Gothab looks repositories up itself through a `RepositoryOpener`
+(`Registry::with_opener`, `wheat_server::registry`); the standalone server's
+`--repos-dir` uses `DirectoryOpener`. A repository is opened when a session first
+asks for it, and two asking at once open it once. A session holds its entry while it
+runs, which is the lease: one nothing holds is closed once idle for
+`RegistryLimits::idle`, or, past `max_open`, least recently used first. Closing
+drops its stores, releasing `catalog.lock`, so a move to another host or a
+maintenance process can open it. An embedder serving through
+`wheat_server::connection` calls `Registry::close_idle` itself; `server::run` does
+it on a timer. When a repository's primary moves, the old host is fenced in its
+`HeadStore`: a publish is acknowledged only after `HeadStore::advance` moved the
+head, so an advance that refuses a stale primary (a compare-and-swap that includes
+a fencing token) refuses the publish. What the stale primary stored before that is
+content-addressed and named by no head.
 
 ### Object store as the scaling axis
 

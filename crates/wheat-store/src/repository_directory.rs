@@ -92,6 +92,16 @@ impl RepositoryDirectory {
         LocalPublicationStore::new(self.head())
     }
 
+    /// Whether a repository is here: its head and its packed store.
+    #[must_use]
+    pub fn is_repository(&self) -> bool {
+        self.head().is_file() && self.catalog_lock().is_file()
+    }
+
+    fn catalog_lock(&self) -> PathBuf {
+        self.storage().join("packed").join("catalog.lock")
+    }
+
     /// Opens the packed store. It stays locked against other opens and against
     /// [`Self::delete`] until closed or dropped.
     pub fn open_store(&self) -> Result<PackedObjectStore, ObjectStoreError> {
@@ -167,10 +177,10 @@ impl RepositoryDirectory {
         if !self.root.exists() {
             return Err(RepositoryDirectoryError::Missing(self.root.clone()));
         }
-        let catalog_lock = self.storage().join("packed").join("catalog.lock");
-        if !self.head().is_file() || !catalog_lock.is_file() {
+        if !self.is_repository() {
             return Err(RepositoryDirectoryError::NotARepository(self.root.clone()));
         }
+        let catalog_lock = self.catalog_lock();
         // The packed store holds this lock while open. Holding it through the rename
         // keeps the store from being opened before it is gone.
         let store_lock = OpenOptions::new()

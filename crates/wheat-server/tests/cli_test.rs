@@ -1,5 +1,5 @@
-//! The `wheat-server` binary's own command line: `hash-token` and the refusal
-//! to serve an open server on a public address.
+//! The `wheat-server` binary's own command line: `hash-token`, the refusal to serve
+//! an open server on a public address, and choosing what to serve.
 
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
@@ -72,4 +72,31 @@ fn a_bad_config_file_stops_the_server() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("64 hex digits"), "{stderr}");
+}
+#[test]
+fn a_repos_dir_that_is_not_a_directory_stops_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = server()
+        .args(["--listen", "127.0.0.1:0", "--repos-dir"])
+        .arg(dir.path().join("missing"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is not a directory"), "{stderr}");
+}
+
+#[test]
+fn a_repos_dir_serves_instead_of_a_data_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = server()
+        .arg("--repos-dir")
+        .arg(dir.path())
+        .arg("--data-dir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
 }

@@ -11,18 +11,11 @@ places each repository on one primary host with fencing, local disk for structur
 a shared object store for blobs; Gothab's server does authentication and repository
 authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
-formats freeze. Items already listed elsewhere that this also needs: the registry is
-not pluggable, blocking disk work on async threads, chunked uploads reassembled in
+formats freeze. Items already listed elsewhere that this also needs: blocking disk work on async threads, chunked uploads reassembled in
 memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
 listing the bucket, opening a packed store costing O(store), the remote catalog head
 being JSON, and `wheat gc` / server-authoritative remote maintenance.
 
-- `[ ]` **The registry must open and close repositories.** Beyond being pluggable (item
-  under the design-doc audit), a host serving thousands of repositories opens them on
-  demand and evicts idle ones. Opening holds `catalog.lock` exclusively, so eviction
-  has to release it, and an open must not cost O(store). Gothab also needs to fence a
-  repository's writes when its primary moves: a store write should be refusable by a
-  host-supplied check, so a stale primary after failover cannot write.
 - `[ ]` **No consistent snapshot of a live served repository.** Gothab backs repositories
   up to object storage and moves them between hosts (drain, snapshot, stage,
   activate). Wheat needs a way to quiesce one repository (finish the group commit,
@@ -325,11 +318,6 @@ budget passes, but by only about 0.7 s.
   2026-09-26 the client sends a bearer token from `credential.helper`, so over plain
   `wheat://` to another machine the token travels in clear text. Once TLS works,
   consider refusing to send a token over plain `wheat://` to a non-loopback host.
-- `[ ]` **The repository registry is not pluggable (2026-09-26).** `Registry`
-  (`crates/wheat-server/src/registry.rs`) is a fixed struct, and `main.rs` serves one
-  repository. Access is pluggable now (`AccessProvider`), but an embedder such as
-  Gothab also needs to look repositories up itself, and the standalone server has no
-  way to serve several (`Registry::from_repos_dir` exists but nothing calls it).
 - `[ ]` **Capturing `.git` paths is not gated (2026-09-26).** Writing paths inside
   `.git` now asks or needs `--allow-dot-git`, but `wheat add .git/config` captures
   one without a word. In a workspace that is also a git checkout that could put

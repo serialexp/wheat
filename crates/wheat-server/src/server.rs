@@ -137,8 +137,8 @@ pub async fn run(
     let registry = Arc::new(registry);
     let config = Arc::new(config);
 
-    info!(addr = %addr, repos = registry.len(), open = config.access.is_open(), "wheat-server listening");
-    for name in registry.names() {
+    info!(addr = %addr, open = config.access.is_open(), "wheat-server listening");
+    for name in registry.open_names() {
         info!(repo = name, "serving repository");
     }
 
@@ -153,6 +153,7 @@ async fn accept_connections(
     registry: Arc<Registry>,
     config: Arc<ServerConfig>,
 ) -> ! {
+    let _closing = close_idle_repositories(&registry);
     let slots = Arc::new(Semaphore::new(config.max_connections));
     // Whether the last connection was turned away, so a flood logs once, not per
     // connection.
@@ -181,6 +182,30 @@ async fn accept_connections(
                 tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
             }
         }
+    }
+}
+
+/// Closes the registry's idle repositories periodically, until the returned guard
+/// is dropped. A registry without an opener never closes any, and gets no task.
+fn close_idle_repositories(registry: &Arc<Registry>) -> Option<AbortOnDrop> {
+    let interval = registry.close_interval()?;
+    let registry = Arc::clone(registry);
+    Some(AbortOnDrop(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            registry.close_idle();
+        }
+    })))
+}
+
+/// Stops a task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -222,7 +247,7 @@ pub async fn run_until(
     let registry = Arc::new(registry);
     let config = Arc::new(config);
 
-    info!(addr = %bound_addr, repos = registry.len(), "wheat-server listening");
+    info!(addr = %bound_addr, "wheat-server listening");
 
     // Report the bound address so the caller can connect.
     let _ = ready.send(bound_addr);

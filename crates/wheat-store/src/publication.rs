@@ -72,7 +72,7 @@ pub enum PublicationError {
     },
     #[error("proposed generation must be exactly one greater than the current generation")]
     InvalidGeneration,
-    #[error("publication store I/O failed")]
+    #[error("publication store I/O failed: {0}")]
     Io(#[from] io::Error),
 }
 
