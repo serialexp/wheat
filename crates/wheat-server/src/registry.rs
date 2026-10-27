@@ -30,8 +30,8 @@ use tokio::time::Instant;
 use tracing::{debug, info};
 use uuid::Uuid;
 use wheat_store::{
-    ObjectStoreError, RepositoriesDirectory, RepositoriesDirectoryError, RepositoryDirectory,
-    RepositoryStore,
+    NetworkStore, ObjectStoreError, PackedObjectStore, RepositoriesDirectory,
+    RepositoriesDirectoryError, RepositoryDirectory, RepositoryStore,
 };
 
 use crate::commit::GroupCommit;
@@ -205,9 +205,16 @@ impl Registry {
 
     /// A registry serving the repositories in `repos_dir` (a
     /// [`RepositoriesDirectory`]), each opened when first asked for (see
-    /// [`DirectoryOpener`]).
-    pub fn from_repos_dir(repos_dir: &Path, limits: RegistryLimits) -> Self {
-        Self::with_opener(Arc::new(DirectoryOpener::new(repos_dir)), limits)
+    /// [`DirectoryOpener`]). Fails when the directory's content store cannot be
+    /// opened, as when another process serves it.
+    pub fn from_repos_dir(
+        repos_dir: &Path,
+        limits: RegistryLimits,
+    ) -> Result<Self, ObjectStoreError> {
+        Ok(Self::with_opener(
+            Arc::new(DirectoryOpener::new(repos_dir)?),
+            limits,
+        ))
     }
 
     /// The repository `name`, opening it if needed. `None` when there is none. Hold
@@ -357,19 +364,26 @@ impl Registry {
 }
 
 /// Opens `owner/repo` from a [`RepositoriesDirectory`], sharing one store among the
-/// open repositories of each fork network. Names that are not `owner/repo`, hidden
-/// ones, and repositories still being created or deleted are not found.
+/// open repositories of each fork network, and the directory's content store among
+/// every network. Names that are not `owner/repo`, hidden ones, and repositories
+/// still being created or deleted are not found.
 pub struct DirectoryOpener {
     repositories: RepositoriesDirectory,
+    /// Open for as long as the opener is, and locked against other processes.
+    content: PackedObjectStore,
     networks: OpenNetworks<Uuid>,
 }
 
 impl DirectoryOpener {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            repositories: RepositoriesDirectory::new(root),
+    /// Opens the content store of the repositories directory `root`, creating it if
+    /// there is none.
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
+        let repositories = RepositoriesDirectory::new(root);
+        Ok(Self {
+            content: repositories.open_content()?,
+            repositories,
             networks: OpenNetworks::default(),
-        }
+        })
     }
 }
 
@@ -378,6 +392,7 @@ impl RepositoryOpener for DirectoryOpener {
     async fn open(&self, name: &str) -> Result<Option<RepositoryEntry>, OpenError> {
         let repositories = self.repositories.clone();
         let networks = self.networks.clone();
+        let content = self.content.clone();
         let name = name.to_owned();
         tokio::task::spawn_blocking(move || {
             let location = match repositories.locate(&name) {
@@ -388,9 +403,9 @@ impl RepositoryOpener for DirectoryOpener {
             let directory = repositories.network(location.network);
             let network = networks
                 .open(&location.network, || {
-                    directory
-                        .open_store()
-                        .map(|store| Box::new(store) as Box<dyn RepositoryStore>)
+                    directory.open_store().map(|pool| {
+                        Box::new(NetworkStore::new(pool, content)) as Box<dyn RepositoryStore>
+                    })
                 })
                 .map_err(|error| OpenError(Box::new(error)))?;
             Ok(Some(RepositoryEntry::in_network(

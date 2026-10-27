@@ -78,8 +78,9 @@ pub use repository_rebase::RebaseOutcome;
 mod repository_reader;
 mod repository_store;
 pub use repository_store::{
-    PendingPublications, PendingView, ReceivedBytes, RepositoryStage, RepositoryStore,
-    RepositoryStoreError, SeparateRepositoryStore, StagedPublication, StoredWrite, put_separately,
+    NetworkStore, PendingPublications, PendingView, ReceivedBytes, RepositoryStage,
+    RepositoryStore, RepositoryStoreError, SeparateRepositoryStore, StagedPublication, StoredWrite,
+    put_separately,
 };
 mod repository_rewrite;
 mod repository_transition;

@@ -191,6 +191,84 @@ impl<O: ImmutableObjectStore> RepositoryStore for SeparateRepositoryStore<O> {
     }
 }
 
+/// A fork network's structural pool and the content store every network shares, as
+/// one [`RepositoryStore`]: objects are kept in `pool` and content in `content`.
+///
+/// [`RepositoryStore::put_publication`] is each store's own write, content first, so
+/// each says what it added and batches its writes as it would alone. Reads of content
+/// through `pool` find none of it.
+#[derive(Clone, Debug)]
+pub struct NetworkStore<P, C> {
+    pool: P,
+    content: C,
+}
+
+impl<P, C> NetworkStore<P, C> {
+    #[must_use]
+    pub fn new(pool: P, content: C) -> Self {
+        Self { pool, content }
+    }
+
+    #[must_use]
+    pub fn pool(&self) -> &P {
+        &self.pool
+    }
+}
+
+#[async_trait]
+impl<P: RepositoryStore, C: RepositoryStore> ImmutableObjectStore for NetworkStore<P, C> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.pool.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.pool.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.pool.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.pool.exists_many(ids).await
+    }
+
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        self.pool.seal().await?;
+        self.content.seal().await
+    }
+}
+
+#[async_trait]
+impl<P: RepositoryStore, C: RepositoryStore> RepositoryStore for NetworkStore<P, C> {
+    fn content_store(&self) -> ContentStore {
+        self.content.content_store()
+    }
+
+    async fn put_publication(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        content: &[ContentItem<'_>],
+    ) -> Result<StoredWrite, RepositoryStoreError> {
+        let mut write = StoredWrite::default();
+        if !content.is_empty() {
+            write.content = self.content.put_publication(&[], content).await?.content;
+        }
+        if !objects.is_empty() {
+            write.objects = self.pool.put_publication(objects, &[]).await?.objects;
+        }
+        Ok(write)
+    }
+}
+
 #[async_trait]
 impl ImmutableObjectStore for Box<dyn RepositoryStore> {
     async fn put_if_absent(

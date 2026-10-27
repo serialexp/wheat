@@ -1,7 +1,8 @@
 # Wheat fork networks — Design
 
 Status: partial — phase 0 (networks in the registry and on disk), the directory
-fork, and network copy landed; phase 1 (content apart) outstanding. Decided (Bart,
+fork, network copy and phase 1 for the standalone server (content apart) landed;
+Gothab's opener and the follow-ups below outstanding. Decided (Bart,
 2026-10-27): one structural pool per fork network, one instance-wide content store,
 a hash is a read capability, publishes upload only what the store lacks, a fork
 starts with all its parent's labels, and the standalone server keeps networks in
@@ -42,17 +43,29 @@ and move them from Outstanding to Done.
 - [x] **Phase 5 — copying a network.** `NetworkDirectory::files` and `copy_to` list
   and copy the store and every head; the copy loop is `RepositoryDirectory`'s,
   which `repository_copy` measures.
+- [x] **Phase 1, standalone — the content tier apart.** A repositories directory
+  keeps every network's content in one packed store, `<repos-dir>/content`
+  (`RepositoriesDirectory::open_content`; Bart chose a packed store over a loose
+  directory, 2026-10-27), which `DirectoryOpener` opens once and holds, so one
+  process serves a directory. `wheat_store::NetworkStore` pairs it with each
+  network's pool: objects go to the pool and content to the content store, each in
+  one durable append of its own. That doubles a group commit's write, about 3.0 ms to
+  6.0 ms in the `network_publish` bench case; Bart accepted that over running the two
+  appends at once (measured at 1.7x), 2026-10-27. `remote_fork` (wheat-cli) clones a
+  fork made while its parent is served.
 
 ### Outstanding
 
-- [ ] **Phase 1 — the content tier apart.** Entries read and write content through
-  an instance-wide `ContentStore` (Gothab's blob store through
-  `ContentStore::over_blobs`, a directory for the standalone server); the network
-  pool holds structure only.
-- [ ] **Phase 4, Gothab — forking through a host's own `HeadStore`.** A host whose
-  database keeps heads creates the fork's head as `RepositoryHead::initial(parent
-  envelope)` and maps the name to the parent's network in its opener. Nothing in
-  Wheat is missing for it yet; revisit when Gothab's opener exists.
+- [ ] **Phase 1 and 4, Gothab — its opener.** A host whose database keeps heads
+  creates a fork's head as `RepositoryHead::initial(parent envelope)`, maps names to
+  networks, and pairs each network's pool with its blob store
+  (`SeparateRepositoryStore` over `ContentStore::over_blobs`), sharing pools through
+  `OpenNetworks`. Nothing in Wheat is missing for it yet; revisit when Gothab's
+  opener exists.
+- [ ] **Moving a standalone network.** `NetworkDirectory::copy_to` copies the pool
+  and the heads, not the content they reach, which is in `<repos-dir>/content`. A
+  copy to another repositories directory needs that content too (the closure's
+  `required_content`, or the content store whole).
 - [ ] **Adopting a standalone repository.** A `RepositoryDirectory` (what `wheat
   import` writes) cannot be moved into a repositories directory; before networks it
   could be renamed to `<repos-dir>/<owner>/<repo>`. Needs a crash-safe move into a
@@ -62,7 +75,7 @@ and move them from Outstanding to Done.
   fork cannot be deleted while any repository of its network is served.
 - [ ] **Defer — network GC.** Marking every head in a network and every network for
   content is the open `wheat gc` / server-authoritative maintenance work in
-  `TODO.md`.
+  `TODO.md`. Deleting a network leaves its content in the content store until then.
 - [ ] **Superseded — phases 2 and 3.** Reads limited to the repository's closure
   and publishes proving possession are not needed after the 2026-10-27 decisions.
 - [ ] **Defer — detaching a fork.** Copying one repository's closure into a network
@@ -171,6 +184,9 @@ name refers to (for network GC) or a name whose head is gone, which counts as no
 repository and is replaced by the next create or fork of the name. The content store
 is not there yet (phase 1).
 
+Phase 1 added it, `<repos-dir>/content/`, a packed store whose objects side is
+unused; a network's `storage/` then holds objects only.
+
 ## Creating a fork
 
 A fork is created on its parent's host:
@@ -241,6 +257,8 @@ quiesce-and-copy (`crates/wheat-server/src/quiesce.rs`,
 - Creating a fork: O(1), one head write (open question 3's second option adds a few
   objects).
 - Content fetch: one `required_content` lookup per blob, O(log n) set-node reads.
+- Publish, standalone: a group commit's write is two durable appends, the network's
+  pool and the content store, one after the other (`network_publish` bench case).
 - Object fetch, option A: the walk is today's; the visited set adds memory
   proportional to the objects pushed. Option B: one index lookup per pulled object
   and one index write per object a publish adds.

@@ -2,15 +2,18 @@
 //!
 //! ```text
 //! <root>/
+//!   content/                                every network's content, a packed store
 //!   names/<owner>/<repo>                    where the repository is
 //!   networks/<network>/
-//!     storage/                              the network's packed store
+//!     storage/                              the network's objects, a packed store
 //!     heads/<repository>/repository.head    each repository's head
 //! ```
 //!
 //! A network is a repository and every fork made from it or from its forks. Its
 //! repositories share its store, so a fork copies no objects: it is a head naming
-//! its parent's envelope. Networks and repositories are named by UUIDs; a name
+//! its parent's envelope. Content is kept once for every network, in `content/`
+//! ([`RepositoriesDirectory::open_content`]; a [`crate::NetworkStore`] pairs it with
+//! a network's store). Networks and repositories are named by UUIDs; a name
 //! (`names/<owner>/<repo>`, a `RepositoryLocationV1` record) says which network and
 //! which head are the repository's.
 //!
@@ -49,6 +52,7 @@ use crate::{
     sync_filesystem,
 };
 
+const CONTENT: &str = "content";
 const NAMES: &str = "names";
 const NETWORKS: &str = "networks";
 const HEADS: &str = "heads";
@@ -106,6 +110,19 @@ impl RepositoriesDirectory {
                 .join(NETWORKS)
                 .join(network.as_simple().to_string()),
         )
+    }
+
+    /// The packed store holding every network's content.
+    #[must_use]
+    pub fn content(&self) -> PathBuf {
+        self.root.join(CONTENT)
+    }
+
+    /// Opens the content store, creating it if there is none. Only its content is
+    /// used. It stays locked against other opens until closed or dropped, so one
+    /// process serves the directory.
+    pub fn open_content(&self) -> Result<PackedObjectStore, ObjectStoreError> {
+        PackedObjectStore::open(self.content())
     }
 
     /// Where the repository `name` (`owner/repo`) is, or `None` when there is none.

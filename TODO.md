@@ -19,10 +19,16 @@ server-authoritative remote maintenance.
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network. Networks share
   one store handle in the registry, and `--repos-dir` keeps them as
-  `wheat_store::RepositoriesDirectory` lays them out, with `fork`; content is still
-  per network (phase 1), and adopting a standalone repository and deleting a fork
-  while its network is served are open. Design and phases:
-  `docs/design/wheat-fork-networks.md`.
+  `wheat_store::RepositoriesDirectory` lays them out, with `fork` and one content
+  store for every network. Open: Gothab's opener, adopting a standalone repository,
+  deleting a fork while its network is served, and moving a standalone network with
+  its content. Design and phases: `docs/design/wheat-fork-networks.md`.
+- `[ ]` **Delta content stored one envelope at a time.**
+  `ContentStore::put_many_with_bases` stores each delta-encoded blob with its own
+  `put_raw_envelope`, one backend write (a synced loose file, or a blob upload) per
+  blob, where the backend takes a batch (`ContentBackend::put_raw_envelopes`). It is
+  the path `SeparateRepositoryStore` (Gothab's content over its blob store) takes for
+  a publish's changed files. Found while splitting content out for fork networks.
 
 ## Desktop client (2026-10-22)
 

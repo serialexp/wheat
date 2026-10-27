@@ -127,7 +127,7 @@ pub struct Server {
     pub addr: SocketAddr,
     /// What the server serves.
     pub registry: Arc<Registry>,
-    /// The served repository's directory.
+    /// The served repository's directory, or the repositories directory served.
     pub store: PathBuf,
     runtime: tokio::runtime::Runtime,
     _shutdown: tokio::sync::oneshot::Sender<()>,
@@ -168,8 +168,20 @@ pub fn serve_store(store: &Path) -> Server {
 
 /// Like [`serve_store`], with the server configured by `server`.
 pub fn serve_store_configured(store: &Path, server: ServerConfig) -> Server {
+    let registry = Registry::single_named("team/repo".to_owned(), store).unwrap();
+    serve_registry(registry, store, server)
+}
+
+/// Serves every repository in the repositories directory `repos`; [`Server::url`]
+/// names `team/repo`, which need not exist.
+pub fn serve_repos_dir(repos: &Path) -> Server {
+    let registry = Registry::from_repos_dir(repos, Default::default()).unwrap();
+    serve_registry(registry, repos, ServerConfig::new())
+}
+
+fn serve_registry(registry: Registry, store: &Path, server: ServerConfig) -> Server {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let registry = Arc::new(Registry::single_named("team/repo".to_owned(), store).unwrap());
+    let registry = Arc::new(registry);
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let served = Arc::clone(&registry);

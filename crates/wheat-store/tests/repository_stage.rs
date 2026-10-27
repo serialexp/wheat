@@ -429,3 +429,67 @@ async fn a_separate_store_reports_only_what_it_lacked() {
     let second = store.put_publication(&objects, &content).await.unwrap();
     assert_eq!(second, StoredWrite::default());
 }
+
+/// A network's objects go to its pool and its content to the content store every
+/// network shares, each in one append, and content another network stored is not
+/// stored again.
+#[tokio::test]
+async fn a_network_store_keeps_objects_in_its_pool_and_content_once_for_every_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let (content_store, content_trace) =
+        PackedObjectStore::open_traced(dir.path().join("content")).unwrap();
+    let (first_pool, first_trace) =
+        PackedObjectStore::open_traced(dir.path().join("first")).unwrap();
+    let (second_pool, second_trace) =
+        PackedObjectStore::open_traced(dir.path().join("second")).unwrap();
+    let first = NetworkStore::new(first_pool, content_store.clone());
+    let second = NetworkStore::new(second_pool, content_store.clone());
+    let (object_id, object_bytes) = object();
+    let (blob_id, blob_bytes) = blob("content shared by two networks");
+    let objects = [(object_id, object_bytes.clone())];
+    let content = [ContentItem::new(
+        VerifiedContent::new(blob_bytes.as_slice()),
+        None,
+    )];
+
+    let added = first.put_publication(&objects, &content).await.unwrap();
+
+    assert_eq!(ids(&added.objects), [object_id]);
+    assert_eq!(ids(&added.content), [blob_id]);
+    assert_eq!(durable_appends(&first_trace), 1);
+    assert_eq!(durable_appends(&content_trace), 1);
+    assert_eq!(
+        first.get(object_id).await.unwrap().canonical_bytes,
+        object_bytes
+    );
+    assert_eq!(first.content_store().get(blob_id).unwrap(), blob_bytes);
+    assert!(!first.pool().content_store().contains(blob_id));
+    assert!(matches!(
+        content_store.get(object_id).await,
+        Err(ObjectStoreError::Missing(_))
+    ));
+
+    let added = second.put_publication(&objects, &content).await.unwrap();
+
+    assert_eq!(ids(&added.objects), [object_id], "pools are apart");
+    assert!(added.content.is_empty(), "content is kept once");
+    assert_eq!(durable_appends(&second_trace), 1);
+    assert_eq!(durable_appends(&content_trace), 1);
+    assert_eq!(second.content_store().get(blob_id).unwrap(), blob_bytes);
+
+    // A write of objects alone or content alone touches only its store.
+    let (other_id, other_bytes) = blob("content alone");
+    let added = second
+        .put_publication(
+            &[],
+            &[ContentItem::new(
+                VerifiedContent::new(other_bytes.as_slice()),
+                None,
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&added.content), [other_id]);
+    assert_eq!(durable_appends(&second_trace), 1);
+    assert_eq!(durable_appends(&content_trace), 2);
+}

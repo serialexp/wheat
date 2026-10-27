@@ -69,7 +69,8 @@ struct Cli {
 
     /// Serve every repository under this directory (`names/<owner>/<repo>` says
     /// which fork network under `networks/` holds it), each opened when first asked
-    /// for and closed when idle.
+    /// for and closed when idle. Content is kept once for every network, in
+    /// `content/`, which this process holds open while it serves.
     #[arg(long, conflicts_with_all = ["name", "store"])]
     repos_dir: Option<PathBuf>,
 
@@ -121,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !repos_dir.is_dir() {
             return Err(format!("--repos-dir {} is not a directory", repos_dir.display()).into());
         }
-        let registry = Registry::from_repos_dir(repos_dir, RegistryLimits::default());
+        let registry = Registry::from_repos_dir(repos_dir, RegistryLimits::default())?;
         return serve(cli.listen, registry, server_config).await;
     }
     let data_dir = cli

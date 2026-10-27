@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
+use wheat_core::VerifiedContent;
 use wheat_server::registry::{
     OpenError, Registry, RegistryLimits, RepositoryEntry, RepositoryOpener,
 };
 use wheat_store::{
-    NetworkDirectory, RepositoriesDirectory, RepositoriesDirectoryError, RepositoryDirectoryError,
-    RepositoryHead,
+    ContentItem, NetworkDirectory, RepositoriesDirectory, RepositoriesDirectoryError,
+    RepositoryDirectoryError, RepositoryHead, RepositoryStore,
 };
 
 /// Limits that close every repository nothing holds whenever asked.
@@ -50,7 +51,7 @@ async fn serves_created_repositories_and_skips_hidden_ones() {
     .unwrap();
     fs::write(repos.path().join("names/owner/broken"), b"not a location").unwrap();
 
-    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default());
+    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default()).unwrap();
 
     assert!(
         registry.open_names().is_empty(),
@@ -75,7 +76,7 @@ async fn serves_created_repositories_and_skips_hidden_ones() {
 #[tokio::test]
 async fn a_repository_not_found_is_looked_up_again_next_time() {
     let repos = tempfile::tempdir().unwrap();
-    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default());
+    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default()).unwrap();
     assert!(registry.get("owner/later").await.unwrap().is_none());
     create(repos.path(), "owner/later").await;
     assert!(registry.get("owner/later").await.unwrap().is_some());
@@ -86,7 +87,7 @@ async fn an_idle_repository_is_closed_only_once_nothing_holds_it() {
     let repos = tempfile::tempdir().unwrap();
     let (directory, head) = create(repos.path(), "owner/repo").await;
     let repositories = RepositoriesDirectory::new(repos.path());
-    let registry = Registry::from_repos_dir(repos.path(), CLOSE_AT_ONCE);
+    let registry = Registry::from_repos_dir(repos.path(), CLOSE_AT_ONCE).unwrap();
 
     let entry = registry.get("owner/repo").await.unwrap().unwrap();
     assert_eq!(registry.close_idle(), 0, "a held repository stays open");
@@ -114,7 +115,7 @@ async fn past_the_limit_the_least_recently_used_unheld_repository_is_closed() {
         idle: Duration::from_secs(3600),
         max_open: 2,
     };
-    let registry = Registry::from_repos_dir(repos.path(), limits);
+    let registry = Registry::from_repos_dir(repos.path(), limits).unwrap();
     let held = registry.get("owner/a").await.unwrap().unwrap();
     drop(registry.get("owner/b").await.unwrap().unwrap());
     drop(registry.get("owner/c").await.unwrap().unwrap());
@@ -186,7 +187,7 @@ async fn the_repositories_of_a_network_share_its_store_until_the_last_is_closed(
     let (network, head) = create(repos.path(), "alice/repo").await;
     let repositories = RepositoriesDirectory::new(repos.path());
     let fork = repositories.fork("alice/repo", "bob/repo").unwrap();
-    let registry = Registry::from_repos_dir(repos.path(), CLOSE_AT_ONCE);
+    let registry = Registry::from_repos_dir(repos.path(), CLOSE_AT_ONCE).unwrap();
 
     // Both open at once: a second open of the packed store would be refused.
     let parent = registry.get("alice/repo").await.unwrap().unwrap();
@@ -221,7 +222,7 @@ async fn quiescing_a_repository_holds_its_whole_network() {
     RepositoriesDirectory::new(repos.path())
         .fork("alice/repo", "bob/repo")
         .unwrap();
-    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default());
+    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default()).unwrap();
 
     let quiesced = registry.quiesce("alice/repo").await.unwrap().unwrap();
 
@@ -231,4 +232,53 @@ async fn quiescing_a_repository_holds_its_whole_network() {
     assert!(!other.network.is_quiesced());
     drop(quiesced);
     assert!(!fork.network.is_quiesced());
+}
+
+#[tokio::test]
+async fn content_is_kept_once_for_every_network_of_the_directory() {
+    let repos = tempfile::tempdir().unwrap();
+    let (alice, _) = create(repos.path(), "alice/repo").await;
+    create(repos.path(), "carol/other").await;
+    let registry = Registry::from_repos_dir(repos.path(), CLOSE_AT_ONCE).unwrap();
+    let blob = b"one blob for every network";
+    let item = [ContentItem::new(VerifiedContent::new(&blob[..]), None)];
+
+    let first = registry.get("alice/repo").await.unwrap().unwrap();
+    let added = first
+        .network
+        .store
+        .put_publication(&[], &item)
+        .await
+        .unwrap();
+    assert_eq!(added.content.len(), 1);
+    let other = registry.get("carol/other").await.unwrap().unwrap();
+    assert_eq!(other.network.content.get(item[0].id()).unwrap(), blob);
+    let added = other
+        .network
+        .store
+        .put_publication(&[], &item)
+        .await
+        .unwrap();
+    assert!(added.content.is_empty(), "stored once");
+
+    // The content is in the directory's content store, not the network's.
+    drop((first, other));
+    assert_eq!(registry.close_idle(), 2);
+    let pool = alice.open_store().unwrap();
+    assert!(!pool.content_store().contains(item[0].id()));
+    drop(registry);
+    let content = RepositoriesDirectory::new(repos.path())
+        .open_content()
+        .unwrap();
+    assert_eq!(content.content_store().get(item[0].id()).unwrap(), blob);
+}
+
+#[tokio::test]
+async fn one_process_serves_a_directory() {
+    let repos = tempfile::tempdir().unwrap();
+    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default()).unwrap();
+
+    assert!(Registry::from_repos_dir(repos.path(), RegistryLimits::default()).is_err());
+    drop(registry);
+    Registry::from_repos_dir(repos.path(), RegistryLimits::default()).unwrap();
 }

@@ -1064,7 +1064,9 @@ repositories of a fork network share one handle to its store
 (`wheat_server::network`); closing the last of them closes the store, releasing
 `catalog.lock`, so a move to another host or a maintenance process can open it. An
 opener shares the handle through `OpenNetworks`; `--repos-dir` keeps networks as
-`wheat_store::RepositoriesDirectory` lays them out (`wheat-fork-networks.md`). An embedder serving through
+`wheat_store::RepositoriesDirectory` lays them out (`wheat-fork-networks.md`), with
+every network's content in one store the server holds open while it serves
+(`wheat_store::NetworkStore`). An embedder serving through
 `wheat_server::connection` calls `Registry::close_idle` itself; `server::run` does
 it on a timer. When a repository's primary moves, the old host is fenced in its
 `HeadStore`: a publish is acknowledged only after `HeadStore::advance` moved the
