@@ -32,6 +32,7 @@ mod label_frontiers;
 mod label_move;
 mod latency_proxy;
 mod materialize_wide;
+mod network_export;
 mod network_publish;
 mod packed_append;
 mod publish_content;
@@ -83,6 +84,7 @@ pub const CASES: &[&str] = &[
     snapshot_export::NAME,
     repository_copy::NAME,
     fork_network::NAME,
+    network_export::NAME,
     network_publish::NAME,
     import_resume_wide::NAME,
     materialize_wide::NAME,
@@ -246,6 +248,7 @@ pub fn run_case(
         snapshot_export::NAME => snapshot_export::run(&context),
         repository_copy::NAME => repository_copy::run(&context),
         fork_network::NAME => fork_network::run(&context),
+        network_export::NAME => network_export::run(&context),
         network_publish::NAME => network_publish::run(&context),
         import_resume_wide::NAME => import_resume_wide::run(&context),
         materialize_wide::NAME => materialize_wide::run(&context),

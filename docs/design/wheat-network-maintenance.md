@@ -1,10 +1,11 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
-Status: designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
+Status: partial — Phase 1 (export to a directory) landed as a library operation,
+the rest designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
-Last updated: 2026-10-27
+Last updated: 2026-10-28
 
 ## Implementation status
 
@@ -36,6 +37,14 @@ and move them from Outstanding to Done.
   question 7, option B, with a bounded rescue list.
 - [x] **Decision — fetches read the old store until done (2026-10-28).** Open
   question 8, option A.
+- [x] **Phase 1 — export to a directory (2026-10-28).** `RepositoriesDirectory::export_network`
+  copies a quiesced network's structure into a stage; `StructureExport::finish` lists
+  and copies the content its heads reach, validates every distinct state, and installs
+  the bundle with its manifest written last (`wheat-store/src/network_bundle.rs`,
+  `tests/network_bundle.rs`). Bench case `network_export`: at 10,000 changes the copy
+  takes 0.3–2.5 s and the finish 20–27 s, of which about 20 s is `validate_complete`
+  re-verifying the history (2 ms a change); peak RSS 460 MiB. Not yet wired to a
+  server operation: that is Phase 0.
 
 ### Outstanding
 
@@ -47,9 +56,6 @@ and move them from Outstanding to Done.
 - [ ] **Phase 0 — admin surface.** Admin request and response messages, the `admin`
   principal flag in `[auth]`, the server's operation runner (one maintenance
   operation at a time per repositories directory) and `wheat admin`.
-- [ ] **Phase 1 — export to a directory.** A quiesced network written as a bundle:
-  its structure (pool files, every head, the manifest), its content list, and the
-  listed content in a store inside the bundle. Bench case at 10,000 changes.
 - [ ] **Phase 2 — import and adoption from a directory.** A bundle, or a
   `RepositoryDirectory` from `wheat import`, placed in a repositories directory under
   its own IDs with names; its content added to the content store. Closes the

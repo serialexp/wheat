@@ -59,6 +59,7 @@ pub use packed::{
 mod remote_packed;
 pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
 mod browse;
+mod network_bundle;
 mod publication;
 mod radix;
 mod repositories_directory;
@@ -134,6 +135,10 @@ pub use merkle_tree::{
 pub use mutation_publication::{
     LabelMove, PreparedMutationPublication, finalize_mutation_publication,
     prepare_mutation_publication, prepare_mutation_publication_moving_label,
+};
+pub use network_bundle::{
+    BundleError, ExportLimits, StructureExport, bundle_content_directory,
+    bundle_structure_directory, read_bundle_content_chunk, read_bundle_manifest,
 };
 pub use object_store_adapter::{
     ObjectStoreAdapter, ObjectStoreAdapterBuildError, S3ObjectStoreConfig,
