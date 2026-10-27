@@ -4,6 +4,14 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **(format) `RepositoryState` stops at 10,000 labels.** It sent at most 10,000
+  labels with a `truncated` flag, and `ListLabels` to page the rest was never served.
+  The labels are in the head's label manifest, which every fetch and clone transfers,
+  so `RepositoryState` now carries only the head, and `ListLabels`/`ListLabelsResult`
+  and `LabelEntry` are gone from the protocol (2026-10-27). The one reader of the
+  list, `clone` choosing its active label, reads the fetched manifest instead; it took
+  the first label by name, so a remote with `a-fix` cloned onto `a-fix`, and now
+  takes main when there is one (`crates/wheat-cli/tests/clone_labels.rs`).
 - `[x]` **Content backend is crate-private.** An embedder now implements the public
   `ContentBlobStore` (`crates/wheat-store/src/content_blobs.rs`): an async key/value
   store of Wheat's content records (put, get, a ranged get for the header, optional

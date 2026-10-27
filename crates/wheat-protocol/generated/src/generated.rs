@@ -16,8 +16,6 @@ pub enum WheatProtocolMessage {
     ClientHello(ClientHelloOutput),
     SessionEstablished(SessionEstablishedOutput),
     RepositoryState(RepositoryStateOutput),
-    ListLabels(ListLabelsOutput),
-    ListLabelsResult(ListLabelsResultOutput),
     FetchRequest(FetchRequestOutput),
     ObjectBatch(ObjectBatchOutput),
     ObjectWant(ObjectWantOutput),
@@ -98,31 +96,6 @@ impl WheatProtocolMessage {
                 encoder.write_uint8(v.message_type);
                 encoder.write_varlength(v.head_generation, "leb128_canonical")?;
                 v.head_envelope.encode_into(encoder)?;
-                encoder.write_varlength(v.labels.len() as u64, "leb128_canonical")?;
-                for item in &v.labels {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_uint8(if v.labels_truncated { 1 } else { 0 });
-            }
-            WheatProtocolMessage::ListLabels(v) => {
-                encoder.write_uint8(v.message_type);
-                encoder.write_varlength(v.op_id, "leb128_canonical")?;
-                encoder.write_varlength(v.cursor.len() as u64, "leb128_canonical")?;
-                for item in &v.cursor {
-                    encoder.write_uint8(*item);
-                }
-            }
-            WheatProtocolMessage::ListLabelsResult(v) => {
-                encoder.write_uint8(v.message_type);
-                encoder.write_varlength(v.op_id, "leb128_canonical")?;
-                encoder.write_varlength(v.labels.len() as u64, "leb128_canonical")?;
-                for item in &v.labels {
-                    item.encode_into(encoder)?;
-                }
-                encoder.write_varlength(v.next_cursor.len() as u64, "leb128_canonical")?;
-                for item in &v.next_cursor {
-                    encoder.write_uint8(*item);
-                }
             }
             WheatProtocolMessage::FetchRequest(v) => {
                 encoder.write_uint8(v.message_type);
@@ -336,14 +309,6 @@ impl WheatProtocolMessage {
             Ok(WheatProtocolMessage::RepositoryState(
                 RepositoryStateOutput::decode_with_decoder(decoder)?,
             ))
-        } else if value == 0x12 {
-            Ok(WheatProtocolMessage::ListLabels(
-                ListLabelsOutput::decode_with_decoder(decoder)?,
-            ))
-        } else if value == 0x13 {
-            Ok(WheatProtocolMessage::ListLabelsResult(
-                ListLabelsResultOutput::decode_with_decoder(decoder)?,
-            ))
         } else if value == 0x20 {
             Ok(WheatProtocolMessage::FetchRequest(
                 FetchRequestOutput::decode_with_decoder(decoder)?,
@@ -502,44 +467,6 @@ impl Uuid128 {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let bytes = decoder.read_bytes_vec(16)?;
         Ok(Self { bytes })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct LabelEntry {
-    pub name: std::string::String,
-    pub view_id: Digest256,
-}
-
-impl LabelEntry {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
-        let string_bytes: &[u8] = self.name.as_bytes();
-        for &b in string_bytes.iter() {
-            encoder.write_byte(b);
-        }
-        self.view_id.encode_into(encoder)?;
-        Ok(())
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let bytes = decoder.read_bytes_vec(length)?;
-        let name = std::string::String::from_utf8(bytes)
-            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
-        let view_id = Digest256::decode_with_decoder(decoder)?;
-        Ok(Self { name, view_id })
     }
 }
 
@@ -1189,8 +1116,6 @@ impl From<SessionEstablishedInput> for SessionEstablishedOutput {
 pub struct RepositoryStateInput {
     pub head_generation: u64,
     pub head_envelope: Digest256,
-    pub labels: Vec<LabelEntry>,
-    pub labels_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1198,8 +1123,6 @@ pub struct RepositoryStateOutput {
     pub message_type: u8,
     pub head_generation: u64,
     pub head_envelope: Digest256,
-    pub labels: Vec<LabelEntry>,
-    pub labels_truncated: bool,
 }
 
 pub type RepositoryState = RepositoryStateOutput;
@@ -1215,11 +1138,6 @@ impl RepositoryStateInput {
         encoder.write_byte(17);
         encoder.write_varlength(self.head_generation, "leb128_canonical")?;
         self.head_envelope.encode_into(encoder)?;
-        encoder.write_varlength(self.labels.len() as u64, "leb128_canonical")?;
-        for item in &self.labels {
-            item.encode_into(encoder)?;
-        }
-        encoder.write_byte(if self.labels_truncated { 1 } else { 0 });
         Ok(())
     }
 }
@@ -1240,19 +1158,10 @@ impl RepositoryStateOutput {
         }
         let head_generation = decoder.read_varlength("leb128_canonical")?;
         let head_envelope = Digest256::decode_with_decoder(decoder)?;
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
-        for _ in 0..length {
-            let item = LabelEntry::decode_with_decoder(decoder)?;
-            labels.push(item);
-        }
-        let labels_truncated = decoder.read_byte()? != 0;
         Ok(Self {
             message_type,
             head_generation,
             head_envelope,
-            labels,
-            labels_truncated,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -1268,8 +1177,6 @@ impl From<RepositoryStateOutput> for RepositoryStateInput {
         Self {
             head_generation: o.head_generation,
             head_envelope: o.head_envelope,
-            labels: o.labels,
-            labels_truncated: o.labels_truncated,
         }
     }
 }
@@ -1280,189 +1187,6 @@ impl From<RepositoryStateInput> for RepositoryStateOutput {
             message_type: 17u8,
             head_generation: i.head_generation,
             head_envelope: i.head_envelope,
-            labels: i.labels,
-            labels_truncated: i.labels_truncated,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListLabelsInput {
-    pub op_id: u64,
-    pub cursor: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListLabelsOutput {
-    pub message_type: u8,
-    pub op_id: u64,
-    pub cursor: Vec<u8>,
-}
-
-pub type ListLabels = ListLabelsOutput;
-
-impl ListLabelsInput {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_byte(18);
-        encoder.write_varlength(self.op_id, "leb128_canonical")?;
-        encoder.write_varlength(self.cursor.len() as u64, "leb128_canonical")?;
-        for item in &self.cursor {
-            encoder.write_byte(*item);
-        }
-        Ok(())
-    }
-}
-
-impl ListLabelsOutput {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let message_type = decoder.read_byte()?;
-        if message_type != 18u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 18, got {}",
-                message_type
-            )));
-        }
-        let op_id = decoder.read_varlength("leb128_canonical")?;
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let cursor = decoder.read_bytes_vec(length)?;
-        Ok(Self {
-            message_type,
-            op_id,
-            cursor,
-        })
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        ListLabelsInput::from(self.clone()).encode()
-    }
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ListLabelsInput::from(self.clone()).encode_into(encoder)
-    }
-}
-
-impl From<ListLabelsOutput> for ListLabelsInput {
-    fn from(o: ListLabelsOutput) -> Self {
-        Self {
-            op_id: o.op_id,
-            cursor: o.cursor,
-        }
-    }
-}
-
-impl From<ListLabelsInput> for ListLabelsOutput {
-    fn from(i: ListLabelsInput) -> Self {
-        Self {
-            message_type: 18u8,
-            op_id: i.op_id,
-            cursor: i.cursor,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListLabelsResultInput {
-    pub op_id: u64,
-    pub labels: Vec<LabelEntry>,
-    pub next_cursor: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListLabelsResultOutput {
-    pub message_type: u8,
-    pub op_id: u64,
-    pub labels: Vec<LabelEntry>,
-    pub next_cursor: Vec<u8>,
-}
-
-pub type ListLabelsResult = ListLabelsResultOutput;
-
-impl ListLabelsResultInput {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
-        self.encode_into(&mut encoder)?;
-        Ok(encoder.finish())
-    }
-
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        encoder.write_byte(19);
-        encoder.write_varlength(self.op_id, "leb128_canonical")?;
-        encoder.write_varlength(self.labels.len() as u64, "leb128_canonical")?;
-        for item in &self.labels {
-            item.encode_into(encoder)?;
-        }
-        encoder.write_varlength(self.next_cursor.len() as u64, "leb128_canonical")?;
-        for item in &self.next_cursor {
-            encoder.write_byte(*item);
-        }
-        Ok(())
-    }
-}
-
-impl ListLabelsResultOutput {
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
-        Self::decode_with_decoder(&mut decoder)
-    }
-
-    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
-        let message_type = decoder.read_byte()?;
-        if message_type != 19u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 19, got {}",
-                message_type
-            )));
-        }
-        let op_id = decoder.read_varlength("leb128_canonical")?;
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let mut labels = Vec::with_capacity(decoder.capacity_hint_sized(length, 33));
-        for _ in 0..length {
-            let item = LabelEntry::decode_with_decoder(decoder)?;
-            labels.push(item);
-        }
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let next_cursor = decoder.read_bytes_vec(length)?;
-        Ok(Self {
-            message_type,
-            op_id,
-            labels,
-            next_cursor,
-        })
-    }
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        ListLabelsResultInput::from(self.clone()).encode()
-    }
-    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        ListLabelsResultInput::from(self.clone()).encode_into(encoder)
-    }
-}
-
-impl From<ListLabelsResultOutput> for ListLabelsResultInput {
-    fn from(o: ListLabelsResultOutput) -> Self {
-        Self {
-            op_id: o.op_id,
-            labels: o.labels,
-            next_cursor: o.next_cursor,
-        }
-    }
-}
-
-impl From<ListLabelsResultInput> for ListLabelsResultOutput {
-    fn from(i: ListLabelsResultInput) -> Self {
-        Self {
-            message_type: 19u8,
-            op_id: i.op_id,
-            labels: i.labels,
-            next_cursor: i.next_cursor,
         }
     }
 }

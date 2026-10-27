@@ -32,11 +32,9 @@
         { type: "ClientHello",           when: "value == 0x02" },
         { type: "SessionEstablished",    when: "value == 0x03" },
 
-        // Repository (0x11–0x13). The WebSocket path names the repository, and the
+        // Repository (0x11). The WebSocket path names the repository, and the
         // server sends its RepositoryState once the session is established.
         { type: "RepositoryState",       when: "value == 0x11" },
-        { type: "ListLabels",            when: "value == 0x12" },
-        { type: "ListLabelsResult",      when: "value == 0x13" },
 
         // Fetch (0x20–0x26)
         { type: "FetchRequest",          when: "value == 0x20" },
@@ -92,14 +90,6 @@
     Uuid128: {
       sequence: [
         { name: "bytes", type: "bytes", kind: "fixed", length: 16 },
-      ],
-    },
-
-    // A labelled view pointer.
-    LabelEntry: {
-      sequence: [
-        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
-        { name: "view_id", type: "Digest256" },
       ],
     },
 
@@ -197,37 +187,6 @@
         { name: "message_type", type: "uint8", const: 0x11 },
         { name: "head_generation", type: "varlength", encoding: "leb128_canonical" },
         { name: "head_envelope", type: "Digest256" },
-        {
-          name: "labels",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "varlength", length_encoding: "leb128_canonical",
-          items: { type: "LabelEntry" },
-        },
-        { name: "labels_truncated", type: "bool" },
-      ],
-    },
-
-    ListLabels: {
-      sequence: [
-        { name: "message_type", type: "uint8", const: 0x12 },
-        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
-        { name: "cursor", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
-      ],
-    },
-
-    ListLabelsResult: {
-      sequence: [
-        { name: "message_type", type: "uint8", const: 0x13 },
-        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
-        {
-          name: "labels",
-          type: "array",
-          kind: "length_prefixed",
-          length_type: "varlength", length_encoding: "leb128_canonical",
-          items: { type: "LabelEntry" },
-        },
-        { name: "next_cursor", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
       ],
     },
 

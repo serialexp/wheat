@@ -2636,10 +2636,15 @@ fn native_clone(
             .fetched;
         // Nothing here is trusted yet, so the whole head is checked before the store
         // keeps it.
-        RepositoryReader::new(&staged, staged.content())
+        let reader = RepositoryReader::new(&staged, staged.content());
+        reader
             .validate_arrival(state.envelope, Arrival::Bootstrap)
             .await
             .context("the remote's head failed validation")?;
+        let labels = reader
+            .view_label_manifest(reader.envelope(state.envelope).await?.labels)
+            .await?
+            .labels;
         staged.flush().await?;
 
         write_stderr(format_args!(
@@ -2649,12 +2654,16 @@ fn native_clone(
         ));
 
         remote::close(&mut session).await?;
-        // Pick the first label as the active label, or "main" as default.
-        let label = state
-            .labels
-            .first()
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| "main".to_string());
+        // The active label is main when the remote has one, else its first label, else
+        // main for an empty repository.
+        let label = if labels.contains_key("main") {
+            "main".to_string()
+        } else {
+            labels
+                .into_keys()
+                .next()
+                .unwrap_or_else(|| "main".to_string())
+        };
         Ok::<_, anyhow::Error>((state, label, fetched, content_count))
     })?;
     // Release the packed store's process lock; the workspace reopens the store below.

@@ -17,11 +17,6 @@ memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
 listing the bucket, opening a packed store costing O(store), the remote catalog head
 being JSON, and `wheat gc` / server-authoritative remote maintenance.
 
-- `[ ]` **(format) `RepositoryState` stops at 10,000 labels.** Repository open sends at
-  most 10,000 labels with a `truncated` flag (`connection.rs`), and `ListLabels`,
-  which would page the rest, is in the schema but not served. Gothab repositories can
-  have more branches than that. Implement `ListLabels` paging, and check its message
-  shape before the freeze.
 - `[ ]` **Handlers take `WebSocketStream<TcpStream>`.** `wire::send`/`recv` and every
   handler in `connection.rs`, `fetch.rs` and `publish.rs` name the concrete stream, so
   the server cannot run on an axum or hyper upgraded connection. Make them generic over

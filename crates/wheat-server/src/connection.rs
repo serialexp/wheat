@@ -21,7 +21,6 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
 use wheat_protocol::*;
-use wheat_store::RepositoryReader;
 
 use crate::access::{Access, Principal};
 use crate::receipt::PublishKey;
@@ -390,27 +389,7 @@ async fn run_session(
         .head()
         .await
         .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
-    let reader = RepositoryReader::new(&entry.store, &entry.content);
-    let envelope = reader
-        .envelope(head.envelope)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read envelope: {e}")))?;
-    let labels_manifest = reader
-        .view_label_manifest(envelope.labels)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read labels: {e}")))?;
-    let labels: Vec<LabelEntry> = labels_manifest
-        .labels
-        .iter()
-        .take(10_000)
-        .map(|(name, label)| LabelEntry {
-            name: name.clone(),
-            view_id: Digest256 {
-                bytes: label.view.as_bytes().to_vec(),
-            },
-        })
-        .collect();
-    let truncated = labels_manifest.labels.len() > 10_000;
+    // The labels are in the envelope, which the client fetches.
     send(
         ws,
         &WheatProtocolMessage::RepositoryState(RepositoryStateOutput {
@@ -419,8 +398,6 @@ async fn run_session(
             head_envelope: Digest256 {
                 bytes: head.envelope.as_bytes().to_vec(),
             },
-            labels,
-            labels_truncated: truncated,
         }),
     )
     .await?;

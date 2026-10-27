@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use url::{Host, Url};
 
-use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, VerifiedContent, ViewId};
+use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, VerifiedContent};
 use wheat_protocol::*;
 use wheat_store::{
     ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead, RepositoryReader,
@@ -197,11 +197,10 @@ impl WheatSession {
     }
 }
 
-/// Repository state received after opening.
+/// Repository state received after opening. Its labels are in the envelope.
 pub struct RemoteRepoState {
     pub generation: u64,
     pub envelope: RepositoryEnvelopeId,
-    pub labels: Vec<(String, ViewId)>,
 }
 
 /// Result of a publish operation.
@@ -297,15 +296,6 @@ fn digest_to_envelope_id(d: &Digest256) -> Result<RepositoryEnvelopeId> {
         .try_into()
         .context("invalid RepositoryEnvelopeId length")?;
     Ok(RepositoryEnvelopeId::from_digest(bytes))
-}
-
-fn digest_to_view_id(d: &Digest256) -> Result<ViewId> {
-    let bytes: [u8; 32] = d
-        .bytes
-        .as_slice()
-        .try_into()
-        .context("invalid ViewId length")?;
-    Ok(ViewId::from_digest(bytes))
 }
 
 fn object_id_to_digest(id: ObjectId) -> Digest256 {
@@ -421,22 +411,10 @@ async fn repository_state(
 ) -> Result<RemoteRepoState> {
     let msg = recv_msg(ws).await?;
     match msg {
-        WheatProtocolMessage::RepositoryState(rs) => {
-            let envelope = digest_to_envelope_id(&rs.head_envelope)?;
-            let labels = rs
-                .labels
-                .iter()
-                .map(|entry| {
-                    let view_id = digest_to_view_id(&entry.view_id)?;
-                    Ok((entry.name.clone(), view_id))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(RemoteRepoState {
-                generation: rs.head_generation,
-                envelope,
-                labels,
-            })
-        }
+        WheatProtocolMessage::RepositoryState(rs) => Ok(RemoteRepoState {
+            generation: rs.head_generation,
+            envelope: digest_to_envelope_id(&rs.head_envelope)?,
+        }),
         WheatProtocolMessage::Error(e) => {
             bail!("server error opening repository '{}': {}", name, e.message);
         }

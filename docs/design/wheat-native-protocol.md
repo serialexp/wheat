@@ -723,12 +723,11 @@ server.
 header. The server validates it against an allowlist to prevent cross-site
 WebSocket hijacking.
 
-**Labels enumeration:** `RepositoryState` includes the full label manifest
-(label name + view ID pairs), not just a count. This lets the client
-discover branches by name without a separate round trip. For repositories
-with many labels, the response is bounded (max 10,000 labels; the server
-truncates with a flag indicating more are available, and a separate
-`ListLabels` paginated message can retrieve the full set).
+**Labels enumeration:** `RepositoryState` carries no labels. They are in the
+head's label manifest, which every fetch and clone transfers, so the client
+reads them from its store at any label count. (An earlier draft listed up to
+10,000 labels in `RepositoryState` and paged the rest with `ListLabels`; it was
+dropped on 2026-10-27 because the manifest already carries them.)
 
 ## Wire protocol schema (sketch)
 
@@ -769,18 +768,7 @@ SessionEstablished
 
 RepositoryState                               // sent after SessionEstablished
   head_generation: u64
-  head_envelope: bytes[32]
-  labels: array<{ name: string (max 256), view_id: bytes[32] }, max=10000>
-  labels_truncated: bool
-
-ListLabels
-  op_id: u32
-  cursor: bytes (max 256, empty = start)
-
-ListLabelsResult
-  op_id: u32
-  labels: array<{ name: string, view_id: bytes[32] }, max=10000>
-  next_cursor: bytes (max 256, empty = end)
+  head_envelope: bytes[32]                    // labels are in its manifest
 
 // --- Fetch (push the difference, then pull the gaps) ---
 

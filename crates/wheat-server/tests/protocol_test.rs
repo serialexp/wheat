@@ -83,9 +83,8 @@ async fn session_setup_and_repo_open() {
     let state = recv_msg(&mut ws).await;
     match state {
         WheatProtocolMessage::RepositoryState(rs) => {
-            // initialize() sets generation = 0 with an empty label manifest.
+            // initialize() sets generation = 0.
             assert_eq!(rs.head_generation, 0);
-            assert!(!rs.labels_truncated);
         }
         other => panic!("expected RepositoryState, got {other:?}"),
     }
