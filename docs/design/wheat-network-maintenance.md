@@ -1,6 +1,8 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
-Status: designed, not yet implemented; Bart answered the open questions on 2026-10-27.
+Status: designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
+review by Codex and Antigravity the same day raised questions 6–8, still open, and
+the changes in [Review](#review-2026-10-27).
 Owner: bart
 Last updated: 2026-10-27
 
@@ -29,6 +31,11 @@ and move them from Outstanding to Done.
 
 ### Outstanding
 
+- [ ] **Open question 6 — closing a move.** See [Review](#review-2026-10-27).
+- [ ] **Open question 7 — how long content GC holds publishes.** See
+  [Review](#review-2026-10-27).
+- [ ] **Open question 8 — fetches in progress during a sweep.** See
+  [Review](#review-2026-10-27).
 - [ ] **Phase 0 — admin surface.** Admin request and response messages, the `admin`
   principal flag in `[auth]`, the server's operation runner (one maintenance
   operation at a time per repositories directory) and `wheat admin`.
@@ -318,6 +325,113 @@ lookups in this process. Since GC removes only records no head reaches, a reader
 affected only when it reads an unreachable record (a superseded envelope, question
 4). No further grace period is proposed for the in-process server; an external
 reader of the files (backup by file copy) must not run during a collection.
+
+## Review (2026-10-27)
+
+Codex and Antigravity reviewed this design at Bart's request. What they found, checked
+against the code, and how the design changes. The sections above stand as written;
+where they disagree with this section, this section wins.
+
+### Changes
+
+1. **A directory-wide publish gate.** `Registry::quiesce` holds one network's
+   `Writers`, and a network opened later gets fresh ones (`network.rs`, `Network::new`),
+   so "quiesce every network" misses networks opened during a content GC: a publish
+   to one finds a blob present (`publish.rs`, the `existing_ids` check), skips
+   uploading it, and the sweep removes it. Content GC instead takes a gate on the
+   registry that every publish passes (`Writers::begin` consults it), including those
+   to networks opened after the gate closed, and that `RepositoriesDirectory::create_empty`,
+   `fork` and import respect. Pool GC and export keep the per-network quiesce, which
+   the network's own opens share.
+2. **Unreachable before writers resume.** Publishing the new content generation is
+   not enough: loose content left behind still answers `contains` and reads
+   (`store.rs`, the loose fallback in `logical_length` and `read_stored`). The hold
+   ends only once every swept record is out of every lookup path (the catalog,
+   loose index, and loose fallback); files are removed after (question 8).
+3. **Bucket keys and an authenticated file list.** Content-generation shard files are
+   named `<generation>/shard-N.pack` with no digest (`content_generation.rs`,
+   `content_generation_shard_manifest_path`), so one name can hold different bytes
+   after a restore and a repack. Immutable files are keyed by their relative path
+   and BLAKE3 digest, and the manifest lists every structural file with path, length
+   and digest; import verifies each as it downloads. An object already in the bucket
+   is reused only when its digest matches.
+4. **Import as a resumable transaction.** Every name's lock is taken before anything
+   is checked and held to the end; the IDs and names are checked before the
+   expensive validation; a durable import record beside the first name lets a crash
+   resume (or roll back) the same import, rather than leaving a network a retry
+   refuses because its ID is taken.
+5. **Deleting while served.** `RepositoriesDirectory::delete` takes the closed-store
+   lock before checking for other repositories and finds the head through the name,
+   and `Registry::get` serves a cached entry without reading the name. Deletion
+   instead marks the registry's entry (or network) draining, so `get` refuses it and
+   its publishes end, waits for holders to drop it, then removes head and name under
+   the name's lock with the location already read; removing a fork's head no longer
+   needs the network's store closed. `OpenNetworks` exposes waiting for a network's
+   close.
+6. **Dropping the pool's content.** `repack_structural` drops content records only
+   when a validated replacement generation covers them (`catalog.rs`,
+   `may_retire_content`), and `retire_repacked_content` does nothing without one. Pool
+   GC adds an explicit mode that drops every content record, generation and loose
+   content file of a network's pool, allowed once the content store is checked to
+   hold each of them.
+7. **Bounded memory and lookups during a rewrite.** Content repack caps planning at
+   250,000 IDs and takes its inventory as a `Vec` (`ContentRepackLimits`,
+   `ContentRepackInput`); structural repack collects its inventory in memory;
+   `validate_complete` builds lineage in memory and reads each blob once per head; and
+   repack holds the catalog's exclusive lock through validation and rewrite, so
+   fetch lookups wait. GC streams its inventories from the disk-backed mark set,
+   validates content once per network rather than per head, builds replacements
+   outside the lookup lock and takes it only to publish. Bench cases cover a million
+   content IDs, a mostly dead store and a large-blob store, with memory, I/O and
+   publish-hold budgets.
+8. **A delta-base reader.** Marking reads a blob's delta base from its envelope
+   header or generation entry without resolving the chain.
+
+Not taken: Antigravity's note that the content store has no segments. It does: the
+content store is a packed store, and content records of kind 0 go to its segments
+(`store.rs`, reads through `CONTENT_NAMESPACE`).
+
+### Open question 6 — closing a move
+
+Export releases the quiesce, so a publish after it reaches only the source, and the
+delete that ends a move loses it. Options:
+
+- **A. Read-only from export.** A move keeps the network quiesced from export to the
+  delete; fetches go on, publishes are refused for the whole move. A plain export
+  (backup) still releases early.
+- **B. Check at cutover.** Export releases as designed; cutover quiesces again and
+  refuses the delete unless every head is unchanged since the export.
+- **C. Catch up at cutover.** Cutover quiesces again and ships only what changed since
+  the export (new heads, new immutable files, new content), then deletes. Publishes
+  are held only for the catch-up.
+
+### Open question 7 — how long content GC holds publishes
+
+Holding every network from marking to publishing the new generation refuses every
+publish of the directory for the whole collection, which Antigravity estimates at
+tens of minutes on a large instance. Options:
+
+- **A. Hold throughout**, as decided for question 3; the bench case records the hold.
+- **B. Two short holds.** Hold briefly to read every head, then mark and build the
+  replacement while publishes go on (records written meanwhile are kept); hold again
+  to mark what commits since then added, make the swept records unreachable, publish
+  and release. Part of the write barrier question 3 did not choose.
+
+### Open question 8 — fetches in progress during a sweep
+
+A fetch looks objects up as it goes (`fetch.rs`, `answer_want`), and a repack replaces
+the catalog's readers and removes old segments at once (`catalog.rs`, after the
+index is rebuilt), so a fetch begun before a sweep can lose what it is sending, such
+as a superseded `want` envelope. Options:
+
+- **A. Read the old store until done.** A fetch begun before the sweep keeps reading
+  through the store's previous readers and index; fetches begun after it, and every
+  publish's lookup (change 2), see only the new one. The old files are removed once
+  the last earlier fetch ends.
+- **B. Pin fetch roots.** Each fetch in progress adds its `want` envelope to the
+  roots until it ends.
+- **C. Fail and retry.** A fetch that meets a swept record ends with a retryable
+  error, and the client fetches again from the current head.
 
 ## Performance
 
