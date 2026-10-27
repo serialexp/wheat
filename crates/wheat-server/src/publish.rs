@@ -1,7 +1,5 @@
 //! Publish protocol handler — receive objects, validate, commit.
 
-use tokio::net::TcpStream;
-use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
 use std::collections::HashMap;
@@ -21,6 +19,7 @@ use crate::commit::{self, Accepted, CommitFailure};
 use crate::connection::ConnectionError;
 use crate::receipt::PublishKey;
 use crate::registry::RepositoryEntry;
+use crate::transport::Transport;
 use crate::wire::{
     connection_error_scope, digest_to_content_id, digest_to_object_id, publish_error_status,
     publish_published, publish_rejected_status, publish_result, publish_stale_status, recv, send,
@@ -46,7 +45,7 @@ pub struct Pushed {
 /// the protocol: the client is told why and the connection ends.
 #[tracing::instrument(name = "publish_push", level = "debug", skip_all)]
 pub async fn receive_push(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     keep: bool,
 ) -> Result<Pushed, ConnectionError> {
@@ -62,7 +61,7 @@ pub async fn receive_push(
 
 /// [`receive_push`] up to the first rule the push breaks, which it returns.
 async fn read_push(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     keep: bool,
 ) -> Result<Result<Pushed, &'static str>, ConnectionError> {
@@ -121,7 +120,7 @@ const OVER_PUSH_LIMIT: &str = "a publish pushed more than MAX_PUSHED_BYTES";
 /// `receipt` it holds for this publish's key. Returns the new head if publication succeeded.
 #[tracing::instrument(name = "publish", level = "debug", skip_all)]
 pub async fn handle_publish(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     entry: &Arc<RepositoryEntry>,
     current_head: &RepositoryHead,
     receipt: Option<&PublishReceiptRecord>,
@@ -388,7 +387,7 @@ pub async fn handle_publish(
 /// is its batch's, which includes every publish in the batch.
 #[tracing::instrument(name = "publish_commit", level = "debug", skip_all)]
 async fn commit(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     entry: &Arc<RepositoryEntry>,
     staged: &Staged<'_>,
     op_id: u64,
@@ -414,7 +413,7 @@ async fn commit(
 /// Tells the client how its publish ended: the head it was published in, or why it
 /// was not.
 async fn answer(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     key: PublishKey,
     accepted: Result<Accepted, CommitFailure>,
@@ -464,7 +463,7 @@ async fn answer(
 
 /// Send the publish back as stale: the client must fetch first.
 async fn stale(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     head: &RepositoryHead,
     message: &str,
@@ -486,7 +485,7 @@ async fn stale(
 
 /// Refuse the publish: tell the client, leave the head where it is.
 async fn reject(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     current_head: &RepositoryHead,
     message: &str,
@@ -529,7 +528,7 @@ const STAGED_BYTES: usize = 64 * 1024 * 1024;
 /// cover. Returns why the publish is refused, if it is.
 #[tracing::instrument(name = "publish_objects", level = "debug", skip_all)]
 async fn receive_objects(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     staged: &Staged<'_>,
     op_id: u64,
     current_head: &RepositoryHead,
@@ -624,7 +623,7 @@ async fn receive_objects(
 /// `ObjectBatch` or in `ObjectChunk`s, and nothing else. Returns why the round is
 /// refused, if it is.
 async fn receive_round(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     staged: &Staged<'_>,
     op_id: u64,
     ids: &[ObjectId],

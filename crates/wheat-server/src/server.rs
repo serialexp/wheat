@@ -37,11 +37,13 @@ pub struct ServerConfig {
     /// authenticated: the WebSocket upgrade, `ClientHello` and the access
     /// provider's answer together. A client that takes longer, or sends nothing,
     /// is disconnected, so connections nobody has authenticated cannot pile up.
-    /// [`connection::handle_connection`] enforces it, so embedders get it too.
+    /// Every entry point in [`connection`] enforces it, so embedders get it too;
+    /// for [`connection::serve`] and [`connection::serve_upgraded`] it starts when
+    /// they are called, so an embedder bounds its own HTTP upgrade.
     pub session_setup_timeout: Duration,
     /// Most connections [`run`] and [`run_until`] hold open at once. Past it, a
     /// new connection is closed as soon as it is accepted. An embedder that calls
-    /// [`connection::handle_connection`] itself sets its own limit.
+    /// an entry point in [`connection`] itself sets its own limit.
     pub max_connections: usize,
 }
 

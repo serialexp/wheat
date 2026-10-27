@@ -1,57 +1,39 @@
-//! Shared WebSocket message framing — send, receive, error helpers.
+//! Shared message framing — send, receive, error helpers.
 //!
 //! Eliminates the send/recv duplication across connection, fetch, and publish.
-
-use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 
 use wheat_core::{ContentId, ObjectId};
 use wheat_protocol::*;
 use wheat_store::RepositoryHead;
 
 use crate::connection::ConnectionError;
+use crate::transport::Transport;
 
-/// Send a protocol message as a WebSocket binary message.
+/// Send a protocol message.
 pub async fn send(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     message: &WheatProtocolMessage,
 ) -> Result<(), ConnectionError> {
     let bytes = encode_message(message).map_err(ConnectionError::Encode)?;
-    ws.send(Message::Binary(bytes.into())).await?;
-    Ok(())
+    ws.send(bytes.into())
+        .await
+        .map_err(ConnectionError::Transport)
 }
 
-/// Receive the next binary protocol message, handling ping/pong.
-pub async fn recv(
-    ws: &mut WebSocketStream<TcpStream>,
-) -> Result<WheatProtocolMessage, ConnectionError> {
-    loop {
-        let msg = ws
-            .next()
-            .await
-            .ok_or(ConnectionError::Closed)?
-            .map_err(ConnectionError::WebSocket)?;
-        match msg {
-            Message::Binary(bytes) => {
-                return decode_message(&bytes).map_err(ConnectionError::Decode);
-            }
-            Message::Ping(data) => {
-                ws.send(Message::Pong(data)).await?;
-            }
-            Message::Pong(_) | Message::Frame(_) => {}
-            Message::Close(_) => return Err(ConnectionError::Closed),
-            Message::Text(_) => {
-                return Err(ConnectionError::Protocol("text frames not supported"));
-            }
-        }
-    }
+/// Receive the next protocol message. Decoding refuses one larger than
+/// [`MAX_MESSAGE_SIZE`].
+pub async fn recv(ws: &mut impl Transport) -> Result<WheatProtocolMessage, ConnectionError> {
+    let bytes = ws
+        .recv()
+        .await
+        .map_err(ConnectionError::Transport)?
+        .ok_or(ConnectionError::Closed)?;
+    decode_message(&bytes).map_err(ConnectionError::Decode)
 }
 
 /// Send an Error message to the client.
 pub async fn send_error(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     code: u16,
     scope: ErrorScope,
@@ -75,7 +57,7 @@ pub async fn send_error(
 
 /// Send an operation-scoped, non-retryable Error about one object.
 pub async fn send_object_error(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     code: u16,
     message: &str,

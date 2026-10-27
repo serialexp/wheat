@@ -1013,9 +1013,11 @@ The file holds BLAKE3 hashes of tokens, never tokens.
 
 A connection has `session_setup_seconds` to get through the WebSocket upgrade,
 `ClientHello` and the access provider's answer; a client that says nothing, or the
-wrong protocol, is disconnected when it runs out. `handle_connection` enforces this,
-so an embedder gets it as well. The connection cap belongs to the standalone
-server's accept loop; an embedder that accepts connections itself sets its own.
+wrong protocol, is disconnected when it runs out. Every entry point enforces this,
+so an embedder gets it as well; for one that upgraded the connection itself it
+starts when Wheat is handed the connection. The connection cap belongs to the
+standalone server's accept loop; an embedder that accepts connections itself sets
+its own.
 `openssl rand -hex 32 | tee token | wheat-server hash-token` makes a token and
 its hash.
 
@@ -1028,6 +1030,16 @@ caller on in a header of its own, which Gothab's `AccessProvider` reads. The rep
 `repositories` table. Object storage uses the existing blobstore configuration
 per namespace. No separate binary — the protocol handler is a library called
 from gothab-server.
+
+The library does not need to own the socket (`wheat_server::connection`). The
+host checks the upgrade request with `Upgrade::check` (the path names a repository,
+a browser's `Origin` is allowed), upgrades it with its own HTTP stack, and hands
+over the result: an upgraded socket to `serve_upgraded`, which answers with
+`Upgrade::response` first (hyper's `upgrade::on`), or its own WebSocket to `serve`
+through the three-method `Transport` trait (send a binary message, receive the
+next, close), which is how axum's `WebSocketUpgrade` fits. The transport must
+refuse a message over `MAX_MESSAGE_SIZE` while it arrives. The standalone server's
+`handle_connection` is the same session on tungstenite over TCP.
 
 ### Object store as the scaling axis
 

@@ -15,4 +15,5 @@ pub mod publish;
 pub mod receipt;
 pub mod registry;
 pub mod server;
+pub mod transport;
 pub mod wire;

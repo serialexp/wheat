@@ -1,23 +1,34 @@
 //! Per-connection state machine.
 //!
-//! Drives the WebSocket through: upgrade (the path names the repository) → handshake
+//! Drives a connection through: upgrade (the path names the repository) → handshake
 //! → repository state → fetch/publish.
+//!
+//! There are three ways in. [`handle_connection`] takes an accepted TCP connection
+//! and does the WebSocket upgrade itself; [`run`](crate::server::run) uses it. An
+//! embedder that serves HTTP itself checks the upgrade request with
+//! [`Upgrade::check`], then either answers with [`Upgrade::response`] and hands the
+//! upgraded socket to [`serve_upgraded`] (hyper's `upgrade::on`), or upgrades with
+//! its own WebSocket type and hands that to [`serve`] as a [`Transport`] (axum's
+//! `WebSocketUpgrade`).
 //!
 //! Everything before the caller is authenticated, from the upgrade to the access
 //! provider's answer, shares one deadline ([`ServerConfig::session_setup_timeout`]),
 //! so a client that connects and then says nothing, or says it slowly, is
-//! disconnected instead of holding the connection open.
+//! disconnected instead of holding the connection open. [`handle_connection`] starts
+//! it when the connection is accepted; [`serve`] and [`serve_upgraded`], whose
+//! caller did the upgrade, when they are called.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use futures::StreamExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::accept_hdr_async_with_config;
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse, Request, Response, create_response,
+};
 use tokio_tungstenite::tungstenite::http::{StatusCode, header::ORIGIN};
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::{WebSocketStream, accept_hdr_async_with_config};
 use tracing::{debug, info, warn};
 
 use wheat_protocol::*;
@@ -26,6 +37,7 @@ use crate::access::{Access, Principal};
 use crate::receipt::PublishKey;
 use crate::registry::Registry;
 use crate::server::ServerConfig;
+use crate::transport::{Transport, TransportError};
 use crate::wire::{
     connection_error_scope, operation_error_scope, publish_rejected_status, publish_result, recv,
     send, send_error,
@@ -37,6 +49,8 @@ const FORBIDDEN: u16 = 403;
 const NOT_FOUND: u16 = 404;
 /// Error code for a session that was not set up by its deadline.
 const SETUP_TIMED_OUT: u16 = 408;
+/// How long a refusal sent at the setup deadline may take to go out.
+const REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run one client connection to completion.
 pub async fn handle_connection(
@@ -51,28 +65,13 @@ pub async fn handle_connection(
     debug!(peer = %peer, "new connection");
     let deadline = Instant::now() + config.session_setup_timeout;
 
-    let allowed_origins = &config.allowed_origins;
     let mut upgrade = None;
     #[allow(clippy::result_large_err)] // The error type is fixed by tungstenite's callback.
     let check_upgrade = |request: &Request, response: Response| {
-        let repository = repository_name(request.uri().path()).map_err(|error| {
-            refusal(
-                StatusCode::BAD_REQUEST,
-                format!("invalid repository path: {error}"),
-            )
-        })?;
-        let response = check_origin(request, response, allowed_origins)?;
-        upgrade = Some(Upgrade {
-            repository,
-            request: copy_request(request),
-        });
+        upgrade = Some(Upgrade::check(request, &config).map_err(Refusal::into_response)?);
         Ok(response)
     };
-    // Refuse an oversized message while it arrives, not after it is in memory.
-    let limits = WebSocketConfig::default()
-        .max_message_size(Some(MAX_MESSAGE_SIZE))
-        .max_frame_size(Some(MAX_MESSAGE_SIZE));
-    let accept = accept_hdr_async_with_config(stream, check_upgrade, Some(limits));
+    let accept = accept_hdr_async_with_config(stream, check_upgrade, Some(message_limits()));
     let mut ws = match timeout_at(deadline, accept).await {
         Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
@@ -88,31 +87,116 @@ pub async fn handle_connection(
         warn!(peer = %peer, "WebSocket handshake finished without its request");
         return;
     };
+    serve_until(&mut ws, &upgrade, &registry, &config, &peer, deadline).await;
+}
 
-    if let Err(e) = run_session(&mut ws, &registry, &config, &peer, &upgrade, deadline).await {
+/// Serve one session on `io`, a connection the caller has already upgraded to a
+/// WebSocket (answering `upgrade`'s request with [`Upgrade::response`]), such as
+/// hyper's `upgrade::on`. `peer` names the client in the logs.
+pub async fn serve_upgraded<S>(
+    io: S,
+    upgrade: Upgrade,
+    registry: &Registry,
+    config: &ServerConfig,
+    peer: &str,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let deadline = Instant::now() + config.session_setup_timeout;
+    let mut ws = WebSocketStream::from_raw_socket(io, Role::Server, Some(message_limits())).await;
+    serve_until(&mut ws, &upgrade, registry, config, peer, deadline).await;
+}
+
+/// Serve one session on `transport`, a WebSocket the caller upgraded `upgrade`'s
+/// request to with its own WebSocket type. `peer` names the client in the logs.
+pub async fn serve(
+    mut transport: impl Transport,
+    upgrade: Upgrade,
+    registry: &Registry,
+    config: &ServerConfig,
+    peer: &str,
+) {
+    let deadline = Instant::now() + config.session_setup_timeout;
+    serve_until(&mut transport, &upgrade, registry, config, peer, deadline).await;
+}
+
+async fn serve_until(
+    ws: &mut impl Transport,
+    upgrade: &Upgrade,
+    registry: &Registry,
+    config: &ServerConfig,
+    peer: &str,
+    deadline: Instant,
+) {
+    if let Err(e) = run_session(ws, registry, config, peer, upgrade, deadline).await {
         info!(peer = %peer, error = %e, "session ended with error");
     } else {
         debug!(peer = %peer, "session closed cleanly");
     }
-    finish(&mut ws).await;
+    ws.close().await;
 }
 
-/// How long [`finish`] waits for the client to answer the closing handshake.
-const CLOSE_WAIT: Duration = Duration::from_secs(10);
+/// Refuse an oversized message while it arrives, not after it is in memory.
+fn message_limits() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE))
+}
 
-/// Ends the connection with a closing handshake, reading and dropping what the
-/// client sent after the server stopped listening: a request sent without waiting
-/// for the session, or the rest of a push. Closing the socket with those bytes
-/// unread resets the connection, and the client can lose the reply that says why
-/// it ended.
-async fn finish(ws: &mut WebSocketStream<TcpStream>) {
-    // The client closed first: tungstenite has answered it already.
-    if ws.close(None).await.is_err() {
-        return;
+/// A WebSocket upgrade request that names a repository and comes from an allowed
+/// origin. Only [`Upgrade::check`] makes one, so every session went through it.
+pub struct Upgrade {
+    repository: String,
+    request: Request,
+}
+
+impl Upgrade {
+    /// Check an upgrade request before upgrading: its path must name a repository
+    /// (`/owner/name`), and a browser's `Origin` must be on
+    /// [`ServerConfig::allowed_origins`]. The request is kept for the access
+    /// provider, which authenticates it once the client has said hello. An embedder
+    /// with an `http::Request<Body>` passes the head:
+    /// `Request::from_parts(parts, ())`.
+    pub fn check(request: &Request, config: &ServerConfig) -> Result<Self, Refusal> {
+        let repository = repository_name(request.uri().path()).map_err(|error| Refusal {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("invalid repository path: {error}"),
+        })?;
+        check_origin(request, &config.allowed_origins)?;
+        Ok(Self {
+            repository,
+            request: copy_request(request),
+        })
     }
-    let drain = async { while let Some(Ok(_)) = ws.next().await {} };
-    if tokio::time::timeout(CLOSE_WAIT, drain).await.is_err() {
-        debug!("client did not finish the closing handshake");
+
+    /// The repository the request's path names.
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// The `101 Switching Protocols` answer to the request, for an embedder that
+    /// upgrades the connection itself before calling [`serve_upgraded`]. Refuses a
+    /// request that is not a valid WebSocket upgrade.
+    pub fn response(&self) -> Result<Response, Refusal> {
+        create_response(&self.request).map_err(|error| Refusal {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("not a WebSocket upgrade: {error}"),
+        })
+    }
+}
+
+/// Why an upgrade request was refused, and the HTTP status to answer it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl Refusal {
+    fn into_response(self) -> ErrorResponse {
+        let mut refusal = ErrorResponse::new(Some(self.message));
+        *refusal.status_mut() = self.status;
+        refusal
     }
 }
 
@@ -121,32 +205,20 @@ async fn finish(ws: &mut WebSocketStream<TcpStream>) {
 /// Browsers always send `Origin` on a WebSocket upgrade and let any page open
 /// one, so without this a web page could use a visitor's browser to reach a
 /// server on their machine. Non-browser clients send no `Origin` and pass.
-#[allow(clippy::result_large_err)] // The error type is fixed by tungstenite's callback.
-fn check_origin(
-    request: &Request,
-    response: Response,
-    allowed_origins: &[String],
-) -> Result<Response, ErrorResponse> {
+fn check_origin(request: &Request, allowed_origins: &[String]) -> Result<(), Refusal> {
     let Some(origin) = request.headers().get(ORIGIN) else {
-        return Ok(response);
+        return Ok(());
     };
     let allowed = origin
         .to_str()
         .is_ok_and(|origin| allowed_origins.iter().any(|allowed| allowed == origin));
     if allowed {
-        return Ok(response);
+        return Ok(());
     }
-    Err(refusal(
-        StatusCode::FORBIDDEN,
-        "origin not allowed".to_owned(),
-    ))
-}
-
-/// What a WebSocket upgrade request asked for: the repository its path names, and
-/// the request itself, for the access provider.
-struct Upgrade {
-    repository: String,
-    request: Request,
+    Err(Refusal {
+        status: StatusCode::FORBIDDEN,
+        message: "origin not allowed".to_owned(),
+    })
 }
 
 /// `request` without its body, which an upgrade request does not have.
@@ -157,13 +229,6 @@ fn copy_request(request: &Request) -> Request {
     *copy.version_mut() = request.version();
     *copy.headers_mut() = request.headers().clone();
     copy
-}
-
-/// An answer refusing the upgrade with `status`.
-fn refusal(status: StatusCode, message: String) -> ErrorResponse {
-    let mut refusal = ErrorResponse::new(Some(message));
-    *refusal.status_mut() = status;
-    refusal
 }
 
 /// Ask the provider for the principal's access to `repository`.
@@ -181,7 +246,7 @@ async fn repository_access(
 
 /// Tell the client that it lacks `needed` access for this operation.
 async fn send_forbidden(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     needed: Access,
     repository: &str,
@@ -201,7 +266,7 @@ async fn send_forbidden(
 /// Returns the principal, or `None` when the session was refused and the client
 /// told why.
 async fn establish(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     config: &ServerConfig,
     peer: &str,
     upgrade: &Upgrade,
@@ -332,7 +397,7 @@ async fn establish(
 
 /// The main session loop.
 async fn run_session(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     registry: &Registry,
     config: &ServerConfig,
     peer: &str,
@@ -355,7 +420,7 @@ async fn run_session(
                 false,
                 message,
             );
-            let _ = tokio::time::timeout(CLOSE_WAIT, refusal).await;
+            let _ = tokio::time::timeout(REFUSAL_WAIT, refusal).await;
             return Err(ConnectionError::Protocol(message));
         }
     };
@@ -501,7 +566,7 @@ async fn run_session(
 /// Errors that can occur during a connection.
 #[derive(Debug)]
 pub enum ConnectionError {
-    WebSocket(tokio_tungstenite::tungstenite::Error),
+    Transport(TransportError),
     Encode(wheat_protocol::EncodeError),
     Decode(wheat_protocol::DecodeError),
     Protocol(&'static str),
@@ -512,7 +577,7 @@ pub enum ConnectionError {
 impl std::fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectionError::WebSocket(e) => write!(f, "websocket: {e}"),
+            ConnectionError::Transport(e) => write!(f, "transport: {e}"),
             ConnectionError::Encode(e) => write!(f, "encode: {e}"),
             ConnectionError::Decode(e) => write!(f, "decode: {e}"),
             ConnectionError::Protocol(msg) => write!(f, "protocol: {msg}"),
@@ -523,9 +588,3 @@ impl std::fmt::Display for ConnectionError {
 }
 
 impl std::error::Error for ConnectionError {}
-
-impl From<tokio_tungstenite::tungstenite::Error> for ConnectionError {
-    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
-        ConnectionError::WebSocket(e)
-    }
-}

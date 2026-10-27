@@ -17,11 +17,6 @@ memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
 listing the bucket, opening a packed store costing O(store), the remote catalog head
 being JSON, and `wheat gc` / server-authoritative remote maintenance.
 
-- `[ ]` **Handlers take `WebSocketStream<TcpStream>`.** `wire::send`/`recv` and every
-  handler in `connection.rs`, `fetch.rs` and `publish.rs` name the concrete stream, so
-  the server cannot run on an axum or hyper upgraded connection. Make them generic over
-  the stream (or a `Sink + Stream` of messages), and expose a "serve this connection"
-  entry point beside `run`'s accept loop.
 - `[ ]` **No hooks around a publish.** Besides `AccessProvider::access`, nothing lets
   an embedder refuse a publish (protected labels, required checks, quota, size) or
   learn it happened: after the head moves the server only logs (`publish.rs`). Gothab

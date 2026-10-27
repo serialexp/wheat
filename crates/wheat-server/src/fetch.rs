@@ -1,7 +1,5 @@
 //! Fetch: push the structural objects the client lacks, then answer its wants.
 
-use tokio::net::TcpStream;
-use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 use wheat_core::{ObjectId, RepositoryEnvelopeId};
@@ -13,6 +11,7 @@ use wheat_store::{
 
 use crate::connection::ConnectionError;
 use crate::registry::RepositoryEntry;
+use crate::transport::Transport;
 use crate::wire::{
     digest_to_object_id, operation_error_scope, recv, send, send_error, send_object_error,
 };
@@ -34,7 +33,7 @@ const INTERNAL: u16 = 500;
 /// Any envelope in this repository's store may be fetched. A `since` envelope the
 /// store does not have is ignored, and everything is pushed.
 pub async fn handle_fetch(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     entry: &RepositoryEntry,
     req: FetchRequestOutput,
 ) -> Result<(), ConnectionError> {
@@ -99,7 +98,7 @@ pub async fn handle_fetch(
 }
 
 async fn fetch_error(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     code: u16,
     message: &str,
@@ -124,7 +123,7 @@ async fn is_envelope<S: ImmutableObjectStore + ?Sized>(
 /// or `None` when the fetch ended with an error sent to the client.
 #[tracing::instrument(name = "fetch_push", level = "debug", skip_all)]
 async fn push(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     entry: &RepositoryEntry,
     op_id: u64,
     since: Option<RepositoryEnvelopeId>,
@@ -179,7 +178,7 @@ impl BatchSender {
 
     async fn push(
         &mut self,
-        ws: &mut WebSocketStream<TcpStream>,
+        ws: &mut impl Transport,
         object: StoredObject,
     ) -> Result<(), ConnectionError> {
         let len = object.canonical_bytes.len();
@@ -197,7 +196,7 @@ impl BatchSender {
         Ok(())
     }
 
-    async fn flush(&mut self, ws: &mut WebSocketStream<TcpStream>) -> Result<(), ConnectionError> {
+    async fn flush(&mut self, ws: &mut impl Transport) -> Result<(), ConnectionError> {
         if self.objects.is_empty() {
             return Ok(());
         }
@@ -227,7 +226,7 @@ fn object_entry(object: &StoredObject) -> ObjectEntry {
 }
 
 async fn send_chunks(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     object: &StoredObject,
 ) -> Result<(), ConnectionError> {
@@ -259,7 +258,7 @@ async fn send_chunks(
 /// Returns false when the fetch ended because an object is unknown.
 #[tracing::instrument(name = "fetch_answer_want", level = "debug", skip_all)]
 async fn answer_want(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     entry: &RepositoryEntry,
     op_id: u64,
     wanted: &ObjectWantOutput,
@@ -316,7 +315,7 @@ async fn answer_want(
 /// read ends the operation with an `Error`, because the client waits for every
 /// blob it asked for.
 pub async fn handle_content_fetch(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     entry: &RepositoryEntry,
     req: ContentFetchRequestOutput,
 ) -> Result<(), ConnectionError> {
@@ -393,7 +392,7 @@ fn content_digest(id: wheat_core::ContentId) -> Digest256 {
 
 /// Send an operation-scoped, non-retryable Error about one blob.
 async fn send_content_error(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut impl Transport,
     op_id: u64,
     code: u16,
     message: &str,

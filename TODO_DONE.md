@@ -4,6 +4,15 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **Handlers take `WebSocketStream<TcpStream>`.** Every handler now runs on a
+  `Transport` (`crates/wheat-server/src/transport.rs`: send a binary message, receive
+  the next, close), implemented for tungstenite's `WebSocketStream` over any socket.
+  Beside `handle_connection` there are two entry points for a host that upgrades the
+  HTTP request itself, both after `Upgrade::check` (repository path, origin):
+  `serve_upgraded` for an upgraded socket (hyper; `Upgrade::response` gives the 101)
+  and `serve` for the host's own WebSocket type (axum's `WebSocketUpgrade`, which
+  Gothab's gitd uses). Messages pass as `Bytes` both ways, so neither copies. The
+  setup deadline applies to both (2026-10-27; `tests/embedding_test.rs`).
 - `[x]` **(format) `RepositoryState` stops at 10,000 labels.** It sent at most 10,000
   labels with a `truncated` flag, and `ListLabels` to page the rest was never served.
   The labels are in the head's label manifest, which every fetch and clone transfers,
