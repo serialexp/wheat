@@ -1,8 +1,8 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
 Status: designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
-review by Codex and Antigravity the same day raised questions 6–8, still open, and
-the changes in [Review](#review-2026-10-27).
+review by Codex and Antigravity the same day raised questions 6–8, which Bart
+answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
 Last updated: 2026-10-27
 
@@ -29,13 +29,21 @@ and move them from Outstanding to Done.
   4, option A.
 - [x] **Decision — import keeps IDs (2026-10-27).** Open question 5, option A.
 
+- [x] **Decision — a move refuses writes (2026-10-28).** Open question 6: from
+  export until the source is deleted the network refuses publishes with a retryable
+  error carrying a retry delay from the move's expected duration.
+- [x] **Decision — content GC holds only for irreversible steps (2026-10-28).** Open
+  question 7, option B, with a bounded rescue list.
+- [x] **Decision — fetches read the old store until done (2026-10-28).** Open
+  question 8, option A.
+
 ### Outstanding
 
-- [ ] **Open question 6 — closing a move.** See [Review](#review-2026-10-27).
-- [ ] **Open question 7 — how long content GC holds publishes.** See
-  [Review](#review-2026-10-27).
-- [ ] **Open question 8 — fetches in progress during a sweep.** See
-  [Review](#review-2026-10-27).
+- [ ] **Retry delay on refused publishes.** The error a quiesced publish gets
+  (`connection.rs`, 503 with the retryable flag) carries no delay. Add a retry-after
+  field to the error record, filled from the operation's expected duration (export:
+  size of the pool and content list over a measured rate; GC: the running estimate).
+
 - [ ] **Phase 0 — admin surface.** Admin request and response messages, the `admin`
   principal flag in `[auth]`, the server's operation runner (one maintenance
   operation at a time per repositories directory) and `wheat admin`.
@@ -393,6 +401,10 @@ content store is a packed store, and content records of kind 0 go to its segment
 
 ### Open question 6 — closing a move
 
+Bart chose (2026-10-28) a stricter form of A: a move refuses publishes from export
+until the source is deleted, and tells the client when to retry, from the move's
+expected duration. The refusal needs a retry delay in the error (see Outstanding).
+
 Export releases the quiesce, so a publish after it reaches only the source, and the
 delete that ends a move loses it. Options:
 
@@ -407,6 +419,16 @@ delete that ends a move loses it. Options:
 
 ### Open question 7 — how long content GC holds publishes
 
+Bart chose B (2026-10-28): no lock for the whole duration, only around irreversible
+steps on the whole store. Records that become used while the collection runs lose
+their eligibility: each commit during a collection adds the content its new state
+adds (`ContentSetStore::added`, which skips shared subtrees, so it is bounded by the
+publish) to a rescue list, and the final hold marks those too. The list is bounded
+by the publishes admitted meanwhile; if it outgrows a limit, the collection stops
+without sweeping and starts over. Records written but not yet named by a head (staged
+early, or uploaded for a publish in progress) are kept by age: nothing newer than
+the first hold is swept.
+
 Holding every network from marking to publishing the new generation refuses every
 publish of the directory for the whole collection, which Antigravity estimates at
 tens of minutes on a large instance. Options:
@@ -418,6 +440,8 @@ tens of minutes on a large instance. Options:
   and release. Part of the write barrier question 3 did not choose.
 
 ### Open question 8 — fetches in progress during a sweep
+
+Bart chose A (2026-10-28).
 
 A fetch looks objects up as it goes (`fetch.rs`, `answer_want`), and a repack replaces
 the catalog's readers and removes old segments at once (`catalog.rs`, after the
