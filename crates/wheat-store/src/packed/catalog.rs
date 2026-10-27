@@ -49,10 +49,15 @@ const SCHEMA_VERSION: i64 = 7;
 const SEGMENT_SUFFIX: &str = ".segment";
 const CATALOG_SUFFIX: &str = ".catalog";
 const CATALOG_HEAD_FILE: &str = "catalog.head";
+pub(super) const CATALOG_LOCK_FILE: &str = "catalog.lock";
+/// The locator index, with its `-wal` and `-shm` beside it.
+pub(super) const LOCATOR_FILE: &str = "catalog-locator.sqlite3";
+pub(super) const SEGMENTS_DIRECTORY: &str = "segments";
+pub(super) const CATALOGS_DIRECTORY: &str = "catalog";
 const ACTIVE_FILE: &str = "active.segment";
 /// The fresh active segment `retire_active` builds before renaming it into place.
-const NEXT_ACTIVE_FILE: &str = "active.segment.next";
-const BULK_FILE_PREFIX: &str = "bulk-";
+pub(super) const NEXT_ACTIVE_FILE: &str = "active.segment.next";
+pub(super) const BULK_FILE_PREFIX: &str = "bulk-";
 const REPACK_INTENT_FILE: &str = "repack.intent";
 const DEFAULT_ACTIVE_TARGET_BYTES: u64 = super::active::ACTIVE_SEGMENT_TARGET_BYTES;
 
@@ -618,8 +623,8 @@ impl PackedCatalog {
     ) -> Result<Self, CatalogError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let segments = root.join("segments");
-        let catalogs = root.join("catalog");
+        let segments = root.join(SEGMENTS_DIRECTORY);
+        let catalogs = root.join(CATALOGS_DIRECTORY);
         fs::create_dir_all(&segments)?;
         fs::create_dir_all(&catalogs)?;
         sync_created_ancestors(&root, durability)?;
@@ -629,7 +634,7 @@ impl PackedCatalog {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(root.join("catalog.lock"))?;
+            .open(root.join(CATALOG_LOCK_FILE))?;
         try_lock_exclusive(&lock)?;
 
         // Recovery is deliberately completed under the writer lock before the
@@ -657,7 +662,7 @@ impl PackedCatalog {
             durability,
         )?;
 
-        let index_path = root.join("catalog-locator.sqlite3");
+        let index_path = root.join(LOCATOR_FILE);
         let index_was_missing = !index_path.exists();
         let mut index_recreated = false;
         let index = open_index(&index_path, durability).or_else(|_| {
@@ -2623,7 +2628,7 @@ fn stored_length_sum(sources: &[SealedSource]) -> Result<u64, CatalogError> {
 /// Whether `name` is one `tempfile` gives a temporary file: `.tmp` and six letters
 /// or digits. Seals, repacks and catalog and head publishes write through such files
 /// and rename them into place, so one left behind is a crashed write's.
-fn is_temporary_file_name(name: &str) -> bool {
+pub(super) fn is_temporary_file_name(name: &str) -> bool {
     name.strip_prefix(".tmp").is_some_and(|rest| {
         rest.len() == 6 && rest.bytes().all(|byte| byte.is_ascii_alphanumeric())
     })
@@ -3138,13 +3143,13 @@ fn recover_repack_intent(
         return Err(CatalogError::Corrupt("repack intent authority mismatch"));
     }
     if current == old {
-        let catalogs = root.join("catalog");
+        let catalogs = root.join(CATALOGS_DIRECTORY);
         let encoded = read_catalog_bytes(&catalogs, new.0, new.1)?;
         let snapshot = decode_physical_catalog_snapshot(&encoded)?;
         if snapshot.generation != new.0 {
             return Err(CatalogError::Corrupt("repack intent new generation"));
         }
-        let segments = root.join("segments");
+        let segments = root.join(SEGMENTS_DIRECTORY);
         for source in authority_sources(&snapshot) {
             let segment_path = root.join(source.path);
             let reader = SegmentReader::open(File::open(&segment_path)?)?;

@@ -3250,6 +3250,10 @@ fn native_publish(
             "publish rejected: {message}{}",
             kept_move(moved.as_ref())
         ))),
+        remote::PublishOutcome::Unavailable { message } => Err(CliFailure::unavailable(format!(
+            "publish refused for now: {message}{}",
+            kept_move(moved.as_ref())
+        ))),
         remote::PublishOutcome::Error { message } => Err(CliFailure::transport(format!(
             "publish error: {message}{}",
             kept_move(moved.as_ref())

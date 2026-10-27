@@ -127,14 +127,17 @@ impl Default for ServerConfig {
 }
 
 /// Run the server: bind to addr, accept connections, spawn handlers.
+///
+/// Pass the registry in an [`Arc`] to keep a handle on it, for example to
+/// [`Registry::quiesce`] a repository.
 pub async fn run(
     addr: SocketAddr,
-    registry: Registry,
+    registry: impl Into<Arc<Registry>>,
     config: ServerConfig,
 ) -> std::io::Result<()> {
     config.check_listen_address(addr)?;
     let listener = TcpListener::bind(addr).await?;
-    let registry = Arc::new(registry);
+    let registry = registry.into();
     let config = Arc::new(config);
 
     info!(addr = %addr, open = config.access.is_open(), "wheat-server listening");
@@ -236,7 +239,7 @@ fn spawn_connection(
 /// lets tests discover the port before any connections arrive.
 pub async fn run_until(
     addr: SocketAddr,
-    registry: Registry,
+    registry: impl Into<Arc<Registry>>,
     config: ServerConfig,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
@@ -244,7 +247,7 @@ pub async fn run_until(
     config.check_listen_address(addr)?;
     let listener = TcpListener::bind(addr).await?;
     let bound_addr = listener.local_addr()?;
-    let registry = Arc::new(registry);
+    let registry = registry.into();
     let config = Arc::new(config);
 
     info!(addr = %bound_addr, "wheat-server listening");

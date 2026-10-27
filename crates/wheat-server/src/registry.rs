@@ -31,6 +31,7 @@ use wheat_store::{ContentStore, ObjectStoreError, RepositoryDirectory, Repositor
 
 use crate::commit::GroupCommit;
 use crate::heads::HeadStore;
+use crate::quiesce::{Quiesced, Writers};
 
 /// A single repository's stores.
 pub struct RepositoryEntry {
@@ -41,6 +42,9 @@ pub struct RepositoryEntry {
     /// Publishes take turns joining onto the head, so none merges against a head
     /// another is about to replace, and are made durable in batches.
     pub commit: GroupCommit,
+    /// The publishes and committer writing to the store, held still by
+    /// [`Registry::quiesce`].
+    pub(crate) writers: Writers,
 }
 
 impl RepositoryEntry {
@@ -59,6 +63,7 @@ impl RepositoryEntry {
             store,
             heads: Box::new(heads),
             commit: GroupCommit::default(),
+            writers: Writers::default(),
         }
     }
 }
@@ -262,6 +267,19 @@ impl Registry {
                 }
             }
         }
+    }
+
+    /// Holds the repository `name` still, opening it if needed, so its files can be
+    /// copied ([`wheat_store::RepositoryDirectory::files`]): refuses new publishes
+    /// with a retryable error and waits for those writing to finish. A publish that
+    /// is uploading is waited for to its end, so bound this with a timeout; dropped
+    /// before it is ready, it lets publishes in again. `None` when there is no such
+    /// repository. While held the repository is not closed, and fetches go on.
+    pub async fn quiesce(&self, name: &str) -> Result<Option<Quiesced>, OpenError> {
+        let Some(entry) = self.get(name).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Quiesced::hold(entry).await))
     }
 
     /// Closes the repositories nothing holds that were not asked for in

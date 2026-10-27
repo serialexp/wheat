@@ -363,7 +363,13 @@ impl CommitState {
             // block a thread of the blocking pool rather than a runtime worker.
             let runtime = tokio::runtime::Handle::current();
             let entry = entry.clone();
-            tokio::task::spawn_blocking(move || runtime.block_on(commit_batches(entry)));
+            // Taken here, while the publish accepted holds its own, so a quiesce never
+            // sees nothing writing between the two.
+            let writing = entry.writers.continue_writing();
+            tokio::task::spawn_blocking(move || {
+                runtime.block_on(commit_batches(entry));
+                drop(writing);
+            });
         }
         receiver
     }

@@ -21,6 +21,7 @@ use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
 use wheat_server::heads::HeadStore;
 use wheat_server::hooks::{Announcement, ProposedPublish, PublishHooks, PublishedBatch};
+use wheat_server::quiesce::Quiesced;
 use wheat_server::receipt::PublishKey;
 use wheat_server::registry::RepositoryEntry;
 use wheat_store::{
@@ -901,6 +902,44 @@ async fn a_head_store_that_fences_this_host_out_fails_the_publish_unacknowledged
         .map(|published| published.publish.proposed)
         .collect();
     assert_eq!(proposed, [next]);
+}
+
+#[tokio::test]
+async fn a_quiesce_waits_for_the_batch_being_written_after_its_publish_went_away() {
+    let server = server().await;
+    let initial = server.initial;
+    let (stage, proposed) = propose(&server, initial, "first.txt").await;
+    let accepted = commit::accept(
+        &server.entry,
+        &stage,
+        key(1, proposed),
+        initial.envelope,
+        proposed,
+        false,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    // The batch is at the store's gate, and nobody waits for its answer.
+    server.gate.arrived.notified().await;
+    drop(accepted);
+    drop(stage);
+
+    let quiesce = tokio::spawn(Quiesced::hold(Arc::clone(&server.entry)));
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let finished_early = quiesce.is_finished();
+    // Let the batch through before asserting, so a failure does not leave the
+    // committer at the gate.
+    server.gate.permits.add_permits(1);
+    let _quiesced = quiesce.await.unwrap();
+    assert!(!finished_early, "the committer still wrote");
+    assert_eq!(
+        server.heads.read().unwrap().generation,
+        initial.generation + 1
+    );
 }
 
 #[tokio::test]

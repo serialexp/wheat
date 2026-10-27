@@ -188,7 +188,7 @@ fn value(index: usize) -> Vec<u8> {
 
 /// A base of `files` files, 25 to a directory, then a stack of `changes` one-file
 /// changes, each published on its own.
-async fn build(scratch: &Scratch, files: usize, changes: usize) -> Result<()> {
+pub(crate) async fn build(scratch: &Scratch, files: usize, changes: usize) -> Result<()> {
     let mut tree = Tree::new();
     for index in 0..files {
         let bytes = value(index);

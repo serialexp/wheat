@@ -3,8 +3,8 @@
 use std::{fs, path::Path};
 
 use wheat_store::{
-    LocalPublicationStore, PublicationStore, RepositoryDirectory, RepositoryDirectoryError,
-    RepositoryReader,
+    ImmutableObjectStore, LocalPublicationStore, PublicationStore, RepositoryDirectory,
+    RepositoryDirectoryError, RepositoryReader,
 };
 
 /// The names in `parent` other than `keep`, sorted.
@@ -214,4 +214,74 @@ fn a_marker_reached_through_a_symlink_is_not_swept() {
     assert!(target.path().join("stage.marker").is_file());
     assert!(linked.exists());
     assert!(marker_link.is_dir());
+}
+#[tokio::test]
+async fn a_copy_of_an_open_repository_has_its_head_and_content() {
+    let parent = tempfile::tempdir().unwrap();
+    let directory = RepositoryDirectory::new(parent.path().join("repo"));
+    let head = directory.create_empty("main").await.unwrap();
+    // Open, as a server holds it, with content written and sealed into segments.
+    let objects = directory.open_store().unwrap();
+    let content = objects.content_store();
+    let small = content.put(b"hello wheat").unwrap();
+    let large = content.put(&vec![7_u8; 3 << 20]).unwrap();
+    objects.seal().await.unwrap();
+
+    let files = directory.files().unwrap();
+    let paths = files
+        .iter()
+        .map(|file| file.path.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&"repository.head"), "{paths:?}");
+    for left_out in ["lock", "sqlite3", "marker"] {
+        assert!(
+            !paths.iter().any(|path| path.contains(left_out)),
+            "{left_out} in {paths:?}"
+        );
+    }
+    assert!(files.iter().any(|file| file.immutable), "{files:?}");
+    assert!(files.iter().filter(|file| file.immutable).all(|file| {
+        !file.path.ends_with("repository.head")
+            && !file.path.ends_with("catalog.head")
+            && !file.path.ends_with("active.segment")
+    }));
+
+    let copy = RepositoryDirectory::new(parent.path().join("copy"));
+    assert_eq!(directory.copy_to(&copy).unwrap(), files);
+    assert!(copy.is_repository());
+    assert_eq!(
+        LocalPublicationStore::new(copy.head()).read().unwrap(),
+        head
+    );
+    let copied = copy.open_store().unwrap();
+    let copied_content = copied.content_store();
+    assert_eq!(copied_content.get(small).unwrap(), b"hello wheat");
+    assert_eq!(copied_content.get(large).unwrap().len(), 3 << 20);
+    let reader = RepositoryReader::new(&copied, &copied_content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    assert_eq!(labels.labels.keys().collect::<Vec<_>>(), ["main"]);
+    assert_eq!(
+        leftovers(parent.path(), &["repo", "copy"]),
+        Vec::<String>::new()
+    );
+
+    // A copy is never made over a directory.
+    assert!(matches!(
+        directory.copy_to(&copy),
+        Err(RepositoryDirectoryError::Exists(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_copy_never_opened_can_be_deleted() {
+    let parent = tempfile::tempdir().unwrap();
+    let directory = RepositoryDirectory::new(parent.path().join("repo"));
+    directory.create_empty("main").await.unwrap();
+    let copy = RepositoryDirectory::new(parent.path().join("copy"));
+    directory.copy_to(&copy).unwrap();
+
+    copy.delete().unwrap();
+
+    assert!(!copy.root().exists());
 }

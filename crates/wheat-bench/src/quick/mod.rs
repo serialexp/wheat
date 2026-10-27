@@ -35,6 +35,7 @@ mod packed_append;
 mod publish_content;
 mod publish_contention;
 mod remote_latency;
+mod repository_copy;
 mod revision_merge;
 mod server;
 mod sharded_manifest;
@@ -78,6 +79,7 @@ pub const CASES: &[&str] = &[
     publish_content::NAME,
     fetch_incremental::NAME,
     snapshot_export::NAME,
+    repository_copy::NAME,
     import_resume_wide::NAME,
     materialize_wide::NAME,
     publish_contention::NAME,
@@ -238,6 +240,7 @@ pub fn run_case(
         publish_content::NAME => publish_content::run(&context),
         fetch_incremental::NAME => fetch_incremental::run(&context),
         snapshot_export::NAME => snapshot_export::run(&context),
+        repository_copy::NAME => repository_copy::run(&context),
         import_resume_wide::NAME => import_resume_wide::run(&context),
         materialize_wide::NAME => materialize_wide::run(&context),
         publish_contention::NAME => publish_contention::run(&context),

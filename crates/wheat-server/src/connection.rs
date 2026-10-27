@@ -49,6 +49,8 @@ const FORBIDDEN: u16 = 403;
 const NOT_FOUND: u16 = 404;
 /// Error code for a session that was not set up by its deadline.
 const SETUP_TIMED_OUT: u16 = 408;
+/// The repository is quiesced; the client may try again.
+const UNAVAILABLE: u16 = 503;
 /// How long a refusal sent at the setup deadline may take to go out.
 const REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -543,6 +545,22 @@ async fn run_session(
                     .await?;
                     continue;
                 }
+                // Held until the publish is answered: a quiesce waits for it.
+                let Some(_writing) = entry.writers.begin() else {
+                    info!(peer = %peer, repo = %repository, "publish refused: repository quiesced");
+                    send_error(
+                        ws,
+                        req.op_id,
+                        UNAVAILABLE,
+                        operation_error_scope(),
+                        true,
+                        &format!(
+                            "'{repository}' is not taking publishes for the moment (it is being backed up or moved); publish again shortly"
+                        ),
+                    )
+                    .await?;
+                    continue;
+                };
                 let key = PublishKey::new(&principal, &req)?;
                 // Read head fresh for each publish attempt, with the receipt that
                 // answers a publish sent again.

@@ -1,0 +1,32 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261027-014536
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# repository_copy	{"changes":50,"growth":4,"samples":3,"small_files":10000}
+# rev	8258b908b27f
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+repository_copy.total.wall	2.882796902	s
+repository_copy.total.peak_rss	93728768	bytes
+repository_copy.small.build.wall	0.895902208	s
+repository_copy.small.list.wall	0.000021069	s
+repository_copy.small.files	5	count
+repository_copy.small.immutable_files	2	count
+repository_copy.small.bytes	4271480	bytes
+repository_copy.small.copy.wall	0.017370171	s
+repository_copy.small.open_copy.wall	0.051303743	s
+repository_copy.large.build.wall	1.582163028	s
+repository_copy.large.list.wall	0.000017473	s
+repository_copy.large.files	5	count
+repository_copy.large.immutable_files	2	count
+repository_copy.large.bytes	11084383	bytes
+repository_copy.large.copy.wall	0.019601874	s
+repository_copy.large.open_copy.wall	0.143201882	s
+run.total_time	2.883274842	s
+process.peak_rss	93728768	bytes
+suite.cases	1	count
+suite.case_failures	0	count

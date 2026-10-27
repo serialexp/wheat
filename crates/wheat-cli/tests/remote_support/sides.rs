@@ -6,7 +6,7 @@ use wheat_client::workspace_metadata::WorkspaceMetadata;
 
 use wheat_server::server::ServerConfig;
 
-use super::{fails, ok, ok_json, serve_configured, write_config};
+use super::{fails, fails_json, ok, ok_json, serve_configured, write_config};
 
 pub struct Side {
     pub workspace: PathBuf,
@@ -20,6 +20,10 @@ impl Side {
 
     pub fn fails(&self, config: &Path, args: &[&str]) -> String {
         fails(&self.workspace, &self.stores, config, args)
+    }
+
+    pub fn fails_json(&self, config: &Path, args: &[&str]) -> serde_json::Value {
+        fails_json(&self.workspace, &self.stores, config, args)
     }
 
     /// A new change writing `path`; the workspace selects it as a frontier.
@@ -55,7 +59,7 @@ impl Side {
 }
 
 pub struct Sides {
-    _root: tempfile::TempDir,
+    pub root: tempfile::TempDir,
     pub config: PathBuf,
     pub writer: Side,
     pub reader: Side,
@@ -90,7 +94,7 @@ pub fn sides_configured(server: ServerConfig) -> (Sides, super::Server) {
     let reader = clone("reader");
     (
         Sides {
-            _root: root,
+            root,
             config,
             writer,
             reader,

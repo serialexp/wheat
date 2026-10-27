@@ -4,6 +4,26 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **No consistent snapshot of a live served repository.**
+  `Registry::quiesce(name)` (`crates/wheat-server/src/quiesce.rs`) refuses new
+  publishes with a retryable operation Error (code 503) and waits for every publish
+  already writing, uploads included, and the group committer to finish (Bart's
+  choices, 2026-10-27: quiesce plus a file copy, a retryable error, wait rather than
+  abort); fetches go on, and dropping the `Quiesced`, or the future before it is
+  ready, lets publishes in again. `RepositoryDirectory::files` lists the repository's
+  files with their lengths, marking the immutable ones (sealed segments, catalog
+  snapshots, loose files, content generations) so a backup uploads them once, and
+  leaving out locks, temporary files and the SQLite locator, which opening the copy
+  rebuilds (`crates/wheat-store/src/packed/files.rs`). `RepositoryDirectory::copy_to`
+  copies them into a stage and installs it. `is_repository` now looks for the
+  catalog head, which a copy has, rather than the lock. The client now reads an Error
+  during a publish (it used to wait for the connection to close), and a retryable one
+  is the CLI's `remote_unavailable`. `run`/`run_until` take `impl Into<Arc<Registry>>`
+  so a host keeps a handle. Tests: `crates/wheat-cli/tests/quiesce.rs` (refused
+  publish, fetch, copy served and cloned, publish after), `embedding_test.rs` (an
+  uploading publish is waited for; an abandoned quiesce lets publishes in),
+  `group_commit_test.rs` (the committer is waited for after its client left),
+  `repository_directory.rs`. Benchmark: `repository_copy`.
 - `[x]` **The registry must open and close repositories.** `Registry::with_opener`
   takes a `RepositoryOpener` (Bart's choice, 2026-10-27) and opens a repository when
   a session first asks for it; two sessions asking at once open it once. A session

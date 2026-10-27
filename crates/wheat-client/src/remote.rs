@@ -217,9 +217,27 @@ pub enum PublishOutcome {
     Rejected {
         message: String,
     },
+    /// The server cannot take publishes to the repository for the moment (it is
+    /// being backed up or moved); the same publish may be sent again later.
+    Unavailable {
+        message: String,
+    },
     Error {
         message: String,
     },
+}
+
+/// A publish the server ended with an Error message.
+fn publish_error(error: ErrorOutput) -> PublishOutcome {
+    if error.retryable {
+        PublishOutcome::Unavailable {
+            message: error.message,
+        }
+    } else {
+        PublishOutcome::Error {
+            message: error.message,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +847,7 @@ pub async fn publish<O: ImmutableObjectStore>(
                 // Early rejection (e.g. stale head).
                 return decode_publish_result(pr);
             }
+            WheatProtocolMessage::Error(e) if e.op_id == op_id => return Ok(publish_error(e)),
             _ => {}
         }
     }
@@ -863,6 +882,7 @@ pub async fn publish<O: ImmutableObjectStore>(
             WheatProtocolMessage::PublishResult(pr) if pr.op_id == op_id => {
                 return decode_publish_result(pr);
             }
+            WheatProtocolMessage::Error(e) if e.op_id == op_id => return Ok(publish_error(e)),
             _ => {}
         }
     }
@@ -888,6 +908,7 @@ pub async fn publish<O: ImmutableObjectStore>(
             WheatProtocolMessage::PublishResult(pr) if pr.op_id == op_id => {
                 return decode_publish_result(pr);
             }
+            WheatProtocolMessage::Error(e) if e.op_id == op_id => return Ok(publish_error(e)),
             _ => {}
         }
     }

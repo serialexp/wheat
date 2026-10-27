@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use serde_json::Value;
+use wheat_server::quiesce::Quiesced;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 
@@ -55,6 +56,24 @@ pub fn fails(cwd: &Path, stores: &Path, config: &Path, args: &[&str]) -> String 
         "wheat {args:?} succeeded:\n{printed}"
     );
     printed
+}
+
+/// Runs `wheat --format json`, insists that it fails, and returns its document.
+pub fn fails_json(cwd: &Path, stores: &Path, config: &Path, args: &[&str]) -> Value {
+    let args: Vec<&str> = ["--format", "json"].iter().chain(args).copied().collect();
+    let output = Command::new(env!("CARGO_BIN_EXE_wheat"))
+        .current_dir(cwd)
+        .args(&args)
+        .env("WHEAT_STORE_HOME", stores)
+        .env("XDG_CONFIG_HOME", config)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "wheat {args:?} succeeded:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 /// Runs `wheat --format json` and returns its `result`.
@@ -106,8 +125,22 @@ pub fn git(cwd: &Path, args: &[&str]) {
 pub struct Server {
     pub url: String,
     pub addr: SocketAddr,
-    _runtime: tokio::runtime::Runtime,
+    /// What the server serves.
+    pub registry: Arc<Registry>,
+    /// The served repository's directory.
+    pub store: PathBuf,
+    runtime: tokio::runtime::Runtime,
     _shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Server {
+    /// Holds the served repository still; see [`Registry::quiesce`].
+    pub fn quiesce(&self) -> Quiesced {
+        self.runtime
+            .block_on(self.registry.quiesce("team/repo"))
+            .unwrap()
+            .unwrap()
+    }
 }
 
 /// Creates an empty repository under `root` and serves it.
@@ -136,13 +169,14 @@ pub fn serve_store(store: &Path) -> Server {
 /// Like [`serve_store`], with the server configured by `server`.
 pub fn serve_store_configured(store: &Path, server: ServerConfig) -> Server {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let registry = Registry::single_named("team/repo".to_owned(), store).unwrap();
+    let registry = Arc::new(Registry::single_named("team/repo".to_owned(), store).unwrap());
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let served = Arc::clone(&registry);
     runtime.spawn(async move {
         run_until(
             "127.0.0.1:0".parse().unwrap(),
-            registry,
+            served,
             server,
             ready_tx,
             shutdown_rx,
@@ -154,7 +188,9 @@ pub fn serve_store_configured(store: &Path, server: ServerConfig) -> Server {
     Server {
         url: format!("wheat://{addr}/team/repo"),
         addr,
-        _runtime: runtime,
+        registry,
+        store: store.to_path_buf(),
+        runtime,
         _shutdown: shutdown,
     }
 }

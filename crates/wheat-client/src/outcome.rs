@@ -62,6 +62,9 @@ pub enum CliFailure {
     CorruptState(String),
     #[error("{0}")]
     TransportFailure(String),
+    /// The remote cannot do this for the moment; the same command may work later.
+    #[error("{0}")]
+    RemoteUnavailable(String),
     /// Adding would move edits out of later changes, which needs confirmation or `--force`.
     #[error("{0}")]
     EditsWouldMove(String),
@@ -98,6 +101,10 @@ impl CliFailure {
 
     pub fn transport(message: impl Into<String>) -> Error {
         Self::TransportFailure(message.into()).into()
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Error {
+        Self::RemoteUnavailable(message.into()).into()
     }
 
     pub fn would_move(message: impl Into<String>) -> Error {

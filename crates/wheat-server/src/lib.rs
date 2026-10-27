@@ -17,6 +17,7 @@ pub mod fetch;
 pub mod heads;
 pub mod hooks;
 pub mod publish;
+pub mod quiesce;
 pub mod receipt;
 pub mod registry;
 pub mod server;

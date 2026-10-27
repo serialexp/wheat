@@ -137,7 +137,9 @@ pub use publication::{
     LocalPublicationStore, PUBLISH_RECEIPT_RETENTION_SECONDS, PublicationError, PublicationStore,
     RepositoryHead,
 };
-pub use repository_directory::{PendingRepository, RepositoryDirectory, RepositoryDirectoryError};
+pub use repository_directory::{
+    PendingRepository, RepositoryDirectory, RepositoryDirectoryError, RepositoryFile,
+};
 pub use repository_mutation::{
     AuthoringSession, PersistedConflictResolution, PersistedRepositoryMutator,
     PreparedRepositoryMutation, RepositoryMutationError,

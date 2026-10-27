@@ -13,7 +13,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -21,6 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{CanonicalObjectError, Repository, Tree, ViewLabelManifestRecord};
 
+use crate::packed::files::StoreFile;
 use crate::{
     LocalPublicationStore, ObjectStoreError, PackedObjectStore, RepositoryHead,
     RepositoryPublicationError, RepositoryPublisher, sync_directory, sync_filesystem,
@@ -92,14 +93,70 @@ impl RepositoryDirectory {
         LocalPublicationStore::new(self.head())
     }
 
-    /// Whether a repository is here: its head and its packed store.
+    /// Whether a repository is here: its head and its packed store's.
     #[must_use]
     pub fn is_repository(&self) -> bool {
-        self.head().is_file() && self.catalog_lock().is_file()
+        self.head().is_file() && self.storage().join("packed").join("catalog.head").is_file()
     }
 
     fn catalog_lock(&self) -> PathBuf {
         self.storage().join("packed").join("catalog.lock")
+    }
+
+    /// The files that make up the repository, for copying it: its head and its
+    /// store's state, without locks, temporary files, or the store's locator index
+    /// (rebuilt when a copy is opened). The list and the files agree only while
+    /// nothing writes to the repository; a server holds it quiesced meanwhile
+    /// (`wheat_server::registry::Registry::quiesce`). Reading may go on. A store
+    /// open with deferred durability (`PackedObjectStore::open_deferred`, never a
+    /// server's) keeps what it writes ahead in a segment it publishes only when
+    /// closed; a copy of it holds what a crash would leave.
+    pub fn files(&self) -> io::Result<Vec<RepositoryFile>> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let name = entry.file_name();
+            if file_type.is_dir() && name == "storage" {
+                list_store_files(&entry.path(), Path::new(&name), &mut files)?;
+            } else if file_type.is_file() && !is_repository_leftover(&name) {
+                files.push(RepositoryFile::new(&entry, PathBuf::from(name), false)?);
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(files)
+    }
+
+    /// Copies the repository to `destination` (see [`Self::files`] for when that is
+    /// consistent), which must not exist yet. The copy is made in a hidden stage
+    /// and renamed into place once complete and durable, like [`Self::create_empty`].
+    /// Returns the files copied.
+    pub fn copy_to(
+        &self,
+        destination: &RepositoryDirectory,
+    ) -> Result<Vec<RepositoryFile>, RepositoryDirectoryError> {
+        let files = self.files()?;
+        let mut pending = destination.begin_create()?;
+        let stage = pending.directory().root().to_path_buf();
+        for file in &files {
+            let target = stage.join(&file.path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut source = File::open(self.root.join(&file.path))?.take(file.len);
+            let copied = io::copy(&mut source, &mut File::create_new(&target)?)?;
+            if copied != file.len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("{} shrank while it was copied", file.path.display()),
+                )
+                .into());
+            }
+        }
+        sync_filesystem(&stage)?;
+        pending.install()?;
+        pending.sync_parent()?;
+        Ok(files)
     }
 
     /// Opens the packed store. It stays locked against other opens and against
@@ -183,7 +240,10 @@ impl RepositoryDirectory {
         let catalog_lock = self.catalog_lock();
         // The packed store holds this lock while open. Holding it through the rename
         // keeps the store from being opened before it is gone.
+        // A copy has no lock file until its store is first opened.
         let store_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&catalog_lock)?;
@@ -216,6 +276,61 @@ impl RepositoryDirectory {
             .ok_or(RepositoryDirectoryError::MissingParent)?;
         Ok((parent, name))
     }
+}
+
+/// One file of a repository, as [`RepositoryDirectory::files`] lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryFile {
+    /// Its path under the repository's root.
+    pub path: PathBuf,
+    /// Its length when listed. A copy takes this much of it.
+    pub len: u64,
+    /// Whether it never changes once written, so a copy made earlier that has it has
+    /// all of it: an incremental backup uploads it once.
+    pub immutable: bool,
+}
+
+impl RepositoryFile {
+    fn new(entry: &fs::DirEntry, path: PathBuf, immutable: bool) -> io::Result<Self> {
+        Ok(Self {
+            path,
+            len: entry.metadata()?.len(),
+            immutable,
+        })
+    }
+}
+
+/// Whether `name`, in a repository's root, is something other than its state: the
+/// head's lock, a stage's marker, or a head being written.
+fn is_repository_leftover(name: &OsStr) -> bool {
+    name == "repository.lock"
+        || name == MARKER_NAME
+        || name.as_encoded_bytes().ends_with(HIDDEN_SUFFIX.as_bytes())
+}
+
+/// Adds the files of the packed store under `directory`, whose path under the
+/// repository is `relative`, to `files`.
+fn list_store_files(
+    directory: &Path,
+    relative: &Path,
+    files: &mut Vec<RepositoryFile>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = relative.join(entry.file_name());
+        if file_type.is_dir() {
+            list_store_files(&entry.path(), &path, files)?;
+        } else if file_type.is_file() {
+            let in_store = path.strip_prefix("storage").unwrap_or(&path);
+            match crate::packed::files::classify(in_store) {
+                StoreFile::Skipped => {}
+                StoreFile::Immutable => files.push(RepositoryFile::new(&entry, path, true)?),
+                StoreFile::Mutable => files.push(RepositoryFile::new(&entry, path, false)?),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A repository being built in a hidden stage; see

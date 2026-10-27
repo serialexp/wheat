@@ -1,6 +1,7 @@
 //! Serving sessions on connections an embedder upgraded itself: a raw upgraded socket
 //! through `serve_upgraded`, and the embedder's own WebSocket type through `serve`
-//! and the `Transport` trait.
+//! and the `Transport` trait. And holding a served repository still with
+//! `Registry::quiesce`.
 
 mod support;
 
@@ -18,7 +19,7 @@ use tokio_tungstenite::tungstenite::handshake::server::Request;
 use tokio_tungstenite::tungstenite::http::{StatusCode, header};
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-use wheat_core::{ApplicationContext, Repository, Tree};
+use wheat_core::{ApplicationContext, Repository, RepositoryEnvelopeId, Tree};
 use wheat_protocol::*;
 use wheat_server::connection::{Upgrade, serve, serve_upgraded};
 use wheat_server::registry::Registry;
@@ -219,6 +220,134 @@ fn channel_transport() -> (ChannelTransport, ChannelClient, Arc<AtomicBool>) {
         from_server,
     };
     (transport, client, closed)
+}
+
+/// Starts a session on `test/repo` over a [`ChannelTransport`], up to the
+/// repository's state. Returns the client, its head, and the session's task.
+async fn session(
+    registry: &Arc<Registry>,
+    config: &Arc<ServerConfig>,
+) -> (
+    ChannelClient,
+    RepositoryEnvelopeId,
+    tokio::task::JoinHandle<()>,
+) {
+    let upgrade = Upgrade::check(&upgrade_request("/test/repo"), config).unwrap();
+    let (transport, mut client, _) = channel_transport();
+    let server = tokio::spawn({
+        let (registry, config) = (Arc::clone(registry), Arc::clone(config));
+        async move { serve(transport, upgrade, &registry, &config, "embedded").await }
+    });
+    assert!(matches!(
+        client.recv().await,
+        WheatProtocolMessage::ServerHello(_)
+    ));
+    client.send(&client_hello()).await;
+    assert!(matches!(
+        client.recv().await,
+        WheatProtocolMessage::SessionEstablished(_)
+    ));
+    let head = match client.recv().await {
+        WheatProtocolMessage::RepositoryState(state) => support::envelope_id(&state.head_envelope),
+        other => panic!("expected RepositoryState, got {other:?}"),
+    };
+    (client, head, server)
+}
+
+/// Asks to publish an envelope the server does not have, on top of `head`, pushing
+/// nothing.
+async fn start_publish(client: &ChannelClient, op_id: u64, head: RepositoryEnvelopeId) {
+    client
+        .send(&WheatProtocolMessage::PublishRequest(
+            PublishRequestOutput {
+                message_type: 0x40,
+                op_id,
+                publish_key: Uuid128 {
+                    bytes: vec![op_id as u8; 16],
+                },
+                envelope_id: support::digest(&[9; 32]),
+                expected_generation: 0,
+                expected_envelope: support::digest(head.as_bytes()),
+                force: false,
+                force_labels: false,
+            },
+        ))
+        .await;
+    client.send(&support::push_end(op_id, 0, 0)).await;
+}
+
+#[tokio::test]
+async fn a_quiesce_refuses_new_publishes_and_waits_for_the_one_uploading() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry(dir.path()).await;
+    let config = Arc::new(ServerConfig::new());
+
+    // A publish that has started uploading: the server asks for its objects.
+    let (mut uploading, head, uploading_session) = session(&registry, &config).await;
+    start_publish(&uploading, 1, head).await;
+    assert!(matches!(
+        uploading.recv().await,
+        WheatProtocolMessage::ObjectsNeeded(_)
+    ));
+
+    let quiesce = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.quiesce("test/repo").await.unwrap().unwrap() }
+    });
+    // A publish asked for meanwhile is refused for now, and may be sent again.
+    let (mut refused, head, _) = session(&registry, &config).await;
+    start_publish(&refused, 1, head).await;
+    match refused.recv().await {
+        WheatProtocolMessage::Error(error) => {
+            assert!(error.retryable, "{error:?}");
+            assert_eq!(error.code, 503);
+        }
+        other => panic!("expected a retryable Error, got {other:?}"),
+    }
+    assert!(!quiesce.is_finished(), "the uploading publish still writes");
+
+    // The uploading publish ends (its client goes away): nothing writes any more.
+    drop(uploading);
+    uploading_session.await.unwrap();
+    let quiesced = quiesce.await.unwrap();
+
+    // Once the hold ends, publishes are taken again.
+    drop(quiesced);
+    start_publish(&refused, 2, head).await;
+    assert!(matches!(
+        refused.recv().await,
+        WheatProtocolMessage::ObjectsNeeded(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_quiesce_dropped_before_it_is_ready_lets_publishes_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry(dir.path()).await;
+    let config = Arc::new(ServerConfig::new());
+    let (mut uploading, head, _) = session(&registry, &config).await;
+    start_publish(&uploading, 1, head).await;
+    assert!(matches!(
+        uploading.recv().await,
+        WheatProtocolMessage::ObjectsNeeded(_)
+    ));
+
+    // Given up on (a host's timeout), the quiesce lets publishes in again at once.
+    let quiesce = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.quiesce("test/repo").await }
+    });
+    let (mut next, head, _) = session(&registry, &config).await;
+    start_publish(&next, 1, head).await;
+    assert!(matches!(next.recv().await, WheatProtocolMessage::Error(_)));
+    quiesce.abort();
+    assert!(quiesce.await.unwrap_err().is_cancelled());
+
+    start_publish(&next, 2, head).await;
+    assert!(matches!(
+        next.recv().await,
+        WheatProtocolMessage::ObjectsNeeded(_)
+    ));
 }
 
 #[tokio::test]

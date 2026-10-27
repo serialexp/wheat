@@ -1069,6 +1069,19 @@ head, so an advance that refuses a stale primary (a compare-and-swap that includ
 a fencing token) refuses the publish. What the stale primary stored before that is
 content-addressed and named by no head.
 
+To back a repository up or move it, Gothab holds it still with
+`Registry::quiesce(name)` and copies its files. A quiesced repository refuses new
+publishes with a retryable `Error` (code 503; the CLI reports `remote_unavailable`),
+and the quiesce waits until every publish already writing has finished, including
+one still uploading (a large publish writes its stage early) and the group
+committer. Fetches go on. `RepositoryDirectory::files` then lists what to copy, each
+file with its length and whether it is immutable (sealed segments, catalog
+snapshots, loose files, content generations), so a backup to object storage uploads
+those once; locks, temporary files and the store's SQLite locator index are left out,
+the index being rebuilt when the copy is first opened. `RepositoryDirectory::copy_to`
+does a local copy. Dropping the `Quiesced` (or the quiesce future, when a host's
+timeout gives up on it) lets publishes in again.
+
 ### Object store as the scaling axis
 
 The server is stateless except for the head pointer. All objects live in the

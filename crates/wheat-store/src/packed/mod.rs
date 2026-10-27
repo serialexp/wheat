@@ -3,6 +3,7 @@ pub(crate) mod bulk;
 pub(crate) mod catalog;
 #[cfg(test)]
 mod catalog_tests;
+pub(crate) mod files;
 mod generation_reader;
 mod loose_files;
 pub(crate) mod segment;
