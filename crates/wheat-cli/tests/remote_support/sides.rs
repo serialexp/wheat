@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use wheat_client::workspace_metadata::WorkspaceMetadata;
 
-use super::{fails, ok, ok_json, serve, write_config};
+use wheat_server::server::ServerConfig;
+
+use super::{fails, ok, ok_json, serve_configured, write_config};
 
 pub struct Side {
     pub workspace: PathBuf,
@@ -62,10 +64,15 @@ pub struct Sides {
 /// Two clones, `writer` and `reader`, of an empty repository the returned server
 /// serves.
 pub fn sides() -> (Sides, super::Server) {
+    sides_configured(ServerConfig::new())
+}
+
+/// Like [`sides`], with the server configured by `server`.
+pub fn sides_configured(server: ServerConfig) -> (Sides, super::Server) {
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("config");
     write_config(&config);
-    let server = serve(root.path(), &config);
+    let server = serve_configured(root.path(), &config, server);
     let clone = |name: &str| {
         let side = Side {
             workspace: root.path().join(name),

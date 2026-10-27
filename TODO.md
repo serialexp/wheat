@@ -17,17 +17,6 @@ memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
 listing the bucket, opening a packed store costing O(store), the remote catalog head
 being JSON, and `wheat gc` / server-authoritative remote maintenance.
 
-- `[ ]` **No hooks around a publish.** Besides `AccessProvider::access`, nothing lets
-  an embedder refuse a publish (protected labels, required checks, quota, size) or
-  learn it happened: after the head moves the server only logs (`publish.rs`). Gothab
-  needs a pre-publish check that sees the principal, the old and new head, the label
-  moves and the bytes uploaded; and a post-publish notification with the same, called
-  once the head is durable (for its push journal, webhooks, CI and search). Labels
-  live inside the envelope, so the label moves need computing from the two label
-  manifests: `RepositoryReader::label_changes(old, new)` does that (2026-10-26). The
-  bytes are counted too: `RepositoryStage::received`, and what the store added from
-  `RepositoryStage::stored` or `PendingPublications::store` (2026-10-26). The hooks
-  themselves are still to do.
 - `[ ]` **The registry must open and close repositories.** Beyond being pluggable (item
   under the design-doc audit), a host serving thousands of repositories opens them on
   demand and evicts idle ones. Opening holds `catalog.lock` exclusively, so eviction

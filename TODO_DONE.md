@@ -4,6 +4,18 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **No hooks around a publish.** `ServerConfig::publish_hooks` takes a
+  `PublishHooks` (`crates/wheat-server/src/hooks.rs`). `check` runs once the upload
+  is complete and the client asked to commit, before the join and outside the commit
+  lock (Bart's choice, 2026-10-27), with the principal, the head the sender built on,
+  the proposed envelope, its label changes (`label_changes(expected, proposed)`) and
+  the bytes received; a refusal goes to the client. `published` runs once per
+  durable batch (Bart's choice) in the committer, after the clients have their
+  answers and before the next batch: head before and after, and each publish with
+  what it added to the store (`PendingPublications::store`). With no hooks nothing
+  is computed. `wheat_server::async_trait` is re-exported for implementers. Tests:
+  `crates/wheat-cli/tests/publish_hooks.rs` (real publishes, a refusal) and
+  `group_commit_test.rs` (a batch of two announces each with its own stored bytes).
 - `[x]` **Handlers take `WebSocketStream<TcpStream>`.** Every handler now runs on a
   `Transport` (`crates/wheat-server/src/transport.rs`: send a binary message, receive
   the next, close), implemented for tungstenite's `WebSocketStream` over any socket.

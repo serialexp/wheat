@@ -13,13 +13,14 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::sync::{Notify, Semaphore};
 use wheat_core::{
-    ApplicationContext, ObjectId, PublishReceiptRecord, Repository, RepositoryEnvelopeId, Tree,
-    VerifiedContent, ViewId, ViewLabelManifestRecord,
+    ApplicationContext, ContentId, ObjectId, PublishReceiptRecord, Repository,
+    RepositoryEnvelopeId, Tree, VerifiedContent, ViewId, ViewLabelManifestRecord,
 };
 use wheat_protocol::{Digest256, PublishRequestOutput, Uuid128};
 use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
 use wheat_server::heads::HeadStore;
+use wheat_server::hooks::{Announcement, ProposedPublish, PublishHooks, PublishedBatch};
 use wheat_server::receipt::PublishKey;
 use wheat_server::registry::RepositoryEntry;
 use wheat_store::{
@@ -302,6 +303,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         first,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -325,6 +327,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -336,6 +339,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         b,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -382,6 +386,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         first,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -394,6 +399,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -425,6 +431,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         c,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -454,6 +461,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         first,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -466,6 +474,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -491,6 +500,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         c,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -518,6 +528,7 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -590,6 +601,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         first,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -603,6 +615,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -621,6 +634,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -650,6 +664,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         first,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -666,6 +681,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -689,6 +705,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         first,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -776,6 +793,7 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
         proposed,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -802,6 +820,7 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
         proposed,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -824,6 +843,7 @@ async fn a_publish_key_used_for_a_different_publish_is_refused() {
         first,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -852,6 +872,7 @@ async fn a_publish_key_used_for_a_different_publish_is_refused() {
             a,
             false,
             false,
+            None,
         )
         .await
         .map(Some),
@@ -951,6 +972,7 @@ async fn a_backward_label_move_is_refused_unless_the_publish_forces_labels() {
             backward,
             force,
             force_labels,
+            None,
         )
         .await;
         if force_labels {
@@ -989,6 +1011,7 @@ async fn forward_moves_and_new_or_deleted_labels_are_accepted() {
         forward,
         false,
         false,
+        None,
     )
     .await
     .unwrap()
@@ -1025,6 +1048,7 @@ async fn forcing_labels_permits_only_its_own_publish() {
         forced,
         false,
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1046,6 +1070,7 @@ async fn forcing_labels_permits_only_its_own_publish() {
             back,
             false,
             false,
+            None,
         )
         .await,
         "label other would move",
@@ -1062,6 +1087,7 @@ async fn forcing_labels_permits_only_its_own_publish() {
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -1094,6 +1120,7 @@ async fn a_label_moved_differently_by_an_accepted_publish_refuses_the_publish_as
         moving,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -1106,6 +1133,7 @@ async fn a_label_moved_differently_by_an_accepted_publish_refuses_the_publish_as
             deleting,
             false,
             false,
+            None,
         )
         .await,
         "labels were moved differently",
@@ -1129,6 +1157,7 @@ async fn a_label_moved_differently_by_another_process_refuses_the_batch_as_stale
         moving,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -1162,6 +1191,7 @@ async fn a_publish_key_reused_with_a_different_force_labels_is_refused() {
         a,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -1178,4 +1208,120 @@ async fn a_publish_key_reused_with_a_different_force_labels_is_refused() {
     }
     server.gate.permits.add_permits(1);
     accepted.durable().await.unwrap();
+}
+
+/// Sends each durable batch it is told about.
+struct Announced(tokio::sync::mpsc::UnboundedSender<PublishedBatch>);
+
+#[async_trait]
+impl PublishHooks for Announced {
+    async fn published(&self, batch: &PublishedBatch) {
+        let _ = self.0.send(batch.clone());
+    }
+}
+
+/// An announcement of a publish of `proposed` built on `expected`, to `hooks`.
+fn announcement(
+    hooks: &Arc<dyn PublishHooks>,
+    expected: RepositoryHead,
+    proposed: RepositoryEnvelopeId,
+) -> Option<Announcement> {
+    Some(Announcement {
+        hooks: Arc::clone(hooks),
+        publish: ProposedPublish {
+            repository: "test/repo".into(),
+            principal: Principal {
+                name: "test".into(),
+            },
+            expected,
+            proposed,
+            force: false,
+            force_labels: false,
+            labels: Vec::new(),
+            received: Default::default(),
+        },
+    })
+}
+
+#[tokio::test]
+async fn each_durable_batch_is_announced_with_what_each_publish_stored() {
+    let server = server().await;
+    let initial = server.initial;
+    let (sender, mut notices) = tokio::sync::mpsc::unbounded_channel();
+    let hooks: Arc<dyn PublishHooks> = Arc::new(Announced(sender));
+    let (first_stage, first) = propose(&server, initial, "first.txt").await;
+    let (a_stage, a) = propose(&server, initial, "a.txt").await;
+    let (b_stage, b) = propose(&server, initial, "b.txt").await;
+
+    let first_accepted = commit::accept(
+        &server.entry,
+        &first_stage,
+        key(1, first),
+        initial.envelope,
+        first,
+        false,
+        false,
+        announcement(&hooks, initial, first),
+    )
+    .await
+    .unwrap();
+    server.gate.arrived.notified().await;
+    // Both join the next batch; only the first of them is announced.
+    let a_accepted = commit::accept(
+        &server.entry,
+        &a_stage,
+        key(2, a),
+        initial.envelope,
+        a,
+        false,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let b_accepted = commit::accept(
+        &server.entry,
+        &b_stage,
+        key(3, b),
+        initial.envelope,
+        b,
+        false,
+        false,
+        announcement(&hooks, initial, b),
+    )
+    .await
+    .unwrap();
+    server.gate.permits.add_permits(2);
+    let first_head = first_accepted.durable().await.unwrap();
+    let a_head = a_accepted.durable().await.unwrap();
+    assert_eq!(b_accepted.durable().await.unwrap(), a_head);
+
+    let wait = std::time::Duration::from_secs(60);
+    let stored = |batch: &PublishedBatch, index: usize, path: &str| {
+        batch.publishes[index]
+            .stored
+            .content
+            .iter()
+            .any(|(id, _)| *id == ContentId::of(path.as_bytes()))
+    };
+    let batch = tokio::time::timeout(wait, notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((batch.before, batch.after), (initial, first_head));
+    assert_eq!(batch.repository, "test/repo");
+    assert_eq!(batch.publishes.len(), 1);
+    assert_eq!(batch.publishes[0].publish.proposed, first);
+    assert!(stored(&batch, 0, "first.txt"));
+
+    let batch = tokio::time::timeout(wait, notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((batch.before, batch.after), (first_head, a_head));
+    assert_eq!(batch.publishes.len(), 1);
+    assert_eq!(batch.publishes[0].publish.proposed, b);
+    // What b stored, not what a, the publish before it in the batch, did.
+    assert!(stored(&batch, 0, "b.txt"));
+    assert!(!stored(&batch, 0, "a.txt"));
 }

@@ -543,6 +543,11 @@ async fn run_session(
                     .head_with_receipt(key.key())
                     .await
                     .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
+                let publisher = crate::publish::Publisher {
+                    repository: &repository,
+                    principal: &principal,
+                    hooks: config.publish_hooks.as_ref(),
+                };
                 crate::publish::handle_publish(
                     ws,
                     &entry,
@@ -551,6 +556,7 @@ async fn run_session(
                     req,
                     key,
                     pushed,
+                    publisher,
                 )
                 .await?;
             }

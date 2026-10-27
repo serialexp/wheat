@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 use crate::access::{AccessProvider, AuthConfigError, OpenLoopbackAccess, TokenFileAccess};
 use crate::config::FileConfig;
 use crate::connection;
+use crate::hooks::PublishHooks;
 use crate::registry::Registry;
 
 /// How long a connection has, by default, from being accepted until its caller is
@@ -45,6 +46,10 @@ pub struct ServerConfig {
     /// new connection is closed as soon as it is accepted. An embedder that calls
     /// an entry point in [`connection`] itself sets its own limit.
     pub max_connections: usize,
+    /// What the embedder runs around each publish: a check before it is joined
+    /// onto the head, and a notice once it is durable. `None` runs nothing and
+    /// skips the work of describing the publish.
+    pub publish_hooks: Option<Arc<dyn PublishHooks>>,
 }
 
 impl ServerConfig {
@@ -61,6 +66,7 @@ impl ServerConfig {
             allowed_origins,
             session_setup_timeout: DEFAULT_SESSION_SETUP_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            publish_hooks: None,
         }
     }
 

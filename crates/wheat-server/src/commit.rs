@@ -10,6 +10,9 @@
 //! The head records each publish's receipt in the write that publishes it. A publish
 //! sent again with its key (see [`crate::receipt`]) is not accepted a second time: it
 //! gets the receipt, or waits for the batch the first sending is in.
+//!
+//! Once a batch is durable and its publishes have their answers, the embedder's
+//! [`PublishHooks::published`] is told about it, before the next batch is written.
 
 use std::{
     sync::Arc,
@@ -22,9 +25,10 @@ use wheat_core::{PublishReceiptRecord, RepositoryEnvelopeId};
 use wheat_store::{
     Arrival, ImmutableObjectStore, MergeBudget, PendingPublications, PublicationError,
     RepositoryHead, RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
-    RepositoryStoreError, RepositoryUnionError, StagedPublication,
+    RepositoryStoreError, RepositoryUnionError, StagedPublication, StoredWrite,
 };
 
+use crate::hooks::{Announcement, ProposedPublish, PublishHooks, Published, PublishedBatch};
 use crate::receipt::{PublishKey, Recorded};
 use crate::registry::RepositoryEntry;
 
@@ -97,6 +101,10 @@ struct Batch {
     keys: Vec<PublishKey>,
     /// Who waits for the batch: its publishes, and any of them sent again.
     members: Vec<oneshot::Sender<CommitOutcome>>,
+    /// The hooks to tell once the batch is durable, and each publication's
+    /// announced publish, in `publications` order.
+    hooks: Option<Arc<dyn PublishHooks>>,
+    announced: Vec<Option<ProposedPublish>>,
 }
 
 /// A publish accepted into a batch, or one sent again and answered as the first
@@ -167,7 +175,8 @@ pub async fn previous(
 /// recorded differently on each side, refuses the publish as stale. A forced publish
 /// is never joined: it replaces exactly the head it names. Each label the publish
 /// moves must move forward unless `force_labels`. Refusals report the durable head,
-/// the one the client can fetch.
+/// the one the client can fetch. `announcement`'s hooks are told about the publish
+/// once its batch is durable.
 ///
 /// A publish whose key was accepted meanwhile, by another session sending it again,
 /// is answered as that one is instead.
@@ -180,6 +189,7 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
     proposed: RepositoryEnvelopeId,
     force: bool,
     force_labels: bool,
+    announcement: Option<Announcement>,
 ) -> Result<Accepted, CommitFailure> {
     let mut turn = entry
         .commit
@@ -227,7 +237,15 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
     })?;
     // Nothing above changed the state, so a publish dropped while joining (its client
     // went away) leaves no trace.
-    let receiver = turn.accept(entry, key, current, joined, force, publication);
+    let receiver = turn.accept(
+        entry,
+        key,
+        current,
+        joined,
+        force,
+        publication,
+        announcement,
+    );
     Ok(Accepted::waiting(receiver, false))
 }
 
@@ -314,6 +332,7 @@ impl CommitState {
         joined: RepositoryEnvelopeId,
         forced: bool,
         publication: Arc<StagedPublication>,
+        announcement: Option<Announcement>,
     ) -> oneshot::Receiver<CommitOutcome> {
         let (sender, receiver) = oneshot::channel();
         debug_assert_eq!(self.tentative.unwrap_or(built_on), built_on);
@@ -324,12 +343,18 @@ impl CommitState {
             publications: PendingPublications::default(),
             keys: Vec::new(),
             members: Vec::new(),
+            hooks: None,
+            announced: Vec::new(),
         });
         batch.target = joined;
         batch.forced |= forced;
         batch.publications.push(publication);
         batch.keys.push(key);
         batch.members.push(sender);
+        batch.announced.push(announcement.map(|announcement| {
+            batch.hooks.get_or_insert(announcement.hooks);
+            announcement.publish
+        }));
         self.tentative = Some(joined);
         if !self.committing {
             self.committing = true;
@@ -360,9 +385,13 @@ async fn commit_batches(entry: Arc<RepositoryEntry>) {
             state.writing_members = std::mem::take(&mut batch.members);
             batch
         };
-        let outcome = commit_batch(&entry, &batch)
+        let durable = commit_batch(&entry, &batch)
             .instrument(debug_span!("group_commit", publishes = batch.keys.len()))
             .await;
+        let outcome = durable
+            .as_ref()
+            .map(|durable| durable.after)
+            .map_err(Clone::clone);
         let mut state = entry.commit.state.lock().await;
         // Once published, the head's receipts answer a publish sent again.
         state.writing_keys.clear();
@@ -391,6 +420,45 @@ async fn commit_batches(entry: Arc<RepositoryEntry>) {
             // A publish whose client went away no longer waits.
             let _ = member.send(outcome.clone());
         }
+        if let (Ok(durable), Some(hooks)) = (durable, batch.hooks) {
+            let published = announce(batch.announced, durable);
+            hooks
+                .published(&published)
+                .instrument(debug_span!("publish_hook_published"))
+                .await;
+        }
+    }
+}
+
+/// A batch made durable: the head it replaced, the head it published, and what each
+/// of its publications added to the store, in order.
+struct Durable {
+    before: RepositoryHead,
+    after: RepositoryHead,
+    stored: Vec<StoredWrite>,
+}
+
+/// What [`PublishHooks::published`] is told about a durable batch: its announced
+/// publishes.
+fn announce(announced: Vec<Option<ProposedPublish>>, durable: Durable) -> PublishedBatch {
+    let publishes: Vec<Published> = announced
+        .into_iter()
+        .zip(durable.stored)
+        .filter_map(|(publish, stored)| {
+            Some(Published {
+                publish: publish?,
+                stored,
+            })
+        })
+        .collect();
+    PublishedBatch {
+        repository: publishes
+            .first()
+            .map(|published| published.publish.repository.clone())
+            .unwrap_or_default(),
+        before: durable.before,
+        after: durable.after,
+        publishes,
     }
 }
 
@@ -429,24 +497,27 @@ impl CommitFailure {
 
 /// Stores `batch` and moves the head to it, joined with whatever another process
 /// published meanwhile.
-async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> CommitOutcome {
+async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable, CommitFailure> {
     // The objects and content in one write, then any buffered objects sealed into a
     // durable batch (e.g. a packed segment uploaded to S3) before the head can name
     // them. Sealing is a no-op for local stores.
     let stored = async {
-        batch.publications.store(&*entry.store).await?;
+        let stored = batch.publications.store(&*entry.store).await?;
         entry.store.seal().await?;
-        Ok::<_, RepositoryStoreError>(())
+        Ok::<_, RepositoryStoreError>(stored)
     }
     .instrument(debug_span!("publish_store"))
     .await;
-    if let Err(e) = stored {
-        warn!(error = %e, "publish: storing a batch failed");
-        return Err(CommitFailure::Failed {
-            head: read_head(entry).await?,
-            message: format!("storing the published objects failed: {e}"),
-        });
-    }
+    let stored = match stored {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!(error = %e, "publish: storing a batch failed");
+            return Err(CommitFailure::Failed {
+                head: read_head(entry).await?,
+                message: format!("storing the published objects failed: {e}"),
+            });
+        }
+    };
 
     let mut built_on = batch.built_on;
     let mut target = batch.target;
@@ -482,7 +553,13 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> CommitOutcome {
             .instrument(debug_span!("publish_cas"))
             .await;
         match advanced {
-            Ok(()) => return Ok(new_head),
+            Ok(()) => {
+                return Ok(Durable {
+                    before: head,
+                    after: new_head,
+                    stored,
+                });
+            }
             Err(PublicationError::Stale { .. }) => continue,
             Err(e) => {
                 return Err(CommitFailure::Failed {

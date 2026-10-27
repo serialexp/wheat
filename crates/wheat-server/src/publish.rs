@@ -1,6 +1,6 @@
 //! Publish protocol handler — receive objects, validate, commit.
 
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, debug_span, info, warn};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,8 +15,10 @@ use wheat_store::{
     StructuralDeltaLimits, TreeDiffLimits,
 };
 
+use crate::access::Principal;
 use crate::commit::{self, Accepted, CommitFailure};
 use crate::connection::ConnectionError;
+use crate::hooks::{Announcement, ProposedPublish, PublishHooks};
 use crate::receipt::PublishKey;
 use crate::registry::RepositoryEntry;
 use crate::transport::Transport;
@@ -116,6 +118,14 @@ async fn read_push(
 
 const OVER_PUSH_LIMIT: &str = "a publish pushed more than MAX_PUSHED_BYTES";
 
+/// Who publishes to which repository, and the embedder's hooks to run around it.
+#[derive(Clone, Copy)]
+pub struct Publisher<'a> {
+    pub repository: &'a str,
+    pub principal: &'a Principal,
+    pub hooks: Option<&'a Arc<dyn PublishHooks>>,
+}
+
 /// Handle a publish request whose push has been read, against `current_head` and the
 /// `receipt` it holds for this publish's key. Returns the new head if publication succeeded.
 #[tracing::instrument(name = "publish", level = "debug", skip_all)]
@@ -127,6 +137,7 @@ pub async fn handle_publish(
     req: PublishRequestOutput,
     key: PublishKey,
     mut pushed: Pushed,
+    publisher: Publisher<'_>,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
     let op_id = req.op_id;
     let force = req.force;
@@ -354,6 +365,44 @@ pub async fn handle_publish(
         }
     }
 
+    // The embedder's check, before the publish is joined onto the head.
+    let announcement = match publisher.hooks {
+        None => None,
+        Some(hooks) => {
+            let labels = match reader
+                .label_changes(Some(expected.envelope), proposed_envelope_id)
+                .await
+            {
+                Ok(labels) => labels,
+                Err(e) => {
+                    let message = format!("cannot compare with the head this publish names: {e}");
+                    return reject(ws, op_id, current_head, &message).await;
+                }
+            };
+            let publish = ProposedPublish {
+                repository: publisher.repository.to_owned(),
+                principal: publisher.principal.clone(),
+                expected,
+                proposed: proposed_envelope_id,
+                force,
+                force_labels,
+                labels,
+                received: staged.received(),
+            };
+            let checked = hooks
+                .check(&publish)
+                .instrument(debug_span!("publish_hook_check"))
+                .await;
+            if let Err(refusal) = checked {
+                return reject(ws, op_id, current_head, &refusal.message).await;
+            }
+            Some(Announcement {
+                hooks: Arc::clone(hooks),
+                publish,
+            })
+        }
+    };
+
     send(
         ws,
         &WheatProtocolMessage::PublishProgress(PublishProgressOutput {
@@ -374,6 +423,7 @@ pub async fn handle_publish(
         proposed_envelope_id,
         force,
         force_labels,
+        announcement,
     )
     .await
 }
@@ -396,6 +446,7 @@ async fn commit(
     proposed: RepositoryEnvelopeId,
     force: bool,
     force_labels: bool,
+    announcement: Option<Announcement>,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
     let accepted = commit::accept(
         entry,
@@ -405,6 +456,7 @@ async fn commit(
         proposed,
         force,
         force_labels,
+        announcement,
     )
     .await;
     answer(ws, op_id, key, accepted).await

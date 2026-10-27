@@ -1041,6 +1041,19 @@ next, close), which is how axum's `WebSocketUpgrade` fits. The transport must
 refuse a message over `MAX_MESSAGE_SIZE` while it arrives. The standalone server's
 `handle_connection` is the same session on tungstenite over TCP.
 
+Gothab's rules for publishes (protected labels, required checks, quota) and what it
+does after one (push journal, webhooks, CI, search) plug in as
+`ServerConfig::publish_hooks` (`wheat_server::hooks`). `PublishHooks::check` is asked
+once a publish has uploaded everything and asked to commit, before it is joined
+onto the head and outside the repository's commit lock: it sees the principal, the
+head the sender built on, the envelope it proposes, the labels it adds, moves and
+removes, and the bytes it uploaded, and a refusal's message goes to the client.
+`PublishHooks::published` is told once per durable batch of the group commit: the
+head before and after, and each publish with what it added to the store. Batches
+are told in order, and the next batch waits for the call, so slow work belongs in a
+queue. A notice lost to a crash between the head moving and the call shows as a
+gap in the head's generations.
+
 ### Object store as the scaling axis
 
 The server is stateless except for the head pointer. All objects live in the

@@ -112,6 +112,11 @@ pub struct Server {
 
 /// Creates an empty repository under `root` and serves it.
 pub fn serve(root: &Path, config: &Path) -> Server {
+    serve_configured(root, config, ServerConfig::new())
+}
+
+/// Like [`serve`], with the server configured by `server`.
+pub fn serve_configured(root: &Path, config: &Path, server: ServerConfig) -> Server {
     let server_stores = root.join("server-stores");
     let source = root.join("source");
     ok(
@@ -120,11 +125,16 @@ pub fn serve(root: &Path, config: &Path) -> Server {
         config,
         &["init", source.to_str().unwrap()],
     );
-    serve_store(&workspace_store(&source))
+    serve_store_configured(&workspace_store(&source), server)
 }
 
 /// Serves the repository in `store` as `team/repo`.
 pub fn serve_store(store: &Path) -> Server {
+    serve_store_configured(store, ServerConfig::new())
+}
+
+/// Like [`serve_store`], with the server configured by `server`.
+pub fn serve_store_configured(store: &Path, server: ServerConfig) -> Server {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let registry = Registry::single_named("team/repo".to_owned(), store).unwrap();
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -133,7 +143,7 @@ pub fn serve_store(store: &Path) -> Server {
         run_until(
             "127.0.0.1:0".parse().unwrap(),
             registry,
-            ServerConfig::new(),
+            server,
             ready_tx,
             shutdown_rx,
         )

@@ -5,12 +5,17 @@
 //! backed by a local `PackedObjectStore` (or a remote packed store) and a
 //! [`heads::HeadStore`], by default a `LocalPublicationStore`.
 
+/// The attribute that implements [`access::AccessProvider`] and
+/// [`hooks::PublishHooks`], so an embedder needs no version of its own.
+pub use async_trait::async_trait;
+
 pub mod access;
 pub mod commit;
 pub mod config;
 pub mod connection;
 pub mod fetch;
 pub mod heads;
+pub mod hooks;
 pub mod publish;
 pub mod receipt;
 pub mod registry;
