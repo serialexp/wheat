@@ -8968,6 +8968,96 @@ impl GitImportRefV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryLocationV1Input {
+    pub network: Uuid128,
+    pub repository: Uuid128,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryLocationV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub network: Uuid128,
+    pub repository: Uuid128,
+}
+
+pub type RepositoryLocationV1 = RepositoryLocationV1Output;
+
+impl RepositoryLocationV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464357452);
+        encoder.write_u16_be(1);
+        self.network.encode_into(encoder)?;
+        self.repository.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl RepositoryLocationV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464357452u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464357452, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let network = Uuid128::decode_with_decoder(decoder)?;
+        let repository = Uuid128::decode_with_decoder(decoder)?;
+        Ok(Self {
+            magic,
+            version,
+            network,
+            repository,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        RepositoryLocationV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        RepositoryLocationV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<RepositoryLocationV1Output> for RepositoryLocationV1Input {
+    fn from(o: RepositoryLocationV1Output) -> Self {
+        Self {
+            network: o.network,
+            repository: o.repository,
+        }
+    }
+}
+
+impl From<RepositoryLocationV1Input> for RepositoryLocationV1Output {
+    fn from(i: RepositoryLocationV1Input) -> Self {
+        Self {
+            magic: 1464357452u32,
+            version: 1u16,
+            network: i.network,
+            repository: i.repository,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoreMetadataV1Input {
     pub store_id: Uuid128,
 }

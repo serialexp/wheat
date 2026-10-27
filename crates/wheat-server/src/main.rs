@@ -67,8 +67,9 @@ struct Cli {
     )]
     data_dir: Option<PathBuf>,
 
-    /// Serve every repository under this directory, `owner/repo` from
-    /// `<dir>/owner/repo`, each opened when first asked for and closed when idle.
+    /// Serve every repository under this directory (`names/<owner>/<repo>` says
+    /// which fork network under `networks/` holds it), each opened when first asked
+    /// for and closed when idle.
     #[arg(long, conflicts_with_all = ["name", "store"])]
     repos_dir: Option<PathBuf>,
 

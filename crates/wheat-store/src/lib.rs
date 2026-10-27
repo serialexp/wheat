@@ -61,6 +61,7 @@ pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
 mod browse;
 mod publication;
 mod radix;
+mod repositories_directory;
 mod repository_directory;
 pub use browse::{
     BrowseError, BrowsedFile, HistoryItem, HistoryPage, RepositoryBrowser, TimeHistoryPage,
@@ -140,6 +141,9 @@ pub use provenance::{LaterEdits, PathHistory, PathStep};
 pub use publication::{
     LocalPublicationStore, PUBLISH_RECEIPT_RETENTION_SECONDS, PublicationError, PublicationStore,
     RepositoryHead,
+};
+pub use repositories_directory::{
+    NetworkDirectory, PlacedRepository, RepositoriesDirectory, RepositoriesDirectoryError,
 };
 pub use repository_directory::{
     PendingRepository, RepositoryDirectory, RepositoryDirectoryError, RepositoryFile,

@@ -6073,6 +6073,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wheat-core",
  "wheat-protocol",
  "wheat-store",

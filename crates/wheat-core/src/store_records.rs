@@ -1,8 +1,8 @@
 //! Safe domain wrappers for the stores' small persisted records: the repository
 //! head, the content envelope header, snapshot and ownership manifests, a
-//! workspace materialization's progress log, a Git import's source binding, and
-//! the control files a client keeps: store and workspace metadata, workspace pins
-//! and the remote binding.
+//! workspace materialization's progress log, a Git import's source binding, a
+//! served repository's location, and the control files a client keeps: store and
+//! workspace metadata, workspace pins and the remote binding.
 //!
 //! Like the physical segment records, none of these are `WheatObject` variants.
 
@@ -93,6 +93,14 @@ pub struct MaterializationProgressFields {
     pub opcode: u16,
     pub transaction: [u8; 16],
     pub index: u64,
+}
+
+/// Where a server keeps a repository: the fork network whose store holds its objects,
+/// and its identity in that network, which names its head. Neither is nil.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RepositoryLocationRecord {
+    pub network: Uuid,
+    pub repository: Uuid,
 }
 
 /// `store.meta`: a store's identity.
@@ -623,6 +631,29 @@ fn cas_domain(
         proposed_head: root_domain(value.proposed_head)?,
         resulting_frontier: view_domain(value.resulting_frontier)?,
     })
+}
+
+pub fn encode_repository_location(
+    record: RepositoryLocationRecord,
+) -> Result<Vec<u8>, StoreRecordError> {
+    encoded(
+        wire::RepositoryLocationV1Input {
+            network: identity(record.network),
+            repository: identity(record.repository),
+        }
+        .encode(),
+    )
+}
+pub fn decode_repository_location(
+    bytes: &[u8],
+) -> Result<RepositoryLocationRecord, StoreRecordError> {
+    let w = wire::RepositoryLocationV1::decode(bytes).map_err(decode_error)?;
+    let reencoded = w.encode();
+    let record = RepositoryLocationRecord {
+        network: identity_domain(w.network, "network ID")?,
+        repository: identity_domain(w.repository, "repository ID")?,
+    };
+    checked(bytes, record, reencoded)
 }
 
 pub fn encode_store_metadata(record: StoreMetadataRecord) -> Result<Vec<u8>, StoreRecordError> {

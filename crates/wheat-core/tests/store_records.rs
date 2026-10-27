@@ -381,6 +381,48 @@ fn tampered(bytes: &[u8]) -> [Vec<u8>; 2] {
 }
 
 #[test]
+fn repository_location_round_trips_and_refuses_nil_identities() {
+    let record = RepositoryLocationRecord {
+        network: id(1),
+        repository: id(2),
+    };
+    let bytes = encode_repository_location(record).unwrap();
+    assert_eq!(bytes.len(), 4 + 2 + 16 + 16);
+    assert_eq!(decode_repository_location(&bytes).unwrap(), record);
+    let [trailing, version] = tampered(&bytes);
+    assert_eq!(
+        decode_repository_location(&trailing),
+        Err(StoreRecordError::NonCanonicalEncoding)
+    );
+    assert!(matches!(
+        decode_repository_location(&version),
+        Err(StoreRecordError::Decode(_))
+    ));
+    for (nil, field) in [
+        (
+            RepositoryLocationRecord {
+                network: uuid::Uuid::nil(),
+                ..record
+            },
+            "network ID",
+        ),
+        (
+            RepositoryLocationRecord {
+                repository: uuid::Uuid::nil(),
+                ..record
+            },
+            "repository ID",
+        ),
+    ] {
+        let bytes = encode_repository_location(nil).unwrap();
+        assert_eq!(
+            decode_repository_location(&bytes),
+            Err(StoreRecordError::NilIdentity(field))
+        );
+    }
+}
+
+#[test]
 fn store_metadata_round_trips_and_refuses_a_nil_store() {
     let record = StoreMetadataRecord { store_id: id(1) };
     let bytes = encode_store_metadata(record).unwrap();

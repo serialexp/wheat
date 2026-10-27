@@ -365,7 +365,7 @@ impl CommitState {
             let entry = entry.clone();
             // Taken here, while the publish accepted holds its own, so a quiesce never
             // sees nothing writing between the two.
-            let writing = entry.writers.continue_writing();
+            let writing = entry.network.writers.continue_writing();
             tokio::task::spawn_blocking(move || {
                 runtime.block_on(commit_batches(entry));
                 drop(writing);
@@ -508,8 +508,8 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
     // durable batch (e.g. a packed segment uploaded to S3) before the head can name
     // them. Sealing is a no-op for local stores.
     let stored = async {
-        let stored = batch.publications.store(&*entry.store).await?;
-        entry.store.seal().await?;
+        let stored = batch.publications.store(&*entry.network.store).await?;
+        entry.network.store.seal().await?;
         Ok::<_, RepositoryStoreError>(stored)
     }
     .instrument(debug_span!("publish_store"))
@@ -588,7 +588,11 @@ async fn rejoin(
     target: RepositoryEnvelopeId,
     head: RepositoryHead,
 ) -> Result<RepositoryEnvelopeId, CommitFailure> {
-    let stage = RepositoryStage::new(&*entry.store, REJOIN_STAGED_OBJECTS, REJOIN_STAGED_BYTES);
+    let stage = RepositoryStage::new(
+        &*entry.network.store,
+        REJOIN_STAGED_OBJECTS,
+        REJOIN_STAGED_BYTES,
+    );
     let reader = RepositoryReader::new(&stage, stage.content());
     let joined = reader
         .union_envelopes(Some(built_on), target, head.envelope)
@@ -606,7 +610,7 @@ async fn rejoin(
     }
     let stored = async {
         stage.flush().await?;
-        entry.store.seal().await?;
+        entry.network.store.seal().await?;
         Ok::<_, RepositoryStoreError>(())
     }
     .await;

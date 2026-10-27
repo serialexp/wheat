@@ -1137,6 +1137,17 @@
         { name: "oid", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
       ],
     },
+    // `names/<owner>/<repo>` in a server's repositories directory: the fork network
+    // the repository is in, and the repository's identity there, which names its
+    // head (`networks/<network>/heads/<repository>/repository.head`). Neither is nil.
+    RepositoryLocationV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x5748524c },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "network", type: "Uuid128" },
+        { name: "repository", type: "Uuid128" },
+      ],
+    },
 
     // Workspace and store control files that wheat-client keeps. Paths are UTF-8.
 

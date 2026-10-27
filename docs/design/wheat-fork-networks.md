@@ -1,9 +1,11 @@
 # Wheat fork networks — Design
 
-Status: draft, not yet implemented. Decided (Bart, 2026-10-27): one structural pool
-per fork network, one instance-wide content store, a hash is a read capability,
-publishes upload only what the store lacks, and a fork starts with all its parent's
-labels.
+Status: partial — phase 0 (networks in the registry and on disk), the directory
+fork, and network copy landed; phase 1 (content apart) outstanding. Decided (Bart,
+2026-10-27): one structural pool per fork network, one instance-wide content store,
+a hash is a read capability, publishes upload only what the store lacks, a fork
+starts with all its parent's labels, and the standalone server keeps networks in
+network directories.
 Owner: bart
 Last updated: 2026-10-27
 
@@ -25,19 +27,39 @@ and move them from Outstanding to Done.
   what the store lacks.
 - [x] **Decision — labels (2026-10-27).** Open question 3: a fork starts with all of
   its parent's labels, so creating one writes nothing to the pool.
+- [x] **Decision — standalone layout (2026-10-27).** Network directories with a
+  name index (option L1 of three: network directories, forks pointing at their
+  root's directory, no directory forks). See [Layout](#layout).
+- [x] **Phase 0 — networks in the registry.** `RepositoryEntry::network` is a
+  `wheat_server::network::Network`, one shared handle per network to its store and
+  its writers, so `Registry::quiesce` on any repository holds the whole network.
+  Openers share handles through `OpenNetworks`, which opens a network's store with
+  its first repository and closes it with its last (waiting out a close in progress
+  before opening again). `DirectoryOpener` reads `wheat_store::RepositoriesDirectory`.
+- [x] **Phase 4, standalone — forking in a repositories directory.**
+  `RepositoriesDirectory::fork` writes a head naming the parent's envelope and a
+  name; nothing is written to the store (`fork_network` bench case).
+- [x] **Phase 5 — copying a network.** `NetworkDirectory::files` and `copy_to` list
+  and copy the store and every head; the copy loop is `RepositoryDirectory`'s,
+  which `repository_copy` measures.
 
 ### Outstanding
 
-- [ ] **Phase 0 — networks in the registry.** An opener hands out entries whose
-  stores are one shared handle per network; `Registry::quiesce` holds a network.
 - [ ] **Phase 1 — the content tier apart.** Entries read and write content through
   an instance-wide `ContentStore` (Gothab's blob store through
   `ContentStore::over_blobs`, a directory for the standalone server); the network
   pool holds structure only.
-- [ ] **Phase 4 — creating a fork.** A library operation and the registry call a
-  host makes; tests for a fork of a fork and for a private fork's isolation.
-- [ ] **Phase 5 — copying a network.** Quiesce and copy a network, with every head
-  in it, as the unit of backup and move.
+- [ ] **Phase 4, Gothab — forking through a host's own `HeadStore`.** A host whose
+  database keeps heads creates the fork's head as `RepositoryHead::initial(parent
+  envelope)` and maps the name to the parent's network in its opener. Nothing in
+  Wheat is missing for it yet; revisit when Gothab's opener exists.
+- [ ] **Adopting a standalone repository.** A `RepositoryDirectory` (what `wheat
+  import` writes) cannot be moved into a repositories directory; before networks it
+  could be renamed to `<repos-dir>/<owner>/<repo>`. Needs a crash-safe move into a
+  new network.
+- [ ] **Deleting a fork while its network is served.**
+  `RepositoriesDirectory::delete` refuses while the network's store is open, so a
+  fork cannot be deleted while any repository of its network is served.
 - [ ] **Defer — network GC.** Marking every head in a network and every network for
   content is the open `wheat gc` / server-authoritative maintenance work in
   `TODO.md`.
@@ -128,6 +150,26 @@ host's disk keeps each network's pool. For the standalone server's `DirectoryOpe
 
 How a repository name maps to its network is the opener's business: Gothab's
 database knows each repository's network.
+
+As built (`wheat_store::RepositoriesDirectory`, 2026-10-27), networks and their
+repositories are named by UUIDs, and a name record says where a repository is, so a
+rename touches only the name:
+
+```text
+<repos-dir>/
+  names/<owner>/<repo>                    RepositoryLocationV1: network and repository
+  networks/<network>/
+    storage/
+    heads/<repository>/repository.head
+```
+
+A new network is built in a hidden stage beside its name and renamed into
+`networks/`; a deleted head or network is renamed to a tombstone beside its name
+first. Both are swept under the name's lock, as `RepositoryDirectory` sweeps its own.
+The name is written last and removed last, so a crash leaves a network or head no
+name refers to (for network GC) or a name whose head is gone, which counts as no
+repository and is replaced by the next create or fork of the name. The content store
+is not there yet (phase 1).
 
 ## Creating a fork
 

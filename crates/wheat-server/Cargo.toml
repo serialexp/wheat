@@ -20,6 +20,7 @@ tokio-tungstenite = "0.28"
 toml = "1"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-protocol = { path = "../wheat-protocol" }
 wheat-store = { path = "../wheat-store" }

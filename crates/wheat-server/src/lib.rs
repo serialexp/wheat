@@ -16,6 +16,7 @@ pub mod connection;
 pub mod fetch;
 pub mod heads;
 pub mod hooks;
+pub mod network;
 pub mod publish;
 pub mod quiesce;
 pub mod receipt;

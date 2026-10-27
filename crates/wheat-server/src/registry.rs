@@ -6,10 +6,11 @@
 //! session or publish holds its repository's [`RepositoryEntry`] while it runs, and
 //! that is the lease: a repository is closed only when nothing holds it, it has not
 //! been asked for in [`RegistryLimits::idle`], or more than
-//! [`RegistryLimits::max_open`] are open and it is the least recently used. Closing
-//! drops its stores, which releases the packed store's `catalog.lock`, so another
-//! process (maintenance, or a move to another host) can open it. Two sessions asking
-//! for a closed repository at once open it once.
+//! [`RegistryLimits::max_open`] are open and it is the least recently used. The
+//! repositories of a fork network share its store ([`crate::network`]), which is
+//! closed with the last of them, releasing the packed store's `catalog.lock` so
+//! another process (maintenance, or a move to another host) can open it. Two sessions
+//! asking for a closed repository at once open it once.
 //!
 //! A host that moves a repository's primary between machines fences the old one in
 //! its [`HeadStore`]: a publish is acknowledged only once [`HeadStore::advance`]
@@ -27,24 +28,24 @@ use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
 use tracing::{debug, info};
-use wheat_store::{ContentStore, ObjectStoreError, RepositoryDirectory, RepositoryStore};
+use uuid::Uuid;
+use wheat_store::{
+    ObjectStoreError, RepositoriesDirectory, RepositoriesDirectoryError, RepositoryDirectory,
+    RepositoryStore,
+};
 
 use crate::commit::GroupCommit;
 use crate::heads::HeadStore;
-use crate::quiesce::{Quiesced, Writers};
+use crate::network::{Network, OpenNetworks};
+use crate::quiesce::Quiesced;
 
-/// A single repository's stores.
+/// A single repository: the stores of its fork network, and its head.
 pub struct RepositoryEntry {
-    pub store: Box<dyn RepositoryStore>,
-    /// `store`'s content.
-    pub content: ContentStore,
+    pub network: Network,
     pub heads: Box<dyn HeadStore>,
     /// Publishes take turns joining onto the head, so none merges against a head
     /// another is about to replace, and are made durable in batches.
     pub commit: GroupCommit,
-    /// The publishes and committer writing to the store, held still by
-    /// [`Registry::quiesce`].
-    pub(crate) writers: Writers,
 }
 
 impl RepositoryEntry {
@@ -57,13 +58,17 @@ impl RepositoryEntry {
         ))
     }
 
+    /// A repository alone in its network, over `store`.
     pub fn new(store: Box<dyn RepositoryStore>, heads: impl HeadStore + 'static) -> Self {
+        Self::in_network(Network::new(store), heads)
+    }
+
+    /// A repository of `network`, whose head is `heads`.
+    pub fn in_network(network: Network, heads: impl HeadStore + 'static) -> Self {
         Self {
-            content: store.content_store(),
-            store,
+            network,
             heads: Box::new(heads),
             commit: GroupCommit::default(),
-            writers: Writers::default(),
         }
     }
 }
@@ -198,8 +203,8 @@ impl Registry {
         Self::fixed([(name, RepositoryEntry::new(store, heads))])
     }
 
-    /// A registry serving the repositories in `repos_dir`, `owner/repo` at
-    /// `repos_dir/owner/repo`, each opened when first asked for (see
+    /// A registry serving the repositories in `repos_dir` (a
+    /// [`RepositoriesDirectory`]), each opened when first asked for (see
     /// [`DirectoryOpener`]).
     pub fn from_repos_dir(repos_dir: &Path, limits: RegistryLimits) -> Self {
         Self::with_opener(Arc::new(DirectoryOpener::new(repos_dir)), limits)
@@ -269,12 +274,14 @@ impl Registry {
         }
     }
 
-    /// Holds the repository `name` still, opening it if needed, so its files can be
-    /// copied ([`wheat_store::RepositoryDirectory::files`]): refuses new publishes
-    /// with a retryable error and waits for those writing to finish. A publish that
-    /// is uploading is waited for to its end, so bound this with a timeout; dropped
+    /// Holds the repository `name` still, with every repository of its fork network
+    /// (they share a store), opening it if needed, so their files can be copied
+    /// ([`wheat_store::NetworkDirectory::files`],
+    /// [`wheat_store::RepositoryDirectory::files`]): refuses new publishes with a
+    /// retryable error and waits for those writing to finish. A publish that is
+    /// uploading is waited for to its end, so bound this with a timeout; dropped
     /// before it is ready, it lets publishes in again. `None` when there is no such
-    /// repository. While held the repository is not closed, and fetches go on.
+    /// repository. While held the network's store is not closed, and fetches go on.
     pub async fn quiesce(&self, name: &str) -> Result<Option<Quiesced>, OpenError> {
         let Some(entry) = self.get(name).await? else {
             return Ok(None);
@@ -349,41 +356,47 @@ impl Registry {
     }
 }
 
-/// Opens `owner/repo` from `root/owner/repo` (a [`RepositoryDirectory`]). Hidden
-/// names, which hold repositories still being created or deleted, and directories
-/// that are not repositories are not found.
+/// Opens `owner/repo` from a [`RepositoriesDirectory`], sharing one store among the
+/// open repositories of each fork network. Names that are not `owner/repo`, hidden
+/// ones, and repositories still being created or deleted are not found.
 pub struct DirectoryOpener {
-    root: PathBuf,
+    repositories: RepositoriesDirectory,
+    networks: OpenNetworks<Uuid>,
 }
 
 impl DirectoryOpener {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            repositories: RepositoriesDirectory::new(root),
+            networks: OpenNetworks::default(),
+        }
     }
 }
 
 #[async_trait]
 impl RepositoryOpener for DirectoryOpener {
     async fn open(&self, name: &str) -> Result<Option<RepositoryEntry>, OpenError> {
-        let mut segments = name.split('/');
-        let (Some(owner), Some(repo), None) = (segments.next(), segments.next(), segments.next())
-        else {
-            return Ok(None);
-        };
-        if [owner, repo]
-            .iter()
-            .any(|segment| segment.is_empty() || segment.starts_with('.'))
-        {
-            return Ok(None);
-        }
-        let directory = RepositoryDirectory::new(self.root.join(owner).join(repo));
+        let repositories = self.repositories.clone();
+        let networks = self.networks.clone();
+        let name = name.to_owned();
         tokio::task::spawn_blocking(move || {
-            if !directory.is_repository() {
-                return Ok(None);
-            }
-            RepositoryEntry::open(directory.root())
-                .map(Some)
-                .map_err(|error| OpenError(Box::new(error)))
+            let location = match repositories.locate(&name) {
+                Ok(Some(location)) => location,
+                Ok(None) | Err(RepositoriesDirectoryError::InvalidName(_)) => return Ok(None),
+                Err(error) => return Err(OpenError(Box::new(error))),
+            };
+            let directory = repositories.network(location.network);
+            let network = networks
+                .open(&location.network, || {
+                    directory
+                        .open_store()
+                        .map(|store| Box::new(store) as Box<dyn RepositoryStore>)
+                })
+                .map_err(|error| OpenError(Box::new(error)))?;
+            Ok(Some(RepositoryEntry::in_network(
+                network,
+                directory.publications(location.repository),
+            )))
         })
         .await
         .map_err(|error| OpenError(Box::new(error)))?

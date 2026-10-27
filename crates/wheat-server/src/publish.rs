@@ -188,7 +188,7 @@ pub async fn handle_publish(
     // refused publish leaves nothing behind. Only a publish larger than the stage is
     // written early, in stage-sized batches, and what they hold is harmless if it
     // is then refused.
-    let staged = RepositoryStage::new(&*entry.store, STAGED_OBJECTS, STAGED_BYTES);
+    let staged = RepositoryStage::new(&*entry.network.store, STAGED_OBJECTS, STAGED_BYTES);
 
     // --- Object transfer phase ---
     if let Some(refusal) = receive_objects(
@@ -232,6 +232,7 @@ pub async fn handle_publish(
         .await
         .map_err(|e| ConnectionError::Internal(format!("failed to compare content sets: {e}")))?;
     let existing = entry
+        .network
         .content
         .existing_ids(&candidates)
         .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;

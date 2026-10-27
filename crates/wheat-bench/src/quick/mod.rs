@@ -20,6 +20,7 @@ mod content_repack_plan;
 mod cpus;
 mod deep_stack;
 mod fetch_incremental;
+mod fork_network;
 mod git;
 mod git_export_notes;
 mod git_pull_incremental;
@@ -80,6 +81,7 @@ pub const CASES: &[&str] = &[
     fetch_incremental::NAME,
     snapshot_export::NAME,
     repository_copy::NAME,
+    fork_network::NAME,
     import_resume_wide::NAME,
     materialize_wide::NAME,
     publish_contention::NAME,
@@ -241,6 +243,7 @@ pub fn run_case(
         fetch_incremental::NAME => fetch_incremental::run(&context),
         snapshot_export::NAME => snapshot_export::run(&context),
         repository_copy::NAME => repository_copy::run(&context),
+        fork_network::NAME => fork_network::run(&context),
         import_resume_wide::NAME => import_resume_wide::run(&context),
         materialize_wide::NAME => materialize_wide::run(&context),
         publish_contention::NAME => publish_contention::run(&context),

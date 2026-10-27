@@ -185,7 +185,7 @@ async fn propose<'a>(
     base: RepositoryHead,
     path: &str,
 ) -> (Stage<'a>, RepositoryEnvelopeId) {
-    let stage = Stage::new(&*server.entry.store, 65_536, 64 * 1024 * 1024);
+    let stage = Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024);
     let value = path.as_bytes().to_vec();
     stage
         .put_content([(VerifiedContent::new(value.clone()), None)])
@@ -281,7 +281,7 @@ async fn joined(
     earlier: RepositoryEnvelopeId,
     later: RepositoryEnvelopeId,
 ) -> RepositoryEnvelopeId {
-    let stage = Stage::new(&*server.entry.store, 65_536, 64 * 1024 * 1024);
+    let stage = Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024);
     RepositoryReader::new(&stage, stage.content())
         .union_envelopes(Some(base), later, earlier)
         .await
@@ -313,7 +313,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
 
     // A publish still receiving does not see the batch's objects as stored: if the
     // batch failed, it would publish without them.
-    let receiving = Stage::new(&*server.entry.store, 65_536, 64 * 1024 * 1024);
+    let receiving = Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024);
     assert_eq!(
         receiving.exists_many(&[first.into()]).await.unwrap(),
         [false]
@@ -366,7 +366,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         a_head.envelope,
         joined(&server, initial.envelope, with_a, b).await
     );
-    let reader = RepositoryReader::new(&server.objects, &server.entry.content);
+    let reader = RepositoryReader::new(&server.objects, &server.entry.network.content);
     let state = reader.envelope(a_head.envelope).await.unwrap().state;
     reader.validate_complete(state).await.unwrap();
 }
@@ -569,7 +569,7 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
 
 /// A stage with nothing in it, as a publish sent again has before its transfer.
 fn empty(server: &Server) -> Stage<'_> {
-    Stage::new(&*server.entry.store, 65_536, 64 * 1024 * 1024)
+    Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024)
 }
 
 /// The answer to a publish sent again with `key`, checked as a connection does
@@ -824,7 +824,7 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
 
     // Sent again, the publish is answered from the table's receipt, and the head is
     // not moved a second time.
-    let empty_stage = Stage::new(&*entry.store, 65_536, 64 * 1024 * 1024);
+    let empty_stage = Stage::new(&*entry.network.store, 65_536, 64 * 1024 * 1024);
     let again = commit::accept(
         &entry,
         &empty_stage,

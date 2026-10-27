@@ -17,9 +17,12 @@ listing the bucket, opening a packed store costing O(store), and `wheat gc` /
 server-authoritative remote maintenance.
 
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
-  protocol doc's two-tier storage keeps structure per fork network; there is no
-  library operation to create a fork that shares its parent's storage. Design and
-  phases: `docs/design/wheat-fork-networks.md`.
+  protocol doc's two-tier storage keeps structure per fork network. Networks share
+  one store handle in the registry, and `--repos-dir` keeps them as
+  `wheat_store::RepositoriesDirectory` lays them out, with `fork`; content is still
+  per network (phase 1), and adopting a standalone repository and deleting a fork
+  while its network is served are open. Design and phases:
+  `docs/design/wheat-fork-networks.md`.
 
 ## Desktop client (2026-10-22)
 

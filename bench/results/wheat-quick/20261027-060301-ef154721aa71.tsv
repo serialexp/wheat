@@ -1,0 +1,24 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261027-060301
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# fork_network	{"checkpoints":[1000,10000],"forks":20}
+# release	true
+# rev	ef154721aa71
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+fork_network.total.wall	25.609342201	s
+fork_network.total.peak_rss	132804608	bytes
+fork_network.n1000.fork.wall	0.008040677	s
+fork_network.n1000.store_bytes_added	0	bytes
+fork_network.n1000.repositories	21	count
+fork_network.n10000.fork.wall	0.008002636	s
+fork_network.n10000.store_bytes_added	0	bytes
+fork_network.n10000.repositories	41	count
+run.total_time	25.609966697	s
+process.peak_rss	132804608	bytes
+suite.cases	1	count
+suite.case_failures	0	count

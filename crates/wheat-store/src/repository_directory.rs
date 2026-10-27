@@ -27,12 +27,12 @@ use crate::{
     RepositoryPublicationError, RepositoryPublisher, sync_directory, sync_filesystem,
 };
 
-const MARKER_NAME: &str = "stage.marker";
+pub(crate) const MARKER_NAME: &str = "stage.marker";
 const MARKER: &[u8] = b"wheat-repository-stage-v1\n";
 const STAGE_INFIX: &str = ".wheat-stage-";
-const TOMBSTONE_INFIX: &str = ".wheat-deleted-";
+pub(crate) const TOMBSTONE_INFIX: &str = ".wheat-deleted-";
 const SWEPT_INFIX: &str = ".wheat-";
-const HIDDEN_SUFFIX: &str = ".tmp";
+pub(crate) const HIDDEN_SUFFIX: &str = ".tmp";
 
 #[derive(Debug, Error)]
 pub enum RepositoryDirectoryError {
@@ -99,10 +99,6 @@ impl RepositoryDirectory {
         self.head().is_file() && self.storage().join("packed").join("catalog.head").is_file()
     }
 
-    fn catalog_lock(&self) -> PathBuf {
-        self.storage().join("packed").join("catalog.lock")
-    }
-
     /// The files that make up the repository, for copying it: its head and its
     /// store's state, without locks, temporary files, or the store's locator index
     /// (rebuilt when a copy is opened). The list and the files agree only while
@@ -136,26 +132,7 @@ impl RepositoryDirectory {
         destination: &RepositoryDirectory,
     ) -> Result<Vec<RepositoryFile>, RepositoryDirectoryError> {
         let files = self.files()?;
-        let mut pending = destination.begin_create()?;
-        let stage = pending.directory().root().to_path_buf();
-        for file in &files {
-            let target = stage.join(&file.path);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut source = File::open(self.root.join(&file.path))?.take(file.len);
-            let copied = io::copy(&mut source, &mut File::create_new(&target)?)?;
-            if copied != file.len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("{} shrank while it was copied", file.path.display()),
-                )
-                .into());
-            }
-        }
-        sync_filesystem(&stage)?;
-        pending.install()?;
-        pending.sync_parent()?;
+        copy_files(&self.root, &files, destination)?;
         Ok(files)
     }
 
@@ -171,25 +148,9 @@ impl RepositoryDirectory {
         &self,
         label: &str,
     ) -> Result<RepositoryHead, RepositoryDirectoryError> {
-        let repository = Repository::new(Tree::new());
-        let labels = ViewLabelManifestRecord::new([(label, repository.base_view().id)])
-            .map_err(RepositoryDirectoryError::Label)?;
         let mut pending = self.begin_create()?;
         let stage = pending.directory().clone();
-        let head = {
-            let objects = stage.open_store()?;
-            let content = objects.content_store();
-            let publications = stage.publications();
-            let publisher = RepositoryPublisher::new(&objects, &content, &publications);
-            let closure = publisher.prepare(&repository).await?;
-            let envelope = publisher
-                .prepare_envelope(closure.state.id, &labels)
-                .await?;
-            let head = publisher.initialize_prepared_envelope(envelope).await?;
-            drop(content);
-            objects.close()?;
-            head
-        };
+        let head = initialize_empty(&stage.storage(), &stage.publications(), label).await?;
         sync_filesystem(stage.root())?;
         pending.install()?;
         pending.sync_parent()?;
@@ -207,29 +168,18 @@ impl RepositoryDirectory {
                 io::Error::new(io::ErrorKind::NotFound, "repository parent is missing").into(),
             );
         }
-        let lock = NameLock::acquire(parent.join(hidden_name(name, ".wheat.lock")))?;
+        let lock = NameLock::of(parent, name)?;
         if self.root.exists() {
             return Err(RepositoryDirectoryError::Exists(self.root.clone()));
         }
-        sweep(parent, name)?;
-        let stage = parent.join(hidden_unique(name, STAGE_INFIX));
-        fs::create_dir(&stage)?;
-        let pending = PendingRepository {
-            _lock: lock,
-            stage: Self::new(stage),
-            destination: self.root.clone(),
-            parent: parent.to_path_buf(),
-            installed: false,
-        };
-        write_marker(pending.stage.root())?;
-        Ok(pending)
+        PendingRepository::stage(lock, parent, name, self.root.clone())
     }
 
     /// Deletes the repository. Refuses while its store is open, here or in another
     /// process, and anything that is not a repository directory.
     pub fn delete(&self) -> Result<(), RepositoryDirectoryError> {
         let (parent, name) = self.parent_and_name()?;
-        let _lock = NameLock::acquire(parent.join(hidden_name(name, ".wheat.lock")))?;
+        let _lock = NameLock::of(parent, name)?;
         sweep(parent, name)?;
         if !self.root.exists() {
             return Err(RepositoryDirectoryError::Missing(self.root.clone()));
@@ -237,23 +187,9 @@ impl RepositoryDirectory {
         if !self.is_repository() {
             return Err(RepositoryDirectoryError::NotARepository(self.root.clone()));
         }
-        let catalog_lock = self.catalog_lock();
-        // The packed store holds this lock while open. Holding it through the rename
-        // keeps the store from being opened before it is gone.
-        // A copy has no lock file until its store is first opened.
-        let store_lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&catalog_lock)?;
-        match store_lock.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(RepositoryDirectoryError::InUse(self.root.clone()));
-            }
-            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
+        // Held through the rename, it keeps the store from being opened before it is
+        // gone.
+        let store_lock = lock_closed_store(&self.storage(), &self.root)?;
         write_marker(&self.root)?;
         let tombstone = parent.join(hidden_unique(name, TOMBSTONE_INFIX));
         fs::rename(&self.root, &tombstone)?;
@@ -278,6 +214,81 @@ impl RepositoryDirectory {
     }
 }
 
+/// Publishes, through `publications`, a first envelope over an empty tree in a new
+/// packed store in `storage`, in which `label` names the base view.
+pub(crate) async fn initialize_empty(
+    storage: &Path,
+    publications: &LocalPublicationStore,
+    label: &str,
+) -> Result<RepositoryHead, RepositoryDirectoryError> {
+    let repository = Repository::new(Tree::new());
+    let labels = ViewLabelManifestRecord::new([(label, repository.base_view().id)])
+        .map_err(RepositoryDirectoryError::Label)?;
+    let objects = PackedObjectStore::open(storage)?;
+    let content = objects.content_store();
+    let publisher = RepositoryPublisher::new(&objects, &content, publications);
+    let closure = publisher.prepare(&repository).await?;
+    let envelope = publisher
+        .prepare_envelope(closure.state.id, &labels)
+        .await?;
+    let head = publisher.initialize_prepared_envelope(envelope).await?;
+    drop(content);
+    objects.close()?;
+    Ok(head)
+}
+
+/// Copies `files`, listed under `source`, to `destination`, which must not exist yet:
+/// into a hidden stage, renamed into place once complete and durable.
+pub(crate) fn copy_files(
+    source: &Path,
+    files: &[RepositoryFile],
+    destination: &RepositoryDirectory,
+) -> Result<(), RepositoryDirectoryError> {
+    let mut pending = destination.begin_create()?;
+    let stage = pending.directory().root().to_path_buf();
+    for file in files {
+        let target = stage.join(&file.path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut reader = File::open(source.join(&file.path))?.take(file.len);
+        let copied = io::copy(&mut reader, &mut File::create_new(&target)?)?;
+        if copied != file.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} shrank while it was copied", file.path.display()),
+            )
+            .into());
+        }
+    }
+    sync_filesystem(&stage)?;
+    pending.install()?;
+    pending.sync_parent()?;
+    Ok(())
+}
+
+/// Takes the lock the packed store in `storage` holds while open, refusing with
+/// [`RepositoryDirectoryError::InUse`] (naming `owner`) while it is. A copy has no
+/// lock file until its store is first opened.
+pub(crate) fn lock_closed_store(
+    storage: &Path,
+    owner: &Path,
+) -> Result<File, RepositoryDirectoryError> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(storage.join("packed").join("catalog.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => {
+            Err(RepositoryDirectoryError::InUse(owner.to_path_buf()))
+        }
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 /// One file of a repository, as [`RepositoryDirectory::files`] lists it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryFile {
@@ -291,7 +302,7 @@ pub struct RepositoryFile {
 }
 
 impl RepositoryFile {
-    fn new(entry: &fs::DirEntry, path: PathBuf, immutable: bool) -> io::Result<Self> {
+    pub(crate) fn new(entry: &fs::DirEntry, path: PathBuf, immutable: bool) -> io::Result<Self> {
         Ok(Self {
             path,
             len: entry.metadata()?.len(),
@@ -302,7 +313,7 @@ impl RepositoryFile {
 
 /// Whether `name`, in a repository's root, is something other than its state: the
 /// head's lock, a stage's marker, or a head being written.
-fn is_repository_leftover(name: &OsStr) -> bool {
+pub(crate) fn is_repository_leftover(name: &OsStr) -> bool {
     name == "repository.lock"
         || name == MARKER_NAME
         || name.as_encoded_bytes().ends_with(HIDDEN_SUFFIX.as_bytes())
@@ -310,7 +321,7 @@ fn is_repository_leftover(name: &OsStr) -> bool {
 
 /// Adds the files of the packed store under `directory`, whose path under the
 /// repository is `relative`, to `files`.
-fn list_store_files(
+pub(crate) fn list_store_files(
     directory: &Path,
     relative: &Path,
     files: &mut Vec<RepositoryFile>,
@@ -345,6 +356,28 @@ pub struct PendingRepository {
 }
 
 impl PendingRepository {
+    /// Sweeps what crashes left under `name` in `parent`, whose lock `lock` is, and
+    /// makes an empty hidden stage there to be installed at `destination`.
+    pub(crate) fn stage(
+        lock: NameLock,
+        parent: &Path,
+        name: &OsStr,
+        destination: PathBuf,
+    ) -> Result<Self, RepositoryDirectoryError> {
+        sweep(parent, name)?;
+        let stage = parent.join(hidden_unique(name, STAGE_INFIX));
+        fs::create_dir(&stage)?;
+        let pending = Self {
+            _lock: lock,
+            stage: RepositoryDirectory::new(stage),
+            destination,
+            parent: parent.to_path_buf(),
+            installed: false,
+        };
+        write_marker(pending.stage.root())?;
+        Ok(pending)
+    }
+
     /// The stage, to build the repository in.
     #[must_use]
     pub fn directory(&self) -> &RepositoryDirectory {
@@ -389,14 +422,14 @@ fn hidden_name(name: &OsStr, suffix: &str) -> OsString {
 }
 
 /// `.{name}{infix}{a new id}.tmp`.
-fn hidden_unique(name: &OsStr, infix: &str) -> OsString {
+pub(crate) fn hidden_unique(name: &OsStr, infix: &str) -> OsString {
     let mut hidden = hidden_name(name, infix);
     hidden.push(Uuid::new_v4().to_string());
     hidden.push(HIDDEN_SUFFIX);
     hidden
 }
 
-fn write_marker(directory: &Path) -> io::Result<()> {
+pub(crate) fn write_marker(directory: &Path) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -408,7 +441,7 @@ fn write_marker(directory: &Path) -> io::Result<()> {
 }
 
 /// Removes the stages and tombstones of `name` a crash left in `parent`.
-fn sweep(parent: &Path, name: &OsStr) -> io::Result<()> {
+pub(crate) fn sweep(parent: &Path, name: &OsStr) -> io::Result<()> {
     let prefix = hidden_name(name, SWEPT_INFIX);
     let prefix = prefix.as_encoded_bytes();
     let mut removed = false;
@@ -462,11 +495,16 @@ fn has_exact_marker(candidate: &Path) -> bool {
 
 /// The lock one create or delete of a name holds.
 #[derive(Debug)]
-struct NameLock {
+pub(crate) struct NameLock {
     _file: File,
 }
 
 impl NameLock {
+    /// The lock of `name` in `parent`: `.{name}.wheat.lock`.
+    pub(crate) fn of(parent: &Path, name: &OsStr) -> Result<Self, RepositoryDirectoryError> {
+        Self::acquire(parent.join(hidden_name(name, ".wheat.lock")))
+    }
+
     fn acquire(path: PathBuf) -> Result<Self, RepositoryDirectoryError> {
         let file = OpenOptions::new()
             .create(true)

@@ -1059,9 +1059,12 @@ Gothab looks repositories up itself through a `RepositoryOpener`
 `--repos-dir` uses `DirectoryOpener`. A repository is opened when a session first
 asks for it, and two asking at once open it once. A session holds its entry while it
 runs, which is the lease: one nothing holds is closed once idle for
-`RegistryLimits::idle`, or, past `max_open`, least recently used first. Closing
-drops its stores, releasing `catalog.lock`, so a move to another host or a
-maintenance process can open it. An embedder serving through
+`RegistryLimits::idle`, or, past `max_open`, least recently used first. The
+repositories of a fork network share one handle to its store
+(`wheat_server::network`); closing the last of them closes the store, releasing
+`catalog.lock`, so a move to another host or a maintenance process can open it. An
+opener shares the handle through `OpenNetworks`; `--repos-dir` keeps networks as
+`wheat_store::RepositoriesDirectory` lays them out (`wheat-fork-networks.md`). An embedder serving through
 `wheat_server::connection` calls `Registry::close_idle` itself; `server::run` does
 it on a timer. When a repository's primary moves, the old host is fenced in its
 `HeadStore`: a publish is acknowledged only after `HeadStore::advance` moved the

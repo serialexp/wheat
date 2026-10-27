@@ -546,7 +546,7 @@ async fn run_session(
                     continue;
                 }
                 // Held until the publish is answered: a quiesce waits for it.
-                let Some(_writing) = entry.writers.begin() else {
+                let Some(_writing) = entry.network.writers.begin() else {
                     info!(peer = %peer, repo = %repository, "publish refused: repository quiesced");
                     send_error(
                         ws,

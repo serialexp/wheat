@@ -39,12 +39,13 @@ pub async fn handle_fetch(
 ) -> Result<(), ConnectionError> {
     let op_id = req.op_id;
     let want = digest_to_object_id(&req.want_envelope)?;
-    if !is_envelope(&entry.store, want).await? {
+    if !is_envelope(&entry.network.store, want).await? {
         let message = "the wanted envelope is not in this repository";
         return send_object_error(ws, op_id, NOT_FOUND, message, want).await;
     }
     let since = digest_to_object_id(&req.since_envelope)?;
-    let since = if *since.as_bytes() == [0; 32] || !is_envelope(&entry.store, since).await? {
+    let since = if *since.as_bytes() == [0; 32] || !is_envelope(&entry.network.store, since).await?
+    {
         None
     } else {
         Some(RepositoryEnvelopeId::from_digest(*since.as_bytes()))
@@ -129,8 +130,12 @@ async fn push(
     since: Option<RepositoryEnvelopeId>,
     want: RepositoryEnvelopeId,
 ) -> Result<Option<u64>, ConnectionError> {
-    let mut delta =
-        StructuralDelta::new(&entry.store, since, want, StructuralDeltaLimits::default());
+    let mut delta = StructuralDelta::new(
+        &entry.network.store,
+        since,
+        want,
+        StructuralDeltaLimits::default(),
+    );
     let mut batch = BatchSender::new(op_id);
     let mut pushed = 0u64;
     while let Some(step) = delta
@@ -267,7 +272,7 @@ async fn answer_want(
     let mut bytes = 0;
     for (index, digest) in wanted.ids.iter().enumerate() {
         let id = digest_to_object_id(digest)?;
-        let object = match entry.store.get(id).await {
+        let object = match entry.network.store.get(id).await {
             Ok(object) => object,
             Err(ObjectStoreError::Missing(_)) => {
                 let message = "a wanted object is not in this repository";
@@ -334,7 +339,11 @@ pub async fn handle_content_fetch(
     }
 
     let mut batch = ContentBatcher::new(op_id);
-    match entry.content.get_many_bounded(&ids, MAX_CONTENT_CHUNK_SIZE) {
+    match entry
+        .network
+        .content
+        .get_many_bounded(&ids, MAX_CONTENT_CHUNK_SIZE)
+    {
         Ok(items) => {
             for (id, data) in items {
                 if let Some(full) = batch.push(content_digest(id), data) {
@@ -345,14 +354,20 @@ pub async fn handle_content_fetch(
         Err(error) => {
             debug!(op_id, %error, "content fetch: bulk read failed, reading one at a time");
             for &id in &ids {
-                let data = match entry.content.get_bounded(id, MAX_CONTENT_CHUNK_SIZE) {
+                let data = match entry
+                    .network
+                    .content
+                    .get_bounded(id, MAX_CONTENT_CHUNK_SIZE)
+                {
                     Ok(data) => {
                         if let Some(full) = batch.push(content_digest(id), data) {
                             send(ws, &full).await?;
                         }
                         continue;
                     }
-                    Err(wheat_store::ContentStoreError::TooLarge { .. }) => entry.content.get(id),
+                    Err(wheat_store::ContentStoreError::TooLarge { .. }) => {
+                        entry.network.content.get(id)
+                    }
                     Err(error) => Err(error),
                 };
                 match data {

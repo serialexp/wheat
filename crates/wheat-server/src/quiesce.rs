@@ -43,6 +43,11 @@ impl Writers {
         })
     }
 
+    /// Whether a [`Quiesced`] holds the repository.
+    pub(crate) fn is_quiesced(&self) -> bool {
+        self.state.borrow().quiesced > 0
+    }
+
     /// Starts writes on behalf of publishes already writing (the group committer),
     /// which a quiesce waits for rather than refuses.
     pub(crate) fn continue_writing(&self) -> Writing {
@@ -79,9 +84,13 @@ impl Quiesced {
     /// [`Registry::quiesce`](crate::registry::Registry::quiesce) finds the entry by
     /// name.
     pub async fn hold(entry: Arc<RepositoryEntry>) -> Self {
-        entry.writers.state.send_modify(|state| state.quiesced += 1);
+        entry
+            .network
+            .writers
+            .state
+            .send_modify(|state| state.quiesced += 1);
         let quiesced = Self { entry };
-        let mut state = quiesced.entry.writers.state.subscribe();
+        let mut state = quiesced.entry.network.writers.state.subscribe();
         // The sender lives in the entry this holds, so the wait cannot fail.
         let _ = state.wait_for(|state| state.writing == 0).await;
         quiesced
@@ -103,6 +112,7 @@ impl std::fmt::Debug for Quiesced {
 impl Drop for Quiesced {
     fn drop(&mut self) {
         self.entry
+            .network
             .writers
             .state
             .send_modify(|state| state.quiesced -= 1);
