@@ -1,7 +1,9 @@
 # Wheat fork networks — Design
 
-Status: draft, not yet implemented. Decided: one structural pool per fork network
-and one instance-wide content store (Bart, 2026-10-27). Open: the questions below.
+Status: draft, not yet implemented. Decided (Bart, 2026-10-27): one structural pool
+per fork network, one instance-wide content store, a hash is a read capability,
+publishes upload only what the store lacks, and a fork starts with all its parent's
+labels.
 Owner: bart
 Last updated: 2026-10-27
 
@@ -17,24 +19,21 @@ and move them from Outstanding to Done.
   fork, pool per network, layered stores).
 - [x] **Decision — content (2026-10-27).** One content store for the whole instance
   (option C3 of three: per repository, per network, instance-wide).
+- [x] **Decision — fetch (2026-10-27).** Open question 1, option C: a hash is a
+  capability. See [Decisions](#decisions-2026-10-27).
+- [x] **Decision — publish (2026-10-27).** Open question 2, option B: upload only
+  what the store lacks.
+- [x] **Decision — labels (2026-10-27).** Open question 3: a fork starts with all of
+  its parent's labels, so creating one writes nothing to the pool.
 
 ### Outstanding
 
-- [ ] **Open question 1 — what a fetch may read from the pool.** See
-  [Fetch](#fetch).
-- [ ] **Open question 2 — what a publish must upload.** See [Publish](#publish).
-- [ ] **Open question 3 — which labels a fork starts with.** See
-  [Creating a fork](#creating-a-fork).
 - [ ] **Phase 0 — networks in the registry.** An opener hands out entries whose
   stores are one shared handle per network; `Registry::quiesce` holds a network.
 - [ ] **Phase 1 — the content tier apart.** Entries read and write content through
   an instance-wide `ContentStore` (Gothab's blob store through
   `ContentStore::over_blobs`, a directory for the standalone server); the network
   pool holds structure only.
-- [ ] **Phase 2 — reads limited to the repository.** Content fetch checks
-  `state.required_content`; object fetch per open question 1.
-- [ ] **Phase 3 — publishes prove what they add.** Per open question 2, for
-  objects and content.
 - [ ] **Phase 4 — creating a fork.** A library operation and the registry call a
   host makes; tests for a fork of a fork and for a private fork's isolation.
 - [ ] **Phase 5 — copying a network.** Quiesce and copy a network, with every head
@@ -42,6 +41,8 @@ and move them from Outstanding to Done.
 - [ ] **Defer — network GC.** Marking every head in a network and every network for
   content is the open `wheat gc` / server-authoritative maintenance work in
   `TODO.md`.
+- [ ] **Superseded — phases 2 and 3.** Reads limited to the repository's closure
+  and publishes proving possession are not needed after the 2026-10-27 decisions.
 - [ ] **Defer — detaching a fork.** Copying one repository's closure into a network
   of its own (for a visibility change, say).
 
@@ -212,6 +213,32 @@ quiesce-and-copy (`crates/wheat-server/src/quiesce.rs`,
 See the Outstanding list. Phase 0 and 1 can land before the open questions are
 answered; phases 2 and 3 depend on them; phase 4 needs 2 and 3 so that no fork is
 created while sharing still leaks.
+
+After the decisions below, phases 2 and 3 fall away: phase 4 follows phases 0 and 1.
+
+## Decisions (2026-10-27)
+
+**Fetch: a hash is a capability (option C).** Bart's reasoning: an object's ID is
+the hash of its bytes, and it appears only inside the objects that refer to it, so a
+client that can name an object has already been given something that refers to it.
+Nobody found a practical way to learn a private fork's hash without that fork's
+content. The two cases looked at, neither of which reveals anything new:
+
+- Someone who lost access to a fork keeps the hashes they saw, and the bytes too.
+- A client that guesses a blob's exact bytes can hash them and ask whether the
+  instance holds them. It learns that the blob exists somewhere, not where, and it
+  had the bytes already. Publishing (below) answers the same question.
+
+So fetch serves any object of the network's pool and any blob of the content store,
+as it does today, and the rule in `wheat-native-protocol.md` that a client of fork A
+cannot read objects only reachable from private fork B is withdrawn. "What sharing
+breaks today" above is the analysis this decision answers.
+
+**Publish: only what the store lacks (option B).** By the same reasoning, a client
+naming an object or blob it does not send must have had it, so the server asks for
+what the store lacks, as today, and no repository-level check is added.
+
+**Labels: all of the parent's.** A fork's head names the parent's envelope.
 
 ## References
 

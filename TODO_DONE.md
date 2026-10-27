@@ -243,6 +243,9 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Found while scoping the Scion lessons (2026-10-15)
 
+- `[x]` **Content fetch checks no reachability.** Withdrawn (Bart, 2026-10-27): a
+  hash is a read capability, so serving any stored `ContentId` is intended. See
+  `docs/design/wheat-fork-networks.md`, "Decisions".
 - `[x]` **`catalog.head` and `repack.intent` are hand-encoded.** Both are BinSchema
   records now, along with six more hand-built layouts the new guard test found: the
   repository head, the content envelope header, the snapshot and ownership manifests,

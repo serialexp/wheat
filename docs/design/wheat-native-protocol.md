@@ -1220,6 +1220,10 @@ This split cleanly separates the two concerns:
   information. Structural objects are fork-network-scoped and auth-gated
   per repository within the network (a client authenticated to fork A
   cannot read structural objects only reachable from private fork B).
+  Withdrawn 2026-10-27: a hash is a read capability, since only something
+  that refers to an object names it; see
+  [`wheat-fork-networks.md`](wheat-fork-networks.md#decisions-2026-10-27).
+  The content gating above falls with it.
 - **Dedup** lives in the content tier. Same bytes = same hash = stored
   once, instance-wide. No fork-network coordination needed for content
   dedup. The authorization check happens at the structural layer above.

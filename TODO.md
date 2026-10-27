@@ -12,13 +12,14 @@ a shared object store for blobs; Gothab's server does authentication and reposit
 authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
 formats freeze. Items already listed elsewhere that this also needs: blocking disk work on async threads, chunked uploads reassembled in
-memory, the fetch walk's visit cap, content fetch reachability, `existing_ids`
+memory, the fetch walk's visit cap, `existing_ids`
 listing the bucket, opening a packed store costing O(store), and `wheat gc` /
 server-authoritative remote maintenance.
 
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network; there is no
-  library operation to create a fork that shares its parent's storage.
+  library operation to create a fork that shares its parent's storage. Design and
+  phases: `docs/design/wheat-fork-networks.md`.
 
 ## Desktop client (2026-10-22)
 
@@ -133,11 +134,6 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
 See `docs/design/wheat-lessons-from-scion.md` for the planned work; these are gaps
 between `wheat-native-protocol.md` and the code.
 
-- `[ ]` **Content fetch checks no reachability.** `handle_content_fetch`
-  (`crates/wheat-server/src/fetch.rs`) serves any `ContentId` in the repository
-  entry's content store. The design says content is served only when the client's
-  authorized graph references it. Check whether a content store can be shared between
-  repositories; if so this leaks content across them.
 - `[ ]` **Protocol doc claims chunk-level resume.** `wheat-native-protocol.md`,
   "Resolved design questions", says transfers resume from the last received chunk.
   Nothing does; a partly received chunked blob is fetched again. Correct the doc or
