@@ -9058,6 +9058,284 @@ impl From<RepositoryLocationV1Input> for RepositoryLocationV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct BundleFileV1 {
+    pub path: std::string::String,
+    pub length: u64,
+    pub digest: Digest256,
+}
+
+impl BundleFileV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_varlength(self.path.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.path.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u64_be(self.length);
+        self.digest.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let path = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u64_be()?;
+        let digest = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self {
+            path,
+            length,
+            digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BundleManifestV1Input {
+    pub network: Uuid128,
+    pub repositories: Vec<Uuid128>,
+    pub files: Vec<BundleFileV1>,
+    pub content_count: u64,
+    pub content_bytes: u64,
+    pub content_chunks: Vec<Digest256>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BundleManifestV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub network: Uuid128,
+    pub repositories: Vec<Uuid128>,
+    pub files: Vec<BundleFileV1>,
+    pub content_count: u64,
+    pub content_bytes: u64,
+    pub content_chunks: Vec<Digest256>,
+}
+
+pub type BundleManifestV1 = BundleManifestV1Output;
+
+impl BundleManifestV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464356162);
+        encoder.write_u16_be(1);
+        self.network.encode_into(encoder)?;
+        encoder.write_u32_be(self.repositories.len() as u32);
+        for item in &self.repositories {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.files.len() as u32);
+        for item in &self.files {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u64_be(self.content_count);
+        encoder.write_u64_be(self.content_bytes);
+        encoder.write_u32_be(self.content_chunks.len() as u32);
+        for item in &self.content_chunks {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl BundleManifestV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464356162u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464356162, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let network = Uuid128::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut repositories = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
+        for _ in 0..length {
+            let item = Uuid128::decode_with_decoder(decoder)?;
+            repositories.push(item);
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut files = Vec::with_capacity(decoder.capacity_hint_sized(length, 41));
+        for _ in 0..length {
+            let item = BundleFileV1::decode_with_decoder(decoder)?;
+            files.push(item);
+        }
+        let content_count = decoder.read_u64_be()?;
+        let content_bytes = decoder.read_u64_be()?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut content_chunks = Vec::with_capacity(decoder.capacity_hint_sized(length, 32));
+        for _ in 0..length {
+            let item = Digest256::decode_with_decoder(decoder)?;
+            content_chunks.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            network,
+            repositories,
+            files,
+            content_count,
+            content_bytes,
+            content_chunks,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        BundleManifestV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        BundleManifestV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<BundleManifestV1Output> for BundleManifestV1Input {
+    fn from(o: BundleManifestV1Output) -> Self {
+        Self {
+            network: o.network,
+            repositories: o.repositories,
+            files: o.files,
+            content_count: o.content_count,
+            content_bytes: o.content_bytes,
+            content_chunks: o.content_chunks,
+        }
+    }
+}
+
+impl From<BundleManifestV1Input> for BundleManifestV1Output {
+    fn from(i: BundleManifestV1Input) -> Self {
+        Self {
+            magic: 1464356162u32,
+            version: 1u16,
+            network: i.network,
+            repositories: i.repositories,
+            files: i.files,
+            content_count: i.content_count,
+            content_bytes: i.content_bytes,
+            content_chunks: i.content_chunks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BundleContentChunkV1Input {
+    pub contents: Vec<InventoryEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BundleContentChunkV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub contents: Vec<InventoryEntryV1>,
+}
+
+pub type BundleContentChunkV1 = BundleContentChunkV1Output;
+
+impl BundleContentChunkV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464353347);
+        encoder.write_u16_be(1);
+        encoder.write_u32_be(self.contents.len() as u32);
+        for item in &self.contents {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl BundleContentChunkV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464353347u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464353347, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut contents = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
+        for _ in 0..length {
+            let item = InventoryEntryV1::decode_with_decoder(decoder)?;
+            contents.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            contents,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        BundleContentChunkV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        BundleContentChunkV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<BundleContentChunkV1Output> for BundleContentChunkV1Input {
+    fn from(o: BundleContentChunkV1Output) -> Self {
+        Self {
+            contents: o.contents,
+        }
+    }
+}
+
+impl From<BundleContentChunkV1Input> for BundleContentChunkV1Output {
+    fn from(i: BundleContentChunkV1Input) -> Self {
+        Self {
+            magic: 1464353347u32,
+            version: 1u16,
+            contents: i.contents,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoreMetadataV1Input {
     pub store_id: Uuid128,
 }

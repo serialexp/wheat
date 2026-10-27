@@ -560,6 +560,104 @@ pub fn encode_git_import_source<'a>(
     )
 }
 
+/// A file of a bundle's structure; see `BundleFileV1` in the schema.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundleFileRecord {
+    /// Relative to the bundle's `structure/` directory, `/`-separated.
+    pub path: String,
+    pub length: u64,
+    pub digest: [u8; 32],
+}
+
+/// An exported fork network's manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundleManifestRecord {
+    pub network: Uuid,
+    /// Sorted.
+    pub repositories: Vec<Uuid>,
+    /// Sorted by path.
+    pub files: Vec<BundleFileRecord>,
+    pub content_count: u64,
+    /// The content's logical bytes.
+    pub content_bytes: u64,
+    /// The digest of each content list chunk, in order.
+    pub content_chunks: Vec<[u8; 32]>,
+}
+
+pub fn encode_bundle_manifest(record: &BundleManifestRecord) -> Result<Vec<u8>, StoreRecordError> {
+    fits_u32_count(record.repositories.len())?;
+    fits_u32_count(record.files.len())?;
+    fits_u32_count(record.content_chunks.len())?;
+    encoded(
+        wire::BundleManifestV1Input {
+            network: identity(record.network),
+            repositories: record.repositories.iter().copied().map(identity).collect(),
+            files: record
+                .files
+                .iter()
+                .map(|file| wire::BundleFileV1 {
+                    path: file.path.clone(),
+                    length: file.length,
+                    digest: digest(file.digest),
+                })
+                .collect(),
+            content_count: record.content_count,
+            content_bytes: record.content_bytes,
+            content_chunks: record.content_chunks.iter().copied().map(digest).collect(),
+        }
+        .encode(),
+    )
+}
+pub fn decode_bundle_manifest(bytes: &[u8]) -> Result<BundleManifestRecord, StoreRecordError> {
+    let w = wire::BundleManifestV1::decode(bytes).map_err(decode_error)?;
+    let reencoded = w.encode();
+    let record = BundleManifestRecord {
+        network: identity_domain(w.network, "network ID")?,
+        repositories: w
+            .repositories
+            .into_iter()
+            .map(|id| identity_domain(id, "repository ID"))
+            .collect::<Result<_, _>>()?,
+        files: w
+            .files
+            .into_iter()
+            .map(|file| {
+                Ok(BundleFileRecord {
+                    path: file.path,
+                    length: file.length,
+                    digest: digest_array(file.digest)?,
+                })
+            })
+            .collect::<Result<_, StoreRecordError>>()?,
+        content_count: w.content_count,
+        content_bytes: w.content_bytes,
+        content_chunks: w
+            .content_chunks
+            .into_iter()
+            .map(digest_array)
+            .collect::<Result<_, _>>()?,
+    };
+    checked(bytes, record, reencoded)
+}
+
+/// Encodes one chunk of a bundle's content list.
+pub fn encode_bundle_content_chunk(
+    contents: impl ExactSizeIterator<Item = InventoryRecord>,
+) -> Result<Vec<u8>, StoreRecordError> {
+    encoded(
+        wire::BundleContentChunkV1Input {
+            contents: inventory_wire(contents)?,
+        }
+        .encode(),
+    )
+}
+pub fn decode_bundle_content_chunk(bytes: &[u8]) -> Result<Vec<InventoryRecord>, StoreRecordError> {
+    let w = wire::BundleContentChunkV1::decode(bytes).map_err(decode_error)?;
+    let reencoded = w.encode();
+    let contents = inventory_domain(w.contents)?;
+    checked(bytes, contents, reencoded)
+}
+
 fn identity(value: Uuid) -> wire::Uuid128 {
     uuid(*value.as_bytes())
 }

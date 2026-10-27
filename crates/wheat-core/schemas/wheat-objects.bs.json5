@@ -1149,6 +1149,43 @@
       ],
     },
 
+    // A file of an exported network's structure, under `structure/` in the bundle:
+    // its path there, its length, and the BLAKE3 digest of its bytes.
+    BundleFileV1: {
+      sequence: [
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "length", type: "uint64" },
+        { name: "digest", type: "Digest256" },
+      ],
+    },
+    // `bundle.manifest`: an exported fork network. `repositories` are its
+    // repositories' IDs, sorted; `files` its structure's files by path; the content
+    // its heads reach is listed in `content_chunks.len()` chunk files, in ID order,
+    // each named by the BLAKE3 digest of its BundleContentChunkV1 bytes. `content_count`
+    // and `content_bytes` (logical) total the lists. Written last, so a bundle with
+    // a manifest is complete.
+    BundleManifestV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484d42 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "network", type: "Uuid128" },
+        { name: "repositories", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "Uuid128" } },
+        { name: "files", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "BundleFileV1" } },
+        { name: "content_count", type: "uint64" },
+        { name: "content_bytes", type: "uint64" },
+        { name: "content_chunks", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "Digest256" } },
+      ],
+    },
+    // One chunk of a bundle's content list (`content.list/<n>`): content IDs in
+    // order with their logical lengths.
+    BundleContentChunkV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484243 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "contents", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
+      ],
+    },
+
     // Workspace and store control files that wheat-client keeps. Paths are UTF-8.
 
     // `store.meta`: the store's identity.

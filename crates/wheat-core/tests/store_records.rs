@@ -575,3 +575,58 @@ fn client_control_records_have_distinct_magics() {
     assert!(decode_workspace_pin(&records[1]).is_err());
     assert!(decode_workspace_metadata(&records[2]).is_err());
 }
+
+#[test]
+fn bundle_records_round_trip_and_refuse_noncanonical_bytes() {
+    let manifest = BundleManifestRecord {
+        network: id(1),
+        repositories: vec![id(2), id(3)],
+        files: vec![
+            BundleFileRecord {
+                path: "storage/packed/catalog.head".into(),
+                length: 7,
+                digest: [4; 32],
+            },
+            BundleFileRecord {
+                path: "heads/ab/repository.head".into(),
+                length: 48,
+                digest: [5; 32],
+            },
+        ],
+        content_count: 3,
+        content_bytes: 600,
+        content_chunks: vec![[6; 32], [7; 32]],
+    };
+    let bytes = encode_bundle_manifest(&manifest).unwrap();
+    assert_eq!(decode_bundle_manifest(&bytes).unwrap(), manifest);
+    let [trailing, version] = tampered(&bytes);
+    assert_eq!(
+        decode_bundle_manifest(&trailing),
+        Err(StoreRecordError::NonCanonicalEncoding)
+    );
+    assert!(matches!(
+        decode_bundle_manifest(&version),
+        Err(StoreRecordError::Decode(_))
+    ));
+    let nil = BundleManifestRecord {
+        repositories: vec![uuid::Uuid::nil()],
+        ..manifest
+    };
+    assert_eq!(
+        decode_bundle_manifest(&encode_bundle_manifest(&nil).unwrap()),
+        Err(StoreRecordError::NilIdentity("repository ID"))
+    );
+
+    let contents = inventory(&[1, 2, 3]);
+    let bytes = encode_bundle_content_chunk(contents.iter().copied()).unwrap();
+    assert_eq!(decode_bundle_content_chunk(&bytes).unwrap(), contents);
+    let [trailing, version] = tampered(&bytes);
+    assert_eq!(
+        decode_bundle_content_chunk(&trailing),
+        Err(StoreRecordError::NonCanonicalEncoding)
+    );
+    assert!(matches!(
+        decode_bundle_content_chunk(&version),
+        Err(StoreRecordError::Decode(_))
+    ));
+}
