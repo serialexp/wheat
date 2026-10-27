@@ -442,3 +442,7 @@ operation; repack is independently useful and may run without either squash or G
   `PhysicalCatalogSnapshotV1`. Decide whether the remote store moves to snapshots
   too (one catalog format). Its `{prefix}/catalog/head` is a `RemoteCatalogHeadV1`
   record now (2026-10-26).
+- `[ ]` **Network export validation costs ~2 ms a change.** `StructureExport::finish`
+  runs `validate_complete` on every distinct state (about 20 s of a 27 s export at
+  10,000 changes, 2026-10-28). Bart kept it for now: make it faster, or drop it once
+  there is enough confidence the export is right (`network_export` bench case).
