@@ -1,6 +1,6 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
-Status: draft, not yet implemented; open questions below await Bart's review.
+Status: designed, not yet implemented; Bart answered the open questions on 2026-10-27.
 Owner: bart
 Last updated: 2026-10-27
 
@@ -17,22 +17,31 @@ and move them from Outstanding to Done.
 - [x] **Decision — run inside the server (2026-10-27).** Import and GC run in the
   serving process, which holds the content store's lock, rather than with the server
   stopped.
+- [x] **Decision — admin surface (2026-10-27).** Open question 1, option A: admin
+  messages on the protocol, an admin flag per principal, `wheat admin`.
+- [x] **Decision — transport (2026-10-27).** Open question 2: one bundle format,
+  structure apart from content, carried both ways: a directory on disk and an
+  S3-compatible bucket, as Gothab moves Git repositories.
+- [x] **Decision — GC holds writers (2026-10-27).** Open question 3, option A.
+- [x] **Decision — superseded envelopes are collected (2026-10-27).** Open question
+  4, option A.
+- [x] **Decision — import keeps IDs (2026-10-27).** Open question 5, option A.
 
 ### Outstanding
 
-- [ ] **Open question 1 — the admin surface.** See [Admin surface](#admin-surface).
-- [ ] **Open question 2 — how a bundle travels.** See [Moving a network](#moving-a-network).
-- [ ] **Open question 3 — GC and concurrent publishes.** See [Concurrency](#concurrency).
-- [ ] **Open question 4 — superseded head envelopes.** See [Superseded envelopes](#superseded-envelopes).
-- [ ] **Open question 5 — identities on import.** See [Importing](#importing).
-- [ ] **Phase 0 — admin surface.** The chosen surface, an `Admin` capability, and
-  the server-side operation runner (one maintenance operation at a time per
-  repositories directory).
-- [ ] **Phase 1 — export.** A quiesced network written as a bundle: the pool's
-  files, every head, and the content its heads reach. Bench case at 10,000 changes.
-- [ ] **Phase 2 — import and adoption.** A bundle, or a `RepositoryDirectory` from
-  `wheat import`, placed in a repositories directory with names; its content moved
-  into the content store. Closes the fork-networks doc's adoption item.
+- [ ] **Phase 0 — admin surface.** Admin request and response messages, the `admin`
+  principal flag in `[auth]`, the server's operation runner (one maintenance
+  operation at a time per repositories directory) and `wheat admin`.
+- [ ] **Phase 1 — export to a directory.** A quiesced network written as a bundle:
+  its structure (pool files, every head, the manifest), its content list, and the
+  listed content in a store inside the bundle. Bench case at 10,000 changes.
+- [ ] **Phase 2 — import and adoption from a directory.** A bundle, or a
+  `RepositoryDirectory` from `wheat import`, placed in a repositories directory under
+  its own IDs with names; its content added to the content store. Closes the
+  fork-networks doc's adoption item.
+- [ ] **Phase 2b — the bucket transport.** Export to and import from an
+  S3-compatible bucket: immutable store files once by name, content once by ID,
+  shared by every export to the bucket.
 - [ ] **Phase 3 — deleting a served network or fork.** Close the network in the
   registry, then `RepositoriesDirectory::delete`. Closes the fork-networks doc's
   "deleting a fork while its network is served" item, and completes a move (export,
@@ -127,40 +136,59 @@ delete or collect. Options:
 Whatever the surface, the server runs one maintenance operation at a time per
 repositories directory, and reports progress and the counts below.
 
+Bart chose A (2026-10-27). Operations run in the server and outlive the request that
+started them: a request starts one and returns its ID; another asks for its progress
+and result, so a dropped connection loses nothing.
+
 ## Moving a network
 
 A move is export, import elsewhere, then delete here. The unit is a **bundle**: a
-self-contained network, the shape a `RepositoryDirectory` already has with any number
-of heads.
+network's **structure** (its pool's files and every head), the list of **content**
+its heads reach, and that content, kept apart so a host whose content store is
+already shared (Gothab's blob store) moves only the structure. This is how Gothab
+moves Git repositories (`gothab-storage`'s structural archive, `blob_refs.txt`, and
+blobs once each under `blobs/<hash>`; nothing goes from host to host).
 
 ```text
-<bundle>/
-  storage/                          packed store: the pool's objects and the content
-  heads/<repository>/repository.head
-  bundle.manifest                   BinSchema: network ID, each repository's ID, format
+<bundle>/                                     a directory, or a prefix in a bucket
+  bundle.manifest                             BinSchema: format, network ID, each
+                                              repository's ID, content list digest
+  structure/storage/                          the pool's files
+  structure/heads/<repository>/repository.head
+  content.list                                BinSchema: the ContentIds reached, sorted
+  content/                                    the listed content
 ```
 
+In a directory, `content/` is a packed store. In a bucket, content is one object per
+blob, `<prefix>/content/<2 hex>/<rest>` (the key `remote_packed` already uses),
+shared by every export to the bucket so a blob is uploaded once; immutable store
+files (`RepositoryFile::immutable`: sealed segments, catalog snapshots, content
+generations) are likewise keyed by name under `<prefix>/networks/<network>/files/`
+and uploaded once, while the manifest, `catalog.head`, the active segment and the
+heads go under `<prefix>/networks/<network>/exports/<export>/`, the manifest last.
+
 `RepositoryDirectory` (what `wheat import` writes) is a bundle with one head at the
-root and no manifest; import accepts both.
+root, content inside its store and no manifest; import accepts it as well.
 
 ### Exporting
 
 1. Quiesce the network, so its pool and heads stay still. Fetches go on.
-2. Read every head.
-3. Copy the pool's files into a hidden stage, as `NetworkDirectory::copy_to` does.
-4. Open the staged store and write into its content side every blob the heads'
-   states list in `required_content`, read through the content store as logical
-   bytes (delta chains resolved), so the bundle carries no delta bases from outside
-   it. Content is immutable, so this step need not hold publishes to other networks.
-   The union of the heads' sets is streamed one head at a time, skipping what the
-   staged store already holds.
-5. Release the quiesce once the heads and pool are copied (after step 3; step 4
-   reads only content).
-6. Validate each head (`validate_complete`), write the manifest, sync, and rename
-   the stage into place.
+2. Read every head and copy the structure: the pool's files, as
+   `NetworkDirectory::copy_to` lists them, and the heads.
+3. Release the quiesce. What follows reads only content, which is immutable, and
+   the copied structure.
+4. Write `content.list`: the union of every head's `required_content`, streamed with
+   `ContentSetStore::cursor` and merged through a disk-backed sort, so memory is
+   bounded however many blobs the network reaches.
+5. Copy the listed content as logical bytes (delta chains resolved), so the bundle
+   holds no delta base from outside it; skip what the destination already holds
+   (the bucket's keys, checked in batches).
+6. Validate each head against the structure and content (`validate_complete`),
+   write the manifest last, and sync (a directory is staged and renamed into
+   place).
 
 Cost: O(pool bytes) copied plus O(content reached) read and written; memory bounded
-by the batch size. The network refuses publishes only for steps 1–3.
+by the batch size. The network refuses publishes only for steps 1–2.
 
 **Open question 2.** How a bundle gets to the other server:
 
@@ -171,20 +199,26 @@ by the batch size. The network refuses publishes only for steps 1–3.
   the client, import accepts them from it, resumable by file. Needs option 1A;
   larger protocol surface.
 
+Bart asked how Gothab moves Git repositories (above), and chose (2026-10-27) one
+bundle format with structure apart from content, and two transports: a directory
+(phase 1, 2) and an S3-compatible bucket (phase 2b). Streaming over the admin
+connection is not built.
+
 ### Importing
 
-1. Validate the bundle: every head against its store (`validate_complete`), so a
-   damaged bundle is refused before anything is placed.
-2. Stream its content into the content store in batches, skipping what is there
+1. Read the manifest and validate the bundle: every head against its structure and
+   content (`validate_complete`), so a damaged bundle is refused before anything is
+   placed.
+2. Refuse if the network ID, a repository ID or a name is already present.
+3. Add the listed content to the content store in batches, skipping what is there
    (`existing_ids`), each batch one durable append. This needs no hold on any
    network: content is only added.
-3. Stage the network: copy the bundle's `storage/` and heads beside the first name,
-   as `create_empty` stages, and rename it into `networks/<network>`.
-4. Write each name (`names/<owner>/<repo>`), last, under the names' locks. A name
-   that is taken refuses the import before step 3.
+4. Stage the network: copy the structure beside the first name, as `create_empty`
+   stages, and rename it into `networks/<network>`.
+5. Write each name (`names/<owner>/<repo>`), last, under the names' locks.
 
-The copied pool still holds the bundle's content records, which nothing reads
-(content is read from the content store); pool GC (phase 4) drops them.
+A `RepositoryDirectory`'s pool still holds its content records once copied, which
+nothing reads (content is read from the content store); pool GC (phase 4) drops them.
 
 **Open question 5.** Identities:
 
@@ -193,6 +227,9 @@ The copied pool still holds the bundle's content records, which nothing reads
   is refused (a network imported twice).
 - **B. Fresh IDs on import.** Two imports of one bundle are two networks; nothing
   can collide; identity does not survive a move.
+
+Bart chose A (2026-10-27). A `RepositoryDirectory` has no IDs; its import makes new
+ones.
 
 ### Deleting a served network or fork
 
@@ -253,6 +290,10 @@ record a mark did not find may be named by a head a moment later.
   written after the collection began are kept regardless. Publishes go on; the
   commit path gets a hook and the mark set takes concurrent inserts.
 
+Bart chose A (2026-10-27). Content GC holds every network of the directory, and so
+refuses every publish, from marking until the new content generation is published;
+the bench case records how long.
+
 ### Superseded envelopes
 
 **Open question 4.** An envelope does not name the previous one, so every publish
@@ -266,6 +307,8 @@ O(change). Options:
   the last N days. Needs the head store to remember envelopes it held (the publish
   receipts table keeps some of this for idempotent publishes).
 - **C. Keep the last K per repository.** As B, by count.
+
+Bart chose A (2026-10-27): only the current heads are roots.
 
 ### Reader grace
 
@@ -290,8 +333,9 @@ reader of the files (backup by file copy) must not run during a collection.
 ## Phasing
 
 Phases 0–3 make moving work (and close the fork-networks doc's adoption and deletion
-items); 4–6 are GC. Phase 1 (export) needs no admin surface to be testable and could
-start before question 1 is answered; everything user-facing waits for it.
+items); 4–6 are GC. Export and import (phases 1, 2, 2b) are library operations in
+`wheat-store` with their own tests and bench cases, so they can land before the admin
+surface (phase 0) that starts them in a server.
 
 ## References
 
