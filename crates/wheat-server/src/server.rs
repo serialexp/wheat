@@ -50,6 +50,11 @@ pub struct ServerConfig {
     /// onto the head, and a notice once it is durable. `None` runs nothing and
     /// skips the work of describing the publish.
     pub publish_hooks: Option<Arc<dyn PublishHooks>>,
+    /// The directory admin operations read bundles and standalone repositories from
+    /// and write bundles to ([`crate::admin`]); each is one path segment in it.
+    /// `None` refuses them, since an admin could otherwise reach any path the server
+    /// can.
+    pub exchange_dir: Option<std::path::PathBuf>,
 }
 
 impl ServerConfig {
@@ -67,6 +72,7 @@ impl ServerConfig {
             session_setup_timeout: DEFAULT_SESSION_SETUP_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             publish_hooks: None,
+            exchange_dir: None,
         }
     }
 

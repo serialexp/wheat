@@ -135,10 +135,54 @@ pub fn parse_wheat_url(input: &str) -> Result<WheatUrl> {
     })
 }
 
+/// Parse the URL of a server's admin path: `wheat://host:port` or
+/// `wheat+tls://host:port`, with nothing after the authority. The result's
+/// `ws_url` ends in [`ADMIN_PATH`] and its `repo_name` is empty.
+pub fn parse_admin_url(input: &str) -> Result<WheatUrl> {
+    let trimmed = input.strip_suffix('/').unwrap_or(input);
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .with_context(|| "invalid wheat URL: missing authority")?;
+    if after_scheme.contains(['/', '?', '#']) {
+        bail!("invalid wheat admin URL: expected only scheme and host, as wheat://host:port");
+    }
+    // The placeholder repository only lends the authority its validation.
+    let mut url = parse_wheat_url(&format!("{trimmed}/admin/admin"))?;
+    let placeholder = repository_path("admin/admin");
+    url.ws_url = url
+        .ws_url
+        .strip_suffix(&placeholder)
+        .map(|origin| format!("{origin}{ADMIN_PATH}"))
+        .with_context(|| "invalid wheat admin URL")?;
+    url.canonical_identity = format!("{}://{}", url.scheme, url.authority);
+    url.repo_name = String::new();
+    Ok(url)
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod url_tests {
-    use super::parse_wheat_url;
+    use super::{parse_admin_url, parse_wheat_url};
+
+    #[test]
+    fn an_admin_url_is_a_server_without_a_path() {
+        let url = parse_admin_url("wheat://Example.com:7420/").unwrap();
+        assert_eq!(url.ws_url, "ws://example.com:7420/.admin");
+        assert_eq!(url.authority, "example.com:7420");
+        assert_eq!(
+            parse_admin_url("wheat+tls://host").unwrap().ws_url,
+            "wss://host/.admin"
+        );
+        for refused in [
+            "wheat://host/owner/repo",
+            "wheat://host/?x",
+            "http://host",
+            "wheat://",
+        ] {
+            assert!(parse_admin_url(refused).is_err(), "{refused}");
+        }
+    }
 
     #[test]
     fn canonicalizes_host_and_escapes_without_changing_repo_case() {
@@ -194,6 +238,14 @@ impl WheatSession {
     /// client supports.
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    pub(crate) async fn send(&mut self, message: &WheatProtocolMessage) -> Result<()> {
+        send_msg(&mut self.ws, message).await
+    }
+
+    pub(crate) async fn receive(&mut self) -> Result<WheatProtocolMessage> {
+        recv_msg(&mut self.ws).await
     }
 }
 
@@ -342,6 +394,20 @@ fn content_id_to_digest(id: ContentId) -> Digest256 {
 /// for none) as the upgrade request's bearer token. Returns the session and the
 /// repository's state, which the server sends once the session is established.
 pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteRepoState)> {
+    let mut session = connect(url, token).await?;
+    let state = repository_state(&mut session.ws, &url.repo_name).await?;
+    Ok((session, state))
+}
+
+/// Connect to the admin path of the server `url` names (see [`parse_admin_url`]),
+/// sending `token` as the bearer token. The server refuses a principal that is not an
+/// admin with an Error message on the first request, not on connecting.
+pub async fn open_admin(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
+    connect(url, token).await
+}
+
+/// Connects to `url.ws_url` and runs the handshake up to the session being established.
+async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
     let ws_url = url.ws_url.as_str();
     let mut request = ws_url
         .into_client_request()
@@ -418,8 +484,7 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
         other => bail!("expected SessionEstablished, got {other:?}"),
     }
 
-    let state = repository_state(&mut ws, &url.repo_name).await?;
-    Ok((WheatSession { ws, capabilities }, state))
+    Ok(WheatSession { ws, capabilities })
 }
 
 /// Reads the state of the repository `name`, which the server sends after the session.

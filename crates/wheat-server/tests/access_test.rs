@@ -76,6 +76,7 @@ fn token_file() -> ServerConfig {
             repositories: access
                 .map(|access| [(REPO.to_owned(), access)].into())
                 .unwrap_or_default(),
+            admin: false,
         }
     }
     ServerConfig::from_file(&FileConfig {

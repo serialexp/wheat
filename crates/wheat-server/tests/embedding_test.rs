@@ -107,7 +107,7 @@ async fn a_session_runs_on_a_socket_the_embedder_upgraded() {
     let config = Arc::new(ServerConfig::new());
 
     let upgrade = Upgrade::check(&upgrade_request("/test/repo"), &config).unwrap();
-    assert_eq!(upgrade.repository(), "test/repo");
+    assert_eq!(upgrade.repository(), Some("test/repo"));
     let response = upgrade.response().unwrap();
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
     // RFC 6455's example answer to that key.

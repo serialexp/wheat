@@ -33,6 +33,8 @@ use tracing::{debug, info, warn};
 
 use wheat_protocol::*;
 
+use crate::admin::{self, RunState, StartError};
+
 use crate::access::{Access, Principal};
 use crate::receipt::PublishKey;
 use crate::registry::Registry;
@@ -98,7 +100,7 @@ pub async fn handle_connection(
 pub async fn serve_upgraded<S>(
     io: S,
     upgrade: Upgrade,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     config: &ServerConfig,
     peer: &str,
 ) where
@@ -114,7 +116,7 @@ pub async fn serve_upgraded<S>(
 pub async fn serve(
     mut transport: impl Transport,
     upgrade: Upgrade,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     config: &ServerConfig,
     peer: &str,
 ) {
@@ -125,7 +127,7 @@ pub async fn serve(
 async fn serve_until(
     ws: &mut impl Transport,
     upgrade: &Upgrade,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     config: &ServerConfig,
     peer: &str,
     deadline: Instant,
@@ -148,32 +150,54 @@ fn message_limits() -> WebSocketConfig {
 /// A WebSocket upgrade request that names a repository and comes from an allowed
 /// origin. Only [`Upgrade::check`] makes one, so every session went through it.
 pub struct Upgrade {
-    repository: String,
+    target: Target,
     request: Request,
+}
+
+/// What a session is for.
+enum Target {
+    Repository(String),
+    /// Maintenance operations ([`crate::admin`]), at [`ADMIN_PATH`].
+    Admin,
 }
 
 impl Upgrade {
     /// Check an upgrade request before upgrading: its path must name a repository
-    /// (`/owner/name`), and a browser's `Origin` must be on
+    /// (`/owner/name`) or be the admin path ([`ADMIN_PATH`]), and a browser's `Origin`
+    /// must be on
     /// [`ServerConfig::allowed_origins`]. The request is kept for the access
     /// provider, which authenticates it once the client has said hello. An embedder
     /// with an `http::Request<Body>` passes the head:
     /// `Request::from_parts(parts, ())`.
     pub fn check(request: &Request, config: &ServerConfig) -> Result<Self, Refusal> {
-        let repository = repository_name(request.uri().path()).map_err(|error| Refusal {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("invalid repository path: {error}"),
-        })?;
+        let target = if request.uri().path() == ADMIN_PATH {
+            Target::Admin
+        } else {
+            Target::Repository(
+                repository_name(request.uri().path()).map_err(|error| Refusal {
+                    status: StatusCode::BAD_REQUEST,
+                    message: format!("invalid repository path: {error}"),
+                })?,
+            )
+        };
         check_origin(request, &config.allowed_origins)?;
         Ok(Self {
-            repository,
+            target,
             request: copy_request(request),
         })
     }
 
-    /// The repository the request's path names.
-    pub fn repository(&self) -> &str {
-        &self.repository
+    /// The repository the request's path names, or `None` for an admin session.
+    pub fn repository(&self) -> Option<&str> {
+        match &self.target {
+            Target::Repository(name) => Some(name),
+            Target::Admin => None,
+        }
+    }
+
+    /// Whether the session is for maintenance operations, not a repository.
+    pub fn is_admin(&self) -> bool {
+        matches!(self.target, Target::Admin)
     }
 
     /// The `101 Switching Protocols` answer to the request, for an embedder that
@@ -400,7 +424,7 @@ async fn establish(
 /// The main session loop.
 async fn run_session(
     ws: &mut impl Transport,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     config: &ServerConfig,
     peer: &str,
     upgrade: &Upgrade,
@@ -433,7 +457,10 @@ async fn run_session(
     // --- Repository open ---
     // The upgrade request's path named the repository; its state follows the session.
 
-    let repository = upgrade.repository.clone();
+    let repository = match &upgrade.target {
+        Target::Repository(name) => name.clone(),
+        Target::Admin => return run_admin(ws, registry, config, peer, &principal).await,
+    };
     // A repository the principal may not read looks the same as one that does not
     // exist, so its existence does not leak.
     let readable = repository_access(config, &principal, &repository)
@@ -593,6 +620,149 @@ async fn run_session(
     }
 
     Ok(())
+}
+
+/// Error code for an operation that cannot start because another is running.
+const CONFLICT: u16 = 409;
+/// Error code for an operation the server is not set up for.
+const NOT_IMPLEMENTED: u16 = 501;
+/// Error code for a request that is malformed.
+const BAD_REQUEST: u16 = 400;
+
+/// An admin session: starts maintenance operations and reports on them. Admin
+/// access is asked again before each, so a revoked right stops the next.
+async fn run_admin(
+    ws: &mut impl Transport,
+    registry: &Arc<Registry>,
+    config: &ServerConfig,
+    peer: &str,
+    principal: &Principal,
+) -> Result<(), ConnectionError> {
+    async fn is_admin(
+        config: &ServerConfig,
+        principal: &Principal,
+    ) -> Result<bool, ConnectionError> {
+        config
+            .access
+            .is_admin(principal)
+            .await
+            .map_err(|e| ConnectionError::Internal(format!("admin check failed: {e}")))
+    }
+    if !is_admin(config, principal).await? {
+        info!(peer = %peer, principal = %principal.name, "admin session refused");
+        send_error(
+            ws,
+            0,
+            FORBIDDEN,
+            connection_error_scope(),
+            false,
+            "permission denied: this needs admin access",
+        )
+        .await?;
+        return Ok(());
+    }
+    info!(peer = %peer, principal = %principal.name, "admin session opened");
+    loop {
+        let msg = match recv(ws).await {
+            Ok(msg) => msg,
+            Err(ConnectionError::Closed) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match msg {
+            WheatProtocolMessage::AdminStart(request) => {
+                if !is_admin(config, principal).await? {
+                    send_error(
+                        ws,
+                        request.op_id,
+                        FORBIDDEN,
+                        operation_error_scope(),
+                        false,
+                        "permission denied: this needs admin access",
+                    )
+                    .await?;
+                    continue;
+                }
+                match admin::start(registry, config.exchange_dir.as_deref(), request.command) {
+                    Ok(operation) => {
+                        info!(peer = %peer, principal = %principal.name, operation, "operation started");
+                        send(
+                            ws,
+                            &WheatProtocolMessage::AdminStarted(AdminStartedOutput {
+                                message_type: 0x51,
+                                op_id: request.op_id,
+                                operation,
+                            }),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        let (code, retryable) = match error {
+                            StartError::Unsupported(_) => (NOT_IMPLEMENTED, false),
+                            StartError::Invalid(_) => (BAD_REQUEST, false),
+                            StartError::Busy(_) => (CONFLICT, true),
+                        };
+                        send_error(
+                            ws,
+                            request.op_id,
+                            code,
+                            operation_error_scope(),
+                            retryable,
+                            &error.to_string(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            WheatProtocolMessage::AdminStatusRequest(request) => {
+                if !is_admin(config, principal).await? {
+                    send_error(
+                        ws,
+                        request.op_id,
+                        FORBIDDEN,
+                        operation_error_scope(),
+                        false,
+                        "permission denied: this needs admin access",
+                    )
+                    .await?;
+                    continue;
+                }
+                let Some(status) = registry.operations().status(request.operation) else {
+                    send_error(
+                        ws,
+                        request.op_id,
+                        NOT_FOUND,
+                        operation_error_scope(),
+                        false,
+                        &format!("there is no operation {}", request.operation),
+                    )
+                    .await?;
+                    continue;
+                };
+                let state = match status.state {
+                    RunState::Running => AdminState::AdminRunning(AdminRunningOutput { code: 0 }),
+                    RunState::Succeeded => {
+                        AdminState::AdminSucceeded(AdminSucceededOutput { code: 1 })
+                    }
+                    RunState::Failed => AdminState::AdminFailed(AdminFailedOutput { code: 2 }),
+                };
+                send(
+                    ws,
+                    &WheatProtocolMessage::AdminStatus(AdminStatusOutput {
+                        message_type: 0x53,
+                        op_id: request.op_id,
+                        operation: request.operation,
+                        state,
+                        phase: status.phase,
+                        message: status.message,
+                    }),
+                )
+                .await?;
+            }
+            _ => {
+                warn!(peer = %peer, "unexpected message in admin session");
+            }
+        }
+    }
 }
 
 /// Errors that can occur during a connection.

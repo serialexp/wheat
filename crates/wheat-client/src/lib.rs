@@ -25,6 +25,7 @@ pub mod materialization;
 pub mod outcome;
 pub mod prompt;
 pub mod remote;
+pub mod remote_admin;
 pub mod remote_config;
 pub mod repack;
 pub mod repository_diff;

@@ -145,6 +145,9 @@ enum Command {
     /// Inspect or detach workspaces sharing one repository store.
     #[command(subcommand)]
     Workspace(WorkspaceCommand),
+    /// Run a maintenance operation on a Wheat server. The token from
+    /// `credential.helper` must belong to an admin principal.
+    Admin(AdminArgs),
     /// Storage analysis and maintenance.
     #[command(subcommand)]
     Store(StoreCommand),
@@ -246,6 +249,44 @@ enum FrontierCommand {
         /// Label to inspect; defaults to the workspace's active label.
         #[arg(long)]
         label: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct AdminArgs {
+    /// The server, as `wheat://host:port` or `wheat+tls://host:port`.
+    #[arg(long)]
+    server: String,
+    #[command(subcommand)]
+    action: AdminAction,
+}
+
+/// Bundles and sources are names in the server's exchange directory
+/// (`wheat-server --exchange-dir`); they are paths on the server, not here.
+#[derive(Debug, Subcommand)]
+enum AdminAction {
+    /// Write the fork network that holds a repository to a bundle.
+    Export {
+        /// The repository, as `owner/repo`.
+        repository: String,
+        /// The bundle's name in the exchange directory.
+        bundle: String,
+    },
+    /// Bring a network in from a bundle.
+    Import {
+        /// The bundle's name in the exchange directory.
+        bundle: String,
+        /// A name for a repository in the bundle, as `<repository id>=owner/repo`. Every
+        /// repository the bundle holds needs one.
+        #[arg(long = "name", value_name = "ID=OWNER/REPO", required = true)]
+        names: Vec<String>,
+    },
+    /// Take a standalone repository directory in as a new repository.
+    Adopt {
+        /// The directory's name in the exchange directory.
+        source: String,
+        /// The repository's name, as `owner/repo`.
+        name: String,
     },
 }
 
@@ -744,6 +785,63 @@ fn main() -> ExitCode {
     code
 }
 
+/// Runs an admin operation on a server and waits for it to end.
+fn admin(arguments: AdminArgs) -> Result<Success> {
+    use wheat_client::remote_admin::{self, Finished, Operation, Refused};
+
+    let command = match &arguments.action {
+        AdminAction::Export { .. } => "admin.export",
+        AdminAction::Import { .. } => "admin.import",
+        AdminAction::Adopt { .. } => "admin.adopt",
+    };
+    let operation = match arguments.action {
+        AdminAction::Export { repository, bundle } => Operation::Export { repository, bundle },
+        AdminAction::Import { bundle, names } => Operation::Import {
+            bundle,
+            names: names
+                .iter()
+                .map(|given| {
+                    let (id, name) = given.split_once('=').ok_or_else(|| {
+                        CliFailure::invalid(format!("--name {given} is not ID=OWNER/REPO"))
+                    })?;
+                    let id = uuid::Uuid::parse_str(id)
+                        .map_err(|error| CliFailure::invalid(format!("--name {given}: {error}")))?;
+                    Ok((id, name.to_owned()))
+                })
+                .collect::<Result<_>>()?,
+        },
+        AdminAction::Adopt { source, name } => Operation::Adopt { source, name },
+    };
+    let url = remote::parse_admin_url(&arguments.server)?;
+    let token = credential::token_for(&UserConfig::from_environment()?, None, &url)?;
+
+    let rt = runtime()?;
+    let finished = rt.block_on(async {
+        let mut session = remote::open_admin(&url, &token).await?;
+        let finished = remote_admin::run(&mut session, &operation, |phase| {
+            write_stderr(format_args!("{phase}\n"));
+        })
+        .await;
+        remote::close(&mut session).await?;
+        finished
+    });
+    match finished {
+        Ok(Finished::Succeeded(message)) => Success::new(
+            command,
+            json!({ "message": message }),
+            format!("{message}\n"),
+        ),
+        Ok(Finished::Failed(message)) => Err(CliFailure::conflict(message)),
+        Err(error) => match error.downcast_ref::<Refused>() {
+            Some(refused) if refused.retryable => {
+                Err(CliFailure::unavailable(refused.message.clone()))
+            }
+            Some(refused) => Err(CliFailure::invalid(refused.message.clone())),
+            None => Err(error),
+        },
+    }
+}
+
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Init(_) => "init",
@@ -774,6 +872,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::Change(ChangeCommand::Squash { .. }) => "change.squash",
         Command::Stack(StackCommand::Squash(_)) => "stack.squash",
         Command::Resolve(_) => "resolve",
+        Command::Admin(AdminArgs { action, .. }) => match action {
+            AdminAction::Export { .. } => "admin.export",
+            AdminAction::Import { .. } => "admin.import",
+            AdminAction::Adopt { .. } => "admin.adopt",
+        },
         Command::Workspace(WorkspaceCommand::List) => "workspace.list",
         Command::Workspace(WorkspaceCommand::Unregister) => "workspace.unregister",
         Command::Store(StoreCommand::Analyze) => "store.analyze",
@@ -1322,6 +1425,7 @@ fn execute(cli: Cli) -> Result<Success> {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             resolve(&context.root, &context.store_root, arguments)
         }
+        Command::Admin(arguments) => admin(arguments),
         Command::Workspace(WorkspaceCommand::List) => {
             list_workspaces(&requested_workspace, cli.store.as_deref())
         }

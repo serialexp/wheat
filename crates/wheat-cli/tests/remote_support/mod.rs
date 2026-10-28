@@ -175,8 +175,13 @@ pub fn serve_store_configured(store: &Path, server: ServerConfig) -> Server {
 /// Serves every repository in the repositories directory `repos`; [`Server::url`]
 /// names `team/repo`, which need not exist.
 pub fn serve_repos_dir(repos: &Path) -> Server {
+    serve_repos_dir_configured(repos, ServerConfig::new())
+}
+
+/// Like [`serve_repos_dir`], with the server configured by `server`.
+pub fn serve_repos_dir_configured(repos: &Path, server: ServerConfig) -> Server {
     let registry = Registry::from_repos_dir(repos, Default::default()).unwrap();
-    serve_registry(registry, repos, ServerConfig::new())
+    serve_registry(registry, repos, server)
 }
 
 fn serve_registry(registry: Registry, store: &Path, server: ServerConfig) -> Server {

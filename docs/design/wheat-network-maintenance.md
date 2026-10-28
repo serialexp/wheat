@@ -1,7 +1,7 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
-Status: partial — Phases 1 (export) and 2 (import and adoption) landed as library
-operations, the rest designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
+Status: partial — Phase 0 (the admin surface) and Phases 1 (export) and 2 (import
+and adoption) landed, the rest designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
@@ -57,7 +57,30 @@ and move them from Outstanding to Done.
   manifest path is checked (only `storage/...` and the listed heads) and every file
   is hashed against the manifest as it is copied. Bench case `network_import`: 10,000
   changes in about 21 s, nearly all `validate_complete`; peak RSS 450 MiB. Not yet
-  held against content GC's publish gate (Phase 5) or run by the server (Phase 0).
+  held against content GC's publish gate (Phase 5).
+- [x] **Phase 0 — admin surface (2026-10-28).** Four messages on the protocol
+  (`AdminStart`, `AdminStarted`, `AdminStatusRequest`, `AdminStatus`; types 0x50–0x53;
+  `wheat-protocol.bs.json5`), an `admin = true` flag on a principal in `[auth]`
+  (`AccessProvider::is_admin`), the operation runner (`wheat-server/src/admin.rs`)
+  and `wheat admin --server <url> export | import | adopt` (`wheat-client/src/remote_admin.rs`).
+  Built early so the operations can be driven through the real interface while their
+  shape may still change; GC and delete have no message yet. Tests: `remote_admin.rs`
+  in `wheat-cli` (export on one server, import on another, adoption, confinement,
+  admin-only), unit tests for the operation table, a protocol round trip. Differences
+  from the design:
+  - Admin sessions use a reserved WebSocket path, `/.admin` (`ADMIN_PATH`); a
+    repository cannot be named `.admin`. `wheat admin --server wheat://host:port` connects
+    there. The session authenticates like any other and then asks `is_admin` before
+    every request, so a right revoked stops the next one.
+  - Bundles and adoption sources are names in the server's `--exchange-dir` (one plain
+    segment, no leading dot), so an admin cannot make the server read or write elsewhere.
+    Without `--exchange-dir` the server refuses the three operations (501).
+  - One operation runs at a time per server (409, retryable, while another runs); the
+    last 64 finished operations stay pollable. An operation outlives the connection;
+    its ID is not found again after a restart.
+  - Import names repositories by their ID in the bundle: `--name <id>=owner/repo`,
+    one per repository; the export's message lists `repository <id> <name>` lines.
+  - Export waits up to 60 s for in-flight publishes before giving up.
 
 ### Outstanding
 
@@ -66,9 +89,6 @@ and move them from Outstanding to Done.
   field to the error record, filled from the operation's expected duration (export:
   size of the pool and content list over a measured rate; GC: the running estimate).
 
-- [ ] **Phase 0 — admin surface.** Admin request and response messages, the `admin`
-  principal flag in `[auth]`, the server's operation runner (one maintenance
-  operation at a time per repositories directory) and `wheat admin`.
 - [ ] **Phase 2b — the bucket transport.** Export to and import from an
   S3-compatible bucket: immutable store files once by name, content once by ID,
   shared by every export to the bucket.
@@ -143,8 +163,7 @@ both run inside the server.
 - **Copying.** `NetworkDirectory::files` and `copy_to` (pool and heads),
   `RepositoryDirectory::copy_to`.
 
-Missing: an admin access level or message (levels are `Read < Publish < Force`), any
-grace period, and a function listing a blob's delta bases.
+Missing: any grace period, and a function listing a blob's delta bases.
 
 ## Admin surface
 

@@ -34,6 +34,7 @@ use wheat_store::{
     RepositoriesDirectoryError, RepositoryDirectory, RepositoryStore,
 };
 
+use crate::admin::Operations;
 use crate::commit::GroupCommit;
 use crate::heads::HeadStore;
 use crate::network::{Network, OpenNetworks};
@@ -80,6 +81,20 @@ pub trait RepositoryOpener: Send + Sync {
     /// repository path (`owner/name`, see [`wheat_protocol::repository_name`]).
     /// Opening can block on disk; the opener runs it where that is fine.
     async fn open(&self, name: &str) -> Result<Option<RepositoryEntry>, OpenError>;
+
+    /// The repositories directory this opener serves, when it serves one: what the
+    /// maintenance operations ([`crate::admin`]) work on.
+    fn directory(&self) -> Option<DirectoryHandle> {
+        None
+    }
+}
+
+/// A repositories directory and its content store, which the process serving it holds
+/// open.
+#[derive(Clone)]
+pub struct DirectoryHandle {
+    pub repositories: RepositoriesDirectory,
+    pub content: PackedObjectStore,
 }
 
 /// A repository could not be opened (not: there is no such repository).
@@ -119,6 +134,7 @@ pub struct Registry {
     opener: Option<Arc<dyn RepositoryOpener>>,
     limits: RegistryLimits,
     slots: Mutex<HashMap<String, Slot>>,
+    operations: Operations,
 }
 
 /// One repository the registry holds or is opening. Sessions asking for it clone
@@ -157,6 +173,7 @@ impl Registry {
         Self {
             opener: None,
             limits: RegistryLimits::default(),
+            operations: Operations::default(),
             slots: Mutex::new(
                 repositories
                     .into_iter()
@@ -172,6 +189,7 @@ impl Registry {
         Self {
             opener: Some(opener),
             limits,
+            operations: Operations::default(),
             slots: Mutex::default(),
         }
     }
@@ -318,6 +336,16 @@ impl Registry {
         before - slots.len()
     }
 
+    /// The repositories directory served, when this registry serves one.
+    pub fn directory(&self) -> Option<DirectoryHandle> {
+        self.opener.as_ref()?.directory()
+    }
+
+    /// The maintenance operations started on this registry's directory.
+    pub fn operations(&self) -> &Operations {
+        &self.operations
+    }
+
     /// The names of the repositories open now.
     pub fn open_names(&self) -> Vec<String> {
         self.lock()
@@ -415,5 +443,12 @@ impl RepositoryOpener for DirectoryOpener {
         })
         .await
         .map_err(|error| OpenError(Box::new(error)))?
+    }
+
+    fn directory(&self) -> Option<DirectoryHandle> {
+        Some(DirectoryHandle {
+            repositories: self.repositories.clone(),
+            content: self.content.clone(),
+        })
     }
 }

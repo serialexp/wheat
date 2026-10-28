@@ -74,6 +74,12 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["name", "store"])]
     repos_dir: Option<PathBuf>,
 
+    /// The directory admin sessions export bundles to and import them from (with
+    /// `--repos-dir`). Admin requests name bundles relative to it and reach nothing
+    /// outside it; without it the server refuses maintenance operations.
+    #[arg(long, requires = "repos_dir")]
+    exchange_dir: Option<PathBuf>,
+
     /// TOML config file. Its `[auth]` table lists principals, their token
     /// hashes and their access per repository.
     #[arg(long)]
@@ -113,8 +119,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => FileConfig::load(path)?,
         None => FileConfig::default(),
     };
-    let server_config = ServerConfig::from_file(&file_config)?;
+    let mut server_config = ServerConfig::from_file(&file_config)?;
     server_config.check_listen_address(cli.listen)?;
+    if let Some(exchange_dir) = &cli.exchange_dir {
+        if !exchange_dir.is_dir() {
+            return Err(format!(
+                "--exchange-dir {} is not a directory",
+                exchange_dir.display()
+            )
+            .into());
+        }
+        server_config.exchange_dir = Some(exchange_dir.clone());
+    }
 
     if let Some(repos_dir) = &cli.repos_dir {
         // A mistyped path would otherwise serve nothing, answering every session that

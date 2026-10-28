@@ -65,6 +65,12 @@
         { type: "ContentComplete",       when: "value == 0x4a" },
         { type: "PublishPushEnd",        when: "value == 0x4b" },
 
+        // Admin (0x50–0x53). Only a session on the admin path speaks these.
+        { type: "AdminStart",            when: "value == 0x50" },
+        { type: "AdminStarted",          when: "value == 0x51" },
+        { type: "AdminStatusRequest",    when: "value == 0x52" },
+        { type: "AdminStatus",           when: "value == 0x53" },
+
         // Flow control (0x60)
         { type: "Credit",               when: "value == 0x60" },
 
@@ -487,6 +493,125 @@
         { name: "status", type: "PublishResultStatus" },
         { name: "new_generation", type: "varlength", encoding: "leb128_canonical" },
         { name: "new_envelope", type: "Digest256" },
+        { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+      ],
+    },
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Admin messages
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // A session whose WebSocket path is the admin path (`/.admin`) is not for a
+    // repository: after SessionEstablished the server sends no RepositoryState, and
+    // the client may send these instead, if its principal is an admin. An operation
+    // outlives the request that started it: AdminStarted names it, and
+    // AdminStatusRequest asks how it is going, on this session or a later one. The
+    // server runs one operation at a time per repositories directory. Paths name
+    // bundles and repositories under the server's exchange directory, one segment
+    // each.
+
+    // Copies a repository's whole fork network to a new bundle.
+    AdminExportCommand: {
+      sequence: [
+        { name: "command_kind", type: "uint8", const: 1 },
+        // The repository whose network is exported, as `owner/repo`.
+        { name: "repository", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        // The bundle's name in the exchange directory; it must not exist.
+        { name: "bundle", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+      ],
+    },
+
+    // The name a repository of an imported network gets.
+    AdminRepositoryName: {
+      sequence: [
+        { name: "repository", type: "Uuid128" },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+      ],
+    },
+
+    // Places the network of a bundle in the exchange directory, giving each of its
+    // repositories a name.
+    AdminImportCommand: {
+      sequence: [
+        { name: "command_kind", type: "uint8", const: 2 },
+        { name: "bundle", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        {
+          name: "names",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "varlength", length_encoding: "leb128_canonical",
+          items: { type: "AdminRepositoryName" },
+        },
+      ],
+    },
+
+    // Places a standalone repository (what `wheat import` writes) from the exchange
+    // directory in a network of its own.
+    AdminAdoptCommand: {
+      sequence: [
+        { name: "command_kind", type: "uint8", const: 3 },
+        { name: "source", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+      ],
+    },
+
+    AdminCommand: {
+      type: "discriminated_union",
+      discriminator: { peek: "uint8" },
+      variants: [
+        { type: "AdminExportCommand", when: "value == 1" },
+        { type: "AdminImportCommand", when: "value == 2" },
+        { type: "AdminAdoptCommand",  when: "value == 3" },
+      ],
+    },
+
+    AdminStart: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x50 },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "command", type: "AdminCommand" },
+      ],
+    },
+
+    // The operation AdminStart began.
+    AdminStarted: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x51 },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "operation", type: "varlength", encoding: "leb128_canonical" },
+      ],
+    },
+
+    AdminStatusRequest: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x52 },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "operation", type: "varlength", encoding: "leb128_canonical" },
+      ],
+    },
+
+    AdminState: {
+      type: "discriminated_union",
+      discriminator: { peek: "uint8" },
+      variants: [
+        { type: "AdminRunning",   when: "value == 0" },
+        { type: "AdminSucceeded", when: "value == 1" },
+        { type: "AdminFailed",    when: "value == 2" },
+      ],
+    },
+    AdminRunning:   { sequence: [{ name: "code", type: "uint8", const: 0 }] },
+    AdminSucceeded: { sequence: [{ name: "code", type: "uint8", const: 1 }] },
+    AdminFailed:    { sequence: [{ name: "code", type: "uint8", const: 2 }] },
+
+    // How an operation is going. `phase` says what a running one is doing; `message`
+    // is what a finished one produced, or why it failed.
+    AdminStatus: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x53 },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "operation", type: "varlength", encoding: "leb128_canonical" },
+        { name: "state", type: "AdminState" },
+        { name: "phase", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
       ],
     },

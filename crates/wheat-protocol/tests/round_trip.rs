@@ -223,3 +223,68 @@ fn fetch_complete_round_trip() {
     let decoded = round_trip(msg.clone());
     assert_eq!(msg, decoded);
 }
+
+#[test]
+fn admin_messages_round_trip() {
+    use wheat_protocol::{
+        AdminAdoptCommandOutput, AdminCommand, AdminExportCommandOutput, AdminFailedOutput,
+        AdminImportCommandOutput, AdminRepositoryName, AdminStartOutput, AdminStartedOutput,
+        AdminState, AdminStatusOutput, AdminStatusRequestOutput, AdminSucceededOutput,
+    };
+
+    let commands = [
+        AdminCommand::AdminExportCommand(AdminExportCommandOutput {
+            command_kind: 1,
+            repository: "team/repo".to_string(),
+            bundle: "bundle".to_string(),
+        }),
+        AdminCommand::AdminImportCommand(AdminImportCommandOutput {
+            command_kind: 2,
+            bundle: "bundle".to_string(),
+            names: vec![AdminRepositoryName {
+                repository: zero_uuid(),
+                name: "team/repo".to_string(),
+            }],
+        }),
+        AdminCommand::AdminAdoptCommand(AdminAdoptCommandOutput {
+            command_kind: 3,
+            source: "standalone".to_string(),
+            name: "team/repo".to_string(),
+        }),
+    ];
+    for command in commands {
+        let msg = WheatProtocolMessage::AdminStart(AdminStartOutput {
+            message_type: 0x50,
+            op_id: 7,
+            command,
+        });
+        assert_eq!(msg, round_trip(msg.clone()));
+    }
+
+    let started = WheatProtocolMessage::AdminStarted(AdminStartedOutput {
+        message_type: 0x51,
+        op_id: 7,
+        operation: 3,
+    });
+    assert_eq!(started, round_trip(started.clone()));
+    let request = WheatProtocolMessage::AdminStatusRequest(AdminStatusRequestOutput {
+        message_type: 0x52,
+        op_id: 8,
+        operation: 3,
+    });
+    assert_eq!(request, round_trip(request.clone()));
+    for state in [
+        AdminState::AdminSucceeded(AdminSucceededOutput { code: 1 }),
+        AdminState::AdminFailed(AdminFailedOutput { code: 2 }),
+    ] {
+        let status = WheatProtocolMessage::AdminStatus(AdminStatusOutput {
+            message_type: 0x53,
+            op_id: 8,
+            operation: 3,
+            state,
+            phase: "copying".to_string(),
+            message: "ok".to_string(),
+        });
+        assert_eq!(status, round_trip(status.clone()));
+    }
+}

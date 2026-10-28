@@ -120,6 +120,17 @@ mod tests {
         assert_eq!(bart.token_hashes, [hash]);
         assert_eq!(bart.repositories["*"], Access::Read);
         assert_eq!(bart.repositories["serialexp/wheat"], Access::Force);
+        assert!(!bart.admin, "admin is off unless the file says so");
+    }
+
+    #[test]
+    fn parses_the_admin_flag() {
+        let hash = "a".repeat(64);
+        let config = FileConfig::parse(&format!(
+            "[[auth.principals]]\nname = \"ops\"\ntoken_hashes = [\"{hash}\"]\nadmin = true\n"
+        ))
+        .unwrap();
+        assert!(config.auth.unwrap().principals[0].admin);
     }
 
     #[test]

@@ -21,10 +21,10 @@ server-authoritative remote maintenance.
   one store handle in the registry, and `--repos-dir` keeps them as
   `wheat_store::RepositoriesDirectory` lays them out, with `fork` and one content
   store for every network. Open: Gothab's opener, deleting a fork while its network is
-  served, and running export and import in the server (library operations since
+  served. Export, import and adoption run in the server through `wheat admin` (since
   2026-10-28). Design and phases: `docs/design/wheat-fork-networks.md`; moving,
   adoption, deletion while served and GC: `docs/design/wheat-network-maintenance.md`
-  (export and import built, the rest decided 2026-10-27).
+  (admin surface, export and import built, the rest decided 2026-10-27).
 - `[ ]` **Delta content stored one envelope at a time.**
   `ContentStore::put_many_with_bases` stores each delta-encoded blob with its own
   `put_raw_envelope`, one backend write (a synced loose file, or a blob upload) per

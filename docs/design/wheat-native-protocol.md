@@ -928,6 +928,27 @@ Error
   object_id: bytes[32] (optional)             // which object failed
 ```
 
+### Admin messages
+
+Maintenance operations (`docs/design/wheat-network-maintenance.md`) use a session at
+the reserved path `/.admin` instead of a repository. It handshakes and authenticates
+like any session, but only a principal with `admin = true` in `[auth]` may use it;
+anyone else gets a 403 Error. There is no `RepositoryState`. Requests:
+
+```
+AdminStart (0x50)        op_id: u64, command: union { export (1), import (2), adopt (3) }
+AdminStarted (0x51)      op_id: u64, operation: u64
+AdminStatusRequest (0x52) op_id: u64, operation: u64
+AdminStatus (0x53)       op_id: u64, operation: u64, state: running | succeeded | failed,
+                         phase: string, message: string
+```
+
+`AdminStart` returns at once with the operation's ID; the operation keeps running if
+the connection closes, and any admin session can ask for its status. A start that
+cannot be taken answers with Error: 409 (retryable) while another operation runs, 400
+for a bad name, 501 when the server has no exchange directory. Names of bundles and
+sources are relative to the server's exchange directory.
+
 ### Message type allocation
 
 Message type bytes are append-only: once a type byte is assigned in a

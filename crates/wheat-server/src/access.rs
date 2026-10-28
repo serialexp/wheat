@@ -85,6 +85,14 @@ pub trait AccessProvider: Send + Sync {
         repository: &str,
     ) -> Result<Option<Access>, AccessError>;
 
+    /// Whether `principal` may run maintenance operations on the server
+    /// ([`crate::admin`]): export, import and the like. A flag on the principal, not
+    /// a level of access to a repository, since an operation is about no one
+    /// repository. Asked when an admin session opens and before each operation.
+    async fn is_admin(&self, _principal: &Principal) -> Result<bool, AccessError> {
+        Ok(false)
+    }
+
     /// Whether this provider lets anyone in. The standalone server refuses to
     /// listen on a non-loopback address with such a provider.
     fn is_open(&self) -> bool {
@@ -116,6 +124,10 @@ impl AccessProvider for OpenLoopbackAccess {
         Ok(Some(Access::Force))
     }
 
+    async fn is_admin(&self, _principal: &Principal) -> Result<bool, AccessError> {
+        Ok(true)
+    }
+
     fn is_open(&self) -> bool {
         true
     }
@@ -134,6 +146,11 @@ impl AccessProvider for OpenLoopbackAccess {
 /// [auth.principals.repositories]
 /// "*" = "read"
 /// "serialexp/wheat" = "force"
+///
+/// [[auth.principals]]
+/// name = "operator"
+/// token_hashes = ["<hash>"]
+/// admin = true   # may run maintenance operations; no repository access by itself
 /// ```
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -158,6 +175,10 @@ pub struct PrincipalConfig {
     /// grants less.
     #[serde(default)]
     pub repositories: HashMap<String, Access>,
+    /// Whether the principal may run maintenance operations on the server (see
+    /// [`AccessProvider::is_admin`]). Absent means not.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 /// A token file is invalid.
@@ -185,6 +206,7 @@ pub struct TokenFileAccess {
 struct PrincipalRules {
     name: String,
     repositories: HashMap<String, Access>,
+    admin: bool,
 }
 
 impl PrincipalRules {
@@ -238,6 +260,7 @@ impl TokenFileAccess {
             principals.push(PrincipalRules {
                 name: principal.name.clone(),
                 repositories: principal.repositories.clone(),
+                admin: principal.admin,
             });
         }
         Ok(Self {
@@ -290,6 +313,13 @@ impl AccessProvider for TokenFileAccess {
             .get(&principal.name)
             .and_then(|&index| self.principals[index].access(repository)))
     }
+
+    async fn is_admin(&self, principal: &Principal) -> Result<bool, AccessError> {
+        Ok(self
+            .by_name
+            .get(&principal.name)
+            .is_some_and(|&index| self.principals[index].admin))
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +337,7 @@ mod tests {
                 .iter()
                 .map(|(repo, access)| ((*repo).to_owned(), *access))
                 .collect(),
+            admin: false,
         }
     }
 
@@ -376,6 +407,7 @@ mod tests {
                 name: "big".to_owned(),
                 token_hashes: vec![token_hash_hex(&big)],
                 repositories: HashMap::new(),
+                admin: false,
             }],
         })
         .unwrap();
@@ -455,6 +487,7 @@ mod tests {
                 name: "a".to_owned(),
                 token_hashes: vec!["not-hex".to_owned()],
                 repositories: HashMap::new(),
+                admin: false,
             }],
         })
         .unwrap_err();

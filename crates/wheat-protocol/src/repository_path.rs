@@ -2,7 +2,11 @@
 //! each segment percent-encoded. The client builds the path from the repository name
 //! and the server reads the name back from it, so a front door can route a connection
 //! by its upgrade request alone. Both refuse the same spellings: an empty, `.` or `..`
-//! segment, an encoded `/`, `\` or NUL, and a name that is not UTF-8.
+//! segment, an encoded `/`, `\` or NUL, and a name that is not UTF-8. The path
+//! [`ADMIN_PATH`] names no repository: a session on it is for the server's operator.
+
+/// The WebSocket path of an admin session, which names no repository.
+pub const ADMIN_PATH: &str = "/.admin";
 
 /// A path that does not name a repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +21,8 @@ pub enum RepositoryPathError {
     NotUtf8,
     /// An empty, `.` or `..` segment, or one holding a separator or NUL.
     InvalidSegment,
+    /// [`ADMIN_PATH`], however it is spelled.
+    Reserved,
 }
 
 impl std::fmt::Display for RepositoryPathError {
@@ -31,6 +37,7 @@ impl std::fmt::Display for RepositoryPathError {
             RepositoryPathError::InvalidSegment => {
                 "empty, dot or separator repository path segment"
             }
+            RepositoryPathError::Reserved => "that path is for admin sessions, not a repository",
         })
     }
 }
@@ -80,6 +87,9 @@ pub fn repository_name(path: &str) -> Result<String, RepositoryPathError> {
             name.push('/');
         }
         name.push_str(&decoded);
+    }
+    if name == ADMIN_PATH.trim_start_matches('/') {
+        return Err(RepositoryPathError::Reserved);
     }
     Ok(name)
 }
@@ -144,6 +154,8 @@ mod tests {
             ("/owner/repo%4", RepositoryPathError::MalformedEscape),
             ("/owner/%FF", RepositoryPathError::NotUtf8),
             ("/owner/a\\b", RepositoryPathError::InvalidSegment),
+            (ADMIN_PATH, RepositoryPathError::Reserved),
+            ("/%2Eadmin", RepositoryPathError::Reserved),
         ] {
             assert_eq!(repository_name(path), Err(error), "{path}");
         }

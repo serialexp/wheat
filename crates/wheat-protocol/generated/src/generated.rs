@@ -37,6 +37,10 @@ pub enum WheatProtocolMessage {
     PublishResult(PublishResultOutput),
     ContentComplete(ContentCompleteOutput),
     PublishPushEnd(PublishPushEndOutput),
+    AdminStart(AdminStartOutput),
+    AdminStarted(AdminStartedOutput),
+    AdminStatusRequest(AdminStatusRequestOutput),
+    AdminStatus(AdminStatusOutput),
     Credit(CreditOutput),
     Error(ErrorOutput),
 }
@@ -261,6 +265,37 @@ impl WheatProtocolMessage {
                 encoder.write_varlength(v.pushed_objects, "leb128_canonical")?;
                 encoder.write_varlength(v.pushed_contents, "leb128_canonical")?;
             }
+            WheatProtocolMessage::AdminStart(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                v.command.encode_into(encoder)?;
+            }
+            WheatProtocolMessage::AdminStarted(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.operation, "leb128_canonical")?;
+            }
+            WheatProtocolMessage::AdminStatusRequest(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.operation, "leb128_canonical")?;
+            }
+            WheatProtocolMessage::AdminStatus(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                encoder.write_varlength(v.operation, "leb128_canonical")?;
+                v.state.encode_into(encoder)?;
+                encoder.write_varlength(v.phase.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.phase.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_varlength(v.message.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.message.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
             WheatProtocolMessage::Credit(v) => {
                 encoder.write_uint8(v.message_type);
                 encoder.write_varlength(v.op_id, "leb128_canonical")?;
@@ -392,6 +427,22 @@ impl WheatProtocolMessage {
         } else if value == 0x4b {
             Ok(WheatProtocolMessage::PublishPushEnd(
                 PublishPushEndOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x50 {
+            Ok(WheatProtocolMessage::AdminStart(
+                AdminStartOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x51 {
+            Ok(WheatProtocolMessage::AdminStarted(
+                AdminStartedOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x52 {
+            Ok(WheatProtocolMessage::AdminStatusRequest(
+                AdminStatusRequestOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x53 {
+            Ok(WheatProtocolMessage::AdminStatus(
+                AdminStatusOutput::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x60 {
             Ok(WheatProtocolMessage::Credit(
@@ -3429,6 +3480,997 @@ impl From<PublishResultInput> for PublishResultOutput {
             status: i.status,
             new_generation: i.new_generation,
             new_envelope: i.new_envelope,
+            message: i.message,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminExportCommandInput {
+    pub repository: std::string::String,
+    pub bundle: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminExportCommandOutput {
+    pub command_kind: u8,
+    pub repository: std::string::String,
+    pub bundle: std::string::String,
+}
+
+pub type AdminExportCommand = AdminExportCommandOutput;
+
+impl AdminExportCommandInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(1);
+        encoder.write_varlength(self.repository.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.repository.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_varlength(self.bundle.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.bundle.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+}
+
+impl AdminExportCommandOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let command_kind = decoder.read_byte()?;
+        if command_kind != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                command_kind
+            )));
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let repository = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let bundle = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            command_kind,
+            repository,
+            bundle,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminExportCommandInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminExportCommandInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminExportCommandOutput> for AdminExportCommandInput {
+    fn from(o: AdminExportCommandOutput) -> Self {
+        Self {
+            repository: o.repository,
+            bundle: o.bundle,
+        }
+    }
+}
+
+impl From<AdminExportCommandInput> for AdminExportCommandOutput {
+    fn from(i: AdminExportCommandInput) -> Self {
+        Self {
+            command_kind: 1u8,
+            repository: i.repository,
+            bundle: i.bundle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminRepositoryName {
+    pub repository: Uuid128,
+    pub name: std::string::String,
+}
+
+impl AdminRepositoryName {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.repository.encode_into(encoder)?;
+        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let repository = Uuid128::decode_with_decoder(decoder)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self { repository, name })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminImportCommandInput {
+    pub bundle: std::string::String,
+    pub names: Vec<AdminRepositoryName>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminImportCommandOutput {
+    pub command_kind: u8,
+    pub bundle: std::string::String,
+    pub names: Vec<AdminRepositoryName>,
+}
+
+pub type AdminImportCommand = AdminImportCommandOutput;
+
+impl AdminImportCommandInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(2);
+        encoder.write_varlength(self.bundle.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.bundle.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_varlength(self.names.len() as u64, "leb128_canonical")?;
+        for item in &self.names {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl AdminImportCommandOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let command_kind = decoder.read_byte()?;
+        if command_kind != 2u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 2, got {}",
+                command_kind
+            )));
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let bundle = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut names = Vec::with_capacity(decoder.capacity_hint_sized(length, 17));
+        for _ in 0..length {
+            let item = AdminRepositoryName::decode_with_decoder(decoder)?;
+            names.push(item);
+        }
+        Ok(Self {
+            command_kind,
+            bundle,
+            names,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminImportCommandInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminImportCommandInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminImportCommandOutput> for AdminImportCommandInput {
+    fn from(o: AdminImportCommandOutput) -> Self {
+        Self {
+            bundle: o.bundle,
+            names: o.names,
+        }
+    }
+}
+
+impl From<AdminImportCommandInput> for AdminImportCommandOutput {
+    fn from(i: AdminImportCommandInput) -> Self {
+        Self {
+            command_kind: 2u8,
+            bundle: i.bundle,
+            names: i.names,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminAdoptCommandInput {
+    pub source: std::string::String,
+    pub name: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminAdoptCommandOutput {
+    pub command_kind: u8,
+    pub source: std::string::String,
+    pub name: std::string::String,
+}
+
+pub type AdminAdoptCommand = AdminAdoptCommandOutput;
+
+impl AdminAdoptCommandInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(3);
+        encoder.write_varlength(self.source.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.source.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+}
+
+impl AdminAdoptCommandOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let command_kind = decoder.read_byte()?;
+        if command_kind != 3u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 3, got {}",
+                command_kind
+            )));
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let source = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            command_kind,
+            source,
+            name,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminAdoptCommandInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminAdoptCommandInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminAdoptCommandOutput> for AdminAdoptCommandInput {
+    fn from(o: AdminAdoptCommandOutput) -> Self {
+        Self {
+            source: o.source,
+            name: o.name,
+        }
+    }
+}
+
+impl From<AdminAdoptCommandInput> for AdminAdoptCommandOutput {
+    fn from(i: AdminAdoptCommandInput) -> Self {
+        Self {
+            command_kind: 3u8,
+            source: i.source,
+            name: i.name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdminCommand {
+    AdminExportCommand(AdminExportCommandOutput),
+    AdminImportCommand(AdminImportCommandOutput),
+    AdminAdoptCommand(AdminAdoptCommandOutput),
+}
+
+impl AdminCommand {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        match self {
+            AdminCommand::AdminExportCommand(v) => {
+                encoder.write_uint8(v.command_kind);
+                encoder.write_varlength(v.repository.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.repository.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_varlength(v.bundle.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.bundle.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
+            AdminCommand::AdminImportCommand(v) => {
+                encoder.write_uint8(v.command_kind);
+                encoder.write_varlength(v.bundle.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.bundle.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_varlength(v.names.len() as u64, "leb128_canonical")?;
+                for item in &v.names {
+                    item.encode_into(encoder)?;
+                }
+            }
+            AdminCommand::AdminAdoptCommand(v) => {
+                encoder.write_uint8(v.command_kind);
+                encoder.write_varlength(v.source.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.source.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_varlength(v.name.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.name.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = decoder.peek_uint8()?;
+        // Match on discriminator value
+        if value == 1 {
+            Ok(AdminCommand::AdminExportCommand(
+                AdminExportCommandOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 2 {
+            Ok(AdminCommand::AdminImportCommand(
+                AdminImportCommandOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 3 {
+            Ok(AdminCommand::AdminAdoptCommand(
+                AdminAdoptCommandOutput::decode_with_decoder(decoder)?,
+            ))
+        } else {
+            Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "unknown discriminator value: {}",
+                value
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStartInput {
+    pub op_id: u64,
+    pub command: AdminCommand,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStartOutput {
+    pub message_type: u8,
+    pub op_id: u64,
+    pub command: AdminCommand,
+}
+
+pub type AdminStart = AdminStartOutput;
+
+impl AdminStartInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(80);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        self.command.encode_into(encoder)?;
+        Ok(())
+    }
+}
+
+impl AdminStartOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 80u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 80, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let command = AdminCommand::decode_with_decoder(decoder)?;
+        Ok(Self {
+            message_type,
+            op_id,
+            command,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminStartInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminStartInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminStartOutput> for AdminStartInput {
+    fn from(o: AdminStartOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            command: o.command,
+        }
+    }
+}
+
+impl From<AdminStartInput> for AdminStartOutput {
+    fn from(i: AdminStartInput) -> Self {
+        Self {
+            message_type: 80u8,
+            op_id: i.op_id,
+            command: i.command,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStartedInput {
+    pub op_id: u64,
+    pub operation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStartedOutput {
+    pub message_type: u8,
+    pub op_id: u64,
+    pub operation: u64,
+}
+
+pub type AdminStarted = AdminStartedOutput;
+
+impl AdminStartedInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(81);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.operation, "leb128_canonical")?;
+        Ok(())
+    }
+}
+
+impl AdminStartedOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 81u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 81, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let operation = decoder.read_varlength("leb128_canonical")?;
+        Ok(Self {
+            message_type,
+            op_id,
+            operation,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminStartedInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminStartedInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminStartedOutput> for AdminStartedInput {
+    fn from(o: AdminStartedOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            operation: o.operation,
+        }
+    }
+}
+
+impl From<AdminStartedInput> for AdminStartedOutput {
+    fn from(i: AdminStartedInput) -> Self {
+        Self {
+            message_type: 81u8,
+            op_id: i.op_id,
+            operation: i.operation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStatusRequestInput {
+    pub op_id: u64,
+    pub operation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStatusRequestOutput {
+    pub message_type: u8,
+    pub op_id: u64,
+    pub operation: u64,
+}
+
+pub type AdminStatusRequest = AdminStatusRequestOutput;
+
+impl AdminStatusRequestInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(82);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.operation, "leb128_canonical")?;
+        Ok(())
+    }
+}
+
+impl AdminStatusRequestOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 82u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 82, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let operation = decoder.read_varlength("leb128_canonical")?;
+        Ok(Self {
+            message_type,
+            op_id,
+            operation,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminStatusRequestInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminStatusRequestInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminStatusRequestOutput> for AdminStatusRequestInput {
+    fn from(o: AdminStatusRequestOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            operation: o.operation,
+        }
+    }
+}
+
+impl From<AdminStatusRequestInput> for AdminStatusRequestOutput {
+    fn from(i: AdminStatusRequestInput) -> Self {
+        Self {
+            message_type: 82u8,
+            op_id: i.op_id,
+            operation: i.operation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdminState {
+    AdminRunning(AdminRunningOutput),
+    AdminSucceeded(AdminSucceededOutput),
+    AdminFailed(AdminFailedOutput),
+}
+
+impl AdminState {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        match self {
+            AdminState::AdminRunning(v) => {
+                encoder.write_uint8(v.code);
+            }
+            AdminState::AdminSucceeded(v) => {
+                encoder.write_uint8(v.code);
+            }
+            AdminState::AdminFailed(v) => {
+                encoder.write_uint8(v.code);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let value = decoder.peek_uint8()?;
+        // Match on discriminator value
+        if value == 0 {
+            Ok(AdminState::AdminRunning(
+                AdminRunningOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 1 {
+            Ok(AdminState::AdminSucceeded(
+                AdminSucceededOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 2 {
+            Ok(AdminState::AdminFailed(
+                AdminFailedOutput::decode_with_decoder(decoder)?,
+            ))
+        } else {
+            Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "unknown discriminator value: {}",
+                value
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminRunningInput {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminRunningOutput {
+    pub code: u8,
+}
+
+pub type AdminRunning = AdminRunningOutput;
+
+impl AdminRunningInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(0);
+        Ok(())
+    }
+}
+
+impl AdminRunningOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let code = decoder.read_byte()?;
+        if code != 0u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 0, got {}",
+                code
+            )));
+        }
+        Ok(Self { code })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminRunningInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminRunningInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminRunningOutput> for AdminRunningInput {
+    fn from(_o: AdminRunningOutput) -> Self {
+        Self {}
+    }
+}
+
+impl From<AdminRunningInput> for AdminRunningOutput {
+    fn from(_i: AdminRunningInput) -> Self {
+        Self { code: 0u8 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminSucceededInput {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminSucceededOutput {
+    pub code: u8,
+}
+
+pub type AdminSucceeded = AdminSucceededOutput;
+
+impl AdminSucceededInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(1);
+        Ok(())
+    }
+}
+
+impl AdminSucceededOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let code = decoder.read_byte()?;
+        if code != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                code
+            )));
+        }
+        Ok(Self { code })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminSucceededInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminSucceededInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminSucceededOutput> for AdminSucceededInput {
+    fn from(_o: AdminSucceededOutput) -> Self {
+        Self {}
+    }
+}
+
+impl From<AdminSucceededInput> for AdminSucceededOutput {
+    fn from(_i: AdminSucceededInput) -> Self {
+        Self { code: 1u8 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminFailedInput {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminFailedOutput {
+    pub code: u8,
+}
+
+pub type AdminFailed = AdminFailedOutput;
+
+impl AdminFailedInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(2);
+        Ok(())
+    }
+}
+
+impl AdminFailedOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let code = decoder.read_byte()?;
+        if code != 2u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 2, got {}",
+                code
+            )));
+        }
+        Ok(Self { code })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminFailedInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminFailedInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminFailedOutput> for AdminFailedInput {
+    fn from(_o: AdminFailedOutput) -> Self {
+        Self {}
+    }
+}
+
+impl From<AdminFailedInput> for AdminFailedOutput {
+    fn from(_i: AdminFailedInput) -> Self {
+        Self { code: 2u8 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStatusInput {
+    pub op_id: u64,
+    pub operation: u64,
+    pub state: AdminState,
+    pub phase: std::string::String,
+    pub message: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminStatusOutput {
+    pub message_type: u8,
+    pub op_id: u64,
+    pub operation: u64,
+    pub state: AdminState,
+    pub phase: std::string::String,
+    pub message: std::string::String,
+}
+
+pub type AdminStatus = AdminStatusOutput;
+
+impl AdminStatusInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(83);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        encoder.write_varlength(self.operation, "leb128_canonical")?;
+        self.state.encode_into(encoder)?;
+        encoder.write_varlength(self.phase.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.phase.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_varlength(self.message.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.message.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+}
+
+impl AdminStatusOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 83u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 83, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let operation = decoder.read_varlength("leb128_canonical")?;
+        let state = AdminState::decode_with_decoder(decoder)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let phase = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let message = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            message_type,
+            op_id,
+            operation,
+            state,
+            phase,
+            message,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminStatusInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminStatusInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminStatusOutput> for AdminStatusInput {
+    fn from(o: AdminStatusOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            operation: o.operation,
+            state: o.state,
+            phase: o.phase,
+            message: o.message,
+        }
+    }
+}
+
+impl From<AdminStatusInput> for AdminStatusOutput {
+    fn from(i: AdminStatusInput) -> Self {
+        Self {
+            message_type: 83u8,
+            op_id: i.op_id,
+            operation: i.operation,
+            state: i.state,
+            phase: i.phase,
             message: i.message,
         }
     }

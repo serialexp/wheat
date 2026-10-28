@@ -68,6 +68,7 @@ fn serve_with_token_file() -> Fixture {
                 name: "cloner".to_owned(),
                 token_hashes: vec![token_hash_hex(TOKEN.as_bytes())],
                 repositories: [("team/repo".to_owned(), Access::Read)].into(),
+                admin: false,
             }],
         }),
         ..FileConfig::default()

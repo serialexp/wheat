@@ -388,7 +388,7 @@ impl RepositoriesDirectory {
             .iter()
             .map(|target| (target.name.to_owned(), target.location))
             .collect::<BTreeMap<_, _>>();
-        for (name, location) in self.names_into(incoming.network)? {
+        for (name, location) in self.names_in_network(incoming.network)? {
             if ours.get(&name) != Some(&location) {
                 return Err(ImportError::NamedElsewhere(name));
             }
@@ -396,8 +396,9 @@ impl RepositoriesDirectory {
         Ok(())
     }
 
-    /// The names whose repository is in `network`, with where they point.
-    fn names_into(
+    /// The names whose repository is in `network`, with where they point. Reads
+    /// every name, so it costs the number of repositories the directory holds.
+    pub fn names_in_network(
         &self,
         network: Uuid,
     ) -> Result<Vec<(String, RepositoryLocationRecord)>, ImportError> {

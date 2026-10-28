@@ -31,7 +31,7 @@ pub use capabilities::{
     accept_capabilities, select_capabilities,
 };
 pub use content_batch::{ContentBatcher, content_chunks};
-pub use repository_path::{RepositoryPathError, repository_name, repository_path};
+pub use repository_path::{ADMIN_PATH, RepositoryPathError, repository_name, repository_path};
 pub use transfer_receiver::{TransferError, TransferReceiver};
 pub use wheat_protocol_generated::generated::*;
 pub use wheat_protocol_generated::{BitOrder, BitStreamDecoder, BitStreamEncoder};
