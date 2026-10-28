@@ -1,0 +1,21 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261028-000930
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# network_import	{"changes":10000}
+# release	true
+# rev	53ee865512bf
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+network_import.total.wall	66.484602209	s
+network_import.total.peak_rss	474685440	bytes
+network_import.import.wall	20.568658808	s
+network_import.content_count	10000	count
+network_import.content_bytes	168890	bytes
+run.total_time	66.48505453	s
+process.peak_rss	474685440	bytes
+suite.cases	1	count
+suite.case_failures	0	count

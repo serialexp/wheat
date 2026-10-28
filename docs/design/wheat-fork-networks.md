@@ -8,7 +8,7 @@ a hash is a read capability, publishes upload only what the store lacks, a fork
 starts with all its parent's labels, and the standalone server keeps networks in
 network directories.
 Owner: bart
-Last updated: 2026-10-27
+Last updated: 2026-10-28
 
 ## Implementation status
 
@@ -53,6 +53,11 @@ and move them from Outstanding to Done.
   6.0 ms in the `network_publish` bench case; Bart accepted that over running the two
   appends at once (measured at 1.7x), 2026-10-27. `remote_fork` (wheat-cli) clones a
   fork made while its parent is served.
+- [x] **Adopting a standalone repository (2026-10-28).**
+  `RepositoriesDirectory::adopt_repository` copies a `RepositoryDirectory` into a
+  network of its own with new IDs, adds its content to the content store, validates
+  it and installs the network before writing the name (`network_import.rs`; see
+  `wheat-network-maintenance.md`).
 
 ### Outstanding
 
@@ -67,10 +72,6 @@ and move them from Outstanding to Done.
   copy to another repositories directory needs that content too (the closure's
   `required_content`, or the content store whole). Designed with GC in
   `wheat-network-maintenance.md`.
-- [ ] **Adopting a standalone repository.** A `RepositoryDirectory` (what `wheat
-  import` writes) cannot be moved into a repositories directory; before networks it
-  could be renamed to `<repos-dir>/<owner>/<repo>`. Needs a crash-safe move into a
-  new network.
 - [ ] **Deleting a fork while its network is served.**
   `RepositoriesDirectory::delete` refuses while the network's store is open, so a
   fork cannot be deleted while any repository of its network is served.

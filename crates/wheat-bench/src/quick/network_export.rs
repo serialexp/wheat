@@ -11,7 +11,7 @@
 use std::{path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
-use wheat_core::{Repository, Tree};
+use wheat_core::{Repository, RepositoryLocationRecord, Tree};
 use wheat_store::{
     Durability, LocalPublicationStore, PackedObjectStore, RepositoriesDirectory,
     read_bundle_manifest,
@@ -48,7 +48,15 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     Ok(recorder.finish())
 }
 
-async fn measure_export(root: &Path, changes: usize, recorder: &mut Recorder) -> Result<()> {
+/// A network of one repository of `changes` changes and a fork of it, in `root`.
+pub(super) struct Built {
+    pub(super) repositories: RepositoriesDirectory,
+    pub(super) location: RepositoryLocationRecord,
+}
+
+/// Builds the network the cases export, with the changes' content in the network's own
+/// store.
+pub(super) async fn build_network(root: &Path, changes: usize) -> Result<Built> {
     let repositories = RepositoriesDirectory::new(root);
     let placed = repositories.create_empty("owner/repo", "main").await?;
     let network = repositories.network(placed.location.network);
@@ -85,13 +93,25 @@ async fn measure_export(root: &Path, changes: usize, recorder: &mut Recorder) ->
     drop(content);
     objects.close()?;
     repositories.fork("owner/repo", "fork/repo")?;
+    Ok(Built {
+        repositories,
+        location: placed.location,
+    })
+}
+
+async fn measure_export(root: &Path, changes: usize, recorder: &mut Recorder) -> Result<()> {
+    let Built {
+        repositories,
+        location,
+    } = build_network(root, changes).await?;
+    let network = location.network;
     // The content stays where the changes put it: in the network's own store.
-    let source_store = PackedObjectStore::open(network.storage())?;
+    let source_store = PackedObjectStore::open(repositories.network(network).storage())?;
     let content = source_store.content_store();
 
     let bundle = root.parent().unwrap_or(root).join("bundle");
     let started = Instant::now();
-    let export = repositories.export_network(placed.location.network, &bundle)?;
+    let export = repositories.export_network(network, &bundle)?;
     recorder.wall("copy", started.elapsed().as_secs_f64());
     let started = Instant::now();
     let manifest = export.finish(&content).await?;

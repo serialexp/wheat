@@ -43,13 +43,13 @@ use crate::{
     sync_filesystem,
 };
 
-const MANIFEST: &str = "bundle.manifest";
+pub(crate) const MANIFEST: &str = "bundle.manifest";
 const STRUCTURE: &str = "structure";
 const CONTENT_LIST: &str = "content.list";
 const CONTENT: &str = "content";
-const COPY_BUFFER_BYTES: usize = 1 << 20;
+pub(crate) const COPY_BUFFER_BYTES: usize = 1 << 20;
 /// Writers for a batch of content.
-const WRITE_CONCURRENCY: usize = 8;
+pub(crate) const WRITE_CONCURRENCY: usize = 8;
 
 /// How [`StructureExport::finish_with`] batches its work, which bounds its memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,7 +315,10 @@ async fn copy_content(
     Ok(listing)
 }
 
-fn put_batch(target: &ContentStore, batch: &mut Vec<VerifiedContent>) -> Result<(), BundleError> {
+pub(crate) fn put_batch(
+    target: &ContentStore,
+    batch: &mut Vec<VerifiedContent>,
+) -> Result<(), BundleError> {
     let blobs = batch
         .iter()
         .map(VerifiedContent::borrowed)
@@ -367,14 +370,14 @@ fn read_head(structure: &Path, repository: Uuid) -> Result<RepositoryHead, Bundl
 }
 
 /// The sorted union of content sets, read through one cursor each.
-struct Merged<'a> {
+pub(crate) struct Merged<'a> {
     cursors: Vec<ContentSetCursor<'a, PackedObjectStore>>,
     next: BinaryHeap<Reverse<(ContentId, usize)>>,
     last: Option<ContentId>,
 }
 
 impl<'a> Merged<'a> {
-    async fn new(
+    pub(crate) async fn new(
         sets: &ContentSetStore<'a, PackedObjectStore>,
         roots: &BTreeSet<ContentSetId>,
     ) -> Result<Self, BundleError> {
@@ -395,7 +398,7 @@ impl<'a> Merged<'a> {
 
     /// The next content ID not yet returned; an ID two sets hold comes once. A set
     /// that does not list its IDs in order is refused.
-    async fn next(&mut self) -> Result<Option<ContentId>, BundleError> {
+    pub(crate) async fn next(&mut self) -> Result<Option<ContentId>, BundleError> {
         while let Some(Reverse((id, index))) = self.next.pop() {
             if let Some(following) = self.cursors[index].next().await? {
                 if following <= id {
@@ -458,7 +461,7 @@ fn portable(path: &Path) -> Result<String, BundleError> {
 
 /// Copies `len` bytes of `source` to the new file `target`, returning their digest.
 #[tracing::instrument(level = "debug", skip_all)]
-fn copy_hashed(
+pub(crate) fn copy_hashed(
     source: &Path,
     len: u64,
     target: &Path,
@@ -512,7 +515,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
 
 /// Removes the files under `directory` (at `relative` in its store) that a copy of
 /// the store leaves out: the lock and the lookup index a running store keeps.
-fn remove_skipped(directory: &Path, relative: &Path) -> io::Result<()> {
+pub(crate) fn remove_skipped(directory: &Path, relative: &Path) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let file_type = entry.file_type()?;

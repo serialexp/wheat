@@ -1,7 +1,7 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
-Status: partial — Phase 1 (export to a directory) landed as a library operation,
-the rest designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
+Status: partial — Phases 1 (export) and 2 (import and adoption) landed as library
+operations, the rest designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
@@ -45,6 +45,19 @@ and move them from Outstanding to Done.
   takes 0.3–2.5 s and the finish 20–27 s, of which about 20 s is `validate_complete`
   re-verifying the history (2 ms a change); peak RSS 460 MiB. Not yet wired to a
   server operation: that is Phase 0.
+- [x] **Phase 2 — import and adoption from a directory (2026-10-28).**
+  `RepositoriesDirectory::import_network` places a bundle's network under its own IDs
+  and `adopt_repository` places a `RepositoryDirectory` under new ones
+  (`wheat-store/src/network_import.rs`, `tests/network_import.rs`). Differs from the
+  review's "durable import record": the network's rename into `networks/` is the commit
+  point (a stage validated against the content store, never renamed over another
+  network), and the names follow it under locks taken first. A crash between leaves
+  a network no name refers to; the same import again finds it (no name outside the
+  request points into it) and writes the names, so no record is needed. Every
+  manifest path is checked (only `storage/...` and the listed heads) and every file
+  is hashed against the manifest as it is copied. Bench case `network_import`: 10,000
+  changes in about 21 s, nearly all `validate_complete`; peak RSS 450 MiB. Not yet
+  held against content GC's publish gate (Phase 5) or run by the server (Phase 0).
 
 ### Outstanding
 
@@ -56,10 +69,6 @@ and move them from Outstanding to Done.
 - [ ] **Phase 0 — admin surface.** Admin request and response messages, the `admin`
   principal flag in `[auth]`, the server's operation runner (one maintenance
   operation at a time per repositories directory) and `wheat admin`.
-- [ ] **Phase 2 — import and adoption from a directory.** A bundle, or a
-  `RepositoryDirectory` from `wheat import`, placed in a repositories directory under
-  its own IDs with names; its content added to the content store. Closes the
-  fork-networks doc's adoption item.
 - [ ] **Phase 2b — the bucket transport.** Export to and import from an
   S3-compatible bucket: immutable store files once by name, content once by ID,
   shared by every export to the bucket.

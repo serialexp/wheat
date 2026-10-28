@@ -20,11 +20,11 @@ server-authoritative remote maintenance.
   protocol doc's two-tier storage keeps structure per fork network. Networks share
   one store handle in the registry, and `--repos-dir` keeps them as
   `wheat_store::RepositoriesDirectory` lays them out, with `fork` and one content
-  store for every network. Open: Gothab's opener, adopting a standalone repository,
-  deleting a fork while its network is served, and moving a standalone network with
-  its content. Design and phases: `docs/design/wheat-fork-networks.md`; moving,
+  store for every network. Open: Gothab's opener, deleting a fork while its network is
+  served, and running export and import in the server (library operations since
+  2026-10-28). Design and phases: `docs/design/wheat-fork-networks.md`; moving,
   adoption, deletion while served and GC: `docs/design/wheat-network-maintenance.md`
-  (decided 2026-10-27, not yet built).
+  (export and import built, the rest decided 2026-10-27).
 - `[ ]` **Delta content stored one envelope at a time.**
   `ContentStore::put_many_with_bases` stores each delta-encoded blob with its own
   `put_raw_envelope`, one backend write (a synced loose file, or a blob upload) per

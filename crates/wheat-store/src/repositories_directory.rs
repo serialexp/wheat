@@ -53,10 +53,10 @@ use crate::{
 };
 
 const CONTENT: &str = "content";
-const NAMES: &str = "names";
-const NETWORKS: &str = "networks";
-const HEADS: &str = "heads";
-const HEAD_FILE: &str = "repository.head";
+pub(crate) const NAMES: &str = "names";
+pub(crate) const NETWORKS: &str = "networks";
+pub(crate) const HEADS: &str = "heads";
+pub(crate) const HEAD_FILE: &str = "repository.head";
 /// A name record being written: `.{repo}.wheat-name-{id}.tmp`.
 const NAME_INFIX: &str = ".wheat-name-";
 
@@ -259,7 +259,7 @@ impl RepositoriesDirectory {
     }
 
     /// `names/<owner>` and `<repo>` for `owner/repo`.
-    fn name_path<'a>(
+    pub(crate) fn name_path<'a>(
         &self,
         name: &'a str,
     ) -> Result<(PathBuf, &'a OsStr), RepositoriesDirectoryError> {
@@ -273,7 +273,7 @@ impl RepositoriesDirectory {
     }
 
     /// The location `<repo>` in `parent` names, when its head is there.
-    fn live_location(
+    pub(crate) fn live_location(
         &self,
         parent: &Path,
         repo: &OsStr,
@@ -405,7 +405,7 @@ fn is_name_segment(segment: &str) -> bool {
 }
 
 /// The location the name record at `path` holds, or `None` when there is none.
-fn read_location(
+pub(crate) fn read_location(
     path: &Path,
 ) -> Result<Option<RepositoryLocationRecord>, RepositoriesDirectoryError> {
     let bytes = match fs::read(path) {
@@ -420,7 +420,7 @@ fn read_location(
 
 /// Writes the name record `<repo>` in `parent`, replacing one whose head is gone.
 /// The caller holds the name's lock.
-fn write_location(
+pub(crate) fn write_location(
     parent: &Path,
     repo: &OsStr,
     location: RepositoryLocationRecord,
@@ -444,7 +444,7 @@ fn write_location(
 
 /// Removes the name records of `<repo>` a crash left half written in `parent`. The
 /// caller holds the name's lock.
-fn sweep_name_records(parent: &Path, repo: &OsStr) -> io::Result<()> {
+pub(crate) fn sweep_name_records(parent: &Path, repo: &OsStr) -> io::Result<()> {
     let mut prefix = OsStr::new(".").to_os_string();
     prefix.push(repo);
     prefix.push(NAME_INFIX);

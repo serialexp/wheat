@@ -60,6 +60,7 @@ mod remote_packed;
 pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
 mod browse;
 mod network_bundle;
+mod network_import;
 mod publication;
 mod radix;
 mod repositories_directory;
@@ -140,6 +141,7 @@ pub use network_bundle::{
     BundleError, ExportLimits, StructureExport, bundle_content_directory,
     bundle_structure_directory, read_bundle_content_chunk, read_bundle_manifest,
 };
+pub use network_import::{ImportError, ImportLimits, ImportedNetwork};
 pub use object_store_adapter::{
     ObjectStoreAdapter, ObjectStoreAdapterBuildError, S3ObjectStoreConfig,
 };
