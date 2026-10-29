@@ -7,7 +7,7 @@
 //! or another, says how it is going and what it produced. Only one runs at a time,
 //! since each holds a network still, or the content store, for stretches the next
 //! should not interleave with; another start is refused with a retryable error naming
-//! the one running. The last [`KEPT`] finished operations stay for asking about.
+//! the one running. The last 64 finished operations stay for asking about.
 //!
 //! The operations name bundles and standalone repositories by a single path segment
 //! under [`ServerConfig::exchange_dir`](crate::server::ServerConfig::exchange_dir), so

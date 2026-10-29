@@ -303,10 +303,6 @@ budget passes, but by only about 0.7 s.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
-- `[ ]` **Two doc comments link private items (2026-10-27).** `cargo doc -p wheat-store`
-  warns that `check_combination` (`revision_merge.rs`) links `merge_order` and
-  `ContentStore::get_bounded` links `MAX_DELTA_CHAIN_DEPTH`; with `-D warnings` the
-  docs do not build. Nothing runs `cargo doc` in `just` today.
 - `[ ]` **Workspace reads keep their own libc module (2026-10-05).** wheat-cli's
   other operating-system calls now go through `sys.rs`, but `workspace_files.rs` still
   has a `#[cfg(unix)] mod platform` that calls `openat`, `fstatat` and `readlinkat`

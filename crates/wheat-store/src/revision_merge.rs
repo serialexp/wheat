@@ -432,8 +432,8 @@ impl<'r, 'a, O: ImmutableObjectStore> RevisionMerge<'r, 'a, O> {
 
 impl<O: ImmutableObjectStore> RepositoryReader<'_, O> {
     /// Checks a combined revision is what integration authors: its parents are
-    /// incomparable, it follows the first of them in [`merge_order`], and its edits are
-    /// their merge. Without the first, a revision could combine a revision with its own
+    /// incomparable, it follows the first of them in merge order (by commit date, ties
+    /// broken by the lowest ID), and its edits are their merge. Without the first, a revision could combine a revision with its own
     /// descendant, and that descendant's removals would look new to a later merge. A
     /// revision combining nothing passes. The merge is bounded by its own
     /// [`MergeBudget::STANDARD`], not by the caller's.

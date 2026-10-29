@@ -148,7 +148,7 @@ pub enum StagedImportError {
 
 /// Discover and stage at most `max_commits` additional commits, capped at
 /// [`DEFAULT_STAGE_COMMITS`]. `None` uses that bound. Each invocation discovers at
-/// most one durable [`DISCOVERY_BATCH`] parent frontier; `complete` remains false until
+/// most one durable parent frontier of 256 commits; `complete` remains false until
 /// that frontier is exhausted. Reopening with changed refs, HEAD, repository path, or
 /// format is rejected.
 pub async fn stage_import<O: ImmutableObjectStore>(

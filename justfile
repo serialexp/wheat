@@ -17,6 +17,10 @@ check-windows:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Build the API docs; warnings (such as a public item linking a private one) fail.
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
 # Verify formatting.
 fmt-check:
     cargo fmt --all -- --check

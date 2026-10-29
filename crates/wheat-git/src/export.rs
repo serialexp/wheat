@@ -205,8 +205,8 @@ struct ChainEntry {
 /// to the caller so publication can use its own compare-and-swap policy.
 ///
 /// One commit is written per projected change application. Its message is
-/// described by [`commit_message`]; author and committer come from the applied
-/// revision.
+/// described by `MessageBuilder::commit_message`; author and committer come
+/// from the applied revision.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn export_revision_history<O: ImmutableObjectStore>(
     objects: &O,

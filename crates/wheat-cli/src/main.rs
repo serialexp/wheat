@@ -431,7 +431,7 @@ enum LabelCommand {
         /// Tag time (RFC3339) for an annotated label; defaults to now.
         #[arg(long, requires = "message")]
         tagged_at: Option<String>,
-        /// Full repository head CAS guard: <generation>:<envelope>.
+        /// Full repository head CAS guard: GENERATION:ENVELOPE.
         #[arg(long, value_parser = label_service::parse_expected_head)]
         expected_head: Option<wheat_store::RepositoryHead>,
     },
@@ -439,7 +439,7 @@ enum LabelCommand {
     Rename {
         old: String,
         new: String,
-        /// Full repository head CAS guard: <generation>:<envelope>.
+        /// Full repository head CAS guard: GENERATION:ENVELOPE.
         #[arg(long, value_parser = label_service::parse_expected_head)]
         expected_head: Option<wheat_store::RepositoryHead>,
     },
@@ -455,14 +455,14 @@ enum LabelCommand {
         /// Move the label even when the move is not forward or leaves frontiers behind.
         #[arg(long)]
         force: bool,
-        /// Full repository head CAS guard: <generation>:<envelope>.
+        /// Full repository head CAS guard: GENERATION:ENVELOPE.
         #[arg(long, value_parser = label_service::parse_expected_head)]
         expected_head: Option<wheat_store::RepositoryHead>,
     },
     /// Delete a label, unless it is selected by the current workspace.
     Delete {
         name: String,
-        /// Full repository head CAS guard: <generation>:<envelope>.
+        /// Full repository head CAS guard: GENERATION:ENVELOPE.
         #[arg(long, value_parser = label_service::parse_expected_head)]
         expected_head: Option<wheat_store::RepositoryHead>,
     },
@@ -678,12 +678,12 @@ struct PushArgs {
     /// Full destination branch ref, for example refs/heads/main.
     #[arg(long, required_unless_present = "tag")]
     to: Option<String>,
-    /// Push annotated label tags/<TAG> as Git tag refs/tags/<TAG>. Its commit must
+    /// Push annotated label tags/TAG as Git tag refs/tags/TAG. Its commit must
     /// already be on a remote branch. A remote tag that differs (the label moved) is
     /// replaced only with --force-with-lease.
     #[arg(long, conflicts_with_all = ["to", "source"])]
     tag: Option<String>,
-    /// Advanced source override: label:<name> or an exact retained view ID.
+    /// Advanced source override: label:NAME or an exact retained view ID.
     #[arg(long)]
     source: Option<PushSource>,
     /// Replace an unknown/diverged destination, or a differing remote tag, only if it

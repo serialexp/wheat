@@ -606,7 +606,7 @@ impl ContentStore {
     /// Reads and verifies content while refusing to allocate more than `max` bytes for it.
     ///
     /// Transparently resolves delta chains: if the envelope uses a delta codec,
-    /// follows the base reference chain (up to [`MAX_DELTA_CHAIN_DEPTH`] links)
+    /// follows the base reference chain (up to 16 links)
     /// and reconstructs the content by applying patches in reverse. The `max`
     /// bound applies to the final reconstructed output, not to intermediate
     /// base fetches.

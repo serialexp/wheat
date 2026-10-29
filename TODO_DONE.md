@@ -519,6 +519,14 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
 
+- `[x]` **Two doc comments link private items (2026-10-27).** `cargo doc -p wheat-store`
+  warned that `check_combination` (`revision_merge.rs`) links `merge_order` and
+  `ContentStore::get_bounded` links `MAX_DELTA_CHAIN_DEPTH`. Fixed 2026-10-29 with the
+  rest `-D warnings` found across the workspace (two more private links in wheat-git,
+  one in wheat-server, and clap help placeholders like `<generation>` that rustdoc
+  reads as HTML, now `GENERATION:ENVELOPE`). `just doc` builds the docs with
+  warnings denied.
+
 - `[x]` **The repository registry is not pluggable (2026-09-26).** An embedder passes
   its own `RepositoryOpener` to `Registry::with_opener`; `DirectoryOpener` serves
   `owner/repo` from a directory, which `wheat-server --repos-dir` uses (2026-10-27,
