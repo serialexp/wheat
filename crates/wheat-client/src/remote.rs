@@ -12,7 +12,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header::AUTHORIZATION};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 use url::{Host, Url};
 
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, VerifiedContent};
@@ -410,9 +412,74 @@ pub async fn open_admin(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
     connect(url, token).await
 }
 
+/// Whether `url`'s host is this machine, where a plain connection is not overheard.
+fn is_loopback(url: &WheatUrl) -> Result<bool> {
+    let parsed = Url::parse(&url.ws_url).with_context(|| format!("invalid URL {}", url.ws_url))?;
+    Ok(match parsed.host() {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    })
+}
+
+/// The TLS settings for `wheat+tls://`: the operating system's trusted roots (or
+/// those `SSL_CERT_FILE` / `SSL_CERT_DIR` name), read once per process.
+fn tls_config() -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    static CONFIG: std::sync::OnceLock<Result<std::sync::Arc<rustls::ClientConfig>, String>> =
+        std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let loaded = rustls_native_certs::load_native_certs();
+            let mut roots = rustls::RootCertStore::empty();
+            let (added, _) = roots.add_parsable_certificates(loaded.certs);
+            if added == 0 {
+                let errors = loaded
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "found no trusted root certificates on this machine to check a \
+                     wheat+tls:// server with; install the system's CA certificates or \
+                     point SSL_CERT_FILE at a PEM file of them{}",
+                    if errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({errors})")
+                    }
+                ));
+            }
+            // Named, rather than the process default, so another crate enabling a
+            // second provider cannot make the default ambiguous.
+            let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map(|builder| {
+                    std::sync::Arc::new(builder.with_root_certificates(roots).with_no_client_auth())
+                })
+                .map_err(|error| format!("cannot set up TLS: {error}"))
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
 /// Connects to `url.ws_url` and runs the handshake up to the session being established.
 async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
     let ws_url = url.ws_url.as_str();
+    if !token.is_empty() && url.scheme == "wheat" && !is_loopback(url)? {
+        bail!(
+            "refusing to send the token from credential.helper to {} over plain wheat://, \
+             where anyone on the way can read it; reach the server with a wheat+tls:// URL",
+            url.authority
+        );
+    }
+    let connector = if url.scheme == "wheat+tls" {
+        Some(Connector::Rustls(tls_config()?))
+    } else {
+        None
+    };
     let mut request = ws_url
         .into_client_request()
         .with_context(|| format!("invalid WebSocket URL {ws_url}"))?;
@@ -429,9 +496,10 @@ async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
     // Nagle's algorithm would hold back the tail of a message until the server's
     // delayed ACK, which costs every request/reply round tens of milliseconds.
     let disable_nagle = true;
-    let (mut ws, _) = connect_async_with_config(request, Some(limits), disable_nagle)
-        .await
-        .with_context(|| format!("failed to connect to {ws_url}"))?;
+    let (mut ws, _) =
+        connect_async_tls_with_config(request, Some(limits), disable_nagle, connector)
+            .await
+            .with_context(|| format!("failed to connect to {ws_url}"))?;
 
     // Receive ServerHello.
     let server_hello = recv_msg(&mut ws).await?;

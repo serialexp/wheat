@@ -8,6 +8,8 @@
 //!   wheat-server --data-dir ./my-repo --listen 127.0.0.1:7420
 //!   wheat-server --data-dir ./my-repo --store s3-packed  # S3 config from env vars
 //!   wheat-server --data-dir ./my-repo --config wheat-server.toml --listen 0.0.0.0:7420
+//!   wheat-server --repos-dir ./repos --config wheat-server.toml --listen 0.0.0.0:7420 \
+//!     --tls-cert fullchain.pem --tls-key key.pem              # serve wheat+tls://
 //!   openssl rand -hex 32 | wheat-server hash-token        # hash for token_hashes
 //!
 //! Without a config file that has an `[auth]` table, the server lets anyone in
@@ -89,6 +91,16 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:7420")]
     listen: SocketAddr,
 
+    /// Serve TLS (`wheat+tls://`) with the certificate chain in this PEM file: the
+    /// server's certificate first, then any intermediates. Without it the server
+    /// speaks plain WebSockets, for loopback or behind a proxy that ends TLS.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// The PEM private key for `--tls-cert`.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
     /// Optional repository name (defaults to the data directory name).
     #[arg(long)]
     name: Option<String>,
@@ -121,6 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut server_config = ServerConfig::from_file(&file_config)?;
     server_config.check_listen_address(cli.listen)?;
+    if let (Some(cert), Some(key)) = (&cli.tls_cert, &cli.tls_key) {
+        server_config.tls = Some(wheat_server::tls::load_pem(cert, key)?);
+    }
     if let Some(exchange_dir) = &cli.exchange_dir {
         if !exchange_dir.is_dir() {
             return Err(format!(

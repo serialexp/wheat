@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-10-27
+Last updated: 2026-10-29
 
 ## Implementation status
 
@@ -102,6 +102,26 @@ top of them.
   per list (`wheat-protocol/src/capabilities.rs`). Added before the V1 format
   freeze, because a decoder needs the field from the start; see
   [Schema evolution policy](#schema-evolution-policy).
+- [x] **Phase 1 — authentication.** Bearer token auth on the WebSocket upgrade
+  request (`Authorization: Bearer`; in `ClientHello` until 2026-10-27), TLS
+  required, localhost-only default when no auth is configured. Standalone
+  server refuses non-loopback binding without explicit auth config. Origin
+  validation for browser WebSocket connections. (2026-09-26: done except TLS.
+  `crates/wheat-server/src/access.rs` has the pluggable `AccessProvider`; the
+  standalone server reads token hashes from the `[auth]` table of
+  `--config wheat-server.toml`, runs open only on loopback, and refuses
+  upgrades whose `Origin` is not in `allowed_origins`. The client gets its token
+  from `credential.helper` (`crates/wheat-client/src/credential.rs`). TLS is still
+  missing: `wheat+tls://` cannot connect, so tokens travel in clear text unless a
+  TLS proxy sits in front.) 2026-10-29: `wheat+tls://` connects over rustls,
+  checking the server against the operating system's trusted roots
+  (`rustls-native-certs`, so `SSL_CERT_FILE` / `SSL_CERT_DIR` name others). The
+  client refuses to send a `credential.helper` token over plain `wheat://` to a
+  host that is not loopback. wheat-server ends TLS itself with
+  `--tls-cert`/`--tls-key` (PEM; `wheat_server::tls`, `ServerConfig::tls`), the
+  handshake inside the session-setup deadline; without them it serves plain
+  WebSockets for loopback or a proxy that ends TLS. See
+  [Authentication](#connection-lifecycle) for how "TLS required" turned out.
 
 ### Outstanding
 
@@ -116,18 +136,6 @@ top of them.
   incremental. There is no named or multi-remote configuration. The push still
   sends whole objects; sending deltas against the objects the client has is
   not started.)
-- [~] **Phase 1 — authentication.** Bearer token auth on the WebSocket upgrade
-  request (`Authorization: Bearer`; in `ClientHello` until 2026-10-27), TLS
-  required, localhost-only default when no auth is configured. Standalone
-  server refuses non-loopback binding without explicit auth config. Origin
-  validation for browser WebSocket connections. (2026-09-26: done except TLS.
-  `crates/wheat-server/src/access.rs` has the pluggable `AccessProvider`; the
-  standalone server reads token hashes from the `[auth]` table of
-  `--config wheat-server.toml`, runs open only on loopback, and refuses
-  upgrades whose `Origin` is not in `allowed_origins`. The client gets its token
-  from `credential.helper` (`crates/wheat-client/src/credential.rs`). TLS is still
-  missing: `wheat+tls://` cannot connect, so tokens travel in clear text unless a
-  TLS proxy sits in front.)
 - [~] **Phase 2 — authorization and publish gates.** Server-side namespace/
   repository permission checks, read vs publish access control, and
   publish-gate enforcement (e.g. CI-required, review-required). (2026-09-26:
@@ -719,6 +727,16 @@ configuration is provided; binding to non-loopback addresses requires
 explicit auth configuration. This prevents accidentally exposing an open
 server.
 
+As built (2026-10-29), TLS is required of the client rather than of the server.
+The server usually sits behind a proxy that ends TLS, so it serves plain
+WebSockets unless given a certificate (`--tls-cert`/`--tls-key`), for internal TLS
+or direct connections. The client is what keeps the token off the wire in clear
+text: it refuses to send one over plain `wheat://` to anything but a loopback
+host, so a token only leaves the machine inside `wheat+tls://`. It trusts the
+operating system's root certificates, which the system keeps current, rather than
+a list built into Wheat; `SSL_CERT_FILE` or `SSL_CERT_DIR` replace them, for an
+internal CA.
+
 **Origin validation:** Browser WebSocket connections include an `Origin`
 header. The server validates it against an allowlist to prevent cross-site
 WebSocket hijacking.
@@ -1046,6 +1064,13 @@ standalone server's accept loop; an embedder that accepts connections itself set
 its own.
 `openssl rand -hex 32 | tee token | wheat-server hash-token` makes a token and
 its hash.
+
+`--tls-cert fullchain.pem --tls-key key.pem` serves `wheat+tls://` directly: the
+certificate file holds the server's certificate and then any intermediates, the
+key file its PEM private key. The TLS handshake counts against
+`session_setup_seconds`. Without them the server speaks plain WebSockets, which
+clients only send tokens over on loopback, so a server reached from elsewhere
+needs either these or a proxy in front that ends TLS.
 
 ### Embedded in Gothab
 

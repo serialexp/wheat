@@ -533,6 +533,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   `crates/wheat-cli/tests/remote_fetch.rs`.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
+- `[x]` **`wheat+tls://` URLs parse but cannot connect.** Done 2026-10-29. The client
+  connects over rustls (aws-lc-rs) and checks the server against the operating
+  system's trusted roots through `rustls-native-certs`, read once per process;
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` replace them. It refuses to send a
+  `credential.helper` token over plain `wheat://` to a host that is not loopback.
+  wheat-server serves TLS itself with `--tls-cert`/`--tls-key` (`wheat_server::tls`,
+  `ServerConfig::tls`), the handshake inside the session-setup deadline. Tests:
+  `wheat-server` `tls_test`, and the TLS clone, untrusted certificate and refused
+  token cases in `wheat-cli` `remote_auth`.
 - `[x]` **JSON output of `status` and `conflicts` gives IDs as byte arrays
   (2026-10-09).** Fixed 2026-10-29 in wheat-core rather than per document: the ID
   types' `Serialize`/`Deserialize` are the hex string (`hex_serde!` in `id.rs`), which

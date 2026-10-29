@@ -26,6 +26,7 @@ wheat-trace = { path = "../wheat-trace" }
 [dev-dependencies]
 blake3 = { workspace = true }
 libc = { workspace = true }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio = { workspace = true }
 wheat-protocol = { path = "../wheat-protocol" }
 wheat-server = { path = "../wheat-server" }

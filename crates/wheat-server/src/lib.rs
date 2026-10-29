@@ -23,5 +23,6 @@ pub mod quiesce;
 pub mod receipt;
 pub mod registry;
 pub mod server;
+pub mod tls;
 pub mod transport;
 pub mod wire;

@@ -68,11 +68,33 @@ pub async fn handle_connection(
         .unwrap_or_else(|_| "unknown".into());
     debug!(peer = %peer, "new connection");
     let deadline = Instant::now() + config.session_setup_timeout;
+    match &config.tls {
+        None => upgrade_and_serve(stream, &registry, &config, &peer, deadline).await,
+        Some(tls) => match timeout_at(deadline, tls.accept(stream)).await {
+            Ok(Ok(stream)) => upgrade_and_serve(stream, &registry, &config, &peer, deadline).await,
+            Ok(Err(e)) => warn!(peer = %peer, error = %e, "TLS handshake failed"),
+            Err(_) => {
+                info!(peer = %peer, "connection closed: no TLS handshake before the deadline");
+            }
+        },
+    }
+}
 
+/// Upgrades `stream` to a WebSocket and serves its session, all of setup before
+/// `deadline`.
+async fn upgrade_and_serve<S>(
+    stream: S,
+    registry: &Arc<Registry>,
+    config: &ServerConfig,
+    peer: &str,
+    deadline: Instant,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut upgrade = None;
     #[allow(clippy::result_large_err)] // The error type is fixed by tungstenite's callback.
     let check_upgrade = |request: &Request, response: Response| {
-        upgrade = Some(Upgrade::check(request, &config).map_err(Refusal::into_response)?);
+        upgrade = Some(Upgrade::check(request, config).map_err(Refusal::into_response)?);
         Ok(response)
     };
     let accept = accept_hdr_async_with_config(stream, check_upgrade, Some(message_limits()));
@@ -91,7 +113,7 @@ pub async fn handle_connection(
         warn!(peer = %peer, "WebSocket handshake finished without its request");
         return;
     };
-    serve_until(&mut ws, &upgrade, &registry, &config, &peer, deadline).await;
+    serve_until(&mut ws, &upgrade, registry, config, peer, deadline).await;
 }
 
 /// Serve one session on `io`, a connection the caller has already upgraded to a

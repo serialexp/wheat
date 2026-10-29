@@ -17,7 +17,9 @@ similar = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { version = "0.28", features = ["connect"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
+tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-native-roots"] }
 tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }

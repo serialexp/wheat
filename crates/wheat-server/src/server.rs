@@ -35,7 +35,7 @@ pub struct ServerConfig {
     /// (non-browser clients) are not affected.
     pub allowed_origins: Vec<String>,
     /// How long a connection has from being accepted until its caller is
-    /// authenticated: the WebSocket upgrade, `ClientHello` and the access
+    /// authenticated: any TLS handshake, the WebSocket upgrade, `ClientHello` and the access
     /// provider's answer together. A client that takes longer, or sends nothing,
     /// is disconnected, so connections nobody has authenticated cannot pile up.
     /// Every entry point in [`connection`] enforces it, so embedders get it too;
@@ -55,6 +55,12 @@ pub struct ServerConfig {
     /// `None` refuses them, since an admin could otherwise reach any path the server
     /// can.
     pub exchange_dir: Option<std::path::PathBuf>,
+    /// TLS for the connections [`run`] and [`run_until`] accept, which clients reach
+    /// with `wheat+tls://` ([`crate::tls::load_pem`]). `None` serves plain
+    /// WebSockets, for loopback or behind a proxy that ends TLS. The handshake counts
+    /// against [`Self::session_setup_timeout`]. An embedder that does its own upgrade
+    /// does its own TLS.
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
 impl ServerConfig {
@@ -73,6 +79,7 @@ impl ServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             publish_hooks: None,
             exchange_dir: None,
+            tls: None,
         }
     }
 

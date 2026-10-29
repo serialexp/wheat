@@ -299,12 +299,12 @@ budget passes, but by only about 0.7 s.
   platform code. `discovery.rs` (the device that stops discovery at a mount) and
   `store_analyze.rs` (allocated bytes) also keep small `cfg(unix)` branches, whose
   non-Unix halves guess instead of failing.
-- `[ ]` **`wheat+tls://` URLs parse but cannot connect.** `crates/wheat-client/src/remote.rs`
-  accepts the scheme, but `tokio-tungstenite` is built with only the `connect`
-  feature (no rustls/native-tls), in both wheat-cli and wheat-server. Since
-  2026-09-26 the client sends a bearer token from `credential.helper`, so over plain
-  `wheat://` to another machine the token travels in clear text. Once TLS works,
-  consider refusing to send a token over plain `wheat://` to a non-loopback host.
+- `[ ]` **A clone that fails to connect leaves an empty store behind (2026-10-29).**
+  `clone` in `crates/wheat-cli/src/main.rs` creates the store directory (and opens
+  its packed storage) before `remote::open`, and nothing removes it when the
+  connection, the token, the certificate or the fetch fails, so every failed clone
+  leaves a store in the store home. Only a failing `credential.helper` is checked
+  first.
 - `[ ]` **Capturing `.git` paths is not gated (2026-09-26).** Writing paths inside
   `.git` now asks or needs `--allow-dot-git`, but `wheat add .git/config` captures
   one without a word. In a workspace that is also a git checkout that could put
