@@ -419,7 +419,7 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     assert!(String::from_utf8_lossy(&conflicted.stdout).contains("active label: main"));
     let conflicts = wheat(directory.path(), &["conflicts"]);
     assert!(conflicts.status.success());
-    assert!(String::from_utf8_lossy(&conflicts.stdout).contains("path=\"shared\""));
+    assert!(String::from_utf8_lossy(&conflicts.stdout).contains("  \"shared\": "));
     let conflicts_json_output = wheat(directory.path(), &["conflicts", "--format", "json"]);
     assert!(conflicts_json_output.status.success());
     let conflicts_json: serde_json::Value =
@@ -428,16 +428,16 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
     assert_eq!(conflicts_json["schema_version"], 1);
     assert!(conflicts_json["head_generation"].as_u64().is_some());
     let conflict = &conflicts_json["conflicts"][0];
-    assert_eq!(conflict["id"].as_array().unwrap().len(), 32);
-    assert_eq!(conflict["base_view"].as_array().unwrap().len(), 32);
+    assert_eq!(conflict["id"].as_str().unwrap().len(), 64);
+    assert_eq!(conflict["base_view"].as_str().unwrap().len(), 64);
     assert_eq!(conflict["change_id"], b_change);
     assert_eq!(
         conflict["revision_id"],
         serde_json::to_value(b_revision.parse::<wheat_core::RevisionId>().unwrap()).unwrap()
     );
-    assert_eq!(conflict["application_id"].as_array().unwrap().len(), 32);
+    assert_eq!(conflict["application_id"].as_str().unwrap().len(), 64);
     let edit = &conflict["edits"][0];
-    assert_eq!(edit["id"].as_array().unwrap().len(), 32);
+    assert_eq!(edit["id"].as_str().unwrap().len(), 64);
     assert_eq!(edit["path"], "shared");
     assert!(!edit["reason"].is_null());
     assert!(!edit["target"].is_null());

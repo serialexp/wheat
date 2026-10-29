@@ -171,6 +171,14 @@ Finished items, moved here from `TODO.md` under the same headings.
   stores and directories were deleted.
 
 ## Found while dogfooding (2026-10-19)
+- `[x]` **`wheat status --format=json` prints view IDs as byte arrays (2026-10-21).**
+  Fixed 2026-10-29: every wheat-core digest ID and `ContentId` serializes as its hex
+  (and reads back from it), so all JSON documents agree with the human output; see the
+  matching item under Loose ends.
+- `[x]` **`wheat conflicts` prints Rust debug output.** Fixed 2026-10-29: each conflict
+  names its change by ID and title, and each edit line gives the quoted path, the
+  reason in words and what the edit writes (`it writes an executable file with content
+  <id>`, `it deletes the path`). The JSON document gained `title`.
 
 - `[x]` **`structural_delta::one_step_forward_yields_little_more_than_the_difference`
   fails about 1 run in 20** (failed CI on 37d047f). Change IDs are UUIDv7, so the
@@ -518,6 +526,13 @@ Finished items, moved here from `TODO.md` under the same headings.
   `crates/wheat-cli/tests/remote_fetch.rs`.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
+- `[x]` **JSON output of `status` and `conflicts` gives IDs as byte arrays
+  (2026-10-09).** Fixed 2026-10-29 in wheat-core rather than per document: the ID
+  types' `Serialize`/`Deserialize` are the hex string (`hex_serde!` in `id.rs`), which
+  also covers IDs nested in `FileValue`, `DiffDescriptor` and `EditFailure`. The
+  `display_id` helpers `frontier list` and `changes` used are gone. The temporary JSON
+  files (materialization journal, rewrite transaction) and the import trace hold hex
+  IDs too.
 
 - `[x]` **Two doc comments link private items (2026-10-27).** `cargo doc -p wheat-store`
   warned that `check_combination` (`revision_merge.rs`) links `merge_order` and

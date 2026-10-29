@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -66,12 +66,46 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Serializes as the hex string an ID displays as, so every JSON document (command
+/// output, and the temporary files that are JSON) shows IDs the way the human output
+/// does, and reads them back from the same.
+macro_rules! hex_serde {
+    ($name:ident) => {
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserializer.deserialize_str(HexVisitor(std::marker::PhantomData))
+            }
+        }
+    };
+}
+
+/// Reads an ID from its hex string without allocating.
+struct HexVisitor<T>(std::marker::PhantomData<T>);
+
+impl<T: FromStr<Err = ParseDigestIdError>> de::Visitor<'_> for HexVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an ID of 64 hexadecimal characters")
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<T, E> {
+        value.parse().map_err(E::custom)
+    }
+}
+
 macro_rules! digest_id {
     ($name:ident) => {
-        #[derive(
-            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-        )]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name([u8; 32]);
+
+        hex_serde!($name);
 
         impl $name {
             #[must_use]
@@ -261,8 +295,10 @@ object_id_from!(
     HistoryMapId,
 );
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ContentId([u8; 32]);
+
+hex_serde!(ContentId);
 
 /// Bytes this process has hashed with [`ContentId::of`].
 static CONTENT_BYTES_HASHED: AtomicU64 = AtomicU64::new(0);
@@ -346,6 +382,22 @@ fn parse_digest(value: &str) -> Result<[u8; 32], ParseDigestIdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_serialize_as_their_hex_and_read_back() {
+        let view = ViewId::from_digest([0xab; 32]);
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json, serde_json::Value::String(view.to_string()));
+        assert_eq!(serde_json::from_value::<ViewId>(json).unwrap(), view);
+
+        let content = ContentId::of(b"bytes");
+        let json = serde_json::to_string(&content).unwrap();
+        assert_eq!(json, format!("\"{content}\""));
+        assert_eq!(serde_json::from_str::<ContentId>(&json).unwrap(), content);
+
+        assert!(serde_json::from_str::<ViewId>("\"not hex\"").is_err());
+        assert!(serde_json::from_str::<ViewId>("[1, 2]").is_err());
+    }
 
     #[test]
     fn content_and_objects_of_the_same_bytes_have_different_ids() {

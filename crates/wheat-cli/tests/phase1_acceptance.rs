@@ -671,7 +671,13 @@ fn phase_one_routine_single_target_workflow_across_processes() {
 
     // JSON status intentionally has no conflict count; durable conflict detail is a separate contract.
     let conflicted_status = harness.json_ok(&harness.workspace, &["status"]);
-    assert!(conflicted_status["result"]["effective_view"].is_array());
+    assert_eq!(
+        conflicted_status["result"]["effective_view"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     let conflicts_first = harness.ok(&harness.workspace, &["conflicts", "--format=json"]);
     let conflicts_first_document = json_document(&conflicts_first);
     assert_eq!(conflicts_first_document["ok"], true);
@@ -686,8 +692,8 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         .as_array()
         .unwrap();
     assert_eq!(conflicts.len(), 1);
-    assert_eq!(conflicts[0]["id"].as_array().unwrap().len(), 32);
-    assert_eq!(conflicts[0]["base_view"].as_array().unwrap().len(), 32);
+    assert_eq!(conflicts[0]["id"].as_str().unwrap().len(), 64);
+    assert_eq!(conflicts[0]["base_view"].as_str().unwrap().len(), 64);
     assert_eq!(conflicts[0]["change_id"], descendant_change);
     let conflicted_revision: wheat_core::RevisionId = descendant_added["result"]["revision"]
         .as_str()
@@ -698,10 +704,10 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         conflicts[0]["revision_id"],
         serde_json::to_value(conflicted_revision).unwrap()
     );
-    assert_eq!(conflicts[0]["application_id"].as_array().unwrap().len(), 32);
+    assert_eq!(conflicts[0]["application_id"].as_str().unwrap().len(), 64);
     let edits = conflicts[0]["edits"].as_array().unwrap();
     assert_eq!(edits.len(), 1);
-    assert_eq!(edits[0]["id"].as_array().unwrap().len(), 32);
+    assert_eq!(edits[0]["id"].as_str().unwrap().len(), 64);
     assert_eq!(edits[0]["path"], "shared.txt");
     assert_eq!(edits[0]["target"]["kind"], "Regular");
     assert_eq!(

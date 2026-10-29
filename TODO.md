@@ -93,9 +93,6 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
   change (2026-10-21).** Pull moves every local change above the pulled commits; one
   whose edits are already there (the same fix made in Git) is not dropped as
   `git rebase` would, so the next push projects it as an empty commit. Untested.
-- `[ ]` **`wheat status --format=json` prints view IDs as byte arrays (2026-10-21).**
-  `basis`, `effective_view` and the other view fields serialize as 32-number arrays;
-  every other command prints them as hex.
 - `[ ]` **A native pull or fetch without `remote.meta` is an internal error
   (2026-10-21).** `resolve_remote` (`main.rs`) fails with plain context ("no
   remote.meta found; use wheat clone or pass --remote"), so `wheat pull wheat://...`
@@ -121,10 +118,6 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
 - `[ ]` **Resolution revisions have no author or date (2026-10-21).** They use
   `RevisionMetadata::default()` (`repository_mutation.rs:445`), so `wheat log` shows
   `author  <> 1970-01-01T00:00:00Z`; integrate's combine-by-date order may see it too.
-- `[ ]` **`wheat conflicts` prints Rust debug output.** The human rendering shows
-  `target=Some(FileValue { content: ContentId([210, 80, ...]), kind: Regular })` and
-  `reason=NoMatch`; and it names the conflict and revision by ID only, not by change
-  message or path summary.
 - `[ ]` **`wheat add <directory>` adds nothing (2026-10-20).** With `many/00/1.txt`
   and `many/00/2.txt` untracked, `wheat add many` reports "added 1 path(s)" and makes
   a revision, but `status` still lists every file under `many/` as untracked. Either
@@ -347,12 +340,6 @@ budget passes, but by only about 0.7 s.
   integrate combines revisions of one change, the new revision's transition has no
   `subsumed` or `resolutions` entries, even where the combined revisions recorded
   them. Check whether `later_edits` / path history need them carried over.
-- `[ ]` **JSON output of `status` and `conflicts` gives IDs as byte arrays
-  (2026-10-09).** `WorkspaceStatus` (`crates/wheat-client/src/workspace_status.rs`) and
-  `ConflictEntry` (`conflict_inspection.rs`) serialize `ViewId`, `ChangeId` and the
-  other IDs with their derived `Serialize`, so `--format json` prints 32 numbers
-  where the human output and every other document print the hex ID.
-  `frontier list` had the same problem and now uses `command_output::display_id`.
 - `[ ]` **Fetch pushes whole objects, even when the client has the old version
   (2026-09-26).** The push sends every object the walk finds in full. Some objects
   grow with the repository and change with every view: a content-set snapshot is

@@ -8,12 +8,12 @@ use std::{
 use anyhow::Result;
 use serde::Serialize;
 use wheat_core::{
-    ApplicationId, ApplicationResultRecord, ChangeId, EditFailure, EditId, FileValue, ObjectId,
-    RevisionId, ViewId,
+    ApplicationId, ApplicationResultRecord, ChangeId, EditFailure, EditId, FileKind, FileValue,
+    ObjectId, RevisionId, ViewId,
 };
 use wheat_store::{
-    ApplicationMapStore, ConflictSetStore, ContentStore, ImmutableObjectStore, PublicationStore,
-    RepositoryReader, RetainedSetStore, RevisionMapStore,
+    ApplicationMapStore, ChangeMapStore, ConflictSetStore, ContentStore, ImmutableObjectStore,
+    PublicationStore, RepositoryReader, RetainedSetStore, RevisionMapStore,
 };
 
 use crate::{local::LocalRepository, outcome::CliFailure};
@@ -41,6 +41,8 @@ pub struct ConflictEntry {
     pub id: wheat_core::ConflictId,
     pub base_view: ViewId,
     pub change_id: ChangeId,
+    /// The conflicted change's title, so a person can tell which change it is.
+    pub title: String,
     pub revision_id: RevisionId,
     pub application_id: ApplicationId,
     pub edits: Vec<ConflictEdit>,
@@ -255,10 +257,29 @@ async fn inspect_store<O: ImmutableObjectStore>(
             conflict.id,
             conflict.base_view,
         )?;
+        let change_object = ChangeMapStore::new(objects)
+            .get(state.changes, change_id)
+            .await?
+            .ok_or_else(|| {
+                CliFailure::corrupt("conflicted application refers to an unindexed logical change")
+            })?;
+        let change = reader.change(change_object).await?;
+        if change.id != change_id {
+            return Err(CliFailure::corrupt(
+                "change-map key does not match logical change identity",
+            ));
+        }
+        model_bytes = bounded_add(
+            model_bytes,
+            change.metadata.title.len(),
+            MAX_MODEL_BYTES,
+            "conflict model",
+        )?;
         entries.push(ConflictEntry {
             id: conflict.id,
             base_view: conflict.base_view,
             change_id,
+            title: change.metadata.title,
             revision_id,
             application_id,
             edits,
@@ -309,18 +330,43 @@ fn bounded_add(current: usize, added: usize, limit: usize, name: &str) -> Result
 pub fn human(document: &ConflictDocument, destination: &mut impl Write) -> Result<()> {
     atomic_render(destination, MAX_OUTPUT_BYTES, |output| {
         for conflict in &document.conflicts {
-            writeln!(output, "conflict {} on {}", conflict.id, conflict.base_view)?;
+            // Debug string formatting quotes and escapes newlines and control bytes.
+            writeln!(
+                output,
+                "conflict in change {} {:?} (revision {})",
+                conflict.change_id, conflict.title, conflict.revision_id
+            )?;
             for edit in &conflict.edits {
-                // Debug string formatting quotes and escapes newlines and control bytes.
                 writeln!(
                     output,
-                    "  edit {} path={:?} target={:?} reason={:?}",
-                    edit.id, edit.path, edit.target, edit.reason
+                    "  {:?}: {}; {}",
+                    edit.path,
+                    edit.reason,
+                    Wants(edit.target)
                 )?;
             }
         }
         Ok(())
     })
+}
+
+/// What an edit would have made of its path.
+struct Wants(Option<FileValue>);
+
+impl std::fmt::Display for Wants {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            None => formatter.write_str("it deletes the path"),
+            Some(FileValue { content, kind }) => {
+                let kind = match kind {
+                    FileKind::Regular => "a file",
+                    FileKind::Executable => "an executable file",
+                    FileKind::Symlink => "a symlink",
+                };
+                write!(formatter, "it writes {kind} with content {content}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +445,7 @@ mod tests {
                 id: ConflictId::from_digest([1; 32]),
                 base_view: ViewId::from_digest([2; 32]),
                 change_id: ChangeId::from_bytes([5; 16]),
+                title: "Make it executable".to_owned(),
                 revision_id: RevisionId::from_digest([6; 32]),
                 application_id: ApplicationId::from_digest([7; 32]),
                 edits: vec![ConflictEdit {
@@ -548,8 +595,25 @@ mod tests {
         let mut output = Vec::new();
         human(&document("line\n\tname"), &mut output).unwrap();
         let rendered = String::from_utf8(output).unwrap();
-        assert!(rendered.contains("path=\"line\\n\\tname\""));
-        assert!(!rendered.contains("path=line\n"));
+        assert!(rendered.contains("  \"line\\n\\tname\": "));
+        assert!(!rendered.contains("line\n"));
+    }
+
+    #[test]
+    fn human_output_names_the_change_and_says_what_failed_in_words() {
+        let mut output = Vec::new();
+        human(&document("bin/run"), &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        let content = ContentId::from_digest([4; 32]);
+        assert_eq!(
+            rendered,
+            format!(
+                "conflict in change {} \"Make it executable\" (revision {})\n  \"bin/run\": the file kind differs from the edit's; it writes an executable file with content {content}\n",
+                ChangeId::from_bytes([5; 16]),
+                RevisionId::from_digest([6; 32]),
+            )
+        );
+        assert!(!rendered.contains("Some("), "no debug output: {rendered}");
     }
 
     #[test]
@@ -559,30 +623,21 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["head_generation"], 42);
         let conflict = &value["conflicts"][0];
-        assert_eq!(conflict["id"], serde_json::to_value([1_u8; 32]).unwrap());
-        assert_eq!(
-            conflict["base_view"],
-            serde_json::to_value([2_u8; 32]).unwrap()
-        );
+        // IDs are their hex, as the human output shows them.
+        let hex = |byte: u8| format!("{byte:02x}").repeat(32);
+        assert_eq!(conflict["id"], hex(1));
+        assert_eq!(conflict["base_view"], hex(2));
         assert_eq!(
             conflict["change_id"],
-            serde_json::to_value(ChangeId::from_bytes([5; 16])).unwrap()
+            ChangeId::from_bytes([5; 16]).to_string()
         );
-        assert_eq!(
-            conflict["revision_id"],
-            serde_json::to_value([6_u8; 32]).unwrap()
-        );
-        assert_eq!(
-            conflict["application_id"],
-            serde_json::to_value([7_u8; 32]).unwrap()
-        );
+        assert_eq!(conflict["title"], "Make it executable");
+        assert_eq!(conflict["revision_id"], hex(6));
+        assert_eq!(conflict["application_id"], hex(7));
         let edit = &conflict["edits"][0];
-        assert_eq!(edit["id"], serde_json::to_value([3_u8; 32]).unwrap());
+        assert_eq!(edit["id"], hex(3));
         assert_eq!(edit["path"], "path");
-        assert_eq!(
-            edit["target"]["content"],
-            serde_json::to_value([4_u8; 32]).unwrap()
-        );
+        assert_eq!(edit["target"]["content"], hex(4));
         assert_eq!(edit["target"]["kind"], "Executable");
         assert_eq!(edit["reason"], "KindMismatch");
         assert!(edit.get("range").is_none());
@@ -617,6 +672,7 @@ mod tests {
                     id: ConflictId::from_digest([20; 32]),
                     base_view: ViewId::from_digest([21; 32]),
                     change_id: ChangeId::from_bytes([24; 16]),
+                    title: "first".to_owned(),
                     revision_id: RevisionId::from_digest([25; 32]),
                     application_id: ApplicationId::from_digest([26; 32]),
                     edits: vec![first_edit],
@@ -625,6 +681,7 @@ mod tests {
                     id: ConflictId::from_digest([22; 32]),
                     base_view: ViewId::from_digest([23; 32]),
                     change_id: ChangeId::from_bytes([27; 16]),
+                    title: "second".to_owned(),
                     revision_id: RevisionId::from_digest([28; 32]),
                     application_id: ApplicationId::from_digest([29; 32]),
                     edits: vec![second_edit],

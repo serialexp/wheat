@@ -5984,6 +5984,7 @@ dependencies = [
  "proc-macro2",
  "proptest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "syn 2.0.119",
  "thiserror 2.0.20",

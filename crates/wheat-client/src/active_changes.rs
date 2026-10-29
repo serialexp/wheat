@@ -8,10 +8,7 @@ use wheat_store::{
     RepositoryPublicationError, RepositoryReader, RevisionMapStore,
 };
 
-use crate::{
-    local::LocalRepository,
-    outcome::{CliFailure, display_id, display_ids, display_optional_id},
-};
+use crate::{local::LocalRepository, outcome::CliFailure};
 
 const MAX_ACTIVE_CHANGES: usize = 250_000;
 const MAX_TITLE_BYTES: usize = 1024 * 1024;
@@ -19,15 +16,11 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ActiveChange {
-    #[serde(serialize_with = "display_id")]
     pub change: ChangeId,
-    #[serde(serialize_with = "display_id")]
     pub revision: RevisionId,
     pub title: String,
-    #[serde(serialize_with = "display_ids")]
     pub dependencies: Vec<ChangeId>,
     pub conflicted: bool,
-    #[serde(serialize_with = "display_optional_id")]
     pub basis_revision: Option<RevisionId>,
 }
 
@@ -35,11 +28,8 @@ pub struct ActiveChange {
 pub struct ActiveChanges {
     pub format: &'static str,
     pub version: u32,
-    #[serde(serialize_with = "display_id")]
     pub basis: ViewId,
-    #[serde(serialize_with = "display_id")]
     pub effective: ViewId,
-    #[serde(serialize_with = "display_optional_id")]
     pub selected: Option<ChangeId>,
     pub changes: Vec<ActiveChange>,
 }

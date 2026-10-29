@@ -10,35 +10,6 @@ use thiserror::Error;
 
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-/// Serializes an identity as the hex string it displays as, for JSON documents.
-pub fn display_id<T: fmt::Display, S: serde::Serializer>(
-    value: &T,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    serializer.collect_str(value)
-}
-
-pub fn display_optional_id<T: fmt::Display, S: serde::Serializer>(
-    value: &Option<T>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    match value {
-        Some(value) => serializer.collect_str(value),
-        None => serializer.serialize_none(),
-    }
-}
-
-pub fn display_ids<T: fmt::Display, S: serde::Serializer>(
-    values: &[T],
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    values
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .serialize(serializer)
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OutputFormat {
     #[default]
