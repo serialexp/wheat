@@ -421,6 +421,7 @@ async fn send_content_error(
             code,
             scope: operation_error_scope(),
             retryable: false,
+            retry_after_seconds: 0,
             message: message.to_string(),
             object_id: Digest256 {
                 bytes: id.as_bytes().to_vec(),

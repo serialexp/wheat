@@ -8,6 +8,7 @@
 //! writes to the repository until the [`Quiesced`] is dropped. Fetches go on.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::watch;
 
@@ -25,6 +26,8 @@ struct WriterState {
     quiesced: usize,
     /// How many [`Writing`] are held.
     writing: usize,
+    /// When the latest end a [`Quiesced::expect`] still held gave is due.
+    expected_end: Option<Instant>,
 }
 
 impl Writers {
@@ -41,6 +44,16 @@ impl Writers {
         began.then(|| Writing {
             state: Arc::clone(&self.state),
         })
+    }
+
+    /// While quiesced, how long the holders expect it to last, if any said.
+    pub(crate) fn retry_after(&self) -> Option<std::time::Duration> {
+        let state = self.state.borrow();
+        let left = state
+            .expected_end?
+            .saturating_duration_since(Instant::now());
+        // A hold that has overrun its estimate has none to give.
+        (state.quiesced > 0 && !left.is_zero()).then_some(left)
     }
 
     /// Whether a [`Quiesced`] holds the repository.
@@ -96,6 +109,20 @@ impl Quiesced {
         quiesced
     }
 
+    /// Says the hold is expected to last `duration` from now; publishes refused
+    /// meanwhile tell their clients how much of it is left. The latest end among the
+    /// holds in force counts, and none is kept once the last hold ends.
+    pub fn expect(&self, duration: std::time::Duration) {
+        let end = Instant::now() + duration;
+        self.entry.network.writers.state.send_if_modified(|state| {
+            let later = state.expected_end.is_none_or(|current| end > current);
+            if later {
+                state.expected_end = Some(end);
+            }
+            later
+        });
+    }
+
     /// The repository held still.
     #[must_use]
     pub fn entry(&self) -> &Arc<RepositoryEntry> {
@@ -111,10 +138,11 @@ impl std::fmt::Debug for Quiesced {
 
 impl Drop for Quiesced {
     fn drop(&mut self) {
-        self.entry
-            .network
-            .writers
-            .state
-            .send_modify(|state| state.quiesced -= 1);
+        self.entry.network.writers.state.send_modify(|state| {
+            state.quiesced -= 1;
+            if state.quiesced == 0 {
+                state.expected_end = None;
+            }
+        });
     }
 }

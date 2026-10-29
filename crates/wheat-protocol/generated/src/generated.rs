@@ -309,6 +309,7 @@ impl WheatProtocolMessage {
                 encoder.write_uint16(v.code, Endianness::BigEndian);
                 v.scope.encode_into(encoder)?;
                 encoder.write_uint8(if v.retryable { 1 } else { 0 });
+                encoder.write_varlength(v.retry_after_seconds, "leb128_canonical")?;
                 encoder.write_varlength(v.message.len() as u64, "leb128_canonical")?;
                 let string_bytes: &[u8] = v.message.as_bytes();
                 for &b in string_bytes.iter() {
@@ -4743,6 +4744,7 @@ pub struct ErrorInput {
     pub code: u16,
     pub scope: ErrorScope,
     pub retryable: bool,
+    pub retry_after_seconds: u64,
     pub message: std::string::String,
     pub object_id: Digest256,
 }
@@ -4754,6 +4756,7 @@ pub struct ErrorOutput {
     pub code: u16,
     pub scope: ErrorScope,
     pub retryable: bool,
+    pub retry_after_seconds: u64,
     pub message: std::string::String,
     pub object_id: Digest256,
 }
@@ -4773,6 +4776,7 @@ impl ErrorInput {
         encoder.write_u16_be(self.code);
         self.scope.encode_into(encoder)?;
         encoder.write_byte(if self.retryable { 1 } else { 0 });
+        encoder.write_varlength(self.retry_after_seconds, "leb128_canonical")?;
         encoder.write_varlength(self.message.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.message.as_bytes();
         for &b in string_bytes.iter() {
@@ -4801,6 +4805,7 @@ impl ErrorOutput {
         let code = decoder.read_u16_be()?;
         let scope = ErrorScope::decode_with_decoder(decoder)?;
         let retryable = decoder.read_byte()? != 0;
+        let retry_after_seconds = decoder.read_varlength("leb128_canonical")?;
         let length = decoder.read_varlength("leb128_canonical")? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let message = std::string::String::from_utf8(bytes)
@@ -4812,6 +4817,7 @@ impl ErrorOutput {
             code,
             scope,
             retryable,
+            retry_after_seconds,
             message,
             object_id,
         })
@@ -4831,6 +4837,7 @@ impl From<ErrorOutput> for ErrorInput {
             code: o.code,
             scope: o.scope,
             retryable: o.retryable,
+            retry_after_seconds: o.retry_after_seconds,
             message: o.message,
             object_id: o.object_id,
         }
@@ -4845,6 +4852,7 @@ impl From<ErrorInput> for ErrorOutput {
             code: i.code,
             scope: i.scope,
             retryable: i.retryable,
+            retry_after_seconds: i.retry_after_seconds,
             message: i.message,
             object_id: i.object_id,
         }

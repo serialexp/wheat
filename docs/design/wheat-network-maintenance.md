@@ -58,6 +58,12 @@ and move them from Outstanding to Done.
   is hashed against the manifest as it is copied. Bench case `network_import`: 10,000
   changes in about 21 s, nearly all `validate_complete`; peak RSS 450 MiB. Not yet
   held against content GC's publish gate (Phase 5).
+- [x] **Retry delay on refused publishes (2026-10-29).** The Error record has
+  `retry_after_seconds` (0 = no estimate). A holder calls `Quiesced::expect(duration)`;
+  publishes refused while it is held get the time left, and the CLI prints it. Export
+  estimates its structure copy as the files' bytes over 50 MiB/s (a conservative guess,
+  not a measurement; floor 1 s). Moves holding longer, and GC, set their own estimates
+  when they exist.
 - [x] **Phase 0 — admin surface (2026-10-28).** Four messages on the protocol
   (`AdminStart`, `AdminStarted`, `AdminStatusRequest`, `AdminStatus`; types 0x50–0x53;
   `wheat-protocol.bs.json5`), an `admin = true` flag on a principal in `[auth]`
@@ -83,11 +89,6 @@ and move them from Outstanding to Done.
   - Export waits up to 60 s for in-flight publishes before giving up.
 
 ### Outstanding
-
-- [ ] **Retry delay on refused publishes.** The error a quiesced publish gets
-  (`connection.rs`, 503 with the retryable flag) carries no delay. Add a retry-after
-  field to the error record, filled from the operation's expected duration (export:
-  size of the pool and content list over a measured rate; GC: the running estimate).
 
 - [ ] **Phase 2b — the bucket transport.** Export to and import from an
   S3-compatible bucket: immutable store files once by name, content once by ID,

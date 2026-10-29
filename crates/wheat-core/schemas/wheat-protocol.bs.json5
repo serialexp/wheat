@@ -657,6 +657,10 @@
         { name: "code", type: "uint16" },
         { name: "scope", type: "ErrorScope" },
         { name: "retryable", type: "bool" },
+        // For a retryable error: the server's estimate of how many seconds until trying
+        // again can work (0 = no estimate). A repository refusing publishes while it
+        // is moved or backed up says how long the operation is expected to take.
+        { name: "retry_after_seconds", type: "varlength", encoding: "leb128_canonical" },
         { name: "message", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         // Optional: which object caused the error (empty digest = not applicable).
         { name: "object_id", type: "Digest256" },

@@ -924,6 +924,8 @@ Error
   code: u16
   scope: enum { connection, operation }
   retryable: bool
+  retry_after_seconds: varint                 // 0 = no estimate; else the server's
+                                              // guess of seconds until a retry can work
   message: string (max 4 KiB)
   object_id: bytes[32] (optional)             // which object failed
 ```

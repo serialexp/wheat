@@ -42,7 +42,7 @@ use crate::server::ServerConfig;
 use crate::transport::{Transport, TransportError};
 use crate::wire::{
     connection_error_scope, operation_error_scope, publish_rejected_status, publish_result, recv,
-    send, send_error,
+    send, send_error, send_error_retry_after,
 };
 
 /// Error code for an operation the principal has no access for.
@@ -575,12 +575,12 @@ async fn run_session(
                 // Held until the publish is answered: a quiesce waits for it.
                 let Some(_writing) = entry.network.writers.begin() else {
                     info!(peer = %peer, repo = %repository, "publish refused: repository quiesced");
-                    send_error(
+                    send_error_retry_after(
                         ws,
                         req.op_id,
                         UNAVAILABLE,
                         operation_error_scope(),
-                        true,
+                        Some(entry.network.writers.retry_after()),
                         &format!(
                             "'{repository}' is not taking publishes for the moment (it is being backed up or moved); publish again shortly"
                         ),

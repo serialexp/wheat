@@ -2,11 +2,12 @@
 
 use wheat_protocol::{
     ClientHelloOutput, CreditOutput, Digest256, ErrorOutput, ErrorScope,
-    ErrorScopeConnectionOutput, FetchCompleteOutput, FetchPushEndOutput, FetchRequestOutput,
-    ObjectBatchOutput, ObjectChunkOutput, ObjectEntry, ObjectWantOutput, ObjectWantReplyOutput,
-    PublishPushEndOutput, PublishRequestOutput, PublishResultOutput, PublishResultStatus,
-    PublishStatusOkOutput, ServerHelloOutput, SessionEstablishedOutput, SessionEstablishedStatus,
-    SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message, encode_message,
+    ErrorScopeConnectionOutput, ErrorScopeOperationOutput, FetchCompleteOutput, FetchPushEndOutput,
+    FetchRequestOutput, ObjectBatchOutput, ObjectChunkOutput, ObjectEntry, ObjectWantOutput,
+    ObjectWantReplyOutput, PublishPushEndOutput, PublishRequestOutput, PublishResultOutput,
+    PublishResultStatus, PublishStatusOkOutput, ServerHelloOutput, SessionEstablishedOutput,
+    SessionEstablishedStatus, SessionStatusOkOutput, Uuid128, WheatProtocolMessage, decode_message,
+    encode_message,
 };
 
 fn zero_digest() -> Digest256 {
@@ -186,11 +187,24 @@ fn error_round_trip() {
         code: 404,
         scope: ErrorScope::ErrorScopeConnection(ErrorScopeConnectionOutput { code: 0 }),
         retryable: false,
+        retry_after_seconds: 0,
         message: "repository not found".to_string(),
         object_id: zero_digest(),
     });
     let decoded = round_trip(msg.clone());
     assert_eq!(msg, decoded);
+
+    let msg = WheatProtocolMessage::Error(ErrorOutput {
+        message_type: 0x70,
+        op_id: 4,
+        code: 503,
+        scope: ErrorScope::ErrorScopeOperation(ErrorScopeOperationOutput { code: 1 }),
+        retryable: true,
+        retry_after_seconds: 300,
+        message: "moving".to_string(),
+        object_id: zero_digest(),
+    });
+    assert_eq!(msg, round_trip(msg.clone()));
 }
 
 #[test]

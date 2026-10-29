@@ -331,6 +331,16 @@ async fn export(
     phase("copying the structure");
     let export = {
         let repositories = repositories.clone();
+        // Publishes refused meanwhile are told how long the copy should take.
+        let sized = {
+            let repositories = repositories.clone();
+            spawn_blocking(move || repositories.network(location.network).files())
+                .await
+                .map_err(|error| chain(&error))?
+        };
+        if let Ok(files) = sized {
+            held.expect(copy_estimate(files.iter().map(|file| file.len).sum()));
+        }
         spawn_blocking(move || repositories.export_network(location.network, bundle))
             .await
             .map_err(|error| chain(&error))?
@@ -362,6 +372,13 @@ async fn export(
         message.push_str(&format!("repository {id} {name}\n"));
     }
     Ok(message)
+}
+
+/// How long copying `bytes` of a network's files is expected to take, for the clients
+/// whose publishes it refuses: at a rate well under a disk's, so the estimate errs long.
+fn copy_estimate(bytes: u64) -> Duration {
+    const BYTES_PER_SECOND: u64 = 50 * 1024 * 1024;
+    Duration::from_secs(bytes.div_ceil(BYTES_PER_SECOND).max(1))
 }
 
 /// Runs `work`, which blocks, on a thread for blocking work, driving the future it
@@ -424,6 +441,13 @@ mod tests {
             operations.finish(next, Ok(String::new()));
         }
         assert!(operations.status(first).is_none());
+    }
+
+    #[test]
+    fn a_copy_is_expected_to_take_whole_seconds_and_at_least_one() {
+        assert_eq!(copy_estimate(0), Duration::from_secs(1));
+        assert_eq!(copy_estimate(50 * 1024 * 1024), Duration::from_secs(1));
+        assert_eq!(copy_estimate(50 * 1024 * 1024 + 1), Duration::from_secs(2));
     }
 
     #[test]

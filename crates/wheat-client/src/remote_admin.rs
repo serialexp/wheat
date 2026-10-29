@@ -44,6 +44,8 @@ pub enum Finished {
 pub struct Refused {
     pub code: u16,
     pub retryable: bool,
+    /// How long the server expects the refusal to last, if it said.
+    pub retry_after: Option<Duration>,
     pub message: String,
 }
 
@@ -85,6 +87,8 @@ fn refused(error: ErrorOutput) -> anyhow::Error {
     Refused {
         code: error.code,
         retryable: error.retryable,
+        retry_after: (error.retry_after_seconds > 0)
+            .then(|| Duration::from_secs(error.retry_after_seconds)),
         message: error.message,
     }
     .into()

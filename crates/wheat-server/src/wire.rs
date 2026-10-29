@@ -40,6 +40,19 @@ pub async fn send_error(
     retryable: bool,
     message: &str,
 ) -> Result<(), ConnectionError> {
+    send_error_retry_after(ws, op_id, code, scope, retryable.then_some(None), message).await
+}
+
+/// Like [`send_error`], for a retryable error when `retry` is `Some`, with the
+/// server's estimate of how long until it can work, if it has one.
+pub async fn send_error_retry_after(
+    ws: &mut impl Transport,
+    op_id: u64,
+    code: u16,
+    scope: ErrorScope,
+    retry: Option<Option<std::time::Duration>>,
+    message: &str,
+) -> Result<(), ConnectionError> {
     send(
         ws,
         &WheatProtocolMessage::Error(ErrorOutput {
@@ -47,7 +60,8 @@ pub async fn send_error(
             op_id,
             code,
             scope,
-            retryable,
+            retryable: retry.is_some(),
+            retry_after_seconds: retry.flatten().map_or(0, |after| after.as_secs().max(1)),
             message: message.to_string(),
             object_id: Digest256 { bytes: vec![0; 32] },
         }),
@@ -71,6 +85,7 @@ pub async fn send_object_error(
             code,
             scope: operation_error_scope(),
             retryable: false,
+            retry_after_seconds: 0,
             message: message.to_string(),
             object_id: Digest256 {
                 bytes: object.as_bytes().to_vec(),

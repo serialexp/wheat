@@ -31,8 +31,24 @@ fn a_quiesced_repository_refuses_publishes_serves_fetches_and_copies_whole() {
             .contains("publish again shortly"),
         "{refused}"
     );
+    assert!(
+        !refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expects"),
+        "a hold nobody gave an estimate for names none: {refused}"
+    );
     sides.reader.ok_json(config, &["fetch"]);
     assert_eq!(sides.reader.label_view(config, "main").unwrap(), published);
+
+    // A holder that expects the hold to last says so to those it refuses.
+    quiesced.expect(std::time::Duration::from_secs(120));
+    let refused = sides.writer.fails_json(config, &["publish"]);
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("the server expects this to last about 1"),
+        "{refused}"
+    );
 
     // Copied while held, the repository is whole: serve the copy and clone it.
     let copy = RepositoryDirectory::new(sides.root.path().join("copy"));

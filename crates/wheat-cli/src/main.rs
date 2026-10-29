@@ -3354,8 +3354,15 @@ fn native_publish(
             "publish rejected: {message}{}",
             kept_move(moved.as_ref())
         ))),
-        remote::PublishOutcome::Unavailable { message } => Err(CliFailure::unavailable(format!(
-            "publish refused for now: {message}{}",
+        remote::PublishOutcome::Unavailable {
+            message,
+            retry_after,
+        } => Err(CliFailure::unavailable(format!(
+            "publish refused for now: {message}{}{}",
+            retry_after.map_or_else(String::new, |after| format!(
+                " (the server expects this to last about {} s)",
+                after.as_secs()
+            )),
             kept_move(moved.as_ref())
         ))),
         remote::PublishOutcome::Error { message } => Err(CliFailure::transport(format!(

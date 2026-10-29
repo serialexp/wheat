@@ -273,6 +273,8 @@ pub enum PublishOutcome {
     /// being backed up or moved); the same publish may be sent again later.
     Unavailable {
         message: String,
+        /// How long the server expects the refusal to last, if it said.
+        retry_after: Option<std::time::Duration>,
     },
     Error {
         message: String,
@@ -284,6 +286,8 @@ fn publish_error(error: ErrorOutput) -> PublishOutcome {
     if error.retryable {
         PublishOutcome::Unavailable {
             message: error.message,
+            retry_after: (error.retry_after_seconds > 0)
+                .then(|| std::time::Duration::from_secs(error.retry_after_seconds)),
         }
     } else {
         PublishOutcome::Error {
