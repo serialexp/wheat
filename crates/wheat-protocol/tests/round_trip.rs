@@ -241,9 +241,10 @@ fn fetch_complete_round_trip() {
 #[test]
 fn admin_messages_round_trip() {
     use wheat_protocol::{
-        AdminAdoptCommandOutput, AdminCommand, AdminExportCommandOutput, AdminFailedOutput,
-        AdminImportCommandOutput, AdminRepositoryName, AdminStartOutput, AdminStartedOutput,
-        AdminState, AdminStatusOutput, AdminStatusRequestOutput, AdminSucceededOutput,
+        AdminAdoptCommandOutput, AdminCommand, AdminDeleteCommandOutput, AdminExportCommandOutput,
+        AdminFailedOutput, AdminImportCommandOutput, AdminRepositoryName, AdminStartOutput,
+        AdminStartedOutput, AdminState, AdminStatusOutput, AdminStatusRequestOutput,
+        AdminSucceededOutput,
     };
 
     let commands = [
@@ -264,6 +265,10 @@ fn admin_messages_round_trip() {
             command_kind: 3,
             source: "standalone".to_string(),
             name: "team/repo".to_string(),
+        }),
+        AdminCommand::AdminDeleteCommand(AdminDeleteCommandOutput {
+            command_kind: 4,
+            repository: "team/repo".to_string(),
         }),
     ];
     for command in commands {

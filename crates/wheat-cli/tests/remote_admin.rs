@@ -279,3 +279,97 @@ fn only_an_admin_principal_may_run_operations() {
     ok(root.path(), &stores, &config, &export);
     assert!(exchange.join("bundle/bundle.manifest").is_file());
 }
+
+/// A move ends with deleting the source: the server stops serving the repositories and
+/// needs no exchange directory for it, while the copy elsewhere carries on.
+#[test]
+fn deleting_a_served_repository_ends_a_move() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    write_config(&config);
+    let exchange = root.path().join("exchange");
+    fs::create_dir(&exchange).unwrap();
+    let stores = root.path().join("admin-stores");
+
+    let (first, first_repos) = serve(root.path(), "first", &exchange, ServerConfig::new());
+    let first_url = |name: &str| format!("wheat://{}/{name}", first.addr);
+    let parent = clone(root.path(), &config, &first_url("team/repo"), "parent");
+    publish(&config, &parent, "one");
+    RepositoriesDirectory::new(&first_repos)
+        .fork("team/repo", "fork/repo")
+        .unwrap();
+
+    let server = format!("wheat://{}", first.addr);
+    let exported = ok_json(
+        root.path(),
+        &stores,
+        &config,
+        &[
+            "admin",
+            "--server",
+            &server,
+            "export",
+            "team/repo",
+            "bundle",
+        ],
+    );
+    let names = names_of(exported["message"].as_str().unwrap());
+
+    let second_repos = root.path().join("second");
+    fs::create_dir(&second_repos).unwrap();
+    let mut second_config = ServerConfig::new();
+    second_config.exchange_dir = Some(exchange.clone());
+    let second = serve_repos_dir_configured(&second_repos, second_config);
+    let second_server = format!("wheat://{}", second.addr);
+    let mut args = vec!["admin", "--server", &second_server, "import", "bundle"];
+    for name in &names {
+        args.extend(["--name", name]);
+    }
+    ok(root.path(), &stores, &config, &args);
+
+    // The source's repositories are open (the clone above, the export) when they go.
+    for name in ["fork/repo", "team/repo"] {
+        ok(
+            root.path(),
+            &stores,
+            &config,
+            &["admin", "--server", &server, "delete", name],
+        );
+    }
+    assert!(
+        fails(
+            root.path(),
+            &stores,
+            &config,
+            &[
+                "clone",
+                &first_url("team/repo"),
+                root.path().join("gone").to_str().unwrap()
+            ],
+        )
+        .contains("not found")
+    );
+    assert!(
+        !first_repos
+            .join("networks")
+            .read_dir()
+            .unwrap()
+            .any(|_| true)
+    );
+    let moved = clone(
+        root.path(),
+        &config,
+        &format!("wheat://{}/team/repo", second.addr),
+        "moved",
+    );
+    assert_eq!(fs::read_to_string(moved.0.join("one.txt")).unwrap(), "one");
+
+    // Not there any more.
+    let stderr = fails(
+        root.path(),
+        &stores,
+        &config,
+        &["admin", "--server", &server, "delete", "team/repo"],
+    );
+    assert!(stderr.contains("no such repository"), "{stderr}");
+}

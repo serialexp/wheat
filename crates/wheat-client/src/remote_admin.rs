@@ -29,6 +29,8 @@ pub enum Operation {
     },
     /// Adopt a standalone repository directory as the repository `name`.
     Adopt { source: String, name: String },
+    /// Delete the repository `repository`, with its network when it is the last in it.
+    Delete { repository: String },
 }
 
 /// How an operation ended.
@@ -71,6 +73,12 @@ fn command(operation: &Operation) -> AdminCommand {
                         name: name.clone(),
                     })
                     .collect(),
+            })
+        }
+        Operation::Delete { repository } => {
+            AdminCommand::AdminDeleteCommand(AdminDeleteCommandOutput {
+                command_kind: 4,
+                repository: repository.clone(),
             })
         }
         Operation::Adopt { source, name } => {

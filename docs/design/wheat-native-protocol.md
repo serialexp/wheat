@@ -938,7 +938,8 @@ like any session, but only a principal with `admin = true` in `[auth]` may use i
 anyone else gets a 403 Error. There is no `RepositoryState`. Requests:
 
 ```
-AdminStart (0x50)        op_id: u64, command: union { export (1), import (2), adopt (3) }
+AdminStart (0x50)        op_id: u64, command: union { export (1), import (2), adopt (3),
+                                                delete (4) }
 AdminStarted (0x51)      op_id: u64, operation: u64
 AdminStatusRequest (0x52) op_id: u64, operation: u64
 AdminStatus (0x53)       op_id: u64, operation: u64, state: running | succeeded | failed,
@@ -948,8 +949,10 @@ AdminStatus (0x53)       op_id: u64, operation: u64, state: running | succeeded 
 `AdminStart` returns at once with the operation's ID; the operation keeps running if
 the connection closes, and any admin session can ask for its status. A start that
 cannot be taken answers with Error: 409 (retryable) while another operation runs, 400
-for a bad name, 501 when the server has no exchange directory. Names of bundles and
-sources are relative to the server's exchange directory.
+for a bad name, 501 when the server has no exchange directory (export, import, adopt)
+or serves no repositories directory. Names of bundles and sources are relative to the
+server's exchange directory. A delete ends the sessions using the repository with a
+connection-scoped 404 Error.
 
 ### Message type allocation
 

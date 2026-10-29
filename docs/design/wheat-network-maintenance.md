@@ -1,11 +1,12 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
-Status: partial — Phase 0 (the admin surface) and Phases 1 (export) and 2 (import
-and adoption) landed, the rest designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
+Status: partial — Phase 0 (the admin surface), Phases 1 (export), 2 (import and
+adoption) and 3 (delete while served) landed, so a network can be moved; Phase 2b
+and GC (4–6) designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
-Last updated: 2026-10-28
+Last updated: 2026-10-29
 
 ## Implementation status
 
@@ -58,6 +59,21 @@ and move them from Outstanding to Done.
   is hashed against the manifest as it is copied. Bench case `network_import`: 10,000
   changes in about 21 s, nearly all `validate_complete`; peak RSS 450 MiB. Not yet
   held against content GC's publish gate (Phase 5).
+- [x] **Phase 3 — deleting a served network or fork (2026-10-29).** `Registry::delete`
+  (and `wheat admin delete`, `AdminDeleteCommand`, kind 4): marks the name deleting so
+  `get` finds nothing, drops the registry's slot, signals the entry removed so sessions
+  on it end with a connection-scoped 404, then retries `RepositoriesDirectory::delete`
+  until the store has closed (up to 30 s; `DeleteError::Held` past that). As review
+  item 5 asked, removing a fork's head no longer needs the network's store closed;
+  only the last repository, which takes the network, does. Concurrent deletes of a
+  network's last two repositories serialize on a `members.lock` in the network
+  directory, so one of them sees it is last. Differs from the design: no draining
+  state on the network, since a fork's delete never closes the store and the last
+  repository's delete waits for the close by retrying the store lock rather than
+  through `OpenNetworks`. A delete needs no exchange directory. Tests:
+  `wheat-server/tests/delete_test.rs`, `wheat-store/tests/repositories_directory.rs`,
+  and `remote_admin.rs`'s `deleting_a_served_repository_ends_a_move` (export, import
+  elsewhere, delete here, clone from the new server).
 - [x] **Retry delay on refused publishes (2026-10-29).** The Error record has
   `retry_after_seconds` (0 = no estimate). A holder calls `Quiesced::expect(duration)`;
   publishes refused while it is held get the time left, and the CLI prints it. Export
@@ -70,7 +86,7 @@ and move them from Outstanding to Done.
   (`AccessProvider::is_admin`), the operation runner (`wheat-server/src/admin.rs`)
   and `wheat admin --server <url> export | import | adopt` (`wheat-client/src/remote_admin.rs`).
   Built early so the operations can be driven through the real interface while their
-  shape may still change; GC and delete have no message yet. Tests: `remote_admin.rs`
+  shape may still change; GC has no message yet. Tests: `remote_admin.rs`
   in `wheat-cli` (export on one server, import on another, adoption, confinement,
   admin-only), unit tests for the operation table, a protocol round trip. Differences
   from the design:
@@ -93,10 +109,6 @@ and move them from Outstanding to Done.
 - [ ] **Phase 2b — the bucket transport.** Export to and import from an
   S3-compatible bucket: immutable store files once by name, content once by ID,
   shared by every export to the bucket.
-- [ ] **Phase 3 — deleting a served network or fork.** Close the network in the
-  registry, then `RepositoriesDirectory::delete`. Closes the fork-networks doc's
-  "deleting a fork while its network is served" item, and completes a move (export,
-  import elsewhere, delete here).
 - [ ] **Phase 4 — pool GC.** Per network: mark every head's closure, rewrite
   segments keeping only marked records, retire unmarked loose objects and the pool's
   content records.

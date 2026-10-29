@@ -166,6 +166,9 @@ enum Job {
         source: PathBuf,
         name: String,
     },
+    Delete {
+        repository: String,
+    },
 }
 
 /// Starts `command` on a task of its own and returns its operation ID. The caller has
@@ -177,9 +180,6 @@ pub fn start(
 ) -> Result<u64, StartError> {
     let directory = registry.directory().ok_or(StartError::Unsupported(
         "this server does not serve a repositories directory (--repos-dir)",
-    ))?;
-    let exchange = exchange.ok_or(StartError::Unsupported(
-        "this server has no exchange directory (--exchange-dir)",
     ))?;
     let job = parse(exchange, command)?;
     let id = registry.operations().begin()?;
@@ -199,14 +199,19 @@ pub fn start(
     Ok(id)
 }
 
-fn parse(exchange: &Path, command: AdminCommand) -> Result<Job, StartError> {
+fn parse(exchange: Option<&Path>, command: AdminCommand) -> Result<Job, StartError> {
+    let exchange = || {
+        exchange.ok_or(StartError::Unsupported(
+            "this server has no exchange directory (--exchange-dir)",
+        ))
+    };
     match command {
         AdminCommand::AdminExportCommand(command) => Ok(Job::Export {
             repository: command.repository,
-            bundle: exchange_path(exchange, &command.bundle)?,
+            bundle: exchange_path(exchange()?, &command.bundle)?,
         }),
         AdminCommand::AdminImportCommand(command) => Ok(Job::Import {
-            bundle: exchange_path(exchange, &command.bundle)?,
+            bundle: exchange_path(exchange()?, &command.bundle)?,
             names: command
                 .names
                 .into_iter()
@@ -214,8 +219,11 @@ fn parse(exchange: &Path, command: AdminCommand) -> Result<Job, StartError> {
                 .collect::<Result<_, StartError>>()?,
         }),
         AdminCommand::AdminAdoptCommand(command) => Ok(Job::Adopt {
-            source: exchange_path(exchange, &command.source)?,
+            source: exchange_path(exchange()?, &command.source)?,
             name: command.name,
+        }),
+        AdminCommand::AdminDeleteCommand(command) => Ok(Job::Delete {
+            repository: command.repository,
         }),
     }
 }
@@ -274,6 +282,14 @@ async fn run(
                 ));
             }
             Ok(message)
+        }
+        Job::Delete { repository } => {
+            phase("deleting");
+            registry
+                .delete(&repository)
+                .await
+                .map_err(|error| format!("{repository}: {error}"))?;
+            Ok(format!("deleted {repository}\n"))
         }
         Job::Adopt { source, name } => {
             phase("adopting");

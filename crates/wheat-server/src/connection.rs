@@ -511,7 +511,23 @@ async fn run_session(
     // revoked right stops the next operation.
 
     loop {
-        let msg = match recv(ws).await {
+        let received = tokio::select! {
+            received = recv(ws) => received,
+            () = entry.removed() => {
+                info!(peer = %peer, repo = %repository, "repository deleted; ending the session");
+                send_error(
+                    ws,
+                    0,
+                    NOT_FOUND,
+                    connection_error_scope(),
+                    false,
+                    &format!("repository '{repository}' was deleted"),
+                )
+                .await?;
+                break;
+            }
+        };
+        let msg = match received {
             Ok(msg) => msg,
             Err(ConnectionError::Closed) => break,
             Err(e) => return Err(e),

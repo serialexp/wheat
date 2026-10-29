@@ -8,7 +8,7 @@ a hash is a read capability, publishes upload only what the store lacks, a fork
 starts with all its parent's labels, and the standalone server keeps networks in
 network directories.
 Owner: bart
-Last updated: 2026-10-28
+Last updated: 2026-10-29
 
 ## Implementation status
 
@@ -59,6 +59,14 @@ and move them from Outstanding to Done.
   it and installs the network before writing the name (`network_import.rs`; see
   `wheat-network-maintenance.md`).
 
+- [x] **Moving a standalone network (2026-10-29).** A bundle carries the pool, the
+  heads and the content they reach: `wheat admin export`, `import` on the other
+  server, then `delete` here (`wheat-network-maintenance.md`, Phases 0–3).
+- [x] **Deleting a fork while its network is served (2026-10-29).** Removing a head
+  no longer needs the network's store closed; only the network's last repository
+  does. `Registry::delete` ends the sessions on the repository and waits for its
+  holders before deleting (`wheat-network-maintenance.md`, Phase 3).
+
 ### Outstanding
 
 - [ ] **Phase 1 and 4, Gothab — its opener.** A host whose database keeps heads
@@ -67,14 +75,6 @@ and move them from Outstanding to Done.
   (`SeparateRepositoryStore` over `ContentStore::over_blobs`), sharing pools through
   `OpenNetworks`. Nothing in Wheat is missing for it yet; revisit when Gothab's
   opener exists.
-- [ ] **Moving a standalone network.** `NetworkDirectory::copy_to` copies the pool
-  and the heads, not the content they reach, which is in `<repos-dir>/content`. A
-  copy to another repositories directory needs that content too (the closure's
-  `required_content`, or the content store whole). Designed with GC in
-  `wheat-network-maintenance.md`.
-- [ ] **Deleting a fork while its network is served.**
-  `RepositoriesDirectory::delete` refuses while the network's store is open, so a
-  fork cannot be deleted while any repository of its network is served.
 - [ ] **Defer — network GC.** Marking every head in a network and every network for
   content is the open `wheat gc` / server-authoritative maintenance work in
   `TODO.md`. Deleting a network leaves its content in the content store until then.

@@ -19,7 +19,7 @@
 //! publish. What a stale primary wrote to its store before that is content-addressed
 //! and named by no head.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -47,6 +47,8 @@ pub struct RepositoryEntry {
     /// Publishes take turns joining onto the head, so none merges against a head
     /// another is about to replace, and are made durable in batches.
     pub commit: GroupCommit,
+    /// Set when the repository is deleted: sessions using the entry end.
+    removed: tokio::sync::watch::Sender<bool>,
 }
 
 impl RepositoryEntry {
@@ -70,7 +72,20 @@ impl RepositoryEntry {
             network,
             heads: Box::new(heads),
             commit: GroupCommit::default(),
+            removed: tokio::sync::watch::Sender::new(false),
         }
+    }
+
+    /// Resolves once the repository has been deleted. A session using the entry ends
+    /// when it does, so the store can close.
+    pub async fn removed(&self) {
+        let mut removed = self.removed.subscribe();
+        // The sender is in the entry this borrows, so the wait cannot fail.
+        let _ = removed.wait_for(|removed| *removed).await;
+    }
+
+    fn mark_removed(&self) {
+        self.removed.send_replace(true);
     }
 }
 
@@ -134,8 +149,45 @@ pub struct Registry {
     opener: Option<Arc<dyn RepositoryOpener>>,
     limits: RegistryLimits,
     slots: Mutex<HashMap<String, Slot>>,
+    /// Names being deleted: [`Self::get`] finds nothing under them.
+    deleting: Mutex<HashSet<String>>,
     operations: Operations,
 }
+
+/// How long [`Registry::delete`] waits for sessions using a repository to end.
+const DELETE_WAIT: Duration = Duration::from_secs(30);
+
+/// A repository could not be deleted.
+#[derive(Debug)]
+pub enum DeleteError {
+    /// The registry does not serve a repositories directory.
+    Unsupported,
+    /// There is no such repository.
+    Missing,
+    /// Another delete of the name is running.
+    Busy,
+    /// Something still held the repository after the wait, so its store did not close.
+    Held,
+    Failed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("this server does not serve a repositories directory"),
+            Self::Missing => f.write_str("there is no such repository"),
+            Self::Busy => f.write_str("the repository is already being deleted"),
+            Self::Held => write!(
+                f,
+                "sessions still held the repository after {} seconds",
+                DELETE_WAIT.as_secs()
+            ),
+            Self::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for DeleteError {}
 
 /// One repository the registry holds or is opening. Sessions asking for it clone
 /// `cell` under the registry's lock, so a slot whose cell and entry nobody else
@@ -174,6 +226,7 @@ impl Registry {
             opener: None,
             limits: RegistryLimits::default(),
             operations: Operations::default(),
+            deleting: Mutex::default(),
             slots: Mutex::new(
                 repositories
                     .into_iter()
@@ -190,6 +243,7 @@ impl Registry {
             opener: Some(opener),
             limits,
             operations: Operations::default(),
+            deleting: Mutex::default(),
             slots: Mutex::default(),
         }
     }
@@ -241,6 +295,9 @@ impl Registry {
     pub async fn get(&self, name: &str) -> Result<Option<Arc<RepositoryEntry>>, OpenError> {
         let cell = {
             let mut slots = self.lock();
+            if self.is_deleting(name) {
+                return Ok(None);
+            }
             match slots.get_mut(name) {
                 Some(slot) => {
                     slot.used = Instant::now();
@@ -281,6 +338,8 @@ impl Registry {
             })
             .await;
         match opened {
+            // Opened while a delete began: not handed out, so nothing holds it open.
+            Ok(_) if self.is_deleting(name) => Ok(None),
             Ok(entry) => Ok(Some(Arc::clone(entry))),
             Err(failure) => {
                 // Asked again, it is looked up again: it may exist by then.
@@ -312,6 +371,57 @@ impl Registry {
             return Ok(None);
         };
         Ok(Some(Quiesced::hold(entry).await))
+    }
+
+    /// Deletes the repository `name` while it is served: sessions using it end, the
+    /// name stops finding it, and once nothing holds it open its head is removed
+    /// (and its network, when it was the last repository in it); see
+    /// [`RepositoriesDirectory::delete`]. Waits up to thirty seconds for the holders.
+    pub async fn delete(&self, name: &str) -> Result<(), DeleteError> {
+        let directory = self.directory().ok_or(DeleteError::Unsupported)?;
+        // Both under the slots' lock, which `get` holds when it checks the name and adds a
+        // slot: it adds none for a name once this marks it.
+        let (_deleting, slot) = {
+            let mut slots = self.lock();
+            (DeletingName::begin(self, name)?, slots.remove(name))
+        };
+        if let Some(entry) = slot.as_ref().and_then(|slot| slot.cell.get()) {
+            entry.mark_removed();
+        }
+        drop(slot);
+
+        let deadline = Instant::now() + DELETE_WAIT;
+        loop {
+            let repositories = directory.repositories.clone();
+            let doomed = name.to_owned();
+            let result = tokio::task::spawn_blocking(move || repositories.delete(&doomed))
+                .await
+                .map_err(|error| DeleteError::Failed(Box::new(error)))?;
+            match result {
+                Ok(()) => {
+                    info!(repo = name, "repository deleted");
+                    return Ok(());
+                }
+                Err(RepositoriesDirectoryError::Missing(_)) => return Err(DeleteError::Missing),
+                // The sessions are on their way out; the store closes with the last.
+                Err(RepositoriesDirectoryError::Directory(
+                    wheat_store::RepositoryDirectoryError::InUse(_),
+                )) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(RepositoriesDirectoryError::Directory(
+                    wheat_store::RepositoryDirectoryError::InUse(_),
+                )) => return Err(DeleteError::Held),
+                Err(error) => return Err(DeleteError::Failed(Box::new(error))),
+            }
+        }
+    }
+
+    fn is_deleting(&self, name: &str) -> bool {
+        self.deleting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
     }
 
     /// Closes the repositories nothing holds that were not asked for in
@@ -388,6 +498,35 @@ impl Registry {
         self.slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A name in [`Registry::delete`], until it ends.
+struct DeletingName<'a> {
+    registry: &'a Registry,
+    name: &'a str,
+}
+
+impl<'a> DeletingName<'a> {
+    fn begin(registry: &'a Registry, name: &'a str) -> Result<Self, DeleteError> {
+        let mut deleting = registry
+            .deleting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !deleting.insert(name.to_owned()) {
+            return Err(DeleteError::Busy);
+        }
+        Ok(Self { registry, name })
+    }
+}
+
+impl Drop for DeletingName<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .deleting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(self.name);
     }
 }
 

@@ -3805,10 +3805,90 @@ impl From<AdminAdoptCommandInput> for AdminAdoptCommandOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AdminDeleteCommandInput {
+    pub repository: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminDeleteCommandOutput {
+    pub command_kind: u8,
+    pub repository: std::string::String,
+}
+
+pub type AdminDeleteCommand = AdminDeleteCommandOutput;
+
+impl AdminDeleteCommandInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(4);
+        encoder.write_varlength(self.repository.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.repository.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+}
+
+impl AdminDeleteCommandOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let command_kind = decoder.read_byte()?;
+        if command_kind != 4u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 4, got {}",
+                command_kind
+            )));
+        }
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let repository = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            command_kind,
+            repository,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        AdminDeleteCommandInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        AdminDeleteCommandInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<AdminDeleteCommandOutput> for AdminDeleteCommandInput {
+    fn from(o: AdminDeleteCommandOutput) -> Self {
+        Self {
+            repository: o.repository,
+        }
+    }
+}
+
+impl From<AdminDeleteCommandInput> for AdminDeleteCommandOutput {
+    fn from(i: AdminDeleteCommandInput) -> Self {
+        Self {
+            command_kind: 4u8,
+            repository: i.repository,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AdminCommand {
     AdminExportCommand(AdminExportCommandOutput),
     AdminImportCommand(AdminImportCommandOutput),
     AdminAdoptCommand(AdminAdoptCommandOutput),
+    AdminDeleteCommand(AdminDeleteCommandOutput),
 }
 
 impl AdminCommand {
@@ -3858,6 +3938,14 @@ impl AdminCommand {
                     encoder.write_uint8(b);
                 }
             }
+            AdminCommand::AdminDeleteCommand(v) => {
+                encoder.write_uint8(v.command_kind);
+                encoder.write_varlength(v.repository.len() as u64, "leb128_canonical")?;
+                let string_bytes: &[u8] = v.repository.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
         }
         Ok(())
     }
@@ -3881,6 +3969,10 @@ impl AdminCommand {
         } else if value == 3 {
             Ok(AdminCommand::AdminAdoptCommand(
                 AdminAdoptCommandOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 4 {
+            Ok(AdminCommand::AdminDeleteCommand(
+                AdminDeleteCommandOutput::decode_with_decoder(decoder)?,
             ))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(

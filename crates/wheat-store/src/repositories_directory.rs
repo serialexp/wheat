@@ -43,8 +43,8 @@ use wheat_core::{
 
 use crate::repository_directory::{
     HIDDEN_SUFFIX, NameLock, PendingRepository, TOMBSTONE_INFIX, copy_files, hidden_unique,
-    initialize_empty, is_repository_leftover, list_store_files, lock_closed_store, sweep,
-    write_marker,
+    initialize_empty, is_repository_leftover, list_store_files, lock_closed_store, lock_members,
+    sweep, write_marker,
 };
 use crate::{
     LocalPublicationStore, ObjectStoreError, PackedObjectStore, PublicationError, PublicationStore,
@@ -216,8 +216,9 @@ impl RepositoriesDirectory {
     }
 
     /// Deletes the repository `name`: its head, and its network with it when no
-    /// other repository is left in it. Refuses while the network's store is open,
-    /// here or in another process.
+    /// other repository is left in it. Removing the network refuses while its store
+    /// is open, here or in another process; removing only a head does not need the
+    /// store closed, since the head is not in it.
     pub fn delete(&self, name: &str) -> Result<(), RepositoriesDirectoryError> {
         let (parent, repo) = self.name_path(name)?;
         let missing = || RepositoriesDirectoryError::Missing(name.to_owned());
@@ -232,13 +233,20 @@ impl RepositoriesDirectory {
         let network = self.network(location.network);
         let head = network.head_directory(location.repository);
         if head.is_dir() {
-            // Held through the rename, it keeps the network's store from being opened
-            // before what goes is gone.
-            let store_lock = lock_closed_store(&network.storage(), network.root())?;
+            // Two deletes of the network's last two repositories would each find the
+            // other left, and leave the network behind.
+            let _members = lock_members(network.root())?;
             let others = network
                 .repositories()?
                 .into_iter()
                 .any(|repository| repository != location.repository);
+            // Held through the rename, it keeps the network's store from being opened
+            // before what goes is gone.
+            let store_lock = if others {
+                None
+            } else {
+                Some(lock_closed_store(&network.storage(), network.root())?)
+            };
             let doomed = if others { head } else { network.root.clone() };
             write_marker(&doomed)?;
             let tombstone = parent.join(hidden_unique(repo, TOMBSTONE_INFIX));

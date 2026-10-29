@@ -289,6 +289,19 @@ pub(crate) fn lock_closed_store(
     }
 }
 
+/// Takes, waiting for it, the lock that serializes deletes of the repositories of the
+/// network in `root`, which have to see each other to know which is the last.
+pub(crate) fn lock_members(root: &Path) -> Result<File, RepositoryDirectoryError> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("members.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 /// One file of a repository, as [`RepositoryDirectory::files`] lists it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryFile {

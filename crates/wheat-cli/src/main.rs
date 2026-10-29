@@ -281,6 +281,12 @@ enum AdminAction {
         #[arg(long = "name", value_name = "ID=OWNER/REPO", required = true)]
         names: Vec<String>,
     },
+    /// Delete a repository, and its network with it when it is the last in it. Sessions
+    /// using it end.
+    Delete {
+        /// The repository, as `owner/repo`.
+        repository: String,
+    },
     /// Take a standalone repository directory in as a new repository.
     Adopt {
         /// The directory's name in the exchange directory.
@@ -793,6 +799,7 @@ fn admin(arguments: AdminArgs) -> Result<Success> {
         AdminAction::Export { .. } => "admin.export",
         AdminAction::Import { .. } => "admin.import",
         AdminAction::Adopt { .. } => "admin.adopt",
+        AdminAction::Delete { .. } => "admin.delete",
     };
     let operation = match arguments.action {
         AdminAction::Export { repository, bundle } => Operation::Export { repository, bundle },
@@ -811,6 +818,7 @@ fn admin(arguments: AdminArgs) -> Result<Success> {
                 .collect::<Result<_>>()?,
         },
         AdminAction::Adopt { source, name } => Operation::Adopt { source, name },
+        AdminAction::Delete { repository } => Operation::Delete { repository },
     };
     let url = remote::parse_admin_url(&arguments.server)?;
     let token = credential::token_for(&UserConfig::from_environment()?, None, &url)?;
@@ -876,6 +884,7 @@ fn command_name(command: &Command) -> &'static str {
             AdminAction::Export { .. } => "admin.export",
             AdminAction::Import { .. } => "admin.import",
             AdminAction::Adopt { .. } => "admin.adopt",
+            AdminAction::Delete { .. } => "admin.delete",
         },
         Command::Workspace(WorkspaceCommand::List) => "workspace.list",
         Command::Workspace(WorkspaceCommand::Unregister) => "workspace.unregister",

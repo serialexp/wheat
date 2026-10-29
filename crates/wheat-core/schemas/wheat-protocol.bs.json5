@@ -555,6 +555,15 @@
       ],
     },
 
+    // Deletes a repository, and its network with it when it was the last in it, while
+    // the server serves it: sessions using the repository end.
+    AdminDeleteCommand: {
+      sequence: [
+        { name: "command_kind", type: "uint8", const: 4 },
+        { name: "repository", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+      ],
+    },
+
     AdminCommand: {
       type: "discriminated_union",
       discriminator: { peek: "uint8" },
@@ -562,6 +571,7 @@
         { type: "AdminExportCommand", when: "value == 1" },
         { type: "AdminImportCommand", when: "value == 2" },
         { type: "AdminAdoptCommand",  when: "value == 3" },
+        { type: "AdminDeleteCommand", when: "value == 4" },
       ],
     },
 

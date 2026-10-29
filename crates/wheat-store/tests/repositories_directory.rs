@@ -221,7 +221,7 @@ async fn deleting_a_fork_keeps_its_network_and_deleting_the_last_removes_it() {
 }
 
 #[tokio::test]
-async fn a_repository_whose_network_is_open_is_not_deleted() {
+async fn a_network_whose_store_is_open_is_not_deleted_but_a_fork_of_it_is() {
     let root = tempfile::tempdir().unwrap();
     let repositories = RepositoriesDirectory::new(root.path());
     let parent = repositories
@@ -231,16 +231,19 @@ async fn a_repository_whose_network_is_open_is_not_deleted() {
     repositories.fork("alice/repo", "bob/repo").unwrap();
     let network = repositories.network(parent.location.network);
 
+    // A head is not in the store, so a fork goes while the store is open.
     let store = network.open_store().unwrap();
-    for name in ["alice/repo", "bob/repo"] {
-        assert!(matches!(
-            repositories.delete(name).unwrap_err(),
-            RepositoriesDirectoryError::Directory(RepositoryDirectoryError::InUse(_))
-        ));
-    }
+    repositories.delete("bob/repo").unwrap();
+    assert!(repositories.locate("bob/repo").unwrap().is_none());
+    assert!(repositories.locate("alice/repo").unwrap().is_some());
+    // The last repository takes the store with it, which must be closed for that.
+    assert!(matches!(
+        repositories.delete("alice/repo").unwrap_err(),
+        RepositoriesDirectoryError::Directory(RepositoryDirectoryError::InUse(_))
+    ));
+    assert!(repositories.locate("alice/repo").unwrap().is_some());
     store.close().unwrap();
 
-    repositories.delete("bob/repo").unwrap();
     repositories.delete("alice/repo").unwrap();
     assert!(!network.root().exists());
 }
@@ -336,4 +339,31 @@ async fn a_network_copies_with_every_head() {
         );
     }
     assert_eq!(labels(&copy, fork.head).await, ["main"]);
+}
+/// Two deletes of a network's last two repositories at once leave nothing behind: each
+/// must see whether the other is gone.
+#[tokio::test]
+async fn deleting_the_last_two_repositories_at_once_removes_the_network() {
+    for _ in 0..20 {
+        let root = tempfile::tempdir().unwrap();
+        let repositories = RepositoriesDirectory::new(root.path());
+        let parent = repositories
+            .create_empty("alice/repo", "main")
+            .await
+            .unwrap();
+        repositories.fork("alice/repo", "bob/repo").unwrap();
+        let network = repositories.network(parent.location.network);
+
+        let deleters: Vec<_> = ["alice/repo", "bob/repo"]
+            .into_iter()
+            .map(|name| {
+                let repositories = repositories.clone();
+                std::thread::spawn(move || repositories.delete(name))
+            })
+            .collect();
+        for deleter in deleters {
+            deleter.join().unwrap().unwrap();
+        }
+        assert!(!network.root().exists());
+    }
 }

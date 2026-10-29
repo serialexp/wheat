@@ -199,7 +199,10 @@ async fn the_repositories_of_a_network_share_its_store_until_the_last_is_closed(
     // Closing one leaves the store open for the other.
     drop(parent);
     assert_eq!(registry.close_idle(), 1);
-    assert!(in_use(repositories.delete("alice/repo").unwrap_err()));
+    assert!(
+        network.open_store().is_err(),
+        "the store is still open for the fork"
+    );
     let reopened = registry.get("alice/repo").await.unwrap().unwrap();
     assert!(std::ptr::eq(
         &*reopened.network.store,
