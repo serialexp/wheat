@@ -413,12 +413,14 @@ fn a_wheat_url_pulls_natively() {
 
     // The native pull needs the remote this store was cloned from; an imported store
     // has none.
-    let (_, error) = team.wheat_error(&["pull", "wheat://127.0.0.1:1/owner/repo"]);
+    let (code, error) = team.wheat_error(&["pull", "wheat://127.0.0.1:1/owner/repo"]);
+    assert_eq!(code, Some(2), "{error:#}");
+    assert_eq!(error["code"], "invalid_input");
     assert!(
         error["message"]
             .as_str()
             .unwrap()
-            .contains("no remote.meta found"),
+            .contains("tracks no native remote"),
         "{error:#}"
     );
 
