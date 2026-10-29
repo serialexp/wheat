@@ -171,6 +171,13 @@ Finished items, moved here from `TODO.md` under the same headings.
   stores and directories were deleted.
 
 ## Found while dogfooding (2026-10-19)
+
+- `[x]` **A native pull or fetch without `remote.meta` is an internal error
+  (2026-10-21).** Fixed 2026-10-29: `resolve_remote` refuses with `invalid_input` and
+  advice that works: `wheat publish --remote <url>` (which already starts tracking a
+  remote on a store that has none) or `wheat clone <url>`. Fetch and pull still do
+  not start tracking a remote themselves: their history has to be the store's first.
+  Test: `remote_fetch.rs`, `fetching_into_a_store_that_tracks_no_remote_says_how_to_start`.
 - `[x]` **`wheat status --format=json` prints view IDs as byte arrays (2026-10-21).**
   Fixed 2026-10-29: every wheat-core digest ID and `ContentId` serializes as its hex
   (and reads back from it), so all JSON documents agree with the human output; see the

@@ -582,3 +582,46 @@ fn a_clone_validates_once_and_local_commands_trust_the_store() {
     let validated = span_names(&reader, &stores, &config, &["validate"]);
     assert_eq!(count(&validated, "validate_complete"), 1);
 }
+
+/// A store no clone or publish tied to a remote has none to fetch from: fetch and pull
+/// say so as bad input, with advice that works, and following it does.
+#[test]
+fn fetching_into_a_store_that_tracks_no_remote_says_how_to_start() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("config");
+    write_config(&config);
+    let server = serve(root, &config);
+    let stores = root.join("local-stores");
+    let local = root.join("local");
+    ok(root, &stores, &config, &["init", local.to_str().unwrap()]);
+
+    for args in [
+        vec!["fetch"],
+        vec!["fetch", "--remote", &server.url],
+        vec!["pull"],
+        vec!["pull", &server.url],
+    ] {
+        let refused = remote_support::fails_json(&local, &stores, &config, &args);
+        assert_eq!(
+            refused["error"]["code"], "invalid_input",
+            "{args:?}: {refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("wheat publish --remote"),
+            "{args:?}: {refused}"
+        );
+    }
+
+    // The local history is unrelated to the server's, hence --force.
+    ok(
+        &local,
+        &stores,
+        &config,
+        &["publish", "--remote", &server.url, "--force"],
+    );
+    ok(&local, &stores, &config, &["fetch"]);
+}

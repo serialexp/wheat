@@ -3430,10 +3430,17 @@ fn resolve_remote(
     store_root: &Path,
     explicit_url: Option<&str>,
 ) -> Result<(remote::WheatUrl, remote_config::RemoteConfig)> {
+    // Only publishing starts tracking a remote: a fetch needs the remote's history to be
+    // this store's, which a clone or a first publish establishes.
+    let untracked = || {
+        CliFailure::invalid(
+            "this store tracks no native remote: `wheat publish --remote <url>` publishes it \
+             to one and tracks it from then on, or `wheat clone <url>` makes a new workspace",
+        )
+    };
     if let Some(url) = explicit_url {
         let parsed = remote::parse_wheat_url(url)?;
-        let cfg = remote_config::RemoteConfig::read(store_root)?
-            .with_context(|| "no remote.meta found; use wheat clone or pass --remote")?;
+        let cfg = remote_config::RemoteConfig::read(store_root)?.ok_or_else(untracked)?;
         if !cfg.has_same_identity(&parsed) {
             return Err(CliFailure::invalid(
                 "explicit native remote does not match this store's tracked remote",
@@ -3441,8 +3448,7 @@ fn resolve_remote(
         }
         Ok((parsed, cfg))
     } else {
-        let cfg = remote_config::RemoteConfig::read(store_root)?
-            .with_context(|| "no remote configured; use wheat clone or pass --remote")?;
+        let cfg = remote_config::RemoteConfig::read(store_root)?.ok_or_else(untracked)?;
         let parsed = remote::parse_wheat_url(&cfg.url)?;
         Ok((parsed, cfg))
     }

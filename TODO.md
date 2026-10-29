@@ -93,11 +93,6 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
   change (2026-10-21).** Pull moves every local change above the pulled commits; one
   whose edits are already there (the same fix made in Git) is not dropped as
   `git rebase` would, so the next push projects it as an empty commit. Untested.
-- `[ ]` **A native pull or fetch without `remote.meta` is an internal error
-  (2026-10-21).** `resolve_remote` (`main.rs`) fails with plain context ("no
-  remote.meta found; use wheat clone or pass --remote"), so `wheat pull wheat://...`
-  in an imported store reports `internal / unexpected_failure`, and the advice to
-  pass `--remote` doesn't help: an explicit remote also needs `remote.meta`.
 - `[ ]` **Resolving a conflict is awkward.** The workspace shows only one side of a
   conflicted file, with no markers, and `wheat resolve` takes the whole resolved
   file as `--value` on the command line (bounded by the argument size limit). After
