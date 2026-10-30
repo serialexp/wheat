@@ -78,6 +78,10 @@ pub struct StructuralDeltaLimits {
     /// Most old children of one view read to find the old view a new one replaces;
     /// a view with more pairs its new children with itself.
     pub max_old_children: usize,
+    /// Most times radix nodes are walked again under another key path, beyond the
+    /// number of objects yielded. A node's ID leaves out its key path, so a few nodes
+    /// can make a map whose paths double at every level.
+    pub max_radix_revisits: usize,
 }
 
 impl Default for StructuralDeltaLimits {
@@ -87,6 +91,7 @@ impl Default for StructuralDeltaLimits {
             max_pending: 4_000_000,
             max_lineage_chain: 100_000,
             max_old_children: 64,
+            max_radix_revisits: 65_536,
         }
     }
 }
@@ -126,6 +131,8 @@ pub struct StructuralDeltaStats {
     pub retained_lookups: u64,
     /// Tasks parked on a missing object.
     pub parked: u64,
+    /// Radix nodes walked again under another key path.
+    pub radix_revisits: u64,
 }
 
 #[derive(Debug, Error)]
@@ -972,6 +979,15 @@ impl<S: ImmutableObjectStore> StructuralDelta<S> {
             self.stats.pruned_emitted += 1;
             return Ok(None);
         }
+        // A node yielded already, here under another key path. Legitimate maps rarely
+        // share a subtree, so repeats are paid for only up to the objects yielded.
+        if self.emitted.contains(&id) {
+            self.stats.radix_revisits += 1;
+            let allowed = self.emitted.len() as u64 + self.limits.max_radix_revisits as u64;
+            if self.stats.radix_revisits > allowed {
+                return Err(StructuralDeltaError::LimitExceeded("radix revisits"));
+            }
+        }
         let old = old.clone();
         let Some(stored) = self.read_new(&task, "radix node", &[role.kind()]).await? else {
             self.radix_walked.remove(&(id, role, path));
@@ -1672,6 +1688,73 @@ mod tests {
         let (yielded, unproven) = walk_set(&objects, None, root).await;
         assert_eq!(unproven, keys.into());
         assert_eq!(yielded, [root.into(), children[0].1].into());
+    }
+
+    /// A content set of `depth` nodes, each with both of its edges on the next, so
+    /// its paths double at every level. Returns the root.
+    async fn doubling_set(objects: &LooseObjectStore, depth: usize) -> ObjectId {
+        let suffix = |first: u8| {
+            let mut suffix = vec![0; 32 - depth];
+            suffix[0] = first;
+            suffix
+        };
+        let leaf = wheat_core::ContentSetNode::new(
+            Vec::new(),
+            false,
+            Vec::new(),
+            vec![suffix(0), suffix(1)],
+        )
+        .unwrap();
+        let mut below = leaf;
+        for _ in 0..depth {
+            objects
+                .put_if_absent(below.id().into(), &below.canonical_bytes())
+                .await
+                .unwrap();
+            let child = below.id();
+            below = wheat_core::ContentSetNode::new(
+                Vec::new(),
+                false,
+                (0..2)
+                    .map(|edge| wheat_core::ContentSetChild { edge, child })
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        objects
+            .put_if_absent(below.id().into(), &below.canonical_bytes())
+            .await
+            .unwrap();
+        below.id().into()
+    }
+
+    #[tokio::test]
+    async fn a_map_whose_paths_double_at_every_level_stops_the_walk() {
+        let (_dir, objects) = store();
+        // A million paths through 21 nodes.
+        let root = doubling_set(&objects, 20).await;
+        let nothing = RepositoryEnvelopeId::from_digest([0; 32]);
+        let limits = StructuralDeltaLimits {
+            max_radix_revisits: 100,
+            ..StructuralDeltaLimits::default()
+        };
+        let mut walk = StructuralDelta::new(&objects, Some(nothing), nothing, limits);
+        walk.push_radix_root(root, Role::AggregateContent, None, None)
+            .unwrap();
+        let error = loop {
+            match walk.next().await {
+                Ok(Some(DeltaStep::Object(_))) => {}
+                Ok(other) => panic!("the walk went on: {other:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(error, StructuralDeltaError::LimitExceeded("radix revisits")),
+            "{error}"
+        );
+        // 21 nodes yielded, then at most the allowance on top of them walked again.
+        assert!(walk.stats().radix_revisits <= 21 + 100 + 1);
     }
 
     /// One node can sit in two collections. Once the walk of one pairs it with the

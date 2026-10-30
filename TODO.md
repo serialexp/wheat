@@ -12,7 +12,7 @@ a shared object store for blobs; Gothab's server does authentication and reposit
 authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
 formats freeze. Items already listed elsewhere that this also needs: chunked uploads reassembled in
-memory, the fetch walk's visit cap, opening a packed store costing O(store), and
+memory, a cap on the fetch union's diffs, opening a packed store costing O(store), and
 `wheat gc` /
 server-authoritative remote maintenance.
 
@@ -318,19 +318,15 @@ budget passes, but by only about 0.7 s.
   A new `newdir/a` shows as `untracked newdir/` and `untracked newdir/a`, and the
   header counts both as "untracked files: 2". Options: collapse to the directory
   as git does, list only files, or keep both and count only files.
-- `[ ]` **The fetch walk has no cap on repeated radix subtrees (2026-09-26).** A
-  radix node's ID does not include its key path, so one node can sit under several
-  edges, and a crafted map can repeat that at every level: a few nodes, walked 2^depth
-  times. `StructuralDelta` (`crates/wheat-store/src/structural_delta.rs`) walks a node
-  once per (node, role, path) and keeps every such triple in `radix_walked`, so both
-  its time and its memory follow the repeats. `max_pending` does not help: the queue
-  stays short. Snapshot's `ClosureWalk` caps visits at twice `max_objects`
-  (`LimitExceeded("closure visits")`); the fetch walk needs a similar cap. Check
-  first which maps a client can fill with chosen keys (change IDs are UUIDs the
-  client picks). 2026-10-09: the fetch union (`crates/wheat-store/src/repository_union.rs`)
-  diffs the remote's change map, lineage and retained sets against the local ones
-  with `DiffLimits::unbounded()`, so a server could do the same to a client; a
-  visit cap there too.
+- `[ ]` **The fetch union diffs remote maps without a cap (2026-10-09).** A radix
+  node's ID does not include its key path, so a crafted map can repeat a few nodes
+  under every edge: paths double at every level. The fetch union
+  (`crates/wheat-store/src/repository_union.rs`) diffs the remote's change map,
+  lineage and retained sets against the local ones with `DiffLimits::unbounded()`
+  (14 call sites across the collections), so a server could make a client walk 2^depth
+  paths. `StructuralDelta` has a cap (TODO_DONE.md). Options: bounded limits at the
+  sites that see remote roots, or a revisit count inside `paired_diff` for every diff
+  (a set of visited node IDs per diff, local ones included). Needs Bart's call.
 - `[ ]` **Combined revisions carry no subsumption evidence (2026-10-09).** When
   integrate combines revisions of one change, the new revision's transition has no
   `subsumed` or `resolutions` entries, even where the combined revisions recorded

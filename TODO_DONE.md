@@ -567,6 +567,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   `crates/wheat-cli/tests/remote_fetch.rs`.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
+- `[x]` **The fetch walk has no cap on repeated radix subtrees (2026-09-26).** A
+  radix node's ID does not include its key path, so a crafted map can repeat a few
+  nodes under every edge, and `StructuralDelta` walked a node once per (node, role,
+  path). It now counts a node walked again under another path, and stops with
+  `LimitExceeded("radix revisits")` once those exceed the objects yielded plus
+  `max_radix_revisits` (65,536) (2026-10-31). A publish whose walk stops so is refused
+  as invalid. Test: a 21-node content set of a million paths stops after about 120
+  node visits (15 s and a million reads without the cap). The fetch union's diffs
+  are still uncapped: TODO.md.
 - `[x]` **`wheat+tls://` URLs parse but cannot connect.** Done 2026-10-29. The client
   connects over rustls (aws-lc-rs) and checks the server against the operating
   system's trusted roots through `rustls-native-certs`, read once per process;
