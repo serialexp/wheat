@@ -6,6 +6,8 @@
 //! standalone server keeps both in one `repository.head` record
 //! ([`LocalPublicationStore`]).
 
+use std::io;
+
 use async_trait::async_trait;
 use wheat_core::PublishReceiptRecord;
 use wheat_store::{LocalPublicationStore, PublicationError, PublicationStore, RepositoryHead};
@@ -38,17 +40,19 @@ pub trait HeadStore: Send + Sync {
     ) -> Result<(), PublicationError>;
 }
 
+// The record is read and written under a file lock, synchronously, so each call runs
+// on a thread for blocking work.
 #[async_trait]
 impl HeadStore for LocalPublicationStore {
     async fn head(&self) -> Result<RepositoryHead, PublicationError> {
-        PublicationStore::read(self)
+        blocking(self, |store| PublicationStore::read(&store)).await
     }
 
     async fn head_with_receipt(
         &self,
         key: &[u8; 16],
     ) -> Result<(RepositoryHead, Option<PublishReceiptRecord>), PublicationError> {
-        let (head, receipts) = self.read_with_receipts()?;
+        let (head, receipts) = blocking(self, |store| store.read_with_receipts()).await?;
         let receipt = receipts.into_iter().find(|receipt| &receipt.key == key);
         Ok((head, receipt))
     }
@@ -60,6 +64,21 @@ impl HeadStore for LocalPublicationStore {
         receipts: &[PublishReceiptRecord],
         now: u64,
     ) -> Result<(), PublicationError> {
-        self.compare_and_advance_with_receipts(expected, proposed, receipts, now)
+        let receipts = receipts.to_vec();
+        blocking(self, move |store| {
+            store.compare_and_advance_with_receipts(expected, proposed, &receipts, now)
+        })
+        .await
     }
+}
+
+/// Runs `work` on a handle to `store` on a thread for blocking work.
+async fn blocking<T: Send + 'static>(
+    store: &LocalPublicationStore,
+    work: impl FnOnce(LocalPublicationStore) -> Result<T, PublicationError> + Send + 'static,
+) -> Result<T, PublicationError> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || work(store))
+        .await
+        .map_err(|error| PublicationError::Io(io::Error::other(error)))?
 }

@@ -11,7 +11,7 @@ places each repository on one primary host with fencing, local disk for structur
 a shared object store for blobs; Gothab's server does authentication and repository
 authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
-formats freeze. Items already listed elsewhere that this also needs: blocking disk work on async threads, chunked uploads reassembled in
+formats freeze. Items already listed elsewhere that this also needs: chunked uploads reassembled in
 memory, the fetch walk's visit cap, `existing_ids`
 listing the bucket, opening a packed store costing O(store), and `wheat gc` /
 server-authoritative remote maintenance.
@@ -200,26 +200,6 @@ Performance, most serious first:
   staged files' own fsyncs (32 at a time). One `syncfs` per batch would replace
   them, but it flushes the whole filesystem, so on a busy disk it may cost more.
   Needs Bart's call; measure with bench `materialize_wide`.
-- `[ ]` **wheat-server does blocking disk work on async threads (confirmed
-  2026-10-05).** Publication, packed-object and content stores are synchronous and
-  called straight from Tokio tasks in `connection.rs`, `publish.rs` and `fetch.rs`
-  (about 20 sites); only the S3 store uses `block_in_place`. The CLI runs a
-  current-thread runtime, where `block_in_place` panics, so it cannot simply go
-  inside the shared stores. Options put to Bart: `block_in_place` at the server's
-  call sites; `spawn_blocking` inside the stores (a handoff per get); or each
-  handler's store work as one blocking job talking to the connection over channels.
-  Since 2026-10-16 the publish committer (`commit.rs`), which does the store write and
-  the head's syncs, runs on the blocking pool. What is left on the runtime are reads
-  and the stage's early writes; in `publish_contention` at 8 writers the server is
-  about 5% busy, so that case cannot show their cost. Bart chose (2026-10-30)
-  `spawn_blocking` a batch at a time (`crate::blocking::drive`). Fetch is done: the
-  walk runs on the blocking pool and hands the connection whole messages through a
-  two-message queue, and each want, each content request and the envelope checks are
-  one job (`blocking_test`). Publish is done too: its stage owns a handle to the
-  network, and each stretch of the walk, each received batch, the content plan, the
-  hooks' label read and the join and validation are one job. An A/B of
-  `publish_contention` and `publish_content` against the code before measures the
-  same. Left: the head reads of `LocalPublicationStore`, and connection setup.
 - `[ ]` **Fetch and publish benches slower than on 2026-10-26 (2026-10-30).**
   `fetch_incremental.total.wall` went from 17.3 s (2026-10-26) to 29–31 s, its
   `publish.wall` from 0.023 s to about 0.07 s, and `remote_latency.many.publish.wall`

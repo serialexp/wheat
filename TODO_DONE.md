@@ -283,6 +283,23 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **wheat-server does blocking disk work on async threads (confirmed
+  2026-10-05).** Publication, packed-object and content stores are synchronous and
+  were called straight from Tokio tasks in `connection.rs`, `publish.rs` and
+  `fetch.rs`. Bart chose (2026-10-30) `spawn_blocking` a batch at a time
+  (`crate::blocking::drive`, which keeps the caller's span); the publish committer
+  already ran on the blocking pool (2026-10-16), and opening a repository did too.
+  Fetch: the walk runs on the blocking pool and hands the connection whole messages
+  through a two-message queue; each want, each content request and the envelope
+  checks are one job. Publish: the stage owns a handle to the network
+  (`RepositoryStage<S>`, `StructuralDelta<S>` and `BatchObjectStore<O>` hold their
+  store), and each stretch of the walk, each received batch, the content plan, the
+  hooks' label read and the join and validation are one job. `LocalPublicationStore`
+  reads and moves the head on the blocking pool, which covers connection setup.
+  `blocking_test` serves on a current-thread runtime and counts store calls made on
+  it (none), and checks a head read waiting on its lock leaves the runtime running.
+  A/B runs of `publish_contention` and `publish_content` measure the same as before.
+
 - `[x]` **Uploads go one file per message (scanner only).** The client sent each
   blob as its own `ContentUpload`. Uploads now use `ContentBatch` and `ContentChunk`,
   built by the shared `ContentBatcher` in `wheat-protocol` (2026-10-20): a publish of

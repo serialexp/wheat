@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use wheat_core::{
@@ -19,12 +20,13 @@ use wheat_core::{
     ViewLabelManifestRecord,
 };
 use wheat_protocol::PublishResultStatus;
+use wheat_server::heads::HeadStore;
 use wheat_server::registry::Registry;
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_store::{
     BlobPage, BlobRead, ContentBlobStore, ContentStore, Durability, ImmutableObjectStore,
-    LocalPublicationStore, LooseObjectStore, ObjectStoreError, RepositoryPublisher,
-    SeparateRepositoryStore, StoredObject,
+    LocalPublicationStore, LooseObjectStore, ObjectStoreError, PublicationStore, RepositoryHead,
+    RepositoryPublisher, SeparateRepositoryStore, StoredObject,
 };
 
 use support::{
@@ -358,4 +360,52 @@ fn a_publish_uses_the_store_off_the_async_threads() {
         assert!(uses.elsewhere.load(Ordering::Relaxed) > 0);
         assert_eq!(uses.on_runtime.load(Ordering::Relaxed), 0, "{uses:?}");
     });
+}
+
+/// A head read waiting for the head's lock, held here by another process, say, waits
+/// on a thread for blocking work: the runtime goes on with its other tasks.
+#[test]
+fn a_head_read_waits_for_its_lock_off_the_async_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let heads = LocalPublicationStore::new(dir.path().join("repository.head"));
+    let head = RepositoryHead {
+        generation: 1,
+        envelope: RepositoryEnvelopeId::from_digest([7; 32]),
+    };
+    heads.initialize(head).unwrap();
+
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(dir.path().join("repository.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let released = Arc::new(AtomicBool::new(false));
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let released = released.clone();
+        std::thread::spawn(move || {
+            // Held until the test says, or long enough that a runtime the read
+            // blocked has visibly stood still; then the test fails instead of hanging.
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            released.store(true, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        })
+    };
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let read = tokio::spawn(async move { HeadStore::head(&heads).await });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !released.load(Ordering::SeqCst),
+                "the runtime stood still until the lock was released"
+            );
+            release.send(()).unwrap();
+            assert_eq!(read.await.unwrap().unwrap(), head);
+        });
+    holder.join().unwrap();
 }
