@@ -144,7 +144,10 @@ top of them.
   Publish gates are not started.)
 - [ ] **Phase 2 — Gothab integration.** Let gothab-server (or gitd's successor)
   serve wheat repositories through the native protocol alongside Git projections,
-  with one canonical store per repository.
+  with one canonical store per repository. (2026-10-30: decided to serve them
+  inside gothab-gitd, with heads in Gothab's Postgres and content in its object
+  storage; see `TODO.md`, "Hosting on Gothab", and Gothab's
+  `repository-backend-interface.md`.)
 - [ ] **Open question — resumable transfer.** Whether large object transfers use
   chunked streaming within the WebSocket connection or out-of-band pre-signed URLs
   to the object store (relevant for R2/Hetzner deployments where the server could

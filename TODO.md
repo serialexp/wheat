@@ -16,6 +16,22 @@ memory, the fetch walk's visit cap, `existing_ids`
 listing the bucket, opening a packed store costing O(store), and `wheat gc` /
 server-authoritative remote maintenance.
 
+Decided 2026-10-30 (recorded in Gothab's `docs/design/repository-backend-interface.md`):
+Wheat is served inside gothab-gitd with `wheat-server` as a library; Gothab depends on
+the wheat crates through a git dependency pinned to a tag of this repository; a step
+of history in Gothab's pages is a change; heads live in Gothab's Postgres (a
+`HeadStore`) and content in its object storage, with only structure pools on the
+host's disk. gitd's endpoints, the front door, the head store, the content object
+kind and publish events are Gothab work.
+
+- `[ ]` **A label's changes in order, read on the server.** Gothab's history pages
+  show one entry per change, so it needs a server-side read listing the changes a
+  label's history holds, newest first and paged, without materializing a workspace.
+  Which view each entry links to is open on Gothab's side.
+- `[ ]` **Tag a release for Gothab to pin.** Gothab pins the wheat crates to a tag
+  (only `v0.2.0` exists); the first integration commit needs one that has the
+  embedder API it uses.
+
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network. Networks share
   one store handle in the registry, and `--repos-dir` keeps them as
