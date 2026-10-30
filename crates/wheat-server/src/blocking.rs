@@ -10,8 +10,10 @@ use std::future::Future;
 
 use tokio::runtime::Handle;
 use tokio::task::{JoinError, spawn_blocking};
+use tracing::{Instrument as _, Span};
 
-/// Runs `work` on a thread for blocking work, driving the future it returns there.
+/// Runs `work` on a thread for blocking work, driving the future it returns there,
+/// inside the caller's span.
 pub(crate) async fn drive<F, Fut>(work: F) -> Result<Fut::Output, JoinError>
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -19,5 +21,6 @@ where
     Fut::Output: Send + 'static,
 {
     let handle = Handle::current();
-    spawn_blocking(move || handle.block_on(work())).await
+    let span = Span::current();
+    spawn_blocking(move || handle.block_on(work().instrument(span))).await
 }

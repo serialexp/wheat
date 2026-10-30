@@ -270,6 +270,36 @@ impl<P: RepositoryStore, C: RepositoryStore> RepositoryStore for NetworkStore<P,
 }
 
 #[async_trait]
+impl<T: RepositoryStore + ?Sized> RepositoryStore for &T {
+    fn content_store(&self) -> ContentStore {
+        (**self).content_store()
+    }
+
+    async fn put_publication(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        content: &[ContentItem<'_>],
+    ) -> Result<StoredWrite, RepositoryStoreError> {
+        (**self).put_publication(objects, content).await
+    }
+}
+
+#[async_trait]
+impl<T: RepositoryStore + ?Sized> RepositoryStore for Arc<T> {
+    fn content_store(&self) -> ContentStore {
+        (**self).content_store()
+    }
+
+    async fn put_publication(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        content: &[ContentItem<'_>],
+    ) -> Result<StoredWrite, RepositoryStoreError> {
+        (**self).put_publication(objects, content).await
+    }
+}
+
+#[async_trait]
 impl ImmutableObjectStore for Box<dyn RepositoryStore> {
     async fn put_if_absent(
         &self,
@@ -327,9 +357,12 @@ impl RepositoryStore for Box<dyn RepositoryStore> {
 /// The stage counts what it was given ([`Self::received`]) and what its writes
 /// added to the store ([`Self::stored`]; [`PendingPublications::store`] for what
 /// [`Self::take`] took).
-pub struct RepositoryStage<'a, S: ?Sized> {
-    store: &'a S,
-    objects: BatchObjectStore<'a, S>,
+///
+/// The stage holds its store handle: `&store` to stage over a borrowed store, or an
+/// `Arc` for a stage shared with work on other threads.
+pub struct RepositoryStage<S> {
+    /// The buffer, which holds the store itself.
+    objects: BatchObjectStore<S>,
     staged: Arc<StagedContent>,
     content: ContentStore,
     max_objects: usize,
@@ -340,7 +373,7 @@ pub struct RepositoryStage<'a, S: ?Sized> {
     stored: Mutex<StoredWrite>,
 }
 
-impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
+impl<S: RepositoryStore> RepositoryStage<S> {
     /// Holds up to `max_objects` objects of up to `max_bytes` in total, and content
     /// of up to `max_bytes`, storing everything once either is reached (so one
     /// object or one put's content may go over).
@@ -348,7 +381,7 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
     /// # Panics
     /// Panics if either limit is zero.
     #[must_use]
-    pub fn new(store: &'a S, max_objects: usize, max_bytes: usize) -> Self {
+    pub fn new(store: S, max_objects: usize, max_bytes: usize) -> Self {
         assert!(max_objects != 0, "stage object limit must be nonzero");
         assert!(max_bytes != 0, "stage byte limit must be nonzero");
         let staged = Arc::new(StagedContent {
@@ -356,7 +389,6 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
             blobs: Mutex::default(),
         });
         Self {
-            store,
             // The stage flushes through `put_publication`, which says what it added,
             // so the buffer is never to write on its own.
             objects: BatchObjectStore::new(store, usize::MAX, usize::MAX),
@@ -451,7 +483,11 @@ impl<'a, S: RepositoryStore + ?Sized> RepositoryStage<'a, S> {
             .iter()
             .map(|(_, blob)| blob.item())
             .collect::<Vec<_>>();
-        let write = self.store.put_publication(&objects, &items).await?;
+        let write = self
+            .objects
+            .backend()
+            .put_publication(&objects, &items)
+            .await?;
         pending.written();
         self.staged
             .lock()?
@@ -560,10 +596,10 @@ impl PendingPublications {
     /// `stage` with these publications beneath it: reads find what they hold, and
     /// writes go to `stage`.
     #[must_use]
-    pub fn over<'a, 's, S: RepositoryStore + ?Sized>(
+    pub fn over<'a, S: RepositoryStore>(
         &self,
-        stage: &'a RepositoryStage<'s, S>,
-    ) -> PendingView<'a, 's, S> {
+        stage: &'a RepositoryStage<S>,
+    ) -> PendingView<'a, S> {
         let content = stage.content.overlaid(Arc::new(PendingContent {
             publications: self.publications.clone(),
             below: stage.content.clone(),
@@ -578,13 +614,13 @@ impl PendingPublications {
 
 /// A [`RepositoryStage`] with [`PendingPublications`] beneath it; see
 /// [`PendingPublications::over`].
-pub struct PendingView<'a, 's, S: ?Sized> {
+pub struct PendingView<'a, S> {
     publications: Vec<Arc<StagedPublication>>,
-    stage: &'a RepositoryStage<'s, S>,
+    stage: &'a RepositoryStage<S>,
     content: ContentStore,
 }
 
-impl<S: ?Sized> PendingView<'_, '_, S> {
+impl<S> PendingView<'_, S> {
     /// The stage's content with the pending content in it.
     #[must_use]
     pub fn content(&self) -> &ContentStore {
@@ -599,7 +635,7 @@ impl<S: ?Sized> PendingView<'_, '_, S> {
 }
 
 #[async_trait]
-impl<S: RepositoryStore + ?Sized> ImmutableObjectStore for PendingView<'_, '_, S> {
+impl<S: RepositoryStore> ImmutableObjectStore for PendingView<'_, S> {
     async fn put_if_absent(
         &self,
         id: ObjectId,
@@ -645,7 +681,7 @@ impl<S: RepositoryStore + ?Sized> ImmutableObjectStore for PendingView<'_, '_, S
 }
 
 #[async_trait]
-impl<S: RepositoryStore + ?Sized> ImmutableObjectStore for RepositoryStage<'_, S> {
+impl<S: RepositoryStore> ImmutableObjectStore for RepositoryStage<S> {
     async fn put_if_absent(
         &self,
         id: ObjectId,

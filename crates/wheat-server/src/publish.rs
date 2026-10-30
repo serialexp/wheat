@@ -11,14 +11,16 @@ use wheat_core::{
 use wheat_protocol::*;
 use wheat_store::{
     DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryHead,
-    RepositoryReader, RepositoryStage, RepositoryStore, StructuralDelta, StructuralDeltaError,
+    RepositoryReader, RepositoryStage, StructuralDelta, StructuralDeltaError,
     StructuralDeltaLimits, TreeDiffLimits,
 };
 
 use crate::access::Principal;
+use crate::blocking::drive;
 use crate::commit::{self, Accepted, CommitFailure};
 use crate::connection::ConnectionError;
 use crate::hooks::{Announcement, ProposedPublish, PublishHooks};
+use crate::network::Network;
 use crate::receipt::PublishKey;
 use crate::registry::RepositoryEntry;
 use crate::transport::Transport;
@@ -136,7 +138,7 @@ pub async fn handle_publish(
     receipt: Option<&PublishReceiptRecord>,
     req: PublishRequestOutput,
     key: PublishKey,
-    mut pushed: Pushed,
+    pushed: Pushed,
     publisher: Publisher<'_>,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
     let op_id = req.op_id;
@@ -187,8 +189,13 @@ pub async fn handle_publish(
     // write once the publish is accepted, rather than one per round of the walk. A
     // refused publish leaves nothing behind. Only a publish larger than the stage is
     // written early, in stage-sized batches, and what they hold is harmless if it
-    // is then refused.
-    let staged = RepositoryStage::new(&*entry.network.store, STAGED_OBJECTS, STAGED_BYTES);
+    // is then refused. The stage owns its handle to the store, so the store work
+    // runs on blocking threads, a batch at a time.
+    let staged = Arc::new(RepositoryStage::new(
+        entry.network.clone(),
+        STAGED_OBJECTS,
+        STAGED_BYTES,
+    ));
 
     // --- Object transfer phase ---
     if let Some(refusal) = receive_objects(
@@ -197,7 +204,7 @@ pub async fn handle_publish(
         op_id,
         current_head,
         proposed_envelope_id,
-        &mut pushed.objects,
+        pushed.objects,
     )
     .await?
     {
@@ -205,69 +212,22 @@ pub async fn handle_publish(
     }
 
     // --- Content transfer phase ---
-    let reader = RepositoryReader::new(&staged, staged.content());
-    let envelope_record = reader
-        .envelope(proposed_envelope_id)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed envelope: {e}")))?;
-    let state = reader
-        .state(envelope_record.state)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed state: {e}")))?;
-    let current_envelope = reader
-        .envelope(current_head.envelope)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read current envelope: {e}")))?;
-    let current_state = reader
-        .state(current_envelope.state)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read current state: {e}")))?;
+    let plan = {
+        let (staged, network) = (Arc::clone(&staged), entry.network.clone());
+        let current = current_head.envelope;
+        let pushed = pushed.contents;
+        drive(move || async move {
+            plan_content(&staged, &network, current, proposed_envelope_id, pushed).await
+        })
+        .await??
+    };
+    let Some(plan) = plan else {
+        return reject(ws, op_id, current_head, "content identity mismatch").await;
+    };
 
-    // A head is only accepted once all its content is stored, so only content the
-    // current head lacks can be missing (transition validation relies on the same).
-    // Bulk-check those: for S3 backends this does one LIST call instead of one GET
-    // per item.
-    let candidates = wheat_store::ContentSetStore::new(&staged)
-        .added(current_state.required_content, state.required_content)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to compare content sets: {e}")))?;
-    let existing = entry
-        .network
-        .content
-        .existing_ids(&candidates)
-        .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
-    let mut missing: Vec<ContentId> = candidates
-        .iter()
-        .filter(|id| !existing.contains(id))
-        .copied()
-        .collect();
-
-    if !missing.is_empty() {
-        // Diff the old and new trees to find which files changed, then use
-        // the old ContentId as a delta base for each new ContentId. This
-        // produces much smaller stored objects for typical edits.
-        let base_map = compute_delta_base_map(&staged, &reader, &current_state, &state).await;
-
-        // Take what the client pushed; ask only for the rest.
-        let mut asked = Vec::with_capacity(missing.len());
-        for id in missing {
-            let Some(data) = pushed.contents.remove(&id) else {
-                asked.push(id);
-                continue;
-            };
-            let Ok(content) = VerifiedContent::check(id, data) else {
-                return reject(ws, op_id, current_head, "content identity mismatch").await;
-            };
-            let base = base_map.get(&id).copied();
-            staged
-                .put_content([(content, base)])
-                .await
-                .map_err(|e| ConnectionError::Internal(format!("failed to store content: {e}")))?;
-        }
-        missing = asked;
-        // What the walk did not need is dropped now rather than held to the commit.
-        drop(pushed);
-
+    // Scoped, so the plan is not held through the commit.
+    {
+        let ContentPlan { missing, base_map } = plan;
         // Ask in rounds of at most MAX_WANT_IDS, one ContentNeeded each. In
         // every round accept only the requested blobs, each once, and stage them
         // as they arrive; the stage bounds what the session holds.
@@ -322,20 +282,9 @@ pub async fn handle_publish(
                         Vec::new()
                     }
                 };
-                let Ok(received) = received
-                    .into_iter()
-                    .map(|(id, data)| VerifiedContent::check(id, data))
-                    .collect::<Result<Vec<_>, _>>()
-                else {
+                if !stage_content(&staged, &base_map, received).await? {
                     return reject(ws, op_id, current_head, "content identity mismatch").await;
-                };
-                let blobs = received.into_iter().map(|content| {
-                    let base = base_map.get(&content.id()).copied();
-                    (content, base)
-                });
-                staged.put_content(blobs).await.map_err(|e| {
-                    ConnectionError::Internal(format!("failed to store content batch: {e}"))
-                })?;
+                }
             }
         }
     }
@@ -370,10 +319,17 @@ pub async fn handle_publish(
     let announcement = match publisher.hooks {
         None => None,
         Some(hooks) => {
-            let labels = match reader
-                .label_changes(Some(expected.envelope), proposed_envelope_id)
-                .await
-            {
+            let read = {
+                let staged = Arc::clone(&staged);
+                drive(move || async move {
+                    RepositoryReader::new(&*staged, staged.content())
+                        .label_changes(Some(expected.envelope), proposed_envelope_id)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await?
+            };
+            let labels = match read {
                 Ok(labels) => labels,
                 Err(e) => {
                     let message = format!("cannot compare with the head this publish names: {e}");
@@ -440,7 +396,7 @@ pub async fn handle_publish(
 async fn commit(
     ws: &mut impl Transport,
     entry: &Arc<RepositoryEntry>,
-    staged: &Staged<'_>,
+    staged: &Arc<Staged>,
     op_id: u64,
     key: PublishKey,
     expected: RepositoryHead,
@@ -563,7 +519,7 @@ const OBJECT_WRITE_CONCURRENCY: usize = 8;
 
 /// A publish's uploaded objects and content, held until the publish is accepted.
 /// Reads see them before they are stored.
-type Staged<'a> = RepositoryStage<'a, dyn RepositoryStore>;
+type Staged = RepositoryStage<Network>;
 
 /// Most objects one publish stages before writing them early.
 const STAGED_OBJECTS: usize = 65_536;
@@ -582,64 +538,36 @@ const STAGED_BYTES: usize = 64 * 1024 * 1024;
 #[tracing::instrument(name = "publish_objects", level = "debug", skip_all)]
 async fn receive_objects(
     ws: &mut impl Transport,
-    staged: &Staged<'_>,
+    staged: &Arc<Staged>,
     op_id: u64,
     current_head: &RepositoryHead,
     proposed: RepositoryEnvelopeId,
-    pushed: &mut HashMap<ObjectId, Vec<u8>>,
+    pushed: HashMap<ObjectId, Vec<u8>>,
 ) -> Result<Option<String>, ConnectionError> {
-    let mut delta = StructuralDelta::new(
-        staged,
-        Some(current_head.envelope),
-        proposed,
-        StructuralDeltaLimits::default(),
-    );
+    let mut walk = Walk {
+        delta: StructuralDelta::new(
+            Arc::clone(staged),
+            Some(current_head.envelope),
+            proposed,
+            StructuralDeltaLimits::default(),
+        ),
+        staged: Arc::clone(staged),
+        pushed,
+    };
     let mut rounds = 0u32;
     loop {
-        let step = match delta.next().await {
-            Ok(step) => step,
-            // Reading the store, or the current head's side of the walk, failed.
-            Err(
-                error @ (StructuralDeltaError::Store(_)
-                | StructuralDeltaError::Collection(_)
-                | StructuralDeltaError::OldLineage(_)),
-            ) => {
-                return Err(ConnectionError::Internal(format!(
-                    "publish walk failed: {error}"
-                )));
-            }
-            Err(error) => return Ok(Some(format!("the proposed envelope is invalid: {error}"))),
+        // One job per stretch of the walk, the walk going to it and back.
+        let (back, advanced) = drive(move || async move {
+            let advanced = walk.advance().await;
+            (walk, advanced)
+        })
+        .await?;
+        walk = back;
+        let ids = match advanced? {
+            Advanced::Done => break,
+            Advanced::Refused(refusal) => return Ok(Some(refusal)),
+            Advanced::Missing(ids) => ids,
         };
-        let ids = match step {
-            None => break,
-            // Already in the store.
-            Some(DeltaStep::Object(_)) => continue,
-            Some(DeltaStep::Missing(ids)) => ids,
-        };
-        let mut claimed = Vec::new();
-        let mut ids = ids;
-        ids.retain(|id| match pushed.remove(id) {
-            Some(data) => {
-                claimed.push((*id, data));
-                false
-            }
-            None => true,
-        });
-        if !claimed.is_empty() {
-            if let Some((id, _)) = claimed
-                .iter()
-                .find(|(id, data)| ObjectId::of_canonical_bytes(data) != *id)
-            {
-                return Ok(Some(format!("object identity mismatch for {id}")));
-            }
-            if let Some(refusal) = store_objects(staged, &claimed).await? {
-                return Ok(Some(refusal));
-            }
-        }
-        if ids.is_empty() {
-            delta.resume();
-            continue;
-        }
         send(
             ws,
             &WheatProtocolMessage::ObjectsNeeded(ObjectsNeededOutput {
@@ -658,9 +586,9 @@ async fn receive_objects(
             return Ok(Some(refusal));
         }
         rounds += 1;
-        delta.resume();
+        walk.delta.resume();
     }
-    debug!(op_id, rounds, stats = ?delta.stats(), "publish: objects complete");
+    debug!(op_id, rounds, stats = ?walk.delta.stats(), "publish: objects complete");
     send(
         ws,
         &WheatProtocolMessage::ObjectsComplete(ObjectsCompleteOutput {
@@ -672,12 +600,80 @@ async fn receive_objects(
     Ok(None)
 }
 
+/// A publish's walk from the current head to the proposed one, with the objects the
+/// client pushed for it.
+struct Walk {
+    delta: StructuralDelta<Arc<Staged>>,
+    staged: Arc<Staged>,
+    pushed: HashMap<ObjectId, Vec<u8>>,
+}
+
+/// How far [`Walk::advance`] got.
+enum Advanced {
+    /// The store holds everything the proposed head adds.
+    Done,
+    /// The client must send these before the walk goes on.
+    Missing(Vec<ObjectId>),
+    /// Why the publish is refused.
+    Refused(String),
+}
+
+impl Walk {
+    /// Walks on until the walk ends or finds objects that neither the store nor the
+    /// push has, staging those the push has.
+    async fn advance(&mut self) -> Result<Advanced, ConnectionError> {
+        loop {
+            let step = match self.delta.next().await {
+                Ok(step) => step,
+                // Reading the store, or the current head's side of the walk, failed.
+                Err(
+                    error @ (StructuralDeltaError::Store(_)
+                    | StructuralDeltaError::Collection(_)
+                    | StructuralDeltaError::OldLineage(_)),
+                ) => {
+                    return Err(ConnectionError::Internal(format!(
+                        "publish walk failed: {error}"
+                    )));
+                }
+                Err(error) => {
+                    return Ok(Advanced::Refused(format!(
+                        "the proposed envelope is invalid: {error}"
+                    )));
+                }
+            };
+            let mut ids = match step {
+                None => return Ok(Advanced::Done),
+                // Already in the store.
+                Some(DeltaStep::Object(_)) => continue,
+                Some(DeltaStep::Missing(ids)) => ids,
+            };
+            let mut claimed = Vec::new();
+            ids.retain(|id| match self.pushed.remove(id) {
+                Some(data) => {
+                    claimed.push((*id, data));
+                    false
+                }
+                None => true,
+            });
+            if !claimed.is_empty()
+                && let Some(refusal) = stage_objects(&self.staged, &claimed).await?
+            {
+                return Ok(Advanced::Refused(refusal));
+            }
+            if !ids.is_empty() {
+                return Ok(Advanced::Missing(ids));
+            }
+            self.delta.resume();
+        }
+    }
+}
+
 /// Takes one round of uploads: each object of `ids` once, whole in an
 /// `ObjectBatch` or in `ObjectChunk`s, and nothing else. Returns why the round is
 /// refused, if it is.
 async fn receive_round(
     ws: &mut impl Transport,
-    staged: &Staged<'_>,
+    staged: &Arc<Staged>,
     op_id: u64,
     ids: &[ObjectId],
 ) -> Result<Option<String>, ConnectionError> {
@@ -691,12 +687,9 @@ async fn receive_round(
                     if let Err(error) = receiver.accept_whole(id, object.data.len()) {
                         return Ok(Some(error.to_string()));
                     }
-                    if ObjectId::of_canonical_bytes(&object.data) != id {
-                        return Ok(Some(format!("object identity mismatch for {id}")));
-                    }
                     objects.push((id, object.data));
                 }
-                if let Some(refusal) = store_objects(staged, &objects).await? {
+                if let Some(refusal) = store_received(staged, objects).await? {
                     return Ok(Some(refusal));
                 }
             }
@@ -708,10 +701,7 @@ async fn receive_round(
                         Ok(None) => continue,
                         Err(error) => return Ok(Some(error.to_string())),
                     };
-                if ObjectId::of_canonical_bytes(&object.1) != id {
-                    return Ok(Some(format!("object identity mismatch for {id}")));
-                }
-                if let Some(refusal) = store_objects(staged, &[object]).await? {
+                if let Some(refusal) = store_received(staged, vec![object]).await? {
                     return Ok(Some(refusal));
                 }
             }
@@ -725,12 +715,27 @@ async fn receive_round(
     Ok(None)
 }
 
-/// Stages uploaded objects. Returns why they are refused when they are not valid
-/// Wheat objects.
-async fn store_objects(
-    staged: &Staged<'_>,
+/// [`stage_objects`] for objects received in a round, as one job.
+async fn store_received(
+    staged: &Arc<Staged>,
+    objects: Vec<(ObjectId, Vec<u8>)>,
+) -> Result<Option<String>, ConnectionError> {
+    let staged = Arc::clone(staged);
+    drive(move || async move { stage_objects(&staged, &objects).await }).await?
+}
+
+/// Stages uploaded objects. Returns why they are refused when one is not the object
+/// its ID names, or they are not valid Wheat objects.
+async fn stage_objects(
+    staged: &Staged,
     objects: &[(ObjectId, Vec<u8>)],
 ) -> Result<Option<String>, ConnectionError> {
+    if let Some((id, _)) = objects
+        .iter()
+        .find(|(id, data)| ObjectId::of_canonical_bytes(data) != *id)
+    {
+        return Ok(Some(format!("object identity mismatch for {id}")));
+    }
     match staged.put_batch(objects, OBJECT_WRITE_CONCURRENCY).await {
         Ok(()) => Ok(None),
         Err(error @ ObjectStoreError::InvalidFormat(_)) => Ok(Some(error.to_string())),
@@ -740,12 +745,129 @@ async fn store_objects(
     }
 }
 
+/// The content a publish still has to ask for, and the delta base of each.
+struct ContentPlan {
+    missing: Vec<ContentId>,
+    base_map: Arc<HashMap<ContentId, ContentId>>,
+}
+
+/// Finds the content `proposed` adds over `current` that `network` lacks, and stages
+/// what of it the client `pushed`. `None` when a pushed blob is not the content its
+/// ID names.
+async fn plan_content(
+    staged: &Staged,
+    network: &Network,
+    current: RepositoryEnvelopeId,
+    proposed: RepositoryEnvelopeId,
+    mut pushed: HashMap<ContentId, Vec<u8>>,
+) -> Result<Option<ContentPlan>, ConnectionError> {
+    let reader = RepositoryReader::new(staged, staged.content());
+    let envelope_record = reader
+        .envelope(proposed)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed envelope: {e}")))?;
+    let state = reader
+        .state(envelope_record.state)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed state: {e}")))?;
+    let current_envelope = reader
+        .envelope(current)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read current envelope: {e}")))?;
+    let current_state = reader
+        .state(current_envelope.state)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to read current state: {e}")))?;
+
+    // A head is only accepted once all its content is stored, so only content the
+    // current head lacks can be missing (transition validation relies on the same).
+    // Bulk-check those: for S3 backends this does one LIST call instead of one GET
+    // per item.
+    let candidates = wheat_store::ContentSetStore::new(staged)
+        .added(current_state.required_content, state.required_content)
+        .await
+        .map_err(|e| ConnectionError::Internal(format!("failed to compare content sets: {e}")))?;
+    let existing = network
+        .content
+        .existing_ids(&candidates)
+        .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
+    let missing: Vec<ContentId> = candidates
+        .iter()
+        .filter(|id| !existing.contains(id))
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        return Ok(Some(ContentPlan {
+            missing,
+            base_map: Arc::default(),
+        }));
+    }
+
+    // Diff the old and new trees to find which files changed, then use
+    // the old ContentId as a delta base for each new ContentId. This
+    // produces much smaller stored objects for typical edits.
+    let base_map = compute_delta_base_map(staged, &reader, &current_state, &state).await;
+
+    // Take what the client pushed; ask only for the rest. What the walk did not
+    // need is dropped with `pushed`, rather than held to the commit.
+    let mut asked = Vec::with_capacity(missing.len());
+    for id in missing {
+        let Some(data) = pushed.remove(&id) else {
+            asked.push(id);
+            continue;
+        };
+        let Ok(content) = VerifiedContent::check(id, data) else {
+            return Ok(None);
+        };
+        let base = base_map.get(&id).copied();
+        staged
+            .put_content([(content, base)])
+            .await
+            .map_err(|e| ConnectionError::Internal(format!("failed to store content: {e}")))?;
+    }
+    Ok(Some(ContentPlan {
+        missing: asked,
+        base_map: Arc::new(base_map),
+    }))
+}
+
+/// Stages content received in a round, as one job. Returns false when a blob is not
+/// the content its ID names.
+async fn stage_content(
+    staged: &Arc<Staged>,
+    base_map: &Arc<HashMap<ContentId, ContentId>>,
+    received: Vec<(ContentId, Vec<u8>)>,
+) -> Result<bool, ConnectionError> {
+    if received.is_empty() {
+        return Ok(true);
+    }
+    let (staged, base_map) = (Arc::clone(staged), Arc::clone(base_map));
+    drive(move || async move {
+        let Ok(received) = received
+            .into_iter()
+            .map(|(id, data)| VerifiedContent::check(id, data))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return Ok(false);
+        };
+        let blobs = received.into_iter().map(|content| {
+            let base = base_map.get(&content.id()).copied();
+            (content, base)
+        });
+        staged.put_content(blobs).await.map_err(|e| {
+            ConnectionError::Internal(format!("failed to store content batch: {e}"))
+        })?;
+        Ok(true)
+    })
+    .await?
+}
+
 /// Diff old and new Merkle trees to find `new_content → old_content` base
 /// mappings for delta compression. Falls back to an empty map on any error
 /// (delta compression is an optimization, not a correctness requirement).
 async fn compute_delta_base_map(
-    objects: &Staged<'_>,
-    reader: &RepositoryReader<'_, Staged<'_>>,
+    objects: &Staged,
+    reader: &RepositoryReader<'_, Staged>,
     old_state: &wheat_core::RepositoryStateRecord,
     new_state: &wheat_core::RepositoryStateRecord,
 ) -> HashMap<ContentId, ContentId> {

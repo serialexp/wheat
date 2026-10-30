@@ -21,6 +21,7 @@ use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
 use wheat_server::heads::HeadStore;
 use wheat_server::hooks::{Announcement, ProposedPublish, PublishHooks, PublishedBatch};
+use wheat_server::network::Network;
 use wheat_server::quiesce::Quiesced;
 use wheat_server::receipt::PublishKey;
 use wheat_server::registry::RepositoryEntry;
@@ -176,16 +177,26 @@ async fn server() -> Server {
     }
 }
 
-type Stage<'a> = RepositoryStage<'a, dyn RepositoryStore>;
+/// A publish's stage, owning its handle to the store as a connection's does.
+type Stage = Arc<RepositoryStage<Network>>;
+
+/// An empty stage over `network`.
+fn new_stage(network: &Network) -> Stage {
+    Arc::new(RepositoryStage::new(
+        network.clone(),
+        65_536,
+        64 * 1024 * 1024,
+    ))
+}
 
 /// A publish's stage holding a new change that writes `path` on top of `base`, as
 /// a client would upload it, and the envelope it proposes.
-async fn propose<'a>(
-    server: &'a Server,
+async fn propose(
+    server: &Server,
     base: RepositoryHead,
     path: &str,
-) -> (Stage<'a>, RepositoryEnvelopeId) {
-    let stage = Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024);
+) -> (Stage, RepositoryEnvelopeId) {
+    let stage = new_stage(&server.entry.network);
     let value = path.as_bytes().to_vec();
     stage
         .put_content([(VerifiedContent::new(value.clone()), None)])
@@ -281,7 +292,7 @@ async fn joined(
     earlier: RepositoryEnvelopeId,
     later: RepositoryEnvelopeId,
 ) -> RepositoryEnvelopeId {
-    let stage = Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024);
+    let stage = new_stage(&server.entry.network);
     RepositoryReader::new(&stage, stage.content())
         .union_envelopes(Some(base), later, earlier)
         .await
@@ -313,7 +324,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
 
     // A publish still receiving does not see the batch's objects as stored: if the
     // batch failed, it would publish without them.
-    let receiving = Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024);
+    let receiving = new_stage(&server.entry.network);
     assert_eq!(
         receiving.exists_many(&[first.into()]).await.unwrap(),
         [false]
@@ -568,8 +579,8 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
 }
 
 /// A stage with nothing in it, as a publish sent again has before its transfer.
-fn empty(server: &Server) -> Stage<'_> {
-    Stage::new(&*server.entry.network.store, 65_536, 64 * 1024 * 1024)
+fn empty(server: &Server) -> Stage {
+    new_stage(&server.entry.network)
 }
 
 /// The answer to a publish sent again with `key`, checked as a connection does
@@ -824,7 +835,7 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
 
     // Sent again, the publish is answered from the table's receipt, and the head is
     // not moved a second time.
-    let empty_stage = Stage::new(&*entry.network.store, 65_536, 64 * 1024 * 1024);
+    let empty_stage = new_stage(&entry.network);
     let again = commit::accept(
         &entry,
         &empty_stage,
@@ -998,11 +1009,11 @@ fn manifest(labels: &[(&str, ViewId)]) -> ViewLabelManifestRecord {
 
 /// A publish's stage holding an envelope of `head`'s state with `labels` instead of
 /// its own, and that envelope.
-async fn relabel<'a>(
-    server: &'a Server,
+async fn relabel(
+    server: &Server,
     head: RepositoryHead,
     labels: &[(&str, ViewId)],
-) -> (Stage<'a>, RepositoryEnvelopeId) {
+) -> (Stage, RepositoryEnvelopeId) {
     let stage = empty(server);
     let state = RepositoryReader::new(&stage, stage.content())
         .envelope(head.envelope)

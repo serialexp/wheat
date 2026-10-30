@@ -77,21 +77,21 @@ pub(crate) fn stored_object(
 /// until an automatic or explicit [`Self::flush`] completes successfully.
 /// Dropping the wrapper does not flush it.
 #[derive(Debug)]
-pub struct BatchObjectStore<'a, O: ?Sized> {
-    backend: &'a O,
+pub struct BatchObjectStore<O> {
+    backend: O,
     max_objects: usize,
     max_bytes: usize,
     concurrency: usize,
     pending: Mutex<Pending>,
 }
 
-impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
+impl<O: ImmutableObjectStore> BatchObjectStore<O> {
     /// Creates a buffer using up to 16 concurrent backend writes.
     ///
     /// # Panics
     /// Panics if either limit is zero.
     #[must_use]
-    pub fn new(backend: &'a O, max_objects: usize, max_bytes: usize) -> Self {
+    pub fn new(backend: O, max_objects: usize, max_bytes: usize) -> Self {
         Self::with_concurrency(backend, max_objects, max_bytes, DEFAULT_CONCURRENCY)
     }
 
@@ -103,7 +103,7 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
     /// Panics if a limit or `concurrency` is zero.
     #[must_use]
     pub fn with_concurrency(
-        backend: &'a O,
+        backend: O,
         max_objects: usize,
         max_bytes: usize,
         concurrency: usize,
@@ -118,6 +118,11 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
             concurrency: concurrency.min(MAX_CONCURRENCY),
             pending: Mutex::new(Pending::default()),
         }
+    }
+
+    /// The store the buffer writes to.
+    pub fn backend(&self) -> &O {
+        &self.backend
     }
 
     /// Makes every currently buffered object durable in the underlying store.
@@ -156,7 +161,7 @@ impl<'a, O: ImmutableObjectStore + ?Sized> BatchObjectStore<'a, O> {
 }
 
 #[async_trait]
-impl<O: ImmutableObjectStore + ?Sized> ImmutableObjectStore for BatchObjectStore<'_, O> {
+impl<O: ImmutableObjectStore> ImmutableObjectStore for BatchObjectStore<O> {
     async fn put_if_absent(
         &self,
         id: ObjectId,

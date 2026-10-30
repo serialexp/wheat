@@ -16,7 +16,7 @@ struct FinalEditNode {
 }
 
 /// The update's objects, held in memory until all of them are derived.
-type Staged<'s, 'o, S> = MerkleTreeStore<'s, BatchObjectStore<'o, S>>;
+type Staged<'s, 'o, S> = MerkleTreeStore<'s, BatchObjectStore<&'o S>>;
 
 struct Budget {
     limits: FinalTreeUpdateLimits,
@@ -28,7 +28,7 @@ impl Budget {
     /// once written, so one directory's objects may pass a limit before it fails.
     async fn check<S: ImmutableObjectStore>(
         &self,
-        staged: &BatchObjectStore<'_, S>,
+        staged: &BatchObjectStore<&S>,
     ) -> Result<(), MerkleTreeError> {
         let (nodes, bytes) = staged.pending_size().await;
         if nodes > self.limits.max_nodes {

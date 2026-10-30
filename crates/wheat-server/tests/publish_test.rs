@@ -34,7 +34,7 @@ use wheat_store::{
 use support::{
     Upload, Ws, connect_and_handshake, content_batch, digest, edit, edits, object_batch,
     object_chunk, object_id, open_repo, push_end, recv_msg, request_publish,
-    request_publish_pushing, send_msg, upload_objects,
+    request_publish_pushing, send_msg, upload_content_and_commit, upload_objects,
 };
 
 const REPO: &str = "test/repo";
@@ -319,59 +319,6 @@ fn files_in_own_directories(count: usize) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// Answers the content phase, however many rounds it takes, and commits. Returns
-/// the result and the blobs the server asked for.
-async fn upload_content_and_commit(
-    ws: &mut Ws,
-    content: &ContentStore,
-) -> (PublishResultOutput, Vec<ContentId>) {
-    let mut asked = Vec::new();
-    loop {
-        match recv_msg(ws).await {
-            WheatProtocolMessage::ContentNeeded(needed) => {
-                assert_eq!(needed.op_id, OP);
-                assert!(needed.content_ids.len() <= MAX_WANT_IDS);
-                let mut blobs = Vec::new();
-                for id in needed.content_ids {
-                    let blob = ContentId::from_digest(id.bytes.as_slice().try_into().unwrap());
-                    asked.push(blob);
-                    blobs.push((blob, content.get(blob).unwrap()));
-                }
-                // The test blobs are small: one batch holds a round.
-                send_msg(ws, &content_batch(OP, blobs)).await;
-                send_msg(
-                    ws,
-                    &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
-                        message_type: 0x46,
-                        op_id: OP,
-                    }),
-                )
-                .await;
-            }
-            WheatProtocolMessage::ContentComplete(complete) => {
-                assert_eq!(complete.op_id, OP);
-                break;
-            }
-            other => panic!("expected ContentNeeded or ContentComplete, got {other:?}"),
-        }
-    }
-    send_msg(
-        ws,
-        &WheatProtocolMessage::PublishCommit(PublishCommitOutput {
-            message_type: 0x47,
-            op_id: OP,
-        }),
-    )
-    .await;
-    loop {
-        match recv_msg(ws).await {
-            WheatProtocolMessage::PublishProgress(_) => continue,
-            WheatProtocolMessage::PublishResult(result) => return (result, asked),
-            other => panic!("expected PublishResult, got {other:?}"),
-        }
-    }
-}
-
 fn assert_published(result: &PublishResultOutput, envelope: RepositoryEnvelopeId) {
     assert!(
         matches!(result.status, PublishResultStatus::PublishStatusOk(_)),
@@ -471,7 +418,7 @@ async fn a_publish_pushed_whole_needs_no_rounds() {
 
     let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
     assert!(rounds.is_empty(), "{rounds:?}");
-    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, asked) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     assert!(asked.is_empty(), "{asked:?}");
     assert_published(&result, proposed);
     publishing.assert_server_complete(proposed).await;
@@ -504,7 +451,7 @@ async fn a_published_blob_is_hashed_once() {
     send_msg(&mut ws, &push_end(OP, objects, files.len() as u64)).await;
     let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
     assert!(rounds.is_empty(), "{rounds:?}");
-    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, asked) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     let hashed = wheat_core::content_bytes_hashed() - before;
 
     assert!(asked.is_empty(), "{asked:?}");
@@ -559,7 +506,8 @@ async fn the_server_asks_only_for_what_the_push_left_out() {
         .collect();
     assert_eq!(asked, lacked);
 
-    let (result, mut asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, mut asked) =
+        upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     let mut expected: Vec<ContentId> = files[1..]
         .iter()
         .map(|(_, value)| ContentId::of(value))
@@ -588,7 +536,7 @@ async fn pushed_objects_and_blobs_the_publish_does_not_need_are_not_stored() {
 
     let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
     assert!(rounds.is_empty(), "{rounds:?}");
-    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, asked) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     assert!(asked.is_empty(), "{asked:?}");
     assert_published(&result, proposed);
     publishing.assert_server_complete(proposed).await;
@@ -695,7 +643,7 @@ async fn a_publish_whose_objects_cannot_be_sealed_leaves_the_head_alone() {
     let mut ws = publishing.request(proposed).await;
 
     upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
-    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, _) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     assert!(
         matches!(result.status, PublishResultStatus::PublishStatusError(_)),
         "the publish should fail, got {:?}: {}",
@@ -721,7 +669,7 @@ async fn a_publish_larger_than_one_round_leaves_the_server_complete() {
     assert!(sent > MAX_WANT_IDS, "{rounds:?}");
     assert!(rounds.contains(&MAX_WANT_IDS), "{rounds:?}");
 
-    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, _) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     assert_published(&result, proposed);
     publishing.assert_server_complete(proposed).await;
 }
@@ -742,7 +690,7 @@ async fn a_publish_of_several_rounds_stores_its_objects_in_one_write() {
 
     let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
     assert!(rounds.len() > 1, "{rounds:?}");
-    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, _) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     assert_published(&result, proposed);
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     publishing.assert_server_complete(proposed).await;
@@ -798,7 +746,7 @@ async fn content_is_asked_for_only_where_the_head_lacks_it() {
     let mut ws = publishing.request(proposed).await;
 
     upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Whole).await;
-    let (result, asked) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, asked) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     assert_published(&result, proposed);
     assert_eq!(asked, [ContentId::of(&notes)]);
 }
@@ -850,7 +798,7 @@ async fn objects_sent_in_chunks_are_put_back_together() {
     let rounds = upload_objects(&mut ws, OP, &publishing.client_objects, Upload::Chunked).await;
     assert!(!rounds.is_empty());
 
-    let (result, _) = upload_content_and_commit(&mut ws, &publishing.client_content).await;
+    let (result, _) = upload_content_and_commit(&mut ws, OP, &publishing.client_content).await;
     assert_published(&result, proposed);
     publishing.assert_server_complete(proposed).await;
 }

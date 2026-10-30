@@ -595,7 +595,7 @@ const STAGED_BYTES: usize = 64 * 1024 * 1024;
 /// with local work makes, are stored together by [`RepositoryStage::flush`] just
 /// before the head moves, not once per message. Reads see what is staged. Only a
 /// transfer larger than the stage is written early, in stage-sized batches.
-pub fn staged<S: RepositoryStore + ?Sized>(store: &S) -> RepositoryStage<'_, S> {
+pub fn staged<S: RepositoryStore + ?Sized>(store: &S) -> RepositoryStage<&S> {
     RepositoryStage::new(store, STAGED_OBJECTS, STAGED_BYTES)
 }
 
@@ -805,10 +805,10 @@ pub struct FetchedContent {
 /// With `since`, only content that `since`'s set lacks is looked up: the
 /// client keeps an envelope as `since` only once all its content is stored.
 /// Fetched content is staged with the objects in `stage`.
-pub async fn fetch_content<S: RepositoryStore + ?Sized>(
+pub async fn fetch_content<S: RepositoryStore>(
     session: &mut WheatSession,
     op_id: u64,
-    stage: &RepositoryStage<'_, S>,
+    stage: &RepositoryStage<S>,
     envelope_id: RepositoryEnvelopeId,
     since: Option<RepositoryEnvelopeId>,
 ) -> Result<FetchedContent> {

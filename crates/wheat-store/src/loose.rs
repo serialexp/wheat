@@ -189,6 +189,70 @@ pub trait ImmutableObjectStore: Send + Sync {
     }
 }
 
+// A store behind a reference or an `Arc` is a store, so a holder that owns its
+// store handle (a batch, a stage, a walk) takes a borrowed store or a shared one alike.
+#[async_trait]
+impl<T: ImmutableObjectStore + ?Sized> ImmutableObjectStore for &T {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        (**self).get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        (**self).exists_many(ids).await
+    }
+
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        (**self).seal().await
+    }
+}
+
+#[async_trait]
+impl<T: ImmutableObjectStore + ?Sized> ImmutableObjectStore for std::sync::Arc<T> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        (**self).put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        (**self).get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        (**self).exists_many(ids).await
+    }
+
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        (**self).seal().await
+    }
+}
+
 #[async_trait]
 impl ImmutableObjectStore for Box<dyn ImmutableObjectStore> {
     async fn put_if_absent(

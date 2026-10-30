@@ -215,9 +215,11 @@ Performance, most serious first:
   `spawn_blocking` a batch at a time (`crate::blocking::drive`). Fetch is done: the
   walk runs on the blocking pool and hands the connection whole messages through a
   two-message queue, and each want, each content request and the envelope checks are
-  one job (`blocking_test`). Left: the publish path (its `RepositoryStage` borrows the
-  store, so it cannot move to a `'static` job as it is), the head reads of
-  `LocalPublicationStore`, and connection setup.
+  one job (`blocking_test`). Publish is done too: its stage owns a handle to the
+  network, and each stretch of the walk, each received batch, the content plan, the
+  hooks' label read and the join and validation are one job. An A/B of
+  `publish_contention` and `publish_content` against the code before measures the
+  same. Left: the head reads of `LocalPublicationStore`, and connection setup.
 - `[ ]` **Fetch and publish benches slower than on 2026-10-26 (2026-10-30).**
   `fetch_incremental.total.wall` went from 17.3 s (2026-10-26) to 29–31 s, its
   `publish.wall` from 0.023 s to about 0.07 s, and `remote_latency.many.publish.wall`

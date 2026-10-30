@@ -181,9 +181,9 @@ pub async fn previous(
 /// A publish whose key was accepted meanwhile, by another session sending it again,
 /// is answered as that one is instead.
 #[tracing::instrument(name = "publish_accept", level = "debug", skip_all)]
-pub async fn accept<S: RepositoryStore + ?Sized>(
+pub async fn accept<S: RepositoryStore + 'static>(
     entry: &Arc<RepositoryEntry>,
-    staged: &RepositoryStage<'_, S>,
+    staged: &Arc<RepositoryStage<S>>,
     key: PublishKey,
     expected: RepositoryEnvelopeId,
     proposed: RepositoryEnvelopeId,
@@ -203,35 +203,19 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
     }
     let current = turn.tentative.unwrap_or(durable.envelope);
     let pending = turn.pending();
-    let view = pending.over(staged);
-    let reader = RepositoryReader::new(&view, view.content());
-    let joined = if current == expected {
-        proposed
-    } else if force {
-        return Err(CommitFailure::Stale {
-            head: durable,
-            message: "a forced publish must name the current head".to_string(),
-        });
-    } else {
-        reader
-            .union_envelopes(Some(expected), proposed, current)
-            .instrument(debug_span!("publish_join"))
-            .await
-            .map_err(|e| join_failure(e, durable))?
+    let stage = Arc::clone(staged);
+    let check = Check {
+        durable,
+        current,
+        expected,
+        proposed,
+        force,
+        force_labels,
     };
-    match validate(&reader, current, joined, force).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            return Err(CommitFailure::Rejected {
-                head: durable,
-                message: format!("validation failed: {e}"),
-            });
-        }
-        Err(e) => return Err(CommitFailure::Internal(e)),
-    }
-    if !force_labels {
-        refuse_backward_labels(&reader, current, joined, durable).await?;
-    }
+    // Joining and validating read the store, so they run on a blocking thread.
+    let joined = crate::blocking::drive(move || async move { check.join(&pending, &stage).await })
+        .await
+        .map_err(|e| CommitFailure::Internal(format!("publish: join and validate: {e}")))??;
     let publication = staged.take().await.map_err(|e| {
         CommitFailure::Internal(format!("publish: take the staged publication: {e}"))
     })?;
@@ -247,6 +231,58 @@ pub async fn accept<S: RepositoryStore + ?Sized>(
         announcement,
     );
     Ok(Accepted::waiting(receiver, false))
+}
+
+/// What [`accept`] joins and validates, against the head it read.
+struct Check {
+    durable: RepositoryHead,
+    current: RepositoryEnvelopeId,
+    expected: RepositoryEnvelopeId,
+    proposed: RepositoryEnvelopeId,
+    force: bool,
+    force_labels: bool,
+}
+
+impl Check {
+    /// `proposed` joined with `current`, read beneath `pending` and `staged`, once it
+    /// is valid to follow it.
+    async fn join<S: RepositoryStore>(
+        &self,
+        pending: &PendingPublications,
+        staged: &RepositoryStage<S>,
+    ) -> Result<RepositoryEnvelopeId, CommitFailure> {
+        let durable = self.durable;
+        let view = pending.over(staged);
+        let reader = RepositoryReader::new(&view, view.content());
+        let joined = if self.current == self.expected {
+            self.proposed
+        } else if self.force {
+            return Err(CommitFailure::Stale {
+                head: durable,
+                message: "a forced publish must name the current head".to_string(),
+            });
+        } else {
+            reader
+                .union_envelopes(Some(self.expected), self.proposed, self.current)
+                .instrument(debug_span!("publish_join"))
+                .await
+                .map_err(|e| join_failure(e, durable))?
+        };
+        match validate(&reader, self.current, joined, self.force).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(CommitFailure::Rejected {
+                    head: durable,
+                    message: format!("validation failed: {e}"),
+                });
+            }
+            Err(e) => return Err(CommitFailure::Internal(e)),
+        }
+        if !self.force_labels {
+            refuse_backward_labels(&reader, self.current, joined, durable).await?;
+        }
+        Ok(joined)
+    }
 }
 
 /// The refusal of a publish whose key was used for a different one.

@@ -462,8 +462,11 @@ struct OldState {
 }
 
 /// Walks the structural objects of `new` that `old` does not prove present.
-pub struct StructuralDelta<'a, S> {
-    objects: &'a S,
+///
+/// The walk holds its store handle: `&store` for a borrowed store, or an `Arc` for
+/// a walk that moves between threads.
+pub struct StructuralDelta<S> {
+    objects: S,
     limits: StructuralDeltaLimits,
     /// Runnable tasks, one stack per [`Stage`].
     stacks: [Vec<Task>; 3],
@@ -495,11 +498,11 @@ pub struct StructuralDelta<'a, S> {
     stats: StructuralDeltaStats,
 }
 
-impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
+impl<S: ImmutableObjectStore> StructuralDelta<S> {
     /// Walks `new`, skipping what `old` proves present. With `old == Some(new)` there
     /// is nothing to walk.
     pub fn new(
-        objects: &'a S,
+        objects: S,
         old: Option<RepositoryEnvelopeId>,
         new: RepositoryEnvelopeId,
         limits: StructuralDeltaLimits,
@@ -1166,7 +1169,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(None);
         };
         self.stats.old_reads += 1;
-        match crate::ViewLineageMapStore::new(self.objects)
+        match crate::ViewLineageMapStore::new(&self.objects)
             .get(root, parent)
             .await
         {
@@ -1189,7 +1192,10 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
             return Ok(known);
         }
         self.stats.retained_lookups += 1;
-        let retained = match RetainedSetStore::new(self.objects).contains(root, id).await {
+        let retained = match RetainedSetStore::new(&self.objects)
+            .contains(root, id)
+            .await
+        {
             Ok(retained) => retained,
             Err(CollectionError::Store(ObjectStoreError::Missing(_))) => {
                 self.stats.old_missing += 1;
@@ -1288,7 +1294,7 @@ impl<'a, S: ImmutableObjectStore> StructuralDelta<'a, S> {
         let Some(root) = self.old_lineage_children(parent).await? else {
             return Ok(Some(HashMap::new()));
         };
-        let sets = RetainedSetStore::new(self.objects);
+        let sets = RetainedSetStore::new(&self.objects);
         let mut ids = Vec::new();
         let listed = async {
             let mut cursor = sets

@@ -16,7 +16,12 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
-use wheat_store::{ContentStore, RepositoryStore};
+use async_trait::async_trait;
+use wheat_core::ObjectId;
+use wheat_store::{
+    ContentItem, ContentStore, ImmutableObjectStore, ObjectStoreError, RepositoryStore,
+    RepositoryStoreError, StoredObject, StoredWrite,
+};
 
 use crate::quiesce::Writers;
 
@@ -36,6 +41,54 @@ impl Deref for Network {
 
     fn deref(&self) -> &NetworkStores {
         &self.0
+    }
+}
+
+// The network as its store, so work handed to another thread can own a handle to it
+// and keep the network open meanwhile.
+#[async_trait]
+impl ImmutableObjectStore for Network {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.store.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.store.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        self.store.get(id).await
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        self.store.exists_many(ids).await
+    }
+
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        self.store.seal().await
+    }
+}
+
+#[async_trait]
+impl RepositoryStore for Network {
+    fn content_store(&self) -> ContentStore {
+        self.store.content_store()
+    }
+
+    async fn put_publication(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        content: &[ContentItem<'_>],
+    ) -> Result<StoredWrite, RepositoryStoreError> {
+        self.store.put_publication(objects, content).await
     }
 }
 

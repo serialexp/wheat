@@ -466,6 +466,60 @@ pub async fn request_publish_pushing(
     .await;
 }
 
+/// Answers the content phase, however many rounds it takes, and commits. Returns
+/// the result and the blobs the server asked for.
+pub async fn upload_content_and_commit(
+    ws: &mut Ws,
+    op_id: u64,
+    content: &ContentStore,
+) -> (PublishResultOutput, Vec<ContentId>) {
+    let mut asked = Vec::new();
+    loop {
+        match recv_msg(ws).await {
+            WheatProtocolMessage::ContentNeeded(needed) => {
+                assert_eq!(needed.op_id, op_id);
+                assert!(needed.content_ids.len() <= MAX_WANT_IDS);
+                let mut blobs = Vec::new();
+                for id in needed.content_ids {
+                    let blob = ContentId::from_digest(id.bytes.as_slice().try_into().unwrap());
+                    asked.push(blob);
+                    blobs.push((blob, content.get(blob).unwrap()));
+                }
+                // The test blobs are small: one batch holds a round.
+                send_msg(ws, &content_batch(op_id, blobs)).await;
+                send_msg(
+                    ws,
+                    &WheatProtocolMessage::ContentUploadComplete(ContentUploadCompleteOutput {
+                        message_type: 0x46,
+                        op_id,
+                    }),
+                )
+                .await;
+            }
+            WheatProtocolMessage::ContentComplete(complete) => {
+                assert_eq!(complete.op_id, op_id);
+                break;
+            }
+            other => panic!("expected ContentNeeded or ContentComplete, got {other:?}"),
+        }
+    }
+    send_msg(
+        ws,
+        &WheatProtocolMessage::PublishCommit(PublishCommitOutput {
+            message_type: 0x47,
+            op_id,
+        }),
+    )
+    .await;
+    loop {
+        match recv_msg(ws).await {
+            WheatProtocolMessage::PublishProgress(_) => continue,
+            WheatProtocolMessage::PublishResult(result) => return (result, asked),
+            other => panic!("expected PublishResult, got {other:?}"),
+        }
+    }
+}
+
 /// Fetches the content of `envelope` that `content` lacks. Returns how much.
 pub async fn fetch_content<O: ImmutableObjectStore>(
     ws: &mut Ws,

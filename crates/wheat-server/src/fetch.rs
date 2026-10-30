@@ -150,7 +150,6 @@ async fn push(
 ) -> Result<Option<u64>, ConnectionError> {
     let (sender, mut queue) = tokio::sync::mpsc::channel(PUSH_QUEUE);
     let network = entry.network.clone();
-    // Its own span, since it runs on another thread.
     let span = tracing::debug_span!("fetch_walk");
     let walk = drive(move || {
         async move { walk(&network, op_id, since, want, &sender).await }.instrument(span)
