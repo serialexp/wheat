@@ -1,6 +1,6 @@
 //! Fetch: push the structural objects the client lacks, then answer its wants.
 
-use tracing::debug;
+use tracing::{Instrument as _, debug};
 
 use wheat_core::{ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
@@ -9,7 +9,9 @@ use wheat_store::{
     StructuralDeltaLimits,
 };
 
+use crate::blocking::drive;
 use crate::connection::ConnectionError;
+use crate::network::Network;
 use crate::registry::RepositoryEntry;
 use crate::transport::Transport;
 use crate::wire::{
@@ -39,17 +41,19 @@ pub async fn handle_fetch(
 ) -> Result<(), ConnectionError> {
     let op_id = req.op_id;
     let want = digest_to_object_id(&req.want_envelope)?;
-    if !is_envelope(&entry.network.store, want).await? {
+    let since = digest_to_object_id(&req.since_envelope)?;
+    let network = entry.network.clone();
+    let (has_want, has_since) = drive(move || async move {
+        let has_want = is_envelope(&network.store, want).await?;
+        let has_since = *since.as_bytes() != [0; 32] && is_envelope(&network.store, since).await?;
+        Ok::<_, ConnectionError>((has_want, has_since))
+    })
+    .await??;
+    if !has_want {
         let message = "the wanted envelope is not in this repository";
         return send_object_error(ws, op_id, NOT_FOUND, message, want).await;
     }
-    let since = digest_to_object_id(&req.since_envelope)?;
-    let since = if *since.as_bytes() == [0; 32] || !is_envelope(&entry.network.store, since).await?
-    {
-        None
-    } else {
-        Some(RepositoryEnvelopeId::from_digest(*since.as_bytes()))
-    };
+    let since = has_since.then(|| RepositoryEnvelopeId::from_digest(*since.as_bytes()));
     let want = RepositoryEnvelopeId::from_digest(*want.as_bytes());
     debug!(op_id, %want, incremental = since.is_some(), "fetch: starting");
 
@@ -120,8 +124,22 @@ async fn is_envelope<S: ImmutableObjectStore + ?Sized>(
     }
 }
 
+/// How many messages the walk may have ready ahead of the connection sending them.
+/// Each is at most one batch, so this bounds what a slow client makes the server hold.
+const PUSH_QUEUE: usize = 2;
+
+/// What the walk hands the connection to send.
+enum Pushed {
+    Message(WheatProtocolMessage),
+    /// The walk reached an object the store does not have, and stopped.
+    Missing(ObjectId),
+}
+
 /// Streams the walk from `since` to `want`. Returns how many objects were pushed,
 /// or `None` when the fetch ended with an error sent to the client.
+///
+/// The walk reads the store, so it runs on a thread for blocking work and hands
+/// the connection whole messages through a short queue.
 #[tracing::instrument(name = "fetch_push", level = "debug", skip_all)]
 async fn push(
     ws: &mut impl Transport,
@@ -130,13 +148,57 @@ async fn push(
     since: Option<RepositoryEnvelopeId>,
     want: RepositoryEnvelopeId,
 ) -> Result<Option<u64>, ConnectionError> {
+    let (sender, mut queue) = tokio::sync::mpsc::channel(PUSH_QUEUE);
+    let network = entry.network.clone();
+    // Its own span, since it runs on another thread.
+    let span = tracing::debug_span!("fetch_walk");
+    let walk = drive(move || {
+        async move { walk(&network, op_id, since, want, &sender).await }.instrument(span)
+    });
+    // Polled with the queue, so the walk's result arrives without a task of its own.
+    tokio::pin!(walk);
+    let mut walked = None;
+    loop {
+        tokio::select! {
+            item = queue.recv() => match item {
+                Some(Pushed::Message(message)) => send(ws, &message).await?,
+                Some(Pushed::Missing(id)) => {
+                    // The repository's own head is incomplete; nothing the client can fix.
+                    tracing::warn!(op_id, first = %id, "fetch: store incomplete");
+                    let message = "this repository's store is missing an object of the envelope";
+                    send_object_error(ws, op_id, INTERNAL, message, id).await?;
+                    return Ok(None);
+                }
+                // The walk finished and sent everything; its result is next.
+                None => break,
+            },
+            result = &mut walk, if walked.is_none() => walked = Some(result),
+        }
+    }
+    let pushed = match walked {
+        Some(result) => result,
+        None => walk.await,
+    }??;
+    Ok(Some(pushed))
+}
+
+/// The walk from `since` to `want`, run on a thread for blocking work: groups what
+/// it finds into messages for `sender`. Returns how many objects it pushed.
+async fn walk(
+    network: &Network,
+    op_id: u64,
+    since: Option<RepositoryEnvelopeId>,
+    want: RepositoryEnvelopeId,
+    sender: &tokio::sync::mpsc::Sender<Pushed>,
+) -> Result<u64, ConnectionError> {
     let mut delta = StructuralDelta::new(
-        &entry.network.store,
+        &network.store,
         since,
         want,
         StructuralDeltaLimits::default(),
     );
     let mut batch = BatchSender::new(op_id);
+    let mut ready = Vec::new();
     let mut pushed = 0u64;
     while let Some(step) = delta
         .next()
@@ -145,25 +207,36 @@ async fn push(
     {
         match step {
             DeltaStep::Object(object) => {
-                batch.push(ws, object).await?;
+                batch.push(object, &mut ready);
                 pushed += 1;
             }
             DeltaStep::Missing(ids) => {
-                // The repository's own head is incomplete; nothing the client can fix.
-                tracing::warn!(op_id, missing = ids.len(), first = %ids[0], "fetch: store incomplete");
-                let message = "this repository's store is missing an object of the envelope";
-                send_object_error(ws, op_id, INTERNAL, message, ids[0]).await?;
-                return Ok(None);
+                hand_over(sender, Pushed::Missing(ids[0])).await?;
+                return Ok(pushed);
             }
         }
+        for message in ready.drain(..) {
+            hand_over(sender, Pushed::Message(message)).await?;
+        }
     }
-    batch.flush(ws).await?;
+    batch.flush(&mut ready);
+    for message in ready.drain(..) {
+        hand_over(sender, Pushed::Message(message)).await?;
+    }
     debug!(op_id, stats = ?delta.stats(), "fetch: walk done");
-    Ok(Some(pushed))
+    Ok(pushed)
 }
 
-/// Groups pushed objects into `ObjectBatch` messages, and sends objects too large
-/// for one as `ObjectChunk`s.
+/// Hands `item` to the connection; fails once the connection has stopped taking them.
+async fn hand_over(
+    sender: &tokio::sync::mpsc::Sender<Pushed>,
+    item: Pushed,
+) -> Result<(), ConnectionError> {
+    sender.send(item).await.map_err(|_| ConnectionError::Closed)
+}
+
+/// Groups pushed objects into `ObjectBatch` messages, and objects too large for
+/// one into `ObjectChunk`s.
 struct BatchSender {
     op_id: u64,
     sequence: u64,
@@ -181,43 +254,36 @@ impl BatchSender {
         }
     }
 
-    async fn push(
-        &mut self,
-        ws: &mut impl Transport,
-        object: StoredObject,
-    ) -> Result<(), ConnectionError> {
+    /// Adds `object`, putting any messages that are now complete in `ready`.
+    fn push(&mut self, object: StoredObject, ready: &mut Vec<WheatProtocolMessage>) {
         let len = object.canonical_bytes.len();
         if len > MAX_OBJECT_BATCH_SIZE {
-            self.flush(ws).await?;
-            return send_chunks(ws, self.op_id, &object).await;
+            self.flush(ready);
+            ready.extend(object_chunks(self.op_id, &object));
+            return;
         }
         // Flush first, so a batch never grows past its limits.
         if self.objects.len() == MAX_OBJECT_BATCH_ITEMS || self.bytes + len > MAX_OBJECT_BATCH_SIZE
         {
-            self.flush(ws).await?;
+            self.flush(ready);
         }
         self.bytes += len;
         self.objects.push(object_entry(&object));
-        Ok(())
     }
 
-    async fn flush(&mut self, ws: &mut impl Transport) -> Result<(), ConnectionError> {
+    /// Puts the batch being built, if any, in `ready`.
+    fn flush(&mut self, ready: &mut Vec<WheatProtocolMessage>) {
         if self.objects.is_empty() {
-            return Ok(());
+            return;
         }
-        send(
-            ws,
-            &WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
-                message_type: 0x21,
-                op_id: self.op_id,
-                sequence: self.sequence,
-                objects: std::mem::take(&mut self.objects),
-            }),
-        )
-        .await?;
+        ready.push(WheatProtocolMessage::ObjectBatch(ObjectBatchOutput {
+            message_type: 0x21,
+            op_id: self.op_id,
+            sequence: self.sequence,
+            objects: std::mem::take(&mut self.objects),
+        }));
         self.sequence += 1;
         self.bytes = 0;
-        Ok(())
     }
 }
 
@@ -230,32 +296,26 @@ fn object_entry(object: &StoredObject) -> ObjectEntry {
     }
 }
 
-async fn send_chunks(
-    ws: &mut impl Transport,
-    op_id: u64,
-    object: &StoredObject,
-) -> Result<(), ConnectionError> {
+/// `object` as `ObjectChunk` messages, for one too large for a batch.
+fn object_chunks(op_id: u64, object: &StoredObject) -> impl Iterator<Item = WheatProtocolMessage> {
     let bytes = &object.canonical_bytes;
-    let mut offset = 0;
-    for piece in bytes.chunks(MAX_OBJECT_CHUNK_SIZE) {
-        let end = offset + piece.len();
-        send(
-            ws,
-            &WheatProtocolMessage::ObjectChunk(ObjectChunkOutput {
+    let total = bytes.len();
+    bytes
+        .chunks(MAX_OBJECT_CHUNK_SIZE)
+        .scan(0, move |offset, piece| {
+            let start = *offset;
+            *offset += piece.len();
+            Some(WheatProtocolMessage::ObjectChunk(ObjectChunkOutput {
                 message_type: 0x26,
                 op_id,
                 object_id: Digest256 {
                     bytes: object.id.as_bytes().to_vec(),
                 },
-                offset: offset as u64,
+                offset: start as u64,
                 data: piece.to_vec(),
-                is_final: end == bytes.len(),
-            }),
-        )
-        .await?;
-        offset = end;
-    }
-    Ok(())
+                is_final: *offset == total,
+            }))
+        })
 }
 
 /// Answers one want with one reply: the wanted objects from the front of its list
@@ -268,16 +328,61 @@ async fn answer_want(
     op_id: u64,
     wanted: &ObjectWantOutput,
 ) -> Result<bool, ConnectionError> {
-    let mut objects = Vec::new();
+    let ids = wanted
+        .ids
+        .iter()
+        .map(digest_to_object_id)
+        .collect::<Result<Vec<_>, _>>()?;
+    let network = entry.network.clone();
+    let answer = drive(move || async move { read_want(&network, &ids).await }).await??;
+    if let Some(object) = &answer.chunked {
+        for chunk in object_chunks(op_id, object) {
+            send(ws, &chunk).await?;
+        }
+    }
+    if let Some(id) = answer.missing {
+        let message = "a wanted object is not in this repository";
+        send_object_error(ws, op_id, NOT_FOUND, message, id).await?;
+        return Ok(false);
+    }
+    let objects = answer.objects;
+    send(
+        ws,
+        &WheatProtocolMessage::ObjectWantReply(ObjectWantReplyOutput {
+            message_type: 0x25,
+            op_id,
+            want_sequence: wanted.want_sequence,
+            objects,
+        }),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// What one want is answered with, read on a thread for blocking work.
+struct WantAnswer {
+    /// The first wanted object, when it is too large for a batch.
+    chunked: Option<StoredObject>,
+    /// The wanted objects that fit in the reply.
+    objects: Vec<ObjectEntry>,
+    /// The first wanted object the store does not have; the fetch ends at it.
+    missing: Option<ObjectId>,
+}
+
+/// Reads the wanted objects from the front of `ids` that fit in one reply.
+async fn read_want(network: &Network, ids: &[ObjectId]) -> Result<WantAnswer, ConnectionError> {
+    let mut answer = WantAnswer {
+        chunked: None,
+        objects: Vec::new(),
+        missing: None,
+    };
     let mut bytes = 0;
-    for (index, digest) in wanted.ids.iter().enumerate() {
-        let id = digest_to_object_id(digest)?;
-        let object = match entry.network.store.get(id).await {
+    for (index, &id) in ids.iter().enumerate() {
+        let object = match network.store.get(id).await {
             Ok(object) => object,
             Err(ObjectStoreError::Missing(_)) => {
-                let message = "a wanted object is not in this repository";
-                send_object_error(ws, op_id, NOT_FOUND, message, id).await?;
-                return Ok(false);
+                answer.missing = Some(id);
+                return Ok(answer);
             }
             Err(error) => {
                 return Err(ConnectionError::Internal(format!(
@@ -290,26 +395,16 @@ async fn answer_want(
             if index > 0 {
                 break;
             }
-            send_chunks(ws, op_id, &object).await?;
+            answer.chunked = Some(object);
             continue;
         }
-        if objects.len() == MAX_OBJECT_BATCH_ITEMS || bytes + len > MAX_OBJECT_BATCH_SIZE {
+        if answer.objects.len() == MAX_OBJECT_BATCH_ITEMS || bytes + len > MAX_OBJECT_BATCH_SIZE {
             break;
         }
         bytes += len;
-        objects.push(object_entry(&object));
+        answer.objects.push(object_entry(&object));
     }
-    send(
-        ws,
-        &WheatProtocolMessage::ObjectWantReply(ObjectWantReplyOutput {
-            message_type: 0x25,
-            op_id,
-            want_sequence: wanted.want_sequence,
-            objects,
-        }),
-    )
-    .await?;
-    Ok(true)
+    Ok(answer)
 }
 
 /// Handle a content fetch request.
@@ -339,11 +434,26 @@ pub async fn handle_content_fetch(
     }
 
     let mut batch = ContentBatcher::new(op_id);
-    match entry
-        .network
-        .content
-        .get_many_bounded(&ids, MAX_CONTENT_CHUNK_SIZE)
-    {
+    let network = entry.network.clone();
+    let read = drive(move || async move {
+        match network
+            .content
+            .get_many_bounded(&ids, MAX_CONTENT_CHUNK_SIZE)
+        {
+            Ok(items) => Ok(items),
+            Err(error) => {
+                debug!(op_id, %error, "content fetch: bulk read failed, reading one at a time");
+                // Blobs too large to read bounded are left to read one at a time
+                // below, so the reads here never hold more than the bulk read would.
+                Err(ids
+                    .into_iter()
+                    .map(|id| (id, network.content.get_bounded(id, MAX_CONTENT_CHUNK_SIZE)))
+                    .collect::<Vec<_>>())
+            }
+        }
+    })
+    .await?;
+    match read {
         Ok(items) => {
             for (id, data) in items {
                 if let Some(full) = batch.push(content_digest(id), data) {
@@ -351,14 +461,9 @@ pub async fn handle_content_fetch(
                 }
             }
         }
-        Err(error) => {
-            debug!(op_id, %error, "content fetch: bulk read failed, reading one at a time");
-            for &id in &ids {
-                let data = match entry
-                    .network
-                    .content
-                    .get_bounded(id, MAX_CONTENT_CHUNK_SIZE)
-                {
+        Err(each) => {
+            for (id, bounded) in each {
+                let data = match bounded {
                     Ok(data) => {
                         if let Some(full) = batch.push(content_digest(id), data) {
                             send(ws, &full).await?;
@@ -366,7 +471,8 @@ pub async fn handle_content_fetch(
                         continue;
                     }
                     Err(wheat_store::ContentStoreError::TooLarge { .. }) => {
-                        entry.network.content.get(id)
+                        let network = entry.network.clone();
+                        drive(move || async move { network.content.get(id) }).await?
                     }
                     Err(error) => Err(error),
                 };

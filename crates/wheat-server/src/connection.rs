@@ -828,3 +828,9 @@ impl std::fmt::Display for ConnectionError {
 }
 
 impl std::error::Error for ConnectionError {}
+impl From<tokio::task::JoinError> for ConnectionError {
+    /// Store work handed to a thread for blocking work panicked or was cancelled.
+    fn from(error: tokio::task::JoinError) -> Self {
+        ConnectionError::Internal(format!("store work failed: {error}"))
+    }
+}

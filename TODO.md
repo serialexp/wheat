@@ -211,7 +211,19 @@ Performance, most serious first:
   Since 2026-10-16 the publish committer (`commit.rs`), which does the store write and
   the head's syncs, runs on the blocking pool. What is left on the runtime are reads
   and the stage's early writes; in `publish_contention` at 8 writers the server is
-  about 5% busy, so that case cannot show their cost.
+  about 5% busy, so that case cannot show their cost. Bart chose (2026-10-30)
+  `spawn_blocking` a batch at a time (`crate::blocking::drive`). Fetch is done: the
+  walk runs on the blocking pool and hands the connection whole messages through a
+  two-message queue, and each want, each content request and the envelope checks are
+  one job (`blocking_test`). Left: the publish path (its `RepositoryStage` borrows the
+  store, so it cannot move to a `'static` job as it is), the head reads of
+  `LocalPublicationStore`, and connection setup.
+- `[ ]` **Fetch and publish benches slower than on 2026-10-26 (2026-10-30).**
+  `fetch_incremental.total.wall` went from 17.3 s (2026-10-26) to 29–31 s, its
+  `publish.wall` from 0.023 s to about 0.07 s, and `remote_latency.many.publish.wall`
+  from 0.25 s to 0.3–0.7 s. The same tree with the fetch code from before the blocking
+  change measures the same, so the change is elsewhere, or the machine was busier
+  (other agents building). Re-measure on a quiet machine and bisect if it holds.
 - `[ ]` **`wheat status` re-reads and re-hashes every file (scanner only).**
   `workspace_scan.rs` has no saved stat cache (mtime, ctime, size, inode, content ID),
   so every status reads all tracked files and their baselines, and fails once the

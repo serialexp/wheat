@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::runtime::Handle;
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 use wheat_protocol::{AdminCommand, AdminRepositoryName, Uuid128};
@@ -405,8 +404,7 @@ where
     Fut: std::future::Future<Output = Result<T, String>>,
     T: Send + 'static,
 {
-    let handle = Handle::current();
-    spawn_blocking(move || handle.block_on(work()))
+    crate::blocking::drive(work)
         .await
         .map_err(|error| chain(&error))?
 }

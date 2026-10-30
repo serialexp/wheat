@@ -11,6 +11,7 @@ pub use async_trait::async_trait;
 
 pub mod access;
 pub mod admin;
+mod blocking;
 pub mod commit;
 pub mod config;
 pub mod connection;
