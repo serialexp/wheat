@@ -17,12 +17,16 @@ use wheat_store::{
     PackedObjectStore, RepositoryStore, SeparateRepositoryStore,
 };
 
-/// Blobs in memory, as an embedder would write them, counting what is read.
+/// Blobs in memory, as an embedder would write them, counting what is read and how
+/// many writes are under way at once.
 #[derive(Debug, Default)]
 struct MemoryBlobs {
     records: Mutex<HashMap<ContentId, Vec<u8>>>,
+    puts_under_way: AtomicUsize,
+    most_puts_at_once: AtomicUsize,
     gets: AtomicUsize,
     range_reads: AtomicUsize,
+    pages_listed: AtomicUsize,
     range_bytes: AtomicUsize,
     /// Page size when listing; `None` for a store that does not list.
     page: Option<usize>,
@@ -48,7 +52,13 @@ impl MemoryBlobs {
 #[async_trait]
 impl ContentBlobStore for MemoryBlobs {
     async fn put(&self, id: ContentId, record: Vec<u8>) -> io::Result<()> {
+        let under_way = self.puts_under_way.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_puts_at_once
+            .fetch_max(under_way, Ordering::SeqCst);
+        // An upload waits on the network: the store goes on with others meanwhile.
+        tokio::task::yield_now().await;
         self.set_record(id, record);
+        self.puts_under_way.fetch_sub(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -78,6 +88,7 @@ impl ContentBlobStore for MemoryBlobs {
         let Some(page) = self.page else {
             return Ok(None);
         };
+        self.pages_listed.fetch_add(1, Ordering::Relaxed);
         let mut ids = self
             .records
             .lock()
@@ -174,6 +185,36 @@ async fn content_close_to_stored_content_is_kept_as_a_delta() {
     assert_eq!(content.get(id).unwrap(), changed);
 }
 
+/// Deltas of one batch go to the blob store together, not one upload after another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_of_deltas_is_uploaded_together() {
+    let blobs = Arc::new(MemoryBlobs::default());
+    let content = over(&blobs);
+    let changed: Vec<(ContentId, Vec<u8>)> = (0..8)
+        .map(|n| {
+            let base = noise(10 + n, 16 * 1024);
+            let base_id = content.put(&base).unwrap();
+            let mut changed = base;
+            changed[100..110].copy_from_slice(b"0123456789");
+            (base_id, changed)
+        })
+        .collect();
+    blobs.most_puts_at_once.store(0, Ordering::SeqCst);
+
+    let items: Vec<ContentItem<'_>> = changed
+        .iter()
+        .map(|(base, bytes)| ContentItem::new(VerifiedContent::new(bytes.as_slice()), Some(*base)))
+        .collect();
+    content.put_many_with_bases(&items, 4).unwrap();
+
+    assert!(blobs.most_puts_at_once.load(Ordering::SeqCst) > 1);
+    for (_, bytes) in &changed {
+        let id = ContentId::of(bytes);
+        assert!(blobs.record(id).unwrap().len() < 1024, "stored as a delta");
+        assert_eq!(&content.get(id).unwrap(), bytes);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_record_that_holds_other_content_is_refused() {
     let blobs = Arc::new(MemoryBlobs::default());
@@ -196,8 +237,10 @@ async fn a_record_that_holds_other_content_is_refused() {
     ));
 }
 
+/// A few IDs are checked one read each, however large the store, rather than by
+/// listing it all.
 #[tokio::test(flavor = "multi_thread")]
-async fn existing_ids_come_from_a_listing_or_one_read_each() {
+async fn a_few_ids_are_checked_one_read_each() {
     for blobs in [MemoryBlobs::listing(3), MemoryBlobs::default()] {
         let blobs = Arc::new(blobs);
         let content = over(&blobs);
@@ -210,9 +253,28 @@ async fn existing_ids_come_from_a_listing_or_one_read_each() {
 
         candidates.pop();
         assert_eq!(found, candidates.into_iter().collect());
-        let per_id_reads = if blobs.page.is_some() { 0 } else { 3 };
-        assert_eq!(blobs.range_reads.load(Ordering::Relaxed), per_id_reads);
+        assert_eq!(blobs.range_reads.load(Ordering::Relaxed), 3);
+        // Listing the eight blobs takes three pages, more than the one round of reads.
+        assert!(blobs.pages_listed.load(Ordering::Relaxed) <= 1);
     }
+}
+
+/// Many IDs against a store that lists them in fewer requests come from the listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn many_ids_come_from_a_listing_when_it_is_shorter() {
+    let blobs = Arc::new(MemoryBlobs::listing(3));
+    let content = over(&blobs);
+    let stored = (0..8_u8)
+        .map(|byte| content.put(&[byte]).unwrap())
+        .collect::<Vec<_>>();
+    // 40 IDs take three rounds of reads; listing the eight blobs takes three pages.
+    let mut candidates = stored.clone();
+    candidates.extend((0..32_u8).map(|n| ContentId::of(&[n, n])));
+    let found = content.existing_ids(&candidates).unwrap();
+
+    assert_eq!(found, stored.into_iter().collect());
+    assert_eq!(blobs.range_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(blobs.pages_listed.load(Ordering::Relaxed), 3);
 }
 
 /// An embedder keeps structure in a packed store on disk and content in its blobs.

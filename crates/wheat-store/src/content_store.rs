@@ -1,5 +1,6 @@
 //! Content retention facade and loose reference backend.
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -35,6 +36,43 @@ impl<'a> ContentItem<'a> {
     pub fn bytes(&self) -> &'a [u8] {
         self.content.into_inner()
     }
+}
+
+/// Runs `work` on each of `items`, on up to `concurrency` threads at once, until
+/// one fails.
+fn in_parallel<T: Send>(
+    items: impl IntoIterator<Item = T>,
+    concurrency: usize,
+    work: impl Fn(T) -> Result<(), ContentStoreError> + Sync,
+) -> Result<(), ContentStoreError> {
+    let (sender, receiver) = mpsc::channel();
+    let mut count = 0;
+    for item in items {
+        sender.send(item).expect("receiver remains alive");
+        count += 1;
+    }
+    drop(sender);
+    let workers = concurrency.max(1).min(count);
+    let receiver = Mutex::new(receiver);
+    thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                scope.spawn(|| -> Result<(), ContentStoreError> {
+                    loop {
+                        let next = receiver.lock().expect("worker mutex poisoned").recv();
+                        let Ok(item) = next else {
+                            return Ok(());
+                        };
+                        work(item)?;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("content worker panicked")?;
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn codec_error(
@@ -181,13 +219,13 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
         false
     }
 
-    /// List all content IDs stored in this backend.
-    ///
-    /// Returns `None` if the backend does not support listing (the caller
-    /// should fall back to per-item `get_bounded` existence checks).
-    /// Remote backends override this to use a single LIST/scan call
-    /// instead of one GET per item.
-    fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
+    /// Which of `candidates` are stored, when the backend answers that better than
+    /// one [`ContentStore::contains`] after another; `None` when it does not.
+    fn existing_ids(
+        &self,
+        candidates: &[ContentId],
+    ) -> Option<Result<HashSet<ContentId>, ContentStoreError>> {
+        let _ = candidates;
         None
     }
 }
@@ -338,11 +376,6 @@ impl ContentStore {
             .is_none_or(|backend| backend.supports_raw_envelopes())
     }
 
-    /// Every stored ID, when the backend can list them in one call.
-    pub(crate) fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
-        self.backend.as_ref().and_then(|backend| backend.list_ids())
-    }
-
     #[tracing::instrument(name = "content_put", level = "debug", skip_all, fields(bytes = bytes.len()))]
     pub fn put(&self, bytes: &[u8]) -> Result<ContentId, ContentStoreError> {
         let content = VerifiedContent::new(bytes);
@@ -366,32 +399,8 @@ impl ContentStore {
         if let Some(backend) = &self.backend {
             return backend.put_many(&deduplicated.into_values().collect::<Vec<_>>());
         }
-        let workers = concurrency.max(1).min(deduplicated.len());
-        let (sender, receiver) = mpsc::channel();
-        for content in deduplicated.into_values() {
-            sender.send(content).expect("receiver remains alive");
-        }
-        drop(sender);
-        let receiver = Arc::new(Mutex::new(receiver));
-        thread::scope(|scope| {
-            let handles = (0..workers)
-                .map(|_| {
-                    let receiver = Arc::clone(&receiver);
-                    scope.spawn(move || -> Result<(), ContentStoreError> {
-                        loop {
-                            let next = receiver.lock().expect("worker mutex poisoned").recv();
-                            let Ok(content) = next else {
-                                return Ok(());
-                            };
-                            self.put_verified(content)?;
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            for handle in handles {
-                handle.join().expect("content worker panicked")?;
-            }
-            Ok(())
+        in_parallel(deduplicated.into_values(), concurrency, |content| {
+            self.put_verified(content)
         })
     }
 
@@ -459,28 +468,51 @@ impl ContentStore {
 
     /// Store content from a batch, with optional delta base hints.
     ///
-    /// Items with a base hint attempt delta encoding; items without store raw.
+    /// Items with a base hint attempt delta encoding; items without store raw, as
+    /// does an item whose delta cannot be made (its base unreadable, say). The deltas
+    /// are written together, as are the raw items.
     pub fn put_many_with_bases(
         &self,
         contents: &[ContentItem<'_>],
         concurrency: usize,
     ) -> Result<(), ContentStoreError> {
-        // Split into delta-eligible and raw items.
         let mut raw_items = Vec::new();
+        let mut deltas = Vec::new();
+        let mut seen = HashSet::new();
         for item in contents {
-            if let Some(base) = item.base {
-                // Try delta — fall back to raw on failure.
-                if let Err(_e) = self.put_with_base(item.content, base) {
-                    raw_items.push(item.content);
-                }
-            } else {
+            let id = item.id();
+            let Some(base) = item.base else {
                 raw_items.push(item.content);
+                continue;
+            };
+            if !seen.insert(id) || self.contains(id) {
+                continue;
+            }
+            match self.delta_envelope(id, item.bytes(), base) {
+                Ok(Some(envelope)) => deltas.push((id, envelope)),
+                Ok(None) | Err(_) => raw_items.push(item.content),
             }
         }
-        if !raw_items.is_empty() {
-            self.put_many(&raw_items, concurrency)?;
+        self.put_raw_envelopes(&deltas, concurrency)?;
+        self.put_many(&raw_items, concurrency)
+    }
+
+    /// Writes pre-encoded envelopes directly to the store, in one backend write or
+    /// with up to `concurrency` local writes at once.
+    pub(crate) fn put_raw_envelopes(
+        &self,
+        envelopes: &[(ContentId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ContentStoreError> {
+        if envelopes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        if let Some(backend) = &self.backend {
+            return backend.put_raw_envelopes(envelopes);
+        }
+        in_parallel(envelopes, concurrency, |(id, envelope)| {
+            self.write_local_envelope(*id, envelope)
+        })
     }
 
     /// Write a pre-encoded envelope directly to the store.
@@ -492,7 +524,15 @@ impl ContentStore {
         if let Some(backend) = &self.backend {
             return backend.put_raw_envelopes(&[(id, envelope)]);
         }
-        // Local filesystem: write the envelope bytes directly.
+        self.write_local_envelope(id, &envelope)
+    }
+
+    /// Writes `envelope` as the local file of `id`.
+    fn write_local_envelope(
+        &self,
+        id: ContentId,
+        envelope: &[u8],
+    ) -> Result<(), ContentStoreError> {
         let path = self.path(id);
         let parent = path.parent().expect("content path has parent");
         fs::create_dir_all(parent)?;
@@ -509,7 +549,7 @@ impl ContentStore {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            file.write_all(&envelope)?;
+            file.write_all(envelope)?;
             self.durability.sync_file(&file)?;
             match fs::rename(&temporary, &path) {
                 Ok(()) => {
@@ -685,28 +725,18 @@ impl ContentStore {
         Ok(results)
     }
 
-    /// Return the set of content IDs that already exist in this store,
-    /// filtered to only those in `candidates`.
-    ///
-    /// When the backend supports listing (remote/S3), this does one
-    /// LIST call and filters in memory — O(1) network round trips
-    /// instead of O(n) per-item existence checks. Falls back to
-    /// per-item `contains()` for local filesystem backends.
+    /// Which of `candidates` are stored. A blob store answers with concurrent
+    /// header reads, or from a listing when that takes fewer requests; a local store
+    /// checks each.
     pub fn existing_ids(
         &self,
         candidates: &[ContentId],
-    ) -> Result<std::collections::HashSet<ContentId>, ContentStoreError> {
+    ) -> Result<HashSet<ContentId>, ContentStoreError> {
         if let Some(backend) = &self.backend
-            && let Some(result) = backend.list_ids()
+            && let Some(found) = backend.existing_ids(candidates)
         {
-            let all: std::collections::HashSet<ContentId> = result?.into_iter().collect();
-            return Ok(candidates
-                .iter()
-                .copied()
-                .filter(|id| all.contains(id))
-                .collect());
+            return found;
         }
-        // Fallback: per-item check (fast for local filesystem).
         Ok(candidates
             .iter()
             .copied()

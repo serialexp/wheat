@@ -815,21 +815,21 @@ impl ContentBackend for StagedContent {
         &self,
         envelopes: &[(ContentId, Vec<u8>)],
     ) -> Result<(), ContentStoreError> {
-        for (id, envelope) in envelopes {
-            self.stored.put_raw_envelope(*id, envelope.clone())?;
-        }
-        Ok(())
+        self.stored.put_raw_envelopes(envelopes, WRITE_CONCURRENCY)
     }
 
     fn supports_raw_envelopes(&self) -> bool {
         self.stored.supports_raw_envelopes()
     }
 
-    fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
-        let stored = self.stored.list_ids()?;
-        Some(stored.and_then(|mut ids| {
-            ids.extend(self.lock()?.blobs.keys().copied());
-            Ok(ids)
+    fn existing_ids(
+        &self,
+        candidates: &[ContentId],
+    ) -> Option<Result<HashSet<ContentId>, ContentStoreError>> {
+        Some(self.stored.existing_ids(candidates).and_then(|mut found| {
+            let staged = self.lock()?;
+            found.extend(candidates.iter().filter(|id| staged.blobs.contains_key(id)));
+            Ok(found)
         }))
     }
 }
@@ -874,23 +874,24 @@ impl ContentBackend for PendingContent {
         &self,
         envelopes: &[(ContentId, Vec<u8>)],
     ) -> Result<(), ContentStoreError> {
-        for (id, envelope) in envelopes {
-            self.below.put_raw_envelope(*id, envelope.clone())?;
-        }
-        Ok(())
+        self.below.put_raw_envelopes(envelopes, WRITE_CONCURRENCY)
     }
 
     fn supports_raw_envelopes(&self) -> bool {
         self.below.supports_raw_envelopes()
     }
 
-    fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
-        let below = self.below.list_ids()?;
-        Some(below.map(|mut ids| {
-            for publication in &self.publications {
-                ids.extend(publication.content.keys().copied());
-            }
-            ids
+    fn existing_ids(
+        &self,
+        candidates: &[ContentId],
+    ) -> Option<Result<HashSet<ContentId>, ContentStoreError>> {
+        Some(self.below.existing_ids(candidates).map(|mut found| {
+            found.extend(candidates.iter().filter(|id| {
+                self.publications
+                    .iter()
+                    .any(|publication| publication.content.contains_key(id))
+            }));
+            found
         }))
     }
 }

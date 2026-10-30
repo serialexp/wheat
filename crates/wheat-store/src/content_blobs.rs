@@ -7,7 +7,7 @@
 //! [`ContentStore::over_blobs`] turns a blob store into a [`ContentStore`], which
 //! [`crate::SeparateRepositoryStore`] pairs with any object store.
 
-use std::{fmt::Debug, future::Future, io, ops::Range, sync::Arc};
+use std::{collections::HashSet, fmt::Debug, future::Future, io, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -58,7 +58,8 @@ pub trait ContentBlobStore: Debug + Send + Sync {
 
     /// Up to `limit` stored IDs, starting where `cursor` says (the first page when
     /// `None`); or `None` if this store does not list. A store that lists answers
-    /// [`ContentStore::existing_ids`] from the listing instead of one read per ID.
+    /// [`ContentStore::existing_ids`] from the listing when that takes fewer requests
+    /// than one read per ID.
     async fn list_page(
         &self,
         cursor: Option<String>,
@@ -127,6 +128,26 @@ fn checked_header(
     Ok(parsed)
 }
 
+impl BlobBackend {
+    /// Every stored ID, if listing them takes at most `pages` requests; `None` if it
+    /// takes more, or the store does not list.
+    async fn list_within(&self, pages: usize) -> io::Result<Option<HashSet<ContentId>>> {
+        let mut ids = HashSet::new();
+        let mut cursor = None;
+        for _ in 0..pages {
+            let Some(page) = self.blobs.list_page(cursor, LIST_PAGE).await? else {
+                return Ok(None);
+            };
+            ids.extend(page.ids);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(Some(ids)),
+            }
+        }
+        Ok(None)
+    }
+}
+
 impl ContentBackend for BlobBackend {
     fn put_many(&self, contents: &[VerifiedContent<&[u8]>]) -> Result<(), ContentStoreError> {
         block_on(async {
@@ -169,27 +190,44 @@ impl ContentBackend for BlobBackend {
         checked_header(id, &read.bytes, read.size).map(|header| header.logical_length)
     }
 
-    fn list_ids(&self) -> Option<Result<Vec<ContentId>, ContentStoreError>> {
-        let listed = block_on(async {
-            let mut ids = Vec::new();
-            let mut cursor = None;
-            loop {
-                let Some(page) = self.blobs.list_page(cursor, LIST_PAGE).await? else {
-                    return Ok::<_, io::Error>(None);
-                };
-                ids.extend(page.ids);
-                match page.next {
-                    Some(next) => cursor = Some(next),
-                    None => return Ok(Some(ids)),
+    fn existing_ids(
+        &self,
+        candidates: &[ContentId],
+    ) -> Option<Result<HashSet<ContentId>, ContentStoreError>> {
+        let found =
+            block_on(async {
+                // A listing costs one request per LIST_PAGE stored blobs, one after
+                // another; checking costs one request per candidate, a window of them at
+                // once. Only as many pages are listed as checking would take rounds, so
+                // neither a large store nor a large check pays more than twice the cheaper.
+                let rounds = candidates.len().div_ceil(MAX_CONCURRENT_REQUESTS);
+                if let Some(listed) = self.list_within(rounds).await? {
+                    return Ok(candidates
+                        .iter()
+                        .copied()
+                        .filter(|id| listed.contains(id))
+                        .collect());
                 }
-            }
-        });
-        match listed {
-            Ok(Ok(Some(ids))) => Some(Ok(ids)),
-            Ok(Ok(None)) => None,
-            Ok(Err(error)) => Some(Err(ContentStoreError::Io(error))),
-            Err(error) => Some(Err(error)),
-        }
+                // Present as `ContentStore::contains` has it: a record whose header reads.
+                stream::iter(candidates.iter().map(|&id| async move {
+                    let read = self
+                        .blobs
+                        .get_range(id, 0..codec::ENVELOPE_HEADER_LEN as u64)
+                        .await?;
+                    Ok::<_, io::Error>(read.and_then(|read| {
+                        checked_header(id, &read.bytes, read.size).ok().map(|_| id)
+                    }))
+                }))
+                .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+                .try_filter_map(|id| async move { Ok(id) })
+                .try_collect::<HashSet<_>>()
+                .await
+            });
+        Some(match found {
+            Ok(Ok(found)) => Ok(found),
+            Ok(Err(error)) => Err(ContentStoreError::Io(error)),
+            Err(error) => Err(error),
+        })
     }
 
     fn put_raw_envelopes(

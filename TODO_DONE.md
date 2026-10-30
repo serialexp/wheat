@@ -4,6 +4,15 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **Delta content stored one envelope at a time.**
+  `ContentStore::put_many_with_bases` stored each delta-encoded blob with its own
+  `put_raw_envelope`, one backend write (a synced loose file, or a blob upload) per
+  blob. It now makes the deltas first and writes them together
+  (`ContentStore::put_raw_envelopes`: one backend batch, or up to `concurrency`
+  local writes at once), as do the stage's and pending publications' content
+  overlays and a packed store's loose envelopes (2026-10-31). Contract:
+  `content_blobs::a_batch_of_deltas_is_uploaded_together`.
+
 - `[x]` **Browsing history is in canonical order, not by time.** Each view now keeps
   a history map (`ViewRecord.history`, `HistoryMapNode`), keyed by its revisions'
   committed_at and change ID with the bits inverted so keys run newest first, to each
@@ -282,6 +291,14 @@ Finished items, moved here from `TODO.md` under the same headings.
   first `PublishResult`).
 
 ## Security and performance scan (2026-09-26)
+
+- `[x]` **`existing_ids` lists the whole S3 bucket even for a few IDs (scanner
+  only, 2026-10-05).** `ContentStore::existing_ids` listed every blob whenever the
+  backend could list. A blob store now checks the IDs with concurrent header reads,
+  and lists only when the listing ends within as many pages as the reads would take
+  rounds, so neither a large store nor a large check pays more than twice the cheaper
+  (2026-10-31). Tests `a_few_ids_are_checked_one_read_each` and
+  `many_ids_come_from_a_listing_when_it_is_shorter`.
 
 - `[x]` **wheat-server does blocking disk work on async threads (confirmed
   2026-10-05).** Publication, packed-object and content stores are synchronous and

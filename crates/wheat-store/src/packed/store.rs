@@ -253,9 +253,8 @@ impl PackedEngine {
             &ids,
             |error| content_catalog_error(first, error),
             || {
-                envelopes.iter().try_for_each(|(id, envelope)| {
-                    self.content.put_raw_envelope(*id, envelope.clone())
-                })
+                self.content
+                    .put_raw_envelopes(envelopes, LOOSE_WRITE_CONCURRENCY)
             },
         )
     }

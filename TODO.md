@@ -12,8 +12,8 @@ a shared object store for blobs; Gothab's server does authentication and reposit
 authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
 formats freeze. Items already listed elsewhere that this also needs: chunked uploads reassembled in
-memory, the fetch walk's visit cap, `existing_ids`
-listing the bucket, opening a packed store costing O(store), and `wheat gc` /
+memory, the fetch walk's visit cap, opening a packed store costing O(store), and
+`wheat gc` /
 server-authoritative remote maintenance.
 
 Decided 2026-10-30 (recorded in Gothab's `docs/design/repository-backend-interface.md`):
@@ -40,12 +40,6 @@ kind and publish events are Gothab work.
   served repository run in the server through `wheat admin` (since 2026-10-28/29). Design and phases: `docs/design/wheat-fork-networks.md`; moving,
   adoption, deletion while served and GC: `docs/design/wheat-network-maintenance.md`
   (admin surface, export and import built, the rest decided 2026-10-27).
-- `[ ]` **Delta content stored one envelope at a time.**
-  `ContentStore::put_many_with_bases` stores each delta-encoded blob with its own
-  `put_raw_envelope`, one backend write (a synced loose file, or a blob upload) per
-  blob, where the backend takes a batch (`ContentBackend::put_raw_envelopes`). It is
-  the path `SeparateRepositoryStore` (Gothab's content over its blob store) takes for
-  a publish's changed files. Found while splitting content out for fork networks.
 
 ## Desktop client (2026-10-22)
 
@@ -180,10 +174,6 @@ Security, most serious first:
 
 Performance, most serious first:
 
-- `[ ]` **`existing_ids` lists the whole S3 bucket even for a few IDs (scanner
-  only, 2026-10-05).** `ContentStore::existing_ids` (`content_store.rs`) uses
-  `list_ids` whenever the backend has it, so a publish of one file lists every blob.
-  Choose per-item checks below some count.
 - `[ ]` **Read-only commands still sync (2026-10-05).**
   `PackedCatalog::open_with_target` (`packed/catalog.rs`) calls
   `sync_created_ancestors` on each open, which syncs every directory from
