@@ -1,5 +1,25 @@
 # Current task
 
+## 2026-10-30/31: Wheat hardening for the Gothab integration (@calm-lynx)
+
+Bart: I coordinate the Wheat–Gothab integration, backend move first. @wise-walrus
+(~/Projects/gothab) does Phase 2c/2d and the move into gothab-gitd-client, but no
+Phase 3/4 and no wheat dependency yet. Meanwhile I harden Wheat.
+
+Done (not pushed): blocking store work off the async threads (f9c7775 fetch,
+e6fff2c publish with an owned-handle stage, d61bf36 local head store), batched delta
+writes and `existing_ids` without listing the bucket (a881e5b), and the structural
+walk's radix revisit cap (3b1b36a).
+
+Waiting on Bart (asked 2026-10-30, no answer yet; options are in the TODO items):
+- Chunked uploads held in memory. Whole blobs are everywhere in the content store,
+  so the options are: spool plus a streaming store of raw records; chunked large
+  blobs (a format change); or lowering `MAX_CONTENT_SIZE`.
+- Packed store open is O(store). Options: check structure only; validate once and
+  record it; or validate in the background.
+- The fetch union's uncapped diffs (TODO.md).
+Also waiting: a release tag for Gothab to pin (needs Bart's permission to tag).
+
 ## 2026-10-26: V1 format blockers (@calm-lynx) — Bart: "lets work through all the blockers in order"
 
 Done and pushed: varints, durable JSON → BinSchema, wide directories (chunking, design
