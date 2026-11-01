@@ -1090,6 +1090,25 @@
         { name: "logical_length", type: "uint64" },
       ],
     },
+    // The payload of a chunked content envelope (codec 5): a blob over 16 MiB stored
+    // as content-defined chunks, each an ordinary content blob under its own
+    // ContentId, in order. Every chunk but the last holds 1 to 4 MiB, the last 1 byte
+    // to 4 MiB, and their lengths sum to `logical_length`, which is over 16 MiB and
+    // at most 1 TiB. See docs/design/wheat-large-content.md.
+    ContentChunkManifestV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484b43 },
+        { name: "version", type: "uint8", const: 1 },
+        { name: "logical_length", type: "uint64" },
+        { name: "chunks", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentChunkRefV1" } },
+      ],
+    },
+    ContentChunkRefV1: {
+      sequence: [
+        { name: "id", type: "ContentId" },
+        { name: "length", type: "uint32" },
+      ],
+    },
     // One object or content blob a manifest accounts for, sorted by `id`.
     InventoryEntryV1: {
       sequence: [

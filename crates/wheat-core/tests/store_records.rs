@@ -630,3 +630,135 @@ fn bundle_records_round_trip_and_refuse_noncanonical_bytes() {
         Err(StoreRecordError::Decode(_))
     ));
 }
+
+const MIB: u32 = 1 << 20;
+
+fn chunked(lengths: &[u32]) -> ContentChunkManifestRecord {
+    ContentChunkManifestRecord {
+        logical_length: lengths.iter().map(|&length| u64::from(length)).sum(),
+        chunks: lengths
+            .iter()
+            .enumerate()
+            .map(|(index, &length)| ContentChunkRecord {
+                id: ContentId::from_digest([index as u8; 32]),
+                length,
+            })
+            .collect(),
+    }
+}
+
+fn manifest_error(manifest: &ContentChunkManifestRecord) -> StoreRecordError {
+    manifest.validate().unwrap_err()
+}
+
+#[test]
+fn chunk_manifest_round_trips_and_refuses_trailing_bytes_and_versions() {
+    // Just over the threshold: four longest chunks and one byte.
+    let manifest = chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 1]);
+    assert_eq!(manifest.logical_length, CHUNKED_CONTENT_THRESHOLD + 1);
+    let bytes = encode_content_chunk_manifest(&manifest).unwrap();
+    assert_eq!(
+        bytes.len(),
+        CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE + 5 * CONTENT_CHUNK_ENCODED_SIZE
+    );
+    assert_eq!(decode_content_chunk_manifest(&bytes).unwrap(), manifest);
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert_eq!(
+        decode_content_chunk_manifest(&trailing),
+        Err(StoreRecordError::NonCanonicalEncoding)
+    );
+    let mut version = bytes.clone();
+    version[4] = 2;
+    assert!(matches!(
+        decode_content_chunk_manifest(&version),
+        Err(StoreRecordError::Decode(_))
+    ));
+}
+
+#[test]
+fn chunk_manifest_refuses_what_the_chunker_would_not_produce() {
+    let invalid = |manifest: ContentChunkManifestRecord| {
+        let error = manifest_error(&manifest);
+        assert!(
+            matches!(error, StoreRecordError::InvalidChunkManifest(_)),
+            "{error:?}"
+        );
+        assert_eq!(encode_content_chunk_manifest(&manifest), Err(error));
+    };
+    // Exactly the threshold is stored whole.
+    invalid(chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB]));
+    // A short chunk before the last, and a long one.
+    invalid(chunked(&[4 * MIB, 4 * MIB, 4 * MIB, MIB - 1, 4 * MIB]));
+    invalid(chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB + 1, 4 * MIB]));
+    // An empty last chunk, and a long one.
+    invalid(chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, MIB, 0]));
+    invalid(chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB + 1]));
+    // Lengths that do not sum to the blob's.
+    let mut short = chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 1]);
+    short.logical_length += 1;
+    invalid(short);
+    // No chunks.
+    invalid(ContentChunkManifestRecord {
+        logical_length: CHUNKED_CONTENT_THRESHOLD + 1,
+        chunks: Vec::new(),
+    });
+    // Longer than the format takes.
+    invalid(ContentChunkManifestRecord {
+        logical_length: MAX_CHUNKED_CONTENT_BYTES + 1,
+        chunks: Vec::new(),
+    });
+}
+
+#[test]
+fn chunk_manifest_decode_validates_what_it_reads() {
+    let bytes =
+        encode_content_chunk_manifest(&chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 1])).unwrap();
+    // The last chunk's length, the record's last four bytes, set to zero.
+    let mut empty_last = bytes.clone();
+    let end = empty_last.len();
+    empty_last[end - 4..].fill(0);
+    assert!(matches!(
+        decode_content_chunk_manifest(&empty_last),
+        Err(StoreRecordError::InvalidChunkManifest(_))
+    ));
+    // The logical length, after the magic and version, set to zero.
+    let mut empty = bytes;
+    empty[5..13].fill(0);
+    assert!(matches!(
+        decode_content_chunk_manifest(&empty),
+        Err(StoreRecordError::InvalidChunkManifest(_))
+    ));
+}
+
+#[test]
+fn chunk_manifest_takes_the_longest_blob_cut_at_the_shortest_chunks() {
+    let manifest = ContentChunkManifestRecord {
+        logical_length: MAX_CHUNKED_CONTENT_BYTES,
+        chunks: vec![
+            ContentChunkRecord {
+                id: ContentId::from_digest([7; 32]),
+                length: MIN_CONTENT_CHUNK_BYTES,
+            };
+            MAX_CONTENT_CHUNKS
+        ],
+    };
+    let bytes = encode_content_chunk_manifest(&manifest).unwrap();
+    assert_eq!(
+        bytes.len(),
+        CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE + MAX_CONTENT_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE
+    );
+    assert_eq!(decode_content_chunk_manifest(&bytes).unwrap(), manifest);
+
+    let mut longer = manifest;
+    longer.logical_length += 1;
+    longer.chunks.push(ContentChunkRecord {
+        id: ContentId::from_digest([8; 32]),
+        length: 1,
+    });
+    assert!(matches!(
+        manifest_error(&longer),
+        StoreRecordError::InvalidChunkManifest(_)
+    ));
+}

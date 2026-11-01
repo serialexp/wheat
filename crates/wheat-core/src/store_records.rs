@@ -1,8 +1,8 @@
 //! Safe domain wrappers for the stores' small persisted records: the repository
 //! head, the content envelope header, snapshot and ownership manifests, a
 //! workspace materialization's progress log, a Git import's source binding, a
-//! served repository's location, and the control files a client keeps: store and
-//! workspace metadata, workspace pins and the remote binding.
+//! served repository's location, a chunked blob's manifest, and the control files a
+//! client keeps: store and workspace metadata, workspace pins and the remote binding.
 //!
 //! Like the physical segment records, none of these are `WheatObject` variants.
 
@@ -10,7 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use wheat_binschema::generated as wire;
 
-use crate::{ChangeId, RepositoryEnvelopeId, TreeId, ViewId};
+use crate::{ChangeId, ContentId, RepositoryEnvelopeId, TreeId, ViewId};
 
 /// Encoded size of a repository head with no publish receipts.
 pub const REPOSITORY_HEAD_ENCODED_SIZE: usize = 48;
@@ -24,6 +24,22 @@ pub const MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE: usize = 36;
 pub const INVENTORY_ENTRY_ENCODED_SIZE: usize = 40;
 /// Encoded size of a snapshot manifest with empty inventories.
 pub const SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE: usize = 86;
+/// A blob longer than this is stored as content-defined chunks and a manifest; one
+/// this long or shorter is stored whole.
+pub const CHUNKED_CONTENT_THRESHOLD: u64 = 16 << 20;
+/// The longest blob a chunk manifest describes.
+pub const MAX_CHUNKED_CONTENT_BYTES: u64 = 1 << 40;
+/// The shortest chunk but a blob's last.
+pub const MIN_CONTENT_CHUNK_BYTES: u32 = 1 << 20;
+/// The longest chunk.
+pub const MAX_CONTENT_CHUNK_BYTES: u32 = 4 << 20;
+/// The most chunks a manifest lists: the longest blob cut at the shortest chunks.
+pub const MAX_CONTENT_CHUNKS: usize =
+    (MAX_CHUNKED_CONTENT_BYTES / MIN_CONTENT_CHUNK_BYTES as u64) as usize;
+/// Encoded size of a chunk manifest with no chunks.
+pub const CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE: usize = 17;
+/// Encoded size of one chunk in a chunk manifest.
+pub const CONTENT_CHUNK_ENCODED_SIZE: usize = 36;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum StoreRecordError {
@@ -35,6 +51,8 @@ pub enum StoreRecordError {
     InvalidCount,
     #[error("store record's {0} is the nil UUID")]
     NilIdentity(&'static str),
+    #[error("chunk manifest is invalid: {0}")]
+    InvalidChunkManifest(&'static str),
 }
 
 /// The published generation and its repository envelope, and the receipts of recent
@@ -68,6 +86,70 @@ pub struct ContentEnvelopeHeaderRecord {
     pub codec: u8,
     pub stored_length: u64,
     pub logical_length: u64,
+}
+
+/// One chunk of a chunked blob.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentChunkRecord {
+    pub id: ContentId,
+    pub length: u32,
+}
+
+/// What a blob over [`CHUNKED_CONTENT_THRESHOLD`] is stored as: its chunks, in order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentChunkManifestRecord {
+    /// The blob's length; the chunks' lengths sum to it.
+    pub logical_length: u64,
+    pub chunks: Vec<ContentChunkRecord>,
+}
+
+impl ContentChunkManifestRecord {
+    /// Checks the manifest describes a blob that is chunked, within the format's size,
+    /// cut into chunks the chunker could produce. It cannot check the chunks are cut
+    /// where the chunker would cut them; a blob's identity is its bytes, so a manifest
+    /// cut elsewhere names the same content.
+    pub fn validate(&self) -> Result<(), StoreRecordError> {
+        if self.logical_length <= CHUNKED_CONTENT_THRESHOLD {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "the blob is short enough to store whole",
+            ));
+        }
+        if self.logical_length > MAX_CHUNKED_CONTENT_BYTES {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "the blob is longer than the format allows",
+            ));
+        }
+        if self.chunks.len() > MAX_CONTENT_CHUNKS {
+            return Err(StoreRecordError::InvalidCount);
+        }
+        let Some((last, rest)) = self.chunks.split_last() else {
+            return Err(StoreRecordError::InvalidChunkManifest("it has no chunks"));
+        };
+        if rest.iter().any(|chunk| {
+            !(MIN_CONTENT_CHUNK_BYTES..=MAX_CONTENT_CHUNK_BYTES).contains(&chunk.length)
+        }) {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "a chunk before the last is outside the chunk sizes",
+            ));
+        }
+        if !(1..=MAX_CONTENT_CHUNK_BYTES).contains(&last.length) {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "the last chunk is empty or too long",
+            ));
+        }
+        // At most `MAX_CONTENT_CHUNKS` chunks of at most 4 MiB: no overflow.
+        let total: u64 = self
+            .chunks
+            .iter()
+            .map(|chunk| u64::from(chunk.length))
+            .sum();
+        if total != self.logical_length {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "the chunks' lengths do not sum to the blob's",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One object or content blob a manifest accounts for.
@@ -383,6 +465,55 @@ pub fn decode_content_envelope_header(
         logical_length: w.logical_length,
     };
     checked(bytes, header, w.encode())
+}
+
+/// Encodes a valid chunk manifest.
+pub fn encode_content_chunk_manifest(
+    manifest: &ContentChunkManifestRecord,
+) -> Result<Vec<u8>, StoreRecordError> {
+    manifest.validate()?;
+    encoded(
+        wire::ContentChunkManifestV1Input {
+            logical_length: manifest.logical_length,
+            chunks: manifest
+                .chunks
+                .iter()
+                .map(|chunk| wire::ContentChunkRefV1 {
+                    id: wire::ContentId {
+                        digest: digest(*chunk.id.as_bytes()),
+                    },
+                    length: chunk.length,
+                })
+                .collect(),
+        }
+        .encode(),
+    )
+}
+/// Decodes exactly one canonical, valid chunk manifest.
+pub fn decode_content_chunk_manifest(
+    bytes: &[u8],
+) -> Result<ContentChunkManifestRecord, StoreRecordError> {
+    let w = wire::ContentChunkManifestV1::decode(bytes).map_err(decode_error)?;
+    if w.chunks.len() > MAX_CONTENT_CHUNKS {
+        return Err(StoreRecordError::InvalidCount);
+    }
+    let reencoded = w.encode();
+    let manifest = ContentChunkManifestRecord {
+        logical_length: w.logical_length,
+        chunks: w
+            .chunks
+            .into_iter()
+            .map(|chunk| {
+                Ok(ContentChunkRecord {
+                    id: ContentId::from_digest(digest_array(chunk.id.digest)?),
+                    length: chunk.length,
+                })
+            })
+            .collect::<Result<_, StoreRecordError>>()?,
+    };
+    let manifest = checked(bytes, manifest, reencoded)?;
+    manifest.validate()?;
+    Ok(manifest)
 }
 
 /// The generated encoder writes a `uint32` count as `len() as u32`, so a longer
