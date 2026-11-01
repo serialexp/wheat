@@ -785,6 +785,19 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Explicit history collapse, repack, and GC
 
+- `[x]` **Opening a packed store costs O(store).** Measured 2026-09-24: every
+  `PackedObjectStore::open` re-read and re-hashed the whole selected content pack
+  (`validate_content_generation`, 124 MiB). Done 2026-11-01, Bart: "validate it
+  once and keep it unless it changes". After reading a generation whole and
+  retiring the loose content it covers, a store records it in
+  `content-generations/checked` (`ContentGenerationCheckV1`): the generation and
+  each shard file's length and modification time. An open that finds the same
+  stamps skips both. Files changed in the two seconds before they are stamped are
+  not recorded, since a file system's coarse modification times could miss a
+  second write. Every read of a generation envelope still checks its digest, and a
+  copy of a store skips the record. Test: `an_unchanged_content_generation_is_read_whole_once`;
+  bench `packed_open`: a 206 MB generation opens in 243 ms read whole, 4 ms
+  checked (warm cache).
 - `[x]` **Read-only `wheat` commands cost a full validation (~30 s on Gothab).**
   `wheat labels` took as long as `wheat validate` because `label_service::load`
   called `validate_envelope`. Done 2026-10-22 (incremental validation step 9):

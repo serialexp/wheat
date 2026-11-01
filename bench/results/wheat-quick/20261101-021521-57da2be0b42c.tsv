@@ -1,0 +1,21 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261101-021521
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# packed_open	{"blob_bytes":4096,"blobs":50000}
+# release	true
+# rev	57da2be0b42c
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+packed_open.total.wall	4.7695586290000005	s
+packed_open.total.peak_rss	74989568	bytes
+packed_open.pack_bytes	205900000	bytes
+packed_open.first_open.wall	0.242582973	s
+packed_open.checked_open.wall	0.004036914	s
+run.total_time	4.770182253	s
+process.peak_rss	74989568	bytes
+suite.cases	1	count
+suite.case_failures	0	count

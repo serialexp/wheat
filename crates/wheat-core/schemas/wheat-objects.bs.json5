@@ -942,6 +942,26 @@
         { name: "fields_digest", type: "Digest256" },
       ],
     },
+    // `content-generations/checked`: the content generation a local packed store
+    // last read whole and found sound, once the loose content it covers was
+    // retired, with the stamps its shard files had then: each shard's manifest,
+    // then its pack. An open that finds the same stamps skips both. A cache: losing
+    // it costs one more full read.
+    ContentGenerationCheckV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484743 },
+        { name: "version", type: "uint16", const: 1 },
+        { name: "generation", type: "PhysicalContentGenerationV1" },
+        { name: "files", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "FileStampV1" } },
+      ],
+    },
+    // A file's length and modification time, in nanoseconds since the Unix epoch.
+    FileStampV1: {
+      sequence: [
+        { name: "length", type: "uint64" },
+        { name: "modified_nanos", type: "uint64" },
+      ],
+    },
 
     // Physical content-repack manifests. These are outside WheatObject: they
     // describe replaceable storage representation, not logical object identity.

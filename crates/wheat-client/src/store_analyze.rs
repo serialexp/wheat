@@ -678,15 +678,17 @@ fn walk_content_generations(
         let entry = entry?;
         let file_type = entry.file_type()?;
         if file_type.is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
             let is_selected_manifest = selected.is_some_and(|selected| {
-                entry.file_name().to_string_lossy()
-                    == format!(
-                        "{}-{}.manifest",
-                        selected.generation,
-                        hex_encode(&selected.manifest)
-                    )
+                name == format!(
+                    "{}-{}.manifest",
+                    selected.generation,
+                    hex_encode(&selected.manifest)
+                )
             });
-            let bytes = if is_selected_manifest {
+            // `checked` records the last full read of the selected generation
+            // (`wheat_core::ContentGenerationCheck`).
+            let bytes = if is_selected_manifest || name == "checked" {
                 &mut analysis.content_generation_selected
             } else {
                 &mut analysis.content_generation_unselected

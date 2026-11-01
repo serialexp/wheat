@@ -9,12 +9,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
 use thiserror::Error;
 use wheat_core::{
-    ContentId, ObjectId, PhysicalContentGeneration, RepositoryEnvelopeId, VerifiedContent,
+    ContentGenerationCheck, ContentId, FileStamp, ObjectId, PhysicalContentGeneration,
+    RepositoryEnvelopeId, VerifiedContent,
 };
 
 use super::{
@@ -428,20 +430,11 @@ impl PackedObjectStore {
             .reconcile(&mut catalog)
             .map_err(object_catalog_error)?;
         let content_generation = catalog.content_generation();
-        let content_manifest = validate_content_generation(root, content_generation)
-            .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
         // The catalog's process lock remains held by `catalog`. Cleanup follows
         // recovery and validation, but never mutates catalog authority.
-        retire_repacked_content(
-            &mut catalog,
-            &loose,
-            root,
-            content_generation,
-            content_manifest.as_ref(),
-        )
-        .and_then(|()| remove_partial_generations(root, content_generation.generation))
-        .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
-        drop(content_manifest);
+        check_content_generation(&mut catalog, &loose, root, content_generation)
+            .and_then(|()| remove_partial_generations(root, content_generation.generation))
+            .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
         let generation_bytes = generation_bytes(root, content_generation)?;
         Ok(Self {
             engine: Arc::new(PackedEngine {
@@ -747,6 +740,15 @@ impl PackedObjectStore {
             replacement_content,
             validated_content.as_ref(),
         )?;
+        if let Some(files) = content_generation_stamps(&self.engine.root, replacement_content)? {
+            record_content_generation_check(
+                &self.engine.root,
+                &ContentGenerationCheck {
+                    generation: replacement_content,
+                    files,
+                },
+            )?;
+        }
         self.engine.generation_bytes.store(
             generation_bytes(&self.engine.root, replacement_content)?,
             Ordering::Relaxed,
@@ -953,6 +955,111 @@ fn list_loose_content_ids(root: &Path) -> Result<Vec<ContentId>, RepackError> {
 /// materializes envelopes, so a 206k-entry / 120 MiB generation costs
 /// O(pack bytes + entries) I/O and O(64 KiB) scratch. Returns the
 /// authenticated manifest so callers need not read it a second time.
+/// Reads the selected content generation whole and retires the loose content it
+/// covers, unless the store did both before and the generation's files are as
+/// they were then (see [`ContentGenerationCheck`]). Every read of a generation's
+/// envelope still checks its digest, so this guards against files damaged or
+/// replaced while the store was closed.
+fn check_content_generation(
+    catalog: &mut PackedCatalog,
+    loose: &LooseDirectories,
+    root: &Path,
+    generation: PhysicalContentGeneration,
+) -> Result<(), RepackError> {
+    // Stamped before the read, so a file changed during it differs next time.
+    let stamps = content_generation_stamps(root, generation)?;
+    if let Some(files) = &stamps
+        && recorded_content_generation_check(root)
+            .is_some_and(|check| check.generation == generation && check.files == *files)
+    {
+        return Ok(());
+    }
+    let manifest = validate_content_generation(root, generation)?;
+    retire_repacked_content(catalog, loose, root, generation, manifest.as_ref())?;
+    if let Some(files) = stamps {
+        record_content_generation_check(root, &ContentGenerationCheck { generation, files })?;
+    }
+    Ok(())
+}
+
+/// How long before it is stamped a file must have last changed for its stamp to
+/// tell later changes apart. File systems keep modification times in coarse steps
+/// (a few milliseconds on ext4, two seconds on FAT), and a write within the step
+/// of the stamped one would keep its time.
+const SETTLED_FILE_AGE: Duration = Duration::from_secs(2);
+
+/// The stamps of `generation`'s shard files, each shard's manifest then its pack.
+/// `None` when there is no generation, or when a file has no modification time or
+/// changed too recently for its stamp to tell later changes apart.
+fn content_generation_stamps(
+    root: &Path,
+    generation: PhysicalContentGeneration,
+) -> Result<Option<Vec<FileStamp>>, RepackError> {
+    if generation == super::catalog::no_content_generation() {
+        return Ok(None);
+    }
+    let generations = root.join("content-generations");
+    let index = crate::content_generation::read_content_generation_index(&generations, generation)
+        .map_err(|error| match error {
+            crate::ContentRepackError::Io(error) => RepackError::Io(error),
+            error => RepackError::Corrupt(error.to_string()),
+        })?;
+    let Some(settled) = SystemTime::now().checked_sub(SETTLED_FILE_AGE) else {
+        return Ok(None);
+    };
+    let mut stamps = Vec::with_capacity(index.shards.len() * 2);
+    for shard in 0..index.shards.len() {
+        for path in [
+            content_generation_shard_manifest_path(&generations, generation.generation, shard),
+            content_generation_shard_pack_path(&generations, generation.generation, shard),
+        ] {
+            let metadata = fs::metadata(path)?;
+            let Some(modified) = metadata.modified().ok().filter(|time| *time < settled) else {
+                return Ok(None);
+            };
+            let Some(modified_nanos) = modified
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|since| u64::try_from(since.as_nanos()).ok())
+            else {
+                return Ok(None);
+            };
+            stamps.push(FileStamp {
+                length: metadata.len(),
+                modified_nanos,
+            });
+        }
+    }
+    Ok(Some(stamps))
+}
+
+fn content_generation_check_path(root: &Path) -> PathBuf {
+    root.join("content-generations")
+        .join(super::files::CONTENT_GENERATION_CHECK_FILE)
+}
+
+/// The store's [`ContentGenerationCheck`]. A missing or unreadable one is none: it
+/// only spares a read.
+fn recorded_content_generation_check(root: &Path) -> Option<ContentGenerationCheck> {
+    let bytes = fs::read(content_generation_check_path(root)).ok()?;
+    wheat_core::decode_content_generation_check(&bytes).ok()
+}
+
+/// Replaces the store's [`ContentGenerationCheck`]. Not synced: a check lost or torn
+/// by a crash only costs the next open a full read.
+fn record_content_generation_check(
+    root: &Path,
+    check: &ContentGenerationCheck,
+) -> Result<(), RepackError> {
+    let path = content_generation_check_path(root);
+    let bytes = wheat_core::encode_content_generation_check(check)
+        .map_err(|error| RepackError::Corrupt(error.to_string()))?;
+    let temporary = path.with_file_name(super::files::CONTENT_GENERATION_CHECK_PARTIAL);
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn validate_content_generation(
     root: &Path,
     generation: PhysicalContentGeneration,

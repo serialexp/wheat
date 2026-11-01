@@ -12,6 +12,9 @@ const PACKED_DIRECTORY: &str = "packed";
 const LOOSE_OBJECTS_DIRECTORY: &str = "loose-objects";
 const LOOSE_CONTENT_DIRECTORY: &str = "loose-content";
 const CONTENT_GENERATIONS_DIRECTORY: &str = "content-generations";
+/// The content generation the store last read whole, and its temporary file.
+pub(super) const CONTENT_GENERATION_CHECK_FILE: &str = "checked";
+pub(super) const CONTENT_GENERATION_CHECK_PARTIAL: &str = "checked.partial";
 /// The suffix of a loose write's temporary file (`.{id}.{pid}.tmp`).
 const LOOSE_TEMPORARY_SUFFIX: &str = ".tmp";
 
@@ -25,7 +28,8 @@ pub(crate) enum StoreFile {
     /// segment), and anything this module does not know, which is copied to be safe.
     Mutable,
     /// Not the store's state: its lock, the locator index (rebuilt when the copy is
-    /// opened), and the temporary and unpublished files opening a store removes.
+    /// opened), the record of its last content check (its file times do not carry
+    /// over), and the temporary and unpublished files opening a store removes.
     Skipped,
 }
 
@@ -54,6 +58,10 @@ pub(crate) fn classify(relative: &Path) -> StoreFile {
         {
             StoreFile::Skipped
         }
+        [
+            CONTENT_GENERATIONS_DIRECTORY,
+            CONTENT_GENERATION_CHECK_FILE | CONTENT_GENERATION_CHECK_PARTIAL,
+        ] => StoreFile::Skipped,
         [
             LOOSE_OBJECTS_DIRECTORY | LOOSE_CONTENT_DIRECTORY | CONTENT_GENERATIONS_DIRECTORY,
             ..,
@@ -85,6 +93,8 @@ mod tests {
             ("loose-objects/ab/cdef", StoreFile::Immutable),
             ("loose-content/ab/cdef", StoreFile::Immutable),
             ("content-generations/2/pack", StoreFile::Immutable),
+            ("content-generations/checked", StoreFile::Skipped),
+            ("content-generations/checked.partial", StoreFile::Skipped),
             ("packed/catalog.lock", StoreFile::Skipped),
             ("packed/catalog-locator.sqlite3", StoreFile::Skipped),
             ("packed/catalog-locator.sqlite3-wal", StoreFile::Skipped),

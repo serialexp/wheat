@@ -10,7 +10,9 @@
 //!
 //! Layout under `content-generations/`:
 //! - `{generation}-{index digest}.manifest`: the top-level index;
-//! - `{generation}/shard-{n}.manifest` and `{generation}/shard-{n}.pack`.
+//! - `{generation}/shard-{n}.manifest` and `{generation}/shard-{n}.pack`;
+//! - `checked`: the generation a local store last read whole, so that opening it
+//!   again can skip the read (`wheat_core::ContentGenerationCheck`).
 
 use std::io;
 use std::path::{Path, PathBuf};

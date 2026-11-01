@@ -7655,6 +7655,138 @@ impl RepackIntentV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationCheckV1Input {
+    pub generation: PhysicalContentGenerationV1,
+    pub files: Vec<FileStampV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGenerationCheckV1Output {
+    pub magic: u32,
+    pub version: u16,
+    pub generation: PhysicalContentGenerationV1,
+    pub files: Vec<FileStampV1>,
+}
+
+pub type ContentGenerationCheckV1 = ContentGenerationCheckV1Output;
+
+impl ContentGenerationCheckV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464354627);
+        encoder.write_u16_be(1);
+        self.generation.encode_into(encoder)?;
+        encoder.write_u32_be(self.files.len() as u32);
+        for item in &self.files {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ContentGenerationCheckV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464354627u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464354627, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_u16_be()?;
+        if version != 1u16 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let generation = PhysicalContentGenerationV1::decode_with_decoder(decoder)?;
+        let length = decoder.read_u32_be()? as usize;
+        let mut files = Vec::with_capacity(decoder.capacity_hint_sized(length, 16));
+        for _ in 0..length {
+            let item = FileStampV1::decode_with_decoder(decoder)?;
+            files.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            generation,
+            files,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentGenerationCheckV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentGenerationCheckV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentGenerationCheckV1Output> for ContentGenerationCheckV1Input {
+    fn from(o: ContentGenerationCheckV1Output) -> Self {
+        Self {
+            generation: o.generation,
+            files: o.files,
+        }
+    }
+}
+
+impl From<ContentGenerationCheckV1Input> for ContentGenerationCheckV1Output {
+    fn from(i: ContentGenerationCheckV1Input) -> Self {
+        Self {
+            magic: 1464354627u32,
+            version: 1u16,
+            generation: i.generation,
+            files: i.files,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileStampV1 {
+    pub length: u64,
+    pub modified_nanos: u64,
+}
+
+impl FileStampV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u64_be(self.length);
+        encoder.write_u64_be(self.modified_nanos);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u64_be()?;
+        let modified_nanos = decoder.read_u64_be()?;
+        Ok(Self {
+            length,
+            modified_nanos,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContentGenerationEntryV1 {
     pub id: ContentId,
     pub envelope_digest: Digest256,

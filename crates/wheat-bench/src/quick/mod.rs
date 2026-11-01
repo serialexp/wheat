@@ -36,6 +36,7 @@ mod network_export;
 mod network_import;
 mod network_publish;
 mod packed_append;
+mod packed_open;
 mod publish_content;
 mod publish_contention;
 mod remote_latency;
@@ -76,6 +77,7 @@ pub const CASES: &[&str] = &[
     bootstrap_validate::NAME,
     packed_append::NAME,
     content_repack_plan::NAME,
+    packed_open::NAME,
     sharded_manifest::NAME,
     git_export_notes::NAME,
     git_pull_incremental::NAME,
@@ -241,6 +243,7 @@ pub fn run_case(
         bootstrap_validate::NAME => bootstrap_validate::run(&context),
         packed_append::NAME => packed_append::run(&context),
         content_repack_plan::NAME => content_repack_plan::run(&context),
+        packed_open::NAME => packed_open::run(&context),
         sharded_manifest::NAME => sharded_manifest::run(&context),
         git_export_notes::NAME => git_export_notes::run(&context),
         git_pull_incremental::NAME => git_pull_incremental::run(&context),

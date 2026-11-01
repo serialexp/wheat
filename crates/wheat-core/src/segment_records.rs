@@ -168,6 +168,21 @@ pub struct RepackIntent {
     pub new: PhysicalCatalogRef,
 }
 
+/// A file's length and modification time, in nanoseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileStamp {
+    pub length: u64,
+    pub modified_nanos: u64,
+}
+
+/// The content generation a local packed store last read whole and found sound,
+/// with the stamps its shard files had then: each shard's manifest, then its pack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentGenerationCheck {
+    pub generation: PhysicalContentGeneration,
+    pub files: Vec<FileStamp>,
+}
+
 /// Hard allocation bound for an authenticated catalog snapshot.
 pub const MAX_PHYSICAL_CATALOG_SEGMENTS: usize = 1_000_000;
 
@@ -685,6 +700,50 @@ pub fn decode_remote_catalog_head(bytes: &[u8]) -> Result<PhysicalCatalogRef, Se
     let encoded = w.encode();
     let head = catalog_ref_domain(w.head)?;
     checked(bytes, head, encoded)
+}
+
+/// Encodes `content-generations/checked`.
+pub fn encode_content_generation_check(
+    check: &ContentGenerationCheck,
+) -> Result<Vec<u8>, SegmentRecordError> {
+    wire::ContentGenerationCheckV1Input {
+        generation: wire::PhysicalContentGenerationV1 {
+            generation: check.generation.generation,
+            manifest: digest(check.generation.manifest),
+        },
+        files: check
+            .files
+            .iter()
+            .map(|file| wire::FileStampV1 {
+                length: file.length,
+                modified_nanos: file.modified_nanos,
+            })
+            .collect(),
+    }
+    .encode()
+    .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))
+}
+pub fn decode_content_generation_check(
+    bytes: &[u8],
+) -> Result<ContentGenerationCheck, SegmentRecordError> {
+    let w = wire::ContentGenerationCheckV1::decode(bytes)
+        .map_err(|e| SegmentRecordError::Decode(format!("{e:?}")))?;
+    let encoded = w.encode();
+    let check = ContentGenerationCheck {
+        generation: PhysicalContentGeneration {
+            generation: w.generation.generation,
+            manifest: digest_array(w.generation.manifest)?,
+        },
+        files: w
+            .files
+            .into_iter()
+            .map(|file| FileStamp {
+                length: file.length,
+                modified_nanos: file.modified_nanos,
+            })
+            .collect(),
+    };
+    checked(bytes, check, encoded)
 }
 
 /// Encodes `repack.intent` with the digest of its fields.

@@ -12,7 +12,7 @@ a shared object store for blobs; Gothab's server does authentication and reposit
 authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
 formats freeze. Items already listed elsewhere that this also needs: chunked uploads reassembled in
-memory, opening a packed store costing O(store), and
+memory, and
 `wheat gc` /
 server-authoritative remote maintenance.
 
@@ -392,14 +392,6 @@ operation; repack is independently useful and may run without either squash or G
     with a revision-wide default of 250,000 (`DEFAULT_MAX_REVISION_EDITS`),
     which covers both. Retry the imports once it lands.
   - Bare clones are in `/tmp/wheat-bigrepos/`.
-- `[ ]` **Opening a packed store costs O(store).** Measured 2026-09-24 on the
-  disposable repacked import: every `PackedObjectStore::open` re-reads and
-  re-hashes the whole selected content pack (`validate_content_generation`,
-  124 MiB) and tries one `unlink` per manifest entry
-  (`retire_repacked_content`, 208,190 failing syscalls). Make store open
-  O(changes), not O(store). (The full validation the same measurement found in
-  read-only commands is gone: TODO_DONE.md.) Retirement now looks only at the loose
-  content files the catalog records (2026-10-26); the pack validation remains.
 - `[ ]` **Remote packed store runs on a different catalog format than local
   stores.** The remote store (`crates/wheat-store/src/remote_packed/catalog.rs`)
   still runs on the `SegmentCatalogRecordV1` chain, while local stores now use only

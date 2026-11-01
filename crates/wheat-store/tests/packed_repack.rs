@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::time::Instant;
+use std::fs::{self, File};
+use std::time::{Duration, Instant, SystemTime};
 
 use wheat_core::{Repository, Tree};
 use wheat_store::{
@@ -167,6 +167,72 @@ async fn same_length_corrupt_generation_never_deletes_loose_fallback() {
 
     assert!(PackedObjectStore::open(&storage).is_err());
     assert!(loose_path.is_file());
+}
+
+/// A store that read its content generation whole skips the read when it opens
+/// again while the generation's files keep their length and modification time, and
+/// reads it again once one changes.
+#[tokio::test]
+async fn an_unchanged_content_generation_is_read_whole_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = directory.path().join("storage");
+    let objects = PackedObjectStore::open(&storage).unwrap();
+    let content = objects.content_store();
+    let heads = LocalPublicationStore::new(directory.path().join("repository.head"));
+    let id = content.put(&vec![b'x'; 256 * 1024]).unwrap();
+    RepositoryPublisher::new(&objects, &content, &heads)
+        .initialize(&Repository::new(Tree::new()))
+        .await
+        .unwrap();
+    let plan = objects
+        .plan_repack(&heads, RepackOptions::default())
+        .await
+        .unwrap();
+    objects.execute_repack(&heads, plan).unwrap();
+    drop(content);
+    drop(objects);
+
+    // A file changed in the last two seconds could change again without its
+    // modification time moving, so the files must be older to be recorded.
+    let checked = storage.join("content-generations/checked");
+    assert!(!checked.exists());
+    let generation = storage.join("content-generations/0");
+    let set_modified = |path: &std::path::Path, ago: u64| {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(ago))
+            .unwrap();
+    };
+    let an_hour = 3600;
+    for entry in fs::read_dir(&generation).unwrap() {
+        set_modified(&entry.unwrap().path(), an_hour);
+    }
+    drop(PackedObjectStore::open(&storage).unwrap());
+    assert!(checked.is_file());
+
+    // Damaged with its stamp kept, the pack is not read at open; a read of the
+    // content still checks it.
+    let pack = generation.join("shard-000000.pack");
+    let modified = fs::metadata(&pack).unwrap().modified().unwrap();
+    let mut bytes = fs::read(&pack).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&pack, bytes).unwrap();
+    File::options()
+        .write(true)
+        .open(&pack)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let reopened = PackedObjectStore::open(&storage).unwrap();
+    assert!(reopened.content_store().get(id).is_err());
+    drop(reopened);
+
+    // With its stamp changed, the open reads the generation again.
+    set_modified(&pack, 60);
+    assert!(PackedObjectStore::open(&storage).is_err());
 }
 
 #[tokio::test]
