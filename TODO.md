@@ -202,7 +202,10 @@ Performance, most serious first:
   workspace passes `MAX_TOTAL_READ_BYTES` (1 GiB).
 - `[ ]` **The server reassembles a chunked upload in memory (scanner only).** A blob
   that comes as `ContentChunk`s is held whole until its last chunk, up to 1 GiB
-  (`MAX_CONTENT_SIZE`). Stream large blobs to disk instead.
+  (`MAX_CONTENT_SIZE`). Stream large blobs to disk instead. Every other content
+  path holds a blob whole too. Bart (2026-11-01): stream everything, and store only
+  the changed chunks of very large blobs: `docs/design/wheat-large-content.md`
+  (proposed; Q1–Q5 open).
 - `[ ]` **Re-adding 20,000 files to one change takes 5.4 s (2026-10-05).** Release,
   NVMe, `wheat add` of 20,000 modified files to a change that already edits them
   all (`WHEAT_TRACE_SUMMARY=1`): `persist_edits` 1.6 s, the first

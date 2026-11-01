@@ -8,16 +8,19 @@ Phase 3/4 and no wheat dependency yet. Meanwhile I harden Wheat.
 
 Done (not pushed): blocking store work off the async threads (f9c7775 fetch,
 e6fff2c publish with an owned-handle stage, d61bf36 local head store), batched delta
-writes and `existing_ids` without listing the bucket (a881e5b), and the structural
-walk's radix revisit cap (3b1b36a).
+writes and `existing_ids` without listing the bucket (a881e5b), the structural
+walk's radix revisit cap (3b1b36a), the same cap in every radix diff, so the fetch
+union is bounded (57da2be, Bart: "something like 1000 or 10k", 10,000), and a
+packed store reading its content generation whole only once (491063f, Bart:
+"validate it once and keep it unless it changes").
 
-Waiting on Bart (asked 2026-10-30, no answer yet; options are in the TODO items):
-- Chunked uploads held in memory. Whole blobs are everywhere in the content store,
-  so the options are: spool plus a streaming store of raw records; chunked large
-  blobs (a format change); or lowering `MAX_CONTENT_SIZE`.
-- Packed store open is O(store). Options: check structure only; validate once and
-  record it; or validate in the background.
-- The fetch union's uncapped diffs (TODO.md).
+Large blobs (2026-11-01): Bart chose to stream everything and to store only the
+changed chunks of very large blobs. `docs/design/wheat-large-content.md` is
+proposed with Q1–Q5 open (threshold, chunk sizes, chunk identity, the one-file
+limit, the chunker); nothing is built yet.
+
+Not yet measured cleanly: the fetch_incremental A/B for 57da2be ran under a load
+average of 32 (counts unchanged, wall times noise); rerun when the machine is quiet.
 Also waiting: a release tag for Gothab to pin (needs Bart's permission to tag).
 
 ## 2026-10-26: V1 format blockers (@calm-lynx) — Bart: "lets work through all the blockers in order"
