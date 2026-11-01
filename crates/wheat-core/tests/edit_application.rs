@@ -461,3 +461,131 @@ fn one_revision_applies_more_edits_than_one_file_may_hold() {
     assert_eq!(result.tree.len(), files * 2);
     assert!(result.tree.values().all(|value| value.content == new_id));
 }
+
+/// A source over `blobs` that records which IDs it resolved and which it confirmed.
+#[derive(Default)]
+struct Recording {
+    blobs: BTreeMap<ContentId, VerifiedContent>,
+    resolved: Vec<ContentId>,
+    confirmed: Vec<ContentId>,
+}
+
+impl wheat_core::edit_application::ContentSource for &mut Recording {
+    type Error = String;
+
+    fn resolve(&mut self, id: ContentId) -> Result<VerifiedContent, String> {
+        self.resolved.push(id);
+        self.blobs.get(&id).cloned().ok_or_else(|| "missing".into())
+    }
+
+    fn confirm(&mut self, id: ContentId) -> Result<Option<VerifiedContent>, String> {
+        self.confirmed.push(id);
+        self.blobs
+            .get(&id)
+            .map(|_| None)
+            .ok_or_else(|| "missing".into())
+    }
+}
+
+#[test]
+fn a_whole_file_replacement_confirms_its_content_without_reading_it() {
+    let (old_id, old) = blob(b"old");
+    let (new_id, new) = blob(b"new");
+    let value = |content| FileValue {
+        content,
+        kind: FileKind::Regular,
+    };
+    let mut target = Tree::new();
+    target.insert("f".into(), value(old_id));
+    let edit = EditRecord::new(
+        "f",
+        EditOperation::ExactFile {
+            expected: Some(value(old_id)),
+            replacement: Some(value(new_id)),
+        },
+    )
+    .unwrap();
+    let mut source = Recording {
+        blobs: BTreeMap::from([(old_id, old), (new_id, new)]),
+        ..Recording::default()
+    };
+    let result = apply_edits(
+        &target,
+        [(edit.id(), edit)],
+        &mut source,
+        ApplicationLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(result.tree.get("f"), Some(&value(new_id)));
+    assert!(source.resolved.is_empty(), "read {:?}", source.resolved);
+    let mut confirmed = source.confirmed.clone();
+    confirmed.sort();
+    let mut expected = vec![old_id, new_id];
+    expected.sort();
+    assert_eq!(confirmed, expected);
+
+    // Content that cannot be confirmed still fails the application.
+    source.blobs.remove(&new_id);
+    let edit = EditRecord::new(
+        "f",
+        EditOperation::ExactFile {
+            expected: Some(value(old_id)),
+            replacement: Some(value(new_id)),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        apply_edits(
+            &target,
+            [(edit.id(), edit)],
+            &mut source,
+            ApplicationLimits::default(),
+        ),
+        Err(wheat_core::edit_application::ApplicationError::Resolve { id, .. }) if id == new_id
+    ));
+}
+
+#[test]
+fn a_guarded_edit_reads_the_file_it_matches() {
+    let (source_id, source_blob) = blob(b"a\nb\nc\n");
+    let parts = [b"a\n".as_slice(), b"b\n", b"B\n", b"c\n"];
+    let mut source = Recording {
+        blobs: parts.into_iter().map(blob).collect(),
+        ..Recording::default()
+    };
+    source.blobs.insert(source_id, source_blob);
+    let edit = EditRecord::new(
+        "f",
+        EditOperation::GuardedText {
+            kind: FileKind::Regular,
+            before: ContentId::of(b"a\n"),
+            expected: ContentId::of(b"b\n"),
+            replacement: ContentId::of(b"B\n"),
+            after: ContentId::of(b"c\n"),
+            start_anchor: false,
+            end_anchor: false,
+        },
+    )
+    .unwrap();
+    let mut target = Tree::new();
+    target.insert(
+        "f".into(),
+        FileValue {
+            content: source_id,
+            kind: FileKind::Regular,
+        },
+    );
+    apply_edits(
+        &target,
+        [(edit.id(), edit)],
+        &mut source,
+        ApplicationLimits::default(),
+    )
+    .unwrap();
+    assert!(source.resolved.contains(&source_id));
+    assert!(
+        source.confirmed.is_empty(),
+        "confirmed {:?}",
+        source.confirmed
+    );
+}

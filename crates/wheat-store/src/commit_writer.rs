@@ -171,7 +171,7 @@ impl<'a, O: ImmutableObjectStore> PersistedCommitWriter<'a, O> {
                 .edits
                 .iter()
                 .map(|(id, edit)| (*id, edit.clone())),
-            |id| self.content.resolve(id),
+            wheat_core::FromContentIo(self.content),
             self.limits,
         )
         .map_err(CommitWriterError::Application)?;

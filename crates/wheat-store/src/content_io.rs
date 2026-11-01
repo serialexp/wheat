@@ -11,6 +11,10 @@ impl ContentIo for ContentStore {
         self.get_verified(id)
     }
 
+    fn confirm(&self, id: ContentId) -> Result<(), Self::Error> {
+        ContentStore::confirm(self, id)
+    }
+
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
         self.put_verified(content)
     }

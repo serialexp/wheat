@@ -17,11 +17,14 @@ use wheat_core::{
     decode_content_chunk_part, encode_content_chunk_part,
 };
 
-use crate::ContentStoreError;
+use crate::{ContentStore, ContentStoreError};
 
 /// Past the fewest chunks, a part ends after one chunk in this many on average, so
 /// parts hold about 4,096 chunks.
 const PART_DIVISOR: u64 = 3072;
+
+/// How many chunk IDs [`ContentStore::confirm`] looks up at once.
+const CONFIRM_BATCH: usize = 1024;
 
 /// Whether a part holding `count` chunks, the last of them `last`, ends there.
 fn part_ends(count: usize, last: ContentId) -> bool {
@@ -176,6 +179,84 @@ impl ManifestChunks {
             .map_err(invalid)?;
         self.chunks = record.chunks.into_iter();
         Ok(self.chunks.next())
+    }
+}
+
+impl ContentStore {
+    /// The manifest of `id` when it is stored as chunks; `None` for a blob stored
+    /// whole.
+    pub fn chunk_manifest(
+        &self,
+        id: ContentId,
+    ) -> Result<Option<ContentChunkManifestRecord>, ContentStoreError> {
+        if !crate::content_store::is_chunked_length(self.logical_length(id)?) {
+            return Ok(None);
+        }
+        match self.stored(id)? {
+            crate::content_store::StoredContent::Envelope(header, payload)
+                if header.codec == crate::codec::Codec::Chunked =>
+            {
+                crate::content_stream::chunk_manifest(id, header, payload).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Checks that the chunks `manifest` names, all stored here, hold the bytes of
+    /// `id`: reads them in order through a hasher, a chunk at a time.
+    pub fn check_manifest(
+        &self,
+        id: ContentId,
+        manifest: &ContentChunkManifestRecord,
+    ) -> Result<(), ContentStoreError> {
+        let mut hasher = ContentId::hasher();
+        let mut chunks = ManifestChunks::new(id, manifest.clone());
+        while let Some(chunk) = chunks.next(|part, max| self.get_bounded(part, max))? {
+            let bytes = self.get_bounded(chunk.id, chunk.length as usize)?;
+            if bytes.len() != chunk.length as usize {
+                return Err(ContentStoreError::InvalidFormat {
+                    id,
+                    reason: format!("chunk {} is not as long as its manifest says", chunk.id),
+                });
+            }
+            hasher.update(&bytes);
+        }
+        let actual = ContentId::from_digest(*hasher.finalize().as_bytes());
+        if actual != id {
+            return Err(ContentStoreError::Corrupt {
+                expected: id,
+                actual,
+            });
+        }
+        Ok(())
+    }
+    /// Confirms `id` is stored and readable without returning its bytes. A blob
+    /// stored whole is read and checked against its ID. A chunked blob's manifest
+    /// and parts are read and every chunk they name looked up, without reading the
+    /// chunks: each was checked against its ID when it was stored, and the manifest
+    /// against the blob's.
+    pub fn confirm(&self, id: ContentId) -> Result<(), ContentStoreError> {
+        let Some(manifest) = self.chunk_manifest(id)? else {
+            return self.get_verified(id).map(drop);
+        };
+        let mut chunks = ManifestChunks::new(id, manifest);
+        let mut batch = Vec::with_capacity(CONFIRM_BATCH);
+        while let Some(chunk) = chunks.next(|part, max| self.get_bounded(part, max))? {
+            batch.push(chunk.id);
+            if batch.len() == CONFIRM_BATCH {
+                self.confirm_present(&batch)?;
+                batch.clear();
+            }
+        }
+        self.confirm_present(&batch)
+    }
+
+    fn confirm_present(&self, ids: &[ContentId]) -> Result<(), ContentStoreError> {
+        let present = self.existing_ids(ids)?;
+        match ids.iter().find(|id| !present.contains(id)) {
+            Some(&missing) => Err(ContentStoreError::Missing(missing)),
+            None => Ok(()),
+        }
     }
 }
 

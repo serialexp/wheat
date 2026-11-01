@@ -871,7 +871,7 @@ async fn verify_mapping<O: ImmutableObjectStore>(
     let replay = apply_edits(
         &target,
         definitions.iter().cloned(),
-        |id| content.get_verified(id),
+        wheat_core::FromContentIo(content),
         import_application_limits(),
     )
     .map_err(|_| bad("edit replay"))?;

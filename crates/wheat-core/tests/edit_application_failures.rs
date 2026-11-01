@@ -210,6 +210,29 @@ fn resolved_byte_limit_is_scoped_to_one_path_group() {
 
 #[test]
 fn one_path_group_cannot_exceed_resolved_byte_limit() {
+    let (tree, edit, blobs) = fixture(b"an old line\n", FileKind::Regular);
+    let held: usize = blobs.values().map(|blob| blob.bytes().len()).sum();
+    let limits = ApplicationLimits {
+        max_resolved_bytes: held - 1,
+        ..ApplicationLimits::default()
+    };
+    assert!(matches!(
+        apply_edits(
+            &tree,
+            [(edit.id(), edit)],
+            |id| blobs.get(&id).cloned().ok_or("missing"),
+            limits,
+        ),
+        Err(ApplicationError::ByteLimitExceeded {
+            generated: false,
+            actual,
+            limit,
+        }) if actual > limit && limit == held - 1
+    ));
+}
+
+#[test]
+fn a_whole_file_replacement_holds_no_content_against_the_limit() {
     let bytes = b"oversized".to_vec();
     let content = ContentId::of(&bytes);
     let edit = EditRecord::new(
@@ -224,27 +247,21 @@ fn one_path_group_cannot_exceed_resolved_byte_limit() {
     )
     .unwrap();
     let limits = ApplicationLimits {
-        max_resolved_bytes: bytes.len() - 1,
+        max_resolved_bytes: 0,
         ..ApplicationLimits::default()
     };
-
-    assert_eq!(
-        apply_edits(
-            &Tree::new(),
-            [(edit.id(), edit)],
-            |id| {
-                (id == content)
-                    .then(|| VerifiedContent::new(bytes.clone()))
-                    .ok_or("missing")
-            },
-            limits,
-        ),
-        Err(ApplicationError::ByteLimitExceeded {
-            generated: false,
-            actual: bytes.len(),
-            limit: bytes.len() - 1,
-        })
-    );
+    let result = apply_edits(
+        &Tree::new(),
+        [(edit.id(), edit)],
+        |id| {
+            (id == content)
+                .then(|| VerifiedContent::new(bytes.clone()))
+                .ok_or("missing")
+        },
+        limits,
+    )
+    .unwrap();
+    assert_eq!(result.tree["a"].content, content);
 }
 
 #[test]

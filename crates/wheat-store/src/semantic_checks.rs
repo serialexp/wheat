@@ -300,7 +300,7 @@ where
         let replay = wheat_core::edit_application::apply_edits(
             &target,
             definitions.iter().cloned(),
-            |id| self.reader.content.get_verified(id),
+            wheat_core::FromContentIo(self.reader.content),
             limits,
         )
         .map_err(|_| invalid("edit replay failed"))?;

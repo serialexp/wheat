@@ -226,6 +226,50 @@ fn a_reader_refuses_a_chunk_that_is_not_what_the_manifest_names() {
 }
 
 #[test]
+fn confirming_a_chunked_blob_looks_its_chunks_up_without_reading_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let bytes = noise(8, 20 * MIB);
+    let (id, _) = write(&store, &bytes, MIB);
+    store.confirm(id).unwrap();
+    let manifest_path = store.path(id);
+    let chunks = files(directory.path())
+        .into_iter()
+        .filter(|path| *path != manifest_path)
+        .collect::<Vec<_>>();
+    assert!(chunks.len() >= 2);
+
+    // A chunk whose file holds another chunk's bytes goes unread, so unnoticed: each
+    // chunk was checked when it was stored.
+    let swapped = std::fs::read(&chunks[0]).unwrap();
+    std::fs::copy(&chunks[1], &chunks[0]).unwrap();
+    store.confirm(id).unwrap();
+    std::fs::write(&chunks[0], swapped).unwrap();
+
+    // A missing chunk is found.
+    std::fs::remove_file(&chunks[0]).unwrap();
+    assert!(matches!(
+        store.confirm(id),
+        Err(ContentStoreError::Missing(missing)) if store.path(missing) == chunks[0]
+    ));
+}
+
+#[test]
+fn confirming_a_blob_stored_whole_reads_and_checks_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let (id, _) = write(&store, &noise(9, MIB), MIB);
+    let (other, _) = write(&store, &noise(10, MIB), MIB);
+    store.confirm(id).unwrap();
+    std::fs::copy(store.path(other), store.path(id)).unwrap();
+    assert!(store.confirm(id).is_err());
+    assert!(matches!(
+        store.confirm(ContentId::of(b"never stored")),
+        Err(ContentStoreError::Missing(_))
+    ));
+}
+
+#[test]
 fn a_chunked_blob_is_no_delta_base() {
     let directory = tempfile::tempdir().unwrap();
     let store = ContentStore::new(directory.path());

@@ -106,17 +106,47 @@ pub enum ApplicationError {
     Guarded(guarded::Error),
 }
 
-/// Applies `edits` deterministically. Every definition is matched against the immutable target.
-#[tracing::instrument(level = "debug", skip_all)]
-pub fn apply_edits<E>(
-    target: &Tree,
-    edit_iter: impl IntoIterator<Item = (EditId, EditRecord)>,
-    mut resolve: impl FnMut(ContentId) -> Result<VerifiedContent, E>,
-    limits: ApplicationLimits,
-) -> Result<ApplicationResult, ApplicationError>
+/// The content an application reads: the bytes guarded edits match against, and a check
+/// that content a whole-file edit only names is present and intact.
+///
+/// A closure resolving content is a source that confirms by resolving.
+pub trait ContentSource {
+    type Error: std::fmt::Display;
+
+    fn resolve(&mut self, id: ContentId) -> Result<VerifiedContent, Self::Error>;
+
+    /// Confirms `id` is present and intact without holding its bytes. A source that can
+    /// only confirm by reading returns what it read, for the application to check against
+    /// `id`; by default it resolves.
+    fn confirm(&mut self, id: ContentId) -> Result<Option<VerifiedContent>, Self::Error> {
+        self.resolve(id).map(Some)
+    }
+}
+
+impl<F, E> ContentSource for F
 where
+    F: FnMut(ContentId) -> Result<VerifiedContent, E>,
     E: std::fmt::Display,
 {
+    type Error = E;
+
+    fn resolve(&mut self, id: ContentId) -> Result<VerifiedContent, E> {
+        self(id)
+    }
+}
+
+/// Applies `edits` deterministically. Every definition is matched against the immutable target.
+///
+/// Only a path a guarded edit touches has its content read. Content a whole-file edit
+/// names, and a target value only whole-file edits touch, is confirmed instead: a file's
+/// whole-file replacement costs a lookup, however long the file.
+#[tracing::instrument(level = "debug", skip_all)]
+pub fn apply_edits(
+    target: &Tree,
+    edit_iter: impl IntoIterator<Item = (EditId, EditRecord)>,
+    mut source: impl ContentSource,
+    limits: ApplicationLimits,
+) -> Result<ApplicationResult, ApplicationError> {
     let mut edits: Vec<(EditId, EditRecord)> = Vec::new();
     for edit in edit_iter {
         if edits.len() == limits.max_edits {
@@ -161,10 +191,15 @@ where
     for (path, group) in paths {
         // Resolve and authenticate one path group's content, then drop it before advancing.
         // Definitions are resolved even when kind/precondition checks will fail so missing or
-        // corrupt records remain fatal independently of the target being applied to.
+        // corrupt records remain fatal independently of the target being applied to. Only
+        // guarded edits read bytes; the rest is confirmed.
         let mut needed = BTreeSet::new();
+        let mut named = BTreeSet::new();
+        let guarded = group
+            .iter()
+            .any(|(_, record)| matches!(record.operation, EditOperation::GuardedText { .. }));
         if let Some(value) = target.get(&path) {
-            needed.insert(value.content);
+            if guarded { &mut needed } else { &mut named }.insert(value.content);
         }
         for (_, record) in &group {
             match &record.operation {
@@ -178,7 +213,7 @@ where
                 EditOperation::ExactFile {
                     expected,
                     replacement,
-                } => needed.extend(
+                } => named.extend(
                     expected
                         .iter()
                         .chain(replacement.iter())
@@ -186,13 +221,31 @@ where
                 ),
             }
         }
+        for &id in named.difference(&needed) {
+            let read = source
+                .confirm(id)
+                .map_err(|error| ApplicationError::Resolve {
+                    id,
+                    message: error.to_string(),
+                })?;
+            if let Some(content) = read
+                && content.id() != id
+            {
+                return Err(ApplicationError::CorruptContent {
+                    expected: id,
+                    actual: content.id(),
+                });
+            }
+        }
         let mut cache = BTreeMap::<ContentId, Vec<u8>>::new();
         let mut resolved_total = 0usize;
         for id in needed {
-            let content = resolve(id).map_err(|error| ApplicationError::Resolve {
-                id,
-                message: error.to_string(),
-            })?;
+            let content = source
+                .resolve(id)
+                .map_err(|error| ApplicationError::Resolve {
+                    id,
+                    message: error.to_string(),
+                })?;
             if content.id() != id {
                 return Err(ApplicationError::CorruptContent {
                     expected: id,

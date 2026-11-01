@@ -1160,7 +1160,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let output = wheat_core::edit_application::apply_edits(
             &flat,
             edits.iter().map(|(id, edit)| (*id, edit.clone())),
-            |id| self.content.resolve(id),
+            wheat_core::FromContentIo(self.content),
             limits,
         )
         .map_err(|error| RepositoryError::EditApplication(format!("{error:?}")))?;

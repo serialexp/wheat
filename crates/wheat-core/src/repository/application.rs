@@ -13,7 +13,7 @@ pub(super) fn execute<C: ContentIo + ?Sized>(
     let output = crate::edit_application::apply_edits(
         &target.tree,
         edits.iter().map(|(id, edit)| (*id, edit.clone())),
-        |id| context.content.resolve(id),
+        crate::FromContentIo(context.content),
         limits,
     )
     .map_err(|error| RepositoryError::EditApplication(format!("{error:?}")))?;

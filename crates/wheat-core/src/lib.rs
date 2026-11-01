@@ -52,7 +52,7 @@ pub use content_generation_wire::{
     decode_content_generation_index, decode_content_generation_shard,
     encode_content_generation_index, encode_content_generation_shard,
 };
-pub use content_io::{ApplicationContext, ContentIo};
+pub use content_io::{ApplicationContext, ContentIo, FromContentIo};
 pub use edit_records::{EditOperation, EditRecord, decode_edit_record};
 pub use hydration::{hydrate_application, hydrate_revision};
 pub use id::{

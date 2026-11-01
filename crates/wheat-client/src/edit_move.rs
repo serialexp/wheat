@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Result, bail};
 use wheat_core::{
     ChangeId, ContentId, EditId, EditRecord, FileKind, FileValue, Tree, VerifiedContent,
-    edit_application::{ApplicationLimits, ApplicationOutcome, apply_edits},
+    edit_application::{ApplicationLimits, ApplicationOutcome, ContentSource, apply_edits},
     edit_placement::{
         LaterEdit, Lines, MoveNotice, PlacementInput, WholeFileReason, attribute, place,
     },
@@ -207,9 +207,9 @@ fn replay(
         let mut result = apply_edits(
             &target,
             edits,
-            |id| match &file {
-                Some((_, content)) if id == content.id() => Ok(content.borrowed().into_owned()),
-                _ => store.get_verified(id).map_err(|error| error.to_string()),
+            Replaying {
+                store,
+                file: file.as_ref().map(|(_, content)| content),
             },
             ApplicationLimits {
                 allow_already_satisfied: reapplied,
@@ -251,6 +251,30 @@ fn replay(
         };
     }
     Ok(Replay::Reached(file.as_ref().map(value_of)))
+}
+
+/// The content a replay step reads: the file as the replay holds it, else the store.
+struct Replaying<'a> {
+    store: &'a ContentStore,
+    file: Option<&'a VerifiedContent<Cow<'a, [u8]>>>,
+}
+
+impl ContentSource for Replaying<'_> {
+    type Error = wheat_store::ContentStoreError;
+
+    fn resolve(&mut self, id: ContentId) -> Result<VerifiedContent, Self::Error> {
+        match self.file {
+            Some(content) if id == content.id() => Ok(content.borrowed().into_owned()),
+            _ => self.store.get_verified(id),
+        }
+    }
+
+    fn confirm(&mut self, id: ContentId) -> Result<Option<VerifiedContent>, Self::Error> {
+        match self.file {
+            Some(content) if id == content.id() => Ok(None),
+            _ => self.store.confirm(id).map(|()| None),
+        }
+    }
 }
 
 /// Asks before moving edits out of later changes into `change`. Without anyone to ask, it
