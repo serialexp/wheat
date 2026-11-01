@@ -16,8 +16,9 @@ packed store reading its content generation whole only once (491063f, Bart:
 
 Large blobs (2026-11-01): Bart chose to stream everything and to store only the
 changed chunks of very large blobs. `docs/design/wheat-large-content.md` is
-proposed with Q1–Q5 open (threshold, chunk sizes, chunk identity, the one-file
-limit, the chunker); nothing is built yet.
+proposed. Decided: chunk blobs over 16 MiB, FastCDC 1/2/4 MiB, a chunk is a
+`ContentId`, the format takes 1 TiB. Open: Q2b (re-chunk a manifest cut elsewhere)
+and Q5 (the `fastcdc` crate or our own). Nothing is built yet.
 
 Not yet measured cleanly: the fetch_incremental A/B for 57da2be ran under a load
 average of 32 (counts unchanged, wall times noise); rerun when the machine is quiet.

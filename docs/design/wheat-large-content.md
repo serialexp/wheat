@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: proposed, awaiting Bart's choices in [Open questions](#open-questions-for-review)
+Status: proposed; Q1–Q4 decided 2026-11-01, Q5 and the re-chunking half of Q2 open
 Owner: bart
 Last updated: 2026-11-01
 
@@ -18,13 +18,22 @@ land and move them from Outstanding to Done.
   "for very large blobs what we do instead is store only changed chunks".
   Content-defined chunks, not deltas, for blobs over the threshold.
 
+- [x] **Decision — the chunking threshold (Q1, 2026-11-01).** Over 16 MiB, today's
+  `wheat add` limit. Blobs up to 16 MiB stay whole envelopes and keep deltas.
+- [x] **Decision — chunk sizes (Q2, 2026-11-01).** FastCDC with a 1 MiB minimum,
+  2 MiB average and 4 MiB maximum: about 500 chunks for 1 GiB.
+- [x] **Decision — chunk identity (Q3, 2026-11-01).** A chunk is content: its ID
+  is the `ContentId` of its bytes.
+- [x] **Decision — the size limit for one file (Q4, 2026-11-01).** Bart: Gothab
+  allows 1 TB, "not because I ever expect anyone to store that, but because the
+  format has to support it". The format takes blobs up to 1 TiB; see
+  [Size](#size). Which limits the tools apply below that is part of step 7.
+
 ### Outstanding
 
-- [ ] **Decision — the chunking threshold.** See [Q1](#open-questions-for-review).
-- [ ] **Decision — chunk sizes.** See [Q2](#open-questions-for-review).
-- [ ] **Decision — chunk identity.** See [Q3](#open-questions-for-review).
-- [ ] **Decision — the size limit for one file.** See [Q4](#open-questions-for-review);
-  also closes the TODO item "The size limits for one file disagree".
+- [ ] **Decision — the chunker (Q5).** See [Q5](#open-questions-for-review).
+- [ ] **Decision — re-chunking a manifest cut elsewhere (Q2b).** See
+  [Q2b](#open-questions-for-review).
 - [ ] **Step 1 — format.** The chunker, the `Chunked` envelope codec and its
   manifest record (BinSchema), canonical validation of a manifest.
 - [ ] **Step 2 — store.** `ContentStore::writer` and `ContentStore::reader`
@@ -66,8 +75,9 @@ that design.
 
 ## Goals
 
-- Memory per transfer, write and read of a large blob is bounded by a chunk (a few
-  MiB), not by the blob.
+- Memory per transfer, write and read of a blob is bounded by the threshold
+  (16 MiB) for a whole blob and by a chunk (at most 4 MiB) for a chunked one, not
+  by the blob.
 - A new version of a large blob stores and sends only the chunks it does not share
   with versions the other side already has.
 - Trees, edits, revisions and every other identity stay as they are: a file is
@@ -120,6 +130,15 @@ The chunker's parameters are part of the format: changing them later changes whe
 new versions cut, and so how much they share with old ones, though never what any
 `ContentId` names.
 
+### Size
+
+The format takes blobs up to 1 TiB (Q4). A 1 MiB minimum chunk bounds a 1 TiB
+blob at 1,048,576 chunks, so its manifest is at most about 36 MiB: within one
+record (`HARD_LOGICAL_RECORD_BYTES` is 1 GiB, a segment payload 128 MiB), read
+whole when a reader opens the blob. At the 2 MiB average a 1 TiB blob's manifest
+is about 18 MiB, a 1 GiB blob's about 18 KiB. `logical_length` is a `uint64`
+and a chunk's length a `uint32`, so neither field limits the size.
+
 ## Store API
 
 `ContentStore` gains streaming halves next to `put`/`get`:
@@ -161,9 +180,11 @@ storage, a transfer of a large blob becomes:
    `ContentId` hasher, checks the blob's ID and stores the manifest. This reads the
    chunks it already had as well: O(blob) disk reads, a chunk of memory.
 
-`ContentChunk` (offset-based reassembly) and the receiver's whole-blob buffer go
-away. Senders read through `ContentStore::reader` a chunk at a time. Blobs at or
-under the threshold travel as they do now.
+Senders read through `ContentStore::reader` a chunk at a time. Blobs at or under
+the threshold travel as they do now: whole in a `ContentBatch` up to 4 MiB, as
+offset-based `ContentChunk`s from 4 to 16 MiB, held whole by both ends (at most
+16 MiB). The receiver's per-item limit for `ContentChunk` drops from 1 GiB to the
+threshold.
 
 ## Callers
 
@@ -204,30 +225,19 @@ What changes outside the store (from the inventory of whole-blob paths,
 
 ## Open questions for review
 
-- **Q1 — threshold.** Which blobs are chunked:
-  - (a) over 4 MiB, the protocol's chunk size: every blob that is chunked on the
-    wire today;
-  - (b) over 16 MiB, today's `wheat add` limit: blobs between 4 and 16 MiB stay
-    whole and keep deltas;
-  - (c) over 64 MiB, the repack's per-record limit.
-- **Q2 — chunk sizes (min / average / max).**
-  - (a) 256 KiB / 1 MiB / 4 MiB: about 1,000 chunks for 1 GiB; finer sharing;
-  - (b) 1 MiB / 2 MiB / 4 MiB: about 500 chunks; fewer objects and requests;
-  - (c) 64 KiB / 256 KiB / 1 MiB: about 4,000 chunks; finest sharing, most
-    objects. And whether a receiver re-chunks a manifest that is not cut where
-    FastCDC would cut it, or stores it as sent.
-- **Q3 — chunk identity.**
-  - (a) A chunk is content: its ID is a `ContentId` of its bytes. A chunk equal to
-    some small file is stored once, and the existing content paths (`existing_ids`,
-    batches, segments, generations) carry chunks unchanged;
-  - (b) A separate `ChunkId` (another hash domain): chunks and files never share
-    an ID, and each path that handles chunks says so in its types.
-- **Q4 — the limit for one file.** Today: 16 MiB `wheat add`, 64 MiB Git import,
-  256 MiB materialization, 1 GiB store and protocol. With streaming:
-  - (a) one limit everywhere, still 1 GiB;
-  - (b) one limit everywhere, larger (for example 16 GiB), bounded by disk, not
-    memory;
-  - (c) a per-repository setting with a default.
+Decided 2026-11-01 (see Done): Q1 over 16 MiB; Q2 1 MiB / 2 MiB / 4 MiB; Q3 a chunk
+is a `ContentId`; Q4 the format takes 1 TiB. The options they were chosen from:
+Q1 over 4, 16 or 64 MiB; Q2 256K/1M/4M, 1M/2M/4M or 64K/256K/1M; Q3 a
+`ContentId` or a separate `ChunkId`; Q4 1 GiB everywhere, a larger limit
+everywhere, or a per-repository setting.
+
+- **Q2b — a manifest cut elsewhere.** A sender's manifest may not cut where this
+  FastCDC would (another chunker, another version). The receiver:
+  - (a) stores it as sent: the blob is the same, only its chunks share less with
+    other versions;
+  - (b) re-chunks it on receipt, reading the chunks back through the hasher it
+    already runs, and stores its own manifest: every stored manifest is cut the
+    same way.
 - **Q5 — the chunker.** The `fastcdc` crate (its 2020 algorithm), or a small
   implementation of our own with the Gear table in the repository. Either way the
   boundaries are pinned by tests, since they are format.
