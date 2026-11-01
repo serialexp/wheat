@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: designed, not yet implemented; every question decided 2026-11-01
+Status: partial — step 1 (format) landed but for the codec number, steps 2–7 outstanding
 Owner: bart
 Last updated: 2026-11-01
 
@@ -33,10 +33,14 @@ land and move them from Outstanding to Done.
 - [x] **Decision — the chunker (Q5, 2026-11-01).** Our own FastCDC in
   `wheat-store`, with its Gear table in the repository.
 
+- [x] **Step 1 — format.** The manifest record `ContentChunkManifestV1` with
+  canonical validation (`wheat_core::ContentChunkManifestRecord`), and the
+  chunker (`wheat_store::ContentChunker`), its Gear table and cut points pinned
+  by tests. The `Chunked` codec number (5) lands with step 2, where the store
+  first reads and writes it.
+
 ### Outstanding
 
-- [ ] **Step 1 — format.** The chunker, the `Chunked` envelope codec and its
-  manifest record (BinSchema), canonical validation of a manifest.
 - [ ] **Step 2 — store.** `ContentStore::writer` and `ContentStore::reader`
   ([Store API](#store-api)) over every backend: loose files, the packed store,
   object-storage blobs. `get`/`get_bounded` keep working for blobs that fit their
