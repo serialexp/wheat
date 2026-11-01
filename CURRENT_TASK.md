@@ -15,10 +15,17 @@ packed store reading its content generation whole only once (491063f, Bart:
 "validate it once and keep it unless it changes").
 
 Large blobs (2026-11-01): Bart chose to stream everything and to store only the
-changed chunks of very large blobs. `docs/design/wheat-large-content.md` is
-proposed. Decided: chunk blobs over 16 MiB, FastCDC 1/2/4 MiB, a chunk is a
-`ContentId`, the format takes 1 TiB, manifests stored as sent, our own FastCDC.
-Nothing is built yet; next is step 1 (format) of the doc's phasing.
+changed chunks of very large blobs. `docs/design/wheat-large-content.md` has the
+design and its checklist. Decided: chunk blobs over 16 MiB, FastCDC 1/2/4 MiB, a
+chunk is a `ContentId`, the format takes 1 TiB, manifests stored as sent, our own
+FastCDC. Step 1 (format) is committed: 99f7300 manifest record, 642c380 chunker.
+Step 2 (store) is in progress: codec 5 `Chunked`, `ContentStore::writer`/`reader`
+(`content_stream.rs`), `put`/`put_many` chunk blobs over the threshold, the packed
+engine writes chunks loose with its bookkeeping, content repack carries manifests
+as they are, and a chunked blob is never a delta or a delta's base. Tests in
+`wheat-store/tests/content_stream.rs`; bench case `content_large_blob`. Known
+leftovers for later steps: `repository_verify`, network export/import and the
+server/client still read blobs whole (≤1 GiB), see the doc's steps 3–6.
 
 Not yet measured cleanly: the fetch_incremental A/B for 57da2be ran under a load
 average of 32 (counts unchanged, wall times noise); rerun when the machine is quiet.

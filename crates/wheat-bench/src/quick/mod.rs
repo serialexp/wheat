@@ -16,6 +16,7 @@ mod bootstrap_validate;
 mod browse_history;
 mod checkpoint_stack;
 mod client_history;
+mod content_large_blob;
 mod content_repack_plan;
 mod cpus;
 mod deep_stack;
@@ -78,6 +79,7 @@ pub const CASES: &[&str] = &[
     packed_append::NAME,
     content_repack_plan::NAME,
     packed_open::NAME,
+    content_large_blob::NAME,
     sharded_manifest::NAME,
     git_export_notes::NAME,
     git_pull_incremental::NAME,
@@ -244,6 +246,7 @@ pub fn run_case(
         packed_append::NAME => packed_append::run(&context),
         content_repack_plan::NAME => content_repack_plan::run(&context),
         packed_open::NAME => packed_open::run(&context),
+        content_large_blob::NAME => content_large_blob::run(&context),
         sharded_manifest::NAME => sharded_manifest::run(&context),
         git_export_notes::NAME => git_export_notes::run(&context),
         git_pull_incremental::NAME => git_pull_incremental::run(&context),

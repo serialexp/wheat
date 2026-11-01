@@ -4,8 +4,11 @@ use std::io::{self, Read};
 
 use thiserror::Error;
 use wheat_core::{
-    CONTENT_ENVELOPE_HEADER_ENCODED_SIZE, ContentEnvelopeHeaderRecord, ContentId,
-    decode_content_envelope_header, encode_content_envelope_header,
+    CHUNKED_CONTENT_THRESHOLD, CONTENT_CHUNK_ENCODED_SIZE,
+    CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE, CONTENT_ENVELOPE_HEADER_ENCODED_SIZE,
+    ContentChunkManifestRecord, ContentEnvelopeHeaderRecord, ContentId, MAX_CHUNKED_CONTENT_BYTES,
+    MAX_CONTENT_CHUNKS, decode_content_chunk_manifest, decode_content_envelope_header,
+    encode_content_chunk_manifest, encode_content_envelope_header,
 };
 
 pub(crate) const RAW_THRESHOLD: usize = 1024;
@@ -19,6 +22,11 @@ pub const HARD_LOGICAL_RECORD_BYTES: usize = 1024 * 1024 * 1024;
 /// preserves those blocks while leaving room for a future 256 KiB policy.
 pub(crate) const MAX_BLOCK_LOGICAL_BYTES: usize = 1024 * 1024;
 pub(crate) const ENVELOPE_HEADER_LEN: usize = CONTENT_ENVELOPE_HEADER_ENCODED_SIZE;
+/// The longest manifest a `Chunked` envelope stores: the most chunks the format
+/// allows, about 36 MiB.
+pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = (CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE
+    + MAX_CONTENT_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE)
+    as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -33,6 +41,12 @@ pub(crate) enum Codec {
     /// reader decompresses the block and extracts the record at its precomputed
     /// within-block byte offset.
     ZstdBlock = 4,
+    /// A blob over [`CHUNKED_CONTENT_THRESHOLD`], stored as content-defined chunks:
+    /// the payload is the chunk manifest, each chunk an envelope under its own ID.
+    /// `logical_length` is the whole blob's, up to [`MAX_CHUNKED_CONTENT_BYTES`]
+    /// and so beyond [`HARD_LOGICAL_RECORD_BYTES`]: only the manifest is ever one
+    /// record.
+    Chunked = 5,
 }
 
 impl Codec {
@@ -43,6 +57,7 @@ impl Codec {
             2 => Ok(Self::Delta),
             3 => Ok(Self::DeltaZstd),
             4 => Ok(Self::ZstdBlock),
+            5 => Ok(Self::Chunked),
             other => Err(CodecError::Unknown(other)),
         }
     }
@@ -91,9 +106,31 @@ impl EnvelopeHeader {
             .ok_or(CodecError::Format("envelope physical length overflows"))
     }
 
+    /// Checks a `Chunked` header's lengths: the blob is one the format chunks, and
+    /// the manifest could list it. The caller's read limit applies to assembling the
+    /// blob, not to its manifest.
+    fn validate_chunked(self) -> Result<(), CodecError> {
+        if !(CHUNKED_CONTENT_THRESHOLD + 1..=MAX_CHUNKED_CONTENT_BYTES)
+            .contains(&self.logical_length)
+        {
+            return Err(CodecError::Format(
+                "chunked logical length is outside the chunked sizes",
+            ));
+        }
+        if !(CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE as u64..=MAX_CHUNK_MANIFEST_BYTES)
+            .contains(&self.stored_length)
+        {
+            return Err(CodecError::Format("chunk manifest length is out of bounds"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(self, physical_length: u64, max: usize) -> Result<(), CodecError> {
         if self.physical_length()? != physical_length {
             return Err(CodecError::Format("stored length differs"));
+        }
+        if self.codec == Codec::Chunked {
+            return self.validate_chunked();
         }
         // For delta codecs, the logical_length limit is checked later after
         // reconstruction, not here — the stored payload is a patch, not the
@@ -194,6 +231,8 @@ pub(crate) enum DecodedPayload {
     /// The content store must resolve this by fetching the base and applying
     /// the patch.
     Delta { base_id: ContentId, patch: Vec<u8> },
+    /// A chunked blob's manifest: its chunks are read from the content store.
+    Chunked(ContentChunkManifestRecord),
 }
 
 pub(crate) fn decode(
@@ -211,6 +250,9 @@ pub(crate) fn decode(
         DecodedPayload::Content(bytes) => Ok(bytes),
         DecodedPayload::Delta { .. } => Err(CodecError::Format(
             "delta codec in a context that does not support delta resolution",
+        )),
+        DecodedPayload::Chunked(_) => Err(CodecError::Format(
+            "chunked codec in a context that does not read chunks",
         )),
     }
 }
@@ -314,7 +356,32 @@ pub(crate) fn decode_payload(
         Codec::ZstdBlock => Err(CodecError::Format(
             "ZstdBlock codec requires block-level decoding, not per-record decode",
         )),
+        Codec::Chunked => {
+            let manifest = decode_content_chunk_manifest(&stored)
+                .map_err(|_| CodecError::Format("invalid chunk manifest"))?;
+            if manifest.logical_length != logical_length {
+                return Err(CodecError::Format(
+                    "chunk manifest length differs from its envelope",
+                ));
+            }
+            Ok(DecodedPayload::Chunked(manifest))
+        }
     }
+}
+
+/// The `Chunked` envelope storing `manifest`.
+pub(crate) fn encode_chunked_envelope(
+    manifest: &ContentChunkManifestRecord,
+) -> Result<Vec<u8>, CodecError> {
+    let payload = encode_content_chunk_manifest(manifest)
+        .map_err(|_| CodecError::Format("invalid chunk manifest"))?;
+    let mut encoded = encode_envelope_header(EnvelopeHeader {
+        codec: Codec::Chunked,
+        stored_length: payload.len() as u64,
+        logical_length: manifest.logical_length,
+    })?;
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
 }
 
 /// Encode content as a delta envelope against a known base.
@@ -534,10 +601,15 @@ pub(crate) fn read_envelope_file_raw(
     // Validates the physical length but not logical limits; the caller handles
     // those after delta resolution.
     let header = read_envelope_file_header(reader, physical_length)?;
-    let logical = usize::try_from(header.logical_length)
-        .map_err(|_| CodecError::Format("logical length does not fit this platform"))?;
-    if logical > HARD_LOGICAL_RECORD_BYTES {
-        return Err(CodecError::HardLimit.into());
+    if header.codec == Codec::Chunked {
+        // Only the manifest is read, however long the blob.
+        header.validate_chunked()?;
+    } else {
+        let logical = usize::try_from(header.logical_length)
+            .map_err(|_| CodecError::Format("logical length does not fit this platform"))?;
+        if logical > HARD_LOGICAL_RECORD_BYTES {
+            return Err(CodecError::HardLimit.into());
+        }
     }
     let stored_length = usize::try_from(header.stored_length)
         .map_err(|_| CodecError::Format("stored length does not fit this platform"))?;
@@ -701,6 +773,63 @@ mod tests {
             decode_envelope(&trailing, usize::MAX),
             Err(CodecError::Format("trailing zstd frame bytes"))
         ));
+    }
+
+    /// A manifest of `count` longest chunks.
+    fn chunked_manifest(count: usize) -> ContentChunkManifestRecord {
+        ContentChunkManifestRecord {
+            logical_length: count as u64 * u64::from(wheat_core::MAX_CONTENT_CHUNK_BYTES),
+            chunks: (0..count)
+                .map(|index| wheat_core::ContentChunkRecord {
+                    id: ContentId::of(&index.to_le_bytes()),
+                    length: wheat_core::MAX_CONTENT_CHUNK_BYTES,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_chunked_envelope_reads_whatever_its_blobs_length() {
+        // 2 GiB, past the hard limit on one record: only the manifest is read.
+        let manifest = chunked_manifest(512);
+        let encoded = encode_chunked_envelope(&manifest).unwrap();
+        let mut reader = &encoded[..];
+        let (header, payload) = read_envelope_file_raw(&mut reader, encoded.len() as u64).unwrap();
+        assert_eq!(header.codec, Codec::Chunked);
+        assert_eq!(header.logical_length, 2 << 30);
+        header.validate(encoded.len() as u64, 0).unwrap();
+        assert!(matches!(
+            decode_payload(header.codec, payload.clone(), header.logical_length, 0),
+            Ok(DecodedPayload::Chunked(decoded)) if decoded == manifest
+        ));
+        // Read as plain content, it is refused rather than assembled.
+        assert!(decode(header.codec, payload, header.logical_length, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_chunked_header_must_agree_with_its_manifest() {
+        let encoded = encode_chunked_envelope(&chunked_manifest(5)).unwrap();
+        let header = parse_envelope_header(&encoded[..ENVELOPE_HEADER_LEN]).unwrap();
+        let payload = encoded[ENVELOPE_HEADER_LEN..].to_vec();
+        for logical_length in [CHUNKED_CONTENT_THRESHOLD, MAX_CHUNKED_CONTENT_BYTES + 1] {
+            let forged = EnvelopeHeader {
+                logical_length,
+                ..header
+            };
+            assert!(forged.validate(encoded.len() as u64, usize::MAX).is_err());
+        }
+        assert!(matches!(
+            decode_payload(header.codec, payload, header.logical_length + 1, usize::MAX),
+            Err(CodecError::Format(
+                "chunk manifest length differs from its envelope"
+            ))
+        ));
+        let oversized = EnvelopeHeader {
+            stored_length: MAX_CHUNK_MANIFEST_BYTES + 1,
+            ..header
+        };
+        let physical = oversized.physical_length().unwrap();
+        assert!(oversized.validate(physical, usize::MAX).is_err());
     }
 
     #[test]

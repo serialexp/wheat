@@ -9,12 +9,14 @@ use std::io::{BufReader, BufWriter, Read, Write};
 
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use wheat_core::ContentId;
+use wheat_core::{CHUNKED_CONTENT_THRESHOLD, ContentId};
 
 use crate::content_generation::{
     CONTENT_GENERATION_SHARD_ENTRIES, ContentGenerationEntry, ContentGenerationManifest,
     fingerprint_entries,
 };
+use crate::content_store::StoredContent;
+use crate::content_stream::chunk_manifest;
 use crate::{ContentStore, ContentStoreError, codec, delta};
 
 const MAX_DELTA_DEPTH: u8 = crate::content_store::MAX_DELTA_CHAIN_DEPTH as u8;
@@ -357,6 +359,21 @@ pub fn plan_content_repack(
                 _ => None,
             };
             let id = entries[index].id;
+            if let Some((envelope, logical_length)) = chunked_envelope(source, id)? {
+                // Its chunks are content of their own, and their bytes count there.
+                let physical_length = u64::try_from(envelope.len())
+                    .map_err(|_| ContentRepackError::ArithmeticOverflow("envelope length"))?;
+                estimated_bytes = estimated_bytes.checked_add(physical_length).ok_or(
+                    ContentRepackError::ArithmeticOverflow("replacement byte estimate"),
+                )?;
+                let entry = &mut entries[index];
+                entry.envelope_digest = *blake3::hash(&envelope).as_bytes();
+                entry.physical_length = physical_length;
+                entry.logical_length = logical_length;
+                visit[index] = Visit::Chosen;
+                production.push(index as u32);
+                continue;
+            }
             let target_bytes = source.get_bounded(id, limits.max_record_logical_bytes)?;
             let target_length = u64::try_from(target_bytes.len())
                 .map_err(|_| ContentRepackError::ArithmeticOverflow("record logical length"))?;
@@ -372,7 +389,11 @@ pub fn plan_content_repack(
             }
             let full = encode_full(id, &target_bytes)?;
             let (bytes, selected_base, depth) = match base {
-                Some(base) if entries[base].delta_depth < MAX_DELTA_DEPTH => {
+                // A blob over the chunking threshold is no delta's base.
+                Some(base)
+                    if entries[base].delta_depth < MAX_DELTA_DEPTH
+                        && entries[base].logical_length <= CHUNKED_CONTENT_THRESHOLD =>
+                {
                     let (base_id, base_depth) = (entries[base].id, entries[base].delta_depth);
                     let base_bytes =
                         source.get_bounded(base_id, limits.max_record_logical_bytes)?;
@@ -506,6 +527,9 @@ fn encode_planned_envelope(
     limits: ContentRepackLimits,
 ) -> Result<Vec<u8>, ContentRepackError> {
     let id = entry.id;
+    if let Some((envelope, _)) = chunked_envelope(source, id)? {
+        return Ok(envelope);
+    }
     let target = source.get_bounded(id, limits.max_record_logical_bytes)?;
     match entry.delta_base {
         Some(base) => {
@@ -522,6 +546,31 @@ fn encode_planned_envelope(
             })
         }
         None => encode_full(id, &target),
+    }
+}
+
+/// The envelope of `id` and the blob's length when it is stored as chunks. Repack
+/// carries a manifest as it is, never as a delta or a delta's base, and its chunks
+/// as content of their own, so it never reads a chunked blob whole.
+fn chunked_envelope(
+    source: &ContentStore,
+    id: ContentId,
+) -> Result<Option<(Vec<u8>, u64)>, ContentRepackError> {
+    if source.logical_length(id)? <= CHUNKED_CONTENT_THRESHOLD {
+        return Ok(None);
+    }
+    match source.stored(id)? {
+        StoredContent::Envelope(header, payload) if header.codec == codec::Codec::Chunked => {
+            let manifest = chunk_manifest(id, header, payload)?;
+            let envelope = codec::encode_chunked_envelope(&manifest).map_err(|error| {
+                ContentStoreError::InvalidFormat {
+                    id,
+                    reason: error.to_string(),
+                }
+            })?;
+            Ok(Some((envelope, manifest.logical_length)))
+        }
+        _ => Ok(None),
     }
 }
 

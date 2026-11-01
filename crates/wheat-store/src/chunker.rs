@@ -70,6 +70,19 @@ fn cut_point(data: &[u8]) -> usize {
     end
 }
 
+/// The chunks of a blob held whole, cut where [`ContentChunker`] cuts it.
+pub(crate) fn chunks_of(blob: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = blob;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (chunk, tail) = rest.split_at(cut_point(rest));
+        rest = tail;
+        Some(chunk)
+    })
+}
+
 /// Cuts a blob fed in pieces of any size into the same chunks as fed whole. It
 /// holds at most one longest chunk: bytes are copied into it only while a chunk
 /// spans two pieces; a chunk inside one piece is passed on from the piece itself.
@@ -82,6 +95,12 @@ impl ContentChunker {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The bytes held for a chunk that spans pieces.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.pending.capacity()
     }
 
     /// Feeds the next bytes of the blob, passing each chunk that ends in them to
@@ -253,6 +272,7 @@ mod tests {
         for piece in [1, 7, 4096, MIB - 1, MAX - 1, MAX, MAX + 1, 3 * MAX + 5] {
             assert_eq!(lengths(&data, piece), whole, "fed {piece} bytes at a time");
         }
+        assert_eq!(chunks_of(&data).map(<[u8]>::len).collect::<Vec<_>>(), whole);
     }
 
     #[test]

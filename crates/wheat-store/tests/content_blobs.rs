@@ -293,3 +293,38 @@ async fn a_repository_store_can_keep_its_content_in_blobs() {
     assert!(!objects.content_store().contains(item.id()));
     assert_eq!(store.content_store().get(item.id()).unwrap(), bytes);
 }
+
+/// A large blob goes to the blobs as its chunks and a small manifest, and reads back
+/// a chunk at a time; writing it again uploads nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_blob_is_kept_in_blobs_as_chunks() {
+    use std::io::{Read, Write};
+
+    let blobs = Arc::new(MemoryBlobs::default());
+    let content = over(&blobs);
+    let bytes = noise(9, 40 << 20);
+    let mut writer = content.writer();
+    writer.write_all(&bytes).unwrap();
+    let id = writer.finish(Some(ContentId::of(&bytes))).unwrap();
+
+    let records = blobs.records.lock().unwrap().len();
+    let chunks = records - 1;
+    assert!((10..=40).contains(&chunks), "{chunks} chunks");
+    assert!(blobs.record(id).unwrap().len() < 4096);
+    assert_eq!(content.logical_length(id).unwrap(), bytes.len() as u64);
+
+    let gets = blobs.gets.load(Ordering::Relaxed);
+    let mut read_back = Vec::new();
+    content
+        .reader(id)
+        .unwrap()
+        .read_to_end(&mut read_back)
+        .unwrap();
+    assert!(read_back == bytes);
+    assert_eq!(blobs.gets.load(Ordering::Relaxed) - gets, chunks + 1);
+
+    let mut again = content.writer();
+    again.write_all(&bytes).unwrap();
+    assert_eq!(again.finish(None).unwrap(), id);
+    assert_eq!(blobs.records.lock().unwrap().len(), records);
+}

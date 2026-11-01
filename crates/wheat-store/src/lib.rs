@@ -182,8 +182,10 @@ pub use view_lineage::{
 
 mod content_blobs;
 mod content_store;
+mod content_stream;
 pub use content_blobs::{BlobPage, BlobRead, ContentBlobStore};
 pub use content_store::{ContentItem, ContentStore, ContentStoreError};
+pub use content_stream::{ContentReader, ContentWriter};
 
 /// Read-only segment and loose-object access for analysis tools (e.g.
 /// `wheat store analyze`).

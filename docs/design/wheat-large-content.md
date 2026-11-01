@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: partial — step 1 (format) landed but for the codec number, steps 2–7 outstanding
+Status: partial — steps 1 (format) and 2 (store) landed, steps 3–7 outstanding
 Owner: bart
 Last updated: 2026-11-01
 
@@ -36,15 +36,23 @@ land and move them from Outstanding to Done.
 - [x] **Step 1 — format.** The manifest record `ContentChunkManifestV1` with
   canonical validation (`wheat_core::ContentChunkManifestRecord`), and the
   chunker (`wheat_store::ContentChunker`), its Gear table and cut points pinned
-  by tests. The `Chunked` codec number (5) lands with step 2, where the store
+  by tests. The `Chunked` codec number (5) landed with step 2, where the store
   first reads and writes it.
+- [x] **Step 2 — store.** `ContentStore::writer` and `ContentStore::reader`
+  (`wheat-store/src/content_stream.rs`) over loose files, the packed store and
+  object-storage blobs; `put`/`put_many` store a blob over the threshold as
+  chunks too, and `get`/`get_bounded` assemble one that fits their bound. Beyond
+  the plan: the packed engine writes chunks loose, through its loose-file
+  bookkeeping, before the manifest that names them; content repack carries a
+  manifest as it is and its chunks as ordinary content, never reading the blob
+  whole; a chunked blob is never a delta or a delta's base. Tests count the bytes
+  writer and reader hold (`tests/content_stream.rs`); bench case
+  `content_large_blob` (1 GiB, 2026-11-01, under a load average of about 22):
+  write 5.5 s holding 16 MiB, a one-byte edit 0.8 s writing 2.7 MB, read 0.4 s
+  holding 4 MiB, peak RSS 58 MiB.
 
 ### Outstanding
 
-- [ ] **Step 2 — store.** `ContentStore::writer` and `ContentStore::reader`
-  ([Store API](#store-api)) over every backend: loose files, the packed store,
-  object-storage blobs. `get`/`get_bounded` keep working for blobs that fit their
-  bound.
 - [ ] **Step 3 — protocol.** Manifest-first transfer of chunked blobs, chunk-level
   have/want, receivers that hash as chunks arrive and stream into the store,
   senders that read chunk by chunk ([Protocol](#protocol)).

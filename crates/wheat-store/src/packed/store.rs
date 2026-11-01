@@ -282,7 +282,8 @@ impl PackedEngine {
             .map(StoredContent::from)
     }
 
-    /// Stores the blobs of `contents` too large for a segment as loose files.
+    /// Stores the blobs of `contents` too large for a segment as loose files, and
+    /// those over the chunking threshold as loose chunks and then their manifests.
     /// Returns the catalog records of the rest, for the caller to append, and the
     /// loose files added.
     fn content_records<'c>(
@@ -297,31 +298,48 @@ impl PackedEngine {
         }
         let mut records = Vec::new();
         let mut loose = Vec::new();
+        let mut manifests = Vec::new();
+        // A chunk repeated within a blob or across blobs is written once.
+        let mut chunks = HashSet::new();
         for content in contents {
-            if content.len() > self.loose_threshold {
+            if crate::content_store::is_chunked(content.len()) {
+                if self.logical_length(content.id()).is_ok() {
+                    continue;
+                }
+                // Chunks are loose whatever the threshold, so they are on disk
+                // before the manifest that names them.
+                let envelope = crate::content_stream::chunked_envelope(content, |chunk| {
+                    if chunks.insert(chunk.id()) && self.logical_length(chunk.id()).is_err() {
+                        loose.push(chunk);
+                    }
+                    Ok(())
+                })?;
+                manifests.push((content.id(), envelope));
+            } else if content.len() > self.loose_threshold {
                 loose.push(content);
             } else {
                 records.push(CheckedRecord::content(content));
             }
         }
-        let Some(first) = loose.first() else {
-            return Ok((records, Vec::new()));
-        };
-        let first = first.id();
-        let ids = loose
-            .iter()
-            .map(|content| *content.id().as_bytes())
-            .collect::<Vec<_>>();
-        let added = self.writing_loose(
-            LooseKind::Content,
-            &ids,
-            |error| content_catalog_error(first, error),
-            || {
-                loose
-                    .iter()
-                    .try_for_each(|content| self.content.put_many(&[*content], 1))
-            },
-        )?;
+        let mut added = Vec::new();
+        if let Some(first) = loose.first() {
+            let first = first.id();
+            let ids = loose
+                .iter()
+                .map(|content| *content.id().as_bytes())
+                .collect::<Vec<_>>();
+            added = self.writing_loose(
+                LooseKind::Content,
+                &ids,
+                |error| content_catalog_error(first, error),
+                || {
+                    loose
+                        .iter()
+                        .try_for_each(|content| self.content.put_many(&[*content], 1))
+                },
+            )?;
+        }
+        added.extend(self.put_loose_envelopes(&manifests)?);
         Ok((records, added))
     }
 
@@ -543,18 +561,19 @@ impl PackedObjectStore {
         };
         let loose_ids = list_loose_content_ids(&self.engine.content_root)?;
         for id in &loose_ids {
+            let (header, payload) = self.engine.content.read_local_raw_envelope(*id)?;
+            if header.codec == crate::codec::Codec::Chunked {
+                // Only its manifest is read: its chunks are loose content of their own.
+                crate::content_stream::chunk_manifest(*id, header, payload)?;
+                continue;
+            }
+            let first = std::cell::Cell::new(Some(StoredContent::from((header, payload))));
             crate::content_store::resolve_delta_chain(
                 *id,
                 options.content_limits.max_record_logical_bytes,
-                |current| {
-                    if current == *id {
-                        self.engine
-                            .content
-                            .read_local_raw_envelope(current)
-                            .map(StoredContent::from)
-                    } else {
-                        self.engine.get_stored(current)
-                    }
+                |current| match first.take() {
+                    Some(stored) if current == *id => Ok(stored),
+                    _ => self.engine.get_stored(current),
                 },
             )?;
         }

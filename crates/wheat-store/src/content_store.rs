@@ -9,7 +9,7 @@ use std::{
 };
 
 use thiserror::Error;
-use wheat_core::{ContentId, ContentMismatch, VerifiedContent};
+use wheat_core::{ContentChunkManifestRecord, ContentId, ContentMismatch, VerifiedContent};
 
 use crate::{Durability, codec};
 
@@ -238,10 +238,24 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
 /// verified as it read it is not hashed again; every other one is.
 ///
 /// The `max` bound applies only to the final reconstructed output.
+///
+/// A chunked blob that fits `max` is assembled from its chunks, each resolved and
+/// verified on its own, and then verified whole. A chunked blob is never a delta's
+/// base.
 pub(crate) fn resolve_delta_chain(
     id: ContentId,
     max: usize,
     fetch: impl Fn(ContentId) -> Result<StoredContent, ContentStoreError>,
+) -> Result<VerifiedContent, ContentStoreError> {
+    resolve(id, max, &fetch)
+}
+
+/// [`resolve_delta_chain`] with `fetch` behind a reference, so assembling a chunked
+/// blob can resolve its chunks with it.
+fn resolve(
+    id: ContentId,
+    max: usize,
+    fetch: &dyn Fn(ContentId) -> Result<StoredContent, ContentStoreError>,
 ) -> Result<VerifiedContent, ContentStoreError> {
     use crate::delta;
 
@@ -297,6 +311,15 @@ pub(crate) fn resolve_delta_chain(
                         current_id = base_id;
                         continue;
                     }
+                    codec::DecodedPayload::Chunked(manifest) => {
+                        if depth != 0 {
+                            return Err(ContentStoreError::DeltaResolution {
+                                id: chain.last().map_or(id, |link| link.0),
+                                reason: "a delta's base is chunked".into(),
+                            });
+                        }
+                        return assemble_chunks(id, &manifest, fetch);
+                    }
                 }
             }
         };
@@ -319,6 +342,33 @@ pub(crate) fn resolve_delta_chain(
     }
 
     unreachable!("bounded delta-chain loop always returns")
+}
+
+/// A chunked blob's bytes, read chunk by chunk, verified whole. The caller has
+/// checked the blob fits its bound.
+fn assemble_chunks(
+    id: ContentId,
+    manifest: &ContentChunkManifestRecord,
+    fetch: &dyn Fn(ContentId) -> Result<StoredContent, ContentStoreError>,
+) -> Result<VerifiedContent, ContentStoreError> {
+    let length =
+        usize::try_from(manifest.logical_length).map_err(|_| ContentStoreError::TooLarge {
+            id,
+            max: usize::MAX,
+            minimum: usize::MAX,
+        })?;
+    let mut bytes = Vec::with_capacity(length);
+    for chunk in &manifest.chunks {
+        let content = resolve(chunk.id, chunk.length as usize, fetch)?;
+        if content.len() != chunk.length as usize {
+            return Err(ContentStoreError::InvalidFormat {
+                id,
+                reason: format!("chunk {} is not as long as its manifest says", chunk.id),
+            });
+        }
+        bytes.extend_from_slice(content.bytes());
+    }
+    Ok(VerifiedContent::check(id, bytes)?)
 }
 
 #[derive(Clone, Debug)]
@@ -383,16 +433,21 @@ impl ContentStore {
         Ok(content.id())
     }
 
-    /// Retains verified content with bounded parallel durability work.
+    /// Retains verified content with bounded parallel durability work. Content over
+    /// the chunking threshold is stored as chunks, one blob after another.
     pub fn put_many(
         &self,
         contents: &[VerifiedContent<&[u8]>],
         concurrency: usize,
     ) -> Result<(), ContentStoreError> {
-        let deduplicated = contents
-            .iter()
-            .map(|content| (content.id(), *content))
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut deduplicated = std::collections::BTreeMap::new();
+        for content in contents {
+            if is_chunked(content.len()) {
+                self.put_chunked(*content)?;
+            } else {
+                deduplicated.insert(content.id(), *content);
+            }
+        }
         if deduplicated.is_empty() {
             return Ok(());
         }
@@ -441,6 +496,10 @@ impl ContentStore {
             .as_ref()
             .is_some_and(|b| !b.supports_raw_envelopes())
         {
+            return Ok(None);
+        }
+        // A chunked blob shares unchanged chunks instead, and is no delta's base.
+        if is_chunked(bytes.len()) || self.logical_length(base_id).is_ok_and(is_chunked_length) {
             return Ok(None);
         }
         // Keep the stored chain within the same 16-link bound enforced by
@@ -584,8 +643,36 @@ impl ContentStore {
         Ok(())
     }
 
-    /// Stores content verified where it came in, without hashing it again.
+    /// Stores content verified where it came in, without hashing it again. Content
+    /// over the chunking threshold is stored as chunks.
     pub fn put_verified(&self, content: VerifiedContent<&[u8]>) -> Result<(), ContentStoreError> {
+        if is_chunked(content.len()) {
+            return self.put_chunked(content);
+        }
+        self.put_whole(content)
+    }
+
+    /// Stores `content`, over the chunking threshold, as chunks and a manifest. Its
+    /// ID is known, so only the chunks are hashed.
+    fn put_chunked(&self, content: VerifiedContent<&[u8]>) -> Result<(), ContentStoreError> {
+        let id = content.id();
+        if self.contains(id) {
+            return Ok(());
+        }
+        let envelope = crate::content_stream::chunked_envelope(content, |chunk| {
+            if self.contains(chunk.id()) {
+                return Ok(());
+            }
+            self.put_whole(chunk)
+        })?;
+        self.put_raw_envelope(id, envelope)
+    }
+
+    /// Stores `content` as one envelope, whatever its length.
+    pub(crate) fn put_whole(
+        &self,
+        content: VerifiedContent<&[u8]>,
+    ) -> Result<(), ContentStoreError> {
         if let Some(backend) = &self.backend {
             return backend.put_many(&[content]);
         }
@@ -787,6 +874,15 @@ impl ContentStore {
         }
         Ok(())
     }
+}
+
+/// Whether content `length` bytes long is stored as chunks.
+pub(crate) fn is_chunked(length: usize) -> bool {
+    is_chunked_length(length as u64)
+}
+
+fn is_chunked_length(length: u64) -> bool {
+    length > wheat_core::CHUNKED_CONTENT_THRESHOLD
 }
 
 #[cfg(test)]
