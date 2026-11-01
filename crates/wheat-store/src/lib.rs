@@ -6,6 +6,8 @@
 mod application_map;
 mod batch;
 mod change_map;
+mod chunker;
+pub use chunker::ContentChunker;
 mod commit_content;
 mod commit_writer;
 mod content_batch;
