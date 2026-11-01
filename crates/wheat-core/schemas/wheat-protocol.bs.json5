@@ -45,11 +45,13 @@
         { type: "ObjectWantReply",       when: "value == 0x25" },
         { type: "ObjectChunk",           when: "value == 0x26" },
 
-        // Content (0x30–0x34)
+        // Content (0x30–0x35)
         { type: "ContentFetchRequest",   when: "value == 0x30" },
         { type: "ContentBatch",          when: "value == 0x31" },
         { type: "ContentChunk",          when: "value == 0x32" },
         { type: "ContentRedirect",       when: "value == 0x33" },
+        { type: "ContentManifest",       when: "value == 0x34" },
+        { type: "ContentFetchEnd",       when: "value == 0x35" },
 
         // Publish (0x40–0x4b)
         { type: "PublishRequest",        when: "value == 0x40" },
@@ -307,6 +309,17 @@
     // Content messages
     // ─────────────────────────────────────────────────────────────────────
 
+    // Content goes either way in the same messages: a fetch asks with
+    // ContentFetchRequest and the server answers, ending each answer with
+    // ContentFetchEnd; a publish's server asks with ContentNeeded and the client
+    // answers, ending each answer with ContentUploadComplete. An answer sends each
+    // requested blob once: up to MAX_CONTENT_CHUNK_SIZE whole in a ContentBatch, up
+    // to MAX_CONTENT_SIZE (the 16 MiB chunking threshold) as ContentChunks, and a
+    // longer one as its ContentManifest. An answer's manifests come to at most
+    // MAX_ANSWER_MANIFEST_BYTES, the first always sent; the blobs left out are asked
+    // for again. A receiver given a manifest asks, in later requests, for the parts
+    // and chunks it names that it lacks, which come as ordinary content, then checks
+    // the blob against its ID.
     ContentFetchRequest: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x30 },
@@ -344,6 +357,27 @@
         { name: "offset", type: "varlength", encoding: "leb128_canonical" },
         { name: "data", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
         { name: "is_final", type: "bool" },
+      ],
+    },
+
+    // A blob over the chunking threshold, sent as its chunk manifest: the canonical
+    // encoding of a ContentChunkManifestV1 (wheat-objects.bs.json5), at most
+    // 144 KiB.
+    ContentManifest: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x34 },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
+        { name: "content_id", type: "Digest256" },
+        { name: "manifest", type: "bytes", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical" },
+      ],
+    },
+
+    // The server has answered one ContentFetchRequest. Requested blobs it left out
+    // are asked for again.
+    ContentFetchEnd: {
+      sequence: [
+        { name: "message_type", type: "uint8", const: 0x35 },
+        { name: "op_id", type: "varlength", encoding: "leb128_canonical" },
       ],
     },
 
@@ -405,7 +439,8 @@
 
     // The server asks for missing content in rounds of at most MAX_WANT_IDS. The
     // client answers each round with the uploads and one ContentUploadComplete;
-    // ContentComplete then says nothing more is needed.
+    // blobs it left out are asked for again, and ContentComplete then says nothing
+    // more is needed.
     ContentNeeded: {
       sequence: [
         { name: "message_type", type: "uint8", const: 0x43 },

@@ -200,12 +200,11 @@ Performance, most serious first:
   `workspace_scan.rs` has no saved stat cache (mtime, ctime, size, inode, content ID),
   so every status reads all tracked files and their baselines, and fails once the
   workspace passes `MAX_TOTAL_READ_BYTES` (1 GiB).
-- `[ ]` **The server reassembles a chunked upload in memory (scanner only).** A blob
-  that comes as `ContentChunk`s is held whole until its last chunk, up to 1 GiB
-  (`MAX_CONTENT_SIZE`). Stream large blobs to disk instead. Every other content
-  path holds a blob whole too. Bart (2026-11-01): stream everything, and store only
-  the changed chunks of very large blobs: `docs/design/wheat-large-content.md`
-  (designed, every question decided; not built).
+- `[ ]` **Content paths outside the protocol hold a blob whole (scanner only).**
+  Since step 3 of `docs/design/wheat-large-content.md` (2026-11-01) publish and fetch
+  move a blob over 16 MiB as its manifest and chunks, and hold at most 16 MiB of one
+  blob. Client capture, materialization, Git import/export, verification and
+  network export/import still read a blob whole: steps 4–6 of that doc.
 - `[ ]` **Re-adding 20,000 files to one change takes 5.4 s (2026-10-05).** Release,
   NVMe, `wheat add` of 20,000 modified files to a change that already edits them
   all (`WHEAT_TRACE_SUMMARY=1`): `persist_edits` 1.6 s, the first

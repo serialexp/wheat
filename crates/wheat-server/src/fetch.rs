@@ -410,9 +410,11 @@ async fn read_want(network: &Network, ids: &[ObjectId]) -> Result<WantAnswer, Co
 ///
 /// Reads all requested blobs together (one round trip on S3) and streams them
 /// in batches. If that read fails, each blob is read on its own: one larger than
-/// `MAX_CONTENT_CHUNK_SIZE` is sent as `ContentChunk`s, and one that cannot be
-/// read ends the operation with an `Error`, because the client waits for every
-/// blob it asked for.
+/// `MAX_CONTENT_CHUNK_SIZE` is sent as `ContentChunk`s, one over the chunking
+/// threshold as its `ContentManifest` while the answer's manifests fit
+/// `MAX_ANSWER_MANIFEST_BYTES` (and is left out, for the client to ask again, once
+/// they do not), and one that cannot be read ends the operation with an `Error`.
+/// `ContentFetchEnd` closes the answer.
 pub async fn handle_content_fetch(
     ws: &mut impl Transport,
     entry: &RepositoryEntry,
@@ -433,6 +435,8 @@ pub async fn handle_content_fetch(
     }
 
     let mut batch = ContentBatcher::new(op_id);
+    let mut manifests = ManifestBudget::default();
+    let mut left_out = 0usize;
     let network = entry.network.clone();
     let read = drive(move || async move {
         match network
@@ -471,18 +475,26 @@ pub async fn handle_content_fetch(
                     }
                     Err(wheat_store::ContentStoreError::TooLarge { .. }) => {
                         let network = entry.network.clone();
-                        drive(move || async move { network.content.get(id) }).await?
+                        drive(move || async move { long_blob(&network.content, id) }).await?
                     }
                     Err(error) => Err(error),
                 };
                 match data {
-                    Ok(data) => {
+                    Ok(LongBlob::Whole(data)) => {
                         if let Some(open) = batch.finish() {
                             send(ws, &open).await?;
                         }
                         let digest = content_digest(id);
                         for chunk in content_chunks(op_id, &digest, &data) {
                             send(ws, &chunk).await?;
+                        }
+                    }
+                    Ok(LongBlob::Manifest(manifest)) => {
+                        if manifests.admit(manifest.len()) {
+                            send(ws, &content_manifest(op_id, content_digest(id), manifest))
+                                .await?;
+                        } else {
+                            left_out += 1;
                         }
                     }
                     Err(error) => {
@@ -498,9 +510,46 @@ pub async fn handle_content_fetch(
             }
         }
     }
-    match batch.finish() {
-        Some(open) => send(ws, &open).await,
-        None => Ok(()),
+    if let Some(open) = batch.finish() {
+        send(ws, &open).await?;
+    }
+    if left_out > 0 {
+        debug!(
+            op_id,
+            left_out, "content fetch: manifests left for the next request"
+        );
+    }
+    send(
+        ws,
+        &WheatProtocolMessage::ContentFetchEnd(ContentFetchEndOutput {
+            message_type: 0x35,
+            op_id,
+        }),
+    )
+    .await
+}
+
+/// A blob too long for one batch item: its bytes, sent as `ContentChunk`s, or, over
+/// the chunking threshold, its encoded manifest.
+enum LongBlob {
+    Whole(Vec<u8>),
+    Manifest(Vec<u8>),
+}
+
+fn long_blob(
+    content: &wheat_store::ContentStore,
+    id: wheat_core::ContentId,
+) -> Result<LongBlob, wheat_store::ContentStoreError> {
+    match content.chunk_manifest(id)? {
+        Some(manifest) => wheat_core::encode_content_chunk_manifest(&manifest)
+            .map(LongBlob::Manifest)
+            .map_err(|error| wheat_store::ContentStoreError::InvalidFormat {
+                id,
+                reason: error.to_string(),
+            }),
+        None => content
+            .get_bounded(id, MAX_CONTENT_SIZE)
+            .map(LongBlob::Whole),
     }
 }
 

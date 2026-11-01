@@ -173,12 +173,21 @@ struct ContentPhase {
 /// Start a server, clone it, add `farewell.txt` holding `farewell` as a new
 /// change, and publish it until the server asks for content.
 async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
+    publish_files_to_content_phase(&[("farewell.txt", farewell)], &[]).await
+}
+
+/// [`publish_to_content_phase`] for a change adding `files`, with `seeded` stored on
+/// the server before it starts.
+async fn publish_files_to_content_phase(files: &[(&str, &[u8])], seeded: &[&[u8]]) -> ContentPhase {
     // Set up server with an initial repo.
     let server_dir = tempfile::tempdir().unwrap();
     let _repo = setup_repo(server_dir.path()).await;
 
     let (server_store, trace) =
         PackedObjectStore::open_traced(server_dir.path().join("storage")).unwrap();
+    for blob in seeded {
+        server_store.content_store().put(blob).unwrap();
+    }
     let (addr, shutdown) = serve(Registry::single_with_stores(
         "test/repo".to_string(),
         Box::new(server_store),
@@ -205,7 +214,9 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
     clone_heads.initialize(head).unwrap();
 
     // Create a change locally using the mutator (same as wheat-cli does).
-    clone_content.put(farewell).unwrap();
+    for (_, data) in files {
+        clone_content.put(data).unwrap();
+    }
 
     let reader = RepositoryReader::new(&clone_objects, &clone_content);
     let envelope_rec = reader.envelope(env_id).await.unwrap();
@@ -250,7 +261,7 @@ async fn publish_to_content_phase(farewell: &[u8]) -> ContentPhase {
             },
             provenance: None,
         },
-        edits: edit("farewell.txt", farewell),
+        edits: support::edits(files.iter().copied()),
     };
 
     let objects_batch = BatchObjectStore::new(&clone_objects, 1024, 8 * 1024 * 1024);
@@ -522,7 +533,7 @@ async fn publish_refuses_a_chunk_that_skips_ahead() {
 async fn publish_refuses_an_upload_missing_content() {
     let mut phase = publish_to_content_phase(b"goodbye wheat").await;
     upload_complete(&mut phase.ws).await;
-    assert_upload_refused(&mut phase, "were not sent").await;
+    assert_upload_refused(&mut phase, "answered with nothing").await;
 }
 
 #[tokio::test]
@@ -541,6 +552,242 @@ async fn publish_refuses_content_that_does_not_match_its_id() {
     let digest = phase.needed[0].clone();
     upload_whole(&mut phase.ws, &digest, b"something else".to_vec()).await;
     assert_upload_refused(&mut phase, "identity mismatch").await;
+}
+
+/// Bytes that do not repeat, from `seed`.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect()
+}
+
+/// A blob over the chunking threshold, cut into several chunks.
+const LONG: usize = wheat_core::CHUNKED_CONTENT_THRESHOLD as usize + 4 * 1024 * 1024 + 7;
+
+fn digest_of(id: ContentId) -> Digest256 {
+    Digest256 {
+        bytes: id.as_bytes().to_vec(),
+    }
+}
+
+/// The chunks `content` stores the long blob `id` as.
+fn chunk_ids(content: &ContentStore, id: ContentId) -> Vec<ContentId> {
+    match content.chunk_manifest(id).unwrap().unwrap().entries {
+        wheat_core::ContentManifestEntries::Chunks(chunks) => {
+            chunks.iter().map(|chunk| chunk.id).collect()
+        }
+        wheat_core::ContentManifestEntries::Parts(_) => panic!("expected chunks"),
+    }
+}
+
+/// Sends the manifest `content` stores for `of` as the manifest of `id`.
+async fn upload_manifest(ws: &mut Ws, content: &ContentStore, id: ContentId, of: ContentId) {
+    let manifest = content.chunk_manifest(of).unwrap().unwrap();
+    let encoded = wheat_core::encode_content_chunk_manifest(&manifest).unwrap();
+    send_msg(ws, &content_manifest(PUBLISH_OP, digest_of(id), encoded)).await;
+}
+
+/// The next `ContentNeeded`'s IDs.
+async fn next_needed(ws: &mut Ws) -> Vec<ContentId> {
+    match recv_msg(ws).await {
+        WheatProtocolMessage::ContentNeeded(cn) => {
+            assert_eq!(cn.op_id, PUBLISH_OP);
+            cn.content_ids
+                .iter()
+                .map(|d| ContentId::from_digest(d.bytes.as_slice().try_into().unwrap()))
+                .collect()
+        }
+        other => panic!("expected ContentNeeded, got {other:?}"),
+    }
+}
+
+/// Uploads each of `ids` from `content` whole, then ends the round.
+async fn upload_round(ws: &mut Ws, content: &ContentStore, ids: &[ContentId]) {
+    for &id in ids {
+        upload_whole(ws, &digest_of(id), content.get(id).unwrap()).await;
+    }
+    upload_complete(ws).await;
+}
+
+fn sorted(mut ids: Vec<ContentId>) -> Vec<ContentId> {
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[tokio::test]
+async fn publish_takes_a_long_blob_as_its_manifest_then_its_chunks() {
+    let long = noise(1, LONG);
+    let id = ContentId::of(&long);
+    let mut phase = publish_to_content_phase(&long).await;
+    assert_eq!(phase.needed, vec![digest_of(id)]);
+    let content = phase.content.clone();
+    let chunks = chunk_ids(&content, id);
+    assert!(chunks.len() > 4, "{} chunks", chunks.len());
+
+    let ws = &mut phase.ws;
+    upload_manifest(ws, &content, id, id).await;
+    upload_complete(ws).await;
+    // The server has none of the chunks, so it asks for every one, each once.
+    let needed = next_needed(ws).await;
+    assert_eq!(needed.len(), chunks.len());
+    assert_eq!(sorted(needed.clone()), sorted(chunks));
+    upload_round(ws, &content, &needed).await;
+    let pr = commit_publish(ws).await;
+    assert_published(&pr, phase.generation);
+
+    // The server serves the blob as the manifest it was sent.
+    let mut ws = connect_and_handshake(phase.addr, "test/repo").await;
+    open_repo(&mut ws).await;
+    send_msg(
+        &mut ws,
+        &WheatProtocolMessage::ContentFetchRequest(ContentFetchRequestOutput {
+            message_type: 0x30,
+            op_id: 9,
+            content_ids: vec![digest_of(id)],
+        }),
+    )
+    .await;
+    let expected =
+        wheat_core::encode_content_chunk_manifest(&content.chunk_manifest(id).unwrap().unwrap())
+            .unwrap();
+    match recv_msg(&mut ws).await {
+        WheatProtocolMessage::ContentManifest(sent) => {
+            assert_eq!(sent.content_id, digest_of(id));
+            assert!(sent.manifest == expected, "the manifest as sent");
+        }
+        other => panic!("expected ContentManifest, got {other:?}"),
+    }
+    ws.close(None).await.ok();
+    let _ = phase.shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_small_edit_to_a_long_blob_asks_only_for_the_chunks_it_changed() {
+    let before = noise(1, LONG);
+    let mut after = before.clone();
+    after[LONG / 2] ^= 0xff;
+    let id = ContentId::of(&after);
+    let mut phase = publish_files_to_content_phase(&[("farewell.txt", &after)], &[&before]).await;
+    assert_eq!(phase.needed, vec![digest_of(id)]);
+    let content = phase.content.clone();
+    // The chunks the server holds are those of `before`.
+    let held = content.put(&before).unwrap();
+    let held = chunk_ids(&content, held);
+    let changed: Vec<ContentId> = chunk_ids(&content, id)
+        .into_iter()
+        .filter(|chunk| !held.contains(chunk))
+        .collect();
+    assert!(
+        (1..=2).contains(&changed.len()),
+        "{} changed chunks",
+        changed.len()
+    );
+
+    let ws = &mut phase.ws;
+    upload_manifest(ws, &content, id, id).await;
+    upload_complete(ws).await;
+    let needed = next_needed(ws).await;
+    assert_eq!(sorted(needed.clone()), sorted(changed));
+    upload_round(ws, &content, &needed).await;
+    let pr = commit_publish(ws).await;
+    assert_published(&pr, phase.generation);
+    let _ = phase.shutdown.send(());
+}
+
+#[tokio::test]
+async fn publish_asks_again_for_a_long_blob_left_out_of_an_answer() {
+    let (first, second) = (noise(1, LONG), noise(2, LONG));
+    let (first_id, second_id) = (ContentId::of(&first), ContentId::of(&second));
+    let mut phase =
+        publish_files_to_content_phase(&[("a.bin", &first), ("b.bin", &second)], &[]).await;
+    assert_eq!(
+        sorted(
+            phase
+                .needed
+                .iter()
+                .map(|d| ContentId::from_digest(d.bytes.as_slice().try_into().unwrap()))
+                .collect()
+        ),
+        sorted(vec![first_id, second_id])
+    );
+    let content = phase.content.clone();
+    let ws = &mut phase.ws;
+    // As a sender past its manifest budget would: the first only.
+    upload_manifest(ws, &content, first_id, first_id).await;
+    upload_complete(ws).await;
+    let needed = next_needed(ws).await;
+    assert_eq!(
+        sorted(needed.clone()),
+        sorted(chunk_ids(&content, first_id))
+    );
+    upload_round(ws, &content, &needed).await;
+    // The first is stored; the second is asked for again.
+    assert_eq!(next_needed(ws).await, vec![second_id]);
+    upload_manifest(ws, &content, second_id, second_id).await;
+    upload_complete(ws).await;
+    let needed = next_needed(ws).await;
+    assert_eq!(
+        sorted(needed.clone()),
+        sorted(chunk_ids(&content, second_id))
+    );
+    upload_round(ws, &content, &needed).await;
+    let pr = commit_publish(ws).await;
+    assert_published(&pr, phase.generation);
+    let _ = phase.shutdown.send(());
+}
+
+#[tokio::test]
+async fn publish_refuses_a_manifest_whose_chunks_are_not_the_blob() {
+    let long = noise(1, LONG);
+    let id = ContentId::of(&long);
+    let mut phase = publish_to_content_phase(&long).await;
+    let content = phase.content.clone();
+    let other = content.put(&noise(2, LONG)).unwrap();
+    let ws = &mut phase.ws;
+    upload_manifest(ws, &content, id, other).await;
+    upload_complete(ws).await;
+    let needed = next_needed(ws).await;
+    upload_round(ws, &content, &needed).await;
+    assert_upload_refused(&mut phase, "does not match its chunks").await;
+}
+
+#[tokio::test]
+async fn publish_refuses_a_chunk_sent_as_a_manifest() {
+    let long = noise(1, LONG);
+    let id = ContentId::of(&long);
+    let mut phase = publish_to_content_phase(&long).await;
+    let content = phase.content.clone();
+    let ws = &mut phase.ws;
+    upload_manifest(ws, &content, id, id).await;
+    upload_complete(ws).await;
+    let needed = next_needed(ws).await;
+    upload_manifest(ws, &content, needed[0], id).await;
+    assert_upload_refused(&mut phase, "sent as a manifest").await;
+}
+
+#[tokio::test]
+async fn publish_refuses_a_long_blob_sent_as_bytes() {
+    let long = noise(1, LONG);
+    let mut phase = publish_to_content_phase(&long).await;
+    let digest = phase.needed[0].clone();
+    let ws = &mut phase.ws;
+    let mut offset = 0;
+    for piece in long.chunks(MAX_CONTENT_CHUNK_SIZE) {
+        let is_final = offset + piece.len() == long.len();
+        upload_chunk(ws, &digest, offset as u64, piece, is_final).await;
+        offset += piece.len();
+        if offset > MAX_CONTENT_SIZE {
+            break;
+        }
+    }
+    assert_upload_refused(&mut phase, "larger than").await;
 }
 
 #[tokio::test]

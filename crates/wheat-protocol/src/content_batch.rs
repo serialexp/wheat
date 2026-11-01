@@ -1,9 +1,11 @@
 //! Content on the wire, either way: blobs up to [`MAX_CONTENT_CHUNK_SIZE`] packed
-//! into `ContentBatch` messages, larger ones as `ContentChunk`s.
+//! into `ContentBatch` messages, larger ones as `ContentChunk`s, and those over the
+//! chunking threshold as their `ContentManifest`.
 
 use crate::{
-    ContentBatchOutput, ContentChunkOutput, ContentEntry, Digest256, MAX_CONTENT_BATCH_ITEMS,
-    MAX_CONTENT_BATCH_SIZE, MAX_CONTENT_CHUNK_SIZE, WheatProtocolMessage,
+    ContentBatchOutput, ContentChunkOutput, ContentEntry, ContentManifestOutput, Digest256,
+    MAX_ANSWER_MANIFEST_BYTES, MAX_CONTENT_BATCH_ITEMS, MAX_CONTENT_BATCH_SIZE,
+    MAX_CONTENT_CHUNK_SIZE, WheatProtocolMessage,
 };
 
 /// Gathers blobs into `ContentBatch` messages that stay within
@@ -92,6 +94,39 @@ pub fn content_chunks<'a>(
     })
 }
 
+/// The manifests one answer sends: at most [`MAX_ANSWER_MANIFEST_BYTES`], the
+/// first always.
+#[derive(Debug, Default)]
+pub struct ManifestBudget {
+    sent: usize,
+    bytes: usize,
+}
+
+impl ManifestBudget {
+    /// Counts a manifest of `len` encoded bytes and returns whether it goes in this
+    /// answer. One that does not is left out, to be asked for again.
+    pub fn admit(&mut self, len: usize) -> bool {
+        let total = self.bytes.saturating_add(len);
+        if self.sent > 0 && total > MAX_ANSWER_MANIFEST_BYTES {
+            return false;
+        }
+        self.sent += 1;
+        self.bytes = total;
+        true
+    }
+}
+
+/// Blob `id` sent as its encoded chunk manifest.
+#[must_use]
+pub fn content_manifest(op_id: u64, id: Digest256, manifest: Vec<u8>) -> WheatProtocolMessage {
+    WheatProtocolMessage::ContentManifest(ContentManifestOutput {
+        message_type: 0x34,
+        op_id,
+        content_id: id,
+        manifest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +211,20 @@ mod tests {
         }
         assert_eq!(joined, data);
         assert_eq!(finals, [false, false, true]);
+    }
+
+    #[test]
+    fn an_answer_sends_manifests_up_to_the_budget_and_always_the_first() {
+        let mut budget = ManifestBudget::default();
+        assert!(
+            budget.admit(MAX_ANSWER_MANIFEST_BYTES + 1),
+            "the first always goes"
+        );
+        assert!(!budget.admit(1));
+
+        let mut budget = ManifestBudget::default();
+        assert!(budget.admit(MAX_ANSWER_MANIFEST_BYTES - 10));
+        assert!(budget.admit(10));
+        assert!(!budget.admit(1));
     }
 }

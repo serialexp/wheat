@@ -563,8 +563,12 @@ pub async fn fetch_content<O: ImmutableObjectStore>(
         assert_eq!(ContentId::of(&data), id, "content identity");
         content.put(&data).unwrap();
     };
-    while !receiver.is_complete() {
+    loop {
         match recv_msg(ws).await {
+            WheatProtocolMessage::ContentFetchEnd(end) => {
+                assert_eq!(end.op_id, op_id);
+                break;
+            }
             WheatProtocolMessage::ContentBatch(cb) => {
                 assert_eq!(cb.op_id, op_id);
                 for entry in cb.contents {

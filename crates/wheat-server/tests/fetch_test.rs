@@ -510,3 +510,79 @@ async fn a_large_blob_beside_a_missing_one_still_comes_in_chunks() {
     assert_eq!(assembled, bytes);
     assert_eq!(error.object_id.bytes, missing.as_bytes());
 }
+
+#[tokio::test]
+async fn a_long_blob_comes_as_its_manifest_and_its_chunks_on_request() {
+    let served = serve_history(3).await;
+    let bytes: Vec<u8> = (0..wheat_core::CHUNKED_CONTENT_THRESHOLD as usize + 3 * 1024 * 1024)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let long = served.content.put(&bytes).unwrap();
+    let small = served.content.put(b"small").unwrap();
+    let mut ws = served.session().await;
+
+    send_msg(&mut ws, &content_fetch(1, &[long, small])).await;
+    let mut manifest = None;
+    let mut smalls = 0;
+    loop {
+        match recv_msg(&mut ws).await {
+            WheatProtocolMessage::ContentManifest(sent) => {
+                assert_eq!(sent.op_id, 1);
+                assert_eq!(sent.content_id.bytes, long.as_bytes());
+                assert!(manifest.is_none(), "the manifest came twice");
+                manifest = Some(wheat_core::decode_content_chunk_manifest(&sent.manifest).unwrap());
+            }
+            WheatProtocolMessage::ContentBatch(batch) => {
+                assert_eq!(batch.op_id, 1);
+                smalls += batch.contents.len();
+            }
+            WheatProtocolMessage::ContentFetchEnd(end) => {
+                assert_eq!(end.op_id, 1);
+                break;
+            }
+            other => panic!("expected the answer, got {other:?}"),
+        }
+    }
+    assert_eq!(smalls, 1);
+    let manifest = manifest.expect("the long blob's manifest");
+    assert_eq!(
+        manifest,
+        served.content.chunk_manifest(long).unwrap().unwrap()
+    );
+    let wheat_core::ContentManifestEntries::Chunks(chunks) = &manifest.entries else {
+        panic!("expected chunks");
+    };
+    assert!(chunks.len() > 1);
+
+    // Each chunk is a blob of its own, under the threshold, so it comes whole.
+    let ids: Vec<ContentId> = chunks.iter().map(|chunk| chunk.id).collect();
+    send_msg(&mut ws, &content_fetch(2, &ids)).await;
+    let mut received = std::collections::HashMap::new();
+    let mut pending = std::collections::HashMap::<ContentId, Vec<u8>>::new();
+    loop {
+        match recv_msg(&mut ws).await {
+            WheatProtocolMessage::ContentBatch(batch) => {
+                for item in batch.contents {
+                    let id = ContentId::from_digest(item.id.bytes.try_into().unwrap());
+                    received.insert(id, item.data);
+                }
+            }
+            WheatProtocolMessage::ContentChunk(chunk) => {
+                let id = ContentId::from_digest(chunk.content_id.bytes.try_into().unwrap());
+                let held = pending.entry(id).or_default();
+                assert_eq!(chunk.offset, held.len() as u64);
+                held.extend_from_slice(&chunk.data);
+                if chunk.is_final {
+                    received.insert(id, pending.remove(&id).unwrap());
+                }
+            }
+            WheatProtocolMessage::ContentFetchEnd(end) => {
+                assert_eq!(end.op_id, 2);
+                break;
+            }
+            other => panic!("expected chunks, got {other:?}"),
+        }
+    }
+    let assembled: Vec<u8> = ids.iter().flat_map(|id| received[id].clone()).collect();
+    assert!(assembled == bytes, "the chunks assemble to the blob");
+}

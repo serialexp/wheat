@@ -2,7 +2,7 @@
 
 use tracing::{Instrument as _, debug, debug_span, info, warn};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use wheat_core::{
@@ -10,8 +10,8 @@ use wheat_core::{
 };
 use wheat_protocol::*;
 use wheat_store::{
-    DeltaStep, ImmutableObjectStore, MerkleTreeStore, ObjectStoreError, RepositoryHead,
-    RepositoryReader, RepositoryStage, StructuralDelta, StructuralDeltaError,
+    DeltaStep, ImmutableObjectStore, ManifestArrivals, MerkleTreeStore, ObjectStoreError,
+    RepositoryHead, RepositoryReader, RepositoryStage, StructuralDelta, StructuralDeltaError,
     StructuralDeltaLimits, TreeDiffLimits,
 };
 
@@ -30,8 +30,9 @@ use crate::wire::{
     send_error,
 };
 
-// A blob the protocol accepts must also fit the store.
-const _: () = assert!(MAX_CONTENT_SIZE == wheat_store::HARD_LOGICAL_RECORD_BYTES);
+// A blob the protocol takes as bytes is one the store keeps whole; a longer one
+// comes as its manifest.
+const _: () = assert!(MAX_CONTENT_SIZE as u64 == wheat_core::CHUNKED_CONTENT_THRESHOLD);
 
 /// What a client pushed unasked straight after its `PublishRequest`: objects of its
 /// own walk from the expected head, and small added blobs. The publish walks take
@@ -228,64 +229,10 @@ pub async fn handle_publish(
     // Scoped, so the plan is not held through the commit.
     {
         let ContentPlan { missing, base_map } = plan;
-        // Ask in rounds of at most MAX_WANT_IDS, one ContentNeeded each. In
-        // every round accept only the requested blobs, each once, and stage them
-        // as they arrive; the stage bounds what the session holds.
-        for round in missing.chunks(MAX_WANT_IDS) {
-            send(
-                ws,
-                &WheatProtocolMessage::ContentNeeded(ContentNeededOutput {
-                    message_type: 0x43,
-                    op_id,
-                    content_ids: round
-                        .iter()
-                        .map(|id| Digest256 {
-                            bytes: id.as_bytes().to_vec(),
-                        })
-                        .collect(),
-                }),
-            )
-            .await?;
-            let mut receiver = TransferReceiver::new(round.iter().copied(), MAX_CONTENT_SIZE);
-            loop {
-                let msg = recv(ws).await?;
-                let received: Vec<(ContentId, Vec<u8>)> = match msg {
-                    WheatProtocolMessage::ContentBatch(batch) if batch.op_id == op_id => {
-                        let mut blobs = Vec::with_capacity(batch.contents.len());
-                        for blob in batch.contents {
-                            let id = digest_to_content_id(&blob.id)?;
-                            if let Err(e) = receiver.accept_whole(id, blob.data.len()) {
-                                return reject(ws, op_id, current_head, &format!("{e}")).await;
-                            }
-                            blobs.push((id, blob.data));
-                        }
-                        blobs
-                    }
-                    WheatProtocolMessage::ContentChunk(chunk) if chunk.op_id == op_id => {
-                        let id = digest_to_content_id(&chunk.content_id)?;
-                        match receiver.accept_chunk(id, chunk.offset, chunk.data, chunk.is_final) {
-                            Ok(finished) => finished.into_iter().collect(),
-                            Err(e) => {
-                                return reject(ws, op_id, current_head, &format!("{e}")).await;
-                            }
-                        }
-                    }
-                    WheatProtocolMessage::ContentUploadComplete(cuc) if cuc.op_id == op_id => {
-                        debug!(op_id, "publish: content upload round complete");
-                        if let Err(e) = receiver.finish() {
-                            return reject(ws, op_id, current_head, &format!("{e}")).await;
-                        }
-                        break;
-                    }
-                    _ => {
-                        warn!(op_id, "publish: unexpected message during content upload");
-                        Vec::new()
-                    }
-                };
-                if !stage_content(&staged, &base_map, received).await? {
-                    return reject(ws, op_id, current_head, "content identity mismatch").await;
-                }
-            }
+        if let Some(refusal) =
+            receive_content(ws, &staged, op_id, missing.into(), &base_map).await?
+        {
+            return reject(ws, op_id, current_head, &refusal).await;
         }
     }
 
@@ -743,6 +690,171 @@ async fn stage_objects(
             "failed to store objects: {error}"
         ))),
     }
+}
+
+/// Gets the content of `missing` from the client, until the stage has it all.
+///
+/// Asks in rounds of at most `MAX_WANT_IDS`, one `ContentNeeded` each, and stages
+/// each blob as it arrives; the stage bounds what the session holds. A round's
+/// answer may leave out blobs it sends as manifests once they pass
+/// `MAX_ANSWER_MANIFEST_BYTES`; those are asked for again. Before anything new, the
+/// parts and chunks the round's manifests name are asked for, in rounds that must
+/// be answered in full, and each such blob is then checked and its manifest stored.
+/// Returns why the publish is refused, if it is.
+#[tracing::instrument(name = "publish_content", level = "debug", skip_all)]
+async fn receive_content(
+    ws: &mut impl Transport,
+    staged: &Arc<Staged>,
+    op_id: u64,
+    mut queue: VecDeque<ContentId>,
+    base_map: &Arc<HashMap<ContentId, ContentId>>,
+) -> Result<Option<String>, ConnectionError> {
+    let mut arrivals = ManifestArrivals::new(MAX_ANSWER_MANIFEST_BYTES);
+    // Parts and chunks are stored whole.
+    let no_bases = Arc::default();
+    loop {
+        // The pieces of the held manifests come before anything new.
+        let pieces = !arrivals.is_empty();
+        let round: Vec<ContentId> = if pieces {
+            let (back, next) = {
+                let staged = Arc::clone(staged);
+                drive(move || async move {
+                    let next = arrivals.next_round(staged.content(), MAX_WANT_IDS);
+                    (arrivals, next)
+                })
+                .await?
+            };
+            arrivals = back;
+            let next =
+                next.map_err(|e| ConnectionError::Internal(format!("content lookup failed: {e}")))?;
+            if next.is_empty() {
+                if let Some(refusal) = store_manifests(staged, arrivals.take()).await? {
+                    return Ok(Some(refusal));
+                }
+                continue;
+            }
+            next
+        } else if queue.is_empty() {
+            return Ok(None);
+        } else {
+            let take = queue.len().min(MAX_WANT_IDS);
+            queue.drain(..take).collect()
+        };
+
+        send(
+            ws,
+            &WheatProtocolMessage::ContentNeeded(ContentNeededOutput {
+                message_type: 0x43,
+                op_id,
+                content_ids: round
+                    .iter()
+                    .map(|id| Digest256 {
+                        bytes: id.as_bytes().to_vec(),
+                    })
+                    .collect(),
+            }),
+        )
+        .await?;
+        let mut receiver = TransferReceiver::new(round.iter().copied(), MAX_CONTENT_SIZE);
+        loop {
+            let received: Vec<(ContentId, Vec<u8>)> = match recv(ws).await? {
+                WheatProtocolMessage::ContentBatch(batch) if batch.op_id == op_id => {
+                    let mut blobs = Vec::with_capacity(batch.contents.len());
+                    for blob in batch.contents {
+                        let id = digest_to_content_id(&blob.id)?;
+                        if let Err(e) = receiver.accept_whole(id, blob.data.len()) {
+                            return Ok(Some(e.to_string()));
+                        }
+                        blobs.push((id, blob.data));
+                    }
+                    blobs
+                }
+                WheatProtocolMessage::ContentChunk(chunk) if chunk.op_id == op_id => {
+                    let id = digest_to_content_id(&chunk.content_id)?;
+                    match receiver.accept_chunk(id, chunk.offset, chunk.data, chunk.is_final) {
+                        Ok(finished) => finished.into_iter().collect(),
+                        Err(e) => return Ok(Some(e.to_string())),
+                    }
+                }
+                WheatProtocolMessage::ContentManifest(sent) if sent.op_id == op_id => {
+                    if pieces {
+                        return Ok(Some("a part or chunk was sent as a manifest".to_owned()));
+                    }
+                    let id = digest_to_content_id(&sent.content_id)?;
+                    if let Err(e) = receiver.accept_whole(id, sent.manifest.len()) {
+                        return Ok(Some(e.to_string()));
+                    }
+                    if let Err(e) = arrivals.hold(id, &sent.manifest) {
+                        return Ok(Some(e.to_string()));
+                    }
+                    Vec::new()
+                }
+                WheatProtocolMessage::ContentUploadComplete(cuc) if cuc.op_id == op_id => {
+                    debug!(op_id, "publish: content upload round complete");
+                    let left = match receiver.finish_partial() {
+                        Ok(left) => left,
+                        Err(e) => return Ok(Some(e.to_string())),
+                    };
+                    if !left.is_empty() {
+                        if pieces {
+                            return Ok(Some(format!(
+                                "{} requested parts or chunks were not sent",
+                                left.len()
+                            )));
+                        }
+                        if left.len() == round.len() {
+                            return Ok(Some("a content round was answered with nothing".into()));
+                        }
+                        // Left out to keep the answer's manifests in bounds: ask again
+                        // once the held ones are stored.
+                        for id in round.iter().rev().filter(|id| left.contains(id)) {
+                            queue.push_front(*id);
+                        }
+                    }
+                    break;
+                }
+                _ => {
+                    warn!(op_id, "publish: unexpected message during content upload");
+                    Vec::new()
+                }
+            };
+            let base_map = if pieces { &no_bases } else { base_map };
+            if !stage_content(staged, base_map, received).await? {
+                return Ok(Some("content identity mismatch".into()));
+            }
+        }
+    }
+}
+
+/// Checks each blob of `manifests` against its ID and stores its manifest, as one
+/// job. Returns why the publish is refused when a blob's chunks are not its bytes.
+async fn store_manifests(
+    staged: &Arc<Staged>,
+    manifests: Vec<(ContentId, wheat_core::ContentChunkManifestRecord)>,
+) -> Result<Option<String>, ConnectionError> {
+    let staged = Arc::clone(staged);
+    drive(move || async move {
+        for (id, manifest) in &manifests {
+            match staged.put_manifest(*id, manifest).await {
+                Ok(()) => {}
+                Err(wheat_store::RepositoryStoreError::Content(
+                    error @ (wheat_store::ContentStoreError::Corrupt { .. }
+                    | wheat_store::ContentStoreError::InvalidFormat { .. }),
+                )) => {
+                    return Ok(Some(format!(
+                        "content {id} does not match its chunks: {error}"
+                    )));
+                }
+                Err(error) => {
+                    return Err(ConnectionError::Internal(format!(
+                        "failed to store the manifest of {id}: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    })
+    .await?
 }
 
 /// The content a publish still has to ask for, and the delta base of each.

@@ -883,7 +883,7 @@ pub(crate) fn is_chunked(length: usize) -> bool {
     is_chunked_length(length as u64)
 }
 
-fn is_chunked_length(length: u64) -> bool {
+pub(crate) fn is_chunked_length(length: u64) -> bool {
     length > wheat_core::CHUNKED_CONTENT_THRESHOLD
 }
 

@@ -20,8 +20,9 @@ use url::{Host, Url};
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, VerifiedContent};
 use wheat_protocol::*;
 use wheat_store::{
-    ContentStore, DeltaStep, ImmutableObjectStore, RepositoryHead, RepositoryReader,
-    RepositoryStage, RepositoryStore, StructuralDelta, StructuralDeltaLimits,
+    ContentStore, ContentStoreError, DeltaStep, ImmutableObjectStore, ManifestArrivals,
+    RepositoryHead, RepositoryReader, RepositoryStage, RepositoryStore, StructuralDelta,
+    StructuralDeltaLimits,
 };
 
 // ---------------------------------------------------------------------------
@@ -856,33 +857,50 @@ pub async fn fetch_content<S: RepositoryStore>(
             .context("storing fetched content")
     };
 
-    // Request content in batches.
-    for batch in missing.chunks(MAX_WANT_IDS) {
-        let content_ids: Vec<Digest256> =
-            batch.iter().map(|id| content_id_to_digest(*id)).collect();
+    // Request content in batches. An answer may leave out blobs it would send as
+    // manifests once they pass MAX_ANSWER_MANIFEST_BYTES; those are asked for again,
+    // after the parts and chunks of the manifests it did send, and the blobs they
+    // make up are checked and stored.
+    let mut queue: std::collections::VecDeque<ContentId> = missing.into();
+    let mut arrivals = ManifestArrivals::new(MAX_ANSWER_MANIFEST_BYTES);
+    loop {
+        let pieces = !arrivals.is_empty();
+        let request: Vec<ContentId> = if pieces {
+            let next = arrivals.next_round(content, MAX_WANT_IDS)?;
+            if next.is_empty() {
+                for (id, manifest) in arrivals.take() {
+                    stage
+                        .put_manifest(id, &manifest)
+                        .await
+                        .with_context(|| format!("storing fetched content {id}"))?;
+                }
+                continue;
+            }
+            next
+        } else if queue.is_empty() {
+            break;
+        } else {
+            let take = queue.len().min(MAX_WANT_IDS);
+            queue.drain(..take).collect()
+        };
 
         send_msg(
             &mut session.ws,
             &WheatProtocolMessage::ContentFetchRequest(ContentFetchRequestOutput {
                 message_type: 0x30,
                 op_id,
-                content_ids,
+                content_ids: request.iter().map(|id| content_id_to_digest(*id)).collect(),
             }),
         )
         .await?;
 
-        // Receive ContentBatch / ContentChunk messages until every blob in
-        // this batch has arrived. Only the requested blobs are accepted, each
-        // once, chunk by chunk in order and no larger than the store takes.
-        let mut receiver = TransferReceiver::new(batch.iter().copied(), MAX_CONTENT_SIZE);
-
-        while !receiver.is_complete() {
-            let msg = recv_msg(&mut session.ws).await?;
-            match msg {
-                WheatProtocolMessage::ContentBatch(cb) => {
-                    if cb.op_id != op_id {
-                        continue;
-                    }
+        // Receive the answer up to its ContentFetchEnd. Only the requested blobs are
+        // accepted, each once, chunk by chunk in order and no larger than the store
+        // keeps whole.
+        let mut receiver = TransferReceiver::new(request.iter().copied(), MAX_CONTENT_SIZE);
+        loop {
+            match recv_msg(&mut session.ws).await? {
+                WheatProtocolMessage::ContentBatch(cb) if cb.op_id == op_id => {
                     for entry in cb.contents {
                         let id = digest_to_content_id(&entry.id)?;
                         receiver
@@ -891,10 +909,7 @@ pub async fn fetch_content<S: RepositoryStore>(
                         stage_blob(id, entry.data).await?;
                     }
                 }
-                WheatProtocolMessage::ContentChunk(chunk) => {
-                    if chunk.op_id != op_id {
-                        continue;
-                    }
+                WheatProtocolMessage::ContentChunk(chunk) if chunk.op_id == op_id => {
                     let chunk_id = digest_to_content_id(&chunk.content_id)?;
                     let finished = receiver
                         .accept_chunk(chunk_id, chunk.offset, chunk.data, chunk.is_final)
@@ -902,6 +917,35 @@ pub async fn fetch_content<S: RepositoryStore>(
                     if let Some((id, data)) = finished {
                         stage_blob(id, data).await?;
                     }
+                }
+                WheatProtocolMessage::ContentManifest(sent) if sent.op_id == op_id => {
+                    if pieces {
+                        bail!("server sent a part or chunk as a manifest");
+                    }
+                    let id = digest_to_content_id(&sent.content_id)?;
+                    receiver
+                        .accept_whole(id, sent.manifest.len())
+                        .context("server sent content that breaks the fetch rules")?;
+                    arrivals
+                        .hold(id, &sent.manifest)
+                        .context("server sent a manifest that breaks the fetch rules")?;
+                }
+                WheatProtocolMessage::ContentFetchEnd(end) if end.op_id == op_id => {
+                    let left = receiver
+                        .finish_partial()
+                        .context("server ended a content answer inside a chunked blob")?;
+                    if !left.is_empty() {
+                        if pieces {
+                            bail!("server left out {} requested parts or chunks", left.len());
+                        }
+                        if left.len() == request.len() {
+                            bail!("server answered a content request with nothing");
+                        }
+                        for id in request.iter().rev().filter(|id| left.contains(id)) {
+                            queue.push_front(*id);
+                        }
+                    }
+                    break;
                 }
                 WheatProtocolMessage::Error(e) if e.op_id == op_id => {
                     bail!("server refused the content fetch: {}", e.message);
@@ -996,9 +1040,28 @@ pub async fn publish<O: ImmutableObjectStore>(
         match msg {
             WheatProtocolMessage::ContentNeeded(cn) if cn.op_id == op_id => {
                 let mut batch = ContentBatcher::new(op_id);
+                let mut manifests = ManifestBudget::default();
                 for digest in &cn.content_ids {
                     let id = digest_to_content_id(digest)?;
-                    let data = content.get(id)?;
+                    let data = match content.get_bounded(id, MAX_CONTENT_SIZE) {
+                        Ok(data) => data,
+                        Err(ContentStoreError::TooLarge { .. }) => {
+                            let manifest = content
+                                .chunk_manifest(id)?
+                                .with_context(|| format!("content {id} is too long to send"))?;
+                            let manifest = wheat_core::encode_content_chunk_manifest(&manifest)?;
+                            // One left out is asked for again.
+                            if manifests.admit(manifest.len()) {
+                                send_msg(
+                                    &mut session.ws,
+                                    &content_manifest(op_id, digest.clone(), manifest),
+                                )
+                                .await?;
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     upload_content(session, &mut batch, digest, data).await?;
                 }
                 if let Some(open) = batch.finish() {

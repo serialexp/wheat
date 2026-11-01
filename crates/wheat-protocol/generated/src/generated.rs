@@ -27,6 +27,8 @@ pub enum WheatProtocolMessage {
     ContentBatch(ContentBatchOutput),
     ContentChunk(ContentChunkOutput),
     ContentRedirect(ContentRedirectOutput),
+    ContentManifest(ContentManifestOutput),
+    ContentFetchEnd(ContentFetchEndOutput),
     PublishRequest(PublishRequestOutput),
     ObjectsNeeded(ObjectsNeededOutput),
     ObjectsComplete(ObjectsCompleteOutput),
@@ -193,6 +195,19 @@ impl WheatProtocolMessage {
                     encoder.write_uint8(b);
                 }
                 encoder.write_varlength(v.expires_seconds, "leb128_canonical")?;
+            }
+            WheatProtocolMessage::ContentManifest(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
+                v.content_id.encode_into(encoder)?;
+                encoder.write_varlength(v.manifest.len() as u64, "leb128_canonical")?;
+                for item in &v.manifest {
+                    encoder.write_uint8(*item);
+                }
+            }
+            WheatProtocolMessage::ContentFetchEnd(v) => {
+                encoder.write_uint8(v.message_type);
+                encoder.write_varlength(v.op_id, "leb128_canonical")?;
             }
             WheatProtocolMessage::PublishRequest(v) => {
                 encoder.write_uint8(v.message_type);
@@ -388,6 +403,14 @@ impl WheatProtocolMessage {
         } else if value == 0x33 {
             Ok(WheatProtocolMessage::ContentRedirect(
                 ContentRedirectOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x34 {
+            Ok(WheatProtocolMessage::ContentManifest(
+                ContentManifestOutput::decode_with_decoder(decoder)?,
+            ))
+        } else if value == 0x35 {
+            Ok(WheatProtocolMessage::ContentFetchEnd(
+                ContentFetchEndOutput::decode_with_decoder(decoder)?,
             ))
         } else if value == 0x40 {
             Ok(WheatProtocolMessage::PublishRequest(
@@ -2152,6 +2175,166 @@ impl From<ContentChunkInput> for ContentChunkOutput {
             offset: i.offset,
             data: i.data,
             is_final: i.is_final,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentManifestInput {
+    pub op_id: u64,
+    pub content_id: Digest256,
+    pub manifest: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentManifestOutput {
+    pub message_type: u8,
+    pub op_id: u64,
+    pub content_id: Digest256,
+    pub manifest: Vec<u8>,
+}
+
+pub type ContentManifest = ContentManifestOutput;
+
+impl ContentManifestInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(52);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        self.content_id.encode_into(encoder)?;
+        encoder.write_varlength(self.manifest.len() as u64, "leb128_canonical")?;
+        for item in &self.manifest {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+}
+
+impl ContentManifestOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 52u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 52, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        let content_id = Digest256::decode_with_decoder(decoder)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let manifest = decoder.read_bytes_vec(length)?;
+        Ok(Self {
+            message_type,
+            op_id,
+            content_id,
+            manifest,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentManifestInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentManifestInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentManifestOutput> for ContentManifestInput {
+    fn from(o: ContentManifestOutput) -> Self {
+        Self {
+            op_id: o.op_id,
+            content_id: o.content_id,
+            manifest: o.manifest,
+        }
+    }
+}
+
+impl From<ContentManifestInput> for ContentManifestOutput {
+    fn from(i: ContentManifestInput) -> Self {
+        Self {
+            message_type: 52u8,
+            op_id: i.op_id,
+            content_id: i.content_id,
+            manifest: i.manifest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentFetchEndInput {
+    pub op_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentFetchEndOutput {
+    pub message_type: u8,
+    pub op_id: u64,
+}
+
+pub type ContentFetchEnd = ContentFetchEndOutput;
+
+impl ContentFetchEndInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(53);
+        encoder.write_varlength(self.op_id, "leb128_canonical")?;
+        Ok(())
+    }
+}
+
+impl ContentFetchEndOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let message_type = decoder.read_byte()?;
+        if message_type != 53u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 53, got {}",
+                message_type
+            )));
+        }
+        let op_id = decoder.read_varlength("leb128_canonical")?;
+        Ok(Self {
+            message_type,
+            op_id,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentFetchEndInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentFetchEndInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentFetchEndOutput> for ContentFetchEndInput {
+    fn from(o: ContentFetchEndOutput) -> Self {
+        Self { op_id: o.op_id }
+    }
+}
+
+impl From<ContentFetchEndInput> for ContentFetchEndOutput {
+    fn from(i: ContentFetchEndInput) -> Self {
+        Self {
+            message_type: 53u8,
+            op_id: i.op_id,
         }
     }
 }

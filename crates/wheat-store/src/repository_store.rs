@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use thiserror::Error;
-use wheat_core::{ContentId, ObjectId, VerifiedContent};
+use wheat_core::{ContentChunkManifestRecord, ContentId, ObjectId, VerifiedContent};
 
 use crate::{
     BatchObjectStore, ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError,
@@ -465,6 +465,30 @@ impl<S: RepositoryStore> RepositoryStage<S> {
         if full {
             self.flush().await?;
         }
+        Ok(())
+    }
+
+    /// Stores a long blob's manifest, as received, once its parts and chunks are
+    /// staged or stored: checks they hold the bytes of `id`
+    /// ([`ContentStore::check_manifest`]), stores everything staged so they are
+    /// stored before the manifest names them, then stores the manifest. Unlike
+    /// staged content, a refused publish leaves the blob stored; it was checked,
+    /// so it is harmless.
+    pub async fn put_manifest(
+        &self,
+        id: ContentId,
+        manifest: &ContentChunkManifestRecord,
+    ) -> Result<(), RepositoryStoreError> {
+        if self.content.contains(id) {
+            return Ok(());
+        }
+        self.content.check_manifest(id, manifest)?;
+        self.flush().await?;
+        let envelope = crate::codec::encode_chunked_envelope(manifest)
+            .map_err(|error| crate::content_store::codec_error(id, usize::MAX, error))?;
+        let bytes = envelope.len() as u64;
+        self.staged.stored.put_raw_envelope(id, envelope)?;
+        self.lock_stored()?.content.push((id, bytes));
         Ok(())
     }
 

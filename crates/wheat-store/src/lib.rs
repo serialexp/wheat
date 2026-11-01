@@ -10,6 +10,7 @@ mod chunker;
 pub use chunker::ContentChunker;
 mod commit_content;
 mod commit_writer;
+mod content_arrivals;
 mod content_batch;
 mod content_manifest;
 pub use content_batch::ContentWriteBatch;
@@ -184,6 +185,7 @@ pub use view_lineage::{
 mod content_blobs;
 mod content_store;
 mod content_stream;
+pub use content_arrivals::{ManifestArrivalError, ManifestArrivals};
 pub use content_blobs::{BlobPage, BlobRead, ContentBlobStore};
 pub use content_store::{ContentItem, ContentStore, ContentStoreError};
 pub use content_stream::{ContentReader, ContentWriter};

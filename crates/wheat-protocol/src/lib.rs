@@ -30,7 +30,7 @@ pub use capabilities::{
     Capabilities, CapabilityError, MAX_CAPABILITIES, MAX_CAPABILITY_BYTES, SUPPORTED_CAPABILITIES,
     accept_capabilities, select_capabilities,
 };
-pub use content_batch::{ContentBatcher, content_chunks};
+pub use content_batch::{ContentBatcher, ManifestBudget, content_chunks, content_manifest};
 pub use repository_path::{ADMIN_PATH, RepositoryPathError, repository_name, repository_path};
 pub use transfer_receiver::{TransferError, TransferReceiver};
 pub use wheat_protocol_generated::generated::*;
@@ -55,10 +55,15 @@ pub const MAX_OBJECT_SIZE: usize = 1024 * 1024 * 1024;
 /// Maximum per-item/chunk content data (4 MiB).
 pub const MAX_CONTENT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
-/// Maximum size of one content blob, however many chunks it arrives in
-/// (1 GiB). Matches the content store's hard record limit, so a peer never
-/// accepts a blob it could not store.
-pub const MAX_CONTENT_SIZE: usize = 1024 * 1024 * 1024;
+/// Maximum size of one content blob sent as bytes, however many `ContentChunk`s it
+/// arrives in (16 MiB): the chunking threshold. A longer blob is sent as its
+/// `ContentManifest`, and its parts and chunks as content of their own.
+pub const MAX_CONTENT_SIZE: usize = 16 * 1024 * 1024;
+
+/// Most encoded manifest bytes in one answer (64 MiB). The receiver holds them
+/// until it has every part and chunk they name; the first manifest of an answer
+/// is always sent, whatever its size.
+pub const MAX_ANSWER_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum items in an ObjectBatch.
 pub const MAX_OBJECT_BATCH_ITEMS: usize = 256;

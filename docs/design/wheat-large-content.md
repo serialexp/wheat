@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: partial — steps 1 (format, two levels) and 2 (store) landed, step 3 in progress, steps 4–7 outstanding
+Status: partial — steps 1 (format, two levels), 2 (store) and 3 (protocol) landed, steps 4–7 outstanding
 Owner: bart
 Last updated: 2026-11-01
 
@@ -73,12 +73,24 @@ land and move them from Outstanding to Done.
   `content_large_blob` (1 GiB, 2026-11-01, under a load average of about 22):
   write 5.5 s holding 16 MiB, a one-byte edit 0.8 s writing 2.7 MB, read 0.4 s
   holding 4 MiB, peak RSS 58 MiB.
+- [x] **Step 3 — protocol.** Manifest-first transfer of chunked blobs in both
+  directions: `ContentManifest` (0x34) in place of a blob over the threshold,
+  chunk-level have/want through `ContentNeeded` and `ContentFetchRequest`, and a
+  receiver (`wheat_store::ManifestArrivals`) that asks for missing parts, then
+  missing chunks, checks the blob through `ContentStore::check_manifest` and stores
+  the manifest with `RepositoryStage::put_manifest`. Senders send a
+  long blob's stored manifest without reading the blob. Beyond the plan:
+  `ContentFetchEnd` (0x35) ends every fetch answer, since a fetch answer may now
+  leave blobs out ([Follow-up](#follow-up-step-3-as-built)); the `ContentChunk`
+  limit is 16 MiB at both ends. Wire tests in
+  `wheat-server/tests/clone_fetch_publish_test.rs` and `fetch_test.rs` cover a
+  publish, a one-byte edit that asks only for the changed chunks, a manifest left
+  out and asked for again, refusals, and a fetch. The 64 MiB answer budget is
+  tested at the unit level only (`ManifestBudget`); publish and fetch benchmarks
+  are step 7.
 
 ### Outstanding
 
-- [ ] **Step 3 — protocol.** Manifest-first transfer of chunked blobs, chunk-level
-  have/want, receivers that hash as chunks arrive and stream into the store,
-  senders that read chunk by chunk ([Protocol](#protocol)).
 - [ ] **Step 4 — client.** Capture (`wheat add`), materialization, diff, `cat`,
   edit move and integrate read and write large blobs through the streaming API.
 - [ ] **Step 5 — Git bridge.** Import and export stream large blobs.
@@ -261,6 +273,27 @@ the threshold travel as they do now: whole in a `ContentBatch` up to 4 MiB, as
 offset-based `ContentChunk`s from 4 to 16 MiB, held whole by both ends (at most
 16 MiB). The receiver's per-item limit for `ContentChunk` drops from 1 GiB to the
 threshold.
+
+### Follow-up: step 3 as built
+
+The steps above held, with these details settled while building it (2026-11-01):
+
+- **Messages.** `ContentManifest { op_id, content_id, manifest }` (0x34) carries
+  the encoded `ContentChunkManifestV1` as stored. `ContentFetchEnd { op_id }`
+  (0x35) ends a fetch answer: once an answer may leave blobs out (the manifest
+  budget below), the client can no longer count items to know it is over.
+- **Answers.** One answer, a publish's reply to `ContentNeeded` or a fetch's to
+  `ContentFetchRequest`, carries at most `MAX_ANSWER_MANIFEST_BYTES` (64 MiB) of
+  manifests, and always the first (Q9). A sender leaves the rest out; the receiver
+  puts the IDs it was not sent back at the front of its queue.
+- **Rounds.** Before asking for anything new, the receiver asks for the parts its
+  held manifests name and then for their missing chunks, in rounds of at most
+  `MAX_WANT_IDS`, each answered in full; a manifest in such a round is refused.
+  Once nothing is missing it checks each blob against its ID and stores its
+  manifest as one job, then goes back to its queue.
+- **Refusals.** A publish is refused when a manifest's chunks are not the blob
+  ("does not match its chunks"), when a chunk is sent as a manifest, when a blob
+  over the threshold comes as bytes, and when a round is answered with nothing.
 
 ## Callers
 
