@@ -318,7 +318,7 @@ fn resolve(
                                 reason: "a delta's base is chunked".into(),
                             });
                         }
-                        return assemble_chunks(id, &manifest, fetch);
+                        return assemble_chunks(id, manifest, fetch);
                     }
                 }
             }
@@ -348,7 +348,7 @@ fn resolve(
 /// checked the blob fits its bound.
 fn assemble_chunks(
     id: ContentId,
-    manifest: &ContentChunkManifestRecord,
+    manifest: ContentChunkManifestRecord,
     fetch: &dyn Fn(ContentId) -> Result<StoredContent, ContentStoreError>,
 ) -> Result<VerifiedContent, ContentStoreError> {
     let length =
@@ -358,7 +358,8 @@ fn assemble_chunks(
             minimum: usize::MAX,
         })?;
     let mut bytes = Vec::with_capacity(length);
-    for chunk in &manifest.chunks {
+    let mut chunks = crate::content_manifest::ManifestChunks::new(id, manifest);
+    while let Some(chunk) = chunks.next(|part, max| Ok(resolve(part, max, fetch)?.into_inner()))? {
         let content = resolve(chunk.id, chunk.length as usize, fetch)?;
         if content.len() != chunk.length as usize {
             return Err(ContentStoreError::InvalidFormat {
@@ -659,12 +660,13 @@ impl ContentStore {
         if self.contains(id) {
             return Ok(());
         }
-        let envelope = crate::content_stream::chunked_envelope(content, |chunk| {
-            if self.contains(chunk.id()) {
+        let store = |piece: VerifiedContent<&[u8]>| {
+            if self.contains(piece.id()) {
                 return Ok(());
             }
-            self.put_whole(chunk)
-        })?;
+            self.put_whole(piece)
+        };
+        let envelope = crate::content_stream::chunked_envelope(content, store, store)?;
         self.put_raw_envelope(id, envelope)
     }
 

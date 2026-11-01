@@ -8545,6 +8545,7 @@ impl From<ContentEnvelopeHeaderV1Input> for ContentEnvelopeHeaderV1Output {
 pub struct ContentChunkManifestV1Input {
     pub logical_length: u64,
     pub chunks: Vec<ContentChunkRefV1>,
+    pub parts: Vec<ContentPartRefV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -8553,6 +8554,7 @@ pub struct ContentChunkManifestV1Output {
     pub version: u8,
     pub logical_length: u64,
     pub chunks: Vec<ContentChunkRefV1>,
+    pub parts: Vec<ContentPartRefV1>,
 }
 
 pub type ContentChunkManifestV1 = ContentChunkManifestV1Output;
@@ -8570,6 +8572,10 @@ impl ContentChunkManifestV1Input {
         encoder.write_u64_be(self.logical_length);
         encoder.write_u32_be(self.chunks.len() as u32);
         for item in &self.chunks {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_u32_be(self.parts.len() as u32);
+        for item in &self.parts {
             item.encode_into(encoder)?;
         }
         Ok(())
@@ -8604,11 +8610,18 @@ impl ContentChunkManifestV1Output {
             let item = ContentChunkRefV1::decode_with_decoder(decoder)?;
             chunks.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut parts = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
+        for _ in 0..length {
+            let item = ContentPartRefV1::decode_with_decoder(decoder)?;
+            parts.push(item);
+        }
         Ok(Self {
             magic,
             version,
             logical_length,
             chunks,
+            parts,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -8624,6 +8637,7 @@ impl From<ContentChunkManifestV1Output> for ContentChunkManifestV1Input {
         Self {
             logical_length: o.logical_length,
             chunks: o.chunks,
+            parts: o.parts,
         }
     }
 }
@@ -8635,6 +8649,7 @@ impl From<ContentChunkManifestV1Input> for ContentChunkManifestV1Output {
             version: 1u8,
             logical_length: i.logical_length,
             chunks: i.chunks,
+            parts: i.parts,
         }
     }
 }
@@ -8667,6 +8682,126 @@ impl ContentChunkRefV1 {
         let id = ContentId::decode_with_decoder(decoder)?;
         let length = decoder.read_u32_be()?;
         Ok(Self { id, length })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentPartRefV1 {
+    pub id: ContentId,
+    pub length: u64,
+}
+
+impl ContentPartRefV1 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.id.encode_into(encoder)?;
+        encoder.write_u64_be(self.length);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let id = ContentId::decode_with_decoder(decoder)?;
+        let length = decoder.read_u64_be()?;
+        Ok(Self { id, length })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentChunkPartV1Input {
+    pub chunks: Vec<ContentChunkRefV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentChunkPartV1Output {
+    pub magic: u32,
+    pub version: u8,
+    pub chunks: Vec<ContentChunkRefV1>,
+}
+
+pub type ContentChunkPartV1 = ContentChunkPartV1Output;
+
+impl ContentChunkPartV1Input {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(1464355664);
+        encoder.write_byte(1);
+        encoder.write_u32_be(self.chunks.len() as u32);
+        for item in &self.chunks {
+            item.encode_into(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl ContentChunkPartV1Output {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let magic = decoder.read_u32_be()?;
+        if magic != 1464355664u32 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1464355664, got {}",
+                magic
+            )));
+        }
+        let version = decoder.read_byte()?;
+        if version != 1u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
+                "expected 1, got {}",
+                version
+            )));
+        }
+        let length = decoder.read_u32_be()? as usize;
+        let mut chunks = Vec::with_capacity(decoder.capacity_hint_sized(length, 36));
+        for _ in 0..length {
+            let item = ContentChunkRefV1::decode_with_decoder(decoder)?;
+            chunks.push(item);
+        }
+        Ok(Self {
+            magic,
+            version,
+            chunks,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        ContentChunkPartV1Input::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        ContentChunkPartV1Input::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<ContentChunkPartV1Output> for ContentChunkPartV1Input {
+    fn from(o: ContentChunkPartV1Output) -> Self {
+        Self { chunks: o.chunks }
+    }
+}
+
+impl From<ContentChunkPartV1Input> for ContentChunkPartV1Output {
+    fn from(i: ContentChunkPartV1Input) -> Self {
+        Self {
+            magic: 1464355664u32,
+            version: 1u8,
+            chunks: i.chunks,
+        }
     }
 }
 

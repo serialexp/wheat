@@ -633,22 +633,55 @@ fn bundle_records_round_trip_and_refuse_noncanonical_bytes() {
 
 const MIB: u32 = 1 << 20;
 
+fn chunk_list(lengths: &[u32]) -> Vec<ContentChunkRecord> {
+    lengths
+        .iter()
+        .enumerate()
+        .map(|(index, &length)| ContentChunkRecord {
+            id: ContentId::from_digest([index as u8; 32]),
+            length,
+        })
+        .collect()
+}
+
 fn chunked(lengths: &[u32]) -> ContentChunkManifestRecord {
     ContentChunkManifestRecord {
         logical_length: lengths.iter().map(|&length| u64::from(length)).sum(),
-        chunks: lengths
-            .iter()
-            .enumerate()
-            .map(|(index, &length)| ContentChunkRecord {
-                id: ContentId::from_digest([index as u8; 32]),
-                length,
-            })
-            .collect(),
+        entries: ContentManifestEntries::Chunks(chunk_list(lengths)),
     }
 }
 
+fn parted(lengths: &[u64]) -> ContentChunkManifestRecord {
+    ContentChunkManifestRecord {
+        logical_length: lengths.iter().sum(),
+        entries: ContentManifestEntries::Parts(
+            lengths
+                .iter()
+                .enumerate()
+                .map(|(index, &length)| ContentPartRecord {
+                    id: ContentId::from_digest([index as u8; 32]),
+                    length,
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The fewest bytes a part before a blob's last holds: the fewest chunks, each of
+/// the shortest length.
+const SHORTEST_PART: u64 = MIN_CONTENT_PART_CHUNKS as u64 * MIB as u64;
+
 fn manifest_error(manifest: &ContentChunkManifestRecord) -> StoreRecordError {
     manifest.validate().unwrap_err()
+}
+
+fn invalid(manifest: ContentChunkManifestRecord) {
+    let error = manifest_error(&manifest);
+    assert!(
+        matches!(error, StoreRecordError::InvalidChunkManifest(_)),
+        "{error:?}"
+    );
+    assert_eq!(encode_content_chunk_manifest(&manifest), Err(error));
 }
 
 #[test]
@@ -679,14 +712,6 @@ fn chunk_manifest_round_trips_and_refuses_trailing_bytes_and_versions() {
 
 #[test]
 fn chunk_manifest_refuses_what_the_chunker_would_not_produce() {
-    let invalid = |manifest: ContentChunkManifestRecord| {
-        let error = manifest_error(&manifest);
-        assert!(
-            matches!(error, StoreRecordError::InvalidChunkManifest(_)),
-            "{error:?}"
-        );
-        assert_eq!(encode_content_chunk_manifest(&manifest), Err(error));
-    };
     // Exactly the threshold is stored whole.
     invalid(chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB]));
     // A short chunk before the last, and a long one.
@@ -699,15 +724,19 @@ fn chunk_manifest_refuses_what_the_chunker_would_not_produce() {
     let mut short = chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 1]);
     short.logical_length += 1;
     invalid(short);
-    // No chunks.
+    // No chunks, and no parts.
     invalid(ContentChunkManifestRecord {
         logical_length: CHUNKED_CONTENT_THRESHOLD + 1,
-        chunks: Vec::new(),
+        entries: ContentManifestEntries::Chunks(Vec::new()),
+    });
+    invalid(ContentChunkManifestRecord {
+        logical_length: CHUNKED_CONTENT_THRESHOLD + 1,
+        entries: ContentManifestEntries::Parts(Vec::new()),
     });
     // Longer than the format takes.
     invalid(ContentChunkManifestRecord {
         logical_length: MAX_CHUNKED_CONTENT_BYTES + 1,
-        chunks: Vec::new(),
+        entries: ContentManifestEntries::Chunks(Vec::new()),
     });
 }
 
@@ -715,10 +744,11 @@ fn chunk_manifest_refuses_what_the_chunker_would_not_produce() {
 fn chunk_manifest_decode_validates_what_it_reads() {
     let bytes =
         encode_content_chunk_manifest(&chunked(&[4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 1])).unwrap();
-    // The last chunk's length, the record's last four bytes, set to zero.
+    // The last chunk's length, just before the empty parts' four-byte count, set
+    // to zero.
     let mut empty_last = bytes.clone();
-    let end = empty_last.len();
-    empty_last[end - 4..].fill(0);
+    let end = empty_last.len() - 4;
+    empty_last[end - 4..end].fill(0);
     assert!(matches!(
         decode_content_chunk_manifest(&empty_last),
         Err(StoreRecordError::InvalidChunkManifest(_))
@@ -733,32 +763,126 @@ fn chunk_manifest_decode_validates_what_it_reads() {
 }
 
 #[test]
-fn chunk_manifest_takes_the_longest_blob_cut_at_the_shortest_chunks() {
-    let manifest = ContentChunkManifestRecord {
-        logical_length: MAX_CHUNKED_CONTENT_BYTES,
-        chunks: vec![
-            ContentChunkRecord {
-                id: ContentId::from_digest([7; 32]),
-                length: MIN_CONTENT_CHUNK_BYTES,
-            };
-            MAX_CONTENT_CHUNKS
-        ],
-    };
+fn chunk_manifest_lists_at_most_the_direct_limit_of_chunks() {
+    let mut lengths = vec![MIB; MAX_DIRECT_CONTENT_CHUNKS];
+    let manifest = chunked(&lengths);
     let bytes = encode_content_chunk_manifest(&manifest).unwrap();
     assert_eq!(
         bytes.len(),
-        CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE + MAX_CONTENT_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE
+        CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE
+            + MAX_DIRECT_CONTENT_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE
     );
+    assert!(bytes.len() <= MAX_CONTENT_CHUNK_MANIFEST_BYTES);
     assert_eq!(decode_content_chunk_manifest(&bytes).unwrap(), manifest);
 
-    let mut longer = manifest;
-    longer.logical_length += 1;
-    longer.chunks.push(ContentChunkRecord {
-        id: ContentId::from_digest([8; 32]),
-        length: 1,
-    });
-    assert!(matches!(
-        manifest_error(&longer),
-        StoreRecordError::InvalidChunkManifest(_)
-    ));
+    lengths.push(1);
+    assert_eq!(
+        manifest_error(&chunked(&lengths)),
+        StoreRecordError::InvalidCount
+    );
+}
+
+#[test]
+fn chunk_manifest_takes_the_longest_blob_in_the_shortest_parts() {
+    let manifest = parted(&vec![SHORTEST_PART; MAX_CONTENT_PARTS]);
+    assert_eq!(manifest.logical_length, MAX_CHUNKED_CONTENT_BYTES);
+    let bytes = encode_content_chunk_manifest(&manifest).unwrap();
+    assert_eq!(
+        bytes.len(),
+        CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE + MAX_CONTENT_PARTS * CONTENT_PART_ENCODED_SIZE
+    );
+    assert!(bytes.len() <= MAX_CONTENT_CHUNK_MANIFEST_BYTES);
+    assert_eq!(decode_content_chunk_manifest(&bytes).unwrap(), manifest);
+
+    // One part more is one byte more than the format takes.
+    let mut longer = vec![SHORTEST_PART; MAX_CONTENT_PARTS];
+    longer.push(1);
+    invalid(parted(&longer));
+}
+
+#[test]
+fn chunk_manifest_refuses_parts_a_long_blob_would_not_have() {
+    // Every part but the last holds at least the fewest chunks of the shortest
+    // length, and none more than the most chunks of the longest.
+    parted(&[SHORTEST_PART, 1]).validate().unwrap();
+    invalid(parted(&[SHORTEST_PART - 1, SHORTEST_PART]));
+    invalid(parted(&[MAX_CONTENT_PART_BYTES + 1, 1]));
+    invalid(parted(&[SHORTEST_PART, 0]));
+    invalid(parted(&[SHORTEST_PART, MAX_CONTENT_PART_BYTES + 1]));
+    let mut short = parted(&[SHORTEST_PART, 1]);
+    short.logical_length += 1;
+    invalid(short);
+}
+
+#[test]
+fn chunk_manifest_refuses_both_chunks_and_parts() {
+    let length = SHORTEST_PART;
+    let direct = chunked(&vec![MIB; MIN_CONTENT_PART_CHUNKS]);
+    assert_eq!(direct.logical_length, length);
+    let direct = encode_content_chunk_manifest(&direct).unwrap();
+    let parts = encode_content_chunk_manifest(&parted(&[length])).unwrap();
+    // The direct manifest up to its empty parts' count, then the parted one's
+    // parts: the same blob, listed both ways.
+    let fixed = CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE;
+    let mut both = direct[..direct.len() - 4].to_vec();
+    both.extend_from_slice(&parts[fixed - 4..]);
+    assert_eq!(
+        decode_content_chunk_manifest(&both),
+        Err(StoreRecordError::InvalidChunkManifest(
+            "it lists both chunks and parts"
+        ))
+    );
+}
+
+#[test]
+fn chunk_part_round_trips_and_is_checked_against_its_manifest() {
+    let part = ContentChunkPartRecord {
+        chunks: chunk_list(&vec![MIB; MIN_CONTENT_PART_CHUNKS]),
+    };
+    let bytes = encode_content_chunk_part(&part).unwrap();
+    assert_eq!(
+        bytes.len(),
+        CONTENT_CHUNK_PART_FIXED_ENCODED_SIZE
+            + MIN_CONTENT_PART_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE
+    );
+    assert_eq!(decode_content_chunk_part(&bytes).unwrap(), part);
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert_eq!(
+        decode_content_chunk_part(&trailing),
+        Err(StoreRecordError::NonCanonicalEncoding)
+    );
+
+    part.validate(SHORTEST_PART, false).unwrap();
+    part.validate(SHORTEST_PART, true).unwrap();
+    // A part's chunks hold exactly the length its manifest names.
+    assert!(part.validate(SHORTEST_PART + 1, false).is_err());
+
+    // Too few chunks for any part but the last; the last may hold one.
+    let one = ContentChunkPartRecord {
+        chunks: chunk_list(&[1]),
+    };
+    assert!(one.validate(1, false).is_err());
+    one.validate(1, true).unwrap();
+    // Only the blob's last chunk is shorter than the shortest chunk.
+    let mut short_end = vec![MIB; MIN_CONTENT_PART_CHUNKS];
+    short_end[MIN_CONTENT_PART_CHUNKS - 1] = 1;
+    let short_end = ContentChunkPartRecord {
+        chunks: chunk_list(&short_end),
+    };
+    let length = SHORTEST_PART - u64::from(MIB) + 1;
+    assert!(short_end.validate(length, false).is_err());
+    short_end.validate(length, true).unwrap();
+    // No part holds more than the most chunks.
+    let many = ContentChunkPartRecord {
+        chunks: chunk_list(&vec![MIB; MAX_CONTENT_PART_CHUNKS + 1]),
+    };
+    assert!(
+        many.validate(u64::from(MIB) * many.chunks.len() as u64, true)
+            .is_err()
+    );
+    assert_eq!(
+        encode_content_chunk_part(&many),
+        Err(StoreRecordError::InvalidCount)
+    );
 }

@@ -1094,19 +1094,40 @@
     // as content-defined chunks, each an ordinary content blob under its own
     // ContentId, in order. Every chunk but the last holds 1 to 4 MiB, the last 1 byte
     // to 4 MiB, and their lengths sum to `logical_length`, which is over 16 MiB and
-    // at most 1 TiB. See docs/design/wheat-large-content.md.
+    // at most 1 TiB. Exactly one of `chunks` and `parts` is non-empty: a blob of up
+    // to 4,096 chunks lists them here; a longer one lists parts, each a
+    // ContentChunkPartV1 stored as content under its own ContentId, in order. See
+    // docs/design/wheat-large-content.md.
     ContentChunkManifestV1: {
       sequence: [
         { name: "magic", type: "uint32", const: 0x57484b43 },
         { name: "version", type: "uint8", const: 1 },
         { name: "logical_length", type: "uint64" },
         { name: "chunks", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentChunkRefV1" } },
+        { name: "parts", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentPartRefV1" } },
       ],
     },
     ContentChunkRefV1: {
       sequence: [
         { name: "id", type: "ContentId" },
         { name: "length", type: "uint32" },
+      ],
+    },
+    // One part of a long blob's manifest: the part's ContentId and the bytes of the
+    // blob its chunks hold.
+    ContentPartRefV1: {
+      sequence: [
+        { name: "id", type: "ContentId" },
+        { name: "length", type: "uint64" },
+      ],
+    },
+    // A run of a long blob's chunks, stored as an ordinary content blob. A part
+    // holds 1 to 16,384 chunks; every part but the blob's last holds at least 1,024.
+    ContentChunkPartV1: {
+      sequence: [
+        { name: "magic", type: "uint32", const: 0x57484b50 },
+        { name: "version", type: "uint8", const: 1 },
+        { name: "chunks", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ContentChunkRefV1" } },
       ],
     },
     // One object or content blob a manifest accounts for, sorted by `id`.

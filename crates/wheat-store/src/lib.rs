@@ -11,6 +11,7 @@ pub use chunker::ContentChunker;
 mod commit_content;
 mod commit_writer;
 mod content_batch;
+mod content_manifest;
 pub use content_batch::ContentWriteBatch;
 mod content_generation;
 pub use content_generation::{

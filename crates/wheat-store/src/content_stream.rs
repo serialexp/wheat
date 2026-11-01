@@ -12,6 +12,7 @@ use wheat_core::{
 
 use crate::{
     ContentChunker, ContentStore, ContentStoreError, codec,
+    content_manifest::{ManifestBuilder, ManifestChunks},
     content_store::{StoredContent, codec_error, resolve_delta_chain},
 };
 
@@ -41,7 +42,7 @@ struct Chunking {
     chunker: ContentChunker,
     hasher: blake3::Hasher,
     length: u64,
-    chunks: Vec<ContentChunkRecord>,
+    manifest: ManifestBuilder,
 }
 
 impl Chunking {
@@ -56,27 +57,38 @@ impl Chunking {
             )));
         }
         self.hasher.update(bytes);
-        let chunks = &mut self.chunks;
+        let manifest = &mut self.manifest;
         self.chunker
-            .update(bytes, |chunk| store_chunk(store, chunks, chunk))
+            .update(bytes, |chunk| store_chunk(store, manifest, chunk))
     }
 }
 
-/// Stores `chunk` unless it is stored already, and lists it.
-fn store_chunk(
+/// Stores `content` unless it is stored already.
+fn store_absent(
     store: &ContentStore,
-    chunks: &mut Vec<ContentChunkRecord>,
-    chunk: &[u8],
+    content: VerifiedContent<&[u8]>,
 ) -> Result<(), ContentStoreError> {
-    let content = VerifiedContent::new(chunk);
     if !store.contains(content.id()) {
         store.put_whole(content)?;
     }
-    chunks.push(ContentChunkRecord {
-        id: content.id(),
-        length: chunk.len() as u32,
-    });
     Ok(())
+}
+
+/// Stores `chunk` unless it is stored already, and adds it to the manifest.
+fn store_chunk(
+    store: &ContentStore,
+    manifest: &mut ManifestBuilder,
+    chunk: &[u8],
+) -> Result<(), ContentStoreError> {
+    let content = VerifiedContent::new(chunk);
+    store_absent(store, content)?;
+    manifest.push(
+        ContentChunkRecord {
+            id: content.id(),
+            length: chunk.len() as u32,
+        },
+        |part| store_absent(store, part),
+    )
 }
 
 impl ContentWriter {
@@ -117,7 +129,7 @@ impl ContentWriter {
                     chunker: ContentChunker::new(),
                     hasher: ContentId::hasher(),
                     length: 0,
-                    chunks: Vec::new(),
+                    manifest: ManifestBuilder::default(),
                 });
                 chunking.update(&self.store, &buffered)?;
                 drop(buffered);
@@ -153,19 +165,21 @@ impl ContentWriter {
                 self.store.put_whole(content)?;
                 Ok(content.id())
             }
-            WriterState::Chunking(mut chunking) => {
-                let chunks = &mut chunking.chunks;
-                chunking
-                    .chunker
-                    .finish(|chunk| store_chunk(&self.store, chunks, chunk))?;
-                let id = ContentId::from_digest(*chunking.hasher.finalize().as_bytes());
+            WriterState::Chunking(chunking) => {
+                let Chunking {
+                    chunker,
+                    hasher,
+                    length,
+                    mut manifest,
+                } = *chunking;
+                chunker.finish(|chunk| store_chunk(&self.store, &mut manifest, chunk))?;
+                let id = ContentId::from_digest(*hasher.finalize().as_bytes());
                 check_expected(expected, id)?;
                 if !self.store.contains(id) {
-                    let envelope = codec::encode_chunked_envelope(&ContentChunkManifestRecord {
-                        logical_length: chunking.length,
-                        chunks: chunking.chunks,
-                    })
-                    .map_err(|error| codec_error(id, usize::MAX, error))?;
+                    let manifest =
+                        manifest.finish(length, |part| store_absent(&self.store, part))?;
+                    let envelope = codec::encode_chunked_envelope(&manifest)
+                        .map_err(|error| codec_error(id, usize::MAX, error))?;
                     self.store.put_raw_envelope(id, envelope)?;
                 }
                 Ok(id)
@@ -219,7 +233,7 @@ enum ReaderSource {
     },
     Chunked {
         store: ContentStore,
-        chunks: std::vec::IntoIter<ContentChunkRecord>,
+        chunks: ManifestChunks,
         current: Vec<u8>,
         position: usize,
         /// Boxed: a hasher is about 2 KiB.
@@ -240,7 +254,7 @@ impl ContentReader {
                     length,
                     source: ReaderSource::Chunked {
                         store: store.clone(),
-                        chunks: manifest.chunks.into_iter(),
+                        chunks: ManifestChunks::new(id, manifest),
                         current: Vec::new(),
                         position: 0,
                         hasher: Box::new(ContentId::hasher()),
@@ -315,7 +329,10 @@ impl io::Read for ContentReader {
                     return Ok(0);
                 }
                 while *position == current.len() {
-                    let Some(chunk) = chunks.next() else {
+                    let next = chunks
+                        .next(|part, max| store.get_bounded(part, max))
+                        .map_err(io::Error::other)?;
+                    let Some(chunk) = next else {
                         if !*verified {
                             let actual = ContentId::from_digest(*hasher.finalize().as_bytes());
                             if actual != self.id {
@@ -361,26 +378,26 @@ impl io::Read for ContentReader {
 }
 
 /// The `Chunked` envelope of `content`, a blob over the threshold held whole,
-/// passing each of its chunks to `store` first.
+/// passing each of its chunks to `store_chunk` and each of its parts, when it has
+/// them, to `store_part` first.
 pub(crate) fn chunked_envelope<'c>(
     content: VerifiedContent<&'c [u8]>,
-    mut store: impl FnMut(VerifiedContent<&'c [u8]>) -> Result<(), ContentStoreError>,
+    mut store_chunk: impl FnMut(VerifiedContent<&'c [u8]>) -> Result<(), ContentStoreError>,
+    mut store_part: impl FnMut(VerifiedContent<&[u8]>) -> Result<(), ContentStoreError>,
 ) -> Result<Vec<u8>, ContentStoreError> {
-    let chunks = crate::chunker::chunks_of(content.into_inner())
-        .map(|chunk| {
-            let chunk = VerifiedContent::new(chunk);
-            store(chunk)?;
-            Ok(ContentChunkRecord {
-                id: chunk.id(),
-                length: chunk.len() as u32,
-            })
-        })
-        .collect::<Result<Vec<_>, ContentStoreError>>()?;
-    codec::encode_chunked_envelope(&ContentChunkManifestRecord {
-        logical_length: content.len() as u64,
-        chunks,
-    })
-    .map_err(|error| codec_error(content.id(), usize::MAX, error))
+    let mut manifest = ManifestBuilder::default();
+    for chunk in crate::chunker::chunks_of(content.into_inner()) {
+        let chunk = VerifiedContent::new(chunk);
+        store_chunk(chunk)?;
+        let record = ContentChunkRecord {
+            id: chunk.id(),
+            length: chunk.len() as u32,
+        };
+        manifest.push(record, &mut store_part)?;
+    }
+    let manifest = manifest.finish(content.len() as u64, &mut store_part)?;
+    codec::encode_chunked_envelope(&manifest)
+        .map_err(|error| codec_error(content.id(), usize::MAX, error))
 }
 
 /// The manifest a `Chunked` envelope stores.
@@ -410,5 +427,91 @@ impl ContentStore {
     /// A reader over `id`'s bytes; see [`ContentReader`].
     pub fn reader(&self, id: ContentId) -> Result<ContentReader, ContentStoreError> {
         ContentReader::open(self, id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use wheat_core::{
+        ContentChunkPartRecord, ContentManifestEntries, ContentPartRecord,
+        encode_content_chunk_part,
+    };
+
+    use super::*;
+
+    /// A blob over the threshold stored with a manifest of parts, as a sender with
+    /// another cut may send one: a single part holding all its chunks.
+    #[test]
+    fn a_blob_listed_in_parts_reads_back_through_reader_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ContentStore::new(dir.path());
+        let blob: Vec<u8> = (0..CHUNKED_CONTENT_THRESHOLD as usize + 5_000_000)
+            .map(|n| (n % 251) as u8 ^ (n >> 20) as u8)
+            .collect();
+        let mut chunks = Vec::new();
+        for chunk in crate::chunker::chunks_of(&blob) {
+            let content = VerifiedContent::new(chunk);
+            store.put_whole(content).unwrap();
+            chunks.push(ContentChunkRecord {
+                id: content.id(),
+                length: chunk.len() as u32,
+            });
+        }
+        let part = encode_content_chunk_part(&ContentChunkPartRecord { chunks }).unwrap();
+        let part_id = store.put(&part).unwrap();
+        let id = ContentId::of(&blob);
+        let manifest = ContentChunkManifestRecord {
+            logical_length: blob.len() as u64,
+            entries: ContentManifestEntries::Parts(vec![ContentPartRecord {
+                id: part_id,
+                length: blob.len() as u64,
+            }]),
+        };
+        store
+            .put_raw_envelope(id, codec::encode_chunked_envelope(&manifest).unwrap())
+            .unwrap();
+
+        let mut read = Vec::new();
+        store.reader(id).unwrap().read_to_end(&mut read).unwrap();
+        assert!(read == blob, "the reader returns the blob");
+        assert!(store.get(id).unwrap() == blob, "get assembles the blob");
+    }
+
+    /// A part that names a length its chunks do not hold is refused, not read.
+    #[test]
+    fn a_part_that_does_not_hold_its_length_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ContentStore::new(dir.path());
+        let blob = vec![7; CHUNKED_CONTENT_THRESHOLD as usize + 1];
+        let mut chunks = Vec::new();
+        for chunk in crate::chunker::chunks_of(&blob) {
+            chunks.push(ContentChunkRecord {
+                id: store.put(chunk).unwrap(),
+                length: chunk.len() as u32,
+            });
+        }
+        // Drop the last chunk from the part, so it holds less than it says.
+        chunks.pop();
+        let part = encode_content_chunk_part(&ContentChunkPartRecord { chunks }).unwrap();
+        let manifest = ContentChunkManifestRecord {
+            logical_length: blob.len() as u64,
+            entries: ContentManifestEntries::Parts(vec![ContentPartRecord {
+                id: store.put(&part).unwrap(),
+                length: blob.len() as u64,
+            }]),
+        };
+        let id = ContentId::of(&blob);
+        store
+            .put_raw_envelope(id, codec::encode_chunked_envelope(&manifest).unwrap())
+            .unwrap();
+        let error = store.get(id).unwrap_err();
+        assert!(
+            matches!(error, ContentStoreError::InvalidFormat { .. }),
+            "{error:?}"
+        );
+        let mut read = Vec::new();
+        assert!(store.reader(id).unwrap().read_to_end(&mut read).is_err());
     }
 }

@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: partial — steps 1 (format) and 2 (store) landed, steps 3–7 outstanding
+Status: partial — steps 1 (format, two levels) and 2 (store) landed, step 3 in progress, steps 4–7 outstanding
 Owner: bart
 Last updated: 2026-11-01
 
@@ -33,11 +33,34 @@ land and move them from Outstanding to Done.
 - [x] **Decision — the chunker (Q5, 2026-11-01).** Our own FastCDC in
   `wheat-store`, with its Gear table in the repository.
 
+- [x] **Decision — a two-level manifest (Q6, 2026-11-01).** At the 1 MiB
+  minimum a 1 TiB blob's flat manifest reaches 36 MiB, more than one 16 MiB
+  protocol message. Bart: "do a two level manifest, but maybe keep the manifest
+  at the first level as something that also contains content items so smaller
+  files only need the single manifest". See [Two levels](#two-levels). The
+  options were the manifest sent in pieces, larger chunks for larger files (in
+  tiers or scaled with the length), or two levels.
+- [x] **Decision — where a part ends (Q7, 2026-11-01).** Content-defined, like a
+  chunk: 1,024 to 16,384 chunks, about 4,096 on average, so an insertion rewrites
+  only the parts around it. The other option was a fixed count of chunks per
+  part, where an insertion near the start moves every later part.
+- [x] **Decision — how many chunks a manifest lists itself (Q8, 2026-11-01).**
+  4,096, about 8 GiB at the 2 MiB average; a direct manifest is at most 144 KiB.
+  The options were 4,096, 16,384 or 65,536.
+- [x] **Decision — what a receiver holds between a manifest and its check (Q9,
+  2026-11-01).** One answer carries at most 64 MiB of manifests, and always at
+  least one; the receiver asks again for what was left out, and checks the
+  manifests it holds before asking for anything new. The options were that cap, a
+  temporary file per operation, or one manifest per answer.
+
 - [x] **Step 1 — format.** The manifest record `ContentChunkManifestV1` with
   canonical validation (`wheat_core::ContentChunkManifestRecord`), and the
   chunker (`wheat_store::ContentChunker`), its Gear table and cut points pinned
   by tests. The `Chunked` codec number (5) landed with step 2, where the store
-  first reads and writes it.
+  first reads and writes it. Extended beyond the plan with the two levels (Q6–Q8):
+  `ContentManifestEntries` (chunks or parts), `ContentChunkPartRecord`
+  (`ContentChunkPartV1`), and part cutting in `wheat-store/src/content_manifest.rs`,
+  its boundaries pinned by a test.
 - [x] **Step 2 — store.** `ContentStore::writer` and `ContentStore::reader`
   (`wheat-store/src/content_stream.rs`) over loose files, the packed store and
   object-storage blobs; `put`/`put_many` store a blob over the threshold as
@@ -142,6 +165,46 @@ sharing. A receiver stores a manifest as sent (Q2b).
 The chunker's parameters are part of the format: changing them later changes where
 new versions cut, and so how much they share with old ones, though never what any
 `ContentId` names.
+
+### Two levels
+
+Added 2026-11-01 (Q6–Q8), after the flat manifest above turned out to outgrow a
+protocol message. A blob of up to 4,096 chunks (about 8 GiB) keeps the flat
+manifest. A longer one groups its chunks into **parts** and its manifest lists the
+parts instead:
+
+```
+ContentChunkManifestV1 {
+  logical_length: uint64
+  chunks: array<ContentChunkRefV1>  // a blob of up to 4,096 chunks; else empty
+  parts: array<ContentPartRefV1>    // a longer blob's parts, in order; else empty
+}
+ContentPartRefV1 {
+  id: ContentId                     // the part, stored as ordinary content
+  length: uint64                    // the blob bytes its chunks hold
+}
+ContentChunkPartV1 {
+  chunks: array<ContentChunkRefV1>  // 1 to 16,384; at least 1,024 but in the last
+}
+```
+
+Exactly one of `chunks` and `parts` is non-empty. A part is content: its ID is
+the `ContentId` of its encoding, it is stored and sent like any blob (at most
+576 KiB, within a `ContentBatch` item), and a receiver checks it as it checks any
+blob. A part ends after a chunk whose ID's first eight bytes, read as a
+little-endian number, are a multiple of 3,072, once it holds 1,024 chunks, or at
+16,384 (Q7). The cut depends only on the chunk IDs, so an insertion changes the
+parts around it and no others.
+
+A reader walks the manifest a part at a time, holding one part's chunk list
+(at most 576 KiB) and one chunk. Validation of the top level checks the parts'
+lengths: each but the last holds at least 1 GiB (1,024 chunks of 1 MiB) and at
+most 64 GiB. A part is checked against its entry when it is read: the count of
+chunks, their sizes, and that they hold the entry's length.
+
+A manifest is now at most 144 KiB (4,096 chunks) and a 1 TiB blob's at most
+40 KiB (1,024 parts), so the [Size](#size) figures below for a flat manifest no
+longer apply to the stored record.
 
 ### Size
 

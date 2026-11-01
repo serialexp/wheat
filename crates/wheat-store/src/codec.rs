@@ -4,11 +4,11 @@ use std::io::{self, Read};
 
 use thiserror::Error;
 use wheat_core::{
-    CHUNKED_CONTENT_THRESHOLD, CONTENT_CHUNK_ENCODED_SIZE,
-    CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE, CONTENT_ENVELOPE_HEADER_ENCODED_SIZE,
-    ContentChunkManifestRecord, ContentEnvelopeHeaderRecord, ContentId, MAX_CHUNKED_CONTENT_BYTES,
-    MAX_CONTENT_CHUNKS, decode_content_chunk_manifest, decode_content_envelope_header,
-    encode_content_chunk_manifest, encode_content_envelope_header,
+    CHUNKED_CONTENT_THRESHOLD, CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE,
+    CONTENT_ENVELOPE_HEADER_ENCODED_SIZE, ContentChunkManifestRecord, ContentEnvelopeHeaderRecord,
+    ContentId, MAX_CHUNKED_CONTENT_BYTES, MAX_CONTENT_CHUNK_MANIFEST_BYTES,
+    decode_content_chunk_manifest, decode_content_envelope_header, encode_content_chunk_manifest,
+    encode_content_envelope_header,
 };
 
 pub(crate) const RAW_THRESHOLD: usize = 1024;
@@ -22,11 +22,8 @@ pub const HARD_LOGICAL_RECORD_BYTES: usize = 1024 * 1024 * 1024;
 /// preserves those blocks while leaving room for a future 256 KiB policy.
 pub(crate) const MAX_BLOCK_LOGICAL_BYTES: usize = 1024 * 1024;
 pub(crate) const ENVELOPE_HEADER_LEN: usize = CONTENT_ENVELOPE_HEADER_ENCODED_SIZE;
-/// The longest manifest a `Chunked` envelope stores: the most chunks the format
-/// allows, about 36 MiB.
-pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = (CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE
-    + MAX_CONTENT_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE)
-    as u64;
+/// The longest manifest a `Chunked` envelope stores, about 144 KiB.
+pub(crate) const MAX_CHUNK_MANIFEST_BYTES: u64 = MAX_CONTENT_CHUNK_MANIFEST_BYTES as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -779,12 +776,14 @@ mod tests {
     fn chunked_manifest(count: usize) -> ContentChunkManifestRecord {
         ContentChunkManifestRecord {
             logical_length: count as u64 * u64::from(wheat_core::MAX_CONTENT_CHUNK_BYTES),
-            chunks: (0..count)
-                .map(|index| wheat_core::ContentChunkRecord {
-                    id: ContentId::of(&index.to_le_bytes()),
-                    length: wheat_core::MAX_CONTENT_CHUNK_BYTES,
-                })
-                .collect(),
+            entries: wheat_core::ContentManifestEntries::Chunks(
+                (0..count)
+                    .map(|index| wheat_core::ContentChunkRecord {
+                        id: ContentId::of(&index.to_le_bytes()),
+                        length: wheat_core::MAX_CONTENT_CHUNK_BYTES,
+                    })
+                    .collect(),
+            ),
         }
     }
 

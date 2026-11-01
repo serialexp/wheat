@@ -27,11 +27,18 @@ const CONVERSIONS: &[&str] = &[
 const SKIPPED_CRATES: &[&str] = &["wheat-bench", "wheat-trace"];
 
 /// `(file relative to crates/, enclosing function, why nothing is persisted)`.
-const NOT_PERSISTED: &[(&str, &str, &str)] = &[(
-    "wheat-core/src/guarded/matcher.rs",
-    "reverse_part_matches",
-    "compares words of two in-memory buffers",
-)];
+const NOT_PERSISTED: &[(&str, &str, &str)] = &[
+    (
+        "wheat-core/src/guarded/matcher.rs",
+        "reverse_part_matches",
+        "compares words of two in-memory buffers",
+    ),
+    (
+        "wheat-store/src/content_manifest.rs",
+        "part_ends",
+        "reads a chunk ID's first bytes as a number to decide where a part ends",
+    ),
+];
 
 #[test]
 fn no_hand_rolled_encodings_outside_generated_code() {

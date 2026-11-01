@@ -33,13 +33,41 @@ pub const MAX_CHUNKED_CONTENT_BYTES: u64 = 1 << 40;
 pub const MIN_CONTENT_CHUNK_BYTES: u32 = 1 << 20;
 /// The longest chunk.
 pub const MAX_CONTENT_CHUNK_BYTES: u32 = 4 << 20;
-/// The most chunks a manifest lists: the longest blob cut at the shortest chunks.
+/// The most chunks a blob has: the longest blob cut at the shortest chunks.
 pub const MAX_CONTENT_CHUNKS: usize =
     (MAX_CHUNKED_CONTENT_BYTES / MIN_CONTENT_CHUNK_BYTES as u64) as usize;
-/// Encoded size of a chunk manifest with no chunks.
-pub const CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE: usize = 17;
-/// Encoded size of one chunk in a chunk manifest.
+/// The most chunks a manifest lists itself. A blob of more lists parts instead.
+pub const MAX_DIRECT_CONTENT_CHUNKS: usize = 4096;
+/// The fewest chunks in a part but a blob's last.
+pub const MIN_CONTENT_PART_CHUNKS: usize = 1024;
+/// The most chunks in a part.
+pub const MAX_CONTENT_PART_CHUNKS: usize = 16_384;
+/// The most parts a manifest lists: the most chunks in the shortest parts.
+pub const MAX_CONTENT_PARTS: usize = MAX_CONTENT_CHUNKS.div_ceil(MIN_CONTENT_PART_CHUNKS);
+/// The most bytes one part's chunks hold.
+pub const MAX_CONTENT_PART_BYTES: u64 =
+    MAX_CONTENT_PART_CHUNKS as u64 * MAX_CONTENT_CHUNK_BYTES as u64;
+/// Encoded size of a chunk manifest with no chunks and no parts.
+pub const CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE: usize = 21;
+/// Encoded size of one chunk in a chunk manifest or a part.
 pub const CONTENT_CHUNK_ENCODED_SIZE: usize = 36;
+/// Encoded size of one part in a chunk manifest.
+pub const CONTENT_PART_ENCODED_SIZE: usize = 40;
+/// Encoded size of a part with no chunks.
+pub const CONTENT_CHUNK_PART_FIXED_ENCODED_SIZE: usize = 9;
+/// The longest encoded part.
+pub const MAX_CONTENT_CHUNK_PART_BYTES: usize =
+    CONTENT_CHUNK_PART_FIXED_ENCODED_SIZE + MAX_CONTENT_PART_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE;
+/// The longest encoded chunk manifest: one listing the most chunks or the most
+/// parts, whichever is longer.
+pub const MAX_CONTENT_CHUNK_MANIFEST_BYTES: usize = CONTENT_CHUNK_MANIFEST_FIXED_ENCODED_SIZE
+    + if MAX_DIRECT_CONTENT_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE
+        > MAX_CONTENT_PARTS * CONTENT_PART_ENCODED_SIZE
+    {
+        MAX_DIRECT_CONTENT_CHUNKS * CONTENT_CHUNK_ENCODED_SIZE
+    } else {
+        MAX_CONTENT_PARTS * CONTENT_PART_ENCODED_SIZE
+    };
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum StoreRecordError {
@@ -95,19 +123,37 @@ pub struct ContentChunkRecord {
     pub length: u32,
 }
 
-/// What a blob over [`CHUNKED_CONTENT_THRESHOLD`] is stored as: its chunks, in order.
+/// One part of a long blob's manifest: a [`ContentChunkPartRecord`] stored as
+/// content under `id`, whose chunks hold `length` bytes of the blob.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentPartRecord {
+    pub id: ContentId,
+    pub length: u64,
+}
+
+/// What a chunk manifest lists: the blob's chunks, or, for a blob of more than
+/// [`MAX_DIRECT_CONTENT_CHUNKS`], its parts. Either way in order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContentManifestEntries {
+    Chunks(Vec<ContentChunkRecord>),
+    Parts(Vec<ContentPartRecord>),
+}
+
+/// What a blob over [`CHUNKED_CONTENT_THRESHOLD`] is stored as: its chunks or its
+/// parts, in order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentChunkManifestRecord {
-    /// The blob's length; the chunks' lengths sum to it.
+    /// The blob's length; the chunks' or parts' lengths sum to it.
     pub logical_length: u64,
-    pub chunks: Vec<ContentChunkRecord>,
+    pub entries: ContentManifestEntries,
 }
 
 impl ContentChunkManifestRecord {
     /// Checks the manifest describes a blob that is chunked, within the format's size,
-    /// cut into chunks the chunker could produce. It cannot check the chunks are cut
-    /// where the chunker would cut them; a blob's identity is its bytes, so a manifest
-    /// cut elsewhere names the same content.
+    /// cut into chunks and parts the chunker could produce. It cannot check the chunks
+    /// are cut where the chunker would cut them; a blob's identity is its bytes, so a
+    /// manifest cut elsewhere names the same content. A part's own chunks are checked
+    /// when it is read ([`ContentChunkPartRecord::validate`]).
     pub fn validate(&self) -> Result<(), StoreRecordError> {
         if self.logical_length <= CHUNKED_CONTENT_THRESHOLD {
             return Err(StoreRecordError::InvalidChunkManifest(
@@ -119,37 +165,101 @@ impl ContentChunkManifestRecord {
                 "the blob is longer than the format allows",
             ));
         }
-        if self.chunks.len() > MAX_CONTENT_CHUNKS {
-            return Err(StoreRecordError::InvalidCount);
-        }
-        let Some((last, rest)) = self.chunks.split_last() else {
-            return Err(StoreRecordError::InvalidChunkManifest("it has no chunks"));
+        let total = match &self.entries {
+            ContentManifestEntries::Chunks(chunks) => {
+                if chunks.len() > MAX_DIRECT_CONTENT_CHUNKS {
+                    return Err(StoreRecordError::InvalidCount);
+                }
+                chunk_run_length(chunks, true)?
+            }
+            ContentManifestEntries::Parts(parts) => {
+                if parts.len() > MAX_CONTENT_PARTS {
+                    return Err(StoreRecordError::InvalidCount);
+                }
+                let Some((last, rest)) = parts.split_last() else {
+                    return Err(StoreRecordError::InvalidChunkManifest("it has no parts"));
+                };
+                let shortest = MIN_CONTENT_PART_CHUNKS as u64 * u64::from(MIN_CONTENT_CHUNK_BYTES);
+                if rest
+                    .iter()
+                    .any(|part| !(shortest..=MAX_CONTENT_PART_BYTES).contains(&part.length))
+                {
+                    return Err(StoreRecordError::InvalidChunkManifest(
+                        "a part before the last is outside the part sizes",
+                    ));
+                }
+                if !(1..=MAX_CONTENT_PART_BYTES).contains(&last.length) {
+                    return Err(StoreRecordError::InvalidChunkManifest(
+                        "the last part is empty or too long",
+                    ));
+                }
+                // At most `MAX_CONTENT_PARTS` parts of at most 64 GiB: no overflow.
+                parts.iter().map(|part| part.length).sum()
+            }
         };
-        if rest.iter().any(|chunk| {
-            !(MIN_CONTENT_CHUNK_BYTES..=MAX_CONTENT_CHUNK_BYTES).contains(&chunk.length)
-        }) {
-            return Err(StoreRecordError::InvalidChunkManifest(
-                "a chunk before the last is outside the chunk sizes",
-            ));
-        }
-        if !(1..=MAX_CONTENT_CHUNK_BYTES).contains(&last.length) {
-            return Err(StoreRecordError::InvalidChunkManifest(
-                "the last chunk is empty or too long",
-            ));
-        }
-        // At most `MAX_CONTENT_CHUNKS` chunks of at most 4 MiB: no overflow.
-        let total: u64 = self
-            .chunks
-            .iter()
-            .map(|chunk| u64::from(chunk.length))
-            .sum();
         if total != self.logical_length {
             return Err(StoreRecordError::InvalidChunkManifest(
-                "the chunks' lengths do not sum to the blob's",
+                "the entries' lengths do not sum to the blob's",
             ));
         }
         Ok(())
     }
+}
+
+/// A run of a long blob's chunks, stored as an ordinary content blob and named by a
+/// [`ContentPartRecord`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentChunkPartRecord {
+    pub chunks: Vec<ContentChunkRecord>,
+}
+
+impl ContentChunkPartRecord {
+    /// Checks the part holds chunks the chunker could produce, as many as a part
+    /// takes, `length` bytes in all. `last` says it is the blob's last part, which
+    /// may hold fewer chunks and ends with the blob's last chunk.
+    pub fn validate(&self, length: u64, last: bool) -> Result<(), StoreRecordError> {
+        let fewest = if last { 1 } else { MIN_CONTENT_PART_CHUNKS };
+        if !(fewest..=MAX_CONTENT_PART_CHUNKS).contains(&self.chunks.len()) {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "a part holds too few or too many chunks",
+            ));
+        }
+        if chunk_run_length(&self.chunks, last)? != length {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "a part's chunks do not sum to its length",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The bytes a run of chunks holds, once each is within the chunk sizes. With
+/// `ends_blob` the run's last chunk is the blob's, which may be shorter.
+fn chunk_run_length(
+    chunks: &[ContentChunkRecord],
+    ends_blob: bool,
+) -> Result<u64, StoreRecordError> {
+    let Some((last, rest)) = chunks.split_last() else {
+        return Err(StoreRecordError::InvalidChunkManifest("it has no chunks"));
+    };
+    let sizes = MIN_CONTENT_CHUNK_BYTES..=MAX_CONTENT_CHUNK_BYTES;
+    if rest.iter().any(|chunk| !sizes.contains(&chunk.length)) {
+        return Err(StoreRecordError::InvalidChunkManifest(
+            "a chunk before the last is outside the chunk sizes",
+        ));
+    }
+    let last_sizes = if ends_blob {
+        1
+    } else {
+        MIN_CONTENT_CHUNK_BYTES
+    }..=MAX_CONTENT_CHUNK_BYTES;
+    if !last_sizes.contains(&last.length) {
+        return Err(StoreRecordError::InvalidChunkManifest(
+            "the last chunk is outside the chunk sizes",
+        ));
+    }
+    // A run is at most `MAX_CONTENT_CHUNKS` chunks of at most 4 MiB: no overflow.
+    Ok(chunks.iter().map(|chunk| u64::from(chunk.length)).sum())
 }
 
 /// One object or content blob a manifest accounts for.
@@ -472,48 +582,125 @@ pub fn encode_content_chunk_manifest(
     manifest: &ContentChunkManifestRecord,
 ) -> Result<Vec<u8>, StoreRecordError> {
     manifest.validate()?;
+    let (chunks, parts) = match &manifest.entries {
+        ContentManifestEntries::Chunks(chunks) => (chunks_wire(chunks), Vec::new()),
+        ContentManifestEntries::Parts(parts) => (
+            Vec::new(),
+            parts
+                .iter()
+                .map(|part| wire::ContentPartRefV1 {
+                    id: content_id_wire(part.id),
+                    length: part.length,
+                })
+                .collect(),
+        ),
+    };
     encoded(
         wire::ContentChunkManifestV1Input {
             logical_length: manifest.logical_length,
-            chunks: manifest
-                .chunks
-                .iter()
-                .map(|chunk| wire::ContentChunkRefV1 {
-                    id: wire::ContentId {
-                        digest: digest(*chunk.id.as_bytes()),
-                    },
-                    length: chunk.length,
-                })
-                .collect(),
+            chunks,
+            parts,
         }
         .encode(),
     )
 }
+
 /// Decodes exactly one canonical, valid chunk manifest.
 pub fn decode_content_chunk_manifest(
     bytes: &[u8],
 ) -> Result<ContentChunkManifestRecord, StoreRecordError> {
     let w = wire::ContentChunkManifestV1::decode(bytes).map_err(decode_error)?;
-    if w.chunks.len() > MAX_CONTENT_CHUNKS {
+    if w.chunks.len() > MAX_DIRECT_CONTENT_CHUNKS || w.parts.len() > MAX_CONTENT_PARTS {
         return Err(StoreRecordError::InvalidCount);
     }
     let reencoded = w.encode();
+    let entries = match (w.chunks.is_empty(), w.parts.is_empty()) {
+        (false, false) => {
+            return Err(StoreRecordError::InvalidChunkManifest(
+                "it lists both chunks and parts",
+            ));
+        }
+        (_, true) => ContentManifestEntries::Chunks(chunks_record(w.chunks)?),
+        (true, false) => ContentManifestEntries::Parts(
+            w.parts
+                .into_iter()
+                .map(|part| {
+                    Ok(ContentPartRecord {
+                        id: ContentId::from_digest(digest_array(part.id.digest)?),
+                        length: part.length,
+                    })
+                })
+                .collect::<Result<_, StoreRecordError>>()?,
+        ),
+    };
     let manifest = ContentChunkManifestRecord {
         logical_length: w.logical_length,
-        chunks: w
-            .chunks
-            .into_iter()
-            .map(|chunk| {
-                Ok(ContentChunkRecord {
-                    id: ContentId::from_digest(digest_array(chunk.id.digest)?),
-                    length: chunk.length,
-                })
-            })
-            .collect::<Result<_, StoreRecordError>>()?,
+        entries,
     };
     let manifest = checked(bytes, manifest, reencoded)?;
     manifest.validate()?;
     Ok(manifest)
+}
+
+/// Encodes a part of at most [`MAX_CONTENT_PART_CHUNKS`] chunks. Its chunks are
+/// checked against the manifest that names it, when it is read.
+pub fn encode_content_chunk_part(
+    part: &ContentChunkPartRecord,
+) -> Result<Vec<u8>, StoreRecordError> {
+    if part.chunks.len() > MAX_CONTENT_PART_CHUNKS {
+        return Err(StoreRecordError::InvalidCount);
+    }
+    encoded(
+        wire::ContentChunkPartV1Input {
+            chunks: chunks_wire(&part.chunks),
+        }
+        .encode(),
+    )
+}
+
+/// Decodes exactly one canonical part of at most [`MAX_CONTENT_PART_CHUNKS`]
+/// chunks. The caller validates it against the manifest that names it
+/// ([`ContentChunkPartRecord::validate`]).
+pub fn decode_content_chunk_part(bytes: &[u8]) -> Result<ContentChunkPartRecord, StoreRecordError> {
+    let w = wire::ContentChunkPartV1::decode(bytes).map_err(decode_error)?;
+    if w.chunks.len() > MAX_CONTENT_PART_CHUNKS {
+        return Err(StoreRecordError::InvalidCount);
+    }
+    let reencoded = w.encode();
+    let part = ContentChunkPartRecord {
+        chunks: chunks_record(w.chunks)?,
+    };
+    checked(bytes, part, reencoded)
+}
+
+fn content_id_wire(id: ContentId) -> wire::ContentId {
+    wire::ContentId {
+        digest: digest(*id.as_bytes()),
+    }
+}
+
+fn chunks_wire(chunks: &[ContentChunkRecord]) -> Vec<wire::ContentChunkRefV1> {
+    chunks
+        .iter()
+        .map(|chunk| wire::ContentChunkRefV1 {
+            id: content_id_wire(chunk.id),
+            length: chunk.length,
+        })
+        .collect()
+}
+
+fn chunks_record(
+    chunks: Vec<wire::ContentChunkRefV1>,
+) -> Result<Vec<ContentChunkRecord>, StoreRecordError> {
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            Ok(ContentChunkRecord {
+                id: ContentId::from_digest(digest_array(chunk.id.digest)?),
+                length: chunk.length,
+            })
+        })
+        .collect()
 }
 
 /// The generated encoder writes a `uint32` count as `len() as u32`, so a longer

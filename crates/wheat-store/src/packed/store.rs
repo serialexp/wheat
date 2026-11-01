@@ -299,21 +299,32 @@ impl PackedEngine {
         let mut records = Vec::new();
         let mut loose = Vec::new();
         let mut manifests = Vec::new();
-        // A chunk repeated within a blob or across blobs is written once.
+        // A chunk or part repeated within a blob or across blobs is written once.
         let mut chunks = HashSet::new();
+        let mut parts = Vec::new();
         for content in contents {
             if crate::content_store::is_chunked(content.len()) {
                 if self.logical_length(content.id()).is_ok() {
                     continue;
                 }
-                // Chunks are loose whatever the threshold, so they are on disk
-                // before the manifest that names them.
-                let envelope = crate::content_stream::chunked_envelope(content, |chunk| {
-                    if chunks.insert(chunk.id()) && self.logical_length(chunk.id()).is_err() {
-                        loose.push(chunk);
-                    }
-                    Ok(())
-                })?;
+                // Chunks and parts are loose whatever the threshold, so they are on
+                // disk before the manifest that names them.
+                let mut absent = |id| chunks.insert(id) && self.logical_length(id).is_err();
+                let mut chunk_ids = Vec::new();
+                let envelope = crate::content_stream::chunked_envelope(
+                    content,
+                    |chunk| {
+                        chunk_ids.push(chunk);
+                        Ok(())
+                    },
+                    |part| {
+                        if absent(part.id()) {
+                            parts.push(part.into_owned());
+                        }
+                        Ok(())
+                    },
+                )?;
+                loose.extend(chunk_ids.into_iter().filter(|chunk| absent(chunk.id())));
                 manifests.push((content.id(), envelope));
             } else if content.len() > self.loose_threshold {
                 loose.push(content);
@@ -322,6 +333,7 @@ impl PackedEngine {
             }
         }
         let mut added = Vec::new();
+        loose.extend(parts.iter().map(VerifiedContent::borrowed));
         if let Some(first) = loose.first() {
             let first = first.id();
             let ids = loose
