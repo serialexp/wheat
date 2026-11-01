@@ -19,6 +19,8 @@ pub enum ContentMapError {
     InvalidChildDepth,
     #[error("content-map node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("content-map repeats its subtrees under more than {limit} other key paths")]
+    RepeatedSubtrees { limit: usize },
     #[error("content-map delta contains more than {limit} entries")]
     DeltaChangeLimitExceeded { limit: usize },
     #[error("content-map delta reads more than {limit} nodes")]
@@ -38,6 +40,7 @@ impl From<radix::Error> for ContentMapError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+            radix::Error::RepeatedSubtrees { limit } => Self::RepeatedSubtrees { limit },
         }
     }
 }
@@ -235,7 +238,7 @@ impl<'a, S: ImmutableObjectStore> ContentMapStore<'a, S> {
     ) -> Result<Vec<ContentId>, ContentMapError> {
         Ok(self
             .inner
-            .paired_diff(old, new, radix::DiffLimits::unbounded())
+            .paired_diff(old, new, radix::DiffLimits::any_size())
             .await?
             .into_iter()
             .filter_map(|entry| match entry {
@@ -264,6 +267,7 @@ impl<'a, S: ImmutableObjectStore> ContentMapStore<'a, S> {
                     max_changes: limits.max_changes,
                     max_nodes: limits.max_nodes,
                     max_pending: limits.max_pending,
+                    ..radix::DiffLimits::default()
                 },
             )
             .await?;

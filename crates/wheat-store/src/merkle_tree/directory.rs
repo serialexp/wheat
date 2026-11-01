@@ -280,6 +280,9 @@ fn malformed(error: radix::Error) -> MerkleTreeError {
         | radix::Error::InvalidTerminalNode => {
             MerkleTreeError::MalformedDirectory("a chunk node is out of shape for its position")
         }
+        radix::Error::RepeatedSubtrees { .. } => {
+            MerkleTreeError::MalformedDirectory("chunk nodes repeat under other key paths")
+        }
     }
 }
 
@@ -606,6 +609,7 @@ impl<S: ImmutableObjectStore> MerkleTreeStore<'_, S> {
             max_nodes: limits.max_nodes.saturating_sub(count.nodes),
             // Pending work holds nodes and entries the two limits above bound.
             max_pending: usize::MAX,
+            ..DiffLimits::default()
         };
         let (changes, nodes) = radix::Store::<S, DirectoryChunkCollection>::new(self.objects)
             .paired_diff_counted(old, new, diff_limits)

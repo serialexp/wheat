@@ -74,6 +74,8 @@ pub enum CollectionError {
     InvalidChildDepth,
     #[error("collection values are permitted only at terminal depth")]
     InvalidTerminalNode,
+    #[error("collection repeats its subtrees under more than {limit} other key paths")]
+    RepeatedSubtrees { limit: usize },
     #[error("set delta contains more than {limit} entries")]
     DeltaChangeLimitExceeded { limit: usize },
     #[error("set delta reads more than {limit} nodes")]
@@ -89,6 +91,7 @@ impl From<radix::Error> for CollectionError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+            radix::Error::RepeatedSubtrees { limit } => Self::RepeatedSubtrees { limit },
         }
     }
 }
@@ -441,6 +444,7 @@ impl<S: ImmutableObjectStore> ContentSetStore<'_, S> {
                     max_changes: limits.max_changes,
                     max_nodes: limits.max_nodes,
                     max_pending: limits.max_pending,
+                    ..radix::DiffLimits::default()
                 },
             )
             .await?
@@ -463,7 +467,7 @@ impl<S: ImmutableObjectStore> ContentSetStore<'_, S> {
     ) -> Result<Vec<ContentId>, CollectionError> {
         Ok(self
             .inner
-            .paired_diff(old, new, radix::DiffLimits::unbounded())
+            .paired_diff(old, new, radix::DiffLimits::any_size())
             .await?
             .into_iter()
             .filter_map(|entry| match entry {
@@ -536,6 +540,7 @@ impl<S: ImmutableObjectStore> ProjectedCommitSetStore<'_, S> {
                     max_changes: limits.max_changes,
                     max_nodes: limits.max_nodes,
                     max_pending: limits.max_pending,
+                    ..radix::DiffLimits::default()
                 },
             )
             .await?
@@ -571,6 +576,7 @@ impl<S: ImmutableObjectStore> RetainedSetStore<'_, S> {
                     max_changes: limits.max_changes,
                     max_nodes: limits.max_nodes,
                     max_pending: limits.max_pending,
+                    ..radix::DiffLimits::default()
                 },
             )
             .await?

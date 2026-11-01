@@ -12,7 +12,7 @@ a shared object store for blobs; Gothab's server does authentication and reposit
 authorization in front of it and proxies to the right host. Items marked
 **(format)** touch a stored record or the protocol, so they want deciding before the
 formats freeze. Items already listed elsewhere that this also needs: chunked uploads reassembled in
-memory, a cap on the fetch union's diffs, opening a packed store costing O(store), and
+memory, opening a packed store costing O(store), and
 `wheat gc` /
 server-authoritative remote maintenance.
 
@@ -318,15 +318,6 @@ budget passes, but by only about 0.7 s.
   A new `newdir/a` shows as `untracked newdir/` and `untracked newdir/a`, and the
   header counts both as "untracked files: 2". Options: collapse to the directory
   as git does, list only files, or keep both and count only files.
-- `[ ]` **The fetch union diffs remote maps without a cap (2026-10-09).** A radix
-  node's ID does not include its key path, so a crafted map can repeat a few nodes
-  under every edge: paths double at every level. The fetch union
-  (`crates/wheat-store/src/repository_union.rs`) diffs the remote's change map,
-  lineage and retained sets against the local ones with `DiffLimits::unbounded()`
-  (14 call sites across the collections), so a server could make a client walk 2^depth
-  paths. `StructuralDelta` has a cap (TODO_DONE.md). Options: bounded limits at the
-  sites that see remote roots, or a revisit count inside `paired_diff` for every diff
-  (a set of visited node IDs per diff, local ones included). Needs Bart's call.
 - `[ ]` **Combined revisions carry no subsumption evidence (2026-10-09).** When
   integrate combines revisions of one change, the new revision's transition has no
   `subsumed` or `resolutions` entries, even where the combined revisions recorded

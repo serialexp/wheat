@@ -575,7 +575,17 @@ Finished items, moved here from `TODO.md` under the same headings.
   `max_radix_revisits` (65,536) (2026-10-31). A publish whose walk stops so is refused
   as invalid. Test: a 21-node content set of a million paths stops after about 120
   node visits (15 s and a million reads without the cap). The fetch union's diffs
-  are still uncapped: TODO.md.
+  are capped too: the next item.
+- `[x]` **The fetch union diffs remote maps without a cap (2026-10-09).** The
+  union diffed the remote's change map, lineage and retained sets with
+  `DiffLimits::unbounded()`, so a server could make a client walk 2^depth paths.
+  Done 2026-11-01, Bart: "limit to something like 1000 or 10k". Every
+  `paired_diff` keeps the IDs of the nodes it reads, and stops with
+  `RepeatedSubtrees` once it has read nodes again under other key paths 10,000
+  times (`DiffLimits::max_revisits`). Keys are digests or random IDs, so legitimate
+  maps almost never repeat a subtree. `DiffLimits::unbounded()` became `any_size()`:
+  no size limits, the revisit cap kept. Test: a union with a 21-node content set of
+  a million paths is refused (42 s and a million entries without the cap).
 - `[x]` **`wheat+tls://` URLs parse but cannot connect.** Done 2026-10-29. The client
   connects over rustls (aws-lc-rs) and checks the server against the operating
   system's trusted roots through `rustls-native-certs`, read once per process;

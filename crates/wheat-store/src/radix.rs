@@ -1,7 +1,12 @@
 //! Shared implementation for maximally path-compressed, fixed-byte radix collections.
 //! The traits in this module are crate-private so collection identities cannot be mixed.
 
-use std::{collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin};
+use std::{
+    collections::{BTreeMap, HashSet},
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+};
 
 use wheat_core::{CanonicalObjectError, ObjectId};
 
@@ -14,6 +19,12 @@ pub(crate) enum Error {
     InvalidRootDepth,
     InvalidChildDepth,
     InvalidTerminalNode,
+    /// A diff read nodes again under other key paths more than `limit` times. A
+    /// node's ID leaves out its key path, so a few nodes can make a map whose paths
+    /// double at every level; a legitimate map does not repeat its subtrees.
+    RepeatedSubtrees {
+        limit: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -31,15 +42,15 @@ impl From<Error> for DiffError {
 }
 
 impl DiffError {
-    /// The storage error behind a diff run with [`DiffLimits::unbounded`], which
-    /// cannot exceed a limit.
-    pub(crate) fn into_unbounded(self) -> Error {
+    /// The error behind a diff run with [`DiffLimits::any_size`], which cannot exceed
+    /// a size limit.
+    pub(crate) fn into_any_size(self) -> Error {
         match self {
             Self::Radix(error) => error,
             Self::ChangeLimitExceeded { .. }
             | Self::NodeLimitExceeded { .. }
             | Self::PendingLimitExceeded { .. } => {
-                unreachable!("an unbounded diff exceeded a limit")
+                unreachable!("a diff of any size exceeded a size limit")
             }
         }
     }
@@ -192,7 +203,14 @@ pub(crate) struct DiffLimits {
     pub max_changes: usize,
     pub max_nodes: usize,
     pub max_pending: usize,
+    /// Most nodes read again under another key path; see
+    /// [`Error::RepeatedSubtrees`].
+    pub max_revisits: usize,
 }
+
+/// The revisit allowance every diff keeps. Keys are digests or random IDs, so two
+/// subtrees under different paths almost never hold the same entries.
+const MAX_REVISITS: usize = 10_000;
 
 impl Default for DiffLimits {
     fn default() -> Self {
@@ -202,19 +220,29 @@ impl Default for DiffLimits {
             // A radix node has at most 256 children; leave room for several
             // divergent levels while still bounding adversarial inputs.
             max_pending: 4_096,
+            max_revisits: MAX_REVISITS,
         }
     }
 }
 
 impl DiffLimits {
-    /// No limits, for callers whose inputs are already authenticated local roots.
-    pub(crate) const fn unbounded() -> Self {
+    /// No size limits, for diffs that must see two maps whole however far they
+    /// differ, such as a union. The revisit cap stays: its inputs may come from a
+    /// remote.
+    pub(crate) const fn any_size() -> Self {
         Self {
             max_changes: usize::MAX,
             max_nodes: usize::MAX,
             max_pending: usize::MAX,
+            max_revisits: MAX_REVISITS,
         }
     }
+}
+
+/// The nodes one diff has read, by ID, to count those read again.
+struct DiffReads {
+    seen: HashSet<ObjectId>,
+    revisits: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -964,7 +992,10 @@ where
         ));
         let mut key = vec![0; C::Key::LEN];
         let mut changes = Vec::new();
-        let mut nodes_read = 0usize;
+        let mut reads = DiffReads {
+            seen: HashSet::new(),
+            revisits: 0,
+        };
 
         while let Some(task) = pending.pop() {
             match task {
@@ -972,9 +1003,8 @@ where
                     if let Some(edge) = edge {
                         key[position - 1] = edge;
                     }
-                    let (mut node, skip) = self
-                        .diff_load(side, position, &mut nodes_read, limits)
-                        .await?;
+                    let (mut node, skip) =
+                        self.diff_load(side, position, &mut reads, limits).await?;
                     let end = position + node.prefix.len() - skip;
                     key[position..end].copy_from_slice(&node.prefix[skip..]);
                     if let Some(value) = node.value.take() {
@@ -1019,10 +1049,10 @@ where
                         continue;
                     }
                     let (left, left_skip) = self
-                        .diff_load(left_side, position, &mut nodes_read, limits)
+                        .diff_load(left_side, position, &mut reads, limits)
                         .await?;
                     let (right, right_skip) = self
-                        .diff_load(right_side, position, &mut nodes_read, limits)
+                        .diff_load(right_side, position, &mut reads, limits)
                         .await?;
                     let left_prefix = &left.prefix[left_skip..];
                     let right_prefix = &right.prefix[right_skip..];
@@ -1143,25 +1173,33 @@ where
                 });
             }
         }
-        Ok((changes, nodes_read))
+        Ok((changes, reads.seen.len() + reads.revisits))
     }
 
     async fn diff_load(
         &self,
         side: DiffSide<C>,
         position: usize,
-        nodes_read: &mut usize,
+        reads: &mut DiffReads,
         limits: DiffLimits,
     ) -> Result<(Node<C::Id, C::Value>, usize), DiffError> {
         match side {
             DiffSide::Loaded(node, skip) => Ok((node, skip)),
             DiffSide::Id(id) => {
-                if *nodes_read == limits.max_nodes {
+                if reads.seen.len() + reads.revisits == limits.max_nodes {
                     return Err(DiffError::NodeLimitExceeded {
                         limit: limits.max_nodes,
                     });
                 }
-                *nodes_read += 1;
+                if !reads.seen.insert(id.into()) {
+                    if reads.revisits == limits.max_revisits {
+                        return Err(Error::RepeatedSubtrees {
+                            limit: limits.max_revisits,
+                        }
+                        .into());
+                    }
+                    reads.revisits += 1;
+                }
                 Ok((self.read_at(id, position).await?, 0))
             }
         }
@@ -1288,9 +1326,9 @@ where
             return Ok(left);
         }
         let added = self
-            .paired_diff(left, right, DiffLimits::unbounded())
+            .paired_diff(left, right, DiffLimits::any_size())
             .await
-            .map_err(DiffError::into_unbounded)?
+            .map_err(DiffError::into_any_size)?
             .into_iter()
             .filter_map(|entry| match entry {
                 DiffEntry::Added(key, value) => Some((key, Some(value))),
@@ -2039,7 +2077,7 @@ mod paired_context_tests {
             .unwrap();
         assert_eq!(
             revisions
-                .paired_diff(left, right, DiffLimits::unbounded())
+                .paired_diff(left, right, DiffLimits::any_size())
                 .await
                 .unwrap(),
             [
@@ -2047,6 +2085,49 @@ mod paired_context_tests {
                 DiffEntry::Changed(high, revision(3), revision(5)),
             ]
         );
+    }
+
+    /// A union with a content set whose `depth` nodes each have both edges on the
+    /// next, so its paths double at every level, reads each node again under every
+    /// path only up to the revisit cap.
+    #[tokio::test]
+    async fn a_union_stops_at_subtrees_repeated_under_every_edge() {
+        use wheat_core::{ContentSetChild, ContentSetNode};
+
+        use crate::{CollectionError, ContentSetStore};
+
+        let objects = ObjectStoreAdapter::new(Arc::new(InMemory::new()), "repeated-subtrees");
+        let depth = 20;
+        let suffix = |first: u8| {
+            let mut suffix = vec![0; 32 - depth];
+            suffix[0] = first;
+            suffix
+        };
+        let mut node =
+            ContentSetNode::new(Vec::new(), false, Vec::new(), vec![suffix(0), suffix(1)]).unwrap();
+        for _ in 0..depth {
+            objects
+                .put_if_absent(node.id().into(), &node.canonical_bytes())
+                .await
+                .unwrap();
+            let child = node.id();
+            let children = (0..2).map(|edge| ContentSetChild { edge, child }).collect();
+            node = ContentSetNode::new(Vec::new(), false, children, Vec::new()).unwrap();
+        }
+        objects
+            .put_if_absent(node.id().into(), &node.canonical_bytes())
+            .await
+            .unwrap();
+
+        // A million paths through 21 nodes.
+        let sets = ContentSetStore::new(&objects);
+        let empty = sets.empty_root().await.unwrap();
+        assert!(matches!(
+            sets.union(empty, node.id()).await,
+            Err(CollectionError::RepeatedSubtrees {
+                limit: MAX_REVISITS
+            })
+        ));
     }
 
     #[tokio::test]

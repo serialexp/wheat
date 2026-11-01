@@ -18,6 +18,8 @@ pub enum RevisionMapError {
     InvalidChildDepth,
     #[error("revision-map node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("revision-map repeats its subtrees under more than {limit} other key paths")]
+    RepeatedSubtrees { limit: usize },
     #[error("revision-map delta contains more than {limit} selections")]
     DeltaSelectionLimitExceeded { limit: usize },
     #[error("revision-map delta reads more than {limit} nodes")]
@@ -34,6 +36,7 @@ impl From<radix::Error> for RevisionMapError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+            radix::Error::RepeatedSubtrees { limit } => Self::RepeatedSubtrees { limit },
         }
     }
 }
@@ -235,6 +238,7 @@ impl<'a, S: ImmutableObjectStore> RevisionMapStore<'a, S> {
                     max_changes: limits.max_selections,
                     max_nodes: limits.max_nodes,
                     max_pending: limits.max_pending,
+                    ..radix::DiffLimits::default()
                 },
             )
             .await?;

@@ -62,6 +62,8 @@ pub enum ViewLineageError {
     InvalidChildDepth,
     #[error("view-lineage node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("view-lineage repeats its subtrees under more than {limit} other key paths")]
+    RepeatedSubtrees { limit: usize },
     #[error("view-lineage structural-node limit exceeded ({limit})")]
     StructuralNodeLimitExceeded { limit: usize },
     #[error("view-lineage map-node limit exceeded ({limit})")]
@@ -98,6 +100,7 @@ impl From<radix::Error> for ViewLineageError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+            radix::Error::RepeatedSubtrees { limit } => Self::RepeatedSubtrees { limit },
         }
     }
 }
@@ -348,9 +351,9 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
         }
         let entries = self
             .inner
-            .paired_diff(left, right, radix::DiffLimits::unbounded())
+            .paired_diff(left, right, radix::DiffLimits::any_size())
             .await
-            .map_err(|error| ViewLineageError::from(error.into_unbounded()))?;
+            .map_err(|error| ViewLineageError::from(error.into_any_size()))?;
         let mut edits = Vec::new();
         for entry in entries {
             match entry {
@@ -374,9 +377,9 @@ impl<'a, S: ImmutableObjectStore> ViewLineageMapStore<'a, S> {
         new: ViewLineageMapId,
     ) -> Result<Vec<radix::DiffEntry<ViewId, RetainedSetId>>, ViewLineageError> {
         self.inner
-            .paired_diff(old, new, radix::DiffLimits::unbounded())
+            .paired_diff(old, new, radix::DiffLimits::any_size())
             .await
-            .map_err(|error| ViewLineageError::from(error.into_unbounded()))
+            .map_err(|error| ViewLineageError::from(error.into_any_size()))
     }
 
     /// The edges `new` adds to `old`, or [`LineageGrowth::Dropped`] when it drops one.

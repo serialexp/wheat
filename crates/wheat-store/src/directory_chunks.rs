@@ -231,7 +231,7 @@ mod tests {
                 assert_eq!(updated, fresh(&objects, &next).await, "round {round}");
                 assert_eq!(
                     store
-                        .paired_diff(root, updated, DiffLimits::unbounded())
+                        .paired_diff(root, updated, DiffLimits::any_size())
                         .await
                         .unwrap(),
                     expected_diff(&current, &next),
@@ -239,7 +239,7 @@ mod tests {
                 );
                 assert_eq!(
                     store
-                        .paired_diff(updated, root, DiffLimits::unbounded())
+                        .paired_diff(updated, root, DiffLimits::any_size())
                         .await
                         .unwrap(),
                     expected_diff(&next, &current),
@@ -302,14 +302,14 @@ mod tests {
         let right = fresh(&objects, &grown).await;
         assert_eq!(
             store
-                .paired_diff(left, right, DiffLimits::unbounded())
+                .paired_diff(left, right, DiffLimits::any_size())
                 .await
                 .unwrap(),
             expected_diff(&base, &grown)
         );
         assert_eq!(
             store
-                .paired_diff(right, left, DiffLimits::unbounded())
+                .paired_diff(right, left, DiffLimits::any_size())
                 .await
                 .unwrap(),
             expected_diff(&grown, &base)

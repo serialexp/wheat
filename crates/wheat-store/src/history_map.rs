@@ -21,6 +21,8 @@ pub enum HistoryMapError {
     InvalidChildDepth,
     #[error("history-map node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("history-map repeats its subtrees under more than {limit} other key paths")]
+    RepeatedSubtrees { limit: usize },
     #[error("history-map delta contains more than {limit} entries")]
     DeltaChangeLimitExceeded { limit: usize },
     #[error("history-map delta reads more than {limit} nodes")]
@@ -36,6 +38,7 @@ impl From<radix::Error> for HistoryMapError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+            radix::Error::RepeatedSubtrees { limit } => Self::RepeatedSubtrees { limit },
         }
     }
 }

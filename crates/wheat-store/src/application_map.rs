@@ -18,6 +18,8 @@ pub enum ApplicationMapError {
     InvalidChildDepth,
     #[error("application-map node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("application-map repeats its subtrees under more than {limit} other key paths")]
+    RepeatedSubtrees { limit: usize },
     #[error("application-map delta contains more than {limit} entries")]
     DeltaChangeLimitExceeded { limit: usize },
     #[error("application-map delta reads more than {limit} nodes")]
@@ -33,6 +35,7 @@ impl From<radix::Error> for ApplicationMapError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+            radix::Error::RepeatedSubtrees { limit } => Self::RepeatedSubtrees { limit },
         }
     }
 }
@@ -211,6 +214,7 @@ impl<'a, S: ImmutableObjectStore> ApplicationMapStore<'a, S> {
                     max_changes: limits.max_changes,
                     max_nodes: limits.max_nodes,
                     max_pending: limits.max_pending,
+                    ..radix::DiffLimits::default()
                 },
             )
             .await?;

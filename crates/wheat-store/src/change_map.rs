@@ -17,6 +17,8 @@ pub enum ChangeMapError {
     InvalidChildDepth,
     #[error("change-map node has an invalid terminal shape")]
     InvalidTerminalNode,
+    #[error("change-map repeats its subtrees under more than {limit} other key paths")]
+    RepeatedSubtrees { limit: usize },
     #[error("change-map delta contains more than {limit} entries")]
     DeltaChangeLimitExceeded { limit: usize },
     #[error("change-map delta reads more than {limit} nodes")]
@@ -35,6 +37,7 @@ impl From<radix::Error> for ChangeMapError {
             radix::Error::InvalidRootDepth => Self::InvalidRootDepth,
             radix::Error::InvalidChildDepth => Self::InvalidChildDepth,
             radix::Error::InvalidTerminalNode => Self::InvalidTerminalNode,
+            radix::Error::RepeatedSubtrees { limit } => Self::RepeatedSubtrees { limit },
         }
     }
 }
@@ -201,9 +204,9 @@ impl<'a, S: ImmutableObjectStore> ChangeMapStore<'a, S> {
         }
         let entries = self
             .inner
-            .paired_diff(left, right, radix::DiffLimits::unbounded())
+            .paired_diff(left, right, radix::DiffLimits::any_size())
             .await
-            .map_err(|error| ChangeMapError::from(error.into_unbounded()))?;
+            .map_err(|error| ChangeMapError::from(error.into_any_size()))?;
         let mut added = Vec::new();
         let mut divergent = Vec::new();
         for entry in entries {
@@ -238,6 +241,7 @@ impl<'a, S: ImmutableObjectStore> ChangeMapStore<'a, S> {
                     max_changes: limits.max_changes,
                     max_nodes: limits.max_nodes,
                     max_pending: limits.max_pending,
+                    ..radix::DiffLimits::default()
                 },
             )
             .await?;
