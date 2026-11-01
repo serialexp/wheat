@@ -15,7 +15,7 @@ use crate::{
     workspace_metadata::WorkspaceMetadata,
 };
 
-const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BASELINE_INSPECTION_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_READ_BYTES: usize = 1024 * 1024 * 1024;
 

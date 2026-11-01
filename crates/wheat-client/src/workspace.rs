@@ -23,7 +23,11 @@ use wheat_store::{
 use crate::{
     edit_move::{FileBytes, PathPlacement, describe, place_path},
     outcome::CliFailure,
-    workspace_files::{absent_where_shape_changed, read_workspace_file},
+    workspace_files::{
+        WorkspaceFileError, absent_where_shape_changed, analyze_workspace_file,
+        read_workspace_file, stream_workspace_file,
+    },
+    workspace_scan::MAX_WORKSPACE_FILE_BYTES,
 };
 
 /// The revisions one `add` publishes: the destination change, plus every later change that
@@ -158,17 +162,8 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
         // The change's new version of the path: the workspace file, or its placement at the
         // change's spot when later changes also edit it.
         let file = match placements.get(path) {
-            Some(placement) => placement.below.clone(),
-            None => absent_where_shape_changed(read_workspace_file(
-                root,
-                Path::new(path),
-                limits.max_input_bytes,
-            ))
-            .with_context(|| format!("cannot read workspace path {path:?}"))?
-            .map(|snapshot| FileBytes {
-                kind: snapshot.kind,
-                bytes: canonical_workspace(&snapshot),
-            }),
+            Some(placement) => placement.below.clone().map(Captured::Bytes),
+            None => read_captured(root, path, store, limits)?,
         };
         let a = authored_values[path.as_str()];
         let b = baseline_values[path.as_str()];
@@ -176,16 +171,28 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
         let old_on_path = old_by_path
             .get(path.as_str())
             .map_or(&[][..], Vec::as_slice);
+        // A file past the guarded bound on either side changes as a whole.
+        let past_bound = |value: Option<wheat_core::FileValue>| -> Result<bool> {
+            Ok(match value {
+                Some(value) => store.logical_length(value.content)? > limits.max_input_bytes as u64,
+                None => false,
+            })
+        };
+        let whole = matches!(file, Some(Captured::Stored(_))) || past_bound(a)?;
 
-        let can_normalize = matches!((a, b, file.as_ref()), (Some(a), Some(b), Some(w))
+        let can_normalize = !whole
+            && matches!((a, b, file.as_ref()), (Some(a), Some(b), Some(Captured::Bytes(w)))
             if a.kind == b.kind && b.kind == w.kind && b.kind != wheat_core::FileKind::Symlink)
             && old_on_path
                 .iter()
-                .all(|(_, e)| matches!(e.operation, EditOperation::GuardedText { .. }));
+                .all(|(_, e)| matches!(e.operation, EditOperation::GuardedText { .. }))
+            && !past_bound(b)?;
         if can_normalize {
             let a = a.unwrap();
             let b = b.unwrap();
-            let w = file.as_ref().unwrap();
+            let Some(Captured::Bytes(w)) = file.as_ref() else {
+                unreachable!("matched above")
+            };
             let authored_bytes = store
                 .get(a.content)
                 .context("cannot resolve authored file")?;
@@ -228,7 +235,37 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
                     replacement,
                 ));
             }
+        } else if whole {
+            if ranges.is_some_and(|ranges| !ranges.is_empty()) {
+                return Err(CliFailure::invalid(format!(
+                    "--guard cannot be used on {path:?}: it is over {} bytes, so it changes as a whole",
+                    limits.max_input_bytes
+                )));
+            }
+            let after = match file {
+                None => None,
+                Some(Captured::Stored(value)) => Some(value),
+                Some(Captured::Bytes(w)) => Some(wheat_core::FileValue {
+                    content: content.put(&w.bytes)?,
+                    kind: w.kind,
+                }),
+            };
+            if a != after {
+                let record = EditRecord::new(
+                    path,
+                    EditOperation::ExactFile {
+                        expected: a,
+                        replacement: after,
+                    },
+                )?;
+                edits.insert(record.id(), record);
+            }
         } else {
+            let file = match &file {
+                Some(Captured::Bytes(w)) => Some(w),
+                Some(Captured::Stored(_)) => unreachable!("a stored file changes as a whole"),
+                None => None,
+            };
             let before_bytes = a
                 .map(|v| store.get(v.content))
                 .transpose()
@@ -423,18 +460,37 @@ async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
         )));
     }
     let sorted = histories.keys().map(String::as_str).collect::<Vec<_>>();
+    // Placing an edit reads every version of the file whole, so a file past the guarded
+    // bound cannot be placed yet.
+    let past_bound = |path: &str| {
+        CliFailure::invalid(format!(
+            "cannot add {path:?} to change {change}: changes after it also edit it, and placing an edit to a file over {} bytes among later changes is not supported yet",
+            limits.max_input_bytes
+        ))
+    };
+    for (path, current) in sorted.iter().zip(&current) {
+        for value in [*current, histories[*path].below].into_iter().flatten() {
+            if store.logical_length(value.content)? > limits.max_input_bytes as u64 {
+                return Err(past_bound(path));
+            }
+        }
+    }
     let mut files = BTreeMap::new();
     for path in &sorted {
-        let file = absent_where_shape_changed(read_workspace_file(
+        let read = absent_where_shape_changed(read_workspace_file(
             root,
             Path::new(path),
             limits.max_input_bytes,
-        ))
-        .with_context(|| format!("cannot read workspace path {path:?}"))?
-        .map(|snapshot| FileBytes {
-            kind: snapshot.kind,
-            bytes: canonical_workspace(&snapshot),
-        });
+        ));
+        if matches!(read, Err(WorkspaceFileError::TooLarge { .. })) {
+            return Err(past_bound(path));
+        }
+        let file = read
+            .with_context(|| format!("cannot read workspace path {path:?}"))?
+            .map(|snapshot| FileBytes {
+                kind: snapshot.kind,
+                bytes: canonical_workspace(&snapshot),
+            });
         files.insert(*path, file);
     }
     let mut reauthored = BTreeSet::new();
@@ -530,6 +586,92 @@ fn guarded_record(
             end_anchor: d.end_anchor,
         },
     )?)
+}
+
+/// A path's new version as capture reads it.
+enum Captured {
+    /// Its canonical bytes.
+    Bytes(FileBytes),
+    /// A file past the guarded bound, already streamed into the store.
+    Stored(wheat_core::FileValue),
+}
+
+/// Reads the workspace version of `path`. A file past the guarded bound is streamed
+/// into the store rather than read whole.
+fn read_captured(
+    root: &Path,
+    path: &str,
+    store: &ContentStore,
+    limits: Limits,
+) -> Result<Option<Captured>> {
+    let read = absent_where_shape_changed(read_workspace_file(
+        root,
+        Path::new(path),
+        limits.max_input_bytes,
+    ));
+    let file = match read {
+        Err(WorkspaceFileError::TooLarge { .. }) => {
+            return Ok(store_long_file(root, path, store)?.map(Captured::Stored));
+        }
+        read => read.with_context(|| format!("cannot read workspace path {path:?}"))?,
+    };
+    Ok(file.map(|snapshot| {
+        Captured::Bytes(FileBytes {
+            kind: snapshot.kind,
+            bytes: canonical_workspace(&snapshot),
+        })
+    }))
+}
+
+/// Streams a workspace file too long to hold into the store and returns its value. One
+/// pass finds its canonical ID, as status does; unless the store already has that, a
+/// second writes it, and the store checks the bytes are the same.
+#[tracing::instrument(level = "debug", skip_all, fields(path = path))]
+fn store_long_file(
+    root: &Path,
+    path: &str,
+    store: &ContentStore,
+) -> Result<Option<wheat_core::FileValue>> {
+    let cannot = || format!("cannot read workspace path {path:?}");
+    let Some(file) = absent_where_shape_changed(analyze_workspace_file(
+        root,
+        Path::new(path),
+        MAX_WORKSPACE_FILE_BYTES,
+        0,
+    ))
+    .with_context(cannot)?
+    else {
+        return Ok(None);
+    };
+    let value = wheat_core::FileValue {
+        content: file.content,
+        kind: file.kind,
+    };
+    if store.contains(value.content) {
+        return Ok(Some(value));
+    }
+    let changed = || {
+        CliFailure::stale(format!(
+            "{path:?} changed while it was being added; retry once it is written"
+        ))
+    };
+    let mut writer = store.writer();
+    let kind = stream_workspace_file(
+        root,
+        Path::new(path),
+        file.text,
+        MAX_WORKSPACE_FILE_BYTES,
+        &mut |bytes| std::io::Write::write_all(&mut writer, bytes),
+    )
+    .with_context(cannot)?;
+    if kind != Some(file.kind) {
+        return Err(changed());
+    }
+    match writer.finish(Some(value.content)) {
+        Ok(_) => Ok(Some(value)),
+        Err(wheat_store::ContentStoreError::Corrupt { .. }) => Err(changed()),
+        Err(error) => Err(error).with_context(|| format!("cannot store {path:?}")),
+    }
 }
 
 /// Durably retains captured content in bounded batches.

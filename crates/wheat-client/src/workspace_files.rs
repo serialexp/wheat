@@ -146,6 +146,20 @@ pub fn analyze_workspace_file(
     platform::analyze(root, &components, byte_limit, retain_limit)
 }
 
+/// Streams the regular file at `path` to `out`, a piece at a time: its canonical text
+/// when `text` (see [`analyze_workspace_file`]), else its bytes. Returns its kind, or
+/// `None` when it is missing.
+pub fn stream_workspace_file(
+    root: &Path,
+    path: &Path,
+    text: bool,
+    byte_limit: usize,
+    out: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+) -> Result<Option<FileKind>, WorkspaceFileError> {
+    let components = validate_path(path)?;
+    platform::stream(root, &components, text, byte_limit, out)
+}
+
 /// Authenticate a named workspace leaf without allocating its regular-file
 /// contents. Symlink targets remain bounded by `byte_limit` and are hashed from
 /// their small `readlinkat` buffer.
@@ -263,6 +277,8 @@ mod platform {
         path::Path,
     };
 
+    use wheat_core::text_capture::LineEndings;
+
     use super::{
         CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, RAW_PREIMAGE_DOMAIN, RawPreimage,
         STREAM_SCRATCH_BYTES, StreamingCapture, WorkspaceFileError, WorkspaceFileSnapshot,
@@ -274,31 +290,9 @@ mod platform {
         limit: usize,
         retain_limit: usize,
     ) -> Result<Option<CanonicalWorkspaceFile>, WorkspaceFileError> {
-        let mut directory = File::open(root)?;
-        for component in &components[..components.len() - 1] {
-            let name = c_name(component)?;
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                return match error.raw_os_error() {
-                    Some(libc::ENOENT) => Ok(None),
-                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
-                        if is_symlink(directory.as_raw_fd(), &name) =>
-                    {
-                        Err(WorkspaceFileError::IntermediateSymlink)
-                    }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
-                    _ => Err(error.into()),
-                };
-            }
-            directory = unsafe { File::from_raw_fd(fd) };
-        }
+        let Some(directory) = open_parent(root, components)? else {
+            return Ok(None);
+        };
         let name = c_name(components.last().expect("validated nonempty path"))?;
         analyze_leaf(directory.as_raw_fd(), &name, limit, retain_limit)
     }
@@ -405,31 +399,9 @@ mod platform {
         components: &[&OsStr],
         limit: usize,
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
-        let mut directory = File::open(root)?;
-        for component in &components[..components.len() - 1] {
-            let name = c_name(component)?;
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                return match error.raw_os_error() {
-                    Some(libc::ENOENT) => Ok(None),
-                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
-                        if is_symlink(directory.as_raw_fd(), &name) =>
-                    {
-                        Err(WorkspaceFileError::IntermediateSymlink)
-                    }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
-                    _ => Err(error.into()),
-                };
-            }
-            directory = unsafe { File::from_raw_fd(fd) };
-        }
+        let Some(directory) = open_parent(root, components)? else {
+            return Ok(None);
+        };
         let name = c_name(components.last().expect("validated nonempty path"))?;
         observe_leaf(directory.as_raw_fd(), &name, limit)
     }
@@ -672,31 +644,9 @@ mod platform {
         components: &[&OsStr],
         limit: usize,
     ) -> Result<Option<WorkspaceFileSnapshot>, WorkspaceFileError> {
-        let mut directory = File::open(root)?;
-        for component in &components[..components.len() - 1] {
-            let name = c_name(component)?;
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                return match error.raw_os_error() {
-                    Some(libc::ENOENT) => Ok(None),
-                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
-                        if is_symlink(directory.as_raw_fd(), &name) =>
-                    {
-                        Err(WorkspaceFileError::IntermediateSymlink)
-                    }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
-                    _ => Err(error.into()),
-                };
-            }
-            directory = unsafe { File::from_raw_fd(fd) };
-        }
+        let Some(directory) = open_parent(root, components)? else {
+            return Ok(None);
+        };
 
         let name = c_name(components.last().expect("validated nonempty path"))?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -729,6 +679,120 @@ mod platform {
             libc::S_IFDIR => Err(WorkspaceFileError::LeafIsDirectory),
             _ => Err(WorkspaceFileError::UnsupportedFileType),
         }
+    }
+
+    /// Opens the directory holding the leaf of `components`, without following a
+    /// symlink on the way; `None` when a directory on the way is missing.
+    fn open_parent(root: &Path, components: &[&OsStr]) -> Result<Option<File>, WorkspaceFileError> {
+        let mut directory = File::open(root)?;
+        for component in &components[..components.len() - 1] {
+            let name = c_name(component)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(None),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                        if is_symlink(directory.as_raw_fd(), &name) =>
+                    {
+                        Err(WorkspaceFileError::IntermediateSymlink)
+                    }
+                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
+                    _ => Err(error.into()),
+                };
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(Some(directory))
+    }
+
+    /// Streams the regular file at `components` to `out`: its canonical text when
+    /// `text`, else its bytes. Returns its kind, or `None` when it is missing. A leaf
+    /// that is no longer a regular file, or has grown past `limit`, is refused.
+    pub(super) fn stream(
+        root: &Path,
+        components: &[&OsStr],
+        text: bool,
+        limit: usize,
+        out: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Result<Option<FileKind>, WorkspaceFileError> {
+        let Some(directory) = open_parent(root, components)? else {
+            return Ok(None);
+        };
+        let name = c_name(components.last().expect("validated nonempty path"))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                // A symlink now stands where the file was.
+                Some(libc::ELOOP) => Err(WorkspaceFileError::UnsupportedFileType),
+                _ => Err(error.into()),
+            };
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let opened = file.metadata()?;
+        if !opened.is_file() {
+            return Err(WorkspaceFileError::UnsupportedFileType);
+        }
+        use std::os::unix::fs::MetadataExt as _;
+        let kind = if opened.mode() & 0o111 != 0 {
+            FileKind::Executable
+        } else {
+            FileKind::Regular
+        };
+        let mut line_endings = LineEndings::default();
+        let mut scratch = vec![0_u8; STREAM_SCRATCH_BYTES];
+        let mut length = 0usize;
+        let mut failed = None;
+        loop {
+            let read = file.read(&mut scratch)?;
+            if read == 0 {
+                break;
+            }
+            length = length.saturating_add(read);
+            if length > limit {
+                return Err(WorkspaceFileError::TooLarge { limit });
+            }
+            let piece = &scratch[..read];
+            if text {
+                line_endings.update(piece, |bytes| {
+                    if failed.is_none()
+                        && let Err(error) = out(bytes)
+                    {
+                        failed = Some(error);
+                    }
+                });
+            } else {
+                out(piece)?;
+            }
+            if let Some(error) = failed.take() {
+                return Err(error.into());
+            }
+        }
+        if text {
+            line_endings.finish(|bytes| {
+                if let Err(error) = out(bytes) {
+                    failed = Some(error);
+                }
+            });
+            if let Some(error) = failed {
+                return Err(error.into());
+            }
+        }
+        Ok(Some(kind))
     }
 
     pub(super) fn open_regular(
@@ -884,6 +948,16 @@ mod platform {
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
         unsupported()
     }
+
+    pub(super) fn stream(
+        _root: &Path,
+        _components: &[&OsStr],
+        _text: bool,
+        _limit: usize,
+        _out: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Result<Option<FileKind>, WorkspaceFileError> {
+        unsupported()
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +984,45 @@ mod tests {
         ));
         assert!(unsupported(
             observe_workspace_file(root.path(), path, 64).unwrap_err()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_a_file_passes_on_the_bytes_analysis_hashed() {
+        let root = tempfile::tempdir().unwrap();
+        let stream = |path: &str, text: bool| {
+            let mut out = Vec::new();
+            let kind =
+                stream_workspace_file(root.path(), Path::new(path), text, 1 << 20, &mut |b| {
+                    out.extend_from_slice(b);
+                    Ok(())
+                })
+                .unwrap();
+            (kind, out)
+        };
+        // A CR at the scratch boundary, with its LF in the next read.
+        let mut text = vec![b'x'; STREAM_SCRATCH_BYTES + 10];
+        text[STREAM_SCRATCH_BYTES - 1] = b'\r';
+        text[STREAM_SCRATCH_BYTES] = b'\n';
+        text.extend_from_slice(b"end\r");
+        fs::write(root.path().join("text"), &text).unwrap();
+        let analyzed = analyze_workspace_file(root.path(), Path::new("text"), 1 << 20, 0)
+            .unwrap()
+            .unwrap();
+        assert!(analyzed.text);
+        let (kind, out) = stream("text", true);
+        assert_eq!(kind, Some(FileKind::Regular));
+        assert_eq!(ContentId::of(&out), analyzed.content);
+        assert_eq!(out.len(), analyzed.bytes);
+
+        // Binary bytes pass unchanged.
+        fs::write(root.path().join("binary"), b"\0a\r\n").unwrap();
+        assert_eq!(stream("binary", false).1, b"\0a\r\n");
+        assert_eq!(stream("missing", false), (None, Vec::new()));
+        assert!(matches!(
+            stream_workspace_file(root.path(), Path::new("text"), true, 16, &mut |_| Ok(())),
+            Err(WorkspaceFileError::TooLarge { limit: 16 })
         ));
     }
 

@@ -303,3 +303,39 @@ fn adding_to_the_top_change_never_moves_anything() {
     assert!(!stdout(&added).contains("moved"));
     workspace.settled(&[("file", edited)]);
 }
+
+/// `len` bytes that do not repeat, from `seed`.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn an_edit_to_a_long_file_a_later_change_edits_is_refused_clearly() {
+    let workspace = Workspace::new();
+    let mut long = noise(1, 20 << 20);
+    let b = field(&workspace.ok(&["change", "new", "-m", "B"]), "change");
+    fs::write(workspace.root.join("long.bin"), &long).unwrap();
+    workspace.ok(&["add", "-m", "B1", "long.bin"]);
+    workspace.ok(&["change", "new", "-m", "C"]);
+    long[1000] ^= 0xff;
+    fs::write(workspace.root.join("long.bin"), &long).unwrap();
+    workspace.ok(&["add", "-m", "C1", "long.bin"]);
+
+    long[2000] ^= 0xff;
+    fs::write(workspace.root.join("long.bin"), &long).unwrap();
+    let refused = workspace.run(&["add", "-m", "B2", "--change", &b, "long.bin", "--force"]);
+    assert!(!refused.status.success());
+    let message = stderr(&refused);
+    assert!(message.contains("not supported yet"), "{message}");
+    // Nothing changed.
+    let status = stdout(&workspace.ok(&["status"]));
+    assert!(status.contains("tracked changes: 1"), "{status}");
+}

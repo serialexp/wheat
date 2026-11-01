@@ -331,10 +331,12 @@ budget passes, but by only about 0.7 s.
   benchmark: one change pushes 6 KiB after 10 changes but 44 KiB after 200. Send
   such objects as deltas against their aligned old counterpart, which the client
   has. Then add a bytes budget to `fetch_incremental`.
-- `[ ]` **The size limits for one file disagree (2026-09-26).** `wheat add` refuses
-  files over 16 MiB (`DEFAULT_MAX_INPUT_BYTES`), Git import takes up to 64 MiB
-  (`MAX_IMPORT_FILE_BYTES`), materialization up to 256 MiB, and the store and protocol
-  up to 1 GiB. Decide which limit a file should have.
+- `[ ]` **The size limits for one file disagree (2026-09-26).** `wheat add` takes
+  files up to 256 MiB, streaming those over 16 MiB into the store (2026-11-01), as
+  status and materialization do; Git import takes up to 64 MiB
+  (`MAX_IMPORT_FILE_BYTES`); the format takes 1 TiB (Q4 of
+  `docs/design/wheat-large-content.md`). Which limits the tools apply is step 7 of
+  that doc.
 
 ## Benchmarks (2026-09-25)
 

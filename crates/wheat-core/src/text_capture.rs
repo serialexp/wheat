@@ -22,12 +22,9 @@ pub struct StreamingCaptureResult {
 /// have flat memory use regardless of input size.
 pub struct StreamingCapture {
     raw: blake3::Hasher,
-    canonical: blake3::Hasher,
+    canonical: Canonical,
     raw_bytes: usize,
-    canonical_bytes: usize,
-    retained: Option<Vec<u8>>,
-    retain_limit: usize,
-    pending_cr: bool,
+    line_endings: LineEndings,
     utf8_tail: [u8; 4],
     utf8_tail_len: usize,
     binary: bool,
@@ -38,14 +35,16 @@ impl StreamingCapture {
     pub fn new(retain_limit: usize) -> Self {
         Self {
             raw: crate::ContentId::hasher(),
-            canonical: crate::ContentId::hasher(),
+            canonical: Canonical {
+                hasher: crate::ContentId::hasher(),
+                bytes: 0,
+                // Reserve once: growth during `update` would otherwise reallocate on
+                // successive chunks. Callers already bound this inline-retention cap.
+                retained: Some(Vec::with_capacity(retain_limit)),
+                retain_limit,
+            },
             raw_bytes: 0,
-            canonical_bytes: 0,
-            // Reserve once: growth during `update` would otherwise reallocate on
-            // successive chunks. Callers already bound this inline-retention cap.
-            retained: Some(Vec::with_capacity(retain_limit)),
-            retain_limit,
-            pending_cr: false,
+            line_endings: LineEndings::default(),
             utf8_tail: [0; 4],
             utf8_tail_len: 0,
             binary: false,
@@ -66,43 +65,20 @@ impl StreamingCapture {
         // retention are wasted work. Raw hashing above must continue for every
         // later chunk because binary identity is byte exact.
         if self.binary {
-            self.retained = None;
+            self.canonical.retained = None;
             return;
         }
-        // An empty update is not an EOF marker. In particular, it must not
-        // resolve a trailing CR before a later chunk starts with LF.
-        if bytes.is_empty() {
-            return;
-        }
-
-        let mut start = 0;
-        if self.pending_cr {
-            self.emit(b"\n");
-            self.pending_cr = false;
-            if bytes.first() == Some(&b'\n') {
-                start = 1;
-            }
-        }
-        while start < bytes.len() {
-            let Some(offset) = bytes[start..].iter().position(|byte| *byte == b'\r') else {
-                self.emit(&bytes[start..]);
-                return;
-            };
-            let cr = start + offset;
-            self.emit(&bytes[start..cr]);
-            if cr + 1 == bytes.len() {
-                self.pending_cr = true;
-                return;
-            }
-            self.emit(b"\n");
-            start = cr + 1 + usize::from(bytes[cr + 1] == b'\n');
-        }
+        let canonical = &mut self.canonical;
+        self.line_endings
+            .update(bytes, |canonical_bytes| canonical.emit(canonical_bytes));
     }
 
     #[must_use]
     pub fn finish(mut self) -> StreamingCaptureResult {
-        if self.pending_cr && !self.binary {
-            self.emit(b"\n");
+        if !self.binary {
+            let canonical = &mut self.canonical;
+            self.line_endings
+                .finish(|canonical_bytes| canonical.emit(canonical_bytes));
         }
         if self.utf8_tail_len != 0 {
             self.binary = true;
@@ -117,24 +93,9 @@ impl StreamingCapture {
         } else {
             StreamingCaptureResult {
                 kind: CaptureKind::Text,
-                digest: *self.canonical.finalize().as_bytes(),
-                bytes: self.canonical_bytes,
-                retained: self.retained,
-            }
-        }
-    }
-
-    fn emit(&mut self, bytes: &[u8]) {
-        self.canonical.update(bytes);
-        self.canonical_bytes = self
-            .canonical_bytes
-            .checked_add(bytes.len())
-            .expect("canonical byte length exceeds address space");
-        if let Some(retained) = &mut self.retained {
-            if retained.len().saturating_add(bytes.len()) <= self.retain_limit {
-                retained.extend_from_slice(bytes);
-            } else {
-                self.retained = None;
+                digest: *self.canonical.hasher.finalize().as_bytes(),
+                bytes: self.canonical.bytes,
+                retained: self.canonical.retained,
             }
         }
     }
@@ -168,6 +129,79 @@ impl StreamingCapture {
                 self.utf8_tail[..tail.len()].copy_from_slice(tail);
                 self.utf8_tail_len = tail.len();
             }
+        }
+    }
+}
+
+/// The canonical side of a [`StreamingCapture`].
+struct Canonical {
+    hasher: blake3::Hasher,
+    bytes: usize,
+    retained: Option<Vec<u8>>,
+    retain_limit: usize,
+}
+
+impl Canonical {
+    fn emit(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .expect("canonical byte length exceeds address space");
+        if let Some(retained) = &mut self.retained {
+            if retained.len().saturating_add(bytes.len()) <= self.retain_limit {
+                retained.extend_from_slice(bytes);
+            } else {
+                self.retained = None;
+            }
+        }
+    }
+}
+
+/// Canonicalizes text's line endings as it streams past: every CRLF and standalone CR
+/// becomes LF, as [`capture`] does to text held whole. It holds one pending CR across
+/// pieces and copies nothing.
+#[derive(Debug, Default)]
+pub struct LineEndings {
+    pending_cr: bool,
+}
+
+impl LineEndings {
+    /// Passes the canonical form of the next `bytes` to `emit`, in order.
+    pub fn update(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
+        // An empty update is not an EOF marker. In particular, it must not
+        // resolve a trailing CR before a later chunk starts with LF.
+        if bytes.is_empty() {
+            return;
+        }
+        let mut start = 0;
+        if self.pending_cr {
+            emit(b"\n");
+            self.pending_cr = false;
+            if bytes.first() == Some(&b'\n') {
+                start = 1;
+            }
+        }
+        while start < bytes.len() {
+            let Some(offset) = bytes[start..].iter().position(|byte| *byte == b'\r') else {
+                emit(&bytes[start..]);
+                return;
+            };
+            let cr = start + offset;
+            emit(&bytes[start..cr]);
+            if cr + 1 == bytes.len() {
+                self.pending_cr = true;
+                return;
+            }
+            emit(b"\n");
+            start = cr + 1 + usize::from(bytes[cr + 1] == b'\n');
+        }
+    }
+
+    /// Ends the text: a CR it ended on is a line ending.
+    pub fn finish(self, mut emit: impl FnMut(&[u8])) {
+        if self.pending_cr {
+            emit(b"\n");
         }
     }
 }
@@ -254,7 +288,7 @@ pub fn capture(bytes: &[u8]) -> CapturedBytes<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureKind, CapturedBytes, StreamingCapture, capture, classify};
+    use super::{CaptureKind, CapturedBytes, LineEndings, StreamingCapture, capture, classify};
     use std::borrow::Cow;
 
     #[test]
@@ -381,6 +415,32 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn line_endings_stream_the_bytes_capture_makes_at_every_split() {
+        let fixtures: &[&[u8]] = &[
+            b"",
+            b"a\r\nb\rc\n",
+            b"\r",
+            b"\r\r\n\n\r",
+            b"ends in cr\r",
+            b"no line endings",
+        ];
+        for input in fixtures {
+            let CapturedBytes::Text(expected) = capture(input) else {
+                panic!("text fixture");
+            };
+            for split in 0..=input.len() {
+                let mut out = Vec::new();
+                let mut line_endings = LineEndings::default();
+                line_endings.update(&input[..split], |bytes| out.extend_from_slice(bytes));
+                line_endings.update(&[], |bytes| out.extend_from_slice(bytes));
+                line_endings.update(&input[split..], |bytes| out.extend_from_slice(bytes));
+                line_endings.finish(|bytes| out.extend_from_slice(bytes));
+                assert_eq!(out, expected.as_bytes(), "{input:?} split at {split}");
             }
         }
     }

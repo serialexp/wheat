@@ -578,3 +578,132 @@ fn explicit_guard_ranges_use_canonical_lf_byte_offsets() {
     );
     assert!(String::from_utf8_lossy(&shown.stdout).contains("guarded-text"));
 }
+
+/// `len` bytes that do not repeat, from `seed`.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect()
+}
+
+/// Files over 1 MiB in the store: the chunks of long blobs.
+fn long_store_files(root: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut pending = vec![store_path(root)];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.len() > 1 << 20 {
+                found.insert(entry.path());
+            }
+        }
+    }
+    found
+}
+
+fn add(dir: &Sandbox, change: &str, predecessor: &str, path: &str) -> String {
+    let added = ok(
+        dir.path(),
+        &[
+            "add",
+            "--change",
+            change,
+            "--predecessor",
+            predecessor,
+            path,
+        ],
+    );
+    field(&added, "revision")
+}
+
+fn shown_edits(dir: &Sandbox, revision: &str) -> String {
+    let shown = ok(dir.path(), &["edits", "--revision", revision]);
+    String::from_utf8_lossy(&shown.stdout).into_owned()
+}
+
+#[test]
+fn a_file_past_the_guarded_bound_is_added_whole_through_the_store() {
+    const LONG: usize = 20 << 20;
+    let (dir, change, first) = setup();
+    let mut long = noise(1, LONG);
+    fs::write(dir.path().join("long.bin"), &long).unwrap();
+    let second = add(&dir, &change, &first, "long.bin");
+    assert!(shown_edits(&dir, &second).contains("exact-file"));
+    let stored = long_store_files(dir.path());
+    // Stored as chunks of at most 4 MiB, so as several files.
+    assert!(stored.len() >= 4, "{} long files", stored.len());
+    let status = ok(dir.path(), &["status"]);
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("untracked long.bin"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    // A one-byte edit stores only the chunks around it.
+    long[LONG / 2] ^= 0xff;
+    fs::write(dir.path().join("long.bin"), &long).unwrap();
+    let third = add(&dir, &change, &second, "long.bin");
+    let added = long_store_files(dir.path()).len() - stored.len();
+    assert!((1..=2).contains(&added), "{added} new long files");
+
+    // A guard cannot be placed in a file that changes as a whole.
+    long[0] ^= 0xff;
+    fs::write(dir.path().join("long.bin"), &long).unwrap();
+    let guarded = wheat(
+        dir.path(),
+        &[
+            "add",
+            "--change",
+            &change,
+            "--predecessor",
+            &third,
+            "--guard",
+            "long.bin:0:1",
+            "long.bin",
+        ],
+    );
+    assert!(!guarded.status.success());
+    let stderr = String::from_utf8_lossy(&guarded.stderr);
+    assert!(stderr.contains("changes as a whole"), "{stderr}");
+
+    // Shrinking it under the bound is a whole-file edit too.
+    fs::write(dir.path().join("long.bin"), b"short now\n").unwrap();
+    let fourth = add(&dir, &change, &third, "long.bin");
+    let edits = shown_edits(&dir, &fourth);
+    assert!(edits.contains("exact-file"), "{edits}");
+}
+
+#[test]
+fn long_text_is_added_with_the_line_endings_status_sees() {
+    let (dir, change, first) = setup();
+    let crlf = "a line of text\r\n".repeat(20 << 16);
+    assert!(crlf.len() > 16 << 20);
+    fs::write(dir.path().join("long.txt"), &crlf).unwrap();
+    fs::write(dir.path().join("short.txt"), "a line of text\r\n").unwrap();
+    let added = ok(
+        dir.path(),
+        &[
+            "add",
+            "--change",
+            &change,
+            "--predecessor",
+            &first,
+            "long.txt",
+            "short.txt",
+        ],
+    );
+    // Both are stored with LF line endings, so both now differ from their workspace
+    // bytes in the same way.
+    let stdout = String::from_utf8_lossy(&added.stdout);
+    assert!(stdout.contains("diverged long.txt"), "{stdout}");
+    assert!(stdout.contains("diverged short.txt"), "{stdout}");
+}
