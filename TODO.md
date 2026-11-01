@@ -205,7 +205,7 @@ Performance, most serious first:
   (`MAX_CONTENT_SIZE`). Stream large blobs to disk instead. Every other content
   path holds a blob whole too. Bart (2026-11-01): stream everything, and store only
   the changed chunks of very large blobs: `docs/design/wheat-large-content.md`
-  (proposed; Q1–Q4 decided, Q2b and Q5 open).
+  (designed, every question decided; not built).
 - `[ ]` **Re-adding 20,000 files to one change takes 5.4 s (2026-10-05).** Release,
   NVMe, `wheat add` of 20,000 modified files to a change that already edits them
   all (`WHEAT_TRACE_SUMMARY=1`): `persist_edits` 1.6 s, the first

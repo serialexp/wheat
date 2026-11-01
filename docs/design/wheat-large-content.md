@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: proposed; Q1–Q4 decided 2026-11-01, Q5 and the re-chunking half of Q2 open
+Status: designed, not yet implemented; every question decided 2026-11-01
 Owner: bart
 Last updated: 2026-11-01
 
@@ -29,11 +29,12 @@ land and move them from Outstanding to Done.
   format has to support it". The format takes blobs up to 1 TiB; see
   [Size](#size). Which limits the tools apply below that is part of step 7.
 
+- [x] **Decision — a manifest cut elsewhere (Q2b, 2026-11-01).** Stored as sent.
+- [x] **Decision — the chunker (Q5, 2026-11-01).** Our own FastCDC in
+  `wheat-store`, with its Gear table in the repository.
+
 ### Outstanding
 
-- [ ] **Decision — the chunker (Q5).** See [Q5](#open-questions-for-review).
-- [ ] **Decision — re-chunking a manifest cut elsewhere (Q2b).** See
-  [Q2b](#open-questions-for-review).
 - [ ] **Step 1 — format.** The chunker, the `Chunked` envelope codec and its
   manifest record (BinSchema), canonical validation of a manifest.
 - [ ] **Step 2 — store.** `ContentStore::writer` and `ContentStore::reader`
@@ -124,7 +125,7 @@ A manifest for a 1 GiB blob with 1 MiB average chunks has about 1,000 entries
 blob is over the threshold. It cannot check from the manifest alone that the
 chunks are where FastCDC would cut, and need not: the blob's identity is its
 bytes, so a manifest cut differently stores the same content, only with less
-sharing. A receiver can re-chunk what it is sent if that matters (Q2).
+sharing. A receiver stores a manifest as sent (Q2b).
 
 The chunker's parameters are part of the format: changing them later changes where
 new versions cut, and so how much they share with old ones, though never what any
@@ -225,11 +226,12 @@ What changes outside the store (from the inventory of whole-blob paths,
 
 ## Open questions for review
 
-Decided 2026-11-01 (see Done): Q1 over 16 MiB; Q2 1 MiB / 2 MiB / 4 MiB; Q3 a chunk
-is a `ContentId`; Q4 the format takes 1 TiB. The options they were chosen from:
-Q1 over 4, 16 or 64 MiB; Q2 256K/1M/4M, 1M/2M/4M or 64K/256K/1M; Q3 a
-`ContentId` or a separate `ChunkId`; Q4 1 GiB everywhere, a larger limit
-everywhere, or a per-repository setting.
+None open. Decided 2026-11-01 (see Done): Q1 over 16 MiB; Q2 1 MiB / 2 MiB /
+4 MiB; Q2b store as sent; Q3 a chunk is a `ContentId`; Q4 the format takes 1 TiB;
+Q5 our own chunker. The options they were chosen from: Q1 over 4, 16 or 64 MiB;
+Q2 256K/1M/4M, 1M/2M/4M or 64K/256K/1M; Q3 a `ContentId` or a separate
+`ChunkId`; Q4 1 GiB everywhere, a larger limit everywhere, or a per-repository
+setting; and Q2b and Q5 as below.
 
 - **Q2b — a manifest cut elsewhere.** A sender's manifest may not cut where this
   FastCDC would (another chunker, another version). The receiver:
