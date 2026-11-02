@@ -3,7 +3,7 @@
 //! Forks served from a repositories directory: a fork shares its parent's network,
 //! and content is kept once for every network.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -1,6 +1,6 @@
 //! Importing a network from a bundle, and adopting a standalone repository.
 
-mod network_support;
+use crate::network_support;
 
 use std::{fs, path::PathBuf};
 

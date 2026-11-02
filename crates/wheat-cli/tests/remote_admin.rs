@@ -3,7 +3,7 @@
 //! `wheat admin` against a server run with a repositories directory: the maintenance
 //! operations a person gives through the real interface.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::fs;
 use std::path::{Path, PathBuf};

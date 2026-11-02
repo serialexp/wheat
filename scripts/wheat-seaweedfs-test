@@ -42,5 +42,5 @@ WHEAT_TEST_S3_BUCKET="wheat-test" \
 WHEAT_TEST_S3_REGION="us-east-1" \
 WHEAT_TEST_S3_ACCESS_KEY_ID="scrydevaccesskey" \
 WHEAT_TEST_S3_SECRET_ACCESS_KEY="scrydevsecretkey0000000000000000" \
-cargo test -p wheat-store --test object_store_adapter \
-  configured_s3_backend -- --ignored --nocapture
+cargo test -p wheat-store --test integration \
+  object_store_adapter::configured_s3_backend -- --ignored --nocapture

@@ -1,6 +1,6 @@
 //! Browsing a repository without a workspace: directories, files and history pages.
 
-mod support;
+use crate::support;
 
 use std::{num::NonZeroUsize, sync::atomic::Ordering};
 

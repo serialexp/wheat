@@ -3,7 +3,7 @@
 //! Each test starts an in-process wheat-server and talks to it with the small
 //! client in `support`.
 
-mod support;
+use crate::support;
 
 use std::net::SocketAddr;
 

@@ -29,6 +29,11 @@ structs, no version bumps.
   `crates/wheat-client/src/sys.rs`, not `libc` or `cfg` at the call site.
 - Use `cargo nextest`, not plain `cargo test`: several suites rely on each test having
   its own process.
+- Each crate builds its integration tests as one binary, `integration`
+  (`tests/harnesses/integration.rs`, with `autotests = false`). A new test file goes
+  under `tests/` and gets a `#[path]` module line in that harness; never a new
+  `[[test]]`. Every test binary links most of Wheat, and one per file is how
+  `target/` fills the disk. `crates/wheat-core/tests/test_binaries.rs` enforces it.
 - Build with `-j 2` / `--build-jobs 2` on Bart's machine.
 - Tests never see personal git config (`.cargo/config.toml` `[env]`); write tests
   against git's built-in defaults.

@@ -3,7 +3,7 @@
 //! `wheat integrate` joins the active label's frontiers into one view, such as the
 //! local and the remote work a fetch kept side by side.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::fs;
 use std::path::{Path, PathBuf};

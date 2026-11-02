@@ -3,7 +3,7 @@
 //! and the `Transport` trait. And holding a served repository still with
 //! `Registry::quiesce`.
 
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

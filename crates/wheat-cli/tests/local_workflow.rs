@@ -5,8 +5,8 @@ use std::process::{Command, Output};
 use sandbox::sandbox;
 use wheat_store::{LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryReader};
 
-mod sandbox;
-mod support;
+use crate::sandbox;
+use crate::support;
 
 fn wheat(root: &std::path::Path, arguments: &[&str]) -> Output {
     let mut adjusted = arguments.to_vec();

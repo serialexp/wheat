@@ -7,7 +7,7 @@ use std::{
 
 use sandbox::{Sandbox, sandbox};
 
-mod sandbox;
+use crate::sandbox;
 
 /// Diffs here must come out whole however busy the machine is.
 const DIFF_TIME_LIMIT: &str = "--time-limit-ms=600000";

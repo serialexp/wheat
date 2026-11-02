@@ -1,6 +1,6 @@
 //! Exporting a fork network as a bundle: structure apart from content.
 
-mod network_support;
+use crate::network_support;
 
 use std::{collections::BTreeSet, fs, path::Path};
 

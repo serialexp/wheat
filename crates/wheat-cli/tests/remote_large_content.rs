@@ -4,7 +4,7 @@
 //! `wheat clone`: a file larger than a message is uploaded and downloaded in chunks,
 //! and more new files than one `ContentNeeded` may list all still arrive.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::fs;
 use std::path::{Path, PathBuf};

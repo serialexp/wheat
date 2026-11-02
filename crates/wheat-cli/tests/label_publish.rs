@@ -4,7 +4,7 @@
 //! anything, under the checks `label move` makes, and the server takes a label only
 //! forward unless the publish forces labels.
 
-mod remote_support;
+use crate::remote_support;
 
 use remote_support::sides::{Side, sides};
 use wheat_client::workspace_metadata::WorkspaceMetadata;

@@ -3,7 +3,7 @@
 //! it would stall every other session sharing them. These tests serve a repository on
 //! a single-threaded runtime and count the store calls made on that thread.
 
-mod support;
+use crate::support;
 
 use std::collections::HashMap;
 use std::io;

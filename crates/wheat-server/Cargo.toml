@@ -2,6 +2,7 @@
 name = "wheat-server"
 version.workspace = true
 edition = "2024"
+autotests = false
 
 [[bin]]
 name = "wheat-server"
@@ -38,3 +39,7 @@ tokio-tungstenite = { version = "0.28", features = ["connect"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/harnesses/integration.rs"

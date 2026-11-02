@@ -3,7 +3,7 @@
 //! `wheat label move`: forward moves, refusals, `--force`, the workspace rebind and
 //! its recovery from an interruption on either side of the head's CAS.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::path::PathBuf;
 use std::process::Command;

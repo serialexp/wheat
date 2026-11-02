@@ -3,7 +3,7 @@
 //! A clone reads the remote's labels from the head it fetched, and becomes active on
 //! main when the remote has one.
 
-mod remote_support;
+use crate::remote_support;
 
 use remote_support::{ok, sides::sides};
 use wheat_client::workspace_metadata::WorkspaceMetadata;

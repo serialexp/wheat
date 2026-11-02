@@ -2,6 +2,7 @@
 name = "wheat-client"
 version.workspace = true
 edition = "2024"
+autotests = false
 
 [dependencies]
 anyhow = { workspace = true }
@@ -31,3 +32,7 @@ wheat-store = { path = "../wheat-store" }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/harnesses/integration.rs"

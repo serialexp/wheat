@@ -2,6 +2,7 @@
 name = "wheat-core"
 version.workspace = true
 edition = "2024"
+autotests = false
 
 [dependencies]
 blake3 = { workspace = true }
@@ -20,3 +21,7 @@ syn = { version = "2", features = ["full", "visit"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/harnesses/integration.rs"

@@ -4,7 +4,7 @@
 //! The store's write is held at a gate, so which publishes share a batch does not
 //! depend on how the runtime schedules the committer.
 
-mod support;
+use crate::support;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -4,7 +4,7 @@
 //! Wheat changes to it, pull commits other people pushed, and push again on top of
 //! them without force.
 
-mod git_team;
+use crate::git_team;
 
 use git_team::{Team, git};
 

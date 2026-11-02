@@ -2,6 +2,7 @@
 name = "wheat-bench"
 version.workspace = true
 edition = "2024"
+autotests = false
 publish = false
 
 [[bin]]
@@ -29,3 +30,7 @@ wheat-trace = { path = "../wheat-trace" }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/harnesses/integration.rs"

@@ -2,7 +2,7 @@
 
 use std::process::{Command, Output};
 
-mod support;
+use crate::support;
 
 fn store_home(workspace: &std::path::Path) -> std::path::PathBuf {
     workspace

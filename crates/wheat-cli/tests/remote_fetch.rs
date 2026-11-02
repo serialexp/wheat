@@ -3,7 +3,7 @@
 //! `wheat clone` gets a whole history from the server's push, and `wheat fetch`
 //! afterwards gets only what changed since the last fetch.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::fs;
 use std::path::Path;

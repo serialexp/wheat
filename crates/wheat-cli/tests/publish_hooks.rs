@@ -4,7 +4,7 @@
 //! asks for before it joins the head and can refuse it, and the durable batch is
 //! announced once the head has moved.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;

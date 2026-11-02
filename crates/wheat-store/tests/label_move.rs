@@ -1,7 +1,7 @@
 //! Whether a label may move from one view to another: forward when integrating the
 //! old view into the new one would change nothing.
 
-mod support;
+use crate::support;
 
 use std::sync::atomic::Ordering;
 

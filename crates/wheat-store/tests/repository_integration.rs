@@ -1,6 +1,6 @@
 //! Joining frontiers that grew apart below one basis into one view.
 
-mod support;
+use crate::support;
 
 use std::sync::atomic::Ordering;
 

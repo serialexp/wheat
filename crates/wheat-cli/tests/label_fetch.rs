@@ -4,7 +4,7 @@
 //! work: a frontier of the label's local view that the new view does not cover and no
 //! workspace shows.
 
-mod remote_support;
+use crate::remote_support;
 
 use remote_support::sides::sides;
 

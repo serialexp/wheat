@@ -1,7 +1,7 @@
 //! End-to-end protocol tests: start a server in-process, connect with a
 //! tokio-tungstenite client, and exercise the full protocol flow.
 
-mod support;
+use crate::support;
 
 use std::net::SocketAddr;
 

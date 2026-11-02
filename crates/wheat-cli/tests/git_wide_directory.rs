@@ -3,7 +3,7 @@
 //! A directory too wide for one Wheat tree node goes through Git both ways: pulled
 //! from Git, it is stored in chunks; pushed back, it is one Git tree again.
 
-mod git_team;
+use crate::git_team;
 
 use git_team::{Team, git};
 

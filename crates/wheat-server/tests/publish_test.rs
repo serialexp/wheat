@@ -4,7 +4,7 @@
 //! round takes exactly the objects it asked for, whole or in chunks, and nothing
 //! else.
 
-mod support;
+use crate::support;
 
 use std::{
     collections::HashSet,

@@ -4,7 +4,7 @@
 //! Run with:
 //!   cargo test -p wheat-server --test s3_packed_test -- --ignored --nocapture
 
-mod support;
+use crate::support;
 
 use std::net::SocketAddr;
 

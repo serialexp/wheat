@@ -2,9 +2,14 @@
 name = "wheat-protocol"
 version.workspace = true
 edition = "2024"
+autotests = false
 
 [dependencies]
 wheat-protocol-generated = { package = "wheat-protocol-binschema-generated", path = "generated" }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/harnesses/integration.rs"

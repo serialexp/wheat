@@ -1,7 +1,7 @@
 //! Deleting a repository while the server serves it: sessions using it end, the name
 //! finds nothing, and the files go once nothing holds them open.
 
-mod support;
+use crate::support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

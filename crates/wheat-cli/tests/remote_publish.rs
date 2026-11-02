@@ -4,7 +4,7 @@
 //! publish with what was published in between, as a fetch would, and refuses only
 //! where the two sides really disagree.
 
-mod remote_support;
+use crate::remote_support;
 
 use std::path::{Path, PathBuf};
 

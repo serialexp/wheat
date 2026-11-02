@@ -3,8 +3,8 @@
 //! `wheat pull <git-url>`: what it appends, how it moves local work, and what it
 //! refuses.
 
-mod git_team;
-mod remote_support;
+use crate::git_team;
+use crate::remote_support;
 
 use std::{fmt::Write as _, io::Write as _};
 

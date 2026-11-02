@@ -4,7 +4,7 @@
 //! moment with a retryable error, fetches go on, the copy serves what was published,
 //! and publishes are taken again once the hold ends.
 
-mod remote_support;
+use crate::remote_support;
 
 use remote_support::sides::sides;
 use remote_support::{ok, serve_store};

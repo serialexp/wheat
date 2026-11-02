@@ -1,7 +1,7 @@
 //! Fetch over the wire: the server pushes what the client's `since` lacks, then
 //! answers the client's wants, one reply each.
 
-mod support;
+use crate::support;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
