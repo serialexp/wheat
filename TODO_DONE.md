@@ -4,6 +4,13 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **A label's changes in order, read on the server.** Gothab's history pages
+  show one entry per change, so it needs a server-side read listing the changes a
+  label's history holds, newest first and paged, without materializing a workspace.
+  `wheat_store::RepositoryBrowser` (70ce056, 4b38413; in v0.3.0) does it: `label`
+  resolves the view, `history` pages it in canonical order by position and
+  `history_by_time` by commit time, each newest first. Which view each entry links to
+  is Gothab's choice (`HistoryItem.parent`, or the view after the change).
 - `[x]` **Tag a release for Gothab to pin.** Gothab pins the wheat crates to a tag
   (only `v0.2.0` existed); the first integration commit needs one that has the
   embedder API it uses. `v0.3.0` (2026-11-02, 523c343) has it, and locks the formats.

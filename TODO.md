@@ -24,11 +24,6 @@ of history in Gothab's pages is a change; heads live in Gothab's Postgres (a
 host's disk. gitd's endpoints, the front door, the head store, the content object
 kind and publish events are Gothab work.
 
-- `[ ]` **A label's changes in order, read on the server.** Gothab's history pages
-  show one entry per change, so it needs a server-side read listing the changes a
-  label's history holds, newest first and paged, without materializing a workspace.
-  Which view each entry links to is open on Gothab's side.
-
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network. Networks share
   one store handle in the registry, and `--repos-dir` keeps them as
