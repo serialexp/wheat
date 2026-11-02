@@ -28,9 +28,6 @@ kind and publish events are Gothab work.
   show one entry per change, so it needs a server-side read listing the changes a
   label's history holds, newest first and paged, without materializing a workspace.
   Which view each entry links to is open on Gothab's side.
-- `[ ]` **Tag a release for Gothab to pin.** Gothab pins the wheat crates to a tag
-  (only `v0.2.0` exists); the first integration commit needs one that has the
-  embedder API it uses.
 
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network. Networks share

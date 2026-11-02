@@ -4,6 +4,9 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Hosting on Gothab (2026-10-26)
 
+- `[x]` **Tag a release for Gothab to pin.** Gothab pins the wheat crates to a tag
+  (only `v0.2.0` existed); the first integration commit needs one that has the
+  embedder API it uses. `v0.3.0` (2026-11-02, 523c343) has it, and locks the formats.
 - `[x]` **Delta content stored one envelope at a time.**
   `ContentStore::put_many_with_bases` stored each delta-encoded blob with its own
   `put_raw_envelope`, one backend write (a synced loose file, or a blob upload) per
