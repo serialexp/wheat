@@ -2,7 +2,7 @@
 
 Status: partial — the native guarded-edit model, persisted copy-on-write mutation, incremental authoring, retention/reopen, Phase 1 local CLI workflow, Git import paths, local active-pack growth/sealing, and Phase 2 immutable labels and workspace frontiers are implemented and qualified; a first native protocol and server exist; model/store qualification, concurrency, deletion/GC, forge review policy, protocol resumability and remote-CLI qualification, and product commitment remain open
 Owner: bart
-Last updated: 2026-09-25
+Last updated: 2026-11-02
 
 ## Implementation status
 
@@ -13,6 +13,12 @@ described here.
 
 ### Done
 
+- [x] **Decision gate — lock the native schema (v0.3.0, 2026-11-02).** Until this
+  release every Wheat schema version was experimental: `V1` types and tags changed in
+  place, code and fixtures were regenerated, and prototype repositories were
+  discarded rather than migrated. From v0.3.0 the existing encodings are persistent
+  compatibility contracts: incompatible changes receive new version tags and the
+  evolution rules below apply.
 - [x] **Custom client/server seam.** `git-remote-gothab` owns the
   `gothab://` and `gothab+ssh://` entry points through Git's remote-helper
   protocol, mediating `list`, `fetch`, and `push` rather than exposing only a
@@ -149,13 +155,6 @@ described here.
   identities of change, revision, dependency, conflict, operation,
   publication, workspace, and Git projection before choosing an on-disk or
   wire encoding.
-- [ ] **Decision gate — lock the native schema.** Until this box is checked,
-  every Wheat schema version is experimental: change `V1` types and tags in
-  place, regenerate code and fixtures, and discard prototype repositories
-  rather than carrying migrations or compatibility code. Checking this box
-  declares existing encodings persistent compatibility contracts; from that
-  point onward, incompatible changes receive new version tags and the evolution
-  rules below apply.
 - [ ] **Decision gate — compatibility contract.** Decide what must round-trip
   through ordinary Git, what may be a lossy projection, and whether
   `git-remote-gothab` initially delegates to Git or materializes Git objects
@@ -634,6 +633,10 @@ prototype `V1` changed. Once the schema is deliberately locked, incompatible
 future encodings receive new object/version tags so persisted bytes and IDs do
 not change in place; old readers and objects are retained according to the
 compatibility and migration policy selected at that gate.
+
+(2026-11-02: the schema was locked with the v0.3.0 release. The paragraph above
+describes the time before it; from v0.3.0 incompatible encodings get new
+object/version tags.)
 
 The prototype identity split is now explicit: `ChangeId` remains UUIDv7 because
 it names stable collaboration identity across mutable intent, while `RevisionId`,

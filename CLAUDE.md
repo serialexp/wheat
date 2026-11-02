@@ -18,8 +18,7 @@ What Wheat persists falls in three kinds (see `crates/wheat-core/CLAUDE.md`):
 
 Schemas: `crates/wheat-core/schemas/*.bs.json5`. Regenerate with
 `just gen-schema` / `just protocol-gen-schema` (needs `~/Projects/binschema` at the
-revision pinned in the scripts). Unreleased formats are edited in place: no V2
-structs, no version bumps.
+revision pinned in the scripts).
 
 ## Building and testing
 

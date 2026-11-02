@@ -2,7 +2,7 @@
 
 Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, `add --all`, and explicit revision collapse are landed; extended configuration keys are stored but not yet read; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-09-26
+Last updated: 2026-11-02
 
 ## Implementation status
 
@@ -12,6 +12,11 @@ both lists.
 
 ### Done
 
+- [x] **Release gate — freeze formats and start versioning (v0.3.0, 2026-11-02).**
+  Formats were edited in place until this release: no `V2` structs, no version bumps,
+  no decode fallbacks, and existing stores were re-imported. From v0.3.0 every on-disk
+  and wire format change is versioned with an explicit migration or compatibility
+  path. The agent memory that said otherwise is deleted.
 - [x] **Repository lifecycle plumbing.** `wheat init`, `status`, `validate`, `log`,
   `cat`, and reopen support operate against loose and packed local repositories.
 - [x] **Explicit native change mutation.** `change new`, explicit-path `add`,
@@ -227,15 +232,6 @@ both lists.
 - [ ] **Defer — advanced history utilities.** Blame, bisect, archive, grep, and
   rewriting already-published history follow the complete edit/materialize/integrate
   loop. Explicit collapse of unpublished revision checkpoints is specified above.
-- [ ] **Release gate — freeze formats and start versioning.** Until Wheat is
-  released, every on-disk and wire format (BinSchema schema, segments, catalog,
-  content generations, SQLite locator) is edited in place: no `V2` structs, no
-  version bumps, no decode fallbacks — existing stores are simply re-imported.
-  At release this flips: from then on every format change must be versioned
-  with an explicit migration or compatibility path. As part of the release,
-  delete the agent memory
-  `~/.claude/projects/-home-bart-Projects-gothab/memory/feedback_no_format_version_bumps.md`
-  (and its `MEMORY.md` line) so agents stop editing released formats in place.
 
 ## Why this exists
 
