@@ -24,6 +24,11 @@ of history in Gothab's pages is a change; heads live in Gothab's Postgres (a
 host's disk. gitd's endpoints, the front door, the head store, the content object
 kind and publish events are Gothab work.
 
+- `[ ]` **wheat-server as a library without its binary's dependencies.** Gothab's gitd
+  embeds wheat-server and so pulls in clap, mimalloc, toml, tracing-subscriber and
+  tokio-rustls, which only the `wheat-server` binary needs. Split them behind a
+  feature (or move the binary to its own crate).
+
 - `[ ]` **Forks.** Gothab forks are repositories sharing history with their parent. The
   protocol doc's two-tier storage keeps structure per fork network. Networks share
   one store handle in the registry, and `--repos-dir` keeps them as
