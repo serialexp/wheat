@@ -1,0 +1,58 @@
+name: Release
+
+# A `v*` tag (matching the workspace version) publishes a gothab release with one
+# archive per platform and SHA256SUMS. Gothab's runners are Linux only, so the
+# archives are built by `.github/workflows/release.yml` on the GitHub mirror, which
+# `gothab/github-dispatch` runs for this commit and copies back as artifacts of this
+# run. The commit must be on GitHub first: push main there before the tag here.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on GitHub
+    runs-on: ubuntu-latest
+    steps:
+      - id: dispatch
+        uses: gothab/github-dispatch@v1
+        with:
+          workflow: release.yml
+          artifacts: >-
+            wheat-x86_64-unknown-linux-gnu,wheat-aarch64-unknown-linux-gnu,wheat-x86_64-unknown-linux-musl,wheat-aarch64-unknown-linux-musl,wheat-aarch64-apple-darwin,wheat-x86_64-apple-darwin,wheat-x86_64-pc-windows-msvc
+      - run: echo "GitHub run ${{ steps.dispatch.outputs.run_url }}"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match the workspace version ${version}" >&2
+            exit 1
+          fi
+
+      # Each artifact lands in downloads/<artifact name>/<archive>.
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloads
+
+      - name: Checksums
+        run: |
+          mkdir dist
+          mv downloads/*/wheat-* dist/
+          cd dist && sha256sum wheat-* > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish the release
+        run: |
+          gt release create "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" \
+            --title "wheat $GITHUB_REF_NAME" \
+            --notes "Install on Linux with install.sh (see README): it picks the glibc build on glibc 2.39 or newer (Ubuntu 24.04 and later), else the static musl build. The wheat CLI runs only on Linux; the macOS and Windows archives are for wheat-server and refuse CLI commands."

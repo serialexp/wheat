@@ -9,10 +9,26 @@ name: Release
 # (crash-safe materialization needs Linux's renameat2). Those archives are built so
 # the code keeps building there, and for wheat-server.
 
+# Gothab's `.gothab/workflows/release.yml` dispatches this workflow through the
+# `gothab/github-dispatch` built-in for the commit a gothab tag names, copies the
+# archives back and publishes the gothab release. The broker passes the commit as
+# `sha` and finds the run by the `dispatch_id` in its title. A run by hand leaves both
+# empty and builds the commit it was started on.
+run-name: release ${{ inputs.sha }} ${{ inputs.dispatch_id }}
+
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to build, checked out exactly.
+        required: false
+        type: string
+      dispatch_id:
+        description: Correlation id gothab uses to find this run.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -52,6 +68,8 @@ jobs:
             os: windows-2022
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.sha || github.sha }}
 
       - name: Install the aarch64 cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'

@@ -1,0 +1,54 @@
+name: CI
+
+# Lint, test and type-check every push to main, on gothab's Linux runners. The same
+# jobs as `.github/workflows/ci.yml`, which runs only on the GitHub mirror: gothab
+# runs `.gothab/workflows` and ignores `.github/workflows` while this directory has
+# workflows.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Installs the toolchain rust-toolchain.toml pins, with rustfmt and clippy.
+      - run: rustup toolchain install
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@nextest
+      # The suite needs git. The S3 tests skip themselves without WHEAT_TEST_S3_*.
+      - run: cargo nextest run --workspace --all-targets --locked --profile ci
+      - run: cargo test --workspace --doc --locked
+
+  # Everything must build for Windows, though workspace file operations refuse to run
+  # there (`just check-windows`).
+  check-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: rustup toolchain install && rustup target add x86_64-pc-windows-gnu
+      - run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
+        env:
+          RUSTFLAGS: -D warnings
