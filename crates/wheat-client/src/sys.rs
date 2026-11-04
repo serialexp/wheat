@@ -231,24 +231,6 @@ mod linux {
         ))
     }
 
-    /// Reads the target of symlink `name` into `buffer` and returns its length. A
-    /// target that fills `buffer` may have been cut short.
-    pub fn read_link_at(directory: &File, name: &str, buffer: &mut [u8]) -> io::Result<usize> {
-        let name = c_string(name.as_bytes())?;
-        let read = unsafe {
-            libc::readlinkat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-            )
-        };
-        if read < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(usize::try_from(read).expect("readlinkat returned a nonnegative length"))
-    }
-
     pub fn rename_at(
         source: &File,
         source_name: &str,
@@ -285,10 +267,6 @@ mod linux {
     pub fn read_open_directory(directory: &File) -> io::Result<fs::ReadDir> {
         let duplicate = directory.as_fd().try_clone_to_owned()?;
         fs::read_dir(format!("/proc/self/fd/{}", duplicate.as_raw_fd()))
-    }
-
-    pub fn is_executable(metadata: &Metadata) -> bool {
-        metadata.mode() & 0o111 != 0
     }
 
     /// Whether two opened files are the same file.
@@ -376,10 +354,6 @@ mod unsupported {
         unsupported()
     }
 
-    pub fn read_link_at(_directory: &File, _name: &str, _buffer: &mut [u8]) -> io::Result<usize> {
-        unsupported()
-    }
-
     pub fn rename_at(
         _source: &File,
         _source_name: &str,
@@ -392,10 +366,6 @@ mod unsupported {
 
     pub fn read_open_directory(_directory: &File) -> io::Result<fs::ReadDir> {
         unsupported()
-    }
-
-    pub fn is_executable(_metadata: &Metadata) -> bool {
-        false
     }
 
     /// Without a file identity to compare, no two files count as the same.
@@ -458,9 +428,6 @@ mod tests {
         );
         assert_eq!(entry_kind_at(&directory, "missing").unwrap(), None);
 
-        let mut target = [0_u8; 64];
-        let length = read_link_at(&directory, "link", &mut target).unwrap();
-        assert_eq!(&target[..length], b"directory");
         let mut names = read_open_directory(&directory)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -505,9 +472,11 @@ mod tests {
         let directory = open_directory(root.path()).unwrap();
         let file = open_file_at(&directory, "private", new_file(0o600)).unwrap();
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(!is_executable(&file.metadata().unwrap()));
         let script = open_file_at(&directory, "script", new_file(0o700)).unwrap();
-        assert!(is_executable(&script.metadata().unwrap()));
+        assert_eq!(
+            script.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         let error = open_file_at(&directory, "private", new_file(0o600)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
 

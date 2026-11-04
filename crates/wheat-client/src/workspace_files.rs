@@ -14,19 +14,33 @@ thread_local! {
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use wheat_core::text_capture::{CaptureKind, StreamingCapture};
-use wheat_core::{ContentId, FileKind};
+use wheat_core::{ContentId, FileKind, FileValue};
 
 #[cfg(unix)]
 const STREAM_SCRATCH_BYTES: usize = 64 * 1024;
-const RAW_PREIMAGE_DOMAIN: &[u8] = b"wheat-workspace-raw-preimage-v1\0";
 
-/// Exact, bounded authentication of a raw workspace leaf.
+/// Exact, bounded authentication of a raw workspace leaf: its kind, length and the
+/// content ID digest of its raw bytes (a symlink's target).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawPreimage {
     pub kind: FileKind,
     pub length: u64,
     pub digest: [u8; 32],
+}
+
+impl RawPreimage {
+    /// The leaf that materializing `value`, of `length` bytes, leaves: materialization
+    /// writes a value's stored bytes unchanged, so its content ID is the leaf's digest.
+    /// Known from stored metadata, without reading the content.
+    #[must_use]
+    pub fn of_value(value: FileValue, length: u64) -> Self {
+        Self {
+            kind: value.kind,
+            length,
+            digest: *value.content.as_bytes(),
+        }
+    }
 }
 
 /// An owned snapshot suitable for borrowing as an `edit_capture::FileSnapshot`.
@@ -160,54 +174,57 @@ pub fn stream_workspace_file(
     platform::stream(root, &components, text, byte_limit, out)
 }
 
-/// Authenticate a named workspace leaf without allocating its regular-file
-/// contents. Symlink targets remain bounded by `byte_limit` and are hashed from
-/// their small `readlinkat` buffer.
-pub fn authenticate_workspace_file(
-    root: &Path,
-    path: &Path,
-    expected: Option<(FileKind, &[u8])>,
-    byte_limit: usize,
-) -> Result<bool, WorkspaceFileError> {
-    let components = validate_path(path)?;
-    platform::authenticate(root, &components, expected, byte_limit)
-}
-
-/// Observe a raw leaf with a domain-separated streaming digest. Missing paths
-/// are represented by `None`; regular contents are never collected.
+/// Observe a raw leaf with a streaming digest. Missing paths are represented by
+/// `None`; regular contents are never collected.
 pub fn observe_workspace_file(
     root: &Path,
     path: &Path,
     byte_limit: usize,
 ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
     let components = validate_path(path)?;
-    platform::observe(root, &components, byte_limit)
+    platform::observe(root, &components, byte_limit, None)
 }
 
+/// Whether nothing is at `path`, without reading a leaf that is there. A directory
+/// or special file at `path` is refused rather than reported as present.
+pub fn workspace_file_is_absent(root: &Path, path: &Path) -> Result<bool, WorkspaceFileError> {
+    let components = validate_path(path)?;
+    platform::is_absent(root, &components)
+}
+
+/// Whether the leaf at `path` is exactly `expected`, streaming a regular file
+/// through fixed scratch. A file of another kind or length is not read.
 pub fn authenticate_workspace_preimage(
     root: &Path,
     path: &Path,
     expected: &RawPreimage,
     byte_limit: usize,
 ) -> Result<bool, WorkspaceFileError> {
-    Ok(observe_workspace_file(root, path, byte_limit)?.as_ref() == Some(expected))
+    let components = validate_path(path)?;
+    Ok(
+        platform::observe(root, &components, byte_limit, Some(expected))?.as_ref()
+            == Some(expected),
+    )
 }
 
 /// Authenticate a leaf relative to an already-open directory descriptor.
-/// Regular contents are streamed through fixed scratch; symlink targets are
-/// bounded to the maximum portable target size used by materialization.
+/// Regular contents are streamed through fixed scratch, and a file of another kind
+/// or length is not read; symlink targets are bounded to the maximum portable
+/// target size used by materialization.
 pub fn authenticate_preimage_at(
     directory: &File,
     name: &OsStr,
     expected: &RawPreimage,
     byte_limit: usize,
 ) -> Result<bool, WorkspaceFileError> {
-    Ok(platform::observe_at(directory, name, byte_limit)?.as_ref() == Some(expected))
+    Ok(
+        platform::observe_at(directory, name, byte_limit, Some(expected))?.as_ref()
+            == Some(expected),
+    )
 }
 
 pub fn raw_preimage(kind: FileKind, bytes: &[u8]) -> RawPreimage {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(RAW_PREIMAGE_DOMAIN);
+    let mut hasher = ContentId::hasher();
     hasher.update(bytes);
     RawPreimage {
         kind,
@@ -280,7 +297,7 @@ mod platform {
     use wheat_core::text_capture::LineEndings;
 
     use super::{
-        CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, RAW_PREIMAGE_DOMAIN, RawPreimage,
+        CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, RawPreimage,
         STREAM_SCRATCH_BYTES, StreamingCapture, WorkspaceFileError, WorkspaceFileSnapshot,
     };
 
@@ -398,26 +415,64 @@ mod platform {
         root: &Path,
         components: &[&OsStr],
         limit: usize,
+        expected: Option<&RawPreimage>,
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
         let Some(directory) = open_parent(root, components)? else {
             return Ok(None);
         };
         let name = c_name(components.last().expect("validated nonempty path"))?;
-        observe_leaf(directory.as_raw_fd(), &name, limit)
+        observe_leaf(directory.as_raw_fd(), &name, limit, expected)
     }
 
     pub(super) fn observe_at(
         directory: &File,
         name: &OsStr,
         limit: usize,
+        expected: Option<&RawPreimage>,
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
-        observe_leaf(directory.as_raw_fd(), &c_name(name)?, limit)
+        observe_leaf(directory.as_raw_fd(), &c_name(name)?, limit, expected)
     }
 
+    pub(super) fn is_absent(
+        root: &Path,
+        components: &[&OsStr],
+    ) -> Result<bool, WorkspaceFileError> {
+        let Some(directory) = open_parent(root, components)? else {
+            return Ok(true);
+        };
+        let name = c_name(components.last().expect("validated nonempty path"))?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(true)
+            } else {
+                Err(error.into())
+            };
+        }
+        let stat = unsafe { stat.assume_init() };
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFLNK | libc::S_IFREG => Ok(false),
+            _ => Err(WorkspaceFileError::UnsupportedFileType),
+        }
+    }
+
+    /// Observes the leaf. When `expected` is given and a regular file's kind or length
+    /// already differs from it, the file is not read: the result then has a zero
+    /// digest, and is only good for comparing with `expected`, which it never equals.
     fn observe_leaf(
         directory: libc::c_int,
         name: &CString,
         limit: usize,
+        expected: Option<&RawPreimage>,
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe {
@@ -493,8 +548,16 @@ mod platform {
                 } else {
                     FileKind::Regular
                 };
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(RAW_PREIMAGE_DOMAIN);
+                if expected.is_some_and(|expected| {
+                    expected.kind != kind || expected.length != opened.len()
+                }) {
+                    return Ok(Some(RawPreimage {
+                        kind,
+                        length: opened.len(),
+                        digest: [0; 32],
+                    }));
+                }
+                let mut hasher = ContentId::hasher();
                 let mut scratch = [0_u8; 64 * 1024];
                 let mut length = 0_u64;
                 loop {
@@ -522,121 +585,9 @@ mod platform {
     }
 
     fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(RAW_PREIMAGE_DOMAIN);
+        let mut hasher = ContentId::hasher();
         hasher.update(bytes);
         *hasher.finalize().as_bytes()
-    }
-
-    pub(super) fn authenticate(
-        root: &Path,
-        components: &[&OsStr],
-        expected: Option<(FileKind, &[u8])>,
-        limit: usize,
-    ) -> Result<bool, WorkspaceFileError> {
-        let mut directory = File::open(root)?;
-        for component in &components[..components.len() - 1] {
-            let name = c_name(component)?;
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                return match error.raw_os_error() {
-                    Some(libc::ENOENT) => Ok(expected.is_none()),
-                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
-                        if is_symlink(directory.as_raw_fd(), &name) =>
-                    {
-                        Err(WorkspaceFileError::IntermediateSymlink)
-                    }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
-                    _ => Err(error.into()),
-                };
-            }
-            directory = unsafe { File::from_raw_fd(fd) };
-        }
-        let name = c_name(components.last().expect("validated nonempty path"))?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } < 0
-        {
-            let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::NotFound {
-                Ok(expected.is_none())
-            } else {
-                Err(error.into())
-            };
-        }
-        let stat = unsafe { stat.assume_init() };
-        match stat.st_mode & libc::S_IFMT {
-            libc::S_IFLNK => {
-                let bytes = read_link(directory.as_raw_fd(), &name, limit)?;
-                Ok(expected
-                    .is_some_and(|(kind, expected)| kind == FileKind::Symlink && expected == bytes))
-            }
-            libc::S_IFREG => {
-                let fd = unsafe {
-                    libc::openat(
-                        directory.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
-                let mut file = unsafe { File::from_raw_fd(fd) };
-                let opened = file.metadata()?;
-                if !opened.is_file() {
-                    return Err(WorkspaceFileError::UnsupportedFileType);
-                }
-                use std::os::unix::fs::MetadataExt as _;
-                let kind = if opened.mode() & 0o111 != 0 {
-                    FileKind::Executable
-                } else {
-                    FileKind::Regular
-                };
-                if opened.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
-                    return Err(WorkspaceFileError::TooLarge { limit });
-                }
-                let Some((expected_kind, expected)) = expected else {
-                    return Ok(false);
-                };
-                if expected_kind != kind
-                    || expected.len() > limit
-                    || opened.len() != expected.len() as u64
-                {
-                    return Ok(false);
-                }
-                let mut scratch = [0_u8; 64 * 1024];
-                let mut offset = 0_usize;
-                loop {
-                    let read = file.read(&mut scratch)?;
-                    if read == 0 {
-                        break;
-                    }
-                    let end = offset
-                        .checked_add(read)
-                        .ok_or(WorkspaceFileError::TooLarge { limit })?;
-                    if end > expected.len() || scratch[..read] != expected[offset..end] {
-                        return Ok(false);
-                    }
-                    offset = end;
-                }
-                Ok(offset == expected.len())
-            }
-            _ => Err(WorkspaceFileError::UnsupportedFileType),
-        }
     }
 
     pub(super) fn read(
@@ -920,16 +871,8 @@ mod platform {
         _root: &Path,
         _components: &[&OsStr],
         _limit: usize,
+        _expected: Option<&RawPreimage>,
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
-        unsupported()
-    }
-
-    pub(super) fn authenticate(
-        _root: &Path,
-        _components: &[&OsStr],
-        _expected: Option<(FileKind, &[u8])>,
-        _limit: usize,
-    ) -> Result<bool, WorkspaceFileError> {
         unsupported()
     }
 
@@ -945,7 +888,15 @@ mod platform {
         _directory: &File,
         _name: &OsStr,
         _limit: usize,
+        _expected: Option<&RawPreimage>,
     ) -> Result<Option<RawPreimage>, WorkspaceFileError> {
+        unsupported()
+    }
+
+    pub(super) fn is_absent(
+        _root: &Path,
+        _components: &[&OsStr],
+    ) -> Result<bool, WorkspaceFileError> {
         unsupported()
     }
 
@@ -1098,10 +1049,10 @@ mod tests {
         TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| assert!(allocated.get() >= bytes.len()));
         TEST_SNAPSHOT_ALLOCATED_BYTES.with(|allocated| allocated.set(0));
         assert!(
-            authenticate_workspace_file(
+            authenticate_workspace_preimage(
                 root.path(),
                 Path::new("file"),
-                Some((FileKind::Regular, &bytes)),
+                &raw_preimage(FileKind::Regular, &bytes),
                 bytes.len(),
             )
             .unwrap()
@@ -1143,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_preimage_streams_kind_length_and_domain_separated_digest() {
+    fn raw_preimage_streams_kind_length_and_content_digest() {
         let root = tempfile::tempdir().unwrap();
         let bytes = vec![b'x'; 2 * 64 * 1024 + 7];
         std::fs::write(root.path().join("large"), &bytes).unwrap();

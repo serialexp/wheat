@@ -23,14 +23,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{
-    FileKind, FileValue, MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE,
+    ContentId, FileKind, FileValue, MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE,
     MaterializationProgressFields, TreeId, ViewId, decode_materialization_progress_record,
     encode_materialization_progress_fields, encode_materialization_progress_record,
 };
 use wheat_ignore::WORKSPACE_CONTROL_NAMES as RESERVED;
 use wheat_store::{
-    ContentStore, MerkleTreeStore, PublicationStore, RepositoryHead, TreeDiffLimits, TreeFile,
-    TreeWalkLimits,
+    ContentReader, ContentStore, MerkleTreeStore, PublicationStore, RepositoryHead, TreeDiffLimits,
+    TreeFile, TreeWalkLimits,
 };
 
 use crate::{
@@ -38,14 +38,13 @@ use crate::{
     local::LocalRepository,
     sys,
     workspace_files::{
-        RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot, authenticate_preimage_at,
-        authenticate_workspace_file, authenticate_workspace_preimage, observe_workspace_file,
-        raw_preimage, read_workspace_file,
+        RawPreimage, WorkspaceFileError, authenticate_preimage_at, authenticate_workspace_preimage,
+        observe_workspace_file, raw_preimage, read_workspace_file, workspace_file_is_absent,
     },
     workspace_metadata::{MaterializedState, WorkspaceMetadata, WorkspaceMetadataPublishError},
 };
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const JOURNAL_NAME: &str = "materialization.json";
 const TRANSACTIONS: &str = "materialization-transactions";
 const PROGRESS_NAME: &str = "progress.log";
@@ -55,22 +54,19 @@ const PROGRESS_OPCODE_COMPLETE: u16 = 2;
 const PROGRESS_OPCODE_ABORTED: u16 = 3;
 const MAX_JOURNAL_BYTES: usize = 192 * 1024 * 1024;
 pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
-// ContentStore currently returns owned Vecs. A replacement needs old and new
-// bytes concurrently to authenticate both sides of an exchange; workspace,
-// staged, and displaced regular files are streamed through a fixed 64 KiB
-// scratch buffer and add no file-sized allocation. This bounds one install's
-// owned file content.
-const MAX_OPERATION_RESIDENT_BYTES: u64 = 2 * MAX_FILE_BYTES as u64;
+/// Scratch that staging streams a value's content through.
+const STAGING_SCRATCH_BYTES: usize = 64 * 1024;
 /// The most installs staged, recorded and synced together. An abort looks for
 /// staged but unrecorded leaves only this far past the recorded intents.
 const MAX_BATCH_INSTALLS: usize = 256;
-/// A batch keeps its installs' store buffers from staging until they are applied,
-/// and is closed before its buffers would pass this bound; an install larger than
-/// it is a batch of its own. The install that closed a batch stays loaded for the
-/// next one, so peak owned file content is at most this plus one install. When this
-/// was `MAX_OPERATION_RESIDENT_BYTES`, cloning 32 files of 12 MiB held all 384 MiB
-/// at once (peak RSS 430–513 MB); with 64 MiB it peaks at 98 MiB (2026-10-15,
-/// publish_content).
+/// A batch's leaves are staged together, each through a store reader that holds a
+/// blob stored whole or one chunk of a chunked blob ([`ContentReader::held_bound`]).
+/// A batch is closed before those readers' bytes would pass this bound; an install
+/// larger than it is a batch of its own. Before installs were staged through
+/// readers, a batch held its installs' whole old and new values from staging until
+/// they were applied: when the bound was twice the file limit, cloning 32 files of
+/// 12 MiB held all 384 MiB at once (peak RSS 430–513 MB); with 64 MiB it peaked at
+/// 98 MiB (2026-10-15, publish_content).
 const MAX_BATCH_RESIDENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Threads that write and sync a batch's staged files, so the filesystem can
 /// commit several syncs at once. Importing 4,096 small files on NVMe ext4 took
@@ -78,6 +74,9 @@ const MAX_BATCH_RESIDENT_BYTES: u64 = 64 * 1024 * 1024;
 const STAGING_WORKERS: usize = 32;
 #[cfg(test)]
 static TEST_PEAK_OWNED_CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// The most store bytes one staging reader held.
+#[cfg(test)]
+static TEST_PEAK_READER_HELD_BYTES: AtomicUsize = AtomicUsize::new(0);
 const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TEST_CHECKPOINT_ENV: &str = "WHEAT_TEST_MATERIALIZATION_FAIL_AFTER";
 const TEST_CHECKPOINT_OCCURRENCE_ENV: &str = "WHEAT_TEST_MATERIALIZATION_FAIL_OCCURRENCE";
@@ -126,17 +125,8 @@ pub fn workspace_holds(
     let Some(value) = value else {
         return path_is_absent(root, path);
     };
-    let bytes = content.get(value.content)?;
-    ensure!(
-        bytes.len() <= MAX_FILE_BYTES,
-        "materialized file exceeds byte limit"
-    );
-    match authenticate_workspace_file(
-        root,
-        Path::new(path),
-        Some((value.kind, &bytes)),
-        MAX_FILE_BYTES,
-    ) {
+    let expected = value_preimage(content, value)?;
+    match authenticate_workspace_preimage(root, Path::new(path), &expected, MAX_FILE_BYTES) {
         Ok(matches) => Ok(matches),
         Err(
             WorkspaceFileError::IntermediateSymlink
@@ -146,6 +136,16 @@ pub fn workspace_holds(
         ) => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The leaf that materializing `value` leaves, from the store's length metadata.
+fn value_preimage(content: &ContentStore, value: FileValue) -> Result<RawPreimage> {
+    let length = content.logical_length(value.content)?;
+    ensure!(
+        length <= MAX_FILE_BYTES as u64,
+        "materialized file exceeds byte limit"
+    );
+    Ok(RawPreimage::of_value(value, length))
 }
 
 pub fn path_is_absent(root: &Path, path: &str) -> Result<bool> {
@@ -669,22 +669,13 @@ pub async fn restore(
                 }
             }
         };
-        let bytes = repository.content.get(value.content)?;
-        ensure!(
-            bytes.len() <= MAX_FILE_BYTES,
-            "restored file exceeds byte limit"
-        );
-        if value.kind == FileKind::Symlink {
-            ensure!(
-                !bytes.is_empty() && !bytes.contains(&0) && bytes.len() <= 4_095,
-                "restored symlink target is not representable"
-            );
-        }
-        if observed.as_ref() == Some(&raw_preimage(value.kind, &bytes)) {
+        let length = materializable_length(&repository.content, value)
+            .with_context(|| format!("restore path {path:?}"))?;
+        if observed.as_ref() == Some(&RawPreimage::of_value(value, length)) {
             continue;
         }
         total = total
-            .checked_add(u64::try_from(bytes.len())?)
+            .checked_add(length)
             .context("restore byte count overflow")?;
         ensure!(total <= MAX_TOTAL_BYTES, "restore exceeds total byte limit");
         let index = installs.len();
@@ -1200,8 +1191,8 @@ fn validate_materializable(repository: &LocalRepository, files: &[TreeFile]) -> 
 
 /// Checks that `value` can be materialized and returns its byte length, from stored
 /// length metadata so planning does not load every file. Only a symlink target, at most
-/// 4,095 bytes, is read, to reject NUL bytes. Installation reads each file again and
-/// enforces [`MAX_FILE_BYTES`] on the real bytes.
+/// 4,095 bytes, is read, to reject NUL bytes. Installation streams each file and
+/// authenticates what it wrote against the value's content ID.
 fn materializable_length(content: &ContentStore, value: FileValue) -> Result<u64> {
     let length = content.logical_length(value.content)?;
     ensure!(
@@ -1238,10 +1229,13 @@ fn validate_initial_workspace(root: &Path, files: &[TreeFile]) -> Result<()> {
     Ok(())
 }
 
+/// Whether the workspace still holds the install's old value: `old`, the preimage of
+/// `install.old`, or nothing when it has none. A restore checks the exact value it
+/// observed instead.
 fn authenticate_install_preimage(
     root: &Path,
     install: &Install,
-    expected_store_bytes: Option<&[u8]>,
+    old: Option<&RawPreimage>,
 ) -> Result<bool> {
     if install.restore_consent {
         return match &install.observed {
@@ -1263,16 +1257,11 @@ fn authenticate_install_preimage(
             None => path_is_absent(root, &install.path),
         };
     }
-    let expected = install
-        .old
-        .zip(expected_store_bytes)
-        .map(|(value, bytes)| (value.kind, bytes));
-    Ok(authenticate_workspace_file(
-        root,
-        Path::new(&install.path),
-        expected,
-        MAX_FILE_BYTES,
-    )?)
+    let path = Path::new(&install.path);
+    Ok(match old {
+        Some(old) => authenticate_workspace_preimage(root, path, old, MAX_FILE_BYTES)?,
+        None => workspace_file_is_absent(root, path)?,
+    })
 }
 
 /// Authenticate a materialization plan and drop the leaf operations the workspace
@@ -1371,11 +1360,11 @@ fn authenticate_preflight_with(
             }
             continue;
         }
-        let old_content = install
+        let old = install
             .old
-            .map(|value| repository.content.get(value.content))
+            .map(|value| value_preimage(&repository.content, value))
             .transpose()?;
-        let matches = authenticate_install_preimage(root, install, old_content.as_deref())
+        let matches = authenticate_install_preimage(root, install, old.as_ref())
             .with_context(|| format!("preflight workspace path {:?}", install.path))?;
         if !matches && install.restore_consent {
             return Err(restore_invalidated(format!(
@@ -1458,7 +1447,7 @@ fn roll_forward(
         if batch.is_empty() {
             return Ok(false);
         }
-        let (prepared, failure) = stage_batch(root, tx, &batch, planner)?;
+        let (prepared, failure) = stage_batch(root, tx, &repository.content, &batch, planner)?;
         batch.truncate(prepared);
         let Some(last) = batch.last() else {
             return match failure {
@@ -1514,29 +1503,15 @@ fn apply_batched<'a>(
     checkpoint("installed")
 }
 
-/// An install with its content, read from the store once for its whole batch.
+/// An install with the preimages of its old and new values, from the store's
+/// length metadata; no content is read.
 struct LoadedInstall<'a> {
     index: usize,
     install: &'a Install,
-    old: Option<Vec<u8>>,
-    /// `None` when the new content is the old content; see `new_bytes`.
-    new: Option<Vec<u8>>,
-    shared: bool,
+    old: Option<RawPreimage>,
+    new: Option<RawPreimage>,
+    /// The store bytes staging the new value holds at once.
     resident_bytes: u64,
-}
-
-impl LoadedInstall<'_> {
-    fn old_bytes(&self) -> Option<&[u8]> {
-        self.old.as_deref()
-    }
-
-    fn new_bytes(&self) -> Option<&[u8]> {
-        if self.shared {
-            self.old.as_deref()
-        } else {
-            self.new.as_deref()
-        }
-    }
 }
 
 fn load_install<'a>(
@@ -1544,45 +1519,21 @@ fn load_install<'a>(
     index: usize,
     install: &'a Install,
 ) -> Result<LoadedInstall<'a>> {
-    // If old and new have the same content ID, retain one copy and share it
-    // between both descriptors.
-    let old = install
-        .old
-        .map(|value| repository.content.get(value.content))
-        .transpose()?;
-    let shared = install
-        .old
-        .zip(install.new)
-        .is_some_and(|(old, new)| old.content == new.content);
-    let new = if shared {
-        None
-    } else {
-        install
-            .new
-            .map(|value| repository.content.get(value.content))
-            .transpose()?
+    let preimage = |value: Option<FileValue>| {
+        value
+            .map(|value| value_preimage(&repository.content, value))
+            .transpose()
     };
-    for bytes in [old.as_ref(), new.as_ref()].into_iter().flatten() {
-        ensure!(
-            bytes.len() <= MAX_FILE_BYTES,
-            "materialized file exceeds byte limit"
-        );
-    }
-    let resident_bytes = old
+    let old = preimage(install.old)?;
+    let new = preimage(install.new)?;
+    let resident_bytes = new
         .as_ref()
-        .map_or(0_u64, |bytes| bytes.len() as u64)
-        .checked_add(new.as_ref().map_or(0_u64, |bytes| bytes.len() as u64))
-        .context("materialization resident byte count overflow")?;
-    ensure!(
-        resident_bytes <= MAX_OPERATION_RESIDENT_BYTES,
-        "materialization operation exceeds resident byte limit"
-    );
+        .map_or(0, |new| ContentReader::held_bound(new.length));
     Ok(LoadedInstall {
         index,
         install,
         old,
         new,
-        shared,
         resident_bytes,
     })
 }
@@ -1596,7 +1547,7 @@ struct Batcher<'a> {
     repository: &'a LocalRepository,
     installs: &'a [Install],
     next: usize,
-    /// An install loaded for a batch its content did not fit, which starts the
+    /// An install loaded for a batch its staging did not fit, which starts the
     /// next batch.
     carried: Option<LoadedInstall<'a>>,
 }
@@ -1684,8 +1635,8 @@ fn apply_loaded<'a>(
         root,
         tx,
         loaded.install,
-        loaded.old_bytes(),
-        loaded.new_bytes(),
+        loaded.old.as_ref(),
+        loaded.new.as_ref(),
         planner,
         syncs,
     )
@@ -1695,7 +1646,15 @@ fn apply_loaded<'a>(
 struct StagedLeaf<'a> {
     name: &'a str,
     kind: FileKind,
-    bytes: &'a [u8],
+    source: LeafSource<'a>,
+}
+
+/// What a staged leaf is written from.
+enum LeafSource<'a> {
+    /// A deletion's tombstone marker.
+    Marker(&'a [u8]),
+    /// A value's content, streamed from the store.
+    Content(ContentId),
 }
 
 /// Checks and prepares a batch's installs in order, writes the staged leaves that
@@ -1708,6 +1667,7 @@ struct StagedLeaf<'a> {
 fn stage_batch(
     root: &Path,
     tx: &File,
+    content: &ContentStore,
     batch: &[LoadedInstall<'_>],
     planner: &PlannerContext,
 ) -> Result<(usize, Option<anyhow::Error>)> {
@@ -1727,7 +1687,7 @@ fn stage_batch(
     }
     drop(prepare);
     if !leaves.is_empty() {
-        write_staged_leaves(tx, &leaves)?;
+        write_staged_leaves(tx, content, &leaves)?;
         tx.sync_all()?;
     }
     Ok((prepared, failure))
@@ -1743,12 +1703,12 @@ fn writing_name(staged: &str) -> String {
 /// Writes `leaves` on up to `STAGING_WORKERS` threads, so the filesystem can
 /// commit their syncs together.
 #[tracing::instrument(name = "materialization_write_leaves", level = "debug", skip_all)]
-fn write_staged_leaves(tx: &File, leaves: &[StagedLeaf<'_>]) -> Result<()> {
+fn write_staged_leaves(tx: &File, content: &ContentStore, leaves: &[StagedLeaf<'_>]) -> Result<()> {
     let next = AtomicUsize::new(0);
     let write = || -> Result<()> {
         while let Some(leaf) = leaves.get(next.fetch_add(1, Ordering::Relaxed)) {
             let writing = writing_name(leaf.name);
-            create_leaf_at(tx, &writing, leaf.kind, leaf.bytes)?;
+            create_leaf_at(tx, &writing, leaf, content)?;
             rename_noreplace(tx, &writing, tx, leaf.name)?;
         }
         Ok(())
@@ -1777,8 +1737,6 @@ fn prepare_install<'a>(
     planner: &PlannerContext,
 ) -> Result<Option<StagedLeaf<'a>>> {
     let install = loaded.install;
-    let old_bytes = loaded.old_bytes();
-    let new_bytes = loaded.new_bytes();
     if !install.empty_directory {
         remove_replaced_directory(root, tx, install, planner)?;
     }
@@ -1789,7 +1747,7 @@ fn prepare_install<'a>(
                 install.path
             )));
         }
-    } else if !authenticate_install_preimage(root, install, old_bytes)? {
+    } else if !authenticate_install_preimage(root, install, loaded.old.as_ref())? {
         if install.restore_consent {
             return Err(restore_invalidated(format!(
                 "workspace path {:?} changed after preflight",
@@ -1798,22 +1756,28 @@ fn prepare_install<'a>(
         }
         bail!("workspace path {:?} changed after preflight", install.path);
     }
-    let leaf = match (install.new, new_bytes, install.tombstone.as_deref()) {
-        (Some(value), Some(bytes), None) => StagedLeaf {
-            name: &install.staged,
-            kind: value.kind,
-            bytes,
-        },
-        (None, None, Some(marker)) => StagedLeaf {
-            name: &install.staged,
-            kind: FileKind::Regular,
-            bytes: marker,
-        },
+    let (leaf, expected) = match (install.new, &loaded.new, install.tombstone.as_deref()) {
+        (Some(value), Some(new), None) => (
+            StagedLeaf {
+                name: &install.staged,
+                kind: value.kind,
+                source: LeafSource::Content(value.content),
+            },
+            new.clone(),
+        ),
+        (None, None, Some(marker)) => (
+            StagedLeaf {
+                name: &install.staged,
+                kind: FileKind::Regular,
+                source: LeafSource::Marker(marker),
+            },
+            raw_preimage(FileKind::Regular, marker),
+        ),
         _ => bail!("invalid materialization operation"),
     };
     let missing = if leaf_exists(tx, leaf.name)? {
         ensure!(
-            authenticate_leaf_at_bytes(tx, leaf.name, leaf.kind, leaf.bytes)?,
+            authenticate_leaf_at(tx, leaf.name, &expected)?,
             "staged transaction leaf changed before intent"
         );
         None
@@ -1830,15 +1794,15 @@ fn apply_or_recover_install<'a>(
     root: &Path,
     tx: &File,
     install: &'a Install,
-    old_bytes: Option<&[u8]>,
-    new_bytes: Option<&[u8]>,
+    old: Option<&RawPreimage>,
+    new: Option<&RawPreimage>,
     planner: &PlannerContext,
     syncs: &mut BatchSyncs<'a>,
 ) -> Result<()> {
     match (install.old, install.new) {
-        (None, Some(new)) => {
+        (None, Some(_)) => {
             let (parent, name) = open_parent(root, &install.path)?;
-            let new_bytes = new_bytes.context("creation target content is unavailable")?;
+            let new = new.context("creation target preimage is unavailable")?;
             if leaf_exists(tx, &install.staged)? {
                 if install.empty_directory {
                     if path_is_directory(root, &install.path)? {
@@ -1883,37 +1847,39 @@ fn apply_or_recover_install<'a>(
                         format!("workspace collision while creating {:?}", install.path),
                     ));
                 }
-                authenticate_exact_at_bytes(tx, &install.staged, new, new_bytes)?;
+                ensure!(
+                    authenticate_leaf_at(tx, &install.staged, new)?,
+                    "materialized target changed externally"
+                );
                 rename_noreplace(tx, &install.staged, &parent, name)?;
             }
             // A rename an earlier run made in this boot may not be durable yet.
             syncs.defer(&install.path, parent);
             ensure!(
-                authenticate_workspace_file(
+                authenticate_workspace_preimage(
                     root,
                     Path::new(&install.path),
-                    Some((new.kind, new_bytes)),
+                    new,
                     MAX_FILE_BYTES,
                 )?,
                 "created workspace path is missing or changed"
             );
         }
-        (Some(_old), Some(new)) => {
+        (Some(_), Some(_)) => {
             let (parent, name) = open_parent(root, &install.path)?;
-            let old_bytes = old_bytes.context("replacement preimage content is unavailable")?;
-            let new_bytes = new_bytes.context("replacement target content is unavailable")?;
-            let workspace_is_old = authenticate_install_preimage(root, install, Some(old_bytes))?;
-            let staged_is_new =
-                authenticate_leaf_at_bytes(tx, &install.staged, new.kind, new_bytes)?;
+            let old = old.context("replacement preimage is unavailable")?;
+            let new = new.context("replacement target preimage is unavailable")?;
+            let workspace_is_old = authenticate_install_preimage(root, install, Some(old))?;
+            let staged_is_new = authenticate_leaf_at(tx, &install.staged, new)?;
             if workspace_is_old && staged_is_new {
                 checkpoint("before-exchange")?;
                 rename_exchange(tx, &install.staged, &parent, name)?;
                 checkpoint("exchanged")?;
-                if !authenticate_displaced_at(tx, &install.staged, install, old_bytes)? {
-                    if authenticate_workspace_file(
+                if !authenticate_displaced_at(tx, &install.staged, install, old)? {
+                    if authenticate_workspace_preimage(
                         root,
                         Path::new(&install.path),
-                        Some((new.kind, new_bytes)),
+                        new,
                         MAX_FILE_BYTES,
                     )? {
                         rename_exchange(tx, &install.staged, &parent, name)?;
@@ -1948,12 +1914,12 @@ fn apply_or_recover_install<'a>(
                     ));
                 }
                 ensure!(
-                    authenticate_workspace_file(
+                    authenticate_workspace_preimage(
                         root,
                         Path::new(&install.path),
-                        Some((new.kind, new_bytes)),
+                        new,
                         MAX_FILE_BYTES
-                    )? && authenticate_displaced_at(tx, &install.staged, install, old_bytes)?,
+                    )? && authenticate_displaced_at(tx, &install.staged, install, old)?,
                     "ambiguous interrupted replacement for {:?}",
                     install.path
                 );
@@ -1961,32 +1927,34 @@ fn apply_or_recover_install<'a>(
             // An exchange an earlier run made in this boot may not be durable yet.
             syncs.defer(&install.path, parent);
         }
-        (Some(_old), None) => {
+        (Some(_), None) => {
             // A completed descendant deletion may already have removed its empty
             // plan-owned parent before a crash. Recreate that directory only as
             // transaction scaffolding; the later directory-to-file install removes
             // it after authenticating the displaced leaf.
             ensure_parent_directories(root, &install.path)?;
             let (parent, name) = open_parent(root, &install.path)?;
-            let old_bytes = old_bytes.context("deletion preimage content is unavailable")?;
-            let marker = install
-                .tombstone
-                .as_deref()
-                .context("deletion has no tombstone")?;
-            let workspace_is_old = authenticate_install_preimage(root, install, Some(old_bytes))?;
-            let staged_is_marker =
-                authenticate_leaf_at_bytes(tx, &install.staged, FileKind::Regular, marker)?;
+            let old = old.context("deletion preimage is unavailable")?;
+            let marker = raw_preimage(
+                FileKind::Regular,
+                install
+                    .tombstone
+                    .as_deref()
+                    .context("deletion has no tombstone")?,
+            );
+            let workspace_is_old = authenticate_install_preimage(root, install, Some(old))?;
+            let staged_is_marker = authenticate_leaf_at(tx, &install.staged, &marker)?;
             if workspace_is_old && staged_is_marker {
                 checkpoint("before-exchange")?;
                 rename_exchange(tx, &install.staged, &parent, name)?;
                 parent.sync_all()?;
                 tx.sync_all()?;
                 checkpoint("exchanged")?;
-                if !authenticate_displaced_at(tx, &install.staged, install, old_bytes)? {
-                    if authenticate_workspace_file(
+                if !authenticate_displaced_at(tx, &install.staged, install, old)? {
+                    if authenticate_workspace_preimage(
                         root,
                         Path::new(&install.path),
-                        Some((FileKind::Regular, marker)),
+                        &marker,
                         MAX_FILE_BYTES,
                     )? {
                         rename_exchange(tx, &install.staged, &parent, name)?;
@@ -2019,30 +1987,21 @@ fn apply_or_recover_install<'a>(
                     ));
                 }
                 ensure!(
-                    authenticate_displaced_at(tx, &install.staged, install, old_bytes)?
-                        && (authenticate_workspace_file(
-                            root,
-                            Path::new(&install.path),
-                            None,
-                            MAX_FILE_BYTES
-                        )? || authenticate_workspace_file(
-                            root,
-                            Path::new(&install.path),
-                            Some((FileKind::Regular, marker)),
-                            MAX_FILE_BYTES
-                        )?),
+                    authenticate_displaced_at(tx, &install.staged, install, old)?
+                        && (workspace_file_is_absent(root, Path::new(&install.path))?
+                            || authenticate_workspace_preimage(
+                                root,
+                                Path::new(&install.path),
+                                &marker,
+                                MAX_FILE_BYTES
+                            )?),
                     "ambiguous interrupted deletion for {:?}",
                     install.path
                 );
             }
             let removed = install.staged.replacen("leaf-", "removed-", 1);
             if !leaf_exists(tx, &removed)?
-                && !authenticate_workspace_file(
-                    root,
-                    Path::new(&install.path),
-                    None,
-                    MAX_FILE_BYTES,
-                )?
+                && !workspace_file_is_absent(root, Path::new(&install.path))?
             {
                 checkpoint("before-deletion-move")?;
                 rename_noreplace(&parent, name, tx, &removed)?;
@@ -2051,7 +2010,7 @@ fn apply_or_recover_install<'a>(
                 checkpoint("deletion-unlinked")?;
             }
             if leaf_exists(tx, &removed)? {
-                if !authenticate_leaf_at_bytes(tx, &removed, FileKind::Regular, marker)? {
+                if !authenticate_leaf_at(tx, &removed, &marker)? {
                     if read_workspace_file(root, Path::new(&install.path), 0)?.is_none() {
                         rename_noreplace(tx, &removed, &parent, name)?;
                         parent.sync_all()?;
@@ -2086,7 +2045,7 @@ fn authenticate_displaced_at(
     directory: &File,
     name: &str,
     install: &Install,
-    old_bytes: &[u8],
+    old: &RawPreimage,
 ) -> Result<bool> {
     if install.restore_consent {
         let Some(observed) = &install.observed else {
@@ -2099,30 +2058,7 @@ fn authenticate_displaced_at(
             MAX_FILE_BYTES,
         )?);
     }
-    let old = install.old.context("install has no old value")?;
-    authenticate_leaf_at_bytes(directory, name, old.kind, old_bytes)
-}
-
-fn authenticate_snapshot_bytes(
-    value: FileValue,
-    expected: &[u8],
-    actual: &WorkspaceFileSnapshot,
-) -> Result<()> {
-    ensure!(
-        actual.kind == value.kind && actual.bytes == expected,
-        "materialized target changed externally"
-    );
-    Ok(())
-}
-
-fn authenticate_exact_at_bytes(
-    directory: &File,
-    name: &str,
-    value: FileValue,
-    bytes: &[u8],
-) -> Result<()> {
-    let actual = read_leaf_at(directory, name, MAX_FILE_BYTES)?;
-    authenticate_snapshot_bytes(value, bytes, &actual)
+    authenticate_leaf_at(directory, name, old)
 }
 
 fn create_transaction(root: &Path, id: Uuid) -> Result<(File, File)> {
@@ -2522,16 +2458,19 @@ fn cleanup_aborted(
         }
         if leaf_exists(tx, &install.staged)? {
             let is_staged_target = match install.new {
-                Some(target) => {
-                    let target_bytes = repository.content.get(target.content)?;
-                    authenticate_leaf_at_bytes(tx, &install.staged, target.kind, &target_bytes)?
-                }
+                Some(target) => authenticate_leaf_at(
+                    tx,
+                    &install.staged,
+                    &value_preimage(&repository.content, target)?,
+                )?,
                 None => false,
             };
             let is_tombstone = match install.tombstone.as_deref() {
-                Some(marker) => {
-                    authenticate_leaf_at_bytes(tx, &install.staged, FileKind::Regular, marker)?
-                }
+                Some(marker) => authenticate_leaf_at(
+                    tx,
+                    &install.staged,
+                    &raw_preimage(FileKind::Regular, marker),
+                )?,
                 None => false,
             };
             let is_displaced_preimage = if index < intents {
@@ -2566,7 +2505,7 @@ fn cleanup_aborted(
                 .as_deref()
                 .context("aborted deletion debris has no tombstone")?;
             ensure!(
-                authenticate_leaf_at_bytes(tx, &removed, FileKind::Regular, marker)?,
+                authenticate_leaf_at(tx, &removed, &raw_preimage(FileKind::Regular, marker))?,
                 "refusing to remove unauthenticated aborted deletion debris for {:?}",
                 install.path
             );
@@ -2605,9 +2544,9 @@ fn cleanup_committed(
     for install in &journal.installs {
         match install.old {
             Some(old) if leaf_exists(tx, &install.staged)? => {
-                let old_bytes = repository.content.get(old.content)?;
+                let old = value_preimage(&repository.content, old)?;
                 ensure!(
-                    authenticate_displaced_at(tx, &install.staged, install, &old_bytes)?,
+                    authenticate_displaced_at(tx, &install.staged, install, &old)?,
                     "displaced preimage for {:?} changed",
                     install.path
                 );
@@ -2976,123 +2915,62 @@ fn create_regular_at(directory: &File, name: &str, mode: u32) -> Result<File> {
     sys::open_file_at(directory, name, how).context("create private materialization file")
 }
 
-fn create_leaf_at(directory: &File, name: &str, kind: FileKind, bytes: &[u8]) -> Result<()> {
-    match kind {
-        FileKind::Regular | FileKind::Executable => {
+fn create_leaf_at(
+    directory: &File,
+    name: &str,
+    leaf: &StagedLeaf<'_>,
+    content: &ContentStore,
+) -> Result<()> {
+    match (leaf.kind, &leaf.source) {
+        (FileKind::Symlink, LeafSource::Content(id)) => {
+            let target = content.get_bounded(*id, 4_095)?;
+            sys::symlink_at(&target, directory, name).context("stage symlink")?;
+        }
+        (FileKind::Symlink, LeafSource::Marker(_)) => bail!("a tombstone is a regular file"),
+        (kind, source) => {
             let mode = if kind == FileKind::Executable {
                 0o755
             } else {
                 0o644
             };
             let mut file = create_regular_at(directory, name, mode)?;
-            file.write_all(bytes)?;
+            match source {
+                LeafSource::Marker(marker) => file.write_all(marker)?,
+                LeafSource::Content(id) => copy_content(content.reader(*id)?, &mut file)?,
+            }
             file.sync_all()?;
-        }
-        FileKind::Symlink => {
-            sys::symlink_at(bytes, directory, name).context("stage symlink")?;
         }
     }
     Ok(())
 }
 
-fn authenticate_leaf_at_bytes(
-    directory: &File,
-    name: &str,
-    kind: FileKind,
-    expected: &[u8],
-) -> Result<bool> {
-    ensure!(
-        expected.len() <= MAX_FILE_BYTES,
-        "materialized file exceeds byte limit"
-    );
-    let entry = leaf_kind_at(directory, name)?;
-    if entry == sys::EntryKind::Symlink {
-        if kind != FileKind::Symlink || expected.len() > 4_095 {
-            return Ok(false);
-        }
-        let mut bytes = [0_u8; 4_096];
-        let read = sys::read_link_at(directory, name, &mut bytes).context("read staged symlink")?;
-        return Ok(&bytes[..read] == expected);
-    }
-    if entry != sys::EntryKind::Regular || kind == FileKind::Symlink {
-        return Ok(false);
-    }
-    let mut file =
-        sys::open_file_at(directory, name, sys::OpenFile::READ).context("open staged file")?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() != expected.len() as u64 {
-        return Ok(false);
-    }
-    let actual_kind = if sys::is_executable(&metadata) {
-        FileKind::Executable
-    } else {
-        FileKind::Regular
-    };
-    if actual_kind != kind {
-        return Ok(false);
-    }
-    let mut scratch = [0_u8; 64 * 1024];
-    let mut offset = 0_usize;
+/// Streams a blob into `file` through fixed scratch, so staging holds no more of it
+/// than its reader does. The reader checks the blob's ID, so a corrupt store fails
+/// the write.
+fn copy_content(mut reader: ContentReader, file: &mut File) -> Result<()> {
+    let mut scratch = [0_u8; STAGING_SCRATCH_BYTES];
     loop {
-        let read = file.read(&mut scratch)?;
+        let read = reader.read(&mut scratch)?;
+        #[cfg(test)]
+        TEST_PEAK_READER_HELD_BYTES.fetch_max(reader.held_bytes(), Ordering::Relaxed);
         if read == 0 {
-            break;
+            return Ok(());
         }
-        let end = offset
-            .checked_add(read)
-            .context("staged file grew while authenticating")?;
-        if end > expected.len() || scratch[..read] != expected[offset..end] {
-            return Ok(false);
-        }
-        offset = end;
+        file.write_all(&scratch[..read])?;
     }
-    Ok(offset == expected.len())
 }
 
-fn read_leaf_at(directory: &File, name: &str, limit: usize) -> Result<WorkspaceFileSnapshot> {
-    let entry = leaf_kind_at(directory, name)?;
-    if entry == sys::EntryKind::Symlink {
-        let mut bytes = vec![0_u8; limit.saturating_add(1)];
-        let read = sys::read_link_at(directory, name, &mut bytes).context("read staged symlink")?;
-        ensure!(read <= limit, "materialized symlink exceeds byte limit");
-        bytes.truncate(read);
-        return Ok(WorkspaceFileSnapshot {
-            kind: FileKind::Symlink,
-            bytes,
-        });
+/// Whether the transaction leaf `name` is exactly `expected`. A leaf of another
+/// type, or one too large to be a materialized file, is not; a regular file of
+/// another kind or length is not read.
+fn authenticate_leaf_at(directory: &File, name: &str, expected: &RawPreimage) -> Result<bool> {
+    match authenticate_preimage_at(directory, OsStr::new(name), expected, MAX_FILE_BYTES) {
+        Ok(matches) => Ok(matches),
+        Err(WorkspaceFileError::UnsupportedFileType | WorkspaceFileError::TooLarge { .. }) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
     }
-    ensure!(
-        entry == sys::EntryKind::Regular,
-        "staged target is not a regular file or symlink"
-    );
-    let file =
-        sys::open_file_at(directory, name, sys::OpenFile::READ).context("open staged file")?;
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file(),
-        "opened staged target is not a regular file"
-    );
-    ensure!(
-        metadata.len() <= u64::try_from(limit)?,
-        "materialized file exceeds byte limit"
-    );
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len())?);
-    file.take(u64::try_from(limit)?.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= limit, "materialized file exceeds byte limit");
-    let kind = if sys::is_executable(&metadata) {
-        FileKind::Executable
-    } else {
-        FileKind::Regular
-    };
-    Ok(WorkspaceFileSnapshot { kind, bytes })
-}
-
-/// What a staged leaf is. A missing leaf is an error.
-fn leaf_kind_at(directory: &File, name: &str) -> Result<sys::EntryKind> {
-    sys::entry_kind_at(directory, name)
-        .and_then(|entry| entry.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)))
-        .context("stat staged materialization leaf")
 }
 
 fn leaf_exists(directory: &File, name: &str) -> Result<bool> {
@@ -3598,14 +3476,44 @@ mod tests {
     }
 
     #[test]
-    fn operation_content_residency_counter_records_real_owned_buffers() {
-        TEST_PEAK_OWNED_CONTENT_BYTES.store(0, Ordering::Relaxed);
-        let old = [0_u8; 17];
-        let new = [0_u8; 29];
-        let resident = old.len() + new.len();
-        TEST_PEAK_OWNED_CONTENT_BYTES.fetch_max(resident, Ordering::Relaxed);
-        assert_eq!(TEST_PEAK_OWNED_CONTENT_BYTES.load(Ordering::Relaxed), 46);
-        assert!(resident as u64 <= MAX_OPERATION_RESIDENT_BYTES);
+    fn staging_a_chunked_file_holds_one_chunk_at_a_time() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = wheat_store::PackedObjectStore::open(root.path().join("storage")).unwrap();
+        let content = objects.content_store();
+        let length = usize::try_from(wheat_core::CHUNKED_CONTENT_THRESHOLD).unwrap() + 9_000_000;
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let bytes = (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let value = FileValue {
+            content: content.put(&bytes).unwrap(),
+            kind: FileKind::Executable,
+        };
+        let tx_path = root.path().join("tx");
+        fs::create_dir(&tx_path).unwrap();
+        let tx = File::open(&tx_path).unwrap();
+
+        TEST_PEAK_READER_HELD_BYTES.store(0, Ordering::Relaxed);
+        let leaf = StagedLeaf {
+            name: "leaf-00000000",
+            kind: value.kind,
+            source: LeafSource::Content(value.content),
+        };
+        write_staged_leaves(&tx, &content, &[leaf]).unwrap();
+
+        let peak = TEST_PEAK_READER_HELD_BYTES.load(Ordering::Relaxed);
+        assert!(
+            peak > 0 && peak as u64 <= u64::from(wheat_core::MAX_CONTENT_CHUNK_BYTES),
+            "staging held {peak} store bytes at once"
+        );
+        let expected = value_preimage(&content, value).unwrap();
+        assert!(authenticate_leaf_at(&tx, "leaf-00000000", &expected).unwrap());
+        assert_eq!(fs::read(tx_path.join("leaf-00000000")).unwrap(), bytes);
     }
 
     #[test]
@@ -3672,10 +3580,11 @@ mod tests {
             );
             batches.push(batch.iter().map(|loaded| loaded.index).collect::<Vec<_>>());
         }
-        // Five 12 MiB files fit in 64 MiB; the 80 MiB file goes alone.
+        // Five 12 MiB files fit in 64 MiB. The 80 MiB file is chunked, so staging
+        // it holds one chunk, and it shares a batch with five 12 MiB files.
         assert_eq!(
             batches,
-            [vec![0, 1, 2, 3, 4], vec![5], vec![6], vec![7, 8, 9, 10, 11]]
+            [vec![0, 1, 2, 3, 4], vec![5, 6, 7, 8, 9, 10], vec![11]]
         );
     }
 

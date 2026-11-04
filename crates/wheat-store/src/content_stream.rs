@@ -7,13 +7,13 @@ use std::io;
 
 use wheat_core::{
     CHUNKED_CONTENT_THRESHOLD, ContentChunkManifestRecord, ContentChunkRecord, ContentId,
-    MAX_CHUNKED_CONTENT_BYTES, VerifiedContent,
+    MAX_CHUNKED_CONTENT_BYTES, MAX_CONTENT_CHUNK_BYTES, VerifiedContent,
 };
 
 use crate::{
     ContentChunker, ContentStore, ContentStoreError, codec,
     content_manifest::{ManifestBuilder, ManifestChunks},
-    content_store::{StoredContent, codec_error, resolve_delta_chain},
+    content_store::{StoredContent, codec_error, is_chunked_length, resolve_delta_chain},
 };
 
 /// Stores a blob fed through [`io::Write`]. Up to the threshold it buffers the
@@ -294,6 +294,18 @@ impl ContentReader {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.length == 0
+    }
+
+    /// The most blob bytes a reader of a `length`-byte blob holds at once, known
+    /// before opening it: a blob stored whole is held whole, a chunked one a chunk at
+    /// a time.
+    #[must_use]
+    pub fn held_bound(length: u64) -> u64 {
+        if is_chunked_length(length) {
+            u64::from(MAX_CONTENT_CHUNK_BYTES)
+        } else {
+            length
+        }
     }
 
     /// The blob bytes the reader holds: a whole blob, or the chunk it is reading.
