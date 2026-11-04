@@ -42,6 +42,8 @@ mod dot_git;
 mod edit_move;
 #[path = "../git_import.rs"]
 mod git_import;
+#[path = "../git_large_files.rs"]
+mod git_large_files;
 #[path = "../git_pull.rs"]
 mod git_pull;
 #[path = "../git_push.rs"]

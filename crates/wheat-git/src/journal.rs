@@ -12,7 +12,7 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
-use wheat_core::{ApplicationId, ChangeId, RevisionId, ViewId};
+use wheat_core::{ApplicationId, ChangeId, ContentId, RevisionId, ViewId};
 
 // Version 2 introduces crash-durable prepared mappings. Prototype journals are
 // deliberately not migrated: callers must restart from the pinned source snapshot.
@@ -214,6 +214,37 @@ impl ImportJournal {
             )
             .optional()
             .map_err(JournalError::from)
+    }
+
+    /// The content the Git blob `oid` was stored as, by [`Self::record_blob_content`].
+    pub fn blob_content(
+        &self,
+        oid: &[u8],
+        symlink: bool,
+    ) -> Result<Option<ContentId>, JournalError> {
+        self.connection
+            .prepare_cached("SELECT content FROM blob_content WHERE oid = ?1 AND symlink = ?2")?
+            .query_row(params![oid, symlink], |row| {
+                array(row.get(0)?, "content ID").map(ContentId::from_digest)
+            })
+            .optional()
+            .map_err(JournalError::from)
+    }
+
+    /// Records that the Git blob `oid` is stored as `content`: as a symlink target when
+    /// `symlink`, else as a file, whose text is canonicalized.
+    pub fn record_blob_content(
+        &self,
+        oid: &[u8],
+        symlink: bool,
+        content: ContentId,
+    ) -> Result<(), JournalError> {
+        self.connection
+            .prepare_cached(
+                "INSERT OR REPLACE INTO blob_content(oid, symlink, content) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![oid, symlink, content.as_bytes().as_slice()])?;
+        Ok(())
     }
 
     /// Bounded prepared mappings awaiting backing-store authentication.

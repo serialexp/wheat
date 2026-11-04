@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use gix::bstr::BString;
 use thiserror::Error;
 use wheat_core::{
-    Actor, ApplicationId, ApplicationResultRecord, ChangeId, ChangeMapId, DirectoryEntry, FileKind,
-    ProjectedCommitSetId, RevisionId, Timestamp, TreeId, ViewId,
+    Actor, ApplicationId, ApplicationResultRecord, CHUNKED_CONTENT_THRESHOLD, ChangeId,
+    ChangeMapId, ContentId, DirectoryEntry, FileKind, ProjectedCommitSetId, RevisionId, Timestamp,
+    TreeId, ViewId,
     message::{fold_messages, strip_title_line},
 };
 use wheat_store::{
@@ -670,9 +671,11 @@ fn write_tree<'a, O: ImmutableObjectStore>(
                     } else if let Some(oid) = cache.contents.get(&file.content) {
                         *oid
                     } else {
-                        let bytes = content.get(file.content)?;
+                        let length = content.logical_length(file.content)?;
                         cache.work.contents_read += 1;
-                        cache.content_bytes = cache.content_bytes.saturating_add(bytes.len());
+                        cache.content_bytes = cache
+                            .content_bytes
+                            .saturating_add(usize::try_from(length).unwrap_or(usize::MAX));
                         if cache.content_bytes > limits.max_content_bytes {
                             return Err(ExportError::LimitExceeded {
                                 limit: ExportLimit::ContentBytes,
@@ -680,10 +683,7 @@ fn write_tree<'a, O: ImmutableObjectStore>(
                                 maximum: limits.max_content_bytes,
                             });
                         }
-                        let oid = git
-                            .write_object(&gix::objs::Blob { data: bytes })
-                            .map_err(git_error)?
-                            .detach();
+                        let oid = write_blob(content, git, file.content, length)?;
                         cache.contents.insert(file.content, oid);
                         oid
                     };
@@ -898,6 +898,27 @@ fn signature(actor: &Actor, timestamp: Timestamp) -> gix::actor::Signature {
             offset: i32::from(timestamp.offset_minutes) * 60,
         },
     }
+}
+
+/// Writes `id`, `length` bytes long, to Git as a blob. A blob stored in chunks streams
+/// from the store into the object database a chunk at a time; a shorter one is read
+/// whole, as Git's own writer wants it, and not written again when Git has it.
+fn write_blob(
+    content: &ContentStore,
+    git: &gix::Repository,
+    id: ContentId,
+    length: u64,
+) -> Result<gix::ObjectId, ExportError> {
+    if length <= CHUNKED_CONTENT_THRESHOLD {
+        let bytes = content.get(id)?;
+        return git
+            .write_object(&gix::objs::Blob { data: bytes })
+            .map(gix::Id::detach)
+            .map_err(git_error);
+    }
+    let mut reader = content.reader(id)?;
+    gix::objs::Write::write_stream(&git.objects, gix::objs::Kind::Blob, length, &mut reader)
+        .map_err(git_error)
 }
 
 fn git_error(error: impl std::fmt::Display) -> ExportError {

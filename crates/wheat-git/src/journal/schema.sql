@@ -41,3 +41,14 @@ CREATE TABLE IF NOT EXISTS prepared_work (
     application_id BLOB NOT NULL,
     FOREIGN KEY (oid) REFERENCES work(oid) ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+
+-- The content a long Git blob was stored as, so a later commit replacing it records
+-- its value without reading it again. `symlink` is 1 when it was stored byte exact
+-- as a symlink target rather than as a file. Rows are a cache: a missing one is
+-- derived again from the blob.
+CREATE TABLE IF NOT EXISTS blob_content (
+    oid BLOB NOT NULL,
+    symlink INTEGER NOT NULL CHECK (symlink IN (0, 1)),
+    content BLOB NOT NULL,
+    PRIMARY KEY (oid, symlink)
+) STRICT, WITHOUT ROWID;

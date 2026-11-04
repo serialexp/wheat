@@ -981,3 +981,135 @@ async fn finalization_retains_branches_without_journal_and_refuses_partial_impor
     // Complete-state validation above proves the aggregate contains every historical
     // edit/evidence reference even though individual views contain visible tree content only.
 }
+
+/// `count` CRLF lines of text, past the threshold at which Git blobs are streamed.
+fn long_crlf_text(count: usize) -> Vec<u8> {
+    let mut text = Vec::new();
+    for line in 0..count {
+        text.extend_from_slice(format!("line {line:08}\r\n").as_bytes());
+    }
+    text
+}
+
+#[tokio::test]
+async fn long_blobs_stream_into_whole_file_edits_and_map_their_content() {
+    let threshold = usize::try_from(wheat_core::CHUNKED_CONTENT_THRESHOLD).unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-b", "main"]);
+    // Each line is 15 bytes raw and 14 canonical, so the canonical text is past the
+    // threshold too.
+    let text = long_crlf_text(threshold / 14 + 1);
+    let binary = (0..threshold + (1 << 20))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(repo.path().join("long.txt"), &text).unwrap();
+    std::fs::write(repo.path().join("long.bin"), &binary).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "long files"]);
+    let first_text = git(repo.path(), &["rev-parse", "HEAD:long.txt"]);
+
+    // The text changes, and the binary file is replaced by a short one.
+    let mut changed = text.clone();
+    changed.extend_from_slice(b"one more\r\n");
+    std::fs::write(repo.path().join("long.txt"), &changed).unwrap();
+    std::fs::write(repo.path().join("long.bin"), b"short\0").unwrap();
+    git(repo.path(), &["commit", "-am", "change them"]);
+    let tip = hex_bytes(&git(repo.path(), &["rev-parse", "HEAD"]));
+
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let journal = dir.path().join("import.sqlite");
+    stage_import(repo.path(), &journal, &objects, &content, Some(1))
+        .await
+        .unwrap();
+
+    // The first commit stored the text canonicalized, and the journal maps its blob.
+    let canonical = |text: &[u8]| {
+        text.iter()
+            .copied()
+            .filter(|byte| *byte != b'\r')
+            .collect::<Vec<_>>()
+    };
+    let id = |bytes: &[u8]| {
+        let mut hasher = wheat_core::ContentId::hasher();
+        hasher.update(bytes);
+        wheat_core::ContentId::from_digest(*hasher.finalize().as_bytes())
+    };
+    let value = |content| {
+        Some(wheat_core::FileValue {
+            content,
+            kind: wheat_core::FileKind::Regular,
+        })
+    };
+    let first = canonical(&text);
+    let mapped: Vec<u8> = rusqlite::Connection::open(&journal)
+        .unwrap()
+        .query_row(
+            "SELECT content FROM blob_content WHERE oid = ?1 AND symlink = 0",
+            [hex_bytes(&first_text)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mapped, id(&first).as_bytes());
+    assert_eq!(
+        content.logical_length(id(&first)).unwrap(),
+        first.len() as u64
+    );
+    assert_eq!(
+        content.logical_length(id(&binary)).unwrap(),
+        binary.len() as u64
+    );
+
+    // Resuming takes the first text's value from the journal, as the second commit's
+    // before side, and records each file as one whole-file replacement.
+    let staged = stage_import(repo.path(), &journal, &objects, &content, None)
+        .await
+        .unwrap();
+    let native = staged
+        .branches
+        .values()
+        .find(|branch| branch.source_oid == tip)
+        .and_then(|branch| branch.native)
+        .unwrap();
+    let reader = RepositoryReader::new(&objects, &content);
+    let revision = reader.revision(native.revision_id).await.unwrap();
+    let mut operations = Vec::new();
+    for edit in &revision.edits {
+        let edit = reader.edit(*edit).await.unwrap();
+        operations.push((edit.path.clone(), edit.operation.clone()));
+    }
+    operations.sort_by(|a, b| a.0.cmp(&b.0));
+    let second = canonical(&changed);
+    assert_eq!(
+        operations,
+        [
+            (
+                "long.bin".to_owned(),
+                EditOperation::ExactFile {
+                    expected: value(id(&binary)),
+                    replacement: value(id(b"short\0")),
+                }
+            ),
+            (
+                "long.txt".to_owned(),
+                EditOperation::ExactFile {
+                    expected: value(id(&first)),
+                    replacement: value(id(&second)),
+                }
+            ),
+        ]
+    );
+    assert_eq!(
+        content.logical_length(id(&second)).unwrap(),
+        second.len() as u64
+    );
+    assert!(content.contains(id(b"short\0")));
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+        .collect()
+}

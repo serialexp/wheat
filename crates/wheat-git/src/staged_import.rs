@@ -71,7 +71,7 @@ pub(crate) fn commit_proposal(
     content: &ContentStore,
 ) -> Result<ChangeProposal, StagedImportError> {
     let object = git.find_commit(commit).map_err(git_error_local)?;
-    let edits = tree_diff::tree_edits(git, &object, commit.as_bytes(), content)?;
+    let edits = tree_diff::tree_edits(git, &object, commit.as_bytes(), content, None)?;
     let parents = object
         .parent_ids()
         .map(|parent| parent.detach())
@@ -311,7 +311,7 @@ async fn stage_import_inner<O: ImmutableObjectStore>(
             .transpose()?
             .flatten();
         let parent_view = parent_native.map_or(empty, |p| p.view_id);
-        let edits = tree_diff::tree_edits(&git, &commit, &work.oid, content)?;
+        let edits = tree_diff::tree_edits(&git, &commit, &work.oid, content, Some(&journal))?;
         let parents = commit.parent_ids().map(|p| p.detach()).collect::<Vec<_>>();
         let (change_metadata, revision_metadata) =
             metadata(&commit, &work.oid, &parents).map_err(convert_import_error)?;

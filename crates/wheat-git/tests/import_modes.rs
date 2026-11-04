@@ -461,27 +461,39 @@ async fn atomic_import_retains_binary_content_above_the_guarded_text_limit() {
 }
 
 #[tokio::test]
-async fn atomic_import_rejects_a_file_above_the_in_memory_import_bound() {
+async fn atomic_import_streams_a_file_above_the_in_memory_import_bound() {
+    const LENGTH: usize = 64 * 1024 * 1024 + 1;
     let git = oversized_binary_fixture();
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("atomic");
 
-    let error = atomic_import(git.path(), &destination, "refs/heads/main")
+    // The file is streamed from Git into the store rather than read whole, so the
+    // bound on what import holds does not apply to it.
+    let head = atomic_import(git.path(), &destination, "refs/heads/main")
         .await
-        .unwrap_err();
-    let AtomicImportError::Stage(wheat_git::StagedImportError::EditCapture { source, .. }) = error
-    else {
-        panic!("unexpected error: {error:?}")
-    };
-    assert!(matches!(
-        source,
-        wheat_core::edit_capture::EditCaptureError::InputTooLarge {
-            side: wheat_core::edit_capture::SnapshotSide::After,
-            actual: 67_108_865,
-            limit: 67_108_864
-        }
-    ));
-    assert!(!destination.exists());
+        .unwrap();
+    let objects = PackedObjectStore::open(destination.join("storage")).unwrap();
+    let content = objects.content_store();
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    let repository = reader.hydrate(envelope.state).await.unwrap();
+    let value = repository
+        .view(labels.labels["main"].view)
+        .unwrap()
+        .tree
+        .get("too-large.bin")
+        .expect("the file is visible");
+    let mut hasher = wheat_core::ContentId::hasher();
+    hasher.update(&vec![0; LENGTH]);
+    assert_eq!(
+        value.content,
+        wheat_core::ContentId::from_digest(*hasher.finalize().as_bytes())
+    );
+    assert_eq!(
+        content.logical_length(value.content).unwrap(),
+        LENGTH as u64
+    );
 }
 
 // Stale stages are recognised by a marker opened without following symlinks,

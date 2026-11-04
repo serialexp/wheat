@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: partial — steps 1 (format, two levels), 2 (store), 3 (protocol) and 4 (client) landed, steps 5–7 outstanding
+Status: partial — steps 1 (format, two levels), 2 (store), 3 (protocol), 4 (client) and 5 (Git bridge) landed, steps 6–7 outstanding
 Owner: bart
 Last updated: 2026-11-05
 
@@ -108,15 +108,39 @@ land and move them from Outstanding to Done.
   `--no-limit`, which streams through `ContentStore::reader` with no bound. JSON
   output is base64 (`result.base64`) instead of a byte array; with `--no-limit` it is
   JSON lines of 3 MiB base64 parts ending in `{"ok": true, "parts": n}`.
+- [x] **Decision — reading long Git blobs (2026-11-05).** Bart: reuse Gothab's
+  approach, whose remote helper streams `git cat-file blob <oid>`. gix reads an
+  object only whole, and Wheat already runs `git` to push.
+- [x] **Decision — what the importer knows about a blob it stored (2026-11-05).**
+  Bart: "keep them in sqlite and fall back to A": the import journal maps a long
+  blob's Git ID to the `ContentId` it was stored as, and without a row the blob is
+  read and hashed again.
+- [x] **Step 5 — Git bridge.** Export writes a blob over 16 MiB to Git with
+  `gix::objs::Write::write_stream` from `ContentStore::reader`, charging its stored
+  length to the export limit (`export.rs`, `write_blob`). Import takes a side's
+  length from the Git object header; when either side is longer than the guarded
+  input bound plus `MAX_IMPORT_GUARDED_LINES` bytes (`STREAMED_BLOB_BYTES`, just over
+  16 MiB) it records the one whole-file replacement capture would, from the values
+  alone (`staged_import/tree_diff.rs`, `record_whole_file`). A side's value comes
+  from the journal's `blob_content` table for a before side, else from streaming
+  `git cat-file blob` through `StreamingCapture`, and the blob is streamed a second
+  time, canonicalized by `LineEndings`, into `ContentStore::writer` when the store
+  lacks it. `wheat pull` has no journal and always hashes. The 64 MiB import file
+  limit no longer meets these blobs. Tests: `a_streamed_side_is_one_capture_records_whole`
+  (the bound is tight), `long_blobs_stream_into_whole_file_edits_and_map_their_content`
+  (wheat-git), `long_files_round_trip_through_git` (push, pull and import of 17 MiB
+  files, wheat-cli).
 
 ### Outstanding
 
-- [ ] **Step 5 — Git bridge.** Import and export stream large blobs.
+- [ ] **Defer — the in-memory Git importer.** `wheat_git::import_repository`, used by
+  tests and an example only, still reads every blob whole and refuses one over the
+  guarded bound.
 - [ ] **Step 6 — repack, verification, bundles.** Content repack and generations
   hold chunks and manifests; full verification and network export/import stream.
 - [ ] **Step 7 — benchmarks and contracts.** Cases for a large file's add,
-  publish, fetch, a small edit to it, and materialization, with peak memory and
-  bytes written/sent as budgets.
+  publish, fetch, a small edit to it, materialization, and its Git push and import,
+  with peak memory and bytes written/sent as budgets.
 
 ## Why this exists
 
@@ -334,6 +358,11 @@ What changes outside the store (from the inventory of whole-blob paths,
   gix's object reader into the writer. **Git export** writes a large blob to Git
   through a stream (Git's blob hash needs the length first, which the manifest
   has).
+
+  As built (step 5): gix has no streaming object reader, so import streams a long
+  blob from `git cat-file blob` instead, as Gothab's remote helper does. A transition
+  with a long side is a whole-file replacement either way, so import records it from
+  the two values without capture.
 - **Repack** treats chunks as ordinary content (delta-free) and manifests as small
   records; its 64 MiB per-record limit no longer meets large blobs.
 - **Verification and bundles** (`repository_verify`, network export/import) read
