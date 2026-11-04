@@ -462,10 +462,12 @@ fn one_revision_applies_more_edits_than_one_file_may_hold() {
     assert!(result.tree.values().all(|value| value.content == new_id));
 }
 
-/// A source over `blobs` that records which IDs it resolved and which it confirmed.
+/// A source over `blobs` that records which IDs it resolved and which it confirmed, and
+/// knows the `lengths` given.
 #[derive(Default)]
 struct Recording {
     blobs: BTreeMap<ContentId, VerifiedContent>,
+    lengths: BTreeMap<ContentId, u64>,
     resolved: Vec<ContentId>,
     confirmed: Vec<ContentId>,
 }
@@ -484,6 +486,10 @@ impl wheat_core::edit_application::ContentSource for &mut Recording {
             .get(&id)
             .map(|_| None)
             .ok_or_else(|| "missing".into())
+    }
+
+    fn logical_length(&mut self, id: ContentId) -> Result<Option<u64>, String> {
+        Ok(self.lengths.get(&id).copied())
     }
 }
 
@@ -588,4 +594,49 @@ fn a_guarded_edit_reads_the_file_it_matches() {
         "confirmed {:?}",
         source.confirmed
     );
+}
+#[test]
+fn a_guarded_edit_refuses_a_target_past_the_byte_limit_without_reading_it() {
+    let parts = [b"a\n".as_slice(), b"b\n", b"B\n", b"c\n"];
+    let long = ContentId::of(b"stands for a file of a gibibyte");
+    let mut source = Recording {
+        blobs: parts.into_iter().map(blob).collect(),
+        lengths: BTreeMap::from([(long, 1 << 30)]),
+        ..Recording::default()
+    };
+    let edit = EditRecord::new(
+        "f",
+        EditOperation::GuardedText {
+            kind: FileKind::Regular,
+            before: ContentId::of(b"a\n"),
+            expected: ContentId::of(b"b\n"),
+            replacement: ContentId::of(b"B\n"),
+            after: ContentId::of(b"c\n"),
+            start_anchor: false,
+            end_anchor: false,
+        },
+    )
+    .unwrap();
+    let mut target = Tree::new();
+    target.insert(
+        "f".into(),
+        FileValue {
+            content: long,
+            kind: FileKind::Regular,
+        },
+    );
+    let limits = ApplicationLimits::default();
+    let result = apply_edits(&target, [(edit.id(), edit)], &mut source, limits);
+    assert!(
+        matches!(
+            result,
+            Err(wheat_core::edit_application::ApplicationError::ByteLimitExceeded {
+                generated: false,
+                limit,
+                ..
+            }) if limit == limits.max_resolved_bytes
+        ),
+        "{result:?}"
+    );
+    assert!(source.resolved.is_empty(), "read {:?}", source.resolved);
 }

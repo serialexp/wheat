@@ -121,6 +121,13 @@ pub trait ContentSource {
     fn confirm(&mut self, id: ContentId) -> Result<Option<VerifiedContent>, Self::Error> {
         self.resolve(id).map(Some)
     }
+
+    /// The length of `id` in bytes when the source knows it without reading the content, so
+    /// content past the application's byte limit is refused before it is read. By default
+    /// it is unknown.
+    fn logical_length(&mut self, _id: ContentId) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
 }
 
 impl<F, E> ContentSource for F
@@ -234,6 +241,24 @@ pub fn apply_edits(
                 return Err(ApplicationError::CorruptContent {
                     expected: id,
                     actual: content.id(),
+                });
+            }
+        }
+        // Lengths the source knows are charged first, so a long target is refused unread.
+        let mut known_total = 0u64;
+        for &id in &needed {
+            let length = source
+                .logical_length(id)
+                .map_err(|error| ApplicationError::Resolve {
+                    id,
+                    message: error.to_string(),
+                })?;
+            known_total = known_total.saturating_add(length.unwrap_or(0));
+            if known_total > limits.max_resolved_bytes as u64 {
+                return Err(ApplicationError::ByteLimitExceeded {
+                    generated: false,
+                    actual: usize::try_from(known_total).unwrap_or(usize::MAX),
+                    limit: limits.max_resolved_bytes,
                 });
             }
         }

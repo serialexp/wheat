@@ -18,9 +18,17 @@ pub trait ContentIo {
         self.resolve(id).map(drop)
     }
     /// The length of `id` in bytes. By default it resolves the content; a store that
-    /// records lengths should read them instead.
+    /// records lengths reads them instead, through [`ContentIo::known_length`].
     fn logical_length(&self, id: ContentId) -> Result<u64, Self::Error> {
-        self.resolve(id).map(|content| content.bytes().len() as u64)
+        match self.known_length(id)? {
+            Some(length) => Ok(length),
+            None => self.resolve(id).map(|content| content.bytes().len() as u64),
+        }
+    }
+    /// The length of `id` when the store records it, without reading the content. By
+    /// default it is unknown.
+    fn known_length(&self, _id: ContentId) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
     }
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error>;
 }
@@ -39,6 +47,10 @@ impl<C: ContentIo + ?Sized> crate::edit_application::ContentSource for FromConte
 
     fn confirm(&mut self, id: ContentId) -> Result<Option<VerifiedContent>, Self::Error> {
         self.0.confirm(id).map(|()| None)
+    }
+
+    fn logical_length(&mut self, id: ContentId) -> Result<Option<u64>, Self::Error> {
+        self.0.known_length(id)
     }
 }
 

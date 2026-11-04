@@ -384,6 +384,13 @@ impl ContentSource for Replaying<'_> {
             _ => self.store.confirm(id).map(|()| None),
         }
     }
+
+    fn logical_length(&mut self, id: ContentId) -> Result<Option<u64>, Self::Error> {
+        match self.file {
+            Some(content) if id == content.id() => Ok(Some(content.bytes().len() as u64)),
+            _ => self.store.logical_length(id).map(Some),
+        }
+    }
 }
 
 /// Asks before moving edits out of later changes into `change`. Without anyone to ask, it
