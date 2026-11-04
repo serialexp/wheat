@@ -496,132 +496,165 @@ async fn conflict_resolution_deletion_mode_and_symlink_match_hydrated_reference(
         Some((b"authored".as_slice(), FileKind::Executable)),
         Some((b"destination".as_slice(), FileKind::Symlink)),
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let objects = LooseObjectStore::new(dir.path().join("objects"));
-        let content = ContentStore::new(dir.path().join("content"));
-        let heads = LocalPublicationStore::new(dir.path().join("head"));
-        for bytes in [b"base".as_slice(), b"authored", b"upstream", b"destination"] {
-            content.put(bytes).unwrap();
-        }
-
-        let mut reference = Repository::new(Tree::new());
-        let base = reference.base_view().id;
-        let mut effective = base;
-        let parent = ChangeId::new();
-        let parent_edits = exact("file", None, b"base");
-        let parent_edit = *parent_edits.edits.keys().next().unwrap();
-        let parent_outcome = reference
-            .create_change_with_id(
-                base,
-                effective,
-                parent,
-                [],
-                parent_edits,
-                ApplicationContext::new(&content),
-            )
-            .unwrap();
-        effective = parent_outcome.resulting_view;
-        let child = ChangeId::new();
-        let child_outcome = reference
-            .create_change_with_id(
-                base,
-                effective,
-                child,
-                [parent],
-                exact("file", Some(b"base"), b"authored"),
-                ApplicationContext::new(&content),
-            )
-            .unwrap();
-        effective = child_outcome.resulting_view;
-        let publisher = RepositoryPublisher::new(&objects, &content, &heads);
-        let head = publisher.initialize(&reference).await.unwrap();
-
-        let parent_revision = revision("file", None, b"upstream", parent_edit);
-        let mutation_effective = effective;
-        let expected_revise = reference
-            .revise_change(
-                base,
-                effective,
-                parent,
-                parent_outcome.revision_id,
-                parent_revision.clone(),
-                ApplicationContext::new(&content),
-            )
-            .unwrap();
-        effective = expected_revise.resulting_view;
-        let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
-        let (prepared, actual_revise) = mutator
-            .revise(
-                head,
-                base,
-                mutation_effective,
-                parent,
-                parent_outcome.revision_id,
-                RevisionMetadata::default(),
-                parent_revision,
-            )
-            .await
-            .unwrap();
-        assert_eq!(actual_revise, expected_revise);
-        let conflicted_head = mutator.publish(prepared).await.unwrap();
-
-        let conflict_revision = reference.current_revision(effective, child).unwrap();
-        let application = reference
-            .conflicted_application(effective, conflict_revision)
-            .unwrap()
-            .clone();
-        let value = resolved.map(|(bytes, kind)| FileValue {
-            content: ContentId::of(bytes),
-            kind,
-        });
-        let mut resolved_tree = application.result.materialized_tree().clone();
-        if let Some(value) = value {
-            resolved_tree.insert("file".into(), value);
-        } else {
-            resolved_tree.remove("file");
-        }
-        let expected = reference
-            .resolve_conflict(
-                base,
-                effective,
-                ConflictResolution {
-                    conflict_revision,
-                    resolved_tree,
-                },
-                ApplicationContext::new(&content),
-            )
-            .unwrap();
-        let expected_state = reference.canonical_closure().state.id;
-        let (prepared, actual) = mutator
-            .resolve_conflict(
-                conflicted_head,
-                base,
-                effective,
-                PersistedConflictResolution {
-                    conflict_revision,
-                    application: application.id,
-                    resolved: [("file".into(), value)].into(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(prepared.state(), expected_state);
-        let resolved_head = mutator.publish(prepared).await.unwrap();
-        let reader = RepositoryReader::new(&objects, &content);
-        let envelope = reader.envelope(resolved_head.envelope).await.unwrap();
-        reader.validate_complete(envelope.state).await.unwrap();
-        assert_eq!(
-            reader
-                .hydrate(envelope.state)
-                .await
-                .unwrap()
-                .canonical_closure()
-                .state
-                .id,
-            expected_state
-        );
+        resolve_conflict_like_the_reference(
+            [b"base", b"authored", b"upstream", b"destination"],
+            resolved,
+        )
+        .await;
     }
+}
+
+#[tokio::test]
+async fn a_conflict_on_a_long_file_resolves_as_a_whole_file_like_the_reference() {
+    // Past the guarded bound, so each is chunked and changes as a whole.
+    let long = |seed: u8| {
+        let mut bytes = vec![seed; 20 << 20];
+        bytes[seed as usize] = !seed;
+        bytes
+    };
+    let (base, authored, upstream) = (long(1), long(2), long(3));
+    for resolved in [
+        None,
+        Some((b"short".as_slice(), FileKind::Regular)),
+        Some((authored.as_slice(), FileKind::Regular)),
+    ] {
+        resolve_conflict_like_the_reference([&base, &authored, &upstream, b"short"], resolved)
+            .await;
+    }
+}
+
+/// Change `parent` creates `file` as `original`, `child` replaces it with `authored`, then
+/// `parent` is revised to `upstream`, which leaves `child` conflicted. Resolving the
+/// conflict to `resolved` (deleting the file for `None`) must match the hydrated reference.
+async fn resolve_conflict_like_the_reference(
+    [original, authored, upstream, extra]: [&[u8]; 4],
+    resolved: Option<(&[u8], FileKind)>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let heads = LocalPublicationStore::new(dir.path().join("head"));
+    for bytes in [original, authored, upstream, extra] {
+        content.put(bytes).unwrap();
+    }
+
+    let mut reference = Repository::new(Tree::new());
+    let base = reference.base_view().id;
+    let mut effective = base;
+    let parent = ChangeId::new();
+    let parent_edits = exact("file", None, original);
+    let parent_edit = *parent_edits.edits.keys().next().unwrap();
+    let parent_outcome = reference
+        .create_change_with_id(
+            base,
+            effective,
+            parent,
+            [],
+            parent_edits,
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    effective = parent_outcome.resulting_view;
+    let child = ChangeId::new();
+    let child_outcome = reference
+        .create_change_with_id(
+            base,
+            effective,
+            child,
+            [parent],
+            exact("file", Some(original), authored),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    effective = child_outcome.resulting_view;
+    let publisher = RepositoryPublisher::new(&objects, &content, &heads);
+    let head = publisher.initialize(&reference).await.unwrap();
+
+    let parent_revision = revision("file", None, upstream, parent_edit);
+    let mutation_effective = effective;
+    let expected_revise = reference
+        .revise_change(
+            base,
+            effective,
+            parent,
+            parent_outcome.revision_id,
+            parent_revision.clone(),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    effective = expected_revise.resulting_view;
+    let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
+    let (prepared, actual_revise) = mutator
+        .revise(
+            head,
+            base,
+            mutation_effective,
+            parent,
+            parent_outcome.revision_id,
+            RevisionMetadata::default(),
+            parent_revision,
+        )
+        .await
+        .unwrap();
+    assert_eq!(actual_revise, expected_revise);
+    let conflicted_head = mutator.publish(prepared).await.unwrap();
+
+    let conflict_revision = reference.current_revision(effective, child).unwrap();
+    let application = reference
+        .conflicted_application(effective, conflict_revision)
+        .unwrap()
+        .clone();
+    let value = resolved.map(|(bytes, kind)| FileValue {
+        content: ContentId::of(bytes),
+        kind,
+    });
+    let mut resolved_tree = application.result.materialized_tree().clone();
+    if let Some(value) = value {
+        resolved_tree.insert("file".into(), value);
+    } else {
+        resolved_tree.remove("file");
+    }
+    let expected = reference
+        .resolve_conflict(
+            base,
+            effective,
+            ConflictResolution {
+                conflict_revision,
+                resolved_tree,
+            },
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    let expected_state = reference.canonical_closure().state.id;
+    let (prepared, actual) = mutator
+        .resolve_conflict(
+            conflicted_head,
+            base,
+            effective,
+            PersistedConflictResolution {
+                conflict_revision,
+                application: application.id,
+                resolved: [("file".into(), value)].into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(prepared.state(), expected_state);
+    let resolved_head = mutator.publish(prepared).await.unwrap();
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(resolved_head.envelope).await.unwrap();
+    reader.validate_complete(envelope.state).await.unwrap();
+    assert_eq!(
+        reader
+            .hydrate(envelope.state)
+            .await
+            .unwrap()
+            .canonical_closure()
+            .state
+            .id,
+        expected_state
+    );
 }
 
 async fn reader_state(

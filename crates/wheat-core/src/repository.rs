@@ -913,9 +913,39 @@ impl Repository {
         let target = self.views[&application.target_view].clone();
         let mut edits = BTreeMap::new();
         let mut generated = BTreeMap::new();
+        let content_error = |error: C::Error| RepositoryError::ContentIo(error.to_string());
+        let capture_error = |error| RepositoryError::EditApplication(format!("capture: {error:?}"));
         for path in changed_paths {
             let before_value = target.tree.get(&path).copied();
             let after_value = resolution.resolved_tree.get(&path).copied();
+            // A file past the guarded bound on either side changes as a whole, unread.
+            let past_bound = |value: Option<crate::FileValue>| -> Result<bool, RepositoryError> {
+                Ok(match value {
+                    Some(value) => {
+                        context
+                            .content
+                            .logical_length(value.content)
+                            .map_err(content_error)?
+                            > context.limits.guarded.max_input_bytes as u64
+                    }
+                    None => false,
+                })
+            };
+            if past_bound(before_value)? || past_bound(after_value)? {
+                if let Some(after) = after_value {
+                    context
+                        .content
+                        .confirm(after.content)
+                        .map_err(content_error)?;
+                }
+                if let Some(record) =
+                    crate::edit_capture::capture_whole_file(&path, before_value, after_value)
+                        .map_err(capture_error)?
+                {
+                    edits.insert(record.id(), record);
+                }
+                continue;
+            }
             let before_bytes = before_value
                 .map(|v| {
                     context
@@ -951,7 +981,7 @@ impl Repository {
                 None,
                 context.limits.guarded,
             )
-            .map_err(|error| RepositoryError::EditApplication(format!("capture: {error:?}")))?;
+            .map_err(capture_error)?;
             edits.extend(captured.edits);
             generated.extend(captured.content);
         }

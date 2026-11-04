@@ -450,6 +450,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let content_error =
             |error: crate::ContentStoreError| RepositoryError::ContentIo(error.to_string());
         let mut captured_content = crate::ContentWriteBatch::new(self.content);
+        let capture_limits = wheat_core::guarded::Limits::default();
         for (((path, after_value), partial_value), before_value) in resolution
             .resolved
             .iter()
@@ -461,6 +462,34 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             }
             if !conflict_paths.contains(path.as_str()) {
                 return Err(RepositoryError::InvalidConflictResolution.into());
+            }
+            // A file past the guarded bound on either side changes as a whole, as capture would
+            // record it, without being read: the target tree's value is already stored, and the
+            // resolved one is confirmed.
+            let past_bound = |value: Option<FileValue>| -> Result<bool> {
+                Ok(match value {
+                    Some(value) => {
+                        self.content
+                            .logical_length(value.content)
+                            .map_err(content_error)?
+                            > capture_limits.max_input_bytes as u64
+                    }
+                    None => false,
+                })
+            };
+            if past_bound(before_value)? || past_bound(*after_value)? {
+                if let Some(after) = after_value {
+                    self.content.confirm(after.content).map_err(content_error)?;
+                }
+                if let Some(record) =
+                    wheat_core::edit_capture::capture_whole_file(path, before_value, *after_value)
+                        .map_err(|error| {
+                        RepositoryError::EditApplication(format!("capture: {error:?}"))
+                    })?
+                {
+                    replacements.insert(record.id(), record);
+                }
+                continue;
             }
             // Resolve and authenticate content before constructing or persisting metadata which
             // refers to it. This also supplies capture without hydrating either tree.
@@ -495,7 +524,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                 before,
                 after,
                 None,
-                wheat_core::guarded::Limits::default(),
+                capture_limits,
             )
             .map_err(|error| RepositoryError::EditApplication(format!("capture: {error:?}")))?;
             for content in captured.content.into_values() {
@@ -1425,9 +1454,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
     ) -> Result<PreparedRepositoryMutation> {
         tracing::debug_span!("resolve_fresh_content", count = fresh.content.len()).in_scope(
             || -> Result<()> {
+                // Confirmed rather than read, so a long blob is never held whole.
                 for id in &fresh.content {
                     self.content
-                        .resolve(*id)
+                        .confirm(*id)
                         .map_err(RepositoryPublicationError::Content)?;
                 }
                 Ok(())

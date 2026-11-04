@@ -15,6 +15,10 @@ impl ContentIo for ContentStore {
         ContentStore::confirm(self, id)
     }
 
+    fn logical_length(&self, id: ContentId) -> Result<u64, Self::Error> {
+        ContentStore::logical_length(self, id)
+    }
+
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error> {
         self.put_verified(content)
     }

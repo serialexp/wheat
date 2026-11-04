@@ -17,6 +17,11 @@ pub trait ContentIo {
     fn confirm(&self, id: ContentId) -> Result<(), Self::Error> {
         self.resolve(id).map(drop)
     }
+    /// The length of `id` in bytes. By default it resolves the content; a store that
+    /// records lengths should read them instead.
+    fn logical_length(&self, id: ContentId) -> Result<u64, Self::Error> {
+        self.resolve(id).map(|content| content.bytes().len() as u64)
+    }
     fn store_generated(&self, content: VerifiedContent<&[u8]>) -> Result<(), Self::Error>;
 }
 

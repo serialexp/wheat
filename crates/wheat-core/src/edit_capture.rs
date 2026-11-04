@@ -83,6 +83,30 @@ impl From<Limits> for CaptureLimits {
     }
 }
 
+/// Capture of a transition with a side past the guarded bound, from its values alone: the
+/// one exact whole-file replacement [`capture_edit_with_limits`] records for it, or nothing
+/// when the values are the same. Neither side is read, so neither is canonicalized; values
+/// from a tree or the store already are.
+pub fn capture_whole_file(
+    path: &str,
+    before: Option<FileValue>,
+    after: Option<FileValue>,
+) -> Result<Option<EditRecord>, EditCaptureError> {
+    validate_path(path).map_err(EditCaptureError::InvalidPath)?;
+    if before == after {
+        return Ok(None);
+    }
+    EditRecord::new(
+        path,
+        EditOperation::ExactFile {
+            expected: before,
+            replacement: after,
+        },
+    )
+    .map(Some)
+    .map_err(EditCaptureError::InvalidRecord)
+}
+
 /// Convert borrowed, authenticated snapshots into canonical edit definitions.
 ///
 /// Regular and executable UTF-8 files without NUL bytes are canonicalized to LF
