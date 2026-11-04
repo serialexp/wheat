@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/serialexp/wheat/main/install.sh | s
 
 On glibc 2.39 or newer (Ubuntu 24.04 and later) it installs the glibc build; on an
 older glibc or a musl system such as Alpine, a static musl build. `WHEAT_LIBC=gnu` or
-`musl` picks one, `WHEAT_VERSION=v0.3.0` a release, `WHEAT_INSTALL_DIR` another
+`musl` picks one, `WHEAT_VERSION=v0.3.1` a release, `WHEAT_INSTALL_DIR` another
 directory. The CLI runs only on Linux: on macOS and Windows it refuses every command.
 
 Releases come from `.github/workflows/release.yml`: push a tag `v<version>` matching
