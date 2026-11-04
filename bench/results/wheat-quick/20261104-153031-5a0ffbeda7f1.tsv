@@ -1,0 +1,26 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261104-153031
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# publish_content	{"file_mib":12,"files":32}
+# release	true
+# rev	5a0ffbeda7f1
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+publish_content.total.wall	8.662388746	s
+publish_content.total.peak_rss	209858560	bytes
+publish_content.add.wall	2.056813122	s
+publish_content.add.peak_rss	104116224	bytes
+publish_content.publish_server.peak_rss	209858560	bytes
+publish_content.publish.wall	5.612542919	s
+publish_content.publish.peak_rss	99794944	bytes
+publish_content.clone_server.peak_rss	101867520	bytes
+publish_content.clone.wall	0.531751147	s
+publish_content.clone.peak_rss	106135552	bytes
+run.total_time	8.662974408	s
+process.peak_rss	209858560	bytes
+suite.cases	1	count
+suite.case_failures	0	count
