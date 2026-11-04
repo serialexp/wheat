@@ -4,14 +4,20 @@
 use crate::support;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use support::{connect_and_handshake, open_repo, recv_msg};
+use tokio::time::Instant;
 use wheat_protocol::WheatProtocolMessage;
-use wheat_server::registry::{DeleteError, Registry, RegistryLimits};
+use wheat_server::registry::{
+    DeleteError, OpenError, Registry, RegistryLimits, RepositoryDeleter, RepositoryEntry,
+    RepositoryOpener,
+};
 use wheat_server::server::{ServerConfig, run_until};
-use wheat_store::RepositoriesDirectory;
+use wheat_store::{RepositoriesDirectory, RepositoryDirectory};
 
 /// A directory with `alice/repo` and its fork `bob/repo`.
 async fn forked() -> (tempfile::TempDir, RepositoriesDirectory) {
@@ -127,4 +133,113 @@ async fn a_session_ends_with_not_found_when_its_repository_is_deleted() {
         }
         other => panic!("expected Error, got {other:?}"),
     }
+}
+
+/// An embedder's own opener, as Gothab's: each repository a directory of its own under
+/// `root`, named by its owner and name, with no repositories directory.
+struct OwnOpener {
+    root: tempfile::TempDir,
+    deletes: bool,
+    opens: AtomicUsize,
+    /// Whether the store could be opened again when it was deleted: closed.
+    closed_when_deleted: AtomicBool,
+}
+
+impl OwnOpener {
+    async fn with(name: &str, deletes: bool) -> Arc<Self> {
+        let opener = Self {
+            root: tempfile::tempdir().unwrap(),
+            deletes,
+            opens: AtomicUsize::new(0),
+            closed_when_deleted: AtomicBool::new(false),
+        };
+        opener.directory(name).create_empty("main").await.unwrap();
+        Arc::new(opener)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.path().join(name.replace('/', "--"))
+    }
+
+    fn directory(&self, name: &str) -> RepositoryDirectory {
+        RepositoryDirectory::new(self.path(name))
+    }
+}
+
+#[wheat_server::async_trait]
+impl RepositoryOpener for OwnOpener {
+    async fn open(&self, name: &str) -> Result<Option<RepositoryEntry>, OpenError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        if !self.path(name).exists() {
+            return Ok(None);
+        }
+        RepositoryEntry::open(&self.path(name))
+            .map(Some)
+            .map_err(|error| OpenError(Box::new(error)))
+    }
+
+    fn deleter(&self) -> Option<&dyn RepositoryDeleter> {
+        self.deletes.then_some(self as &dyn RepositoryDeleter)
+    }
+}
+
+#[wheat_server::async_trait]
+impl RepositoryDeleter for OwnOpener {
+    async fn delete(&self, name: &str, _deadline: Instant) -> Result<(), DeleteError> {
+        let path = self.path(name);
+        if !path.exists() {
+            return Err(DeleteError::Missing);
+        }
+        // The packed store is locked while open: opening it again proves it closed.
+        let closed = self.directory(name).open_store().is_ok();
+        self.closed_when_deleted.store(closed, Ordering::SeqCst);
+        std::fs::remove_dir_all(path).map_err(|error| DeleteError::Failed(Box::new(error)))
+    }
+}
+
+#[tokio::test]
+async fn an_opener_deletes_its_own_repository_once_the_store_closed() {
+    let opener = OwnOpener::with("alice/repo", true).await;
+    let registry = Registry::with_opener(opener.clone(), RegistryLimits::default());
+    let entry = registry.get("alice/repo").await.unwrap().unwrap();
+
+    let deleting = registry.delete("alice/repo");
+    let ended = async {
+        entry.removed().await;
+        // Held a while longer, as a session finishing what it was doing; meanwhile
+        // the name finds nothing and is not opened again.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(registry.get("alice/repo").await.unwrap().is_none());
+        assert_eq!(opener.opens.load(Ordering::SeqCst), 1);
+        assert!(opener.path("alice/repo").exists(), "deleted while held");
+        drop(entry);
+    };
+    let (deleted, ()) = tokio::join!(deleting, ended);
+    deleted.unwrap();
+
+    assert!(opener.closed_when_deleted.load(Ordering::SeqCst));
+    assert!(!opener.path("alice/repo").exists());
+    assert!(registry.get("alice/repo").await.unwrap().is_none());
+    assert!(matches!(
+        registry.delete("alice/repo").await,
+        Err(DeleteError::Missing)
+    ));
+}
+
+#[tokio::test]
+async fn an_opener_without_a_deleter_leaves_its_sessions_alone() {
+    let opener = OwnOpener::with("alice/repo", false).await;
+    let registry = Registry::with_opener(opener.clone(), RegistryLimits::default());
+    let entry = registry.get("alice/repo").await.unwrap().unwrap();
+
+    assert!(matches!(
+        registry.delete("alice/repo").await,
+        Err(DeleteError::Unsupported)
+    ));
+    let removed = tokio::time::timeout(Duration::from_millis(50), entry.removed()).await;
+    assert!(removed.is_err(), "the session was ended");
+    assert!(Arc::ptr_eq(
+        &entry,
+        &registry.get("alice/repo").await.unwrap().unwrap()
+    ));
 }

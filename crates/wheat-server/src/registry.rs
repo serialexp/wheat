@@ -102,6 +102,25 @@ pub trait RepositoryOpener: Send + Sync {
     fn directory(&self) -> Option<DirectoryHandle> {
         None
     }
+
+    /// What deletes this opener's repositories, when it can: what
+    /// [`Registry::delete`] uses.
+    fn deleter(&self) -> Option<&dyn RepositoryDeleter> {
+        None
+    }
+}
+
+/// Deletes the repositories a [`RepositoryOpener`] opens.
+#[async_trait]
+pub trait RepositoryDeleter: Send + Sync {
+    /// Deletes the repository `name`: its head and what of its store no other
+    /// repository uses. [`Registry::delete`] calls this once the sessions that used it
+    /// ended and the registry dropped its entry, and [`Registry::get`] finds nothing
+    /// under the name until this returns, so it is not opened again meanwhile. A store
+    /// the entry shared with other open repositories (a fork network's) is still open.
+    /// [`DeleteError::Missing`] when there is no such repository;
+    /// [`DeleteError::Held`] when what it must remove is still in use at `deadline`.
+    async fn delete(&self, name: &str, deadline: Instant) -> Result<(), DeleteError>;
 }
 
 /// A repositories directory and its content store, which the process serving it holds
@@ -157,10 +176,13 @@ pub struct Registry {
 /// How long [`Registry::delete`] waits for sessions using a repository to end.
 const DELETE_WAIT: Duration = Duration::from_secs(30);
 
+/// How often [`Registry::delete`] looks again whether they have.
+const DELETE_POLL: Duration = Duration::from_millis(25);
+
 /// A repository could not be deleted.
 #[derive(Debug)]
 pub enum DeleteError {
-    /// The registry does not serve a repositories directory.
+    /// The registry's opener cannot delete repositories.
     Unsupported,
     /// There is no such repository.
     Missing,
@@ -174,7 +196,7 @@ pub enum DeleteError {
 impl std::fmt::Display for DeleteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsupported => f.write_str("this server does not serve a repositories directory"),
+            Self::Unsupported => f.write_str("this server cannot delete repositories"),
             Self::Missing => f.write_str("there is no such repository"),
             Self::Busy => f.write_str("the repository is already being deleted"),
             Self::Held => write!(
@@ -211,12 +233,16 @@ impl Slot {
 
     /// Whether the slot may be closed: open, and nothing holds it.
     fn unused(&self) -> bool {
-        !self.pinned
-            && Arc::strong_count(&self.cell) == 1
+        !self.pinned && self.cell.initialized() && self.released()
+    }
+
+    /// Whether nothing but the slot holds its entry or is opening it.
+    fn released(&self) -> bool {
+        Arc::strong_count(&self.cell) == 1
             && self
                 .cell
                 .get()
-                .is_some_and(|entry| Arc::strong_count(entry) == 1)
+                .is_none_or(|entry| Arc::strong_count(entry) == 1)
     }
 }
 
@@ -374,47 +400,38 @@ impl Registry {
     }
 
     /// Deletes the repository `name` while it is served: sessions using it end, the
-    /// name stops finding it, and once nothing holds it open its head is removed
-    /// (and its network, when it was the last repository in it); see
-    /// [`RepositoriesDirectory::delete`]. Waits up to thirty seconds for the holders.
+    /// name stops finding it, and once nothing holds it open the opener's
+    /// [`RepositoryDeleter`] deletes it (for a [`DirectoryOpener`], see
+    /// [`RepositoriesDirectory::delete`]). Waits up to thirty seconds for the holders.
     pub async fn delete(&self, name: &str) -> Result<(), DeleteError> {
-        let directory = self.directory().ok_or(DeleteError::Unsupported)?;
+        let deleter = self
+            .opener
+            .as_deref()
+            .and_then(RepositoryOpener::deleter)
+            .ok_or(DeleteError::Unsupported)?;
         // Both under the slots' lock, which `get` holds when it checks the name and adds a
         // slot: it adds none for a name once this marks it.
         let (_deleting, slot) = {
             let mut slots = self.lock();
             (DeletingName::begin(self, name)?, slots.remove(name))
         };
-        if let Some(entry) = slot.as_ref().and_then(|slot| slot.cell.get()) {
-            entry.mark_removed();
-        }
-        drop(slot);
-
         let deadline = Instant::now() + DELETE_WAIT;
-        loop {
-            let repositories = directory.repositories.clone();
-            let doomed = name.to_owned();
-            let result = tokio::task::spawn_blocking(move || repositories.delete(&doomed))
-                .await
-                .map_err(|error| DeleteError::Failed(Box::new(error)))?;
-            match result {
-                Ok(()) => {
-                    info!(repo = name, "repository deleted");
-                    return Ok(());
+        if let Some(slot) = slot {
+            if let Some(entry) = slot.cell.get() {
+                entry.mark_removed();
+            }
+            // The sessions are on their way out; a `get` opening it meanwhile finds the
+            // name deleting and drops what it opened.
+            while !slot.released() {
+                if Instant::now() >= deadline {
+                    return Err(DeleteError::Held);
                 }
-                Err(RepositoriesDirectoryError::Missing(_)) => return Err(DeleteError::Missing),
-                // The sessions are on their way out; the store closes with the last.
-                Err(RepositoriesDirectoryError::Directory(
-                    wheat_store::RepositoryDirectoryError::InUse(_),
-                )) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(RepositoriesDirectoryError::Directory(
-                    wheat_store::RepositoryDirectoryError::InUse(_),
-                )) => return Err(DeleteError::Held),
-                Err(error) => return Err(DeleteError::Failed(Box::new(error))),
+                tokio::time::sleep(DELETE_POLL).await;
             }
         }
+        deleter.delete(name, deadline).await?;
+        info!(repo = name, "repository deleted");
+        Ok(())
     }
 
     fn is_deleting(&self, name: &str) -> bool {
@@ -589,5 +606,38 @@ impl RepositoryOpener for DirectoryOpener {
             repositories: self.repositories.clone(),
             content: self.content.clone(),
         })
+    }
+
+    fn deleter(&self) -> Option<&dyn RepositoryDeleter> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl RepositoryDeleter for DirectoryOpener {
+    /// Removes the repository's head, and its network when it was the last one in it;
+    /// see [`RepositoriesDirectory::delete`]. The network's store, open while another
+    /// of its repositories is, is waited for until `deadline`.
+    async fn delete(&self, name: &str, deadline: Instant) -> Result<(), DeleteError> {
+        loop {
+            let repositories = self.repositories.clone();
+            let doomed = name.to_owned();
+            let result = tokio::task::spawn_blocking(move || repositories.delete(&doomed))
+                .await
+                .map_err(|error| DeleteError::Failed(Box::new(error)))?;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(RepositoriesDirectoryError::Missing(_)) => return Err(DeleteError::Missing),
+                Err(RepositoriesDirectoryError::Directory(
+                    wheat_store::RepositoryDirectoryError::InUse(_),
+                )) if Instant::now() < deadline => {
+                    tokio::time::sleep(DELETE_POLL).await;
+                }
+                Err(RepositoriesDirectoryError::Directory(
+                    wheat_store::RepositoryDirectoryError::InUse(_),
+                )) => return Err(DeleteError::Held),
+                Err(error) => return Err(DeleteError::Failed(Box::new(error))),
+            }
+        }
     }
 }

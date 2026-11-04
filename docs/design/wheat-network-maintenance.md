@@ -74,6 +74,13 @@ and move them from Outstanding to Done.
   `wheat-server/tests/delete_test.rs`, `wheat-store/tests/repositories_directory.rs`,
   and `remote_admin.rs`'s `deleting_a_served_repository_ends_a_move` (export, import
   elsewhere, delete here, clone from the new server).
+- [x] **Delete through any opener (2026-11-05, beyond the original plan).** Gothab
+  serves through its own `RepositoryOpener`, with no repositories directory.
+  `Registry::delete` now waits for the entry's holders itself and then calls the
+  opener's `RepositoryDeleter`; `DirectoryOpener`'s deleter is the retry loop over
+  `RepositoriesDirectory::delete` described above. Tests:
+  `an_opener_deletes_its_own_repository_once_the_store_closed` and
+  `an_opener_without_a_deleter_leaves_its_sessions_alone` in `delete_test.rs`.
 - [x] **Retry delay on refused publishes (2026-10-29).** The Error record has
   `retry_after_seconds` (0 = no estimate). A holder calls `Quiesced::expect(duration)`;
   publishes refused while it is held get the time left, and the CLI prints it. Export

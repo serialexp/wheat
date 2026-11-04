@@ -1128,6 +1128,16 @@ head, so an advance that refuses a stale primary (a compare-and-swap that includ
 a fencing token) refuses the publish. What the stale primary stored before that is
 content-addressed and named by no head.
 
+`Registry::delete` works for any opener whose `RepositoryOpener::deleter` returns a
+`RepositoryDeleter` (2026-11-05, for Gothab). The registry blocks the name, so `get`
+finds nothing and the opener is not asked to open it again; ends the sessions
+holding the entry; waits up to 30 s until nothing holds it; and drops it, which
+closes a store no other open repository shares. Only then does it call
+`RepositoryDeleter::delete`, with the name still blocked. `DirectoryOpener`'s
+deleter is `RepositoriesDirectory::delete`, retried while a network's store is still
+open. An opener with no deleter gets `DeleteError::Unsupported`, and its sessions
+are left alone.
+
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new
 publishes with a retryable `Error` (code 503; the CLI reports `remote_unavailable`),
