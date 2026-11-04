@@ -13,6 +13,12 @@ the same commit.
   `also_move`, and the same placement repeats forever. The whole-file branch had the
   same gap and now moves `also_move` too; the empty-provenance branch needs a decision
   on what moving an edit that wrote nothing means. Needs a reproducing test first.
+- [ ] **`materialize_wide` smoke failed once: Git object missing on import.** In a
+  full `nextest --workspace` run, `wheat import` of the case's fresh Git fixture
+  (built with plain `git commit`) failed with "An object with id
+  08252c1739b28a05f81491af88b914d05d6eb062 could not be found". 6 sequential and
+  24 eight-way parallel reruns passed. Unexplained; watch for it again, and look at
+  how the import opens the object database if it recurs.
 
 ## Hosting on Gothab (2026-10-26)
 

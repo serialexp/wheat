@@ -1,6 +1,10 @@
 //! Versioned, bounded terminal outcomes for human and automated callers.
 
-use std::{fmt, io::Write as _, process::ExitCode};
+use std::{
+    fmt,
+    io::{Read, Write as _},
+    process::ExitCode,
+};
 
 use anyhow::Error;
 use serde::Serialize;
@@ -56,8 +60,11 @@ struct ErrorBody<'a> {
     message: &'a str,
 }
 
-pub(crate) fn emit_success(format: OutputFormat, success: &Success) -> ExitCode {
+pub(crate) fn emit_success(format: OutputFormat, success: Success) -> ExitCode {
     if format == OutputFormat::Human {
+        if let Some(stream) = success.stream {
+            return stream_stdout(format, success.command, stream);
+        }
         if success.human.len() > MAX_OUTPUT_BYTES {
             return emit_error(
                 format,
@@ -162,7 +169,7 @@ pub(crate) fn clap_error(format: OutputFormat, error: clap::Error) -> ExitCode {
             Vec::new(),
         )
         .expect("version is JSON serializable");
-        return emit_success(format, &success);
+        return emit_success(format, success);
     }
     if matches!(
         error.kind(),
@@ -173,7 +180,7 @@ pub(crate) fn clap_error(format: OutputFormat, error: clap::Error) -> ExitCode {
         }
         let success = Success::new("help", json!({ "text": error.to_string() }), Vec::new())
             .expect("help text is JSON serializable");
-        return emit_success(format, &success);
+        return emit_success(format, success);
     }
     let message = bounded_text(error.to_string());
     if format == OutputFormat::Human {
@@ -244,7 +251,46 @@ fn commit_error_json(bytes: &[u8], exit: u8) -> ExitCode {
 }
 
 fn commit_stdout(format: OutputFormat, bytes: &[u8]) -> ExitCode {
-    match write_stdout(bytes) {
+    written(format, write_stdout(bytes))
+}
+
+/// The bytes read through stdout's buffer at a time while streaming.
+const STREAM_SCRATCH_BYTES: usize = 64 * 1024;
+
+/// Copies `stream` to stdout. A read failure after some output is reported on stderr
+/// like any failure; what was written stays written.
+fn stream_stdout(format: OutputFormat, command: &str, mut stream: Box<dyn Read>) -> ExitCode {
+    let mut stdout = std::io::stdout().lock();
+    let mut scratch = vec![0_u8; STREAM_SCRATCH_BYTES];
+    loop {
+        let read = match stream.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                let _ = stdout.flush();
+                return emit_error(format, command, &read_failure(error));
+            }
+        };
+        if let Err(error) = stdout.write_all(&scratch[..read]) {
+            return written(format, Err(error));
+        }
+    }
+    written(format, stdout.flush())
+}
+
+/// A stream's read failure as the error it carries, so a content store failure
+/// classifies as one rather than as I/O.
+fn read_failure(error: std::io::Error) -> Error {
+    match error.downcast::<ContentStoreError>() {
+        Ok(content) => content.into(),
+        Err(error) => error.into(),
+    }
+}
+
+/// The exit status for writing command output with `result`.
+fn written(format: OutputFormat, result: std::io::Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
             ExitCode::from(BROKEN_PIPE_EXIT)
@@ -714,6 +760,16 @@ mod tests {
             (classified.code, classified.retryable, classified.exit),
             ("label_moved", true, 3)
         );
+    }
+
+    /// A content store failure inside a stream's read keeps its class.
+    #[test]
+    fn a_stream_read_failure_classifies_by_the_error_it_carries() {
+        let missing =
+            std::io::Error::other(ContentStoreError::Missing(wheat_core::ContentId::of(b"x")));
+        assert_eq!(classify(&read_failure(missing)).code, "missing_content");
+        let io = std::io::Error::other("disk");
+        assert_eq!(classify(&read_failure(io)).code, "io_failure");
     }
 
     #[test]

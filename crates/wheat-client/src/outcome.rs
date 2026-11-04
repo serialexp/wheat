@@ -1,7 +1,7 @@
 //! What a service returns to its caller: a result document with its human
 //! rendering, or a classified failure.
 
-use std::fmt;
+use std::{fmt, io::Read};
 
 use anyhow::Error;
 use serde::Serialize;
@@ -95,6 +95,9 @@ pub struct Success {
     pub command: &'static str,
     pub result: Value,
     pub human: Vec<u8>,
+    /// Human output read from here instead of `human`, streamed to stdout with no
+    /// output bound. JSON output carries `result` alone.
+    pub stream: Option<Box<dyn Read>>,
 }
 
 impl Success {
@@ -107,6 +110,7 @@ impl Success {
             command,
             result: serde_json::to_value(result)?,
             human: human.into(),
+            stream: None,
         })
     }
 
@@ -119,6 +123,21 @@ impl Success {
             command,
             result: serde_json::to_value(result)?,
             human,
+            stream: None,
+        })
+    }
+
+    /// A success whose human output is everything `stream` reads.
+    pub fn streamed(
+        command: &'static str,
+        result: impl Serialize,
+        stream: impl Read + 'static,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            command,
+            result: serde_json::to_value(result)?,
+            human: Vec::new(),
+            stream: Some(Box::new(stream)),
         })
     }
 }

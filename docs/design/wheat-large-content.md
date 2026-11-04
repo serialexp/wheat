@@ -103,12 +103,13 @@ land and move them from Outstanding to Done.
   4909be5). Diff, status and `cat` already read at most their bound: `get_bounded`
   checks the stored length before reading, so a longer blob is described by its ID and
   length (diff, status) or refused (`cat`).
+- [x] **`cat` past its bound.** Decided 2026-11-05: `wheat cat` keeps refusing
+  content over its 8 MiB output bound (2 MiB in JSON) and names `--no-limit`, which
+  streams human output through `ContentStore::reader` with no bound. JSON output
+  refuses `--no-limit`.
 
 ### Outstanding
 
-- [ ] **Open question — `cat` past its bound.** `wheat cat` refuses content over its
-  8 MiB output bound (2 MiB in JSON). It could stream human output through
-  `ContentStore::reader` with no bound, keeping the bound for JSON. Bart to decide.
 - [ ] **Step 5 — Git bridge.** Import and export stream large blobs.
 - [ ] **Step 6 — repack, verification, bundles.** Content repack and generations
   hold chunks and manifests; full verification and network export/import stream.

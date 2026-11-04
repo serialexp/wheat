@@ -19,9 +19,9 @@ use wheat_core::{
     diff_model::DiffLimits, guarded::Limits,
 };
 use wheat_store::{
-    ApplicationMapStore, Arrival, BatchObjectStore, ImmutableObjectStore, MergeBudget,
-    MerkleTreeStore, PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore,
-    RepositoryReader, RevisionMapStore, finalize_mutation_publication,
+    ApplicationMapStore, Arrival, BatchObjectStore, ContentStoreError, ImmutableObjectStore,
+    MergeBudget, MerkleTreeStore, PersistedConflictResolution, PersistedRepositoryMutator,
+    PublicationStore, RepositoryReader, RevisionMapStore, finalize_mutation_publication,
     prepare_mutation_publication, prepare_mutation_publication_moving_label,
 };
 mod command_output;
@@ -133,7 +133,13 @@ enum Command {
     /// Add explicitly selected workspace paths as a new revision.
     Add(AddArgs),
     /// Print retained content by its native identity.
-    Cat { content: String },
+    Cat {
+        content: String,
+        /// Print content of any size, streamed from the store, instead of refusing
+        /// content past the output limit. Human output only.
+        #[arg(long)]
+        no_limit: bool,
+    },
     /// Create a logical change with its initial captured edit.
     #[command(subcommand)]
     Change(ChangeCommand),
@@ -782,7 +788,7 @@ fn main() -> ExitCode {
     let format = OutputFormat::from(cli.format);
     let command = command_name(&cli.command);
     let code = match tracing::info_span!("command", command).in_scope(|| execute(cli)) {
-        Ok(success) => emit_success(format, &success),
+        Ok(success) => emit_success(format, success),
         Err(error) => emit_error(format, command, &error),
     };
     if let Err(error) = wheat_client::store_stats::write() {
@@ -1337,17 +1343,37 @@ fn execute(cli: Cli) -> Result<Success> {
                 output,
             )
         }
-        Command::Cat { content } => {
+        Command::Cat { content, no_limit } => {
+            if no_limit && format == OutputFormat::Json {
+                return Err(CliFailure::invalid(
+                    "--no-limit prints human output only; JSON output holds the content whole",
+                ));
+            }
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let id = ContentId::from_str(&content)
                 .map_err(|_| CliFailure::invalid("invalid content ID"))?;
             let store = content_store(&store_root)?;
+            if no_limit {
+                let reader = store.reader(id)?;
+                let result = json!({ "content_id": id.to_string(), "length": reader.len() });
+                return Success::streamed("cat", result, reader);
+            }
             let limit = if format == OutputFormat::Json {
                 wheat_client::outcome::MAX_OUTPUT_BYTES / 4
             } else {
                 wheat_client::outcome::MAX_OUTPUT_BYTES
             };
-            let bytes = store.get_bounded(id, limit)?;
+            let bytes = match store.get_bounded(id, limit) {
+                Err(ContentStoreError::TooLarge { minimum, max, .. })
+                    if format == OutputFormat::Human =>
+                {
+                    return Err(CliFailure::limit(format!(
+                        "content {id} is at least {minimum} bytes, past the output limit of \
+                         {max} bytes; `wheat cat --no-limit` prints it"
+                    )));
+                }
+                result => result?,
+            };
             let result = json!({ "content_id": id.to_string(), "bytes": &bytes });
             Success::raw("cat", result, bytes)
         }

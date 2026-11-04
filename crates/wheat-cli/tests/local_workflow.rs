@@ -556,6 +556,52 @@ fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
     assert!(add_help.contains("Explicit repository-relative workspace paths"));
 }
 
+/// Content past `cat`'s output limit is refused with a pointer to `--no-limit`, which
+/// streams it whole; `--no-limit` is for human output only.
+#[test]
+fn cat_streams_content_past_its_limit_only_when_asked() {
+    let dir = sandbox();
+    assert!(wheat(dir.path(), &["init"]).status.success());
+    // Past the 8 MiB output limit and the 16 MiB chunking threshold.
+    let bytes = (0..20 * 1024 * 1024_u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(dir.path().join("large"), &bytes).unwrap();
+    assert!(wheat(dir.path(), &["change", "new"]).status.success());
+    let added = wheat(dir.path(), &["add", "large"]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let content_id = wheat_core::ContentId::of(&bytes).to_string();
+
+    let refused = wheat(dir.path(), &["cat", &content_id]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert!(refused.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("wheat cat --no-limit"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let streamed = wheat(dir.path(), &["cat", "--no-limit", &content_id]);
+    assert!(
+        streamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&streamed.stderr)
+    );
+    assert!(streamed.stdout == bytes, "streamed bytes differ");
+
+    let json = wheat(
+        dir.path(),
+        &["--format", "json", "cat", "--no-limit", &content_id],
+    );
+    assert_eq!(json.status.code(), Some(2));
+    let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(document["error"]["code"], "invalid_input");
+}
+
 #[test]
 fn string_values_are_normalized_and_mode_only_edits_preserve_content() {
     let dir = sandbox();
