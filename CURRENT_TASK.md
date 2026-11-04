@@ -19,22 +19,20 @@ changed chunks of very large blobs. `docs/design/wheat-large-content.md` has the
 design and its checklist. Decided: chunk blobs over 16 MiB, FastCDC 1/2/4 MiB, a
 chunk is a `ContentId`, the format takes 1 TiB, manifests stored as sent, our own
 FastCDC, a two-level manifest (parts of 1,024–16,384 chunks past 4,096), at most
-64 MiB of manifests per answer. Steps 1 (format), 2 (store) and 3 (protocol:
-`ContentManifest`, `ContentFetchEnd`, `ManifestArrivals`) are committed. Step 4
-(client) is in progress: 0e918a5 makes edit application confirm whole-file edit
-content (`ContentSource`, `ContentStore::confirm`) instead of reading it; capture
-is committed too (`wheat add` streams a file over 16 MiB, up to 256 MiB, into
-`ContentStore::writer` as an `ExactFile` edit). Next in step 4: edit move with
-large files (whole-file placement; for now `wheat add --change` refuses a large file
-later changes also edit, "not supported yet"), materialization through
-`ContentStore::reader`, `cat` streaming. Then 5–7 per the doc. The Projects disk was
-full on 2026-11-01 (I deleted wheat's `target/debug/incremental`; `gothab/` is
-717 GB). Known leftovers: `repository_verify`, network
-export/import, Git import/export and client capture still read blobs whole.
+64 MiB of manifests per answer. Steps 1 (format), 2 (store), 3 (protocol:
+`ContentManifest`, `ContentFetchEnd`, `ManifestArrivals`) and 4 (client, finished
+2026-11-05: materialization through `ContentStore::reader`, long files placed whole by
+edit move, conflict resolution and publish without reading, guarded targets refused
+from their length) are committed; the design doc's step 4 entry lists the commits.
+Open: whether `wheat cat` should stream past its 8 MiB bound (asked Bart). Next:
+step 5 (Git bridge), then 6 and 7 per the doc. Known leftovers for those steps:
+`repository_verify`, network export/import and Git import/export still read blobs
+whole. The Projects disk was full on 2026-11-01 (I deleted wheat's
+`target/debug/incremental`; `gothab/` is 717 GB).
 
 Not yet measured cleanly: the fetch_incremental A/B for 57da2be ran under a load
 average of 32 (counts unchanged, wall times noise); rerun when the machine is quiet.
-Also waiting: a release tag for Gothab to pin (needs Bart's permission to tag).
+v0.3.0 is tagged (523c343) and pinned by Gothab.
 
 ## 2026-10-26: V1 format blockers (@calm-lynx) — Bart: "lets work through all the blockers in order"
 

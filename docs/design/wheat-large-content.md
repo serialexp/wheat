@@ -1,8 +1,8 @@
 # Wheat large content — Design
 
-Status: partial — steps 1 (format, two levels), 2 (store) and 3 (protocol) landed, steps 4–7 outstanding
+Status: partial — steps 1 (format, two levels), 2 (store), 3 (protocol) and 4 (client) landed, steps 5–7 outstanding
 Owner: bart
-Last updated: 2026-11-01
+Last updated: 2026-11-05
 
 ## Implementation status
 
@@ -88,11 +88,27 @@ land and move them from Outstanding to Done.
   out and asked for again, refusals, and a fetch. The 64 MiB answer budget is
   tested at the unit level only (`ManifestBudget`); publish and fetch benchmarks
   are step 7.
+- [x] **Step 4 — client.** `wheat add` streams a file over 16 MiB into
+  `ContentStore::writer` (6072e1a), and edit application confirms whole-file content
+  instead of reading it (0e918a5). Materialization authenticates leaves by preimage,
+  whose digest is now the content ID's, so expected leaves come from stored lengths, and
+  stages files through `ContentStore::reader` with a 64 KiB buffer; a batch is bounded
+  by what its readers hold, `ContentReader::held_bound` (5a0ffbe; `publish_content`
+  clone peak 101 MiB, was 120 MiB). Edit move places a long file whole without reading
+  it (`edit_placement::place_long`, `WholeFileReason::Long`) instead of refusing it
+  (f414ca8). Publishing confirms fresh content rather than resolving it, and a conflict
+  on a long file resolves as one whole-file edit from the values
+  (`edit_capture::capture_whole_file`, 6a34681). A guarded edit's long target is
+  refused from its length before it is read (`ContentSource::logical_length`,
+  4909be5). Diff, status and `cat` already read at most their bound: `get_bounded`
+  checks the stored length before reading, so a longer blob is described by its ID and
+  length (diff, status) or refused (`cat`).
 
 ### Outstanding
 
-- [ ] **Step 4 — client.** Capture (`wheat add`), materialization, diff, `cat`,
-  edit move and integrate read and write large blobs through the streaming API.
+- [ ] **Open question — `cat` past its bound.** `wheat cat` refuses content over its
+  8 MiB output bound (2 MiB in JSON). It could stream human output through
+  `ContentStore::reader` with no bound, keeping the bound for JSON. Bart to decide.
 - [ ] **Step 5 — Git bridge.** Import and export stream large blobs.
 - [ ] **Step 6 — repack, verification, bundles.** Content repack and generations
   hold chunks and manifests; full verification and network export/import stream.
