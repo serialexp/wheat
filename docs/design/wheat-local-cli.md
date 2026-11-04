@@ -1087,10 +1087,12 @@ I/O or transport failure; and 1 unexpected internal failure. The symbolic error
 code remains the finer-grained automation key.
 
 `cat` is bounded by the same terminal-output budget: human mode writes raw bytes,
-while JSON mode represents them as a structured byte array until the native
-client/protocol introduces a streaming binary response. `cat --no-limit` (human mode
-only) streams content of any size from the store instead; a store failure partway
-through is reported on stderr after the bytes already written. Help/version are terminal
+while JSON mode returns them as the base64 string `result.base64`, with
+`result.length`. `cat --no-limit` streams content of any size from the store
+instead, in either mode, encoding the base64 as it reads. A store failure partway
+through is reported on stderr after the bytes already written in human mode; in JSON
+mode it leaves the document unterminated inside the string, so it never parses, and
+the exit status is the failure's. Help/version are terminal
 success documents in JSON mode; parser failures are terminal error documents.
 A downstream stdout write failure may necessarily leave an OS-level partial write;
 JSON mode never follows such a failure with prose on stderr.

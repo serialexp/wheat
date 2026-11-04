@@ -61,10 +61,13 @@ struct ErrorBody<'a> {
 }
 
 pub(crate) fn emit_success(format: OutputFormat, success: Success) -> ExitCode {
+    if let Some(stream) = success.stream {
+        return match format {
+            OutputFormat::Human => stream_human(success.command, stream),
+            OutputFormat::Json => stream_json(success.command, &success.result, stream),
+        };
+    }
     if format == OutputFormat::Human {
-        if let Some(stream) = success.stream {
-            return stream_stdout(format, success.command, stream);
-        }
         if success.human.len() > MAX_OUTPUT_BYTES {
             return emit_error(
                 format,
@@ -257,26 +260,104 @@ fn commit_stdout(format: OutputFormat, bytes: &[u8]) -> ExitCode {
 /// The bytes read through stdout's buffer at a time while streaming.
 const STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 
-/// Copies `stream` to stdout. A read failure after some output is reported on stderr
-/// like any failure; what was written stays written.
-fn stream_stdout(format: OutputFormat, command: &str, mut stream: Box<dyn Read>) -> ExitCode {
-    let mut stdout = std::io::stdout().lock();
+/// The `result` field JSON output streams a success's stream into, as base64.
+pub(crate) const STREAM_JSON_FIELD: &str = "base64";
+
+enum StreamFailure {
+    Read(std::io::Error),
+    Write(std::io::Error),
+}
+
+/// Copies everything `stream` reads to `out`.
+fn copy_stream(stream: &mut dyn Read, out: &mut impl std::io::Write) -> Result<(), StreamFailure> {
     let mut scratch = vec![0_u8; STREAM_SCRATCH_BYTES];
     loop {
         let read = match stream.read(&mut scratch) {
-            Ok(0) => break,
+            Ok(0) => return Ok(()),
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                let _ = stdout.flush();
-                return emit_error(format, command, &read_failure(error));
-            }
+            Err(error) => return Err(StreamFailure::Read(error)),
         };
-        if let Err(error) = stdout.write_all(&scratch[..read]) {
-            return written(format, Err(error));
-        }
+        out.write_all(&scratch[..read])
+            .map_err(StreamFailure::Write)?;
     }
-    written(format, stdout.flush())
+}
+
+/// Copies `stream` to stdout. A read failure after some output is reported on stderr
+/// like any failure; what was written stays written.
+fn stream_human(command: &str, mut stream: Box<dyn Read>) -> ExitCode {
+    let format = OutputFormat::Human;
+    let mut stdout = std::io::stdout().lock();
+    match copy_stream(&mut stream, &mut stdout) {
+        Ok(()) => written(format, stdout.flush()),
+        Err(StreamFailure::Read(error)) => {
+            let _ = stdout.flush();
+            emit_error(format, command, &read_failure(error))
+        }
+        Err(StreamFailure::Write(error)) => written(format, Err(error)),
+    }
+}
+
+/// Writes the success envelope with `result`'s fields and [`STREAM_JSON_FIELD`], the
+/// base64 of everything `stream` reads, encoded as it is read. A read failure partway
+/// leaves the document unterminated, inside a string, so it never parses; the exit
+/// status is the failure's.
+fn stream_json(command: &str, result: &Value, mut stream: Box<dyn Read>) -> ExitCode {
+    use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
+
+    let format = OutputFormat::Json;
+    let head = match stream_json_head(command, result) {
+        Ok(head) => head,
+        Err(error) => return emit_error(format, command, &error),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(&head) {
+        return written(format, Err(error));
+    }
+    let mut encoder = EncoderWriter::new(&mut stdout, &STANDARD);
+    match copy_stream(&mut stream, &mut encoder) {
+        Ok(()) => {}
+        Err(StreamFailure::Read(error)) => {
+            drop(encoder);
+            let _ = stdout.flush();
+            return ExitCode::from(classify(&read_failure(error)).exit);
+        }
+        Err(StreamFailure::Write(error)) => return written(format, Err(error)),
+    }
+    let tail = encoder.finish().and_then(|stdout| {
+        stdout.write_all(b"\"}}\n")?;
+        stdout.flush()
+    });
+    written(format, tail)
+}
+
+/// The envelope [`emit_success`] writes, up to and including the opening quote of
+/// [`STREAM_JSON_FIELD`]'s value, with `result`'s own fields before it.
+fn stream_json_head(command: &str, result: &Value) -> anyhow::Result<Vec<u8>> {
+    let Value::Object(fields) = result else {
+        anyhow::bail!("a streamed result must be a JSON object");
+    };
+    anyhow::ensure!(
+        !fields.contains_key(STREAM_JSON_FIELD),
+        "a streamed result must not hold its own {STREAM_JSON_FIELD:?} field"
+    );
+    let mut head = Vec::new();
+    head.extend_from_slice(b"{\"format\":");
+    serde_json::to_writer(&mut head, FORMAT)?;
+    head.extend_from_slice(b",\"version\":");
+    serde_json::to_writer(&mut head, &VERSION)?;
+    head.extend_from_slice(b",\"ok\":true,\"command\":");
+    serde_json::to_writer(&mut head, command)?;
+    head.extend_from_slice(b",\"result\":{");
+    for (key, value) in fields {
+        serde_json::to_writer(&mut head, key)?;
+        head.push(b':');
+        serde_json::to_writer(&mut head, value)?;
+        head.push(b',');
+    }
+    serde_json::to_writer(&mut head, STREAM_JSON_FIELD)?;
+    head.extend_from_slice(b":\"");
+    Ok(head)
 }
 
 /// A stream's read failure as the error it carries, so a content store failure
@@ -770,6 +851,27 @@ mod tests {
         assert_eq!(classify(&read_failure(missing)).code, "missing_content");
         let io = std::io::Error::other("disk");
         assert_eq!(classify(&read_failure(io)).code, "io_failure");
+    }
+
+    /// A streamed document is the envelope a held one would be, with the stream's
+    /// base64 as one more result field.
+    #[test]
+    fn a_streamed_json_head_opens_the_envelope_a_held_result_renders() {
+        let result = json!({ "content_id": "id", "length": 3 });
+        let mut streamed = stream_json_head("cat", &result).unwrap();
+        streamed.extend_from_slice(b"YWJj\"}}");
+        let streamed: Value = serde_json::from_slice(&streamed).unwrap();
+
+        let mut held = result.clone();
+        held[STREAM_JSON_FIELD] = json!("YWJj");
+        let held = SuccessEnvelope {
+            format: FORMAT,
+            version: VERSION,
+            ok: true,
+            command: "cat",
+            result: &held,
+        };
+        assert_eq!(streamed, serde_json::to_value(&held).unwrap());
     }
 
     #[test]

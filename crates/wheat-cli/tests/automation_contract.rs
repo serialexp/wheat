@@ -207,10 +207,15 @@ fn human_output_and_raw_cat_remain_the_defaults() {
     let cat_json = document(&cat_json);
     assert_eq!(cat_json["command"], "cat");
     assert_eq!(cat_json["result"]["content_id"], content_id);
-    assert_eq!(
-        cat_json["result"]["bytes"],
-        serde_json::json!([114, 97, 119, 32, 98, 121, 116, 101, 115])
+    assert_eq!(cat_json["result"]["length"], 9);
+    assert_eq!(cat_json["result"]["base64"], "cmF3IGJ5dGVz");
+    let streamed = command(
+        root.path(),
+        config.path(),
+        &["cat", &content_id, "--format=json", "--no-limit"],
     );
+    assert!(streamed.status.success());
+    assert_eq!(document(&streamed), cat_json);
     assert!(!field(&created, "revision").is_empty());
 }
 

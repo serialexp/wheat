@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
@@ -49,6 +50,10 @@ use wheat_client::{
 use workspace_lifecycle::{ensure_fresh_workspace, initialize_workspace_directory};
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
 use workspace_scan::ensure_workspace_clean_locked;
+
+/// The most content `cat --format json` returns without `--no-limit`: its base64,
+/// 4 bytes per 3, and the envelope fit the output limit.
+const MAX_JSON_CAT_BYTES: usize = (wheat_client::outcome::MAX_OUTPUT_BYTES - 64 * 1024) / 4 * 3;
 
 /// `--format`, as clap parses it.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -136,7 +141,7 @@ enum Command {
     Cat {
         content: String,
         /// Print content of any size, streamed from the store, instead of refusing
-        /// content past the output limit. Human output only.
+        /// content past the output limit.
         #[arg(long)]
         no_limit: bool,
     },
@@ -1344,11 +1349,6 @@ fn execute(cli: Cli) -> Result<Success> {
             )
         }
         Command::Cat { content, no_limit } => {
-            if no_limit && format == OutputFormat::Json {
-                return Err(CliFailure::invalid(
-                    "--no-limit prints human output only; JSON output holds the content whole",
-                ));
-            }
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let id = ContentId::from_str(&content)
                 .map_err(|_| CliFailure::invalid("invalid content ID"))?;
@@ -1359,22 +1359,19 @@ fn execute(cli: Cli) -> Result<Success> {
                 return Success::streamed("cat", result, reader);
             }
             let limit = if format == OutputFormat::Json {
-                wheat_client::outcome::MAX_OUTPUT_BYTES / 4
+                MAX_JSON_CAT_BYTES
             } else {
                 wheat_client::outcome::MAX_OUTPUT_BYTES
             };
             let bytes = match store.get_bounded(id, limit) {
-                Err(ContentStoreError::TooLarge { minimum, max, .. })
-                    if format == OutputFormat::Human =>
-                {
-                    return Err(CliFailure::limit(format!(
-                        "content {id} is at least {minimum} bytes, past the output limit of \
-                         {max} bytes; `wheat cat --no-limit` prints it"
-                    )));
+                Err(error @ ContentStoreError::TooLarge { .. }) => {
+                    return Err(anyhow::Error::new(error)
+                        .context("`wheat cat --no-limit` prints content past the output limit"));
                 }
                 result => result?,
             };
-            let result = json!({ "content_id": id.to_string(), "bytes": &bytes });
+            let mut result = json!({ "content_id": id.to_string(), "length": bytes.len() });
+            result[command_output::STREAM_JSON_FIELD] = json!(BASE64.encode(&bytes));
             Success::raw("cat", result, bytes)
         }
         Command::Change(ChangeCommand::New(arguments)) => {

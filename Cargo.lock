@@ -6115,6 +6115,7 @@ name = "wheat-cli"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "clap",
  "libc",

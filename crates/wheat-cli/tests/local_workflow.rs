@@ -557,7 +557,7 @@ fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
 }
 
 /// Content past `cat`'s output limit is refused with a pointer to `--no-limit`, which
-/// streams it whole; `--no-limit` is for human output only.
+/// streams it whole, as raw bytes or as base64 in JSON.
 #[test]
 fn cat_streams_content_past_its_limit_only_when_asked() {
     let dir = sandbox();
@@ -593,13 +593,30 @@ fn cat_streams_content_past_its_limit_only_when_asked() {
     );
     assert!(streamed.stdout == bytes, "streamed bytes differ");
 
+    let refused = wheat(dir.path(), &["--format", "json", "cat", &content_id]);
+    assert_eq!(refused.status.code(), Some(5));
+    let document: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(document["error"]["code"], "content_too_large");
+
     let json = wheat(
         dir.path(),
         &["--format", "json", "cat", "--no-limit", &content_id],
     );
-    assert_eq!(json.status.code(), Some(2));
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
     let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(document["error"]["code"], "invalid_input");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["result"]["content_id"], content_id);
+    assert_eq!(document["result"]["length"], bytes.len());
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        document["result"]["base64"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert!(decoded == bytes, "streamed base64 differs");
 }
 
 #[test]
