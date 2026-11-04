@@ -106,6 +106,23 @@ fn malformed(id: ContentId, reason: &'static str) -> ContentStoreError {
 }
 
 /// Parses the header of `id`'s record, which is `size` bytes long in all.
+/// The logical length of `id`'s stored `record`, as [`crate::ContentStore::logical_length`]
+/// answers it over a blob store, from the record in hand: the whole blob's length for a
+/// chunked one's manifest, the reconstructed length for a delta. Only the header is
+/// read; it is checked against the record's length and its codec's bounds, but the
+/// payload is not checked against it, as reading the content does.
+pub fn record_logical_length(id: ContentId, record: &[u8]) -> Result<u64, ContentStoreError> {
+    let header = checked_header(
+        id,
+        record.get(..codec::ENVELOPE_HEADER_LEN).unwrap_or(record),
+        record.len() as u64,
+    )?;
+    header
+        .validate(record.len() as u64, usize::MAX)
+        .map_err(|error| codec_error(id, usize::MAX, error))?;
+    Ok(header.logical_length)
+}
+
 fn checked_header(
     id: ContentId,
     header: &[u8],

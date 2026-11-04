@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use wheat_core::{ContentId, VerifiedContent};
 use wheat_store::{
     BlobPage, BlobRead, ContentBlobStore, ContentItem, ContentStore, ContentStoreError,
-    PackedObjectStore, RepositoryStore, SeparateRepositoryStore,
+    PackedObjectStore, RepositoryStore, SeparateRepositoryStore, record_logical_length,
 };
 
 /// Blobs in memory, as an embedder would write them, counting what is read and how
@@ -327,4 +327,44 @@ async fn a_large_blob_is_kept_in_blobs_as_chunks() {
     again.write_all(&bytes).unwrap();
     assert_eq!(again.finish(None).unwrap(), id);
     assert_eq!(blobs.records.lock().unwrap().len(), records);
+}
+
+/// What a blob store is given to write answers the same length as the store reads
+/// back, for a whole record, a delta and a chunked blob's manifest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_records_length_comes_from_the_record_alone() {
+    use std::io::Write;
+
+    let blobs = Arc::new(MemoryBlobs::default());
+    let content = over(&blobs);
+    let empty = content.put(b"").unwrap();
+    let small = content.put(&vec![7_u8; 256 * 1024]).unwrap();
+    let base = noise(10, 64 * 1024);
+    let mut changed = base.clone();
+    changed[1000..1010].copy_from_slice(b"0123456789");
+    let base_id = content.put(&base).unwrap();
+    let delta = VerifiedContent::new(changed.as_slice());
+    content.put_with_base(delta, base_id).unwrap();
+    let long = noise(11, 20 << 20);
+    let mut writer = content.writer();
+    writer.write_all(&long).unwrap();
+    let chunked = writer.finish(None).unwrap();
+
+    for (id, length) in [
+        (empty, 0),
+        (small, 256 * 1024),
+        (delta.id(), changed.len() as u64),
+        (chunked, long.len() as u64),
+    ] {
+        let record = blobs.record(id).unwrap();
+        assert_eq!(record_logical_length(id, &record).unwrap(), length);
+        assert_eq!(content.logical_length(id).unwrap(), length);
+        // A record cut short, or with bytes after it, is refused.
+        assert!(record_logical_length(id, &record[..record.len() - 1]).is_err());
+        let mut longer = record.clone();
+        longer.push(0);
+        assert!(record_logical_length(id, &longer).is_err());
+    }
+    assert!(record_logical_length(empty, b"").is_err());
+    assert!(record_logical_length(empty, b"not a record").is_err());
 }
