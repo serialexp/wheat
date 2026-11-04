@@ -32,7 +32,7 @@ whole. The Projects disk was full on 2026-11-01 (I deleted wheat's
 
 Not yet measured cleanly: the fetch_incremental A/B for 57da2be ran under a load
 average of 32 (counts unchanged, wall times noise); rerun when the machine is quiet.
-v0.3.0 is tagged (523c343) and pinned by Gothab; v0.3.1 adds `RepositoryDeleter` (691796b) for Gothab's delete.
+v0.3.0 is tagged (523c343) and pinned by Gothab; v0.3.1 adds `RepositoryDeleter` (691796b) for Gothab's delete but has no release binaries (its release workflow lacked `artifacts: write`); v0.3.2 is the same code with the fixed workflow.
 
 ## 2026-10-26: V1 format blockers (@calm-lynx) — Bart: "lets work through all the blockers in order"
 
