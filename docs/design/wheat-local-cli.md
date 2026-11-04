@@ -1089,10 +1089,14 @@ code remains the finer-grained automation key.
 `cat` is bounded by the same terminal-output budget: human mode writes raw bytes,
 while JSON mode returns them as the base64 string `result.base64`, with
 `result.length`. `cat --no-limit` streams content of any size from the store
-instead, in either mode, encoding the base64 as it reads. A store failure partway
-through is reported on stderr after the bytes already written in human mode; in JSON
-mode it leaves the document unterminated inside the string, so it never parses, and
-the exit status is the failure's. Help/version are terminal
+instead. In human mode a store failure partway through is reported on stderr after
+the bytes already written. In JSON mode the output is JSON lines: a header
+(`"format": "wheat-command-stream"`, `version`, `command`, `result` with
+`content_id` and `length`), one `{"part": n, "base64": …}` line per 3 MiB of content,
+and `{"ok": true, "parts": n}` at the end. A part is read whole before it is
+written, so a store failure leaves only whole parts, followed by the usual error
+envelope instead of the end line; a caller knows the content is complete only when
+it reads the end line. Help/version are terminal
 success documents in JSON mode; parser failures are terminal error documents.
 A downstream stdout write failure may necessarily leave an OS-level partial write;
 JSON mode never follows such a failure with prose on stderr.

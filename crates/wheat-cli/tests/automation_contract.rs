@@ -215,7 +215,24 @@ fn human_output_and_raw_cat_remain_the_defaults() {
         &["cat", &content_id, "--format=json", "--no-limit"],
     );
     assert!(streamed.status.success());
-    assert_eq!(document(&streamed), cat_json);
+    let lines = String::from_utf8(streamed.stdout).unwrap();
+    let lines = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["format"], "wheat-command-stream");
+    assert_eq!(lines[0]["version"], 1);
+    assert_eq!(lines[0]["command"], "cat");
+    assert_eq!(
+        lines[0]["result"],
+        serde_json::json!({ "content_id": content_id, "length": 9 })
+    );
+    assert_eq!(
+        lines[1],
+        serde_json::json!({ "part": 0, "base64": "cmF3IGJ5dGVz" })
+    );
+    assert_eq!(lines[2], serde_json::json!({ "ok": true, "parts": 1 }));
     assert!(!field(&created, "revision").is_empty());
 }
 

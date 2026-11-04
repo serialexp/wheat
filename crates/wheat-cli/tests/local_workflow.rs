@@ -557,7 +557,7 @@ fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
 }
 
 /// Content past `cat`'s output limit is refused with a pointer to `--no-limit`, which
-/// streams it whole, as raw bytes or as base64 in JSON.
+/// streams it whole, as raw bytes or as JSON lines of base64 parts.
 #[test]
 fn cat_streams_content_past_its_limit_only_when_asked() {
     let dir = sandbox();
@@ -607,16 +607,34 @@ fn cat_streams_content_past_its_limit_only_when_asked() {
         "{}",
         String::from_utf8_lossy(&json.stderr)
     );
-    let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(document["ok"], true);
-    assert_eq!(document["result"]["content_id"], content_id);
-    assert_eq!(document["result"]["length"], bytes.len());
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        document["result"]["base64"].as_str().unwrap(),
-    )
-    .unwrap();
-    assert!(decoded == bytes, "streamed base64 differs");
+    let lines = json
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines[0]["format"], "wheat-command-stream");
+    assert_eq!(lines[0]["result"]["content_id"], content_id);
+    assert_eq!(lines[0]["result"]["length"], bytes.len());
+    // 20 MiB in parts of 3 MiB.
+    let parts = &lines[1..lines.len() - 1];
+    assert_eq!(parts.len(), 7);
+    let mut decoded = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        assert_eq!(part["part"], index);
+        decoded.extend(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                part["base64"].as_str().unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    assert!(decoded == bytes, "streamed parts differ");
+    assert_eq!(
+        lines[lines.len() - 1],
+        serde_json::json!({ "ok": true, "parts": 7 })
+    );
 }
 
 #[test]

@@ -24,7 +24,7 @@ FastCDC, a two-level manifest (parts of 1,024–16,384 chunks past 4,096), at mo
 2026-11-05: materialization through `ContentStore::reader`, long files placed whole by
 edit move, conflict resolution and publish without reading, guarded targets refused
 from their length) are committed; the design doc's step 4 entry lists the commits.
-`wheat cat --no-limit` streams past the 8 MiB bound (JSON as streamed base64). Next:
+`wheat cat --no-limit` streams past the 8 MiB bound (JSON as lines of base64 parts). Next:
 step 5 (Git bridge), then 6 and 7 per the doc. Known leftovers for those steps:
 `repository_verify`, network export/import and Git import/export still read blobs
 whole. The Projects disk was full on 2026-11-01 (I deleted wheat's

@@ -1371,7 +1371,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 result => result?,
             };
             let mut result = json!({ "content_id": id.to_string(), "length": bytes.len() });
-            result[command_output::STREAM_JSON_FIELD] = json!(BASE64.encode(&bytes));
+            result["base64"] = json!(BASE64.encode(&bytes));
             Success::raw("cat", result, bytes)
         }
         Command::Change(ChangeCommand::New(arguments)) => {

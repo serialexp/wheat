@@ -260,8 +260,33 @@ fn commit_stdout(format: OutputFormat, bytes: &[u8]) -> ExitCode {
 /// The bytes read through stdout's buffer at a time while streaming.
 const STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 
-/// The `result` field JSON output streams a success's stream into, as base64.
-pub(crate) const STREAM_JSON_FIELD: &str = "base64";
+/// The content bytes one part of a streamed JSON result carries: 4 MiB as base64, so
+/// a part line stays under the output limit.
+const STREAM_PART_BYTES: usize = 3 * 1024 * 1024;
+
+/// The first line of a streamed JSON result.
+const STREAM_FORMAT: &str = "wheat-command-stream";
+const STREAM_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct StreamHeader<'a> {
+    format: &'static str,
+    version: u32,
+    command: &'a str,
+    result: &'a Value,
+}
+
+#[derive(Serialize)]
+struct StreamPart<'a> {
+    part: u64,
+    base64: &'a str,
+}
+
+#[derive(Serialize)]
+struct StreamEnd {
+    ok: bool,
+    parts: u64,
+}
 
 enum StreamFailure {
     Read(std::io::Error),
@@ -298,66 +323,81 @@ fn stream_human(command: &str, mut stream: Box<dyn Read>) -> ExitCode {
     }
 }
 
-/// Writes the success envelope with `result`'s fields and [`STREAM_JSON_FIELD`], the
-/// base64 of everything `stream` reads, encoded as it is read. A read failure partway
-/// leaves the document unterminated, inside a string, so it never parses; the exit
-/// status is the failure's.
+/// Writes a streamed JSON result: see [`write_parts`]. A read failure ends it with
+/// the error envelope [`emit_error`] writes, as its own line.
 fn stream_json(command: &str, result: &Value, mut stream: Box<dyn Read>) -> ExitCode {
-    use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
-
     let format = OutputFormat::Json;
-    let head = match stream_json_head(command, result) {
-        Ok(head) => head,
-        Err(error) => return emit_error(format, command, &error),
-    };
     let mut stdout = std::io::stdout().lock();
-    if let Err(error) = stdout.write_all(&head) {
-        return written(format, Err(error));
-    }
-    let mut encoder = EncoderWriter::new(&mut stdout, &STANDARD);
-    match copy_stream(&mut stream, &mut encoder) {
-        Ok(()) => {}
+    match write_parts(command, result, &mut stream, &mut stdout) {
+        Ok(()) => written(format, stdout.flush()),
         Err(StreamFailure::Read(error)) => {
-            drop(encoder);
             let _ = stdout.flush();
-            return ExitCode::from(classify(&read_failure(error)).exit);
+            drop(stdout);
+            emit_error(format, command, &read_failure(error))
         }
-        Err(StreamFailure::Write(error)) => return written(format, Err(error)),
+        Err(StreamFailure::Write(error)) => written(format, Err(error)),
     }
-    let tail = encoder.finish().and_then(|stdout| {
-        stdout.write_all(b"\"}}\n")?;
-        stdout.flush()
-    });
-    written(format, tail)
 }
 
-/// The envelope [`emit_success`] writes, up to and including the opening quote of
-/// [`STREAM_JSON_FIELD`]'s value, with `result`'s own fields before it.
-fn stream_json_head(command: &str, result: &Value) -> anyhow::Result<Vec<u8>> {
-    let Value::Object(fields) = result else {
-        anyhow::bail!("a streamed result must be a JSON object");
+/// Writes JSON lines to `out`: a [`StreamHeader`] with `result`, a [`StreamPart`] per
+/// [`STREAM_PART_BYTES`] of what `stream` reads, as base64, and a [`StreamEnd`] once
+/// it is all read. A part is read whole before its line is written, so a read
+/// failure leaves only complete lines behind it.
+fn write_parts(
+    command: &str,
+    result: &Value,
+    stream: &mut dyn Read,
+    out: &mut impl std::io::Write,
+) -> Result<(), StreamFailure> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let header = StreamHeader {
+        format: STREAM_FORMAT,
+        version: STREAM_VERSION,
+        command,
+        result,
     };
-    anyhow::ensure!(
-        !fields.contains_key(STREAM_JSON_FIELD),
-        "a streamed result must not hold its own {STREAM_JSON_FIELD:?} field"
-    );
-    let mut head = Vec::new();
-    head.extend_from_slice(b"{\"format\":");
-    serde_json::to_writer(&mut head, FORMAT)?;
-    head.extend_from_slice(b",\"version\":");
-    serde_json::to_writer(&mut head, &VERSION)?;
-    head.extend_from_slice(b",\"ok\":true,\"command\":");
-    serde_json::to_writer(&mut head, command)?;
-    head.extend_from_slice(b",\"result\":{");
-    for (key, value) in fields {
-        serde_json::to_writer(&mut head, key)?;
-        head.push(b':');
-        serde_json::to_writer(&mut head, value)?;
-        head.push(b',');
+    write_line(out, &header)?;
+    let mut content = vec![0_u8; STREAM_PART_BYTES];
+    let mut encoded = String::with_capacity(STREAM_PART_BYTES / 3 * 4);
+    let mut parts = 0;
+    loop {
+        let filled = fill(stream, &mut content).map_err(StreamFailure::Read)?;
+        if filled == 0 {
+            break;
+        }
+        encoded.clear();
+        STANDARD.encode_string(&content[..filled], &mut encoded);
+        let part = StreamPart {
+            part: parts,
+            base64: &encoded,
+        };
+        write_line(out, &part)?;
+        parts += 1;
+        if filled < content.len() {
+            break;
+        }
     }
-    serde_json::to_writer(&mut head, STREAM_JSON_FIELD)?;
-    head.extend_from_slice(b":\"");
-    Ok(head)
+    write_line(out, &StreamEnd { ok: true, parts })
+}
+
+fn write_line(out: &mut impl std::io::Write, line: &impl Serialize) -> Result<(), StreamFailure> {
+    serde_json::to_writer(&mut *out, line).map_err(|error| StreamFailure::Write(error.into()))?;
+    out.write_all(b"\n").map_err(StreamFailure::Write)
+}
+
+/// Reads into `buffer` until it is full or `stream` ends, and returns how much it read.
+fn fill(stream: &mut dyn Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
 }
 
 /// A stream's read failure as the error it carries, so a content store failure
@@ -853,25 +893,86 @@ mod tests {
         assert_eq!(classify(&read_failure(io)).code, "io_failure");
     }
 
-    /// A streamed document is the envelope a held one would be, with the stream's
-    /// base64 as one more result field.
-    #[test]
-    fn a_streamed_json_head_opens_the_envelope_a_held_result_renders() {
-        let result = json!({ "content_id": "id", "length": 3 });
-        let mut streamed = stream_json_head("cat", &result).unwrap();
-        streamed.extend_from_slice(b"YWJj\"}}");
-        let streamed: Value = serde_json::from_slice(&streamed).unwrap();
+    fn stream_lines(output: &[u8]) -> Vec<Value> {
+        output
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
 
-        let mut held = result.clone();
-        held[STREAM_JSON_FIELD] = json!("YWJj");
-        let held = SuccessEnvelope {
-            format: FORMAT,
-            version: VERSION,
-            ok: true,
-            command: "cat",
-            result: &held,
+    fn decoded(part: &Value) -> Vec<u8> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        STANDARD.decode(part["base64"].as_str().unwrap()).unwrap()
+    }
+
+    /// A streamed result is a header, the content in parts of at most
+    /// `STREAM_PART_BYTES`, and an end line counting them.
+    #[test]
+    fn a_streamed_json_result_is_a_header_parts_and_an_end() {
+        let content = (0..STREAM_PART_BYTES * 2 + 5)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let result = json!({ "content_id": "id", "length": content.len() });
+        let mut out = Vec::new();
+        assert!(write_parts("cat", &result, &mut content.as_slice(), &mut out).is_ok());
+
+        let lines = stream_lines(&out);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(
+            lines[0],
+            json!({ "format": STREAM_FORMAT, "version": STREAM_VERSION, "command": "cat",
+                    "result": result })
+        );
+        let mut joined = Vec::new();
+        for (index, part) in lines[1..4].iter().enumerate() {
+            assert_eq!(part["part"], index);
+            joined.extend(decoded(part));
+        }
+        assert!(joined == content, "parts join to the content");
+        assert_eq!(lines[4], json!({ "ok": true, "parts": 3 }));
+
+        let mut empty = Vec::new();
+        assert!(write_parts("cat", &result, &mut [].as_slice(), &mut empty).is_ok());
+        assert_eq!(stream_lines(&empty)[1], json!({ "ok": true, "parts": 0 }));
+    }
+
+    /// Reads `good` bytes, then fails as a missing chunk would.
+    struct FailingAfter {
+        good: usize,
+    }
+
+    impl Read for FailingAfter {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.good == 0 {
+                return Err(std::io::Error::other(ContentStoreError::Missing(
+                    wheat_core::ContentId::of(b"chunk"),
+                )));
+            }
+            let read = self.good.min(out.len());
+            out[..read].fill(7);
+            self.good -= read;
+            Ok(read)
+        }
+    }
+
+    /// A read failure partway through a part leaves the parts before it, whole, and
+    /// no end line; the failure is the content store's.
+    #[test]
+    fn a_read_failure_leaves_only_whole_parts() {
+        let mut stream = FailingAfter {
+            good: STREAM_PART_BYTES + 10,
         };
-        assert_eq!(streamed, serde_json::to_value(&held).unwrap());
+        let mut out = Vec::new();
+        let result = json!({ "content_id": "id" });
+        let Err(StreamFailure::Read(error)) = write_parts("cat", &result, &mut stream, &mut out)
+        else {
+            panic!("the stream's failure is a read failure");
+        };
+        assert_eq!(classify(&read_failure(error)).code, "missing_content");
+        let lines = stream_lines(&out);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(decoded(&lines[1]).len(), STREAM_PART_BYTES);
     }
 
     #[test]

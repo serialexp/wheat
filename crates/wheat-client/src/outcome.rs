@@ -96,7 +96,8 @@ pub struct Success {
     pub result: Value,
     pub human: Vec<u8>,
     /// Output read from here instead of `human`, streamed to stdout with no output
-    /// bound. JSON output adds it to `result` as one base64 string field.
+    /// bound. JSON output is a header line with `result`, then the stream as parts of
+    /// base64, one line each, and an end line.
     pub stream: Option<Box<dyn Read>>,
 }
 

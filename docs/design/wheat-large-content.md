@@ -106,7 +106,8 @@ land and move them from Outstanding to Done.
 - [x] **`cat` past its bound.** Decided 2026-11-05: `wheat cat` keeps refusing
   content over its 8 MiB output bound (just under 6 MiB in JSON) and names
   `--no-limit`, which streams through `ContentStore::reader` with no bound. JSON
-  output is base64 (`result.base64`), streamed too, instead of a byte array.
+  output is base64 (`result.base64`) instead of a byte array; with `--no-limit` it is
+  JSON lines of 3 MiB base64 parts ending in `{"ok": true, "parts": n}`.
 
 ### Outstanding
 
