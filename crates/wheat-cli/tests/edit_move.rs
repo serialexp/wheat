@@ -318,24 +318,62 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn an_edit_to_a_long_file_a_later_change_edits_is_refused_clearly() {
+fn an_edit_to_a_long_file_a_later_change_edits_moves_the_whole_file() {
     let workspace = Workspace::new();
     let mut long = noise(1, 20 << 20);
     let b = field(&workspace.ok(&["change", "new", "-m", "B"]), "change");
     fs::write(workspace.root.join("long.bin"), &long).unwrap();
     workspace.ok(&["add", "-m", "B1", "long.bin"]);
-    workspace.ok(&["change", "new", "-m", "C"]);
+    let c = field(&workspace.ok(&["change", "new", "-m", "C"]), "change");
     long[1000] ^= 0xff;
     fs::write(workspace.root.join("long.bin"), &long).unwrap();
     workspace.ok(&["add", "-m", "C1", "long.bin"]);
 
     long[2000] ^= 0xff;
     fs::write(workspace.root.join("long.bin"), &long).unwrap();
-    let refused = workspace.run(&["add", "-m", "B2", "--change", &b, "long.bin", "--force"]);
-    assert!(!refused.status.success());
+    let refused = workspace.run(&["add", "-m", "B2", "--change", &b, "long.bin"]);
+    assert_eq!(refused.status.code(), Some(2));
     let message = stderr(&refused);
-    assert!(message.contains("not supported yet"), "{message}");
-    // Nothing changed.
+    assert!(
+        message.contains(&format!(
+            "long.bin: change {c} replaced the whole file later; adding it to {b} moves the entire file into {b}"
+        )),
+        "{message}"
+    );
+
+    let added = workspace.ok(&[
+        "add", "-m", "B2", "--change", &b, "long.bin", "--force", "--format", "json",
+    ]);
+    let document: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    let moved = document["result"]["moved"].as_array().unwrap();
+    assert_eq!(moved.len(), 1, "{document}");
+    assert_eq!(moved[0]["from"], c.as_str());
     let status = stdout(&workspace.ok(&["status"]));
-    assert!(status.contains("tracked changes: 1"), "{status}");
+    assert!(status.contains("tracked changes: 0"), "{status}");
+    workspace.ok(&["validate"]);
+    workspace.ok(&["materialize"]);
+    assert_eq!(fs::read(workspace.root.join("long.bin")).unwrap(), long);
+}
+#[test]
+fn a_long_file_cut_short_below_a_later_edit_moves_whole() {
+    let workspace = Workspace::new();
+    let mut long = noise(2, 20 << 20);
+    let b = field(&workspace.ok(&["change", "new", "-m", "B"]), "change");
+    fs::write(workspace.root.join("long.bin"), &long).unwrap();
+    workspace.ok(&["add", "-m", "B1", "long.bin"]);
+    let c = field(&workspace.ok(&["change", "new", "-m", "C"]), "change");
+    long[1000] ^= 0xff;
+    fs::write(workspace.root.join("long.bin"), &long).unwrap();
+    workspace.ok(&["add", "-m", "C1", "long.bin"]);
+
+    // The workspace version fits the guarded bound; the versions before it do not.
+    workspace.write("long.bin", "short\n");
+    let added = workspace.ok(&[
+        "add", "-m", "B2", "--change", &b, "long.bin", "--force", "--format", "json",
+    ]);
+    let document: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    let moved = document["result"]["moved"].as_array().unwrap();
+    assert_eq!(moved.len(), 1, "{document}");
+    assert_eq!(moved[0]["from"], c.as_str());
+    workspace.settled(&[("long.bin", "short\n")]);
 }

@@ -3,6 +3,17 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Found while placing long files (2026-11-05)
+
+- [ ] **Edit move can loop when no later edit wrote the path.** `place` returns the
+  workspace file with nothing moved when `provenance.edits` is empty, even when
+  `also_move` is not (`crates/wheat-core/src/edit_placement.rs`). An edit that applied
+  before but wrote nothing (its replacement was already there) and no longer fits after
+  the author's edit comes back from the replay as `NoLongerFit`, `place_path` adds it to
+  `also_move`, and the same placement repeats forever. The whole-file branch had the
+  same gap and now moves `also_move` too; the empty-provenance branch needs a decision
+  on what moving an edit that wrote nothing means. Needs a reproducing test first.
+
 ## Hosting on Gothab (2026-10-26)
 
 Found while scoping Wheat repositories served natively from Gothab's gitd hosts

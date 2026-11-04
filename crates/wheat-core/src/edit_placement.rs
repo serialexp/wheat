@@ -358,6 +358,8 @@ pub enum WholeFileReason {
     ReplacedLater,
     /// The workspace deletes the file or changes its kind.
     WorkspaceReplaces,
+    /// A version of the file is too long to read, so no block of it can move alone.
+    Long,
 }
 
 /// Why edits move, in terms of the current file the author sees.
@@ -497,20 +499,80 @@ pub fn place(input: PlacementInput<'_>) -> Result<Placement, PlacementError> {
 }
 
 fn whole_file_placement(input: PlacementInput<'_>, reason: WholeFileReason) -> Placement {
-    let moved = input
-        .provenance
-        .edits
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let Moves { moved, notices } = whole_file_moves(input.provenance, input.also_move, reason);
     Placement {
         below: input.workspace.map(<[u8]>::to_vec),
+        moved,
+        notices,
+    }
+}
+
+/// Every later edit on the path, and every edit the caller found no longer fits, moves.
+fn whole_file_moves(
+    provenance: &Provenance,
+    also_move: &BTreeSet<LaterEdit>,
+    reason: WholeFileReason,
+) -> Moves {
+    let moved = provenance
+        .edits
+        .iter()
+        .chain(also_move)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    Moves {
         notices: vec![MoveNotice::WholeFile {
             reason,
             changes: moved.iter().map(|edit| edit.change).collect(),
         }],
         moved,
     }
+}
+
+/// Which versions of a file too long to read there are.
+#[derive(Clone, Copy, Debug)]
+pub struct LongFile {
+    /// The earlier change has the file.
+    pub below: bool,
+    /// The current file exists.
+    pub current: bool,
+    /// The workspace has the file.
+    pub workspace: bool,
+    /// The workspace changes the file's kind.
+    pub kind_changed: bool,
+}
+
+/// The later edits that move into the earlier change, and why.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Moves {
+    pub moved: BTreeSet<LaterEdit>,
+    pub notices: Vec<MoveNotice>,
+}
+
+/// Places a file a version of which is too long to read. No block of it can be matched, so
+/// when later edits wrote the file, the earlier change takes the whole workspace version and
+/// every later edit on the path moves into it, with the reason [`place`] would give or
+/// [`WholeFileReason::Long`]. When none wrote it, the workspace version goes in as it is.
+/// As with [`place`], the caller handles a file the author left unchanged.
+pub fn place_long(
+    file: LongFile,
+    provenance: &Provenance,
+    also_move: &BTreeSet<LaterEdit>,
+) -> Moves {
+    if provenance.edits.is_empty() && also_move.is_empty() {
+        return Moves::default();
+    }
+    let reason = if !file.below {
+        WholeFileReason::CreatedLater
+    } else if !file.current || provenance.segments.is_none() {
+        WholeFileReason::DeletedLater
+    } else if !provenance.whole_file.is_empty() {
+        WholeFileReason::ReplacedLater
+    } else if !file.workspace || file.kind_changed {
+        WholeFileReason::WorkspaceReplaces
+    } else {
+        WholeFileReason::Long
+    };
+    whole_file_moves(provenance, also_move, reason)
 }
 
 /// Checks that the runs cover both the current file and the earlier change's file in order,

@@ -16,7 +16,8 @@ use wheat_core::{
     ChangeId, ContentId, EditId, EditRecord, FileKind, FileValue, Tree, VerifiedContent,
     edit_application::{ApplicationLimits, ApplicationOutcome, ContentSource, apply_edits},
     edit_placement::{
-        LaterEdit, Lines, MoveNotice, PlacementInput, WholeFileReason, attribute, place,
+        LaterEdit, Lines, LongFile, MoveNotice, PlacementInput, WholeFileReason, attribute, place,
+        place_long,
     },
 };
 use wheat_store::{ContentStore, PathHistory};
@@ -40,10 +41,35 @@ impl FileBytes {
     }
 }
 
+/// A version of a file to author.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Captured {
+    /// Its canonical bytes.
+    Bytes(FileBytes),
+    /// A file past the guarded bound, already in the store.
+    Stored(FileValue),
+}
+
+impl Captured {
+    fn value(&self) -> FileValue {
+        match self {
+            Self::Bytes(file) => file.value(),
+            Self::Stored(value) => *value,
+        }
+    }
+
+    fn kind(&self) -> FileKind {
+        match self {
+            Self::Bytes(file) => file.kind,
+            Self::Stored(value) => value.kind,
+        }
+    }
+}
+
 /// The earlier change's new version of one path and the later edits that move into it.
 #[derive(Debug)]
 pub struct PathPlacement {
-    pub below: Option<FileBytes>,
+    pub below: Option<Captured>,
     pub moved: BTreeSet<LaterEdit>,
     pub notices: Vec<MoveNotice>,
 }
@@ -54,36 +80,43 @@ pub struct PathPlacement {
 /// version. Changes in `reauthored` get new revisions without their moved edits, so their
 /// remaining edits must apply exactly; the others are reapplied and may find an edit already
 /// satisfied.
+///
+/// A file one version of which is over `max_input_bytes` is never read: it moves as a whole
+/// (see [`place_long`]).
 #[tracing::instrument(level = "debug", skip_all, fields(path = path, later_steps = history.steps.len()))]
 pub fn place_path(
     store: &ContentStore,
     path: &str,
     history: &PathHistory,
     current: Option<FileValue>,
-    workspace: Option<&FileBytes>,
+    workspace: Option<&Captured>,
     reauthored: &BTreeSet<ChangeId>,
+    max_input_bytes: usize,
 ) -> Result<PathPlacement> {
-    let resolve = |value: Option<FileValue>| -> Result<Option<Vec<u8>>> {
+    let length = |value: Option<FileValue>| -> Result<Option<u64>> {
         value
-            .map(|value| store.get(value.content))
+            .map(|value| store.logical_length(value.content))
             .transpose()
             .map_err(Into::into)
     };
-    let below = resolve(history.below)?;
-    let current_bytes = resolve(current)?;
+    let below_length = length(history.below)?;
+    let long = matches!(workspace, Some(Captured::Stored(_)))
+        || [below_length, length(current)?]
+            .into_iter()
+            .flatten()
+            .any(|length| length > max_input_bytes as u64);
     let kind_changed = matches!((current, workspace), (Some(current), Some(workspace))
-        if current.kind != workspace.kind);
-    let unchanged =
-        !kind_changed && current_bytes.as_deref() == workspace.map(|file| file.bytes.as_slice());
-    if history.steps.is_empty() || unchanged {
+        if current.kind != workspace.kind());
+    let wanted = workspace.map(Captured::value);
+    if history.steps.is_empty() || (!kind_changed && current == wanted) {
         // Nothing later touched the path, or the author left it as it is.
         let below = if history.steps.is_empty() {
             workspace.cloned()
         } else {
-            history.below.zip(below).map(|(value, bytes)| FileBytes {
-                kind: value.kind,
-                bytes,
-            })
+            history
+                .below
+                .map(|value| captured(store, value, max_input_bytes))
+                .transpose()?
         };
         return Ok(PathPlacement {
             below,
@@ -94,7 +127,12 @@ pub fn place_path(
     let corrupt =
         |_| CliFailure::corrupt(format!("later edit evidence for {path:?} is inconsistent"));
     let provenance = attribute(
-        below.as_ref().map(Vec::len),
+        below_length
+            .map(|length| {
+                usize::try_from(length)
+                    .map_err(|_| CliFailure::corrupt(format!("{path:?} exceeds memory")))
+            })
+            .transpose()?,
         &history.placement_steps(store)?,
     )
     .map_err(corrupt)?;
@@ -111,28 +149,64 @@ pub fn place_path(
                 })
         })
         .collect::<BTreeSet<_>>();
-    let wanted = workspace.map(FileBytes::value);
+    // Only a file every version of which fits the bound is read.
+    let resolved = if long {
+        None
+    } else {
+        let resolve = |value: Option<FileValue>| -> Result<Option<Vec<u8>>> {
+            value
+                .map(|value| store.get(value.content))
+                .transpose()
+                .map_err(Into::into)
+        };
+        let workspace = match workspace {
+            Some(Captured::Bytes(file)) => Some(file.bytes.as_slice()),
+            Some(Captured::Stored(_)) => unreachable!("a stored workspace file is long"),
+            None => None,
+        };
+        Some((resolve(history.below)?, resolve(current)?, workspace))
+    };
     let mut also_move = BTreeSet::new();
     loop {
-        let placement = place(PlacementInput {
-            below: below.as_deref(),
-            current: current_bytes.as_deref(),
-            workspace: workspace.map(|file| file.bytes.as_slice()),
-            kind_changed,
-            provenance: &provenance,
-            also_move: &also_move,
-        })
-        .map_err(corrupt)?;
-        let placed = placement.below.map(|bytes| FileBytes {
-            kind: workspace.map_or(FileKind::Regular, |file| file.kind),
-            bytes,
-        });
+        let (placed, moved, notices) = match &resolved {
+            Some((below, current, workspace_bytes)) => {
+                let placement = place(PlacementInput {
+                    below: below.as_deref(),
+                    current: current.as_deref(),
+                    workspace: *workspace_bytes,
+                    kind_changed,
+                    provenance: &provenance,
+                    also_move: &also_move,
+                })
+                .map_err(corrupt)?;
+                let placed = placement.below.map(|bytes| {
+                    Captured::Bytes(FileBytes {
+                        kind: workspace.map_or(FileKind::Regular, Captured::kind),
+                        bytes,
+                    })
+                });
+                (placed, placement.moved, placement.notices)
+            }
+            None => {
+                let moves = place_long(
+                    LongFile {
+                        below: history.below.is_some(),
+                        current: current.is_some(),
+                        workspace: workspace.is_some(),
+                        kind_changed,
+                    },
+                    &provenance,
+                    &also_move,
+                );
+                (workspace.cloned(), moves.moved, moves.notices)
+            }
+        };
         let replay = replay(
             store,
             path,
             history,
             placed.as_ref(),
-            &placement.moved,
+            &moved,
             &failed_before,
             reauthored,
         )?;
@@ -140,8 +214,8 @@ pub fn place_path(
             Replay::Reached(value) if value == wanted => {
                 return Ok(PathPlacement {
                     below: placed,
-                    moved: placement.moved,
-                    notices: placement.notices,
+                    moved,
+                    notices,
                 });
             }
             Replay::Reached(_) => {
@@ -152,6 +226,20 @@ pub fn place_path(
             Replay::NoLongerFit(edits) => also_move.extend(edits),
         }
     }
+}
+
+/// `value` as a version to author: its bytes when it fits `max_input_bytes`, else the value.
+fn captured(store: &ContentStore, value: FileValue, max_input_bytes: usize) -> Result<Captured> {
+    Ok(
+        if store.logical_length(value.content)? > max_input_bytes as u64 {
+            Captured::Stored(value)
+        } else {
+            Captured::Bytes(FileBytes {
+                kind: value.kind,
+                bytes: store.get(value.content)?,
+            })
+        },
+    )
 }
 
 enum Replay {
@@ -167,20 +255,21 @@ fn replay(
     store: &ContentStore,
     path: &str,
     history: &PathHistory,
-    placed: Option<&FileBytes>,
+    placed: Option<&Captured>,
     moved: &BTreeSet<LaterEdit>,
     failed_before: &BTreeSet<LaterEdit>,
     reauthored: &BTreeSet<ChangeId>,
 ) -> Result<Replay> {
-    // The bytes travel verified, so a step hashes only the content it generates.
-    let mut file: Option<(FileKind, VerifiedContent<Cow<'_, [u8]>>)> = placed.map(|file| {
-        (
+    // Bytes travel verified, so a step hashes only the content it generates.
+    let mut file: Option<(FileKind, Held<'_>)> = placed.map(|file| match file {
+        Captured::Bytes(file) => (
             file.kind,
-            VerifiedContent::new(Cow::Borrowed(file.bytes.as_slice())),
-        )
+            Held::Bytes(VerifiedContent::new(Cow::Borrowed(file.bytes.as_slice()))),
+        ),
+        Captured::Stored(value) => (value.kind, Held::Stored(value.content)),
     });
-    let value_of = |(kind, content): &(FileKind, VerifiedContent<Cow<'_, [u8]>>)| FileValue {
-        content: content.id(),
+    let value_of = |(kind, held): &(FileKind, Held<'_>)| FileValue {
+        content: held.id(),
         kind: *kind,
     };
     let mut no_longer_fit = BTreeSet::new();
@@ -209,7 +298,10 @@ fn replay(
             edits,
             Replaying {
                 store,
-                file: file.as_ref().map(|(_, content)| content),
+                file: file.as_ref().and_then(|(_, held)| match held {
+                    Held::Bytes(content) => Some(content),
+                    Held::Stored(_) => None,
+                }),
             },
             ApplicationLimits {
                 allow_already_satisfied: reapplied,
@@ -241,16 +333,33 @@ fn replay(
         file = match result.tree.get(path).copied() {
             None => None,
             Some(next) if Some(next) == value => file,
-            Some(next) => {
-                let content = match result.generated_content.remove(&next.content) {
-                    Some(content) => content,
-                    None => store.get_verified(next.content)?,
-                };
-                Some((next.kind, content.into()))
-            }
+            // Content an edit names is read only when a later step reads it.
+            Some(next) => Some((
+                next.kind,
+                match result.generated_content.remove(&next.content) {
+                    Some(content) => Held::Bytes(content.into()),
+                    None => Held::Stored(next.content),
+                },
+            )),
         };
     }
     Ok(Replay::Reached(file.as_ref().map(value_of)))
+}
+
+/// The path's content as a replay holds it.
+enum Held<'a> {
+    Bytes(VerifiedContent<Cow<'a, [u8]>>),
+    /// Content only the store has, read when an edit needs it.
+    Stored(ContentId),
+}
+
+impl Held<'_> {
+    fn id(&self) -> ContentId {
+        match self {
+            Self::Bytes(content) => content.id(),
+            Self::Stored(id) => *id,
+        }
+    }
 }
 
 /// The content a replay step reads: the file as the replay holds it, else the store.
@@ -331,6 +440,11 @@ pub fn describe(path: &str, into: ChangeId, notice: &MoveNotice) -> String {
                 WholeFileReason::ReplacedLater => format!("{from} replaced the whole file later"),
                 WholeFileReason::WorkspaceReplaces => {
                     format!("your edit replaces the whole file, which {from} also edits")
+                }
+                WholeFileReason::Long => {
+                    format!(
+                        "the file is too long to place block by block, and {from} also edits it"
+                    )
                 }
             };
             format!("{path}: {why}; adding it to {into} moves the entire file into {into}")

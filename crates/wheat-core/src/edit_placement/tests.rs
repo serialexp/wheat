@@ -481,6 +481,99 @@ fn whole_file_moves_name_the_reason_and_every_change() {
 }
 
 #[test]
+fn a_whole_file_move_takes_edits_that_no_longer_fit_along() {
+    let (c, current, provenance) = replaced_line_three();
+    let unwritten = later(c, 9);
+    let placement = place(PlacementInput {
+        below: Some(R.as_bytes()),
+        current: Some(current.as_bytes()),
+        workspace: None,
+        kind_changed: false,
+        provenance: &provenance,
+        also_move: &BTreeSet::from([unwritten]),
+    })
+    .unwrap();
+    assert_eq!(placement.moved, BTreeSet::from([later(c, 1), unwritten]));
+}
+
+#[test]
+fn a_long_file_moves_whole_with_the_reason_place_would_give() {
+    let (c, _, provenance) = replaced_line_three();
+    let file = LongFile {
+        below: true,
+        current: true,
+        workspace: true,
+        kind_changed: false,
+    };
+    let none = BTreeSet::new();
+    let reason = |file: LongFile, provenance: &Provenance| {
+        let moves = place_long(file, provenance, &none);
+        assert_eq!(moves.moved, provenance.edits.iter().copied().collect());
+        match moves.notices.as_slice() {
+            [MoveNotice::WholeFile { reason, changes }] => {
+                assert_eq!(*changes, BTreeSet::from([c]));
+                *reason
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    // Range writes alone would be placed block by block, but the file cannot be read.
+    assert_eq!(reason(file, &provenance), WholeFileReason::Long);
+    assert_eq!(
+        reason(
+            LongFile {
+                below: false,
+                ..file
+            },
+            &provenance
+        ),
+        WholeFileReason::CreatedLater
+    );
+    assert_eq!(
+        reason(
+            LongFile {
+                current: false,
+                ..file
+            },
+            &provenance
+        ),
+        WholeFileReason::DeletedLater
+    );
+    assert_eq!(
+        reason(
+            LongFile {
+                kind_changed: true,
+                ..file
+            },
+            &provenance
+        ),
+        WholeFileReason::WorkspaceReplaces
+    );
+    let replaced = attribute(
+        Some(R.len()),
+        &[LaterStep {
+            change: c,
+            writes: vec![LaterWrite::WholeFile {
+                edit: edit(1),
+                len: Some(4),
+            }],
+        }],
+    )
+    .unwrap();
+    assert_eq!(reason(file, &replaced), WholeFileReason::ReplacedLater);
+
+    // Nothing later wrote the file: nothing moves.
+    assert_eq!(
+        place_long(file, &Provenance::default(), &none),
+        Moves::default()
+    );
+    // An edit that no longer fits moves even then.
+    let unwritten = BTreeSet::from([later(c, 9)]);
+    let moves = place_long(file, &Provenance::default(), &unwritten);
+    assert_eq!(moves.moved, unwritten);
+}
+
+#[test]
 fn a_small_edit_in_a_large_file_only_diffs_its_neighbourhood() {
     // Far more lines than one line diff accepts.
     let lines = (0..50_000)

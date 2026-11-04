@@ -21,7 +21,7 @@ use wheat_store::{
 };
 
 use crate::{
-    edit_move::{FileBytes, PathPlacement, describe, place_path},
+    edit_move::{Captured, FileBytes, PathPlacement, describe, place_path},
     outcome::CliFailure,
     workspace_files::{
         WorkspaceFileError, absent_where_shape_changed, analyze_workspace_file,
@@ -162,7 +162,7 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
         // The change's new version of the path: the workspace file, or its placement at the
         // change's spot when later changes also edit it.
         let file = match placements.get(path) {
-            Some(placement) => placement.below.clone().map(Captured::Bytes),
+            Some(placement) => placement.below.clone(),
             None => read_captured(root, path, store, limits)?,
         };
         let a = authored_values[path.as_str()];
@@ -395,7 +395,7 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
 
 /// A placement with the current revision of every change it moves edits out of.
 struct Placed {
-    below: Option<FileBytes>,
+    below: Option<Captured>,
     moved: BTreeSet<LaterEdit>,
     notices: Vec<wheat_core::edit_placement::MoveNotice>,
     revisions: BTreeMap<ChangeId, RevisionId>,
@@ -460,38 +460,10 @@ async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
         )));
     }
     let sorted = histories.keys().map(String::as_str).collect::<Vec<_>>();
-    // Placing an edit reads every version of the file whole, so a file past the guarded
-    // bound cannot be placed yet.
-    let past_bound = |path: &str| {
-        CliFailure::invalid(format!(
-            "cannot add {path:?} to change {change}: changes after it also edit it, and placing an edit to a file over {} bytes among later changes is not supported yet",
-            limits.max_input_bytes
-        ))
-    };
-    for (path, current) in sorted.iter().zip(&current) {
-        for value in [*current, histories[*path].below].into_iter().flatten() {
-            if store.logical_length(value.content)? > limits.max_input_bytes as u64 {
-                return Err(past_bound(path));
-            }
-        }
-    }
+    // A file past the guarded bound is streamed into the store and placed whole.
     let mut files = BTreeMap::new();
     for path in &sorted {
-        let read = absent_where_shape_changed(read_workspace_file(
-            root,
-            Path::new(path),
-            limits.max_input_bytes,
-        ));
-        if matches!(read, Err(WorkspaceFileError::TooLarge { .. })) {
-            return Err(past_bound(path));
-        }
-        let file = read
-            .with_context(|| format!("cannot read workspace path {path:?}"))?
-            .map(|snapshot| FileBytes {
-                kind: snapshot.kind,
-                bytes: canonical_workspace(&snapshot),
-            });
-        files.insert(*path, file);
+        files.insert(*path, read_captured(root, path, store, limits)?);
     }
     let mut reauthored = BTreeSet::new();
     loop {
@@ -510,6 +482,7 @@ async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
                 *current,
                 files[path].as_ref(),
                 &reauthored,
+                limits.max_input_bytes,
             )?;
             giving_up.extend(moved.iter().map(|edit| edit.change));
             let revisions = history
@@ -589,13 +562,6 @@ fn guarded_record(
 }
 
 /// A path's new version as capture reads it.
-enum Captured {
-    /// Its canonical bytes.
-    Bytes(FileBytes),
-    /// A file past the guarded bound, already streamed into the store.
-    Stored(wheat_core::FileValue),
-}
-
 /// Reads the workspace version of `path`. A file past the guarded bound is streamed
 /// into the store rather than read whole.
 fn read_captured(
