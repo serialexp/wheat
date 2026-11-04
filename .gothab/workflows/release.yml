@@ -10,8 +10,11 @@ on:
   push:
     tags: ["v*"]
 
+# `contents: write` for the release, `artifacts: write` for the GitHub run's archives
+# the dispatch copies back as artifacts of this run (and the release job reads).
 permissions:
   contents: write
+  artifacts: write
 
 jobs:
   build:
