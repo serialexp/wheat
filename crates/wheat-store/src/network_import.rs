@@ -26,7 +26,8 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{
-    BundleManifestRecord, ContentId, RepositoryLocationRecord, RepositoryStateId, VerifiedContent,
+    BundleManifestRecord, CHUNKED_CONTENT_THRESHOLD, ContentId, RepositoryLocationRecord,
+    RepositoryStateId, VerifiedContent,
 };
 
 use crate::{
@@ -580,15 +581,31 @@ impl<'a> Adder<'a> {
             if present.contains(&id) {
                 continue;
             }
-            let blob = match self.source.get_verified(id) {
-                Ok(blob) => blob,
-                Err(ContentStoreError::Missing(_)) => {
-                    return Err(BundleError::MissingContent(id).into());
+            let missing = |error| -> ImportError {
+                match error {
+                    ContentStoreError::Missing(_) => BundleError::MissingContent(id).into(),
+                    error => error.into(),
                 }
-                Err(error) => return Err(error.into()),
             };
+            let mismatch =
+                || -> ImportError { BundleError::Mismatch(PathBuf::from(id.to_string())).into() };
+            // A long blob is copied a chunk at a time rather than batched whole. The
+            // stored length refuses a listing that disagrees before anything is copied;
+            // the copy's own length is the one checked against the bytes.
+            let stored = self.source.logical_length(id).map_err(missing)?;
+            if stored > CHUNKED_CONTENT_THRESHOLD {
+                if length.is_some_and(|length| length != stored) {
+                    return Err(mismatch());
+                }
+                let copied = self.source.copy_to(id, self.target).map_err(missing)?;
+                if length.is_some_and(|length| length != copied) {
+                    return Err(mismatch());
+                }
+                continue;
+            }
+            let blob = self.source.get_verified(id).map_err(missing)?;
             if length.is_some_and(|length| length != blob.len() as u64) {
-                return Err(BundleError::Mismatch(PathBuf::from(id.to_string())).into());
+                return Err(mismatch());
             }
             batch_bytes += blob.len();
             batch.push(blob);

@@ -5,6 +5,13 @@ the same commit.
 
 ## Found while placing long files (2026-11-05)
 
+- [ ] **Increment validation takes a chunked blob's manifest for the blob.**
+  `added_content` (`crates/wheat-store/src/increment_validation.rs`) checks added
+  content with `logical_length`, a header read, so a chunked blob counts as present
+  once its manifest is, whether or not its chunks are. Publish arrivals check a
+  manifest's chunks before storing it, so this only misses a store that lost chunks
+  afterwards; `ContentStore::confirm` would look each chunk up. Decide whether the
+  increment check should pay for that.
 - [ ] **Edit move can loop when no later edit wrote the path.** `place` returns the
   workspace file with nothing moved when `provenance.edits` is empty, even when
   `also_move` is not (`crates/wheat-core/src/edit_placement.rs`). An edit that applied

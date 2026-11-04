@@ -230,6 +230,16 @@ impl ContentStore {
         }
         Ok(())
     }
+    /// Reads `id` and checks its bytes against its ID without returning them. A
+    /// chunked blob is read a chunk at a time through [`Self::check_manifest`], so
+    /// at most one chunk is held; a blob stored whole is read whole.
+    pub fn verify(&self, id: ContentId) -> Result<(), ContentStoreError> {
+        match self.chunk_manifest(id)? {
+            Some(manifest) => self.check_manifest(id, &manifest),
+            None => self.get_verified(id).map(drop),
+        }
+    }
+
     /// Confirms `id` is stored and readable without returning its bytes. A blob
     /// stored whole is read and checked against its ID. A chunked blob's manifest
     /// and parts are read and every chunk they name looked up, without reading the

@@ -805,8 +805,8 @@ where
             .await?;
         while let Some(id) = contents.next().await? {
             self.scratch.insert_content(id)?;
-            match self.reader.content.get(id) {
-                Ok(_) => {}
+            match self.reader.content.verify(id) {
+                Ok(()) => {}
                 Err(ContentStoreError::Missing(_)) => {
                     return Err(RepositoryPublicationError::MissingContent(id));
                 }

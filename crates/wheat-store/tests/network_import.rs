@@ -101,6 +101,58 @@ async fn an_imported_network_keeps_its_ids_heads_and_content() {
     );
 }
 
+/// A blob over the chunking threshold is copied into the bundle and out of it a chunk
+/// at a time, and validated where it lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_blob_moves_through_a_bundle_as_chunks() {
+    let mut source = Fixture::new();
+    let placed = source
+        .repositories
+        .create_empty("alice/long", "main")
+        .await
+        .unwrap();
+    let network = source.repositories.network(placed.location.network);
+    let long = (0..wheat_core::CHUNKED_CONTENT_THRESHOLD as usize + (3 << 20))
+        .map(|index| (index % 251) as u8 ^ (index >> 20) as u8)
+        .collect::<Vec<_>>();
+    let id = ContentId::of(&long);
+    let base = source.base;
+    source
+        .add(
+            &network,
+            placed.location.repository,
+            base,
+            "long.bin",
+            &long,
+        )
+        .await;
+    let bundle = source.root().join("bundle");
+    let manifest = source
+        .repositories
+        .export_network(placed.location.network, &bundle)
+        .unwrap()
+        .finish(&source.content.content_store())
+        .await
+        .unwrap();
+    assert_eq!(manifest.content_count, 1);
+    assert_eq!(manifest.content_bytes, long.len() as u64);
+    let held = wheat_store::PackedObjectStore::open(wheat_store::bundle_content_directory(&bundle))
+        .unwrap();
+    assert!(held.content_store().chunk_manifest(id).unwrap().is_some());
+    held.close().unwrap();
+
+    let target = Fixture::new();
+    let names = [(placed.location.repository, "carol/long".to_owned())];
+    target
+        .repositories
+        .import_network(&bundle, &names, &target.content.content_store())
+        .await
+        .unwrap();
+    let content = target.content.content_store();
+    assert!(content.chunk_manifest(id).unwrap().is_some());
+    assert!(content.get(id).unwrap() == long);
+}
+
 fn names_of(target: &Fixture) -> Vec<String> {
     listing(&target.repositories.root().join("names"))
 }

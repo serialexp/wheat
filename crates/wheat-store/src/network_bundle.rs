@@ -29,9 +29,10 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 use wheat_core::{
-    BundleFileRecord, BundleManifestRecord, ContentId, ContentSetId, InventoryRecord,
-    RepositoryStateId, StoreRecordError, VerifiedContent, decode_bundle_content_chunk,
-    decode_bundle_manifest, encode_bundle_content_chunk, encode_bundle_manifest,
+    BundleFileRecord, BundleManifestRecord, CHUNKED_CONTENT_THRESHOLD, ContentId, ContentSetId,
+    InventoryRecord, RepositoryStateId, StoreRecordError, VerifiedContent,
+    decode_bundle_content_chunk, decode_bundle_manifest, encode_bundle_content_chunk,
+    encode_bundle_manifest,
 };
 
 use crate::{
@@ -277,24 +278,30 @@ async fn copy_content(
     let mut batch: Vec<VerifiedContent> = Vec::new();
     let mut batch_bytes = 0;
     while let Some(id) = merged.next().await? {
-        let blob = match source.get_verified(id) {
-            Ok(blob) => blob,
-            Err(ContentStoreError::Missing(_)) => return Err(BundleError::MissingContent(id)),
-            Err(error) => return Err(error.into()),
+        let missing = |error| match error {
+            ContentStoreError::Missing(_) => BundleError::MissingContent(id),
+            error => error.into(),
         };
-        let length = blob.len();
+        // A long blob is copied a chunk at a time rather than batched whole.
+        let length = if source.logical_length(id).map_err(missing)? > CHUNKED_CONTENT_THRESHOLD {
+            source.copy_to(id, &target).map_err(missing)?
+        } else {
+            let blob = source.get_verified(id).map_err(missing)?;
+            let length = blob.len();
+            batch_bytes += length;
+            batch.push(blob);
+            if batch_bytes >= limits.batch_bytes || batch.len() >= limits.batch_blobs {
+                put_batch(&target, &mut batch)?;
+                batch_bytes = 0;
+            }
+            length as u64
+        };
         chunk.push(InventoryRecord {
             id: *id.as_bytes(),
-            bytes: length as u64,
+            bytes: length,
         });
         listing.count += 1;
-        listing.bytes += length as u64;
-        batch_bytes += length;
-        batch.push(blob);
-        if batch_bytes >= limits.batch_bytes || batch.len() >= limits.batch_blobs {
-            put_batch(&target, &mut batch)?;
-            batch_bytes = 0;
-        }
+        listing.bytes += length;
         if chunk.len() == limits.chunk_entries {
             listing
                 .chunks

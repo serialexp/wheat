@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: partial — steps 1 (format, two levels), 2 (store), 3 (protocol), 4 (client) and 5 (Git bridge) landed, steps 6–7 outstanding
+Status: partial — steps 1 (format, two levels), 2 (store), 3 (protocol), 4 (client), 5 (Git bridge) and 6 (repack, verification, bundles) landed, step 7 outstanding
 Owner: bart
 Last updated: 2026-11-05
 
@@ -131,13 +131,26 @@ land and move them from Outstanding to Done.
   (wheat-git), `long_files_round_trip_through_git` (push, pull and import of 17 MiB
   files, wheat-cli).
 
+- [x] **Step 6 — repack, verification, bundles.** Repack already met it in step 2:
+  it carries a manifest as it is, its chunks and parts as ordinary content, and never
+  makes a chunked blob a delta or a delta's base, and content generations hold them
+  (`a_packed_store_keeps_chunked_blobs_through_a_repack`, 72 MiB). Full verification
+  reads a chunked blob a chunk at a time through `ContentStore::verify`
+  (`check_manifest`) instead of assembling it and hashing it twice. Network bundle
+  export and import, and adopting a repository, copy a blob over the threshold with
+  `ContentStore::copy_to`, a reader into a writer, instead of batching it whole and
+  cutting it again. Tests: `verifying_a_chunked_blob_reads_every_chunk`,
+  `a_chunked_blob_copies_into_another_store_as_chunks`,
+  `a_long_blob_moves_through_a_bundle_as_chunks`. What each holds is step 7's to
+  measure.
+
 ### Outstanding
 
+- [ ] **Defer — snapshot export.** `export_snapshot_to`, used by tests and a bench case
+  only, sends content whole and refuses a blob over its 8 MiB batch.
 - [ ] **Defer — the in-memory Git importer.** `wheat_git::import_repository`, used by
   tests and an example only, still reads every blob whole and refuses one over the
   guarded bound.
-- [ ] **Step 6 — repack, verification, bundles.** Content repack and generations
-  hold chunks and manifests; full verification and network export/import stream.
 - [ ] **Step 7 — benchmarks and contracts.** Cases for a large file's add,
   publish, fetch, a small edit to it, materialization, and its Git push and import,
   with peak memory and bytes written/sent as budgets.

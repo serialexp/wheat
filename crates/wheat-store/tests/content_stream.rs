@@ -255,6 +255,50 @@ fn confirming_a_chunked_blob_looks_its_chunks_up_without_reading_them() {
 }
 
 #[test]
+fn verifying_a_chunked_blob_reads_every_chunk() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ContentStore::new(directory.path());
+    let bytes = noise(12, 20 * MIB);
+    let (id, _) = write(&store, &bytes, MIB);
+    store.verify(id).unwrap();
+    let manifest_path = store.path(id);
+    let chunks = files(directory.path())
+        .into_iter()
+        .filter(|path| *path != manifest_path)
+        .collect::<Vec<_>>();
+    assert!(chunks.len() >= 2);
+
+    // Unlike confirming, verifying reads the chunk that holds another's bytes.
+    std::fs::copy(&chunks[1], &chunks[0]).unwrap();
+    store.confirm(id).unwrap();
+    let error = store.verify(id).unwrap_err().to_string();
+    assert!(
+        error.contains("integrity") || error.contains("read limit"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_chunked_blob_copies_into_another_store_as_chunks() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = ContentStore::new(directory.path().join("source"));
+    let target = ContentStore::new(directory.path().join("target"));
+    let bytes = noise(13, 20 * MIB + 3);
+    let (id, _) = write(&source, &bytes, MIB);
+
+    assert_eq!(source.copy_to(id, &target).unwrap(), bytes.len() as u64);
+    assert!(target.chunk_manifest(id).unwrap().is_some());
+    assert!(std::fs::metadata(target.path(id)).unwrap().len() < 4096);
+    assert!(read(&target, id).0 == bytes);
+    // Copying again finds every chunk there.
+    assert_eq!(source.copy_to(id, &target).unwrap(), bytes.len() as u64);
+    assert!(matches!(
+        source.copy_to(ContentId::of(b"never stored"), &target),
+        Err(ContentStoreError::Missing(_))
+    ));
+}
+
+#[test]
 fn confirming_a_blob_stored_whole_reads_and_checks_it() {
     let directory = tempfile::tempdir().unwrap();
     let store = ContentStore::new(directory.path());

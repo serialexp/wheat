@@ -440,6 +440,39 @@ impl ContentStore {
     pub fn reader(&self, id: ContentId) -> Result<ContentReader, ContentStoreError> {
         ContentReader::open(self, id)
     }
+
+    /// Copies `id` into `target` through a reader and a writer, so neither store's
+    /// side holds more than a chunk of it, and returns its length. The bytes are
+    /// checked against `id` as they are read and again as `target` names them.
+    pub fn copy_to(&self, id: ContentId, target: &ContentStore) -> Result<u64, ContentStoreError> {
+        let mut reader = self.reader(id)?;
+        let mut writer = target.writer();
+        let mut scratch = vec![0; COPY_SCRATCH_BYTES];
+        let mut length = 0_u64;
+        loop {
+            let read = match io::Read::read(&mut reader, &mut scratch) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(store_error(error)),
+            };
+            io::Write::write_all(&mut writer, &scratch[..read]).map_err(store_error)?;
+            length += read as u64;
+        }
+        writer.finish(Some(id))?;
+        Ok(length)
+    }
+}
+
+/// Bytes [`ContentStore::copy_to`] moves at a time.
+const COPY_SCRATCH_BYTES: usize = 256 * 1024;
+
+/// The store error a reader's or writer's I/O error carries.
+fn store_error(error: io::Error) -> ContentStoreError {
+    match error.downcast::<ContentStoreError>() {
+        Ok(error) => error,
+        Err(error) => ContentStoreError::Io(error),
+    }
 }
 
 #[cfg(test)]
