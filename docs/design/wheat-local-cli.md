@@ -774,7 +774,12 @@ while every revision records author, authored-at, committer, committed-at, and
 its optional message. Timestamps default to the current local clock and accept
 explicit RFC3339 flags, preserving minute offsets. A revision leaves its logical
 change's metadata unchanged. `wheat log` shows the current revisions' title,
-author, timestamp, and any nonempty revision note.
+author, timestamp, and any nonempty revision note. `wheat log PATH` lists only the
+changes that touch a repository-relative file, or anything below a directory, newest
+first in canonical order; `--limit` bounds a page and `--before` (printed at a page's
+end, and `next` in JSON) starts the next one. The store keeps which changes touch
+which paths in `paths.sqlite`, a cache caught up when a query needs it (see
+`docs/design/wheat-path-history.md`).
 
 Configuration files are versioned, bounded, strict JSON and published atomically
 under a per-config lock. Repository configuration belongs to Wheat, not

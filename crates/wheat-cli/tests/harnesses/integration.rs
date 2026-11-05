@@ -68,6 +68,8 @@ mod label_publish;
 mod labels;
 #[path = "../local_workflow.rs"]
 mod local_workflow;
+#[path = "../log_path.rs"]
+mod log_path;
 #[path = "../materialization_recovery.rs"]
 mod materialization_recovery;
 #[path = "../phase1_acceptance.rs"]

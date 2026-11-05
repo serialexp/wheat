@@ -26,6 +26,11 @@ the same commit.
   08252c1739b28a05f81491af88b914d05d6eb062 could not be found". 6 sequential and
   24 eight-way parallel reruns passed. Unexplained; watch for it again, and look at
   how the import opens the object database if it recurs.
+- [ ] **`remote_large_content::more_new_files_than_one_content_request_publish_and_clone`
+  failed once (2026-11-06).** In a full `nextest --workspace` run it failed after
+  0.48 s (it takes ~10 s when it passes), so early, before any transfer; three
+  reruns alone passed. The error text was not kept. Rerun under load and capture it
+  if it recurs.
 
 ## Hosting on Gothab (2026-10-26)
 
@@ -156,7 +161,9 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
 - `[ ]` **`wheat log` lists changes in ChangeId order.** For imported history the
   IDs are UUIDv5, so the log is in effectively random order, and it prints every
   change with its whole message, with no limit or paging. Order by the view's
-  canonical order (or time), newest first, with a count limit.
+  canonical order (or time), newest first, with a count limit. `wheat log PATH`
+  already does (2026-11-06): newest first in canonical order, with `--limit` and
+  `--before`, through the path history index.
 
 ## Found while scoping the Scion lessons (2026-10-15)
 

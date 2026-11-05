@@ -1,6 +1,6 @@
 # Wheat path history — Design
 
-Status: partial — the index, `RepositoryBrowser::path_history` and the benchmark landed; callers outstanding
+Status: partial — the index, `RepositoryBrowser::path_history`, the benchmark and `wheat log PATH` landed; gitd outstanding (Gothab)
 Owner: bart
 Last updated: 2026-11-06
 
@@ -34,12 +34,16 @@ land and move them from Outstanding to Done.
   gitd's walk took 1.78 s and 218 ms. Catching up a cold index over all 20,000
   changes takes 1.3 s and 119,904 reads (6 per change), which is why callers catch
   up after a publish rather than on a page.
+- [x] **Clients: `wheat log PATH [--limit N] [--before P]`** (Bart, 2026-11-06). The
+  index is `paths.sqlite` in the store, opened by the command and caught up lazily:
+  a client's backlog is what it fetched since its last path log.
 
 ### Outstanding
 
-- [ ] **Callers.** The file in each client store (`LocalRepository`), and in gitd
-  where it opens a network; `catch_up` after a publish or import so a request never
-  pays for a large backlog.
+- [ ] **gitd.** The file where gitd opens a network, `RepositoryBrowser::path_history`
+  in place of `touching()`, and `catch_up` after a publish or import so a request
+  never pays for a large backlog. The API was sent to Gothab (@wise-walrus,
+  2026-11-06); the work is in the Gothab repository.
 - [ ] **After the index, measured first:** metadata only for hits (Gothab's (b)), a
   decoded-object cache in `Network` (a), cheaper `application_at` and tips (d).
 

@@ -112,7 +112,7 @@ enum Command {
     /// Verify the complete retained repository state.
     Validate,
     /// Inspect logical changes and immutable revisions.
-    Log,
+    Log(LogArgs),
     /// List changes active relative to this workspace's authoring basis.
     Changes,
     /// List native short labels in deterministic name order.
@@ -526,6 +526,20 @@ struct RevisionMetadataArgs {
 }
 
 #[derive(Debug, Args)]
+struct LogArgs {
+    /// List only the changes that touch this repository-relative file, or anything
+    /// below this directory, newest first.
+    path: Option<String>,
+    /// With a path, list only changes before this position in the history (the
+    /// `--before` a previous page printed).
+    #[arg(long, requires = "path")]
+    before: Option<u64>,
+    /// With a path, list at most this many changes.
+    #[arg(long, requires = "path")]
+    limit: Option<std::num::NonZeroUsize>,
+}
+
+#[derive(Debug, Args)]
 struct AddArgs {
     /// Active logical change to revise instead of the workspace selection.
     #[arg(long)]
@@ -872,7 +886,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Restore(_) => "restore",
         Command::Status => "status",
         Command::Validate => "validate",
-        Command::Log => "log",
+        Command::Log(_) => "log",
         Command::Changes => "changes",
         Command::Labels => "labels",
         Command::Label(LabelCommand::Create { .. }) => "label.create",
@@ -1044,7 +1058,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 format!("valid state: {state}\n"),
             )
         }
-        Command::Log => {
+        Command::Log(arguments) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
             let local = open(&context.store_root)?;
             let _operation =
@@ -1053,7 +1067,17 @@ fn execute(cli: Cli) -> Result<Success> {
             // Packed repositories hold their catalog lock for the handle lifetime; admission is
             // retained independently while the inspector reopens the same store.
             drop(local);
-            log_inspection::inspect(&context.store_root, workspace.effective_view(), format)
+            let path = arguments.path.map(|path| log_inspection::LogPath {
+                path,
+                before: arguments.before,
+                limit: arguments.limit,
+            });
+            log_inspection::inspect(
+                &context.store_root,
+                workspace.effective_view(),
+                path,
+                format,
+            )
         }
         Command::Ignore(IgnoreCommand::Import) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;

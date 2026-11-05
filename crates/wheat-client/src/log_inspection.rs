@@ -1,16 +1,35 @@
-use std::{fmt::Write as _, path::Path};
+use std::{fmt::Write as _, num::NonZeroUsize, path::Path};
 
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
-use wheat_core::{Change, ChangeMetadata, RevisionId, RevisionMetadata, RevisionRecord, ViewId};
-use wheat_store::{PublicationStore, RepositoryReader, RevisionMapStore};
+use wheat_core::{
+    Change, ChangeId, ChangeMetadata, RepositoryStateRecord, RevisionId, RevisionMetadata,
+    RevisionRecord, ViewId, ViewRecord,
+};
+use wheat_store::{
+    ImmutableObjectStore, PathHistoryIndex, PublicationStore, RepositoryReader, RevisionMapStore,
+};
 
 use crate::{
     authoring_metadata,
-    local::{open, runtime},
+    local::{PATH_HISTORY_INDEX_FILE, open, runtime},
     outcome::{CliFailure, OutputFormat, Success},
 };
+
+/// The most records one log lists.
+const MAX_LOG_RECORDS: usize = 250_000;
+
+/// `wheat log PATH`: the changes that touch a file, or anything below a directory,
+/// newest first in canonical order.
+pub struct LogPath {
+    /// Repository-relative, `/`-separated; a trailing `/` is ignored.
+    pub path: String,
+    /// List only changes before this canonical position.
+    pub before: Option<u64>,
+    /// List at most this many changes.
+    pub limit: Option<NonZeroUsize>,
+}
 
 const MAX_LOG_HUMAN_BYTES: usize = crate::outcome::MAX_OUTPUT_BYTES;
 // Leave room for the stable command envelope added by `emit_success`.
@@ -65,7 +84,14 @@ impl std::fmt::Write for BoundedLogText {
     }
 }
 
-pub fn inspect(root: &Path, effective_view: ViewId, format: OutputFormat) -> Result<Success> {
+/// Lists the revisions `effective_view` holds, or with `path` those of the changes
+/// that touch it.
+pub fn inspect(
+    root: &Path,
+    effective_view: ViewId,
+    path: Option<LogPath>,
+    format: OutputFormat,
+) -> Result<Success> {
     let repository = open(root)?;
     let runtime = runtime()?;
     runtime.block_on(async {
@@ -83,56 +109,147 @@ pub fn inspect(root: &Path, effective_view: ViewId, format: OutputFormat) -> Res
         if working.id() != effective_view {
             return Err(CliFailure::corrupt("effective view identity mismatch"));
         }
-        let revisions = RevisionMapStore::new(&repository.objects);
-        let changes = wheat_store::ChangeMapStore::new(&repository.objects);
-        let mut cursor = revisions.cursor(working.revisions).await?;
-        let mut output = BoundedLogText::new();
-        let mut entries = Vec::new();
-        let mut serialized_bytes = br#"{"entries":[]}"#.len();
-        let mut record_count = 0usize;
-        while let Some((change_id, revision_id)) = cursor.next().await? {
-            record_count = record_count
-                .checked_add(1)
-                .ok_or_else(|| CliFailure::limit("log record count overflow"))?;
-            if record_count > 250_000 {
-                return Err(CliFailure::limit(
-                    "current revision count exceeds the log limit",
-                ));
+        let mut output = LogOutput::new(
+            &reader,
+            wheat_store::ChangeMapStore::new(&repository.objects),
+            &state,
+            format,
+        );
+        let Some(path) = path else {
+            let revisions = RevisionMapStore::new(&repository.objects);
+            let mut cursor = revisions.cursor(working.revisions).await?;
+            while let Some((change_id, revision_id)) = cursor.next().await? {
+                output.push(change_id, revision_id).await?;
             }
-            let revision = reader.revision(revision_id).await?;
-            if revision.id() != revision_id || revision.change_id != change_id {
-                return Err(CliFailure::corrupt("revision identity mismatch"));
-            }
-            let change_object = changes
-                .get(state.changes, change_id)
-                .await?
-                .ok_or_else(|| {
-                    CliFailure::corrupt("revision refers to an unindexed logical change")
-                })?;
-            let change = reader.change(change_object).await?;
-            if change.id != change_id {
-                return Err(CliFailure::corrupt("logical change identity mismatch"));
-            }
-            match format {
-                OutputFormat::Human => {
-                    render_log_human_record(&mut output, &change, revision_id, &revision)?
-                }
-                OutputFormat::Json => push_log_entry(
-                    &mut entries,
-                    &mut serialized_bytes,
-                    change,
-                    revision_id,
-                    revision,
-                )?,
-            }
+            let (entries, human) = output.finish()?;
+            return Success::new("log", json!({ "entries": entries }), human);
+        };
+        let next = path_history(root, &reader, &working, &path, &mut output).await?;
+        let (entries, mut human) = output.finish()?;
+        if let (Some(next), OutputFormat::Human) = (next, format) {
+            writeln!(human, "older changes: --before {next}")?;
         }
-        let human = if format == OutputFormat::Human {
-            output.finish()?
+        Success::new("log", json!({ "entries": entries, "next": next }), human)
+    })
+}
+
+/// Adds the changes in `view` that touch `path` to `output`, newest first, and returns
+/// the `--before` for the changes after them, if any.
+async fn path_history<O: ImmutableObjectStore>(
+    root: &Path,
+    reader: &RepositoryReader<'_, O>,
+    view: &ViewRecord,
+    path: &LogPath,
+    output: &mut LogOutput<'_, '_, O>,
+) -> Result<Option<u64>> {
+    let repository_path = path.path.strip_suffix('/').unwrap_or(&path.path);
+    if repository_path
+        .split('/')
+        .any(|component| matches!(component, "" | "." | ".."))
+    {
+        return Err(CliFailure::invalid(format!(
+            "{:?} is not a repository-relative path",
+            path.path
+        )));
+    }
+    let size = view.order.size;
+    if let Some(before) = path.before.filter(|&before| before > size) {
+        return Err(CliFailure::invalid(format!(
+            "--before {before} is beyond the view's {size} changes"
+        )));
+    }
+    let limit = path
+        .limit
+        .unwrap_or(NonZeroUsize::new(MAX_LOG_RECORDS + 1).expect("the log limit is positive"));
+    let index = PathHistoryIndex::open(&root.join(PATH_HISTORY_INDEX_FILE))?;
+    let touches = index
+        .touching(reader, view, repository_path, path.before, limit)
+        .await?;
+    for touch in touches.touches {
+        let application = reader.application(touch.application).await?;
+        if application.id() != touch.application || application.order.position != touch.position {
+            return Err(CliFailure::corrupt("application identity mismatch"));
+        }
+        output.push(touch.change, application.revision_id).await?;
+    }
+    Ok(touches.next)
+}
+
+/// The log's revisions as they are listed, in `format`, within the output limits.
+struct LogOutput<'r, 'a, O> {
+    reader: &'r RepositoryReader<'a, O>,
+    changes: wheat_store::ChangeMapStore<'a, O>,
+    state: &'r RepositoryStateRecord,
+    format: OutputFormat,
+    text: BoundedLogText,
+    entries: Vec<LogEntry>,
+    serialized_bytes: usize,
+    records: usize,
+}
+
+impl<'r, 'a, O: ImmutableObjectStore> LogOutput<'r, 'a, O> {
+    fn new(
+        reader: &'r RepositoryReader<'a, O>,
+        changes: wheat_store::ChangeMapStore<'a, O>,
+        state: &'r RepositoryStateRecord,
+        format: OutputFormat,
+    ) -> Self {
+        Self {
+            reader,
+            changes,
+            state,
+            format,
+            text: BoundedLogText::new(),
+            entries: Vec::new(),
+            serialized_bytes: br#"{"entries":[]}"#.len(),
+            records: 0,
+        }
+    }
+
+    /// Lists `change_id` at revision `revision_id`.
+    async fn push(&mut self, change_id: ChangeId, revision_id: RevisionId) -> Result<()> {
+        self.records += 1;
+        if self.records > MAX_LOG_RECORDS {
+            return Err(CliFailure::limit(
+                "current revision count exceeds the log limit",
+            ));
+        }
+        let revision = self.reader.revision(revision_id).await?;
+        if revision.id() != revision_id || revision.change_id != change_id {
+            return Err(CliFailure::corrupt("revision identity mismatch"));
+        }
+        let change_object = self
+            .changes
+            .get(self.state.changes, change_id)
+            .await?
+            .ok_or_else(|| CliFailure::corrupt("revision refers to an unindexed logical change"))?;
+        let change = self.reader.change(change_object).await?;
+        if change.id != change_id {
+            return Err(CliFailure::corrupt("logical change identity mismatch"));
+        }
+        match self.format {
+            OutputFormat::Human => {
+                render_log_human_record(&mut self.text, &change, revision_id, &revision)
+            }
+            OutputFormat::Json => push_log_entry(
+                &mut self.entries,
+                &mut self.serialized_bytes,
+                change,
+                revision_id,
+                revision,
+            ),
+        }
+    }
+
+    /// The JSON entries and the human text.
+    fn finish(self) -> Result<(Vec<LogEntry>, String)> {
+        let human = if self.format == OutputFormat::Human {
+            self.text.finish()?
         } else {
             String::new()
         };
-        Success::new("log", json!({ "entries": entries }), human)
-    })
+        Ok((self.entries, human))
+    }
 }
 
 fn render_log_human_record(
