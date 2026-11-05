@@ -151,6 +151,59 @@ async fn browser(fixture: &Fixture) -> RepositoryBrowser<'_, CountingStore> {
 }
 
 #[tokio::test]
+async fn a_history_item_carries_the_change_and_revision_metadata() {
+    let fixture = Fixture::new().await;
+    let actor = |name: &str| Actor {
+        name: name.to_owned(),
+        email: format!("{name}@example.invalid"),
+    };
+    let at = |seconds| Timestamp {
+        seconds,
+        offset_minutes: 60,
+    };
+    let (change, view) = fixture
+        .create_with(
+            fixture.base,
+            fixture.base,
+            "file",
+            b"bytes",
+            ChangeMetadata {
+                title: "title".to_owned(),
+                description: "description".to_owned(),
+                creator: actor("creator"),
+                created_at: at(1),
+                provenance: None,
+            },
+            RevisionMetadata {
+                message: "message".to_owned(),
+                author: actor("author"),
+                authored_at: at(2),
+                committer: actor("committer"),
+                committed_at: at(3),
+                provenance: None,
+            },
+        )
+        .await;
+    let page = browser(&fixture)
+        .await
+        .history(view, None, limit(1))
+        .await
+        .unwrap();
+    let [item] = page.items.as_slice() else {
+        panic!("one item: {page:?}");
+    };
+    assert_eq!(item.change, change);
+    assert_eq!(item.title, "title");
+    assert_eq!(item.description, "description");
+    assert_eq!(item.creator, actor("creator"));
+    assert_eq!(item.message, "message");
+    assert_eq!(item.author, actor("author"));
+    assert_eq!(item.authored_at, at(2));
+    assert_eq!(item.committer, actor("committer"));
+    assert_eq!(item.committed_at, at(3));
+}
+
+#[tokio::test]
 async fn history_pages_walk_a_view_newest_first() {
     let fixture = Fixture::new().await;
     let views = line(&fixture, 12).await;

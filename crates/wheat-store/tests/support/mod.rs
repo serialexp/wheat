@@ -134,6 +134,33 @@ impl Fixture {
         bytes: &[u8],
         committed_at: i64,
     ) -> (ChangeId, ViewId) {
+        self.create_with(
+            basis,
+            effective,
+            path,
+            bytes,
+            ChangeMetadata::default(),
+            RevisionMetadata {
+                committed_at: Timestamp {
+                    seconds: committed_at,
+                    offset_minutes: 0,
+                },
+                ..RevisionMetadata::default()
+            },
+        )
+        .await
+    }
+
+    /// [`Self::create`], with the change's and the revision's metadata given.
+    pub async fn create_with(
+        &self,
+        basis: ViewId,
+        effective: ViewId,
+        path: &str,
+        bytes: &[u8],
+        metadata: ChangeMetadata,
+        revision_metadata: RevisionMetadata,
+    ) -> (ChangeId, ViewId) {
         self.content.put(bytes).unwrap();
         let change = self.next_change();
         let (prepared, outcome) = self
@@ -144,15 +171,9 @@ impl Fixture {
                 effective,
                 ChangeProposal {
                     id: change,
-                    metadata: ChangeMetadata::default(),
+                    metadata,
                     dependencies: Default::default(),
-                    revision_metadata: RevisionMetadata {
-                        committed_at: Timestamp {
-                            seconds: committed_at,
-                            offset_minutes: 0,
-                        },
-                        ..RevisionMetadata::default()
-                    },
+                    revision_metadata,
                     edits: exact(path, None, bytes),
                 },
             )

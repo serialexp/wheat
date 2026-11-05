@@ -61,10 +61,13 @@ pub struct HistoryItem {
     pub conflicted: bool,
     pub change: ChangeId,
     pub title: String,
+    pub description: String,
     pub creator: Actor,
     pub revision: RevisionId,
     pub message: String,
     pub author: Actor,
+    pub authored_at: Timestamp,
+    pub committer: Actor,
     pub committed_at: Timestamp,
 }
 
@@ -304,10 +307,13 @@ impl<'a, O: ImmutableObjectStore> RepositoryBrowser<'a, O> {
             conflicted,
             change: revision.change_id,
             title: change.metadata.title,
+            description: change.metadata.description,
             creator: change.metadata.creator,
             revision: application.revision_id,
             message: revision.metadata.message,
             author: revision.metadata.author,
+            authored_at: revision.metadata.authored_at,
+            committer: revision.metadata.committer,
             committed_at: revision.metadata.committed_at,
         })
     }
