@@ -408,13 +408,14 @@ async fn read_want(network: &Network, ids: &[ObjectId]) -> Result<WantAnswer, Co
 
 /// Handle a content fetch request.
 ///
-/// Reads all requested blobs together (one round trip on S3) and streams them
-/// in batches. If that read fails, each blob is read on its own: one larger than
-/// `MAX_CONTENT_CHUNK_SIZE` is sent as `ContentChunk`s, one over the chunking
-/// threshold as its `ContentManifest` while the answer's manifests fit
-/// `MAX_ANSWER_MANIFEST_BYTES` (and is left out, for the client to ask again, once
-/// they do not), and one that cannot be read ends the operation with an `Error`.
-/// `ContentFetchEnd` closes the answer.
+/// Reads the requested blobs about a batch at a time (`read_group`) and sends
+/// each group before reading the next, so an answer of thousands of chunks holds a
+/// batch, not all of them. A blob up to `MAX_CONTENT_CHUNK_SIZE` goes in a batch;
+/// a longer one is sent as `ContentChunk`s, one over the chunking threshold as its
+/// `ContentManifest` while the answer's manifests fit `MAX_ANSWER_MANIFEST_BYTES`
+/// (and is left out, for the client to ask again, once they do not), and one that
+/// cannot be read ends the operation with an `Error`. `ContentFetchEnd` closes the
+/// answer.
 pub async fn handle_content_fetch(
     ws: &mut impl Transport,
     entry: &RepositoryEntry,
@@ -437,75 +438,45 @@ pub async fn handle_content_fetch(
     let mut batch = ContentBatcher::new(op_id);
     let mut manifests = ManifestBudget::default();
     let mut left_out = 0usize;
-    let network = entry.network.clone();
-    let read = drive(move || async move {
-        match network
-            .content
-            .get_many_bounded(&ids, MAX_CONTENT_CHUNK_SIZE)
-        {
-            Ok(items) => Ok(items),
-            Err(error) => {
-                debug!(op_id, %error, "content fetch: bulk read failed, reading one at a time");
-                // Blobs too large to read bounded are left to read one at a time
-                // below, so the reads here never hold more than the bulk read would.
-                Err(ids
-                    .into_iter()
-                    .map(|id| (id, network.content.get_bounded(id, MAX_CONTENT_CHUNK_SIZE)))
-                    .collect::<Vec<_>>())
-            }
-        }
-    })
-    .await?;
-    match read {
-        Ok(items) => {
-            for (id, data) in items {
-                if let Some(full) = batch.push(content_digest(id), data) {
-                    send(ws, &full).await?;
+    let ids: std::sync::Arc<[wheat_core::ContentId]> = ids.into();
+    let mut next = 0;
+    while next < ids.len() {
+        let network = entry.network.clone();
+        let group = ids.clone();
+        let (reads, read_to) =
+            drive(move || async move { read_group(&network.content, &group, next) }).await?;
+        next = read_to;
+        for (id, read) in reads {
+            match read {
+                Ok(Fetched::Batched(data)) => {
+                    if let Some(full) = batch.push(content_digest(id), data) {
+                        send(ws, &full).await?;
+                    }
                 }
-            }
-        }
-        Err(each) => {
-            for (id, bounded) in each {
-                let data = match bounded {
-                    Ok(data) => {
-                        if let Some(full) = batch.push(content_digest(id), data) {
-                            send(ws, &full).await?;
-                        }
-                        continue;
+                Ok(Fetched::Whole(data)) => {
+                    if let Some(open) = batch.finish() {
+                        send(ws, &open).await?;
                     }
-                    Err(wheat_store::ContentStoreError::TooLarge { .. }) => {
-                        let network = entry.network.clone();
-                        drive(move || async move { long_blob(&network.content, id) }).await?
+                    let digest = content_digest(id);
+                    for chunk in content_chunks(op_id, &digest, &data) {
+                        send(ws, &chunk).await?;
                     }
-                    Err(error) => Err(error),
-                };
-                match data {
-                    Ok(LongBlob::Whole(data)) => {
-                        if let Some(open) = batch.finish() {
-                            send(ws, &open).await?;
-                        }
-                        let digest = content_digest(id);
-                        for chunk in content_chunks(op_id, &digest, &data) {
-                            send(ws, &chunk).await?;
-                        }
+                }
+                Ok(Fetched::Manifest(manifest)) => {
+                    if manifests.admit(manifest.len()) {
+                        send(ws, &content_manifest(op_id, content_digest(id), manifest)).await?;
+                    } else {
+                        left_out += 1;
                     }
-                    Ok(LongBlob::Manifest(manifest)) => {
-                        if manifests.admit(manifest.len()) {
-                            send(ws, &content_manifest(op_id, content_digest(id), manifest))
-                                .await?;
-                        } else {
-                            left_out += 1;
-                        }
-                    }
-                    Err(error) => {
-                        debug!(op_id, content_id = %id, %error, "content fetch: unreadable");
-                        let code = match error {
-                            wheat_store::ContentStoreError::Missing(_) => NOT_FOUND,
-                            _ => INTERNAL,
-                        };
-                        let message = format!("cannot read content {id}: {error}");
-                        return send_content_error(ws, op_id, code, &message, id).await;
-                    }
+                }
+                Err(error) => {
+                    debug!(op_id, content_id = %id, %error, "content fetch: unreadable");
+                    let code = match error {
+                        wheat_store::ContentStoreError::Missing(_) => NOT_FOUND,
+                        _ => INTERNAL,
+                    };
+                    let message = format!("cannot read content {id}: {error}");
+                    return send_content_error(ws, op_id, code, &message, id).await;
                 }
             }
         }
@@ -529,27 +500,74 @@ pub async fn handle_content_fetch(
     .await
 }
 
-/// A blob too long for one batch item: its bytes, sent as `ContentChunk`s, or, over
-/// the chunking threshold, its encoded manifest.
-enum LongBlob {
+/// A requested blob as the answer sends it.
+#[derive(Debug)]
+enum Fetched {
+    /// Up to `MAX_CONTENT_CHUNK_SIZE`: an item of a `ContentBatch`.
+    Batched(Vec<u8>),
+    /// Longer, up to the chunking threshold: sent as `ContentChunk`s.
     Whole(Vec<u8>),
+    /// Over the chunking threshold: its encoded manifest.
     Manifest(Vec<u8>),
+}
+
+impl Fetched {
+    fn len(&self) -> usize {
+        match self {
+            Self::Batched(bytes) | Self::Whole(bytes) | Self::Manifest(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// One requested blob and how reading it went.
+type BlobRead = (
+    wheat_core::ContentId,
+    Result<Fetched, wheat_store::ContentStoreError>,
+);
+
+/// Reads `ids` from `start` on until a batch's worth of bytes is read or a blob
+/// cannot be, and returns the reads and where the next group starts. A group holds
+/// less than `MAX_CONTENT_BATCH_SIZE` plus one blob of at most `MAX_CONTENT_SIZE`.
+fn read_group(
+    content: &wheat_store::ContentStore,
+    ids: &[wheat_core::ContentId],
+    start: usize,
+) -> (Vec<BlobRead>, usize) {
+    let mut reads = Vec::new();
+    let mut bytes = 0;
+    let mut next = start;
+    while next < ids.len() && bytes < MAX_CONTENT_BATCH_SIZE {
+        let id = ids[next];
+        next += 1;
+        let read = match content.get_bounded(id, MAX_CONTENT_CHUNK_SIZE) {
+            Ok(data) => Ok(Fetched::Batched(data)),
+            Err(wheat_store::ContentStoreError::TooLarge { .. }) => long_blob(content, id),
+            Err(error) => Err(error),
+        };
+        let failed = read.is_err();
+        bytes += read.as_ref().map_or(0, Fetched::len);
+        reads.push((id, read));
+        if failed {
+            break;
+        }
+    }
+    (reads, next)
 }
 
 fn long_blob(
     content: &wheat_store::ContentStore,
     id: wheat_core::ContentId,
-) -> Result<LongBlob, wheat_store::ContentStoreError> {
+) -> Result<Fetched, wheat_store::ContentStoreError> {
     match content.chunk_manifest(id)? {
         Some(manifest) => wheat_core::encode_content_chunk_manifest(&manifest)
-            .map(LongBlob::Manifest)
+            .map(Fetched::Manifest)
             .map_err(|error| wheat_store::ContentStoreError::InvalidFormat {
                 id,
                 reason: error.to_string(),
             }),
         None => content
             .get_bounded(id, MAX_CONTENT_SIZE)
-            .map(LongBlob::Whole),
+            .map(Fetched::Whole),
     }
 }
 
@@ -583,4 +601,47 @@ async fn send_content_error(
         }),
     )
     .await
+}
+#[cfg(test)]
+mod tests {
+    use wheat_core::ContentId;
+    use wheat_store::ContentStore;
+
+    use super::*;
+
+    /// Many chunk-sized blobs are read a batch's worth at a time, never all at once.
+    #[test]
+    fn a_large_answer_is_read_a_batch_at_a_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = ContentStore::new(directory.path().join("content"));
+        let mut ids = (0..16_u8)
+            .map(|index| content.put(&vec![index; MAX_CONTENT_CHUNK_SIZE]).unwrap())
+            .collect::<Vec<_>>();
+        let missing = ContentId::from_digest([7; 32]);
+        ids.insert(12, missing);
+
+        let mut start = 0;
+        let mut groups = Vec::new();
+        loop {
+            let (reads, next) = read_group(&content, &ids, start);
+            let held: usize = reads
+                .iter()
+                .map(|(_, read)| read.as_ref().map_or(0, Fetched::len))
+                .sum();
+            assert!(
+                held < MAX_CONTENT_BATCH_SIZE + MAX_CONTENT_SIZE,
+                "a group held {held} bytes"
+            );
+            groups.push(reads.len());
+            let failed = reads.last().is_some_and(|(_, read)| read.is_err());
+            start = next;
+            if failed {
+                assert_eq!(reads.last().unwrap().0, missing);
+                break;
+            }
+        }
+        // Three 4 MiB blobs reach the 12 MiB batch size.
+        assert_eq!(groups, [3, 3, 3, 3, 1]);
+        assert_eq!(start, 13);
+    }
 }

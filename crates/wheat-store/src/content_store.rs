@@ -800,20 +800,6 @@ impl ContentStore {
         self.path(id).is_file()
     }
 
-    /// Reads each of `ids` as [`Self::get_bounded`] does, one after another.
-    pub fn get_many_bounded(
-        &self,
-        ids: &[ContentId],
-        max: usize,
-    ) -> Result<Vec<(ContentId, Vec<u8>)>, ContentStoreError> {
-        let mut results = Vec::with_capacity(ids.len());
-        for &id in ids {
-            let bytes = self.get_bounded(id, max)?;
-            results.push((id, bytes));
-        }
-        Ok(results)
-    }
-
     /// Which of `candidates` are stored. A blob store answers with concurrent
     /// header reads, or from a listing when that takes fewer requests; a local store
     /// checks each.
