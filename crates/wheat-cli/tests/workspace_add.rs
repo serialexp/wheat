@@ -683,6 +683,60 @@ fn a_file_past_the_guarded_bound_is_added_whole_through_the_store() {
 }
 
 #[test]
+fn a_file_over_the_file_limit_is_refused_until_wheat_json_raises_it() {
+    let (dir, change, first) = setup();
+    let refused = |path: &str| {
+        let output = wheat(
+            dir.path(),
+            &["add", "--change", &change, "--predecessor", &first, path],
+        );
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("file limit") && stderr.contains(".wheat.json"),
+            "{stderr}"
+        );
+    };
+    // The default is 256 MiB. A sparse file reads fast.
+    let sparse = fs::File::create(dir.path().join("sparse.bin")).unwrap();
+    sparse.set_len((256 << 20) + 1).unwrap();
+    refused("sparse.bin");
+
+    // `.wheat.json` sets the limit in either direction, as it is on disk.
+    fs::write(dir.path().join("long.bin"), noise(2, 18 << 20)).unwrap();
+    fs::write(
+        dir.path().join(".wheat.json"),
+        r#"{"format":"wheat-repository","version":1,"max_file_bytes":17825792}"#,
+    )
+    .unwrap();
+    refused("long.bin");
+    fs::write(
+        dir.path().join(".wheat.json"),
+        r#"{"format":"wheat-repository","version":1,"max_file_bytes":20971520}"#,
+    )
+    .unwrap();
+    let added = add(&dir, &change, &first, "long.bin");
+    assert!(shown_edits(&dir, &added).contains("exact-file"));
+
+    // A malformed `.wheat.json` stops add rather than falling back to the default.
+    fs::write(dir.path().join(".wheat.json"), "{}").unwrap();
+    let output = wheat(
+        dir.path(),
+        &[
+            "add",
+            "--change",
+            &change,
+            "--predecessor",
+            &added,
+            "long.bin",
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".wheat.json: "), "{stderr}");
+}
+
+#[test]
 fn long_text_is_added_with_the_line_endings_status_sees() {
     let (dir, change, first) = setup();
     let crlf = "a line of text\r\n".repeat(20 << 16);

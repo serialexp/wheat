@@ -23,11 +23,11 @@ use wheat_store::{
 use crate::{
     edit_move::{Captured, FileBytes, PathPlacement, describe, place_path},
     outcome::CliFailure,
+    repository_config::{self, REPOSITORY_CONFIG_PATH},
     workspace_files::{
         WorkspaceFileError, absent_where_shape_changed, analyze_workspace_file,
         read_workspace_file, stream_workspace_file,
     },
-    workspace_scan::MAX_WORKSPACE_FILE_BYTES,
 };
 
 /// The revisions one `add` publishes: the destination change, plus every later change that
@@ -140,8 +140,17 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
         .collect::<BTreeMap<_, _>>();
 
     let limits = Limits::default();
-    let placements =
-        place_later_edits(target, working.tree, change, &selected, guards, limits).await?;
+    let max_file_bytes = repository_config::read(target.root)?.max_file_bytes;
+    let placements = place_later_edits(
+        target,
+        working.tree,
+        change,
+        &selected,
+        guards,
+        limits,
+        max_file_bytes,
+    )
+    .await?;
 
     let mut edits = old_definitions
         .iter()
@@ -163,7 +172,7 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
         // change's spot when later changes also edit it.
         let file = match placements.get(path) {
             Some(placement) => placement.below.clone(),
-            None => read_captured(root, path, store, limits)?,
+            None => read_captured(root, path, store, limits, max_file_bytes)?,
         };
         let a = authored_values[path.as_str()];
         let b = baseline_values[path.as_str()];
@@ -413,6 +422,7 @@ async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
     selected: &BTreeSet<String>,
     guards: &BTreeMap<String, Vec<Range<usize>>>,
     limits: Limits,
+    max_file_bytes: usize,
 ) -> Result<BTreeMap<String, Placed>> {
     let (root, store) = (target.root, target.store);
     let later = target
@@ -463,7 +473,10 @@ async fn place_later_edits<O: ImmutableObjectStore, P: PublicationStore>(
     // A file past the guarded bound is streamed into the store and placed whole.
     let mut files = BTreeMap::new();
     for path in &sorted {
-        files.insert(*path, read_captured(root, path, store, limits)?);
+        files.insert(
+            *path,
+            read_captured(root, path, store, limits, max_file_bytes)?,
+        );
     }
     let mut reauthored = BTreeSet::new();
     loop {
@@ -563,12 +576,13 @@ fn guarded_record(
 
 /// A path's new version as capture reads it.
 /// Reads the workspace version of `path`. A file past the guarded bound is streamed
-/// into the store rather than read whole.
+/// into the store rather than read whole; one longer than `max_file_bytes` is refused.
 fn read_captured(
     root: &Path,
     path: &str,
     store: &ContentStore,
     limits: Limits,
+    max_file_bytes: usize,
 ) -> Result<Option<Captured>> {
     let read = absent_where_shape_changed(read_workspace_file(
         root,
@@ -577,7 +591,7 @@ fn read_captured(
     ));
     let file = match read {
         Err(WorkspaceFileError::TooLarge { .. }) => {
-            return Ok(store_long_file(root, path, store)?.map(Captured::Stored));
+            return Ok(store_long_file(root, path, store, max_file_bytes)?.map(Captured::Stored));
         }
         read => read.with_context(|| format!("cannot read workspace path {path:?}"))?,
     };
@@ -597,15 +611,24 @@ fn store_long_file(
     root: &Path,
     path: &str,
     store: &ContentStore,
+    max_file_bytes: usize,
 ) -> Result<Option<wheat_core::FileValue>> {
     let cannot = || format!("cannot read workspace path {path:?}");
+    let too_long = |error: WorkspaceFileError| match error {
+        WorkspaceFileError::TooLarge { limit } => CliFailure::LimitExceeded(format!(
+            "{path:?} is longer than the {limit}-byte file limit; raise max_file_bytes in \
+             {REPOSITORY_CONFIG_PATH} to add it"
+        ))
+        .into(),
+        error => anyhow::Error::new(error).context(cannot()),
+    };
     let Some(file) = absent_where_shape_changed(analyze_workspace_file(
         root,
         Path::new(path),
-        MAX_WORKSPACE_FILE_BYTES,
+        max_file_bytes,
         0,
     ))
-    .with_context(cannot)?
+    .map_err(too_long)?
     else {
         return Ok(None);
     };
@@ -626,10 +649,10 @@ fn store_long_file(
         root,
         Path::new(path),
         file.text,
-        MAX_WORKSPACE_FILE_BYTES,
+        max_file_bytes,
         &mut |bytes| std::io::Write::write_all(&mut writer, bytes),
     )
-    .with_context(cannot)?;
+    .map_err(too_long)?;
     if kind != Some(file.kind) {
         return Err(changed());
     }

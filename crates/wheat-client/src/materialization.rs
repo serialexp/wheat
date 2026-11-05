@@ -53,7 +53,9 @@ const PROGRESS_OPCODE_INSTALL_INTENT: u16 = 1;
 const PROGRESS_OPCODE_COMPLETE: u16 = 2;
 const PROGRESS_OPCODE_ABORTED: u16 = 3;
 const MAX_JOURNAL_BYTES: usize = 192 * 1024 * 1024;
-pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
+/// Materialization writes a file of any length the format stores; `.wheat.json`'s
+/// limit is for capture.
+pub const MAX_FILE_BYTES: usize = crate::repository_config::FORMAT_MAX_FILE_BYTES;
 /// Scratch that staging streams a value's content through.
 const STAGING_SCRATCH_BYTES: usize = 64 * 1024;
 /// The most installs staged, recorded and synced together. An abort looks for

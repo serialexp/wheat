@@ -11,8 +11,8 @@ What Wheat persists falls in three kinds (see `crates/wheat-core/CLAUDE.md`):
 - **Durable system state** is a **BinSchema-generated binary** record or a SQLite
   database (the store locator, the catalog, the git journal). No JSON, serde or
   hand-rolled encodings for anything the system writes and reads back later.
-- **Files people edit** are JSON. Today that is only `config.json` (user and
-  repository).
+- **Files people edit** are JSON: `config.json` (user and store) and the tracked
+  `.wheat.json` at a workspace's root (`repository_config.rs`).
 - **Temporary files** that never outlive the operation that wrote them (for example
   `materialization.json`, `rewrite-transaction.json`) may be JSON.
 

@@ -144,6 +144,19 @@ land and move them from Outstanding to Done.
   `a_long_blob_moves_through_a_bundle_as_chunks`. What each holds is step 7's to
   measure.
 
+- [x] **Bench children measured from a fresh launcher (94ac059).** Found while
+  writing step 7: a child's `wait4` peak counts the memory it was forked from, so
+  every client command after an in-process server grew reported the case's size
+  (`edit_add` 164 MiB, really 82 MiB). Bart chose a launcher process.
+- [x] **Decision — the tools' file limit (2026-11-05).** Bart: 256 MiB stays the
+  default, "just there to stop footguns, not an actual limit", raised by a tracked
+  `.wheat.json` at the workspace root (not in `.wheat/`, which is never tracked);
+  `<store>/config.json` stays the local, untracked configuration. See
+  [Tool limits](#tool-limits-and-status-on-long-files).
+- [x] **Decision — status on long files (2026-11-05).** Bart: a stat cache, then
+  samples: an unchanged stat means unchanged; a changed stat with different samples
+  means modified; matching samples get a full hash.
+
 ### Outstanding
 
 - [ ] **Defer — snapshot export.** `export_snapshot_to`, used by tests and a bench case
@@ -151,9 +164,18 @@ land and move them from Outstanding to Done.
 - [ ] **Defer — the in-memory Git importer.** `wheat_git::import_repository`, used by
   tests and an example only, still reads every blob whole and refuses one over the
   guarded bound.
+- [ ] **`.wheat.json` file limit.** Default 256 MiB, at most the format's 1 TiB; see
+  the open points under [Tool limits](#tool-limits-and-status-on-long-files). Built
+  on provisional answers (Bart had not answered the open points by the time it
+  was needed): the limit applies to capture only, so status and materialization
+  take up to 1 TiB; add reads `.wheat.json` from disk
+  (`repository_config::read`). Not built: a local override in `<store>/config.json`.
+- [ ] **Stat cache and sampled status.** Same section.
 - [ ] **Step 7 — benchmarks and contracts.** Cases for a large file's add,
   publish, fetch, a small edit to it, materialization, and its Git push and import,
-  with peak memory and bytes written/sent as budgets.
+  with peak memory and bytes written/sent as budgets. `large_file` (add, publish,
+  clone, one-byte edit, fetch, refresh) runs at smoke size; at 1 GiB it needs the
+  file limit above.
 
 ## Why this exists
 
@@ -380,6 +402,47 @@ What changes outside the store (from the inventory of whole-blob paths,
   records; its 64 MiB per-record limit no longer meets large blobs.
 - **Verification and bundles** (`repository_verify`, network export/import) read
   through the reader and copy chunk by chunk.
+
+## Tool limits and status on long files
+
+Below the format's 1 TiB, two tool limits remained when step 7 began, both 256 MiB
+per file: `MAX_WORKSPACE_FILE_BYTES` (add and status) and materialization's
+`MAX_FILE_BYTES`. Both paths stream, so neither bounds memory, only work. Status also
+stops after 1 GiB of reads in one scan (`MAX_TOTAL_READ_BYTES`), because it hashes
+every tracked file on every run: one 1 GiB file and anything else, and status fails.
+
+**The file limit.** `.wheat.json` at the workspace root is tracked like any file:
+
+```json
+{ "format": "wheat-repository", "version": 1, "max_file_bytes": 4294967296 }
+```
+
+Without it the limit is 256 MiB; `max_file_bytes` above 1 TiB
+(`MAX_CHUNKED_CONTENT_BYTES`) is refused. Open:
+
+- Where the limit applies: when a workspace file is captured (add, and the capture
+  publish and edit capture do), or also when materializing and in status. Content
+  already in the repository got past someone's limit.
+- Which `.wheat.json` add reads: the one on disk, so raising the limit and adding the
+  file can be one change, or the one in the change's basis.
+- Whether `<store>/config.json` may override it locally, and in which direction.
+
+**Status.** A stat cache in `.wheat/` keeps, per tracked path, the size, mtime,
+ctime, inode and mode it had when Wheat last wrote or read it (materialize, add,
+status), with its content ID. Status reads a file only when its stat changed. As
+Git's index does, an entry whose mtime is not older than the cache's own write is
+racily clean and counts as changed. A file over the chunking threshold also keeps a
+digest of fixed samples of it; when its stat changed, status reads the samples
+first: different means modified, without reading the rest, and the same means a
+full hash. Open:
+
+- The cache's format: SQLite (`.wheat/stat.sqlite`), updated row by row, or a
+  BinSchema file rewritten whole when it changes.
+- The samples: how many, how large (for example the first and last 4 KiB and 62
+  evenly spaced 4 KiB blocks, 256 KiB read for any length).
+- A modified long file found by its samples has no content ID until add reads it:
+  status reports its workspace side without one (`DiffDescriptor::content` becomes
+  optional) or hashes it anyway when asked for IDs (`--format json`).
 
 ## Phasing
 

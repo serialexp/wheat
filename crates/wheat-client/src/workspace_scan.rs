@@ -15,7 +15,9 @@ use crate::{
     workspace_metadata::WorkspaceMetadata,
 };
 
-pub(crate) const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024 * 1024;
+/// Status reads a file of any length the format stores; `.wheat.json`'s limit is for
+/// capture.
+const MAX_WORKSPACE_FILE_BYTES: usize = crate::repository_config::FORMAT_MAX_FILE_BYTES;
 const MAX_BASELINE_INSPECTION_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_READ_BYTES: usize = 1024 * 1024 * 1024;
 

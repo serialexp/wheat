@@ -28,6 +28,7 @@ pub mod remote;
 pub mod remote_admin;
 pub mod remote_config;
 pub mod repack;
+pub mod repository_config;
 pub mod repository_diff;
 pub mod rewrite_transaction;
 pub mod selection_recovery;
