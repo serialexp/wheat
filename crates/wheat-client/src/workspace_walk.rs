@@ -169,16 +169,17 @@ fn walk_directory(
             format!("{prefix}/{name}")
         };
 
-        let metadata = match entry.path().symlink_metadata() {
-            Ok(m) => m,
+        // The type the directory listing gives (a stat only where the filesystem
+        // gives none). It does not follow links, so a symlink is never a directory
+        // here, whatever it points at: like Git, the walk lists it as one entry,
+        // matches it against ignore rules as a file (`dir/` rules do not apply), and
+        // does not descend through it.
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
             Err(_) => continue,
         };
 
-        // `symlink_metadata` does not follow links, so a symlink is never a
-        // directory here, whatever it points at: like Git, the walk lists it as
-        // one entry, matches it against ignore rules as a file (`dir/` rules
-        // do not apply), and does not descend through it.
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             match ignore_stack.is_ignored(&relative_path, true) {
                 IgnoreMatch::Ignored { .. } => {
                     // Prune: don't descend into ignored directories.
