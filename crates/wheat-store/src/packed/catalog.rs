@@ -2570,7 +2570,8 @@ fn open_index(path: &Path, durability: Durability) -> Result<Connection, Catalog
     } else if version != SCHEMA_VERSION {
         return Err(CatalogError::Corrupt("locator schema version"));
     }
-    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    let integrity: String = tracing::debug_span!("locator_quick_check")
+        .in_scope(|| connection.query_row("PRAGMA quick_check", [], |row| row.get(0)))?;
     if integrity != "ok" {
         return Err(CatalogError::Corrupt("locator database integrity"));
     }
