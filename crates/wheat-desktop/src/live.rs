@@ -57,7 +57,12 @@ impl LiveBackend {
 
     fn load(&mut self) -> Result<Model> {
         let root = self.workspace.as_path();
-        let status = workspace_status::read(root, None)?;
+        // The workspace screen lists what changed, not the content IDs.
+        let status = workspace_status::read(
+            root,
+            None,
+            wheat_client::workspace_scan::ContentIds::Optional,
+        )?;
         let active = active_changes::read(root, None)?;
         let entries = history::read(root, None)?;
         let workspaces = workspace_lifecycle::entries(root, None)?;

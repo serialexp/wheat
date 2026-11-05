@@ -224,10 +224,22 @@ Performance, most serious first:
   from 0.25 s to 0.3–0.7 s. The same tree with the fetch code from before the blocking
   change measures the same, so the change is elsewhere, or the machine was busier
   (other agents building). Re-measure on a quiet machine and bisect if it holds.
-- `[ ]` **`wheat status` re-reads and re-hashes every file (scanner only).**
-  `workspace_scan.rs` has no saved stat cache (mtime, ctime, size, inode, content ID),
-  so every status reads all tracked files and their baselines, and fails once the
-  workspace passes `MAX_TOTAL_READ_BYTES` (1 GiB).
+- `[ ]` **Status refuses a tracked file over 1 GiB, and a cold cache over 1 GiB in
+  all (2026-11-06).** `workspace_scan.rs` still charges every read to
+  `MAX_TOTAL_READ_BYTES` (1 GiB) and gives a file at most what is left as its limit,
+  so one tracked file over 1 GiB fails status with `TooLarge`, though the large-content
+  design says status takes files up to 1 TiB. With no stat cache yet (a new workspace,
+  or after a materialize, which records nothing), tracked files over 1 GiB in all fail
+  it too, and since the failed status records nothing, every later one fails the same
+  way. Reads stream, so the cap bounds time, not memory. Needs Bart's call: drop the
+  cap, or keep one and record what was read before it ran out.
+- `[ ]` **Every command `quick_check`s the packed locator (2026-11-06).**
+  `open_index` (`packed/catalog.rs`) runs `PRAGMA quick_check` on
+  `catalog-locator.sqlite3` at each open, which reads the whole database: 15 ms of a
+  92 ms warm `wheat status` at 20,000 files (2.6 MB locator), growing with the store's
+  objects (span `locator_quick_check`). The locator is derived and rebuilt when it
+  disagrees with the segments, so whether it needs the check on every open is Bart's
+  call.
 - `[ ]` **Content paths outside the protocol hold a blob whole (scanner only).**
   Since step 3 of `docs/design/wheat-large-content.md` (2026-11-01) publish and fetch
   move a blob over 16 MiB as its manifest and chunks, and hold at most 16 MiB of one

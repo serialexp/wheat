@@ -209,6 +209,19 @@ fn operational_store_artifacts(root: &Path) -> Vec<(PathBuf, SnapshotEntry)> {
         .collect()
 }
 
+/// The workspace's entries but for its stat cache, which status rewrites as it reads.
+fn workspace_snapshot(root: &Path) -> Vec<(PathBuf, SnapshotEntry)> {
+    filesystem_snapshot(root, false)
+        .into_iter()
+        .filter(|(path, _)| {
+            !path.starts_with(".wheat")
+                || !path
+                    .file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().starts_with(b"stat."))
+        })
+        .collect()
+}
+
 fn regular(bytes: &[u8], executable: bool) -> SnapshotEntry {
     SnapshotEntry::Regular {
         bytes: bytes.to_vec(),
@@ -404,7 +417,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     )
     .unwrap();
 
-    let workspace_before_reads = filesystem_snapshot(&harness.workspace, false);
+    let workspace_before_reads = workspace_snapshot(&harness.workspace);
     let store_before_reads = canonical_store_snapshot(&harness.store());
     let operational_before_reads = operational_store_artifacts(&harness.store());
     assert!(
@@ -540,7 +553,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         "read commands may mutate locator/lock bytes, but must preserve their explicit artifact paths and types"
     );
     assert_eq!(
-        filesystem_snapshot(&harness.workspace, false),
+        workspace_snapshot(&harness.workspace),
         workspace_before_reads
     );
     assert_eq!(
@@ -874,7 +887,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     );
     let head_path = harness.store().join("repository.head");
     let expected_head = fs::read(&head_path).unwrap();
-    let expected_workspace = filesystem_snapshot(&harness.workspace, false);
+    let expected_workspace = workspace_snapshot(&harness.workspace);
     let nested = harness.workspace.join("nested/reopen/here");
     fs::create_dir_all(&nested).unwrap();
     let reopened = harness.json_ok(&nested, &["status"]);
@@ -918,7 +931,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         fs::read(harness.workspace.join(".wheat/workspace.meta")).unwrap(),
         pinned_metadata
     );
-    let workspace_after_reopen = filesystem_snapshot(&harness.workspace, false);
+    let workspace_after_reopen = workspace_snapshot(&harness.workspace);
     assert_eq!(
         workspace_after_reopen
             .into_iter()

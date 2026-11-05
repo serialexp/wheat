@@ -98,6 +98,8 @@ mod revise_after_reapply;
 mod span_trace;
 #[path = "../squash.rs"]
 mod squash;
+#[path = "../stat_cache.rs"]
+mod stat_cache;
 #[path = "../store_analyze.rs"]
 mod store_analyze;
 #[path = "../unsupported_platform.rs"]

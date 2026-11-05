@@ -3,7 +3,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use wheat_core::{ContentId, FileKind, ViewId, diff_model::DiffDescriptor, text_capture};
+use tracing::Instrument as _;
+use wheat_core::{
+    ContentId, FileKind, FileValue, ViewId, diff_model::DiffDescriptor, text_capture,
+};
 use wheat_store::{
     ContentStoreError, MerkleTreeStore, PublicationStore, RepositoryHead, RepositoryReader,
     TreePathFilter, TreeWalkLimits,
@@ -11,9 +14,22 @@ use wheat_store::{
 
 use crate::{
     local::LocalRepository,
-    workspace_files::{absent_where_shape_changed, analyze_workspace_file},
+    stat_cache::{Observed, StatCache},
+    workspace_files::{
+        FileStamp, SAMPLE_BYTES, SAMPLE_COUNT, SAMPLED_FILE_BYTES, WorkspaceStats,
+        absent_where_shape_changed, analyze_workspace_file, sample_workspace_file,
+    },
     workspace_metadata::WorkspaceMetadata,
 };
+
+/// Whether a scan must give the content ID of each file it finds modified. When it
+/// need not, a long binary file whose samples differ from those it had when it was
+/// last found unchanged is reported modified without reading the rest of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentIds {
+    Required,
+    Optional,
+}
 
 /// Status reads a file of any length the format stores; `.wheat.json`'s limit is for
 /// capture.
@@ -37,6 +53,20 @@ pub struct WorkspaceScan {
     pub changes: Vec<ScannedChange>,
     /// Complete set of tracked paths from the materialized tree.
     pub tracked_paths: std::collections::BTreeSet<String>,
+    pub reads: ScanReads,
+}
+
+/// What a scan read to answer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ScanReads {
+    /// Workspace files read whole.
+    pub files_read: usize,
+    /// Their raw bytes.
+    pub bytes_read: u64,
+    /// Long workspace files whose samples were read instead.
+    pub files_sampled: usize,
+    /// Baseline contents looked up in the store.
+    pub baselines_read: usize,
 }
 
 #[derive(Debug)]
@@ -44,7 +74,10 @@ pub struct ScannedChange {
     pub path: String,
     pub content_changed: bool,
     pub kind_changed: bool,
+    pub deleted: bool,
     pub baseline: DiffDescriptor,
+    /// The workspace's file; none when it is deleted, or when it was found modified
+    /// by its samples under [`ContentIds::Optional`].
     pub workspace: Option<DiffDescriptor>,
     /// Canonical text is retained only when the caller's inline bound permits it.
     pub baseline_text: Option<Vec<u8>>,
@@ -57,6 +90,7 @@ pub fn scan(
     workspace: &WorkspaceMetadata,
     max_inline_text_bytes: usize,
     filter: &TreePathFilter,
+    ids: ContentIds,
 ) -> Result<WorkspaceScan> {
     let _lock = crate::materialization::WorkspaceLock::acquire(workspace_root)?;
     let runtime = crate::local::runtime()?;
@@ -72,11 +106,14 @@ pub fn scan(
         &workspace,
         max_inline_text_bytes,
         filter,
+        ids,
     )
 }
 
 /// Compares the tracked files `filter` selects with the workspace. Unselected files are
-/// neither read nor reported, though they stay in `tracked_paths`.
+/// neither read nor reported, though they stay in `tracked_paths`. A file whose stat
+/// is what the workspace's stat cache (`.wheat/stat.sqlite`) recorded is not read
+/// again; nor is its baseline when it is unchanged.
 #[tracing::instrument(name = "workspace_scan", level = "debug", skip_all)]
 pub fn scan_locked(
     workspace_root: &Path,
@@ -84,6 +121,7 @@ pub fn scan_locked(
     workspace: &WorkspaceMetadata,
     max_inline_text_bytes: usize,
     filter: &TreePathFilter,
+    ids: ContentIds,
 ) -> Result<WorkspaceScan> {
     let runtime = crate::local::runtime()?;
     anyhow::ensure!(
@@ -125,44 +163,87 @@ pub fn scan_locked(
             .map(|label| label.view);
         let files = MerkleTreeStore::new(&repository.objects)
             .walk_files(materialized.tree, TreeWalkLimits::default())
+            .instrument(tracing::debug_span!("walk_tracked_files"))
             .await?;
         Ok::<_, anyhow::Error>((current_label_binding, files))
     })?;
 
     let mut read_budget = ScanReadBudget::new(MAX_TOTAL_READ_BYTES);
+    let mut cache = StatCache::open(workspace_root)?;
+    let mut reads = ScanReads::default();
     let mut changes = Vec::new();
     let mut tracked_paths = std::collections::BTreeSet::new();
+    let check = tracing::debug_span!("check_tracked_files").entered();
+    let mut stats = WorkspaceStats::new(workspace_root)
+        .with_context(|| format!("open workspace {}", workspace_root.display()))?;
     for file in files {
         tracked_paths.insert(file.path.clone());
         if !filter.matches(&file.path) {
             continue;
         }
-        let baseline_limit = read_budget.next_limit(MAX_BASELINE_INSPECTION_BYTES)?;
-        // Retained content is collected only when it fits the text-diff eligibility bound.
-        // Larger retained leaves are described from their authenticated identity and known size
-        // without allocating their contents. Workspace leaves are always streamed below.
-        let (baseline, baseline_bytes) = match repository
-            .content
-            .get_bounded(file.value.content, baseline_limit)
-        {
-            Ok(bytes) => {
-                read_budget.charge(bytes.len())?;
-                (
-                    descriptor(file.value.kind, file.value.content, &bytes),
-                    Some(bytes),
-                )
-            }
-            Err(ContentStoreError::TooLarge { minimum, .. }) => (
-                DiffDescriptor {
-                    kind: file.value.kind,
-                    content: file.value.content,
-                    bytes: minimum,
-                    text: None,
-                },
-                None,
-            ),
-            Err(error) => return Err(error.into()),
+        let path = Path::new(&file.path);
+        let stamp = absent_where_shape_changed(stats.stat(path))
+            .with_context(|| format!("inspect tracked workspace path {}", file.path))?;
+        let cached = match stamp {
+            Some(_) => cache.get(&file.path).copied(),
+            None => None,
         };
+        if let (Some(stamp), Some((cached_stamp, cached))) = (stamp, cached) {
+            if cached_stamp == stamp {
+                if is_unchanged(&cached, file.value) {
+                    continue;
+                }
+                // A file still modified as it was: what it holds is known, but an inline
+                // diff needs its text.
+                if max_inline_text_bytes == 0 {
+                    let (baseline, baseline_bytes) =
+                        read_baseline(repository, file.value, &mut read_budget, &mut reads)?;
+                    changes.push(ScannedChange {
+                        path: file.path,
+                        content_changed: cached.content != file.value.content,
+                        kind_changed: cached.kind != file.value.kind,
+                        deleted: false,
+                        baseline_text: inline_text(baseline.text, baseline_bytes, 0),
+                        baseline,
+                        workspace: Some(DiffDescriptor {
+                            kind: cached.kind,
+                            content: cached.content,
+                            bytes: cached.bytes,
+                            text: Some(cached.text),
+                        }),
+                        workspace_text: None,
+                    });
+                    continue;
+                }
+            } else if ids == ContentIds::Optional
+                && samples_differ(
+                    workspace_root,
+                    path,
+                    &stamp,
+                    &cached_stamp,
+                    &cached,
+                    file.value,
+                    &mut read_budget,
+                    &mut reads,
+                )?
+            {
+                let (baseline, baseline_bytes) =
+                    read_baseline(repository, file.value, &mut read_budget, &mut reads)?;
+                changes.push(ScannedChange {
+                    path: file.path,
+                    content_changed: true,
+                    kind_changed: false,
+                    deleted: false,
+                    baseline_text: inline_text(baseline.text, baseline_bytes, 0),
+                    baseline,
+                    workspace: None,
+                    workspace_text: None,
+                });
+                continue;
+            }
+        }
+        let (baseline, baseline_bytes) =
+            read_baseline(repository, file.value, &mut read_budget, &mut reads)?;
         let workspace_limit = read_budget.next_limit(MAX_WORKSPACE_FILE_BYTES)?;
         let observed = absent_where_shape_changed(analyze_workspace_file(
             workspace_root,
@@ -177,6 +258,7 @@ pub fn scan_locked(
                 path: file.path,
                 content_changed: true,
                 kind_changed: false,
+                deleted: true,
                 baseline,
                 workspace: None,
                 baseline_text,
@@ -185,6 +267,21 @@ pub fn scan_locked(
             continue;
         };
         read_budget.charge(observed.read_bytes)?;
+        reads.files_read += 1;
+        reads.bytes_read += observed.read_bytes as u64;
+        if let Some(stamp) = observed.stamp {
+            cache.record(
+                &file.path,
+                stamp,
+                Observed {
+                    kind: observed.kind,
+                    content: observed.content,
+                    bytes: observed.bytes,
+                    text: observed.text,
+                    samples: observed.samples,
+                },
+            );
+        }
         let content_changed = observed.content != file.value.content;
         let kind_changed = observed.kind != file.value.kind;
         if content_changed || kind_changed {
@@ -200,6 +297,7 @@ pub fn scan_locked(
                 path: file.path,
                 content_changed,
                 kind_changed,
+                deleted: false,
                 baseline,
                 workspace: Some(workspace_descriptor),
                 baseline_text,
@@ -207,6 +305,8 @@ pub fn scan_locked(
             });
         }
     }
+    drop(check);
+    cache.finish(filter.is_everything().then_some(&tracked_paths))?;
     Ok(WorkspaceScan {
         materialized_view: materialized.view,
         materialized_head_generation: materialized_head.generation,
@@ -221,6 +321,7 @@ pub fn scan_locked(
         effective_view: workspace.effective_view(),
         changes,
         tracked_paths,
+        reads,
     })
 }
 
@@ -285,6 +386,73 @@ impl ScanReadBudget {
     }
 }
 
+/// Whether what the stat cache recorded is the baseline.
+fn is_unchanged(cached: &Observed, baseline: FileValue) -> bool {
+    cached.kind == baseline.kind && cached.content == baseline.content
+}
+
+/// Whether the long binary file at `path`, whose stat changed from `cached_stamp` to
+/// `stamp`, is shown modified by its length or its samples, which were recorded when
+/// it held the baseline. False when that cannot be told without reading it whole.
+fn samples_differ(
+    root: &Path,
+    path: &Path,
+    stamp: &FileStamp,
+    cached_stamp: &FileStamp,
+    cached: &Observed,
+    baseline: FileValue,
+    budget: &mut ScanReadBudget,
+    reads: &mut ScanReads,
+) -> Result<bool> {
+    let Some(samples) = cached.samples else {
+        return Ok(false);
+    };
+    if !is_unchanged(cached, baseline)
+        || cached.text
+        || stamp.kind() != cached.kind
+        || stamp.size < SAMPLED_FILE_BYTES
+    {
+        return Ok(false);
+    }
+    // Binary content is its raw bytes, so another length is other content.
+    if stamp.size != cached_stamp.size {
+        return Ok(true);
+    }
+    budget.charge(SAMPLE_COUNT as usize * SAMPLE_BYTES)?;
+    reads.files_sampled += 1;
+    let now = sample_workspace_file(root, path, stamp)
+        .with_context(|| format!("sample tracked workspace path {}", path.display()))?;
+    Ok(now.is_some_and(|now| now != samples))
+}
+
+/// The baseline's descriptor, with its bytes when they fit the text-diff bound. Longer
+/// content is described from its identity and stored length without reading it.
+fn read_baseline(
+    repository: &LocalRepository,
+    value: FileValue,
+    budget: &mut ScanReadBudget,
+    reads: &mut ScanReads,
+) -> Result<(DiffDescriptor, Option<Vec<u8>>)> {
+    let limit = budget.next_limit(MAX_BASELINE_INSPECTION_BYTES)?;
+    reads.baselines_read += 1;
+    match repository.content.get_bounded(value.content, limit) {
+        Ok(bytes) => {
+            budget.charge(bytes.len())?;
+            Ok((descriptor(value.kind, value.content, &bytes), Some(bytes)))
+        }
+        Err(ContentStoreError::TooLarge { minimum, .. }) => Ok((
+            DiffDescriptor {
+                kind: value.kind,
+                content: value.content,
+                bytes: minimum,
+                text: None,
+            },
+            None,
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn descriptor(kind: FileKind, content: ContentId, bytes: &[u8]) -> DiffDescriptor {
     DiffDescriptor {
         kind,
@@ -307,7 +475,14 @@ pub fn ensure_workspace_clean_locked(
     repository: &LocalRepository,
     workspace: &WorkspaceMetadata,
 ) -> Result<()> {
-    let scan = scan_locked(root, repository, workspace, 0, &TreePathFilter::default())?;
+    let scan = scan_locked(
+        root,
+        repository,
+        workspace,
+        0,
+        &TreePathFilter::default(),
+        ContentIds::Optional,
+    )?;
     if !scan.changes.is_empty() {
         return Err(crate::outcome::CliFailure::invalid(
             "uncaptured tracked workspace edits block switch, refresh or integrate",

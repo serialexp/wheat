@@ -12,6 +12,7 @@ chrono = { workspace = true }
 crc32fast = "1"
 futures = "0.3"
 libc = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }

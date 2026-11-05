@@ -302,6 +302,11 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **`wheat status` re-reads and re-hashes every file (scanner only).** Done
+  2026-11-06: a stat cache (`.wheat/stat.sqlite`, `stat_cache.rs`) lets status read
+  only files whose stat changed, and a long binary file's samples show it modified
+  without reading it whole (`docs/design/wheat-large-content.md`). The 1 GiB aggregate
+  read cap is still there; see TODO.
 - `[x]` **`existing_ids` lists the whole S3 bucket even for a few IDs (scanner
   only, 2026-10-05).** `ContentStore::existing_ids` listed every blob whenever the
   backend could list. A blob store now checks the IDs with concurrent header reads,

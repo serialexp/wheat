@@ -1,6 +1,6 @@
 # Wheat large content — Design
 
-Status: partial — steps 1–7 landed; the stat cache with sampled status outstanding
+Status: partial — steps 1–7 and the stat cache with sampled status landed; recording the cache on materialize and add outstanding
 Owner: bart
 Last updated: 2026-11-06
 
@@ -169,6 +169,21 @@ land and move them from Outstanding to Done.
 - [x] **Decision — status on long files (2026-11-05).** Bart: a stat cache, then
   samples: an unchanged stat means unchanged; a changed stat with different samples
   means modified; matching samples get a full hash.
+- [x] **Stat cache and sampled status.** Same section. Decided 2026-11-06: the
+  cache is SQLite (Bart: "cache goes in sqlite. Durable goes in binschema"), and
+  samples are 256 of 4 KiB. When a long file's stat changed, human status reports it
+  modified on differing samples without reading the rest, and hashes it in full when
+  they match; `--format json` hashes it in full either way, so its content ID is
+  always there (Bart, after the first answers contradicted each other). Built as
+  `.wheat/stat.sqlite` (`wheat-client/src/stat_cache.rs`), recorded by status
+  (`workspace_scan.rs`, `ContentIds::{Required, Optional}`); see the follow-up under
+  [Tool limits](#tool-limits-and-status-on-long-files). Tests in
+  `wheat-cli/tests/stat_cache.rs`; bench case `status_scale` (release, 2026-11-06,
+  20,000 small files and a 256 MiB one): the first status reads all 20,002 files in
+  0.63 s, a status with nothing changed reads none in 83 ms, ten edited files are the
+  ten read, and a changed sample of the long file is found by reading its samples
+  alone. Found on the way: each stat opened every directory above the file, and the
+  untracked walk stat'd every entry for its type; both now cost no extra syscall.
 
 ### Outstanding
 
@@ -183,12 +198,10 @@ land and move them from Outstanding to Done.
   was needed): the limit applies to capture only, so status and materialization
   take up to 1 TiB; add reads `.wheat.json` from disk
   (`repository_config::read`). Not built: a local override in `<store>/config.json`.
-- [ ] **Stat cache and sampled status.** Same section. Decided 2026-11-06: the
-  cache is SQLite (Bart: "cache goes in sqlite. Durable goes in binschema"), and
-  samples are 256 of 4 KiB. When a long file's stat changed, human status reports it
-  modified on differing samples without reading the rest, and hashes it in full when
-  they match; `--format json` hashes it in full either way, so its content ID is
-  always there (Bart, after the first answers contradicted each other).
+- [ ] **The stat cache on materialize and add.** Status records what it reads;
+  materialize and add, which write or read the same files, record nothing yet, so the
+  first status after them reads every file they touched. Needs the racy-clean rule
+  where Wheat itself wrote the file.
 
 ## Why this exists
 
@@ -456,6 +469,17 @@ full hash. Open:
 - A modified long file found by its samples has no content ID until add reads it:
   status reports its workspace side without one (`DiffDescriptor::content` becomes
   optional) or hashes it anyway when asked for IDs (`--format json`).
+
+Follow-up (2026-11-06): all three were decided as listed under Done (SQLite; 256
+samples of 4 KiB; human status without an ID, JSON with one), and status is built.
+The cache loads whole when a read starts, since status looks up every tracked path.
+An entry is kept only when the file's mtime is older than a time the filesystem gave
+at the start of the read (the mtime of `.wheat/stat.clock`, written then), and only
+when the file's stat was the same before and after it was read. The samples are a
+blake3 digest of the length and 256 blocks of 4 KiB at evenly spaced offsets, first
+and last included. Only binary files over the chunking threshold keep them: a text
+file's content ID is of its canonical text, so its raw bytes could change (line
+endings) while its content does not, and human and JSON status would disagree.
 
 ## Phasing
 

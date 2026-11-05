@@ -9,6 +9,7 @@ thread_local! {
     static TEST_SNAPSHOT_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
     static TEST_STREAM_READS: Cell<usize> = const { Cell::new(0) };
     static TEST_STREAM_SCRATCH_BYTES: Cell<usize> = const { Cell::new(0) };
+    static TEST_SAMPLE_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 use serde::{Deserialize, Serialize};
@@ -58,7 +59,54 @@ pub struct CanonicalWorkspaceFile {
     pub read_bytes: usize,
     pub text: bool,
     pub retained_text: Option<Vec<u8>>,
+    /// The leaf's stat, when it was the same before and after the read, so the
+    /// content above is what a leaf with that stat holds.
+    pub stamp: Option<FileStamp>,
+    /// [`FileSamples`] of a binary regular file at least [`SAMPLED_FILE_BYTES`] long.
+    pub samples: Option<FileSamples>,
 }
+
+/// What a leaf's stat says about it: a leaf whose stamp is unchanged has not been
+/// written, renamed over, or had its mode changed since. `ctime` changes on every
+/// write and cannot be set back, so it catches a write whose mtime was restored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileStamp {
+    /// The raw length: a symlink target's, or a regular file's on disk.
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub inode: u64,
+    pub device: u64,
+    /// `st_mode`: the file type and permission bits.
+    pub mode: u32,
+}
+
+impl FileStamp {
+    /// The kind of file the stamp describes.
+    #[must_use]
+    pub fn kind(&self) -> FileKind {
+        const TYPE: u32 = 0o170_000;
+        const SYMLINK: u32 = 0o120_000;
+        if self.mode & TYPE == SYMLINK {
+            FileKind::Symlink
+        } else if self.mode & 0o111 != 0 {
+            FileKind::Executable
+        } else {
+            FileKind::Regular
+        }
+    }
+}
+
+/// A digest of [`SAMPLE_COUNT`] evenly spaced [`SAMPLE_BYTES`]-byte pieces of a long
+/// file and its length: two files with different samples differ, without reading the
+/// rest of either.
+pub type FileSamples = [u8; 32];
+
+/// Files at least this long get [`FileSamples`]: the length past which content is
+/// chunked.
+pub const SAMPLED_FILE_BYTES: u64 = wheat_core::CHUNKED_CONTENT_THRESHOLD;
+pub const SAMPLE_COUNT: u64 = 256;
+pub const SAMPLE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub enum WorkspaceFileError {
@@ -158,6 +206,41 @@ pub fn analyze_workspace_file(
 ) -> Result<Option<CanonicalWorkspaceFile>, WorkspaceFileError> {
     let components = validate_path(path)?;
     platform::analyze(root, &components, byte_limit, retain_limit)
+}
+
+/// Stats a workspace's leaves one after another without reading them. The
+/// directories above a leaf stay open for the next one, so leaves in the same
+/// directory cost one stat each: give them in tree order. A directory renamed while
+/// it is open is still the one stat'd, as if its leaves had been stat'd before the
+/// rename.
+pub struct WorkspaceStats {
+    directories: platform::Directories,
+}
+
+impl WorkspaceStats {
+    pub fn new(root: &Path) -> Result<Self, WorkspaceFileError> {
+        Ok(Self {
+            directories: platform::Directories::new(root)?,
+        })
+    }
+
+    /// The stamp of the leaf at `path`; `None` when it is missing. A directory or
+    /// special file there is refused as [`analyze_workspace_file`] refuses it.
+    pub fn stat(&mut self, path: &Path) -> Result<Option<FileStamp>, WorkspaceFileError> {
+        let components = validate_path(path)?;
+        self.directories.stat(&components)
+    }
+}
+
+/// The [`FileSamples`] of the regular file at `path` if it still has `stamp`, read
+/// without reading the rest of it; `None` when it no longer has that stamp.
+pub fn sample_workspace_file(
+    root: &Path,
+    path: &Path,
+    stamp: &FileStamp,
+) -> Result<Option<FileSamples>, WorkspaceFileError> {
+    let components = validate_path(path)?;
+    platform::sample(root, &components, stamp)
 }
 
 /// Streams the regular file at `path` to `out`, a piece at a time: its canonical text
@@ -284,7 +367,7 @@ fn validate_path(path: &Path) -> Result<Vec<&std::ffi::OsStr>, WorkspaceFileErro
 #[cfg(unix)]
 mod platform {
     use std::{
-        ffi::{CString, OsStr},
+        ffi::{CString, OsStr, OsString},
         fs::File,
         io::{self, Read},
         os::{
@@ -297,8 +380,9 @@ mod platform {
     use wheat_core::text_capture::LineEndings;
 
     use super::{
-        CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, RawPreimage,
-        STREAM_SCRATCH_BYTES, StreamingCapture, WorkspaceFileError, WorkspaceFileSnapshot,
+        CanonicalWorkspaceFile, CaptureKind, ContentId, FileKind, FileSamples, FileStamp,
+        RawPreimage, SAMPLE_BYTES, SAMPLE_COUNT, SAMPLED_FILE_BYTES, STREAM_SCRATCH_BYTES,
+        StreamingCapture, WorkspaceFileError, WorkspaceFileSnapshot,
     };
 
     pub(super) fn analyze(
@@ -338,6 +422,7 @@ mod platform {
             };
         }
         let stat = unsafe { stat.assume_init() };
+        let before = stamp_of_stat(&stat);
         if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
             // Linux symlink targets are bounded independently of the regular-file
             // scan cap; do not size an allocation from the 256 MiB file limit.
@@ -349,6 +434,9 @@ mod platform {
                 read_bytes: bytes.len(),
                 text: false,
                 retained_text: None,
+                // A symlink's target cannot change in place.
+                stamp: Some(before),
+                samples: None,
             }));
         }
         match stat.st_mode & libc::S_IFMT {
@@ -401,14 +489,179 @@ mod platform {
             capture.update(&scratch[..read]);
         }
         let result = capture.finish();
+        let text = result.kind == CaptureKind::Text;
+        // Samples are of the raw bytes, so they only stand for binary content, whose
+        // canonical bytes are its raw bytes.
+        let mut samples = None;
+        if !text && raw_length as u64 >= SAMPLED_FILE_BYTES {
+            match sample_digest(&file, raw_length as u64) {
+                Ok(digest) => samples = Some(digest),
+                // The file shrank under the read; the stamp below differs too.
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let after = stamp_of_metadata(&file.metadata()?);
+        let stamp = (after == before && after.size == raw_length as u64).then_some(before);
         Ok(Some(CanonicalWorkspaceFile {
             kind,
             content: ContentId::from_digest(result.digest),
             bytes: result.bytes,
             read_bytes: raw_length,
-            text: result.kind == CaptureKind::Text,
+            text,
             retained_text: result.retained,
+            stamp,
+            samples: samples.filter(|_| stamp.is_some()),
         }))
+    }
+
+    /// The workspace's root and the directories below it last stat'd in, outermost
+    /// first.
+    pub(super) struct Directories {
+        root: File,
+        open: Vec<(OsString, File)>,
+    }
+
+    impl Directories {
+        pub(super) fn new(root: &Path) -> Result<Self, WorkspaceFileError> {
+            Ok(Self {
+                root: File::open(root)?,
+                open: Vec::new(),
+            })
+        }
+
+        pub(super) fn stat(
+            &mut self,
+            components: &[&OsStr],
+        ) -> Result<Option<FileStamp>, WorkspaceFileError> {
+            let (name, parents) = components.split_last().expect("validated nonempty path");
+            let kept = self
+                .open
+                .iter()
+                .zip(parents)
+                .take_while(|((open, _), parent)| open.as_os_str() == **parent)
+                .count();
+            self.open.truncate(kept);
+            for parent in &parents[kept..] {
+                let above = self
+                    .open
+                    .last()
+                    .map_or(&self.root, |(_, directory)| directory);
+                let Some(directory) = open_directory(above, parent)? else {
+                    return Ok(None);
+                };
+                self.open.push(((*parent).to_owned(), directory));
+            }
+            let directory = self
+                .open
+                .last()
+                .map_or(&self.root, |(_, directory)| directory);
+            stat_at(directory, name)
+        }
+    }
+
+    fn stat_at(directory: &File, name: &OsStr) -> Result<Option<FileStamp>, WorkspaceFileError> {
+        let name = c_name(name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        let stat = unsafe { stat.assume_init() };
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFLNK | libc::S_IFREG => Ok(Some(stamp_of_stat(&stat))),
+            libc::S_IFDIR => Err(WorkspaceFileError::LeafIsDirectory),
+            _ => Err(WorkspaceFileError::UnsupportedFileType),
+        }
+    }
+
+    pub(super) fn sample(
+        root: &Path,
+        components: &[&OsStr],
+        stamp: &FileStamp,
+    ) -> Result<Option<FileSamples>, WorkspaceFileError> {
+        let Some(directory) = open_parent(root, components)? else {
+            return Ok(None);
+        };
+        let name = c_name(components.last().expect("validated nonempty path"))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT | libc::ELOOP) => Ok(None),
+                _ => Err(error.into()),
+            };
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if stamp_of_metadata(&file.metadata()?) != *stamp {
+            return Ok(None);
+        }
+        let samples = match sample_digest(&file, stamp.size) {
+            Ok(samples) => samples,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok((stamp_of_metadata(&file.metadata()?) == *stamp).then_some(samples))
+    }
+
+    /// The [`FileSamples`] of `file`, `length` bytes long: the length and the
+    /// samples, evenly spaced from the first byte to the last.
+    fn sample_digest(file: &File, length: u64) -> io::Result<FileSamples> {
+        use std::os::unix::fs::FileExt as _;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"wheat-file-samples\0");
+        hasher.update(&length.to_le_bytes());
+        let span = length.saturating_sub(SAMPLE_BYTES as u64);
+        let mut piece = [0_u8; SAMPLE_BYTES];
+        for index in 0..SAMPLE_COUNT {
+            let offset = span * index / (SAMPLE_COUNT - 1);
+            file.read_exact_at(&mut piece, offset)?;
+            #[cfg(test)]
+            super::TEST_SAMPLE_READS.with(|reads| reads.set(reads.get() + 1));
+            hasher.update(&piece);
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn stamp_of_stat(stat: &libc::stat) -> FileStamp {
+        FileStamp {
+            size: stat.st_size as u64,
+            mtime_ns: stat.st_mtime * 1_000_000_000 + stat.st_mtime_nsec,
+            ctime_ns: stat.st_ctime * 1_000_000_000 + stat.st_ctime_nsec,
+            inode: stat.st_ino,
+            device: stat.st_dev,
+            mode: stat.st_mode,
+        }
+    }
+
+    fn stamp_of_metadata(metadata: &std::fs::Metadata) -> FileStamp {
+        use std::os::unix::fs::MetadataExt as _;
+        FileStamp {
+            size: metadata.size(),
+            mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+            ctime_ns: metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec(),
+            inode: metadata.ino(),
+            device: metadata.dev(),
+            mode: metadata.mode(),
+        }
     }
 
     pub(super) fn observe(
@@ -638,30 +891,39 @@ mod platform {
     fn open_parent(root: &Path, components: &[&OsStr]) -> Result<Option<File>, WorkspaceFileError> {
         let mut directory = File::open(root)?;
         for component in &components[..components.len() - 1] {
-            let name = c_name(component)?;
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                return match error.raw_os_error() {
-                    Some(libc::ENOENT) => Ok(None),
-                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
-                        if is_symlink(directory.as_raw_fd(), &name) =>
-                    {
-                        Err(WorkspaceFileError::IntermediateSymlink)
-                    }
-                    Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
-                    _ => Err(error.into()),
-                };
+            match open_directory(&directory, component)? {
+                Some(next) => directory = next,
+                None => return Ok(None),
             }
-            directory = unsafe { File::from_raw_fd(fd) };
         }
         Ok(Some(directory))
+    }
+
+    /// The directory `name` in `directory`, not following a symlink; `None` when it
+    /// is missing.
+    fn open_directory(directory: &File, name: &OsStr) -> Result<Option<File>, WorkspaceFileError> {
+        let name = c_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                    if is_symlink(directory.as_raw_fd(), &name) =>
+                {
+                    Err(WorkspaceFileError::IntermediateSymlink)
+                }
+                Some(libc::ENOTDIR) => Err(WorkspaceFileError::AncestorNotDirectory),
+                _ => Err(error.into()),
+            };
+        }
+        Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
 
     /// Streams the regular file at `components` to `out`: its canonical text when
@@ -848,8 +1110,32 @@ mod platform {
     use std::{ffi::OsStr, fs::File, io, path::Path};
 
     use super::{
-        CanonicalWorkspaceFile, FileKind, RawPreimage, WorkspaceFileError, WorkspaceFileSnapshot,
+        CanonicalWorkspaceFile, FileKind, FileSamples, FileStamp, RawPreimage, WorkspaceFileError,
+        WorkspaceFileSnapshot,
     };
+
+    pub(super) struct Directories;
+
+    impl Directories {
+        pub(super) fn new(_root: &Path) -> Result<Self, WorkspaceFileError> {
+            Ok(Self)
+        }
+
+        pub(super) fn stat(
+            &mut self,
+            _components: &[&OsStr],
+        ) -> Result<Option<FileStamp>, WorkspaceFileError> {
+            unsupported()
+        }
+    }
+
+    pub(super) fn sample(
+        _root: &Path,
+        _components: &[&OsStr],
+        _stamp: &FileStamp,
+    ) -> Result<Option<FileSamples>, WorkspaceFileError> {
+        unsupported()
+    }
 
     fn unsupported<T>() -> Result<T, WorkspaceFileError> {
         Err(io::Error::new(
@@ -1168,6 +1454,54 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.kind, FileKind::Symlink);
         assert_eq!(snapshot.bytes, target.into_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stats_keep_directories_open_from_one_leaf_to_the_next() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/b")).unwrap();
+        fs::create_dir(root.path().join("c")).unwrap();
+        for (path, bytes) in [
+            ("a/b/x", 1),
+            ("a/b/y", 2),
+            ("a/z", 3),
+            ("c/w", 4),
+            ("top", 5),
+        ] {
+            fs::write(root.path().join(path), vec![b'x'; bytes]).unwrap();
+        }
+        fs::write(outside.path().join("secret"), b"secret").unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+
+        let mut stats = WorkspaceStats::new(root.path()).unwrap();
+        let mut size = |path: &str| {
+            stats
+                .stat(Path::new(path))
+                .map(|stamp| stamp.map(|stamp| stamp.size))
+        };
+        assert_eq!(size("a/b/x").unwrap(), Some(1));
+        assert_eq!(size("a/b/y").unwrap(), Some(2));
+        assert_eq!(size("a/z").unwrap(), Some(3));
+        assert_eq!(size("a/missing/v").unwrap(), None);
+        assert_eq!(size("c/w").unwrap(), Some(4));
+        assert_eq!(size("top").unwrap(), Some(5));
+        assert!(matches!(
+            size("escape/secret"),
+            Err(WorkspaceFileError::IntermediateSymlink)
+        ));
+        assert!(matches!(
+            size("a/b"),
+            Err(WorkspaceFileError::LeafIsDirectory)
+        ));
+        assert!(matches!(
+            size("top/v"),
+            Err(WorkspaceFileError::AncestorNotDirectory)
+        ));
+        assert!(matches!(size("../x"), Err(WorkspaceFileError::InvalidPath)));
+        assert_eq!(size("a/b/x").unwrap(), Some(1));
     }
 
     #[cfg(unix)]

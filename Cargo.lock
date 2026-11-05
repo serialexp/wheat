@@ -6148,6 +6148,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "libc",
+ "rusqlite",
  "rustls",
  "rustls-native-certs",
  "serde",

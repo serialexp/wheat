@@ -102,6 +102,7 @@ pub fn compare(
                 &context.workspace,
                 limits.max_inline_bytes_per_side,
                 filter,
+                workspace_scan::ContentIds::Required,
             )?;
             build(scan, limits, deadline)
         }

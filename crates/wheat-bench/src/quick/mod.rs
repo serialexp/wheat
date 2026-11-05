@@ -49,6 +49,7 @@ mod revision_merge;
 mod server;
 mod sharded_manifest;
 mod snapshot_export;
+mod status_scale;
 mod transition_validate;
 mod workspace;
 
@@ -105,6 +106,7 @@ pub const CASES: &[&str] = &[
     client_history::NAME,
     browse_history::NAME,
     path_history::NAME,
+    status_scale::NAME,
     label_move::NAME,
     label_frontiers::NAME,
 ];
@@ -275,6 +277,7 @@ pub fn run_case(
         client_history::NAME => client_history::run(&context),
         browse_history::NAME => browse_history::run(&context),
         path_history::NAME => path_history::run(&context),
+        status_scale::NAME => status_scale::run(&context),
         label_move::NAME => label_move::run(&context),
         label_frontiers::NAME => label_frontiers::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),

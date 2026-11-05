@@ -999,7 +999,13 @@ fn execute(cli: Cli) -> Result<Success> {
             )
         }
         Command::Status => {
-            let status = workspace_status::read(&requested_workspace, cli.store.as_deref())?;
+            // JSON gives every modified file's content ID; the human form only says
+            // which changed, so a long file whose samples changed is not read whole.
+            let ids = match format {
+                OutputFormat::Json => wheat_client::workspace_scan::ContentIds::Required,
+                OutputFormat::Human => wheat_client::workspace_scan::ContentIds::Optional,
+            };
+            let status = workspace_status::read(&requested_workspace, cli.store.as_deref(), ids)?;
             let mut output = String::new();
             // Print diagnostics to stderr (they're informational, not command output).
             for diagnostic in &status.diagnostics {

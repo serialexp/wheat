@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS file (
+    path TEXT PRIMARY KEY NOT NULL,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    ctime INTEGER NOT NULL,
+    inode INTEGER NOT NULL,
+    device INTEGER NOT NULL,
+    mode INTEGER NOT NULL,
+    kind INTEGER NOT NULL,
+    content BLOB NOT NULL,
+    bytes INTEGER NOT NULL,
+    text INTEGER NOT NULL,
+    samples BLOB
+) WITHOUT ROWID;

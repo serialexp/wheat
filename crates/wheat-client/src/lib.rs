@@ -34,6 +34,7 @@ pub mod rewrite_transaction;
 pub mod selection_recovery;
 pub mod squash;
 pub mod squash_attribution;
+mod stat_cache;
 pub mod store_analyze;
 pub mod store_lookup;
 pub mod store_stats;

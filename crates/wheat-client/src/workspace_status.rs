@@ -9,12 +9,18 @@ use crate::{
     local::open,
     rewrite_transaction::StoreOperationGuard,
     workspace_metadata::WorkspaceMetadata,
-    workspace_scan::{self, WorkspaceScan},
+    workspace_scan::{self, ContentIds, WorkspaceScan},
     workspace_walk::{self, UntrackedClassification, WorkspaceWalkResult},
 };
 
 /// The workspace's tracked edits and untracked files against what it materialized.
-pub fn read(workspace: &Path, explicit_store: Option<&Path>) -> Result<WorkspaceStatus> {
+/// With [`ContentIds::Optional`], a long file found modified by its samples has no
+/// workspace descriptor (see [`workspace_scan::scan_locked`]).
+pub fn read(
+    workspace: &Path,
+    explicit_store: Option<&Path>,
+    ids: ContentIds,
+) -> Result<WorkspaceStatus> {
     let mut context = resolve_context(workspace, explicit_store)?;
     let local = open(&context.store_root)?;
     let _operation = StoreOperationGuard::acquire(&context.store_root, &local)?;
@@ -25,6 +31,7 @@ pub fn read(workspace: &Path, explicit_store: Option<&Path>) -> Result<Workspace
         &context.workspace,
         0,
         &wheat_store::TreePathFilter::default(),
+        ids,
     )?;
     let global = wheat_ignore::loader::read_global_ignore();
     let global_ref = global
@@ -59,6 +66,9 @@ pub struct WorkspaceStatus {
     pub untracked: Vec<UntrackedFile>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// What answering read; not part of the output.
+    #[serde(skip)]
+    pub reads: workspace_scan::ScanReads,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,13 +138,14 @@ impl WorkspaceStatus {
                     path: change.path,
                     content_changed: change.content_changed,
                     kind_changed: change.kind_changed,
-                    deleted: change.workspace.is_none(),
+                    deleted: change.deleted,
                     baseline: change.baseline,
                     workspace: change.workspace,
                 })
                 .collect(),
             untracked,
             diagnostics,
+            reads: scan.reads,
         }
     }
 }

@@ -107,6 +107,7 @@ pub fn add(
                 &context.workspace,
                 0,
                 &TreePathFilter::default(),
+                workspace_scan::ContentIds::Optional,
             )?;
             let resolved: Vec<String> = scan.changes.into_iter().map(|c| c.path).collect();
             if resolved.is_empty() {

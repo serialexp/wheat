@@ -34,6 +34,11 @@ const NOT_PERSISTED: &[(&str, &str, &str)] = &[
         "compares words of two in-memory buffers",
     ),
     (
+        "wheat-client/src/workspace_files.rs",
+        "sample_digest",
+        "hashes a file's length into its samples' digest, which is compared, never decoded",
+    ),
+    (
         "wheat-store/src/content_manifest.rs",
         "part_ends",
         "reads a chunk ID's first bytes as a number to decide where a part ends",
