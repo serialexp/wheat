@@ -40,6 +40,7 @@ mod network_import;
 mod network_publish;
 mod packed_append;
 mod packed_open;
+mod path_history;
 mod publish_content;
 mod publish_contention;
 mod remote_latency;
@@ -103,6 +104,7 @@ pub const CASES: &[&str] = &[
     head_receipts::NAME,
     client_history::NAME,
     browse_history::NAME,
+    path_history::NAME,
     label_move::NAME,
     label_frontiers::NAME,
 ];
@@ -272,6 +274,7 @@ pub fn run_case(
         head_receipts::NAME => head_receipts::run(&context),
         client_history::NAME => client_history::run(&context),
         browse_history::NAME => browse_history::run(&context),
+        path_history::NAME => path_history::run(&context),
         label_move::NAME => label_move::run(&context),
         label_frontiers::NAME => label_frontiers::run(&context),
         _ => bail!("unknown case {name:?}; cases are {CASES:?}"),

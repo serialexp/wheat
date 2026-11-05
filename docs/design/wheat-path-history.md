@@ -1,6 +1,6 @@
 # Wheat path history — Design
 
-Status: partial — the index and `RepositoryBrowser::path_history` landed; callers and the benchmark outstanding
+Status: partial — the index, `RepositoryBrowser::path_history` and the benchmark landed; callers outstanding
 Owner: bart
 Last updated: 2026-11-06
 
@@ -27,15 +27,19 @@ land and move them from Outstanding to Done.
   Newest first, a page of the changes that touch `path`, with a cursor; `""` is the
   view's history. Tests check every file and directory of a forked random history
   against the changes the test made, and count a page's object reads.
+- [x] **Benchmark.** `wheat-bench` case `path_history` at Gothab's scale (20,000
+  linear changes to 1,000 files in 100 directories), with contracts on reads per hit
+  and per change caught up. Release, 2026-11-06: a file's whole history (20 changes)
+  1.1 ms and 186 reads, a directory's first 30-change page 1.6 ms and 279 reads, where
+  gitd's walk took 1.78 s and 218 ms. Catching up a cold index over all 20,000
+  changes takes 1.3 s and 119,904 reads (6 per change), which is why callers catch
+  up after a publish rather than on a page.
 
 ### Outstanding
 
 - [ ] **Callers.** The file in each client store (`LocalRepository`), and in gitd
   where it opens a network; `catch_up` after a publish or import so a request never
   pays for a large backlog.
-- [ ] **Benchmark.** A `wheat-bench` case at Gothab's scale (20,000 linear changes
-  to 1,000 files in 100 directories): a sparse file's whole history and a
-  directory's first page, with a contract on objects read per hit.
 - [ ] **After the index, measured first:** metadata only for hits (Gothab's (b)), a
   decoded-object cache in `Network` (a), cheaper `application_at` and tips (d).
 
