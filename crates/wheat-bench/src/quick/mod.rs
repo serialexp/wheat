@@ -31,6 +31,8 @@ mod import_resume_wide;
 mod increment_validate;
 mod label_frontiers;
 mod label_move;
+mod large_file;
+mod large_file_git;
 mod latency_proxy;
 mod materialize_wide;
 mod network_export;
@@ -80,6 +82,8 @@ pub const CASES: &[&str] = &[
     content_repack_plan::NAME,
     packed_open::NAME,
     content_large_blob::NAME,
+    large_file::NAME,
+    large_file_git::NAME,
     sharded_manifest::NAME,
     git_export_notes::NAME,
     git_pull_incremental::NAME,
@@ -247,6 +251,8 @@ pub fn run_case(
         content_repack_plan::NAME => content_repack_plan::run(&context),
         packed_open::NAME => packed_open::run(&context),
         content_large_blob::NAME => content_large_blob::run(&context),
+        large_file::NAME => large_file::run(&context),
+        large_file_git::NAME => large_file_git::run(&context),
         sharded_manifest::NAME => sharded_manifest::run(&context),
         git_export_notes::NAME => git_export_notes::run(&context),
         git_pull_incremental::NAME => git_pull_incremental::run(&context),

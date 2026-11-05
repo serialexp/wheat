@@ -1,8 +1,8 @@
 # Wheat large content — Design
 
-Status: partial — steps 1 (format, two levels), 2 (store), 3 (protocol), 4 (client), 5 (Git bridge) and 6 (repack, verification, bundles) landed, step 7 outstanding
+Status: partial — steps 1–7 landed; the stat cache with sampled status outstanding
 Owner: bart
-Last updated: 2026-11-05
+Last updated: 2026-11-06
 
 ## Implementation status
 
@@ -153,6 +153,19 @@ land and move them from Outstanding to Done.
   `.wheat.json` at the workspace root (not in `.wheat/`, which is never tracked);
   `<store>/config.json` stays the local, untracked configuration. See
   [Tool limits](#tool-limits-and-status-on-long-files).
+- [x] **Step 7 — benchmarks and contracts.** `large_file`: add, publish, clone,
+  a one-byte edit added, published and fetched, and refresh, which materializes it;
+  every process stays under 192 MiB (highest 153 MiB at 1 GiB) and the edit stores and
+  sends under two chunks and 1 MiB (2.5 MiB measured). `large_file_git`: push, a
+  one-byte edit pushed, and a fresh import, which stores the second version as the
+  chunks it changed (1026.6 MiB for both versions of 1 GiB). Found and fixed on the
+  way: the server read a whole content-fetch request before answering (clone server
+  peak 1222 → 153 MiB, 69b5261) and a symlink read allocated its whole limit
+  (4d874fe).
+- [x] **Decision — Git's own peaks (2026-11-06).** Bart: if it is how Wheat calls
+  git, fix it; if it is what git does, leave it. Plain `git push` and `git cat-file`
+  of a 1 GiB blob peak at 1028 MiB without Wheat (git maps the object file), so
+  `large_file_git` records the Git steps' peaks without a budget.
 - [x] **Decision — status on long files (2026-11-05).** Bart: a stat cache, then
   samples: an unchanged stat means unchanged; a changed stat with different samples
   means modified; matching samples get a full hash.
@@ -170,12 +183,12 @@ land and move them from Outstanding to Done.
   was needed): the limit applies to capture only, so status and materialization
   take up to 1 TiB; add reads `.wheat.json` from disk
   (`repository_config::read`). Not built: a local override in `<store>/config.json`.
-- [ ] **Stat cache and sampled status.** Same section.
-- [ ] **Step 7 — benchmarks and contracts.** Cases for a large file's add,
-  publish, fetch, a small edit to it, materialization, and its Git push and import,
-  with peak memory and bytes written/sent as budgets. `large_file` (add, publish,
-  clone, one-byte edit, fetch, refresh) runs at smoke size; at 1 GiB it needs the
-  file limit above.
+- [ ] **Stat cache and sampled status.** Same section. Decided 2026-11-06: the
+  cache is SQLite (Bart: "cache goes in sqlite. Durable goes in binschema"), and
+  samples are 256 of 4 KiB. When a long file's stat changed, human status reports it
+  modified on differing samples without reading the rest, and hashes it in full when
+  they match; `--format json` hashes it in full either way, so its content ID is
+  always there (Bart, after the first answers contradicted each other).
 
 ## Why this exists
 

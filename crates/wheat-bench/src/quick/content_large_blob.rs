@@ -146,7 +146,7 @@ impl Noise {
 }
 
 /// The bytes of every file under `root`.
-fn directory_bytes(root: &Path) -> Result<u64> {
+pub(crate) fn directory_bytes(root: &Path) -> Result<u64> {
     let mut total = 0;
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {

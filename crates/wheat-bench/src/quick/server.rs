@@ -80,6 +80,11 @@ impl Server {
         self.addr
     }
 
+    /// The store the server serves.
+    pub(crate) fn store(&self) -> &Path {
+        &self.store
+    }
+
     /// Stops serving and returns the store, which the case may then open itself.
     pub(crate) fn stop(self) -> Result<PathBuf> {
         let _ = self.shutdown.send(());
