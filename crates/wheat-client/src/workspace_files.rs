@@ -620,7 +620,8 @@ mod platform {
         let stat = unsafe { stat.assume_init() };
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFLNK => {
-                let bytes = read_link(directory.as_raw_fd(), &name, limit)?;
+                // A target is at most 4,095 bytes; `read_link` allocates its limit.
+                let bytes = read_link(directory.as_raw_fd(), &name, limit.min(4_095))?;
                 Ok(Some(WorkspaceFileSnapshot {
                     kind: FileKind::Symlink,
                     bytes,
