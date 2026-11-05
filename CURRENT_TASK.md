@@ -41,6 +41,18 @@ measurements, results under `bench/results/`, and the stat cache with sampled st
 (design doc, open points unanswered). The Projects disk was full on 2026-11-01 (I deleted wheat's
 `target/debug/incremental`; `gothab/` is 717 GB).
 
+2026-11-06: path history is done on the Wheat side (5463c0c, 27f10ea, 0b93e51,
+`docs/design/wheat-path-history.md`); gitd's part is @wise-walrus's in Gothab. The
+stat cache with sampled status is committed (1e8478d, with fc8cdc4 and 3bc48fd found
+while profiling it). Next, per the large-content doc's Outstanding list: the stat
+cache on materialize and add. Not started. The catch: materialization renames a staged
+file into place, which changes its ctime on ext4, so the stamp must be taken by name
+after the rename, racing a writer between the rename and the stat; compare the
+post-rename mtime, size and inode with the staged fd's fstat before recording. Waiting
+on Bart (TODO.md, 2026-11-06): the 1 GiB status read cap (a file over 1 GiB fails
+status) and the locator `quick_check` on every open. Also waiting: Bart's OK for a new
+tag for Gothab (77cb287 and the path history).
+
 Not yet measured cleanly: the fetch_incremental A/B for 57da2be ran under a load
 average of 32 (counts unchanged, wall times noise); rerun when the machine is quiet.
 v0.3.0 is tagged (523c343) and pinned by Gothab; v0.3.1 adds `RepositoryDeleter` (691796b) for Gothab's delete but has no release binaries (its release workflow lacked `artifacts: write`); v0.3.2 is the same code with the fixed workflow.
