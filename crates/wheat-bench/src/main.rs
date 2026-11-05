@@ -18,14 +18,14 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::{io::Write, path::PathBuf};
+    use std::{ffi::OsString, io::Write, path::PathBuf};
 
     use anyhow::Result;
     use clap::{Parser, Subcommand};
     use wheat_bench::{
         Destination, corpus, history,
         host::Checkout,
-        publish,
+        measure, publish,
         quick::{self, Scale},
         scratch_root, wheat_binary,
     };
@@ -60,6 +60,15 @@ mod linux {
         },
         /// Compare two results files from `bench/results`.
         Compare { old: PathBuf, new: PathBuf },
+        /// Run one command and report its wait status, wall time and peak memory to
+        /// `--report`; the launcher `measure` starts children through.
+        #[command(hide = true)]
+        Time {
+            #[arg(long)]
+            report: PathBuf,
+            #[arg(last = true, required = true)]
+            command: Vec<OsString>,
+        },
         /// Run one quick case in this process and print its output as JSON.
         #[command(hide = true)]
         Case {
@@ -84,6 +93,7 @@ mod linux {
     }
 
     pub(crate) fn main() -> Result<()> {
+        measure::measure_through(std::env::current_exe()?);
         match Cli::parse().command {
             Command::Quick {
                 scale,
@@ -107,6 +117,10 @@ mod linux {
                 let checkout = Checkout::find(&std::env::current_dir()?)?;
                 let report = corpus::run(&corpus, wheat_binary()?, &scratch_root()?, &checkout)?;
                 publish(&report, &destination)
+            }
+            Command::Time { report, command } => {
+                let (program, arguments) = command.split_first().expect("clap requires one");
+                measure::time(&report, program, arguments)
             }
             Command::Compare { old, new } => {
                 let old = history::Results::read(&old)?;

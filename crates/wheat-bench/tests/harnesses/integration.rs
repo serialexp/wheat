@@ -3,5 +3,7 @@
 //! binary links most of Wheat. `crates/wheat-core/tests/test_binaries.rs` checks
 //! that every file is listed.
 
+#[path = "../measure.rs"]
+mod measure;
 #[path = "../smoke.rs"]
 mod smoke;
