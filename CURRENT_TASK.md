@@ -27,9 +27,18 @@ from their length) are committed; the design doc's step 4 entry lists the commit
 `wheat cat --no-limit` streams past the 8 MiB bound (JSON as lines of base64 parts).
 Step 5 (Git bridge, 08297cf): export streams chunked blobs into Git; import streams
 long blobs from `git cat-file` and maps them in the journal's `blob_content` table.
-Next: steps 6 and 7 per the doc. Known leftovers: `repository_verify` and network
-export/import still read blobs whole; the in-memory `import_repository` (tests only)
-too. The Projects disk was full on 2026-11-01 (I deleted wheat's
+Step 6 (verify, bundles) is committed (6988ec3). Step 7 (2026-11-05/06) is in
+progress: committed are the bench launcher (94ac059, a child's `wait4` peak counted
+the case's own size), the server's content fetch read a batch at a time (69b5261,
+clone of 1 GiB: 1222 → 153 MiB server peak), a symlink-read buffer fix (4d874fe) and
+the `.wheat.json` file limit for add (cf3fa62, on provisional answers; see the design
+doc). Uncommitted: the bench cases `large_file` and `large_file_git`
+(`crates/wheat-bench/src/quick/`), waiting on Bart: at 1 GiB the Git cases' peaks
+(push 1084, import 1028 MiB) are git's file-backed mappings of the object
+(`pack-objects` anon 0.7 MiB, file 1080 MiB; `cat-file` drops to 70 MiB with
+`core.packedGitWindowSize=32m`), not Wheat (36–72 MiB). Then: budgets from the
+measurements, results under `bench/results/`, and the stat cache with sampled status
+(design doc, open points unanswered). The Projects disk was full on 2026-11-01 (I deleted wheat's
 `target/debug/incremental`; `gothab/` is 717 GB).
 
 Not yet measured cleanly: the fetch_incremental A/B for 57da2be ran under a load
