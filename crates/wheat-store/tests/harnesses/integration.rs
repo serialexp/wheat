@@ -84,6 +84,8 @@ mod packed_repack;
 mod packed_store;
 #[path = "../packed_stored_bytes.rs"]
 mod packed_stored_bytes;
+#[path = "../path_history_index.rs"]
+mod path_history_index;
 #[path = "../phase1_measurement.rs"]
 mod phase1_measurement;
 #[path = "../projected_commits.rs"]

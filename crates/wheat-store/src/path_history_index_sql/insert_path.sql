@@ -1,0 +1,1 @@
+INSERT OR IGNORE INTO path (path) VALUES (?1)

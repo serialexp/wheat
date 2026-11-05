@@ -14,8 +14,9 @@ use wheat_core::{
 
 use crate::{
     ChangeMapStore, ContentStore, ContentStoreError, HistoryMapError, HistoryMapStore,
-    ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, RepositoryHead,
-    RepositoryPublicationError, RepositoryReader, RetainedSetStore, TreeListing,
+    ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, PathHistoryIndex,
+    PathHistoryIndexError, RepositoryHead, RepositoryPublicationError, RepositoryReader,
+    RetainedSetStore, TreeListing,
 };
 
 #[derive(Debug, Error)]
@@ -36,6 +37,8 @@ pub enum BrowseError {
     History(#[from] HistoryMapError),
     #[error(transparent)]
     Content(#[from] ContentStoreError),
+    #[error(transparent)]
+    PathHistory(#[from] PathHistoryIndexError),
 }
 
 /// A file read by [`RepositoryBrowser::read_file`].
@@ -236,6 +239,46 @@ impl<'a, O: ImmutableObjectStore> RepositoryBrowser<'a, O> {
             id = previous.ok_or(BrowseError::IdentityMismatch("application order"))?;
             application = self.reader.application(id).await?;
         }
+    }
+
+    /// Up to `limit` of `view`'s changes before canonical position `before` (all of
+    /// them when `None`) that touch `path`, newest first: for a file the changes that
+    /// changed it, for a directory those that changed anything below it, for `""`
+    /// every change. `index` answers which changes those are (see
+    /// [`PathHistoryIndex::touching`]), so a page costs what its changes number, not
+    /// the changes between them.
+    #[tracing::instrument(name = "browse_path_history", level = "debug", skip_all)]
+    pub async fn path_history(
+        &self,
+        index: &PathHistoryIndex,
+        view: ViewId,
+        path: &str,
+        before: Option<u64>,
+        limit: NonZeroUsize,
+    ) -> Result<HistoryPage, BrowseError> {
+        if components(path)?.is_empty() {
+            return self.history(view, before, limit).await;
+        }
+        let record = self.view(view).await?;
+        let size = record.order.size;
+        if let Some(position) = before.filter(|&position| position > size) {
+            return Err(BrowseError::PositionOutOfRange { position, size });
+        }
+        let touches = index
+            .touching(&self.reader, &record, path, before, limit)
+            .await?;
+        let mut items = Vec::with_capacity(touches.touches.len());
+        for touch in touches.touches {
+            let application = self.reader.application(touch.application).await?;
+            if application.order.position != touch.position {
+                return Err(BrowseError::IdentityMismatch("application"));
+            }
+            items.push(self.item(touch.application, application).await?);
+        }
+        Ok(HistoryPage {
+            items,
+            next: touches.next,
+        })
     }
 
     /// Up to `limit` of `view`'s changes by when their revisions were committed, newest

@@ -38,6 +38,8 @@ mod directory_chunks;
 mod durability;
 mod frontier_index;
 pub use frontier_index::{FrontierIndex, FrontierIndexError};
+mod path_history_index;
+pub use path_history_index::{PathHistoryIndex, PathHistoryIndexError, PathTouch, PathTouches};
 mod increment_validation;
 pub use increment_validation::{Arrival, IncrementBudget, IncrementReport};
 mod label_move;

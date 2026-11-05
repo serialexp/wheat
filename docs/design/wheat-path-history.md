@@ -1,6 +1,6 @@
 # Wheat path history — Design
 
-Status: decided (option 1, a local SQLite index), not yet implemented
+Status: partial — the index and `RepositoryBrowser::path_history` landed; callers and the benchmark outstanding
 Owner: bart
 Last updated: 2026-11-06
 
@@ -17,13 +17,19 @@ land and move them from Outstanding to Done.
   changes anything below it: each change indexes its changed files and their
   ancestor directories (not the root, whose history is the plain history).
 - [x] **Decision — who keeps it (2026-11-06).** Every store, clients included.
+- [x] **`PathHistoryIndex`** in wheat-store (`path_history_index.rs`): the SQLite
+  file, catching up to a view on query (no writer hooks), and the candidate scan with
+  its membership check. Catching up uses the previous application's result tree as
+  each one's parent tree (a view's tree is its producing application's), so it reads
+  one view, then an application and a revision per change plus its diff. A page
+  reports `next` only when a further hit exists.
+- [x] **`RepositoryBrowser::path_history(index, view, path, before, limit)`.**
+  Newest first, a page of the changes that touch `path`, with a cursor; `""` is the
+  view's history. Tests check every file and directory of a forked random history
+  against the changes the test made, and count a page's object reads.
 
 ### Outstanding
 
-- [ ] **`PathHistoryIndex`** in wheat-store: the SQLite file, catching up to a view
-  on query (no writer hooks), and the candidate scan with its membership check.
-- [ ] **`RepositoryBrowser::path_history(view, path, before, limit)`.** Newest
-  first, a page of the changes that touch `path`, with a cursor.
 - [ ] **Callers.** The file in each client store (`LocalRepository`), and in gitd
   where it opens a network; `catch_up` after a publish or import so a request never
   pays for a large backlog.
