@@ -37,6 +37,7 @@ chrono = { version = "0.4", features = ["serde"] }
 gix = { version = "0.87.1", features = ["blame", "blob-diff", "merge"] }
 hdrhistogram = "7"
 hex = "0.4"
+imara-diff = "0.2"
 libc = "0.2"
 # The global allocator of every binary: faster than glibc's for Wheat's
 # multi-threaded work, and than musl's by far (bench runs of 2026-10-21).

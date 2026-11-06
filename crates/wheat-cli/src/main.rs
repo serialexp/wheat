@@ -40,12 +40,13 @@ use materialization::materialize_resolved;
 use wheat_client::authoring_metadata::UserConfig;
 use wheat_client::outcome::{CliFailure, OutputFormat, Success};
 use wheat_client::{
-    active_changes, authoring, authoring_metadata, conflict_inspection, credential, diff_render,
-    discovery, dot_git, edit_move, frontier_service, git_pull, ignore_import, import_trace,
-    inspection, label_move, label_service, local, log_inspection, materialization, prompt, remote,
-    remote_config, repack, rewrite_transaction, selection_recovery, squash, squash_attribution,
-    store_analyze, store_lookup, workspace, workspace_clone, workspace_diff, workspace_lifecycle,
-    workspace_metadata, workspace_registry_service, workspace_scan, workspace_status,
+    active_changes, authoring, authoring_metadata, blame_inspection, conflict_inspection,
+    credential, diff_render, discovery, dot_git, edit_move, frontier_service, git_pull,
+    ignore_import, import_trace, inspection, label_move, label_service, local, log_inspection,
+    materialization, prompt, remote, remote_config, repack, rewrite_transaction,
+    selection_recovery, squash, squash_attribution, store_analyze, store_lookup, workspace,
+    workspace_clone, workspace_diff, workspace_lifecycle, workspace_metadata,
+    workspace_registry_service, workspace_scan, workspace_status,
 };
 use workspace_lifecycle::{ensure_fresh_workspace, initialize_workspace_directory};
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
@@ -113,6 +114,8 @@ enum Command {
     Validate,
     /// Inspect logical changes and immutable revisions.
     Log(LogArgs),
+    /// Show which change last wrote each line of a file in the effective view.
+    Blame(BlameArgs),
     /// List changes active relative to this workspace's authoring basis.
     Changes,
     /// List native short labels in deterministic name order.
@@ -540,6 +543,16 @@ struct LogArgs {
 }
 
 #[derive(Debug, Args)]
+struct BlameArgs {
+    /// The repository-relative file.
+    path: String,
+    /// Walk at most this many of the file's changes, newest first; older lines are
+    /// left unresolved.
+    #[arg(long)]
+    limit: Option<std::num::NonZeroUsize>,
+}
+
+#[derive(Debug, Args)]
 struct AddArgs {
     /// Active logical change to revise instead of the workspace selection.
     #[arg(long)]
@@ -887,6 +900,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Status => "status",
         Command::Validate => "validate",
         Command::Log(_) => "log",
+        Command::Blame(_) => "blame",
         Command::Changes => "changes",
         Command::Labels => "labels",
         Command::Label(LabelCommand::Create { .. }) => "label.create",
@@ -1082,6 +1096,24 @@ fn execute(cli: Cli) -> Result<Success> {
                 &context.store_root,
                 workspace.effective_view(),
                 path,
+                format,
+            )
+        }
+        Command::Blame(arguments) => {
+            let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&context.store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
+            let workspace = WorkspaceMetadata::read(&context.root)?;
+            // As for `log`: the inspector reopens the store, so the handle goes first.
+            drop(local);
+            blame_inspection::inspect(
+                &context.store_root,
+                workspace.effective_view(),
+                blame_inspection::BlamePath {
+                    path: arguments.path,
+                    limit: arguments.limit,
+                },
                 format,
             )
         }

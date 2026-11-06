@@ -24,6 +24,8 @@ mod add_scale;
 mod authoring_metadata;
 #[path = "../automation_contract.rs"]
 mod automation_contract;
+#[path = "../blame.rs"]
+mod blame;
 #[path = "../broken_pipe.rs"]
 mod broken_pipe;
 #[path = "../client_authoring.rs"]

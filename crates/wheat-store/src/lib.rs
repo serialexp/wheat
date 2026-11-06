@@ -64,6 +64,8 @@ pub use packed::{
 };
 mod remote_packed;
 pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
+mod blame;
+pub use blame::{Blame, BlameChange, BlameError, BlameLimits, BlameOrigin, BlameRange, blame};
 mod browse;
 mod network_bundle;
 mod network_import;

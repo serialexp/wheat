@@ -4,6 +4,7 @@
 pub mod active_changes;
 pub mod authoring;
 pub mod authoring_metadata;
+pub mod blame_inspection;
 pub mod capture_settlement;
 pub mod conflict_inspection;
 pub mod credential;

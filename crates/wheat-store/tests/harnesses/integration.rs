@@ -14,6 +14,8 @@ mod actor_concurrency_corpus;
 mod authoring_spot;
 #[path = "../batch_store.rs"]
 mod batch_store;
+#[path = "../blame.rs"]
+mod blame;
 #[path = "../branch_publication.rs"]
 mod branch_publication;
 #[path = "../browse.rs"]

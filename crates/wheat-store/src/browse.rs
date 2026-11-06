@@ -13,10 +13,10 @@ use wheat_core::{
 };
 
 use crate::{
-    ChangeMapStore, ContentStore, ContentStoreError, HistoryMapError, HistoryMapStore,
-    ImmutableObjectStore, MerkleTreeError, MerkleTreeStore, PathHistoryIndex,
-    PathHistoryIndexError, RepositoryHead, RepositoryPublicationError, RepositoryReader,
-    RetainedSetStore, TreeListing,
+    Blame, BlameError, BlameLimits, ChangeMapStore, ContentStore, ContentStoreError,
+    HistoryMapError, HistoryMapStore, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
+    PathHistoryIndex, PathHistoryIndexError, RepositoryHead, RepositoryPublicationError,
+    RepositoryReader, RetainedSetStore, TreeListing,
 };
 
 #[derive(Debug, Error)]
@@ -39,6 +39,8 @@ pub enum BrowseError {
     Content(#[from] ContentStoreError),
     #[error(transparent)]
     PathHistory(#[from] PathHistoryIndexError),
+    #[error(transparent)]
+    Blame(#[from] BlameError),
 }
 
 /// A file read by [`RepositoryBrowser::read_file`].
@@ -279,6 +281,36 @@ impl<'a, O: ImmutableObjectStore> RepositoryBrowser<'a, O> {
             items,
             next: touches.next,
         })
+    }
+
+    /// Which change last wrote each line of the file at `path` in `view`, or `None`
+    /// when no file is there; see [`crate::blame()`]. `index` finds the file's
+    /// changes, so the walk costs what they number, up to `limits.max_changes`. Each
+    /// change a range names costs a history item's reads more.
+    #[tracing::instrument(name = "browse_blame", level = "debug", skip_all)]
+    pub async fn blame(
+        &self,
+        index: &PathHistoryIndex,
+        view: ViewId,
+        path: &str,
+        limits: BlameLimits,
+    ) -> Result<Option<Blame<HistoryItem>>, BrowseError> {
+        let record = self.view(view).await?;
+        let Some(blame) = crate::blame(&self.reader, index, &record, path, limits).await? else {
+            return Ok(None);
+        };
+        let mut origins = Vec::with_capacity(blame.origins.len());
+        for origin in blame.origins {
+            origins.push(
+                self.item(origin.touch.application, origin.application)
+                    .await?,
+            );
+        }
+        Ok(Some(Blame {
+            lines: blame.lines,
+            ranges: blame.ranges,
+            origins,
+        }))
     }
 
     /// Up to `limit` of `view`'s changes by when their revisions were committed, newest

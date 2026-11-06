@@ -779,7 +779,10 @@ changes that touch a repository-relative file, or anything below a directory, ne
 first in canonical order; `--limit` bounds a page and `--before` (printed at a page's
 end, and `next` in JSON) starts the next one. The store keeps which changes touch
 which paths in `paths.sqlite`, a cache caught up when a query needs it (see
-`docs/design/wheat-path-history.md`).
+`docs/design/wheat-path-history.md`). `wheat blame PATH` shows which change last
+wrote each line of a file in the effective view, the lines grouped under their change;
+it walks the file's changes through the same index, and `--limit` bounds how many,
+leaving older lines unresolved (`docs/design/wheat-blame.md`).
 
 Configuration files are versioned, bounded, strict JSON and published atomically
 under a per-config lock. Repository configuration belongs to Wheat, not

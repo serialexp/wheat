@@ -1,0 +1,30 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261106-113527
+# blame	{"checkpoints":[2000,20000],"edited_lines":5,"files":1000,"hot_every":20,"hot_lines":2000,"samples":5}
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	81a6a03e608b
+# scale	full
+# scratch_fs	ext4
+measurement	value	unit
+blame.total.wall	56.45796209	s
+blame.total.peak_rss	227409920	bytes
+blame.n2000.hot.wall	0.021866481	s
+blame.n2000.hot.reads	1010	count
+blame.n2000.hot.origins	100	count
+blame.n2000.cold.wall	0.000116509	s
+blame.n2000.cold.reads	19	count
+blame.n2000.cold.origins	1	count
+blame.n20000.hot.wall	0.223090496	s
+blame.n20000.hot.reads	10893	count
+blame.n20000.hot.origins	759	count
+blame.n20000.cold.wall	0.000603236	s
+blame.n20000.cold.reads	78	count
+blame.n20000.cold.origins	1	count
+run.total_time	56.466782935	s
+process.peak_rss	227409920	bytes
+suite.cases	1	count
+suite.case_failures	0	count
