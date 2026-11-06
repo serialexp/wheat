@@ -134,6 +134,8 @@ mod root_publication;
 mod sharded_content_generation;
 #[path = "../snapshot_restore.rs"]
 mod snapshot_restore;
+#[path = "../state_scan.rs"]
+mod state_scan;
 #[path = "../structural_delta.rs"]
 mod structural_delta;
 #[path = "../transition_validation.rs"]

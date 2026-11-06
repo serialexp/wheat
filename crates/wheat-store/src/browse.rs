@@ -104,8 +104,8 @@ pub struct TimeHistoryPage {
 
 /// Browsing reads at one repository head.
 pub struct RepositoryBrowser<'a, O> {
-    reader: RepositoryReader<'a, O>,
-    state: RepositoryStateRecord,
+    pub(crate) reader: RepositoryReader<'a, O>,
+    pub(crate) state: RepositoryStateRecord,
     labels: ViewLabelManifestRecord,
 }
 

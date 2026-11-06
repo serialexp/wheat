@@ -1,0 +1,28 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261106-160929
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	f52330b45aa3
+# scale	full
+# scratch_fs	ext4
+# state_scan	{"changes":10000,"files":1000,"page":1000}
+measurement	value	unit
+state_scan.total.wall	26.472652274	s
+state_scan.total.peak_rss	128180224	bytes
+state_scan.n10000.trees.wall	0.397740425	s
+state_scan.n10000.trees.listed	30001	count
+state_scan.n10000.trees.pages	31	count
+state_scan.n10000.trees.reads	32932	count
+state_scan.n10000.trees.reads_per_record	1.0976967434418852	count
+state_scan.n10000.edits.wall	0.33147601	s
+state_scan.n10000.edits.listed	10000	count
+state_scan.n10000.edits.pages	21	count
+state_scan.n10000.edits.reads	31968	count
+state_scan.n10000.edits.reads_per_record	1.0656	count
+run.total_time	26.47573122	s
+process.peak_rss	128180224	bytes
+suite.cases	1	count
+suite.case_failures	0	count

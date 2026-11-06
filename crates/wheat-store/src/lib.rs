@@ -68,6 +68,11 @@ pub use remote_packed::{RemotePackedStore, RemotePackedStoreConfig};
 mod blame;
 pub use blame::{Blame, BlameChange, BlameError, BlameLimits, BlameOrigin, BlameRange, blame};
 mod browse;
+mod state_scan;
+pub use state_scan::{
+    EditOrigin, StateEdit, StateEditCursor, StateEditPage, StateTree, StateTreeCursor,
+    StateTreePage, TreeOrigin,
+};
 mod network_bundle;
 mod network_import;
 mod publication;

@@ -300,6 +300,17 @@ macro_rules! set_api {
                     inner: self.inner.cursor(root).await?,
                 })
             }
+            /// A cursor over the keys from `lower` on, in ascending order; only the
+            /// nodes on the path to `lower` and those holding later keys are read.
+            pub async fn cursor_from(
+                &self,
+                root: $id,
+                lower: $key,
+            ) -> Result<$cursor<'a, S>, CollectionError> {
+                Ok($cursor {
+                    inner: self.inner.cursor_from(root, &lower).await?,
+                })
+            }
             /// Returns the authenticated structural union of two roots.
             ///
             /// Equal subtrees are skipped by identity and only the keys `other` adds are
