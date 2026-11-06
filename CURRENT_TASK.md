@@ -26,10 +26,16 @@ it together later (v0.3.5), only on Bart's go-ahead.
   Done: `record_info` (fdf8ded), `ContentMarks`/`sweep` with the bench case
   (a472476), and naming (847bc74 `needed_to_read`, 678df28 the `ContentNaming`
   hook with renewal at commit). Bart chose (2026-11-07) that Wheat names the whole
-  closure (chunks, parts, delta bases), so Gothab's `named` only stamps rows. Open,
-  in TODO.md: a chunk reused as a stored delta isn't named with its base, a join
-  after a forced publish can re-add unnamed content, and publish delta bases come
-  from the base view (so there are hardly any).
+  closure (chunks, parts, delta bases), so Gothab's `named` only stamps rows.
+  d8ac395: batched `reclaim(ids) -> reclaimed ids` (≤ `SWEEP_PAGE_IDS` per call) and
+  a collection's start in the mark file (`create(path, started)`, `merge` refuses an
+  earlier input); walrus told. Open, in TODO.md: a chunk reused as a stored delta
+  isn't named with its base, a join after a forced publish can re-add unnamed
+  content, publish delta bases come from the base view (so there are hardly any), and
+  a store failure during upload drops the connection instead of answering "publish
+  again" (asked Bart whether to fix now).
+- Walrus asked (2026-11-07) for a secret-sweep API: `state_trees`/`state_edits`,
+  paged with stable cursors. Outside Bart's order; asked Bart.
 
 ## 2026-10-30/31: Wheat hardening for the Gothab integration (@calm-lynx)
 
