@@ -27,6 +27,7 @@ use wheat_core::{ContentId, RepositoryEnvelopeId, StoreRecordError, decode_conte
 use crate::{
     CollectionError, ContentBlobStore, ContentStore, ContentStoreError, ImmutableObjectStore,
     RecordReferences, RepositoryPublicationError, RepositoryReader,
+    content_closure::MAX_PART_BYTES,
     radix::{Key as _, Store as RadixStore},
     sets::ContentCollection,
 };
@@ -37,9 +38,6 @@ const INSERT_BATCH: usize = 4096;
 const REFERENCE_BATCH: usize = 1024;
 /// IDs asked for per listed page.
 const LIST_PAGE: usize = 1000;
-/// The longest part record read while following a long blob's manifest: a part
-/// lists at most 16,384 chunks of 36 bytes.
-const MAX_PART_BYTES: usize = 1 << 20;
 
 const SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = "

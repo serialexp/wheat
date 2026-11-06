@@ -455,3 +455,129 @@ async fn a_records_references_come_from_the_record_alone() {
     garbled[header] ^= 0xff;
     assert!(record_info(long_id, &garbled).is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_reading_content_needs_is_found_from_headers_and_manifests() {
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    let blobs = Arc::new(MemoryBlobs::default());
+    let content = over(&blobs);
+    let reads = || {
+        (
+            blobs.range_reads.swap(0, Ordering::Relaxed),
+            blobs.gets.swap(0, Ordering::Relaxed),
+        )
+    };
+    let set = |ids: Vec<ContentId>| ids.into_iter().collect::<HashSet<_>>();
+
+    // Whole content needs nothing else: one ranged read.
+    let small = content.put(&noise(1, 4096)).unwrap();
+    reads();
+    assert_eq!(content.needed_to_read([small, small], []).unwrap(), [small]);
+    assert_eq!(reads(), (1, 0));
+
+    // A delta needs its base, and the base's base: one ranged read each.
+    let base = noise(2, 64 * 1024);
+    let base_id = content.put(&base).unwrap();
+    let mut first = base.clone();
+    first[100..110].copy_from_slice(b"0123456789");
+    let first = VerifiedContent::new(first.as_slice());
+    content.put_with_base(first, base_id).unwrap();
+    let mut second = first.bytes().to_vec();
+    second[5000..5010].copy_from_slice(b"9876543210");
+    let second = VerifiedContent::new(second.as_slice());
+    content.put_with_base(second, first.id()).unwrap();
+    assert_eq!(
+        record_info(second.id(), &blobs.record(second.id()).unwrap())
+            .unwrap()
+            .references,
+        RecordReferences::Delta { base: first.id() }
+    );
+    reads();
+    assert_eq!(
+        content.needed_to_read([second.id()], []).unwrap(),
+        [second.id(), first.id(), base_id]
+    );
+    assert_eq!(reads(), (3, 0));
+
+    // A chunked blob needs its chunks, which are not read: its manifest is.
+    let mut writer = content.writer();
+    writer.write_all(&noise(3, 20 << 20)).unwrap();
+    let chunked = writer.finish(None).unwrap();
+    let RecordReferences::Chunks(chunks) = record_info(chunked, &blobs.record(chunked).unwrap())
+        .unwrap()
+        .references
+    else {
+        panic!("a chunked blob's record lists its chunks");
+    };
+    reads();
+    let needed = content.needed_to_read([chunked], []).unwrap();
+    assert_eq!(needed[0], chunked);
+    assert_eq!(set(needed[1..].to_vec()), set(chunks.clone()));
+    assert_eq!(reads(), (1, 1));
+    // As a possible delta base it is left out: a chunked blob is no delta's base.
+    // A whole base is kept, with its own base.
+    assert_eq!(
+        content
+            .needed_to_read([small], [chunked, second.id(), small])
+            .unwrap(),
+        [small, second.id(), first.id(), base_id]
+    );
+    reads();
+
+    // A long blob needs its parts and each part's chunks: each part is read once.
+    let chunk = |n: u8| wheat_core::ContentChunkRecord {
+        id: ContentId::from_digest([n; 32]),
+        length: wheat_core::MIN_CONTENT_CHUNK_BYTES,
+    };
+    let part_length =
+        wheat_core::MIN_CONTENT_PART_CHUNKS as u64 * u64::from(wheat_core::MIN_CONTENT_CHUNK_BYTES);
+    let parts: Vec<_> = (0..2_u8)
+        .map(|n| {
+            let record = wheat_core::ContentChunkPartRecord {
+                chunks: vec![chunk(10 + n), chunk(20 + n)],
+            };
+            let id = content
+                .put(&wheat_core::encode_content_chunk_part(&record).unwrap())
+                .unwrap();
+            wheat_core::ContentPartRecord {
+                id,
+                length: part_length,
+            }
+        })
+        .collect();
+    let manifest =
+        wheat_core::encode_content_chunk_manifest(&wheat_core::ContentChunkManifestRecord {
+            logical_length: 2 * part_length,
+            entries: wheat_core::ContentManifestEntries::Parts(parts.clone()),
+        })
+        .unwrap();
+    let mut record =
+        wheat_core::encode_content_envelope_header(&wheat_core::ContentEnvelopeHeaderRecord {
+            codec: 5,
+            stored_length: manifest.len() as u64,
+            logical_length: 2 * part_length,
+        })
+        .unwrap();
+    record.extend_from_slice(&manifest);
+    let long = ContentId::from_digest([9; 32]);
+    blobs.set_record(long, record);
+    reads();
+    let needed = content.needed_to_read([long, small], []).unwrap();
+    let mut expected = vec![long];
+    for (part, n) in parts.iter().zip(0_u8..) {
+        expected.extend([part.id, chunk(10 + n).id, chunk(20 + n).id]);
+    }
+    expected.push(small);
+    assert_eq!(needed, expected);
+    // The two headers, the manifest, and each part.
+    assert_eq!(reads(), (2, 3));
+
+    // Nothing is needed of content that is not stored: the caller is told.
+    let unknown = ContentId::from_digest([1; 32]);
+    assert!(matches!(
+        content.needed_to_read([small], [unknown]),
+        Err(ContentStoreError::Missing(id)) if id == unknown
+    ));
+}

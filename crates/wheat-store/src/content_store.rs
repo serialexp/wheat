@@ -228,6 +228,17 @@ pub(crate) trait ContentBackend: std::fmt::Debug + Send + Sync {
         let _ = candidates;
         None
     }
+
+    /// What each of `ids`'s stored records refers to, in order, when the backend
+    /// answers that with less than reading each whole record; `None` when it does
+    /// not.
+    fn references_many(
+        &self,
+        ids: &[ContentId],
+    ) -> Option<Result<Vec<crate::RecordReferences>, ContentStoreError>> {
+        let _ = ids;
+        None
+    }
 }
 
 /// Iteratively resolve a content delta chain and verify the final ContentId.
@@ -817,6 +828,30 @@ impl ContentStore {
             .copied()
             .filter(|id| self.contains(*id))
             .collect())
+    }
+
+    /// What each of `ids`'s stored records refers to, in order (see
+    /// [`crate::record_info`]). A blob store reads a record's header and a delta's
+    /// base reference in one ranged read, and a chunked blob's manifest whole;
+    /// a backend that checks content as it reads it (a packed store) keeps its own
+    /// records whole, so they refer to nothing.
+    pub fn record_references(
+        &self,
+        ids: &[ContentId],
+    ) -> Result<Vec<crate::RecordReferences>, ContentStoreError> {
+        if let Some(backend) = &self.backend
+            && let Some(found) = backend.references_many(ids)
+        {
+            return found;
+        }
+        ids.iter()
+            .map(|&id| match self.stored(id)? {
+                StoredContent::Verified(_) => Ok(crate::RecordReferences::None),
+                StoredContent::Envelope(header, payload) => {
+                    crate::content_blobs::payload_references(id, &header, &payload)
+                }
+            })
+            .collect()
     }
 
     /// Loose fallback path, not a locator for packed content.

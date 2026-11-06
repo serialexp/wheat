@@ -12,6 +12,7 @@ mod commit_content;
 mod commit_writer;
 mod content_arrivals;
 mod content_batch;
+mod content_closure;
 mod content_manifest;
 pub use content_batch::ContentWriteBatch;
 mod content_generation;

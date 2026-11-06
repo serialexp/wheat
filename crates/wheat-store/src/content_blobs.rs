@@ -153,7 +153,21 @@ pub fn record_info(id: ContentId, record: &[u8]) -> Result<RecordInfo, ContentSt
         .validate(record.len() as u64, usize::MAX)
         .map_err(|error| codec_error(id, usize::MAX, error))?;
     let payload = &record[codec::ENVELOPE_HEADER_LEN..];
-    let references = match header.codec {
+    Ok(RecordInfo {
+        logical_length: header.logical_length,
+        references: payload_references(id, &header, payload)?,
+    })
+}
+
+/// What a record whose header is `header` refers to, from its `payload`: a delta's
+/// leading base reference (the rest may be left out), or a chunked blob's whole
+/// manifest.
+pub(crate) fn payload_references(
+    id: ContentId,
+    header: &codec::EnvelopeHeader,
+    payload: &[u8],
+) -> Result<RecordReferences, ContentStoreError> {
+    Ok(match header.codec {
         codec::Codec::Raw | codec::Codec::Zstd => RecordReferences::None,
         codec::Codec::Delta | codec::Codec::DeltaZstd => {
             let base: [u8; 32] = payload
@@ -185,10 +199,6 @@ pub fn record_info(id: ContentId, record: &[u8]) -> Result<RecordInfo, ContentSt
                 "a block-compressed record is not stored alone",
             ));
         }
-    };
-    Ok(RecordInfo {
-        logical_length: header.logical_length,
-        references,
     })
 }
 
@@ -333,5 +343,42 @@ impl ContentBackend for BlobBackend {
 
     fn supports_raw_envelopes(&self) -> bool {
         true
+    }
+
+    fn references_many(
+        &self,
+        ids: &[ContentId],
+    ) -> Option<Result<Vec<RecordReferences>, ContentStoreError>> {
+        // The header and a delta's base reference in one ranged read; only a chunked
+        // blob's manifest is read whole.
+        let prefix = (codec::ENVELOPE_HEADER_LEN + crate::delta::BASE_REFERENCE_SIZE) as u64;
+        let found = block_on(
+            stream::iter(ids.iter().map(|&id| async move {
+                let read = self
+                    .blobs
+                    .get_range(id, 0..prefix)
+                    .await?
+                    .ok_or(ContentStoreError::Missing(id))?;
+                let header = checked_header(
+                    id,
+                    read.bytes
+                        .get(..codec::ENVELOPE_HEADER_LEN)
+                        .ok_or_else(|| malformed(id, "bad envelope prefix"))?,
+                    read.size,
+                )?;
+                if header.codec == codec::Codec::Chunked {
+                    let record = self
+                        .blobs
+                        .get(id)
+                        .await?
+                        .ok_or(ContentStoreError::Missing(id))?;
+                    return Ok(record_info(id, &record)?.references);
+                }
+                payload_references(id, &header, &read.bytes[codec::ENVELOPE_HEADER_LEN..])
+            }))
+            .buffered(MAX_CONCURRENT_REQUESTS)
+            .try_collect::<Vec<_>>(),
+        );
+        Some(found.and_then(|found| found))
     }
 }
