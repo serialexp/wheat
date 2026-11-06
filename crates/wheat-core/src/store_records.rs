@@ -325,15 +325,15 @@ pub struct PendingRepositoryCasRecord {
     pub resulting_frontier: ViewId,
 }
 
-/// `.wheat/workspace.meta`: a workspace's binding to its store and label. Neither
-/// identity is nil.
+/// `.wheat/workspace.meta`: a workspace's binding to its store and, unless it shows
+/// one view on its own, the label it follows. Neither identity is nil.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceMetadataRecord {
     pub workspace_id: Uuid,
     pub registration_token: Uuid,
     pub store_path: String,
     pub store_id: Uuid,
-    pub active_label: String,
+    pub active_label: Option<String>,
     pub basis: ViewId,
     pub observed_label_binding: ViewId,
     pub selected_frontier: Option<ViewId>,
@@ -1146,12 +1146,15 @@ pub fn encode_workspace_metadata(
     record: &WorkspaceMetadataRecord,
 ) -> Result<Vec<u8>, StoreRecordError> {
     encoded(
-        wire::WorkspaceMetadataV1Input {
+        wire::WorkspaceMetadataV2Input {
             workspace_id: identity(record.workspace_id),
             registration_token: identity(record.registration_token),
             store_path: record.store_path.clone(),
             store_id: identity(record.store_id),
-            active_label: record.active_label.clone(),
+            active_label: record
+                .active_label
+                .clone()
+                .map(|name| wire::FollowedLabelV1 { name }),
             basis: view_wire(record.basis),
             observed_label_binding: view_wire(record.observed_label_binding),
             selected_frontier: record.selected_frontier.map(view_wire),
@@ -1171,14 +1174,14 @@ pub fn encode_workspace_metadata(
 pub fn decode_workspace_metadata(
     bytes: &[u8],
 ) -> Result<WorkspaceMetadataRecord, StoreRecordError> {
-    let w = wire::WorkspaceMetadataV1::decode(bytes).map_err(decode_error)?;
+    let w = wire::WorkspaceMetadataV2::decode(bytes).map_err(decode_error)?;
     let reencoded = w.encode();
     let record = WorkspaceMetadataRecord {
         workspace_id: identity_domain(w.workspace_id, "workspace ID")?,
         registration_token: identity_domain(w.registration_token, "registration token")?,
         store_path: w.store_path,
         store_id: identity_domain(w.store_id, "store ID")?,
-        active_label: w.active_label,
+        active_label: w.active_label.map(|label| label.name),
         basis: view_domain(w.basis)?,
         observed_label_binding: view_domain(w.observed_label_binding)?,
         selected_frontier: w.selected_frontier.map(view_domain).transpose()?,

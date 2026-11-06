@@ -50,7 +50,7 @@ pub fn init(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Init
     let workspace = WorkspaceMetadata::new(
         canonical_store,
         store.store_id,
-        "main".into(),
+        Some("main".into()),
         resolved.basis,
         resolved.selected_frontier,
     );
@@ -60,7 +60,7 @@ pub fn init(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Init
     let (view, materialized_root) = crate::materialization::materialize_resolved(
         workspace_root,
         Some(&store_root),
-        "main".into(),
+        Some("main".into()),
         resolved,
         crate::dot_git::DotGitGate::Refuse,
     )?;

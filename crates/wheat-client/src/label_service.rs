@@ -337,7 +337,8 @@ pub fn move_label(
         RepositoryPublisher::new(&repository.objects, &repository.content, &repository.heads);
     let root = runtime.block_on(publisher.stage_envelope(state_id, &manifest))?;
     let rebinding = workspace.filter(|workspace| {
-        workspace.metadata.active_label == name && workspace.metadata.effective_view() == to
+        workspace.metadata.active_label.as_deref() == Some(name.as_str())
+            && workspace.metadata.effective_view() == to
     });
     let head = match rebinding {
         Some(workspace) => {

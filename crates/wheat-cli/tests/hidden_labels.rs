@@ -61,8 +61,9 @@ fn hidden_labels_are_kept_but_listed_only_when_asked() {
     assert_eq!(
         WorkspaceMetadata::read(&third.workspace)
             .unwrap()
-            .active_label,
-        "main"
+            .active_label
+            .as_deref(),
+        Some("main")
     );
     let listing = third.ok_json(config, &["labels"]);
     assert_eq!(names(&listing), ["main"]);

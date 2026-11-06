@@ -2,14 +2,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
+use wheat_core::ViewId;
 use wheat_store::{PublicationStore, RepositoryReader};
 
 use crate::{
     discovery::{canonical_store_path, discover_workspace},
     dot_git::DotGitGate,
-    frontier_service,
+    frontier_service::{self, ResolvedFrontier},
     hidden_labels::{self, LabelFilter},
-    local::{open, runtime},
+    local::{LocalRepository, open, runtime},
     materialization::materialize_resolved,
     outcome::Success,
     workspace_lifecycle::{ensure_fresh_workspace, initialize_workspace_directory},
@@ -17,12 +18,55 @@ use crate::{
     workspace_registry_service,
 };
 
-/// A new workspace on the store at or of `source`. `shown` adds hidden label patterns
-/// to the store's remote binding first ([`crate::hidden_labels`]).
+/// What a new workspace shows.
+#[derive(Clone, Copy, Debug)]
+pub enum CloneStart {
+    /// The default label (`main`, or the first one shown), at its view when it has
+    /// several descendant frontiers.
+    DefaultLabel,
+    /// Exactly this view, following no label.
+    View(ViewId),
+}
+
+/// The label a new workspace on `repository` follows, if any, and what it shows.
+pub async fn resolve_start(
+    repository: &LocalRepository,
+    filter: &LabelFilter,
+    start: CloneStart,
+) -> Result<(Option<String>, ResolvedFrontier)> {
+    if let CloneStart::View(view) = start {
+        return Ok((
+            None,
+            frontier_service::resolve_view(repository, view).await?,
+        ));
+    }
+    let head = repository.heads.read()?;
+    let reader = RepositoryReader::new(&repository.objects, &repository.content);
+    let envelope = reader.envelope(head.envelope).await?;
+    let labels = reader.view_label_manifest(envelope.labels).await?;
+    let label = filter.default_label(labels.labels.keys());
+    let resolved = match frontier_service::resolve(repository, &label, None).await {
+        Ok(resolved) => resolved,
+        // Several descendant frontiers: start at the label's own view.
+        Err(_) => {
+            let basis = labels
+                .labels
+                .get(&label)
+                .context("selected label disappeared")?
+                .view;
+            frontier_service::resolve(repository, &label, Some(basis)).await?
+        }
+    };
+    Ok((Some(label), resolved))
+}
+
+/// A new workspace on the store at or of `source`, showing `start`. `shown` adds
+/// hidden label patterns to the store's remote binding first ([`crate::hidden_labels`]).
 pub fn clone_local(
     source: &Path,
     workspace_root: &Path,
     shown: &[String],
+    start: CloneStart,
     dot_git: DotGitGate,
 ) -> Result<Success> {
     ensure_fresh_workspace(workspace_root)?;
@@ -47,26 +91,7 @@ pub fn clone_local(
         hidden_labels::update_shown(&store_root, shown, &[])?;
     }
     let filter = LabelFilter::of_store(&store_root, false)?;
-    let head = repository.heads.read()?;
-    let rt = runtime()?;
-    let (label, resolved) = rt.block_on(async {
-        let reader = RepositoryReader::new(&repository.objects, &repository.content);
-        let envelope = reader.envelope(head.envelope).await?;
-        let labels = reader.view_label_manifest(envelope.labels).await?;
-        let label = filter.default_label(labels.labels.keys());
-        let resolved = match frontier_service::resolve(&repository, &label, None).await {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                let basis = labels
-                    .labels
-                    .get(&label)
-                    .context("selected label disappeared")?
-                    .view;
-                frontier_service::resolve(&repository, &label, Some(basis)).await?
-            }
-        };
-        Ok::<_, anyhow::Error>((label, resolved))
-    })?;
+    let (label, resolved) = runtime()?.block_on(resolve_start(&repository, &filter, start))?;
     drop(repository);
 
     initialize_workspace_directory(workspace_root)?;

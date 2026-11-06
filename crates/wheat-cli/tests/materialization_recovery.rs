@@ -1071,7 +1071,7 @@ fn rematerialization_recovery_refuses_replacement_toctou() {
         b"raced\n"
     );
     let metadata = wheat_client::workspace_metadata::WorkspaceMetadata::read(&workspace).unwrap();
-    assert_eq!(metadata.active_label, "main");
+    assert_eq!(metadata.active_label.as_deref(), Some("main"));
     assert!(workspace.join(".wheat/materialization.json").is_file());
 }
 

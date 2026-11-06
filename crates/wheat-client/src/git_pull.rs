@@ -55,7 +55,7 @@ pub fn pull(
     selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
     ensure_workspace_clean_locked(&context.root, &repository, &context.workspace)?;
 
-    let label = context.workspace.active_label.clone();
+    let label = context.workspace.followed_label("pull")?.to_owned();
     let listed = runtime.block_on(frontier_service::list(&repository, &label))?;
     // The head `list` read, unless a command published since; the publication below
     // refuses that.
@@ -158,7 +158,7 @@ pub fn pull(
         &repository,
         &mut context.workspace,
         head,
-        label.clone(),
+        Some(label.clone()),
         listed.basis,
         (view != listed.basis).then_some(view),
         tree,

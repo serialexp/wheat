@@ -31,13 +31,18 @@ pub struct StoreMetadata {
 /// A workspace's binding to its store and label, kept in `.wheat/workspace.meta`.
 /// Serde serves only the rewrite transaction journal, which holds a workspace's old
 /// and new metadata while a rewrite is in flight.
+///
+/// A workspace made for one view (`wheat switch --view`, `wheat clone --view`) follows
+/// no label: `active_label` is `None`, and its basis is that view, which
+/// `observed_label_binding` repeats. Commands that read the label refuse there until
+/// the workspace switches to one ([`WorkspaceMetadata::followed_label`]).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMetadata {
     pub workspace_id: Uuid,
     pub registration_token: Uuid,
     pub store: WorkspaceStore,
-    pub active_label: String,
+    pub active_label: Option<String>,
     pub basis: ViewId,
     pub observed_label_binding: ViewId,
     pub selected_frontier: Option<ViewId>,
@@ -174,11 +179,12 @@ impl StoreMetadata {
 
 impl WorkspaceMetadata {
     /// A workspace on `active_label` at `basis`, pinning `selected_frontier` when the
-    /// label had one frontier to select. Materializing reads only what is pinned here.
+    /// label had one frontier to select, or on `basis` alone when it follows no label.
+    /// Materializing reads only what is pinned here.
     pub fn new(
         store_path: PathBuf,
         store_id: Uuid,
-        active_label: String,
+        active_label: Option<String>,
         basis: ViewId,
         selected_frontier: Option<ViewId>,
     ) -> Self {
@@ -201,6 +207,17 @@ impl WorkspaceMetadata {
 
     pub fn effective_view(&self) -> ViewId {
         self.selected_frontier.unwrap_or(self.basis)
+    }
+
+    /// The label this workspace follows, for a command that reads it; refuses when the
+    /// workspace shows one view and follows none.
+    pub fn followed_label(&self, command: &str) -> Result<&str> {
+        self.active_label.as_deref().ok_or_else(|| {
+            crate::outcome::CliFailure::invalid(format!(
+                "`wheat {command}` needs a label, and this workspace shows view {} and follows none; run `wheat switch <label>` first",
+                self.effective_view()
+            ))
+        })
     }
 
     /// Applies the pending repository operation's outcome once its CAS installed the
@@ -383,7 +400,7 @@ mod tests {
         let original = WorkspaceMetadata::new(
             PathBuf::from("/store"),
             store_id,
-            "main".into(),
+            Some("main".into()),
             basis,
             None,
         );
@@ -410,7 +427,7 @@ mod tests {
         let mut metadata = WorkspaceMetadata::new(
             PathBuf::from("/store"),
             Uuid::now_v7(),
-            "main".into(),
+            Some("main".into()),
             basis,
             Some(frontier),
         );
@@ -446,7 +463,7 @@ mod tests {
         let metadata = WorkspaceMetadata::new(
             PathBuf::from(std::ffi::OsStr::from_bytes(b"/store-\xff")),
             Uuid::now_v7(),
-            "main".into(),
+            Some("main".into()),
             ViewId::from_digest([1; 32]),
             None,
         );

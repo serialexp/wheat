@@ -349,7 +349,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
         ],
     );
     let status_after_materialize = harness.json_ok(&harness.workspace, &["status"]);
-    assert_eq!(status_after_materialize["result"]["schema_version"], 2);
+    assert_eq!(status_after_materialize["result"]["schema_version"], 3);
     assert_eq!(
         status_after_materialize["result"]["authority_advanced"],
         false
@@ -434,7 +434,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     let metadata_before_reads = fs::read(harness.workspace.join(".wheat/workspace.meta")).unwrap();
     let status = harness.json_ok(&harness.workspace, &["status"]);
     assert_eq!(status["command"], "status");
-    assert_eq!(status["result"]["schema_version"], 2);
+    assert_eq!(status["result"]["schema_version"], 3);
     assert_eq!(status["result"]["authority_advanced"], true);
     assert!(
         status["result"]["current_head_generation"]
@@ -862,7 +862,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     let metadata =
         wheat_client::workspace_metadata::WorkspaceMetadata::decode(&pinned_metadata).unwrap();
     assert!(!metadata.registration_token.is_nil());
-    assert_eq!(metadata.active_label, "main");
+    assert_eq!(metadata.active_label.as_deref(), Some("main"));
     assert_eq!(
         serde_json::to_value(metadata.basis).unwrap(),
         expected_reopened["result"]["basis"]

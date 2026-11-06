@@ -2,7 +2,7 @@
 
 Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, `add --all`, and explicit revision collapse are landed; extended configuration keys are stored but not yet read; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-11-02
+Last updated: 2026-11-07
 
 ## Implementation status
 
@@ -169,6 +169,11 @@ both lists.
   object IDs are the same on every push, guarded by remote-branch reachability. A
   moved label replaces its remote tag only with `--force-with-lease` (2026-10-26). Extended beyond the original plan: squash refuses to move an
   annotated label. See "Git compatibility workflow".
+- [x] **A workspace for one exact view.** (2026-11-07) `wheat switch --view V` and
+  `wheat clone URL DIR --view V` show exactly V and follow no label, for a CI runner
+  checking out the view that triggered it. Extended beyond the original plan: the
+  workspace metadata is `WorkspaceMetadataV2` with an optional label, and status
+  JSON is schema 3. See "Repository labels and integration workflow".
 
 ### Outstanding
 - [ ] **Import keeps annotated tag data.** Import turns `refs/tags/X` into label
@@ -890,6 +895,20 @@ server take a backward move (the request's `force_labels`, which needs `force`
 access); `--force` still only replaces the remote head. A publish the server refuses
 keeps the local move, says so, and the next `pull` reconciles it through the fetch
 rule. The JSON gains `label_moved` (`{from, label}` or null).
+
+**A workspace for one view (2026-11-07).** A CI run is pinned to the view that
+triggered it, and by the time a runner clones, the label may have moved past it;
+going through the label can then only reach its view or a descendant frontier.
+Bart: "You should be able to just materialize view ID X, and then yeah, you cannot
+refresh, pull etc unless you connect to a label because you need those to take the
+action." So `wheat switch --view V` and `wheat clone URL DIR --view V` show exactly
+the retained view V and follow no label: `active_label` is absent from the
+workspace metadata (`WorkspaceMetadataV2`; older files no longer decode), the basis
+is V, and status reports `active_label: null` (status JSON schema 3). `refresh`,
+`integrate`, `pull`, `frontier list` without `--label`, and `publish --force-label`
+refuse there, naming `wheat switch <label>`. `publish` sends the work without moving
+a label. Authoring works as anywhere: a new change becomes the selected frontier
+above V. `switch <label>` follows a label again.
 
 A fetch takes the remote's label moves and deletions (and settles a label both sides
 moved with the forward check) unless that would hide local work no workspace shows:

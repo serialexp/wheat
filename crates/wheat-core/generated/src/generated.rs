@@ -10984,12 +10984,51 @@ impl PendingRepositoryOperationV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct WorkspaceMetadataV1Input {
+pub struct FollowedLabelV1 {
+    pub name: std::string::String,
+}
+
+impl FollowedLabelV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self { name })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceMetadataV2Input {
     pub workspace_id: Uuid128,
     pub registration_token: Uuid128,
     pub store_path: std::string::String,
     pub store_id: Uuid128,
-    pub active_label: std::string::String,
+    pub active_label: Option<FollowedLabelV1>,
     pub basis: ViewId,
     pub observed_label_binding: ViewId,
     pub selected_frontier: Option<ViewId>,
@@ -10999,14 +11038,14 @@ pub struct WorkspaceMetadataV1Input {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct WorkspaceMetadataV1Output {
+pub struct WorkspaceMetadataV2Output {
     pub magic: u32,
     pub version: u16,
     pub workspace_id: Uuid128,
     pub registration_token: Uuid128,
     pub store_path: std::string::String,
     pub store_id: Uuid128,
-    pub active_label: std::string::String,
+    pub active_label: Option<FollowedLabelV1>,
     pub basis: ViewId,
     pub observed_label_binding: ViewId,
     pub selected_frontier: Option<ViewId>,
@@ -11015,9 +11054,9 @@ pub struct WorkspaceMetadataV1Output {
     pub pending_repository_operation: Option<PendingRepositoryOperationV1>,
 }
 
-pub type WorkspaceMetadataV1 = WorkspaceMetadataV1Output;
+pub type WorkspaceMetadataV2 = WorkspaceMetadataV2Output;
 
-impl WorkspaceMetadataV1Input {
+impl WorkspaceMetadataV2Input {
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
         self.encode()
     }
@@ -11030,7 +11069,7 @@ impl WorkspaceMetadataV1Input {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_u32_be(1464358739);
-        encoder.write_u16_be(1);
+        encoder.write_u16_be(2);
         self.workspace_id.encode_into(encoder)?;
         self.registration_token.encode_into(encoder)?;
         encoder.write_varlength(self.store_path.len() as u64, "leb128_canonical")?;
@@ -11039,10 +11078,11 @@ impl WorkspaceMetadataV1Input {
             encoder.write_byte(b);
         }
         self.store_id.encode_into(encoder)?;
-        encoder.write_varlength(self.active_label.len() as u64, "leb128_canonical")?;
-        let string_bytes: &[u8] = self.active_label.as_bytes();
-        for &b in string_bytes.iter() {
-            encoder.write_byte(b);
+        if let Some(ref v) = self.active_label {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
         }
         self.basis.encode_into(encoder)?;
         self.observed_label_binding.encode_into(encoder)?;
@@ -11074,7 +11114,7 @@ impl WorkspaceMetadataV1Input {
     }
 }
 
-impl WorkspaceMetadataV1Output {
+impl WorkspaceMetadataV2Output {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
         Self::decode_with_decoder(&mut decoder)
@@ -11089,9 +11129,9 @@ impl WorkspaceMetadataV1Output {
             )));
         }
         let version = decoder.read_u16_be()?;
-        if version != 1u16 {
+        if version != 2u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 1, got {}",
+                "expected 2, got {}",
                 version
             )));
         }
@@ -11102,10 +11142,12 @@ impl WorkspaceMetadataV1Output {
         let store_path = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let store_id = Uuid128::decode_with_decoder(decoder)?;
-        let length = decoder.read_varlength("leb128_canonical")? as usize;
-        let bytes = decoder.read_bytes_vec(length)?;
-        let active_label = std::string::String::from_utf8(bytes)
-            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let has_value = decoder.read_uint8()? != 0;
+        let active_label = if has_value {
+            Some(FollowedLabelV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
         let basis = ViewId::decode_with_decoder(decoder)?;
         let observed_label_binding = ViewId::decode_with_decoder(decoder)?;
         let has_value = decoder.read_uint8()? != 0;
@@ -11149,19 +11191,19 @@ impl WorkspaceMetadataV1Output {
         })
     }
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
-        WorkspaceMetadataV1Input::from(self.clone()).encode_measuring()
+        WorkspaceMetadataV2Input::from(self.clone()).encode_measuring()
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        WorkspaceMetadataV1Input::from(self.clone()).encode()
+        WorkspaceMetadataV2Input::from(self.clone()).encode()
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        WorkspaceMetadataV1Input::from(self.clone()).encode_into(encoder)
+        WorkspaceMetadataV2Input::from(self.clone()).encode_into(encoder)
     }
 }
 
-impl From<WorkspaceMetadataV1Output> for WorkspaceMetadataV1Input {
-    fn from(o: WorkspaceMetadataV1Output) -> Self {
+impl From<WorkspaceMetadataV2Output> for WorkspaceMetadataV2Input {
+    fn from(o: WorkspaceMetadataV2Output) -> Self {
         Self {
             workspace_id: o.workspace_id,
             registration_token: o.registration_token,
@@ -11178,11 +11220,11 @@ impl From<WorkspaceMetadataV1Output> for WorkspaceMetadataV1Input {
     }
 }
 
-impl From<WorkspaceMetadataV1Input> for WorkspaceMetadataV1Output {
-    fn from(i: WorkspaceMetadataV1Input) -> Self {
+impl From<WorkspaceMetadataV2Input> for WorkspaceMetadataV2Output {
+    fn from(i: WorkspaceMetadataV2Input) -> Self {
         Self {
             magic: 1464358739u32,
-            version: 1u16,
+            version: 2u16,
             workspace_id: i.workspace_id,
             registration_token: i.registration_token,
             store_path: i.store_path,

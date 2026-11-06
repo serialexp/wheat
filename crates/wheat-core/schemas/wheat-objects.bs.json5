@@ -1318,16 +1318,23 @@
         { name: "rebinds", type: "bool" },
       ],
     },
-    // `.wheat/workspace.meta`: a workspace's binding to its store and label.
-    WorkspaceMetadataV1: {
+    // The label a workspace follows.
+    FollowedLabelV1: {
+      sequence: [
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+      ],
+    },
+    // `.wheat/workspace.meta`: a workspace's binding to its store and, unless it shows
+    // one view on its own, the label it follows.
+    WorkspaceMetadataV2: {
       sequence: [
         { name: "magic", type: "uint32", const: 0x57485753 },
-        { name: "version", type: "uint16", const: 1 },
+        { name: "version", type: "uint16", const: 2 },
         { name: "workspace_id", type: "Uuid128" },
         { name: "registration_token", type: "Uuid128" },
         { name: "store_path", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "store_id", type: "Uuid128" },
-        { name: "active_label", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "active_label", type: "optional", value_type: "FollowedLabelV1" },
         { name: "basis", type: "ViewId" },
         { name: "observed_label_binding", type: "ViewId" },
         { name: "selected_frontier", type: "optional", value_type: "ViewId" },

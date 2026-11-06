@@ -22,6 +22,11 @@ it together later (v0.3.5), only on Bart's go-ahead.
   `published` answering `Submission::Unknown`, and a conformance check
   (`heads::conformance::check_head_store`, feature `conformance`) Gothab runs.
   The local file head keeps its 1024 cap (`Some(1024)`).
+- CI checkouts of one exact view (walrus's slice 4d question): Bart (2026-11-07)
+  "just materialize view ID X", label commands refuse until a switch to a label.
+  `wheat switch --view V`, `wheat clone URL DIR --view V`; `WorkspaceMetadataV2`
+  with an optional label; status JSON schema 3; test `wheat-cli/tests/pinned_view.rs`.
+  Documented in `wheat-local-cli.md`. Walrus to be told once committed.
 - Hidden labels: done. Bart chose (2026-11-07) that they stay in the local head
   exactly as on the remote (clone, fetch and publish move them as before) and are
   only left out of `wheat labels`, which lists them with `--hidden`; glob patterns

@@ -233,10 +233,16 @@ impl DotGitArgs {
 
 #[derive(Debug, Args)]
 struct FrontierSelectionArgs {
-    label: String,
+    /// The label to follow. Omit it with `--view`.
+    #[arg(required_unless_present = "view")]
+    label: Option<String>,
     /// Exact descendant frontier view. Required when more than one exists.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "view")]
     frontier: Option<String>,
+    /// Show exactly this retained view and follow no label. `refresh`, `pull`,
+    /// `integrate` and `frontier list` then refuse until a `switch` to a label.
+    #[arg(long, conflicts_with = "label")]
+    view: Option<String>,
     #[command(flatten)]
     dot_git: DotGitArgs,
 }
@@ -767,6 +773,10 @@ struct NativeCloneArgs {
     /// kept on the remote binding (`wheat remote labels`).
     #[arg(long = "label", value_name = "GLOB")]
     labels: Vec<String>,
+    /// Show exactly this view and follow no label, as `wheat switch --view` does,
+    /// instead of the default label.
+    #[arg(long)]
+    view: Option<String>,
     #[command(flatten)]
     dot_git: DotGitArgs,
 }
@@ -987,14 +997,23 @@ fn execute(cli: Cli) -> Result<Success> {
             "materialize",
             dot_git.gate(format),
         ),
-        Command::Switch(arguments) => switch_workspace(
-            &requested_workspace,
-            cli.store.as_deref(),
-            arguments.label,
-            parse_optional_view(arguments.frontier)?,
-            "switch",
-            arguments.dot_git.gate(format),
-        ),
+        Command::Switch(arguments) => {
+            let to = match (arguments.label, parse_optional_view(arguments.view)?) {
+                (Some(label), None) => SwitchTo::Label {
+                    label,
+                    frontier: parse_optional_view(arguments.frontier)?,
+                },
+                (None, Some(view)) => SwitchTo::View(view),
+                _ => unreachable!("clap requires exactly one of a label and --view"),
+            };
+            switch_workspace(
+                &requested_workspace,
+                cli.store.as_deref(),
+                to,
+                "switch",
+                arguments.dot_git.gate(format),
+            )
+        }
         Command::Integrate(arguments) => {
             let dot_git = arguments.dot_git.gate(format);
             let frontiers = arguments
@@ -1020,7 +1039,13 @@ fn execute(cli: Cli) -> Result<Success> {
         ),
         Command::Frontier(FrontierCommand::List { label }) => {
             let context = resolve_context(&requested_workspace, cli.store.as_deref())?;
-            let label = label.unwrap_or(context.workspace.active_label);
+            let label = match label {
+                Some(label) => label,
+                None => context
+                    .workspace
+                    .followed_label("frontier list")?
+                    .to_owned(),
+            };
             let local = open(&context.store_root)?;
             let _operation =
                 rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &local)?;
@@ -1057,7 +1082,10 @@ fn execute(cli: Cli) -> Result<Success> {
             for diagnostic in &status.diagnostics {
                 write_stderr(format_args!("note: {diagnostic}\n"));
             }
-            writeln!(output, "active label: {}", status.active_label)?;
+            match &status.active_label {
+                Some(label) => writeln!(output, "active label: {label}")?,
+                None => writeln!(output, "active label: none (this workspace shows one view)")?,
+            }
             writeln!(output, "basis view: {}", status.basis)?;
             writeln!(output, "effective view: {}", status.effective_view)?;
             writeln!(output, "tracked changes: {}", status.changes.len())?;
@@ -1764,7 +1792,7 @@ fn import(
     let workspace = WorkspaceMetadata::new(
         canonical_store,
         store.store_id,
-        selected_label.clone(),
+        Some(selected_label.clone()),
         resolved.basis,
         resolved.selected_frontier,
     );
@@ -1786,7 +1814,7 @@ fn import(
     let (view, materialized_root) = materialize_resolved(
         workspace_root,
         Some(&store_root),
-        selected_label,
+        Some(selected_label),
         resolved,
         dot_git,
     )?;
@@ -1835,7 +1863,7 @@ fn reject_selected_label_mutation(
     name: &str,
     operation: &str,
 ) -> Result<()> {
-    if context.is_some_and(|context| context.workspace.active_label == name) {
+    if context.is_some_and(|context| context.workspace.active_label.as_deref() == Some(name)) {
         return Err(CliFailure::invalid(format!(
             "cannot {operation} label {name}: it is selected by this workspace"
         )));
@@ -1932,11 +1960,21 @@ fn materialize_active_workspace(
     )
 }
 
+/// What `switch_workspace` moves a workspace to.
+enum SwitchTo {
+    /// A label, at its view or the given descendant frontier of it.
+    Label {
+        label: String,
+        frontier: Option<ViewId>,
+    },
+    /// Exactly this view, following no label.
+    View(ViewId),
+}
+
 fn switch_workspace(
     workspace: &Path,
     explicit_store: Option<&Path>,
-    label: String,
-    requested_frontier: Option<ViewId>,
+    to: SwitchTo,
     command: &'static str,
     dot_git: dot_git::DotGitGate,
 ) -> Result<Success> {
@@ -1953,11 +1991,17 @@ fn switch_workspace(
     ))?;
     selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
     ensure_workspace_clean_locked(&context.root, &repository, &context.workspace)?;
-    let resolved = runtime()?.block_on(frontier_service::resolve(
-        &repository,
-        &label,
-        requested_frontier,
-    ))?;
+    let (label, resolved) = match to {
+        SwitchTo::Label { label, frontier } => {
+            let resolved =
+                runtime()?.block_on(frontier_service::resolve(&repository, &label, frontier))?;
+            (Some(label), resolved)
+        }
+        SwitchTo::View(view) => (
+            None,
+            runtime()?.block_on(frontier_service::resolve_view(&repository, view))?,
+        ),
+    };
     let view = resolved.effective_view();
     runtime()?.block_on(materialization::materialize_locked(
         &context.root,
@@ -1971,13 +2015,20 @@ fn switch_workspace(
         dot_git,
     ))?;
     let root = context.root;
-    Success::new(
-        command,
-        json!({ "label": label, "view": view.to_string() }),
-        format!(
+    let human = match &label {
+        Some(label) => format!(
             "{command} selected label {label} at view {view} in {}\n",
             root.display()
         ),
+        None => format!(
+            "{command} selected view {view}, following no label, in {}\n",
+            root.display()
+        ),
+    };
+    Success::new(
+        command,
+        json!({ "label": label, "view": view.to_string() }),
+        human,
     )
 }
 
@@ -2018,7 +2069,7 @@ fn refresh_workspace(
             &mut context.workspace,
         ))?;
         selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
-        let label = context.workspace.active_label.clone();
+        let label = context.workspace.followed_label("refresh")?.to_owned();
         let listed = runtime.block_on(frontier_service::list(&repository, &label))?;
         let effective = context.workspace.effective_view();
         let covered = effective == listed.basis
@@ -2036,8 +2087,7 @@ fn refresh_workspace(
         return switch_workspace(
             workspace,
             explicit_store,
-            label,
-            frontier,
+            SwitchTo::Label { label, frontier },
             "refresh",
             dot_git,
         );
@@ -2078,7 +2128,7 @@ fn integrate_workspace(
     selection_recovery::recover(&context.root, &repository, &mut context.workspace)?;
     ensure_workspace_clean_locked(&context.root, &repository, &context.workspace)?;
 
-    let label = context.workspace.active_label.clone();
+    let label = context.workspace.followed_label(command)?.to_owned();
     let listed = runtime.block_on(frontier_service::list(&repository, &label))?;
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
     let mut budget = MergeBudget::STANDARD;
@@ -2154,7 +2204,7 @@ fn integrate_workspace(
             &repository,
             &mut context.workspace,
             moved.head,
-            label.clone(),
+            Some(label.clone()),
             view,
             None,
             tree,
@@ -2235,7 +2285,7 @@ fn integrate_workspace(
         &repository,
         &mut context.workspace,
         head,
-        label.clone(),
+        Some(label.clone()),
         basis,
         selected,
         tree,
@@ -2795,6 +2845,10 @@ fn native_clone(
     explicit_store: Option<&Path>,
     dot_git: dot_git::DotGitGate,
 ) -> Result<Success> {
+    let start = match parse_optional_view(arguments.view.clone())? {
+        Some(view) => workspace_clone::CloneStart::View(view),
+        None => workspace_clone::CloneStart::DefaultLabel,
+    };
     if let Some(source) = workspace_clone::local_source(&arguments.url) {
         let workspace_root = arguments.workspace.unwrap_or_else(|| {
             let name = source
@@ -2813,7 +2867,13 @@ fn native_clone(
                 ));
             }
         }
-        return workspace_clone::clone_local(&source, &workspace_root, &arguments.labels, dot_git);
+        return workspace_clone::clone_local(
+            &source,
+            &workspace_root,
+            &arguments.labels,
+            start,
+            dot_git,
+        );
     }
     let parsed = remote::parse_wheat_url(&arguments.url)?;
 
@@ -2849,6 +2909,7 @@ fn native_clone(
             &store_root,
             &workspace_root,
             &arguments.labels,
+            start,
             dot_git,
         );
     }
@@ -2868,7 +2929,7 @@ fn native_clone(
     let heads = wheat_store::LocalPublicationStore::new(store_root.join("repository.head"));
 
     let rt = runtime()?;
-    let (remote_state, label_name, fetched, content_count) = rt.block_on(async {
+    let (remote_state, fetched, content_count) = rt.block_on(async {
         let (mut session, state) = remote::open(&parsed, &token).await?;
 
         // Fetch all structural objects.
@@ -2886,10 +2947,6 @@ fn native_clone(
             .validate_arrival(state.envelope, Arrival::Bootstrap)
             .await
             .context("the remote's head failed validation")?;
-        let labels = reader
-            .view_label_manifest(reader.envelope(state.envelope).await?.labels)
-            .await?
-            .labels;
         staged.flush().await?;
 
         write_stderr(format_args!(
@@ -2899,8 +2956,7 @@ fn native_clone(
         ));
 
         remote::close(&mut session).await?;
-        let label = filter.default_label(labels.keys());
-        Ok::<_, anyhow::Error>((state, label, fetched, content_count))
+        Ok::<_, anyhow::Error>((state, fetched, content_count))
     })?;
     // Release the packed store's process lock; the workspace reopens the store below.
     drop(objects);
@@ -2921,34 +2977,13 @@ fn native_clone(
     remote_cfg.shown_hidden_labels = shown_patterns(&arguments.labels);
     remote_cfg.write(&store_root)?;
 
-    // Initialize workspace and materialize. If multiple descendant
-    // frontiers exist, resolve at the label basis (the user can select
-    // a specific frontier later with `wheat switch --frontier`).
+    // Initialize the workspace and materialize: the default label, at its own view
+    // when it has several descendant frontiers (`wheat switch --frontier` picks one
+    // later), or exactly the view asked for.
     initialize_workspace_directory(&workspace_root)?;
     let repository = open(&store_root)?;
-    let resolved = match rt.block_on(frontier_service::resolve(&repository, &label_name, None)) {
-        Ok(r) => r,
-        Err(_) => {
-            // Multiple frontiers — resolve at the label's basis view.
-            let basis_view = rt.block_on(async {
-                let reader =
-                    wheat_store::RepositoryReader::new(&repository.objects, &repository.content);
-                let head = repository.heads.read()?;
-                let envelope = reader.envelope(head.envelope).await?;
-                let labels = reader.view_label_manifest(envelope.labels).await?;
-                let label_entry = labels
-                    .labels
-                    .get(&label_name)
-                    .ok_or_else(|| anyhow::anyhow!("unknown label {label_name}"))?;
-                Ok::<_, anyhow::Error>(label_entry.view)
-            })?;
-            rt.block_on(frontier_service::resolve(
-                &repository,
-                &label_name,
-                Some(basis_view),
-            ))?
-        }
-    };
+    let (label_name, resolved) =
+        rt.block_on(workspace_clone::resolve_start(&repository, &filter, start))?;
     drop(repository);
     let workspace = workspace_metadata::WorkspaceMetadata::new(
         canonical_store,
@@ -3203,9 +3238,19 @@ fn native_pull(
     if integrated.result["integrated"] == false && integrated.result["label_moved"].is_null() {
         let label = resolve_context(workspace, explicit_store)?
             .workspace
-            .active_label;
-        integrated = switch_workspace(workspace, explicit_store, label, None, "pull", dot_git)
-            .map_err(after_fetch)?;
+            .followed_label("pull")?
+            .to_owned();
+        integrated = switch_workspace(
+            workspace,
+            explicit_store,
+            SwitchTo::Label {
+                label,
+                frontier: None,
+            },
+            "pull",
+            dot_git,
+        )
+        .map_err(after_fetch)?;
     }
     let mut human = fetched.human;
     human.extend_from_slice(&integrated.human);
@@ -3304,7 +3349,11 @@ fn native_publish(
     // The published envelope carries the active label at this workspace's view. The
     // move is local and stays when the server refuses the publish; the next pull
     // reconciles it with the remote's label.
-    let moved = if arguments.keep_label {
+    // A workspace that follows no label publishes without moving one; only
+    // `--force-label` asks for a label, and is refused there.
+    let moved = if arguments.keep_label
+        || (context.workspace.active_label.is_none() && !arguments.force_label)
+    {
         None
     } else {
         Some(move_label_for_publish(
@@ -3529,9 +3578,12 @@ fn move_label_for_publish(
         &mut workspace,
     ))?;
     selection_recovery::recover(&context.root, repository, &mut workspace)?;
+    let label = workspace
+        .followed_label("publish --force-label")?
+        .to_owned();
     label_service::move_label(
         repository,
-        workspace.active_label.clone(),
+        label,
         workspace.effective_view(),
         force,
         PUBLISH_LABEL_HINT,

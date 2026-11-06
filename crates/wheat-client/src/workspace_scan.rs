@@ -43,7 +43,8 @@ pub struct WorkspaceScan {
     pub materialized_head_generation: u64,
     pub current_head_generation: u64,
     pub authority_advanced: bool,
-    pub active_label: String,
+    /// `None` for a workspace that shows one view and follows no label.
+    pub active_label: Option<String>,
     pub basis: ViewId,
     pub observed_label_binding: ViewId,
     pub current_label_binding: Option<ViewId>,
@@ -157,9 +158,10 @@ pub fn scan_locked(
                 materialized_envelope
             };
         let labels = reader.view_label_manifest(current_envelope.labels).await?;
-        let current_label_binding = labels
-            .labels
-            .get(&workspace.active_label)
+        let current_label_binding = workspace
+            .active_label
+            .as_ref()
+            .and_then(|name| labels.labels.get(name))
             .map(|label| label.view);
         let files = MerkleTreeStore::new(&repository.objects)
             .walk_files(materialized.tree, TreeWalkLimits::default())
@@ -310,7 +312,9 @@ pub fn scan_locked(
         basis: workspace.basis,
         observed_label_binding: workspace.observed_label_binding,
         current_label_binding,
-        label_binding_drifted: current_label_binding != Some(workspace.observed_label_binding),
+        // A workspace that follows no label has no binding to drift from.
+        label_binding_drifted: workspace.active_label.is_some()
+            && current_label_binding != Some(workspace.observed_label_binding),
         selected_frontier: workspace.selected_frontier,
         effective_view: workspace.effective_view(),
         changes,

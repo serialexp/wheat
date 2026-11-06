@@ -340,7 +340,8 @@ fn workspace(full: bool) -> WorkspaceMetadataRecord {
         registration_token: id(2),
         store_path: "/stores/ünïcode store".into(),
         store_id: id(3),
-        active_label: "main".into(),
+        // A workspace made for one view follows no label.
+        active_label: full.then(|| "main".into()),
         basis: ViewId::from_digest([4; 32]),
         observed_label_binding: ViewId::from_digest([5; 32]),
         selected_frontier: full.then(|| ViewId::from_digest([6; 32])),
@@ -371,7 +372,7 @@ fn pin(full: bool) -> WorkspacePinRecord {
 }
 
 /// `bytes` with one more byte, and with the version after the four-byte magic
-/// raised to 2.
+/// raised by one.
 fn tampered(bytes: &[u8]) -> [Vec<u8>; 2] {
     let mut trailing = bytes.to_vec();
     trailing.push(0);

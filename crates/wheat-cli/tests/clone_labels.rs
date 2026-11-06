@@ -27,7 +27,7 @@ fn a_clone_is_active_on_main_when_other_labels_sort_first() {
         &["clone", &server.url, workspace.to_str().unwrap()],
     );
     let metadata = WorkspaceMetadata::read(&workspace).unwrap();
-    assert_eq!(metadata.active_label, "main");
+    assert_eq!(metadata.active_label.as_deref(), Some("main"));
     let third = remote_support::sides::Side { workspace, stores };
     let labels = third.ok_json(config, &["labels"])["labels"]
         .as_array()

@@ -54,7 +54,8 @@ pub struct WorkspaceStatus {
     pub materialized_head_generation: u64,
     pub current_head_generation: u64,
     pub authority_advanced: bool,
-    pub active_label: String,
+    /// `null` for a workspace that shows one view and follows no label.
+    pub active_label: Option<String>,
     pub basis: ViewId,
     pub observed_label_binding: ViewId,
     pub current_label_binding: Option<ViewId>,
@@ -119,7 +120,7 @@ impl WorkspaceStatus {
         };
 
         Self {
-            schema_version: 2,
+            schema_version: 3,
             materialized_view: scan.materialized_view,
             materialized_head_generation: scan.materialized_head_generation,
             current_head_generation: scan.current_head_generation,

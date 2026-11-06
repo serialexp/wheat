@@ -557,7 +557,7 @@ mod tests {
         let metadata = WorkspaceMetadata::new(
             store_root.clone(),
             store.store_id,
-            "main".into(),
+            Some("main".into()),
             view(1),
             None,
         );
@@ -625,7 +625,7 @@ mod tests {
         let mut second = WorkspaceMetadata::new(
             store_root.clone(),
             repository.store_id,
-            "main".into(),
+            Some("main".into()),
             view(1),
             None,
         );

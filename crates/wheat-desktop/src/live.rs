@@ -66,7 +66,12 @@ impl LiveBackend {
         let active = active_changes::read(root, None)?;
         let entries = history::read(root, None)?;
         let workspaces = workspace_lifecycle::entries(root, None)?;
-        let frontiers = frontier_service::read(root, None)?;
+        // A workspace that shows one view follows no label, so has no frontiers below
+        // one.
+        let frontiers = match status.active_label {
+            Some(_) => frontier_service::read(root, None)?.frontiers,
+            None => Vec::new(),
+        };
         let now = now();
 
         let index: HashMap<ChangeId, usize> = entries
@@ -171,7 +176,7 @@ impl LiveBackend {
         // waits on the basis for a choice.
         let frontier = match status.selected_frontier {
             Some(view) => Some(short(&view.to_string())),
-            None if frontiers.frontiers.len() > 1 => None,
+            None if frontiers.len() > 1 => None,
             None => Some(short(&status.effective_view.to_string())),
         };
         let mut model = Model {
@@ -191,10 +196,11 @@ impl LiveBackend {
                 .collect(),
             store,
             workspace: WorkspaceView {
-                label: status.active_label.clone(),
+                label: status.active_label.clone().unwrap_or_else(|| {
+                    format!("view {}", short(&status.effective_view.to_string()))
+                }),
                 frontier,
                 frontiers: frontiers
-                    .frontiers
                     .iter()
                     .map(|view| FrontierChoice {
                         name: short(&view.to_string()),

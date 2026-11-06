@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use serde::Serialize;
 use wheat_core::{RepositoryStateRecord, ViewId, ViewLabel};
 use wheat_store::{
@@ -72,6 +72,32 @@ pub async fn pinned(
         head,
         basis,
         selected_frontier,
+        tree,
+    })
+}
+
+/// `view` on its own, for a workspace that shows it and follows no label: the current
+/// head must retain it.
+pub async fn resolve_view(repository: &LocalRepository, view: ViewId) -> Result<ResolvedFrontier> {
+    let head = repository.heads.read()?;
+    let reader = RepositoryReader::new(&repository.objects, &repository.content);
+    let envelope = reader.envelope(head.envelope).await?;
+    let state = reader.state(envelope.state).await?;
+    let tree = reader
+        .retained_view(&state, view)
+        .await
+        .with_context(|| {
+            format!("view {view} is not in this repository; `wheat fetch` it first if it is new")
+        })?
+        .tree;
+    anyhow::ensure!(
+        repository.heads.read()? == head,
+        "repository head changed while resolving view {view}"
+    );
+    Ok(ResolvedFrontier {
+        head,
+        basis: view,
+        selected_frontier: None,
         tree,
     })
 }
@@ -231,5 +257,6 @@ pub fn read(
     let repository = crate::local::open(&context.store_root)?;
     let _operation =
         crate::rewrite_transaction::StoreOperationGuard::acquire(&context.store_root, &repository)?;
-    crate::local::runtime()?.block_on(list(&repository, &context.workspace.active_label))
+    let label = context.workspace.followed_label("frontier list")?;
+    crate::local::runtime()?.block_on(list(&repository, label))
 }

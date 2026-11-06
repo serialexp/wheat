@@ -78,6 +78,8 @@ mod log_path;
 mod materialization_recovery;
 #[path = "../phase1_acceptance.rs"]
 mod phase1_acceptance;
+#[path = "../pinned_view.rs"]
+mod pinned_view;
 #[path = "../publish_hooks.rs"]
 mod publish_hooks;
 #[path = "../quiesce.rs"]

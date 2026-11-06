@@ -600,7 +600,7 @@ fn schema_version_is_two_with_untracked() {
 
     let status = h.json_ok(&h.workspace, &["status"]);
     assert_eq!(
-        status["result"]["schema_version"], 2,
+        status["result"]["schema_version"], 3,
         "status schema version should be 2 with untracked discovery"
     );
 }
