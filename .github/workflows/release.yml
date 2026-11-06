@@ -60,10 +60,10 @@ jobs:
             os: ubuntu-24.04
             zig: true
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           # Cross-compiled on Apple silicon: the SDK covers both architectures.
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-2022
     steps:
