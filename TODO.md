@@ -13,6 +13,14 @@ the same commit.
   rewrite (each changed path's previous content). Measure what deltas would save on
   a blob store before choosing. Content naming already names whatever bases the map
   gives (`crates/wheat-server/tests/naming_test.rs`).
+- [ ] **A store failure during a publish's upload drops the connection.** A content
+  or object write that fails while a publish uploads (a stage written early, a
+  manifest stored, `crates/wheat-server/src/publish.rs`) becomes
+  `ConnectionError::Internal`. The session then ends with no message, where a failure
+  at commit answers with the error status. Nothing is kept, so sending the publish
+  again works, but the client sees a lost connection instead of "publish again".
+  Gothab's blob `put` refuses retryably while a row is being reclaimed, so this path
+  will happen.
 - [ ] **A chunk equal to a stored delta is named without its base.** Naming a
   publish's content (`ContentStore::needed_to_read`) does not read chunks, since
   chunks are stored whole. But a chunk whose bytes equal a file stored earlier as a
