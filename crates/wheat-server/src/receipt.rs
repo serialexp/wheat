@@ -66,6 +66,19 @@ impl PublishKey {
         Ok(Self { key, request })
     }
 
+    /// The key of a server write ([`crate::write`]) that `principal` sent with `key`,
+    /// asking for what `request` digests. Refuses a principal name too long to bind.
+    pub fn server_write(
+        principal: &Principal,
+        key: [u8; 16],
+        request: [u8; 16],
+    ) -> Result<Self, wheat_core::StoreRecordError> {
+        Ok(Self {
+            key: publish_key_digest(principal.name.as_bytes(), key)?,
+            request,
+        })
+    }
+
     /// The receipt of this publish published in `head` at `now`, in seconds since the
     /// Unix epoch.
     pub fn receipt(&self, head: RepositoryHead, now: u64) -> PublishReceiptRecord {

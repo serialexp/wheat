@@ -382,6 +382,49 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
     reader.validate_complete(state).await.unwrap();
 }
 
+/// A server write accepted while a batch is being written is checked against that
+/// batch's head, not the durable one.
+#[tokio::test]
+async fn a_server_write_is_checked_against_the_tentative_head() {
+    use wheat_server::write::{LabelChange, ServerWrite, WriteFailure, write};
+    let server = server().await;
+    let label = |key: u8, expected: Option<ViewId>, new: Option<ViewId>| ServerWrite {
+        principal: Principal {
+            name: "gothab".into(),
+        },
+        key: [key; 16],
+        labels: vec![LabelChange {
+            name: "a".into(),
+            expected,
+            new: new.map(wheat_core::ViewLabel::from),
+        }],
+        force_labels: false,
+    };
+    let entry = Arc::clone(&server.entry);
+    let create =
+        tokio::spawn(async move { write(&entry, label(1, None, Some(server.greeting))).await });
+    // The first write's batch is being written; the label exists only in it.
+    server.gate.arrived.notified().await;
+    assert_eq!(server.heads.read().unwrap(), server.initial);
+    let refused = write(&server.entry, label(2, None, Some(server.base))).await;
+    assert!(
+        matches!(&refused, Err(WriteFailure::LabelMoved { labels, .. }) if labels == &[("a".to_owned(), Some(server.greeting))]),
+        "{refused:?}"
+    );
+    let entry = Arc::clone(&server.entry);
+    let greeting = server.greeting;
+    let delete = tokio::spawn(async move { write(&entry, label(3, Some(greeting), None)).await });
+    server.gate.permits.add_permits(2);
+    let created = create.await.unwrap().unwrap();
+    let deleted = delete.await.unwrap().unwrap();
+    assert_eq!(created.generation, server.initial.generation + 1);
+    assert_eq!(deleted.generation, server.initial.generation + 2);
+    let reader = RepositoryReader::new(&server.objects, &server.entry.network.content);
+    let envelope = reader.envelope(deleted.envelope).await.unwrap();
+    let labels = reader.view_label_manifest(envelope.labels).await.unwrap();
+    assert!(labels.labels.is_empty());
+}
+
 #[tokio::test]
 async fn a_failed_batch_fails_the_batch_joined_onto_it() {
     let server = server().await;

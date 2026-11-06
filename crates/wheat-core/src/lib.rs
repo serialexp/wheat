@@ -127,7 +127,7 @@ pub use store_records::{
     encode_ownership_manifest, encode_remote_config, encode_repository_head,
     encode_repository_location, encode_snapshot_manifest, encode_store_metadata,
     encode_workspace_metadata, encode_workspace_pin, publish_key_digest, publish_receipt_id,
-    publish_request_digest,
+    publish_request_digest, server_write_request_digest,
 };
 pub use verified_content::{ContentMismatch, VerifiedContent};
 pub use wire::{

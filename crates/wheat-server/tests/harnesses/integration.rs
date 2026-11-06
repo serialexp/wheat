@@ -32,5 +32,7 @@ mod publish_test;
 mod registry_test;
 #[path = "../s3_packed_test.rs"]
 mod s3_packed_test;
+#[path = "../server_write_test.rs"]
+mod server_write_test;
 #[path = "../tls_test.rs"]
 mod tls_test;

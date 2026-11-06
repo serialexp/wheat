@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-10-29
+Last updated: 2026-11-06
 
 ## Implementation status
 
@@ -122,6 +122,11 @@ top of them.
   handshake inside the session-setup deadline; without them it serves plain
   WebSockets for loopback or a proxy that ends TLS. See
   [Authentication](#connection-lifecycle) for how "TLS required" turned out.
+- [x] **Embedder-started label writes (2026-11-06, for Gothab's ref writes).**
+  `wheat_server::write::write`: label changes through the group commit, checked per
+  label against the head they join onto, idempotent by key (see
+  [Embedded in Gothab](#embedded-in-gothab)). Tests: `server_write_test.rs`,
+  `group_commit_test.rs`'s `a_server_write_is_checked_against_the_tentative_head`.
 
 ### Outstanding
 
@@ -142,6 +147,9 @@ top of them.
   per-repository `read` / `publish` / `force` access is checked before every
   operation, and a repository without access answers like a missing one.
   Publish gates are not started.)
+- [ ] **Embedder-started writes of new changes.** Server edits and merges: a builder
+  that stages new objects and content on a base head, joined onto the current head
+  as a publish is, a label moved on both sides refusing it as `LabelMoved`.
 - [ ] **Phase 2 — Gothab integration.** Let gothab-server (or gitd's successor)
   serve wheat repositories through the native protocol alongside Git projections,
   with one canonical store per repository. (2026-10-30: decided to serve them
@@ -1137,6 +1145,22 @@ closes a store no other open repository shares. Only then does it call
 deleter is `RepositoriesDirectory::delete`, retried while a network's store is still
 open. An opener with no deleter gets `DeleteError::Unsupported`, and its sessions
 are left alone.
+
+Gothab's own writes (ref updates from its web pages and API) go through
+`wheat_server::write::write` (2026-11-06), with no client session: a `ServerWrite` is
+a principal, the embedder's 16-byte idempotency key and label changes, each naming
+the view it expects (none: the label must not exist) and what the label becomes
+(none: delete). The write takes its turn in the repository's group commit like a
+publish and is built in that turn on the head it joins onto, the tentative one
+while a batch is being written, so each expected view is checked against exactly
+that head; a mismatch is `WriteFailure::LabelMoved` with each label's actual view.
+The new envelope keeps the head's state, is validated as a publish of it, and moves
+labels forward unless `force_labels`. Its receipt binds the key to a digest of the
+changes (`server_write_request_digest`: the expected and new labels as two label
+manifests), so the same write sent again gets its first answer and the same key
+for another write is refused. A quiesced network refuses it with its retry delay.
+Publish hooks are not told: the embedder tells its own listeners. Writes that add
+changes (server edits, merges) are to build on this.
 
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new

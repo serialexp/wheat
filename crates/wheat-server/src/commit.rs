@@ -21,7 +21,10 @@ use std::{
 
 use tokio::sync::{Mutex, oneshot};
 use tracing::{Instrument as _, debug_span, warn};
-use wheat_core::{PublishReceiptRecord, RepositoryEnvelopeId};
+use wheat_core::{
+    PublishReceiptRecord, RepositoryEnvelopeId, RepositoryEnvelopeRecord, ViewId,
+    ViewLabelManifestRecord,
+};
 use wheat_store::{
     Arrival, ImmutableObjectStore, MergeBudget, PendingPublications, PublicationError,
     RepositoryHead, RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
@@ -231,6 +234,133 @@ pub async fn accept<S: RepositoryStore + 'static>(
         announcement,
     );
     Ok(Accepted::waiting(receiver, false))
+}
+
+/// Why [`accept_labels`] did not accept a server write.
+pub(crate) enum LabelRefusal {
+    /// A label is not where the write expects it, on the head it would join onto:
+    /// each such label and the view it is at (none when it does not exist).
+    Moved {
+        head: RepositoryHead,
+        labels: Vec<(String, Option<ViewId>)>,
+    },
+    Failed(CommitFailure),
+}
+
+impl From<CommitFailure> for LabelRefusal {
+    fn from(failure: CommitFailure) -> Self {
+        Self::Failed(failure)
+    }
+}
+
+/// Accepts a server write of `changes` into the next batch: built in its turn on the
+/// head it joins onto (the tentative one while a batch is being written), so each
+/// change's `expected` is checked against exactly that head. The new envelope keeps
+/// that head's state and replaces its labels; it is validated as a publish of it,
+/// and each label must move forward unless `force_labels`. Answered as a publish sent
+/// again when its key was accepted before. Staged into `staged`.
+#[tracing::instrument(name = "server_write_accept", level = "debug", skip_all)]
+pub(crate) async fn accept_labels<S: RepositoryStore + 'static>(
+    entry: &Arc<RepositoryEntry>,
+    staged: &Arc<RepositoryStage<S>>,
+    key: PublishKey,
+    changes: Arc<Vec<crate::write::LabelChange>>,
+    force_labels: bool,
+) -> Result<Accepted, LabelRefusal> {
+    let mut turn = entry
+        .commit
+        .state
+        .lock()
+        .instrument(debug_span!("publish_commit_wait"))
+        .await;
+    let (durable, receipt) = read_receipt(entry, &key).await?;
+    if let Some(previous) = turn.previous(receipt.as_ref(), durable, &key) {
+        return Ok(previous?);
+    }
+    let current = turn.tentative.unwrap_or(durable.envelope);
+    let pending = turn.pending();
+    let stage = Arc::clone(staged);
+    let joined = crate::blocking::drive(move || async move {
+        build_labels(&pending, &stage, durable, current, &changes, force_labels).await
+    })
+    .await
+    .map_err(|e| CommitFailure::Internal(format!("server write: build and validate: {e}")))??;
+    let publication = staged.take().await.map_err(|e| {
+        CommitFailure::Internal(format!("server write: take the staged write: {e}"))
+    })?;
+    let receiver = turn.accept(entry, key, current, joined, false, publication, None);
+    Ok(Accepted::waiting(receiver, false))
+}
+
+/// `current` with `changes` made to its labels, staged into `staged` and validated as
+/// following `current`.
+async fn build_labels<S: RepositoryStore>(
+    pending: &PendingPublications,
+    staged: &RepositoryStage<S>,
+    durable: RepositoryHead,
+    current: RepositoryEnvelopeId,
+    changes: &[crate::write::LabelChange],
+    force_labels: bool,
+) -> Result<RepositoryEnvelopeId, LabelRefusal> {
+    let internal = |what: &str, e: &dyn std::fmt::Display| {
+        CommitFailure::Internal(format!("server write: {what}: {e}"))
+    };
+    let view = pending.over(staged);
+    let reader = RepositoryReader::new(&view, view.content());
+    let envelope = reader
+        .envelope(current)
+        .await
+        .map_err(|e| internal("read the current envelope", &e))?;
+    let mut labels = reader
+        .view_label_manifest(envelope.labels)
+        .await
+        .map_err(|e| internal("read the current labels", &e))?
+        .labels;
+    let moved: Vec<_> = changes
+        .iter()
+        .filter_map(|change| {
+            let actual = labels.get(&change.name).map(|label| label.view);
+            (actual != change.expected).then(|| (change.name.clone(), actual))
+        })
+        .collect();
+    if !moved.is_empty() {
+        return Err(LabelRefusal::Moved {
+            head: durable,
+            labels: moved,
+        });
+    }
+    for change in changes {
+        match &change.new {
+            Some(label) => labels.insert(change.name.clone(), label.clone()),
+            None => labels.remove(&change.name),
+        };
+    }
+    let manifest = ViewLabelManifestRecord::new(labels).map_err(|e| CommitFailure::Rejected {
+        head: durable,
+        message: format!("the labels are not valid: {e}"),
+    })?;
+    let proposed = RepositoryEnvelopeRecord {
+        state: envelope.state,
+        labels: manifest.id(),
+    };
+    for (id, bytes) in [
+        (manifest.id().into(), manifest.canonical_bytes()),
+        (proposed.id().into(), proposed.canonical_bytes()),
+    ] {
+        staged
+            .put_if_absent(id, &bytes)
+            .await
+            .map_err(|e| internal("stage the new envelope", &e))?;
+    }
+    let check = Check {
+        durable,
+        current,
+        expected: current,
+        proposed: proposed.id(),
+        force: false,
+        force_labels,
+    };
+    Ok(check.join(pending, staged).await?)
 }
 
 /// What [`accept`] joins and validates, against the head it read.

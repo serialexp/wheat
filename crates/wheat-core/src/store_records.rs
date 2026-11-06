@@ -467,6 +467,26 @@ pub fn publish_request_digest(
     )
 }
 
+/// What a server write (`wheat_server::write`) asks for: the labels it expects, the
+/// labels it writes, and whether it may move them backward. A label it expects absent
+/// is in neither manifest's `expected`, one it deletes in neither's `new`, so the two
+/// manifests, each a self-delimiting canonical encoding, say exactly which change was
+/// asked for.
+#[must_use]
+pub fn server_write_request_digest(
+    expected: &crate::ViewLabelManifestRecord,
+    new: &crate::ViewLabelManifestRecord,
+    force_labels: bool,
+) -> [u8; 16] {
+    let mut input = expected.canonical_bytes();
+    input.extend_from_slice(&new.canonical_bytes());
+    input.push(u8::from(force_labels));
+    digest16(
+        b"wheat-server-write-request-v1\0",
+        Ok::<_, std::convert::Infallible>(input),
+    )
+}
+
 /// The receipt ID of a publish, by its key and request digests, published in the
 /// head at `generation` with `envelope`.
 pub fn publish_receipt_id(
