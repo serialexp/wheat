@@ -16,8 +16,8 @@ use crate::{
     local::LocalRepository,
     stat_cache::{Observed, StatCache},
     workspace_files::{
-        FileStamp, SAMPLE_BYTES, SAMPLE_COUNT, SAMPLED_FILE_BYTES, WorkspaceStats,
-        absent_where_shape_changed, analyze_workspace_file, sample_workspace_file,
+        FileStamp, SAMPLED_FILE_BYTES, WorkspaceStats, absent_where_shape_changed,
+        analyze_workspace_file, sample_workspace_file,
     },
     workspace_metadata::WorkspaceMetadata,
 };
@@ -32,10 +32,10 @@ pub enum ContentIds {
 }
 
 /// Status reads a file of any length the format stores; `.wheat.json`'s limit is for
-/// capture.
+/// capture. Nothing caps the bytes a scan reads in all: it streams each file, so what
+/// it holds does not grow with them, and a large workspace's first scan reads it all.
 const MAX_WORKSPACE_FILE_BYTES: usize = crate::repository_config::FORMAT_MAX_FILE_BYTES;
 const MAX_BASELINE_INSPECTION_BYTES: usize = 1024 * 1024;
-const MAX_TOTAL_READ_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct WorkspaceScan {
@@ -168,7 +168,6 @@ pub fn scan_locked(
         Ok::<_, anyhow::Error>((current_label_binding, files))
     })?;
 
-    let mut read_budget = ScanReadBudget::new(MAX_TOTAL_READ_BYTES);
     let mut cache = StatCache::open(workspace_root)?;
     let mut reads = ScanReads::default();
     let mut changes = Vec::new();
@@ -197,7 +196,7 @@ pub fn scan_locked(
                 // diff needs its text.
                 if max_inline_text_bytes == 0 {
                     let (baseline, baseline_bytes) =
-                        read_baseline(repository, file.value, &mut read_budget, &mut reads)?;
+                        read_baseline(repository, file.value, &mut reads)?;
                     changes.push(ScannedChange {
                         path: file.path,
                         content_changed: cached.content != file.value.content,
@@ -223,12 +222,10 @@ pub fn scan_locked(
                     &cached_stamp,
                     &cached,
                     file.value,
-                    &mut read_budget,
                     &mut reads,
                 )?
             {
-                let (baseline, baseline_bytes) =
-                    read_baseline(repository, file.value, &mut read_budget, &mut reads)?;
+                let (baseline, baseline_bytes) = read_baseline(repository, file.value, &mut reads)?;
                 changes.push(ScannedChange {
                     path: file.path,
                     content_changed: true,
@@ -242,13 +239,11 @@ pub fn scan_locked(
                 continue;
             }
         }
-        let (baseline, baseline_bytes) =
-            read_baseline(repository, file.value, &mut read_budget, &mut reads)?;
-        let workspace_limit = read_budget.next_limit(MAX_WORKSPACE_FILE_BYTES)?;
+        let (baseline, baseline_bytes) = read_baseline(repository, file.value, &mut reads)?;
         let observed = absent_where_shape_changed(analyze_workspace_file(
             workspace_root,
             Path::new(&file.path),
-            workspace_limit,
+            MAX_WORKSPACE_FILE_BYTES,
             max_inline_text_bytes,
         ))
         .with_context(|| format!("inspect tracked workspace path {}", file.path))?;
@@ -266,7 +261,6 @@ pub fn scan_locked(
             });
             continue;
         };
-        read_budget.charge(observed.read_bytes)?;
         reads.files_read += 1;
         reads.bytes_read += observed.read_bytes as u64;
         if let Some(stamp) = observed.stamp {
@@ -360,32 +354,6 @@ fn needs_current_envelope_validation(
         == EnvelopeValidationPlan::PinnedAndCurrent
 }
 
-struct ScanReadBudget {
-    remaining: usize,
-}
-
-impl ScanReadBudget {
-    fn new(limit: usize) -> Self {
-        Self { remaining: limit }
-    }
-
-    fn next_limit(&self, per_file_limit: usize) -> Result<usize> {
-        anyhow::ensure!(
-            self.remaining != 0,
-            "tracked workspace scan exhausted its aggregate byte limit"
-        );
-        Ok(self.remaining.min(per_file_limit))
-    }
-
-    fn charge(&mut self, bytes: usize) -> Result<()> {
-        self.remaining = self
-            .remaining
-            .checked_sub(bytes)
-            .context("tracked workspace scan exceeded its aggregate byte limit")?;
-        Ok(())
-    }
-}
-
 /// Whether what the stat cache recorded is the baseline.
 fn is_unchanged(cached: &Observed, baseline: FileValue) -> bool {
     cached.kind == baseline.kind && cached.content == baseline.content
@@ -401,7 +369,6 @@ fn samples_differ(
     cached_stamp: &FileStamp,
     cached: &Observed,
     baseline: FileValue,
-    budget: &mut ScanReadBudget,
     reads: &mut ScanReads,
 ) -> Result<bool> {
     let Some(samples) = cached.samples else {
@@ -418,7 +385,6 @@ fn samples_differ(
     if stamp.size != cached_stamp.size {
         return Ok(true);
     }
-    budget.charge(SAMPLE_COUNT as usize * SAMPLE_BYTES)?;
     reads.files_sampled += 1;
     let now = sample_workspace_file(root, path, stamp)
         .with_context(|| format!("sample tracked workspace path {}", path.display()))?;
@@ -430,16 +396,14 @@ fn samples_differ(
 fn read_baseline(
     repository: &LocalRepository,
     value: FileValue,
-    budget: &mut ScanReadBudget,
     reads: &mut ScanReads,
 ) -> Result<(DiffDescriptor, Option<Vec<u8>>)> {
-    let limit = budget.next_limit(MAX_BASELINE_INSPECTION_BYTES)?;
     reads.baselines_read += 1;
-    match repository.content.get_bounded(value.content, limit) {
-        Ok(bytes) => {
-            budget.charge(bytes.len())?;
-            Ok((descriptor(value.kind, value.content, &bytes), Some(bytes)))
-        }
+    match repository
+        .content
+        .get_bounded(value.content, MAX_BASELINE_INSPECTION_BYTES)
+    {
+        Ok(bytes) => Ok((descriptor(value.kind, value.content, &bytes), Some(bytes))),
         Err(ContentStoreError::TooLarge { minimum, .. }) => Ok((
             DiffDescriptor {
                 kind: value.kind,
@@ -494,17 +458,6 @@ pub fn ensure_workspace_clean_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aggregate_remaining_is_the_bound_for_each_next_side() {
-        let mut budget = ScanReadBudget::new(10);
-        assert_eq!(budget.next_limit(6).unwrap(), 6);
-        budget.charge(6).unwrap();
-        assert_eq!(budget.next_limit(6).unwrap(), 4);
-        budget.charge(4).unwrap();
-        assert!(budget.next_limit(6).is_err());
-        assert!(budget.charge(1).is_err());
-    }
 
     #[test]
     fn identical_envelopes_skip_the_second_full_validation() {

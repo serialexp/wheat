@@ -2,13 +2,15 @@
 //! workspace's stat cache.
 //!
 //! The workspace's one change adds [`DIRECTORIES`] directories of small files and a
-//! long file of noise, every file written an hour ago so the cache may keep it. The
+//! long file of noise (1.25 GiB at full scale), every file written an hour ago so the
+//! cache may keep it. The
 //! first status reads every file and records it. With nothing changed, a status reads
 //! no file and no baseline. With ten small files edited, it reads those ten. With a
 //! byte of the long file changed at one of its samples, human status (which does not
 //! need content IDs) reads the samples and not the file; JSON status reads it whole.
 //! Counts come from the scan itself, with status run in this process. They are checked
-//! at every scale; at full scale the contract also holds the warm status to a budget.
+//! at every scale; at full scale the contract also holds the warm status to a time
+//! budget and the case's peak to one far below the long file.
 
 use std::{
     fs,
@@ -34,10 +36,14 @@ const MIB: usize = 1024 * 1024;
 /// Budget for a status with nothing changed: no file read, so a few stats and a
 /// cache lookup per file.
 const WARM_BUDGET_SECONDS: f64 = 1.0;
+/// Budget for the case's peak: status streams each file, so neither the long file
+/// nor the bytes read in all show in it. 102 MiB at 1.25 GiB (2026-11-06).
+const PEAK_BUDGET_BYTES: f64 = 192.0 * MIB as f64;
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let files = context.scale.pick(20_000, 300);
-    let long_mib = context.scale.pick(256, 20);
+    // Over 1 GiB at full scale: status once refused a file that long.
+    let long_mib = context.scale.pick(1280, 20);
     let mut recorder = Recorder::new(NAME);
     recorder.parameter("files", files);
     recorder.parameter("long_mib", long_mib);
@@ -127,6 +133,7 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     recorder.at_most("warm.files_read", 0.0, "count");
     recorder.at_most("warm.baselines_read", 0.0, "count");
     recorder.at_most("warm.wall", WARM_BUDGET_SECONDS, "s");
+    recorder.at_most("total.peak_rss", PEAK_BUDGET_BYTES, "bytes");
     recorder.at_most("edited.files_read", 10.0, "count");
     recorder.at_most("long_sampled.files_read", 0.0, "count");
     recorder.at_most("long_sampled.files_sampled", 1.0, "count");

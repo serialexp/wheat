@@ -307,6 +307,10 @@ Finished items, moved here from `TODO.md` under the same headings.
   only files whose stat changed, and a long binary file's samples show it modified
   without reading it whole (`docs/design/wheat-large-content.md`). The 1 GiB aggregate
   read cap is still there; see TODO.
+- `[x]` **Status refuses a tracked file over 1 GiB, and a cold cache over 1 GiB in
+  all (2026-11-06).** Done 2026-11-06 (Bart: status should work on files above
+  1 GiB): the scan's 1 GiB total read cap is gone, so a file is limited only by the
+  format's 1 TiB. Bench `status_scale` holds a 1.25 GiB file at full scale.
 - `[x]` **`existing_ids` lists the whole S3 bucket even for a few IDs (scanner
   only, 2026-10-05).** `ContentStore::existing_ids` listed every blob whenever the
   backend could list. A blob store now checks the IDs with concurrent header reads,

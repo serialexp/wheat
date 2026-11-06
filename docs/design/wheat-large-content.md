@@ -184,6 +184,13 @@ land and move them from Outstanding to Done.
   ten read, and a changed sample of the long file is found by reading its samples
   alone. Found on the way: each stat opened every directory above the file, and the
   untracked walk stat'd every entry for its type; both now cost no extra syscall.
+- [x] **Status on files over 1 GiB (2026-11-06).** Status still charged every read to
+  a 1 GiB total and gave each file what was left as its limit, so a file over 1 GiB
+  failed status, as did a first status over 1 GiB in all. Bart: status should work
+  on files above 1 GiB. The cap is gone: status streams each file, so a file is
+  limited only by the format's 1 TiB. `status_scale` now has a 1.25 GiB file at full
+  scale: the first status reads 1.43 GB in 0.80 s, hashing the long file in full
+  takes 0.37 s, and the case peaks at 101 MiB (budget 192 MiB).
 
 ### Outstanding
 
