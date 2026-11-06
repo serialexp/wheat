@@ -13,6 +13,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::{BinSchemaError, Result};
+
 /// Dynamic field value for parent context.
 /// Used to pass parent field values down to nested struct encoders.
 #[derive(Debug, Clone)]
@@ -351,6 +353,11 @@ pub struct EncodeContext {
     /// Used to compute absolute offsets for compression dictionary entries.
     /// Each nested encoder accumulates the parent's base_offset + the parent's current position.
     base_offset: usize,
+
+    /// True when the encode only measures the value (its size, or the offsets of what
+    /// precedes it) and its bytes are discarded. Selector lookups that cannot resolve yet
+    /// then yield a placeholder instead of an error; see `corresponding_position`.
+    measuring: bool,
 }
 
 impl EncodeContext {
@@ -364,7 +371,30 @@ impl EncodeContext {
             current_array: None,
             compression_dict: None,
             base_offset: 0,
+            measuring: false,
         }
+    }
+
+    /// Create an empty context for a measuring encode (see `measuring`).
+    pub fn measuring() -> Self {
+        Self {
+            measuring: true,
+            ..Self::new()
+        }
+    }
+
+    /// A copy of this context for a measuring encode. Parents, positions and the
+    /// compression dictionary are kept, so the measured size matches the real encode.
+    pub fn as_measuring(&self) -> Self {
+        Self {
+            measuring: true,
+            ..self.clone()
+        }
+    }
+
+    /// Whether this encode only measures; see the `measuring` field.
+    pub fn is_measuring(&self) -> bool {
+        self.measuring
     }
 
     /// Create a new context with an additional parent added.
@@ -381,6 +411,7 @@ impl EncodeContext {
             current_array: self.current_array.clone(),
             compression_dict: self.compression_dict.clone(),
             base_offset: self.base_offset,
+            measuring: self.measuring,
         }
     }
 
@@ -442,6 +473,36 @@ impl EncodeContext {
     /// Get the Nth tracked position for a key
     pub fn get_position(&self, key: &str, index: usize) -> Option<usize> {
         self.positions.get(key).and_then(|v| v.get(index).copied())
+    }
+
+    /// Placeholder offset written while a position is not known yet.
+    pub const UNRESOLVED_POSITION: usize = 0xFFFF_FFFF;
+
+    /// Position of the `index`th occurrence for a corresponding<Type> selector.
+    ///
+    /// Errors when no such occurrence was tracked: the value is encoded outside an array
+    /// holding that type, or `index` is past the last occurrence. While measuring, positions
+    /// are not tracked yet, so an unresolved lookup yields `UNRESOLVED_POSITION`; the offset
+    /// has a fixed width, so the measured size does not depend on it.
+    pub fn corresponding_position(&self, key: &str, index: usize) -> Result<usize> {
+        if let Some(position) = self.get_position(key, index) {
+            return Ok(position);
+        }
+        if self.measuring {
+            return Ok(Self::UNRESOLVED_POSITION);
+        }
+        match self.positions.get(key) {
+            None => Err(BinSchemaError::ContextMissing(format!(
+                "corresponding<T> selector '{}' found no occurrence: encoded outside an array context, or the array has none of that type",
+                key
+            ))),
+            Some(tracked) => Err(BinSchemaError::InvalidValue(format!(
+                "corresponding<T> selector '{}': index {} out of bounds (only {} occurrences)",
+                key,
+                index,
+                tracked.len()
+            ))),
+        }
     }
 
     // === Array iteration tracking for corresponding<Type> ===
@@ -523,6 +584,7 @@ impl EncodeContext {
             current_array: self.current_array.clone(),
             compression_dict: self.compression_dict.clone(),
             base_offset: offset,
+            measuring: self.measuring,
         }
     }
 }
@@ -614,6 +676,64 @@ mod tests {
         assert_eq!(
             FieldValue::String("AB".to_string()).to_bytes(),
             vec![0x41, 0x42]
+        );
+    }
+
+    #[test]
+    fn test_corresponding_position_resolves_tracked_occurrence() {
+        let mut ctx = EncodeContext::new();
+        ctx.track_position("blocks_Data", 7);
+        ctx.track_position("blocks_Data", 19);
+        assert_eq!(ctx.corresponding_position("blocks_Data", 0).unwrap(), 7);
+        assert_eq!(ctx.corresponding_position("blocks_Data", 1).unwrap(), 19);
+    }
+
+    #[test]
+    fn test_corresponding_position_errors_without_array_context() {
+        let ctx = EncodeContext::new();
+        match ctx.corresponding_position("blocks_Data", 0) {
+            Err(BinSchemaError::ContextMissing(_)) => {}
+            other => panic!("expected ContextMissing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_corresponding_position_errors_past_last_occurrence() {
+        let mut ctx = EncodeContext::new();
+        ctx.track_position("blocks_Data", 7);
+        match ctx.corresponding_position("blocks_Data", 1) {
+            Err(BinSchemaError::InvalidValue(msg)) => assert!(msg.contains("out of bounds")),
+            other => panic!("expected InvalidValue out of bounds, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_corresponding_position_measuring_yields_placeholder() {
+        let ctx = EncodeContext::measuring();
+        assert!(ctx.is_measuring());
+        assert_eq!(
+            ctx.corresponding_position("blocks_Data", 0).unwrap(),
+            EncodeContext::UNRESOLVED_POSITION
+        );
+    }
+
+    #[test]
+    fn test_measuring_flag_survives_derived_contexts() {
+        let ctx = EncodeContext::measuring();
+        assert!(ctx.extend_with_parent(HashMap::new()).is_measuring());
+        assert!(ctx.with_base_offset(4).is_measuring());
+        assert!(EncodeContext::new().as_measuring().is_measuring());
+        assert!(!EncodeContext::new().is_measuring());
+    }
+
+    #[test]
+    fn test_as_measuring_keeps_tracked_positions() {
+        let mut ctx = EncodeContext::new();
+        ctx.track_position("blocks_Data", 7);
+        let measuring = ctx.as_measuring();
+        assert_eq!(
+            measuring.corresponding_position("blocks_Data", 0).unwrap(),
+            7
         );
     }
 }

@@ -38,6 +38,10 @@ pub enum WheatObject {
 }
 
 impl WheatObject {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -496,6 +500,10 @@ pub struct Uuid128 {
 }
 
 impl Uuid128 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -526,6 +534,10 @@ pub struct Digest256 {
 }
 
 impl Digest256 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -556,6 +568,10 @@ pub struct ContentId {
 }
 
 impl ContentId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -584,6 +600,10 @@ pub struct ChangeId {
 }
 
 impl ChangeId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -612,6 +632,10 @@ pub struct RevisionId {
 }
 
 impl RevisionId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -640,6 +664,10 @@ pub struct EditId {
 }
 
 impl EditId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -668,6 +696,10 @@ pub struct TreeId {
 }
 
 impl TreeId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -696,6 +728,10 @@ pub struct ChangeObjectId {
 }
 
 impl ChangeObjectId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -724,6 +760,10 @@ pub struct ApplicationId {
 }
 
 impl ApplicationId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -752,6 +792,10 @@ pub struct ConflictId {
 }
 
 impl ConflictId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -780,6 +824,10 @@ pub struct ViewId {
 }
 
 impl ViewId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -808,6 +856,10 @@ pub struct ContentMapId {
 }
 
 impl ContentMapId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -836,6 +888,10 @@ pub struct RevisionMapId {
 }
 
 impl RevisionMapId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -864,6 +920,10 @@ pub struct ChangeMapId {
 }
 
 impl ChangeMapId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -892,6 +952,10 @@ pub struct ApplicationMapId {
 }
 
 impl ApplicationMapId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -920,6 +984,10 @@ pub struct ConflictSetId {
 }
 
 impl ConflictSetId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -948,6 +1016,10 @@ pub struct ContentSetId {
 }
 
 impl ContentSetId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -976,6 +1048,10 @@ pub struct RetainedSetId {
 }
 
 impl RetainedSetId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1004,6 +1080,10 @@ pub struct ProjectedCommitSetId {
 }
 
 impl ProjectedCommitSetId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1032,6 +1112,10 @@ pub struct ChangeSetId {
 }
 
 impl ChangeSetId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1060,6 +1144,10 @@ pub struct ViewLineageMapId {
 }
 
 impl ViewLineageMapId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1088,6 +1176,10 @@ pub struct RepositoryStateId {
 }
 
 impl RepositoryStateId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1116,6 +1208,10 @@ pub struct ViewLabelManifestId {
 }
 
 impl ViewLabelManifestId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1144,6 +1240,10 @@ pub struct DirectoryChunkId {
 }
 
 impl DirectoryChunkId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1172,6 +1272,10 @@ pub struct HistoryMapId {
 }
 
 impl HistoryMapId {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1208,6 +1312,10 @@ pub struct TreeV1Output {
 pub type TreeV1 = TreeV1Output;
 
 impl TreeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1246,6 +1354,10 @@ impl TreeV1Output {
         }
         Ok(Self { wire_tag, entries })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        TreeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         TreeV1Input::from(self.clone()).encode()
     }
@@ -1276,6 +1388,10 @@ pub struct DirectoryEntryV1 {
 }
 
 impl DirectoryEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1314,6 +1430,10 @@ pub enum DirectoryEntryValueV1 {
 }
 
 impl DirectoryEntryValueV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1365,6 +1485,10 @@ pub struct FileKindV1 {
 }
 
 impl FileKindV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1394,6 +1518,10 @@ pub struct FileValueV1 {
 }
 
 impl FileValueV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1432,6 +1560,10 @@ pub struct FileEntryV1Output {
 pub type FileEntryV1 = FileEntryV1Output;
 
 impl FileEntryV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1462,6 +1594,10 @@ impl FileEntryV1Output {
         let value = FileValueV1::decode_with_decoder(decoder)?;
         Ok(Self { entry_kind, value })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        FileEntryV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         FileEntryV1Input::from(self.clone()).encode()
     }
@@ -1499,6 +1635,10 @@ pub struct DirectoryEntryRefV1Output {
 pub type DirectoryEntryRefV1 = DirectoryEntryRefV1Output;
 
 impl DirectoryEntryRefV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1532,6 +1672,10 @@ impl DirectoryEntryRefV1Output {
             directory,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        DirectoryEntryRefV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         DirectoryEntryRefV1Input::from(self.clone()).encode()
     }
@@ -1573,6 +1717,10 @@ pub struct ChunkedTreeV1Output {
 pub type ChunkedTreeV1 = ChunkedTreeV1Output;
 
 impl ChunkedTreeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1609,6 +1757,10 @@ impl ChunkedTreeV1Output {
             root,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ChunkedTreeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ChunkedTreeV1Input::from(self.clone()).encode()
     }
@@ -1654,6 +1806,10 @@ pub struct DirectoryChunkNodeV1Output {
 pub type DirectoryChunkNodeV1 = DirectoryChunkNodeV1Output;
 
 impl DirectoryChunkNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1713,6 +1869,10 @@ impl DirectoryChunkNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        DirectoryChunkNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         DirectoryChunkNodeV1Input::from(self.clone()).encode()
     }
@@ -1749,6 +1909,10 @@ pub struct DirectoryChunkChildV1 {
 }
 
 impl DirectoryChunkChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1780,6 +1944,10 @@ pub struct DirectoryChunkEntryV1 {
 }
 
 impl DirectoryChunkEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1815,6 +1983,10 @@ pub struct ActorV1 {
 }
 
 impl ActorV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1860,6 +2032,10 @@ pub struct TimestampV1 {
 }
 
 impl TimestampV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1895,6 +2071,10 @@ pub struct SourceProvenanceV1 {
 }
 
 impl SourceProvenanceV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1950,6 +2130,10 @@ pub struct SourceObjectIdV1 {
 }
 
 impl SourceObjectIdV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1986,6 +2170,10 @@ pub struct ChangeMetadataV1 {
 }
 
 impl ChangeMetadataV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2057,6 +2245,10 @@ pub struct RevisionMetadataV1 {
 }
 
 impl RevisionMetadataV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2129,6 +2321,10 @@ pub struct ChangeV1Output {
 pub type ChangeV1 = ChangeV1Output;
 
 impl ChangeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2165,6 +2361,10 @@ impl ChangeV1Output {
             metadata,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ChangeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ChangeV1Input::from(self.clone()).encode()
     }
@@ -2224,6 +2424,10 @@ pub struct RevisionV1Output {
 pub type RevisionV1 = RevisionV1Output;
 
 impl RevisionV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2316,6 +2520,10 @@ impl RevisionV1Output {
             resulting_tree,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RevisionV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RevisionV1Input::from(self.clone()).encode()
     }
@@ -2369,6 +2577,10 @@ pub struct EditTransitionV1 {
 }
 
 impl EditTransitionV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2452,6 +2664,10 @@ pub struct EditSubsumptionV1 {
 }
 
 impl EditSubsumptionV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2495,6 +2711,10 @@ pub struct ConflictResolutionEvidenceV1 {
 }
 
 impl ConflictResolutionEvidenceV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2569,6 +2789,10 @@ pub struct ApplicationV1Output {
 pub type ApplicationV1 = ApplicationV1Output;
 
 impl ApplicationV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2655,6 +2879,10 @@ impl ApplicationV1Output {
             applied,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ApplicationV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ApplicationV1Input::from(self.clone()).encode()
     }
@@ -2701,6 +2929,10 @@ pub enum ApplicationResultV1 {
 }
 
 impl ApplicationResultV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2761,6 +2993,10 @@ pub struct CleanApplicationV1Output {
 pub type CleanApplicationV1 = CleanApplicationV1Output;
 
 impl CleanApplicationV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2794,6 +3030,10 @@ impl CleanApplicationV1Output {
             resulting_tree,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        CleanApplicationV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         CleanApplicationV1Input::from(self.clone()).encode()
     }
@@ -2835,6 +3075,10 @@ pub struct ConflictedApplicationV1Output {
 pub type ConflictedApplicationV1 = ConflictedApplicationV1Output;
 
 impl ConflictedApplicationV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2871,6 +3115,10 @@ impl ConflictedApplicationV1Output {
             conflict,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ConflictedApplicationV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ConflictedApplicationV1Input::from(self.clone()).encode()
     }
@@ -2914,6 +3162,10 @@ pub struct ConflictV1Output {
 pub type ConflictV1 = ConflictV1Output;
 
 impl ConflictV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -2958,6 +3210,10 @@ impl ConflictV1Output {
             edits,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ConflictV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ConflictV1Input::from(self.clone()).encode()
     }
@@ -2992,6 +3248,10 @@ pub struct ByteRangeV1 {
 }
 
 impl ByteRangeV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3023,6 +3283,10 @@ pub struct AppliedEditEntryV1 {
 }
 
 impl AppliedEditEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3055,6 +3319,10 @@ pub struct AppliedEditEvidenceV1 {
 }
 
 impl AppliedEditEvidenceV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3116,6 +3384,10 @@ pub struct FailedEditEntryV1 {
 }
 
 impl FailedEditEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3147,6 +3419,10 @@ pub struct FailedEditEvidenceV1 {
 }
 
 impl FailedEditEvidenceV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3189,6 +3465,10 @@ pub enum EditFailureV1 {
 }
 
 impl EditFailureV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3268,6 +3548,10 @@ pub struct NoMatchFailureV1Output {
 pub type NoMatchFailureV1 = NoMatchFailureV1Output;
 
 impl NoMatchFailureV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3296,6 +3580,10 @@ impl NoMatchFailureV1Output {
         }
         Ok(Self { failure_kind })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        NoMatchFailureV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         NoMatchFailureV1Input::from(self.clone()).encode()
     }
@@ -3327,6 +3615,10 @@ pub struct AmbiguousFailureV1Output {
 pub type AmbiguousFailureV1 = AmbiguousFailureV1Output;
 
 impl AmbiguousFailureV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3355,6 +3647,10 @@ impl AmbiguousFailureV1Output {
         }
         Ok(Self { failure_kind })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        AmbiguousFailureV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         AmbiguousFailureV1Input::from(self.clone()).encode()
     }
@@ -3389,6 +3685,10 @@ pub struct InterferenceFailureV1Output {
 pub type InterferenceFailureV1 = InterferenceFailureV1Output;
 
 impl InterferenceFailureV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3427,6 +3727,10 @@ impl InterferenceFailureV1Output {
         }
         Ok(Self { failure_kind, with })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        InterferenceFailureV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         InterferenceFailureV1Input::from(self.clone()).encode()
     }
@@ -3461,6 +3765,10 @@ pub struct KindMismatchFailureV1Output {
 pub type KindMismatchFailureV1 = KindMismatchFailureV1Output;
 
 impl KindMismatchFailureV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3489,6 +3797,10 @@ impl KindMismatchFailureV1Output {
         }
         Ok(Self { failure_kind })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        KindMismatchFailureV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         KindMismatchFailureV1Input::from(self.clone()).encode()
     }
@@ -3520,6 +3832,10 @@ pub struct ExpectedFileMismatchFailureV1Output {
 pub type ExpectedFileMismatchFailureV1 = ExpectedFileMismatchFailureV1Output;
 
 impl ExpectedFileMismatchFailureV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3548,6 +3864,10 @@ impl ExpectedFileMismatchFailureV1Output {
         }
         Ok(Self { failure_kind })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ExpectedFileMismatchFailureV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ExpectedFileMismatchFailureV1Input::from(self.clone()).encode()
     }
@@ -3600,6 +3920,10 @@ pub struct ViewV1Output {
 pub type ViewV1 = ViewV1Output;
 
 impl ViewV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3668,6 +3992,10 @@ impl ViewV1Output {
             weight,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ViewV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ViewV1Input::from(self.clone()).encode()
     }
@@ -3731,6 +4059,10 @@ pub struct ContentMapNodeV1Output {
 pub type ContentMapNodeV1 = ContentMapNodeV1Output;
 
 impl ContentMapNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3801,6 +4133,10 @@ impl ContentMapNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentMapNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentMapNodeV1Input::from(self.clone()).encode()
     }
@@ -3839,6 +4175,10 @@ pub struct ContentMapChildV1 {
 }
 
 impl ContentMapChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3870,6 +4210,10 @@ pub struct ContentMapEntryV1 {
 }
 
 impl ContentMapEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3918,6 +4262,10 @@ pub struct RevisionMapNodeV1Output {
 pub type RevisionMapNodeV1 = RevisionMapNodeV1Output;
 
 impl RevisionMapNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -3988,6 +4336,10 @@ impl RevisionMapNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RevisionMapNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RevisionMapNodeV1Input::from(self.clone()).encode()
     }
@@ -4026,6 +4378,10 @@ pub struct RevisionMapChildV1 {
 }
 
 impl RevisionMapChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4057,6 +4413,10 @@ pub struct RevisionMapEntryV1 {
 }
 
 impl RevisionMapEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4105,6 +4465,10 @@ pub struct ChangeMapNodeV1Output {
 pub type ChangeMapNodeV1 = ChangeMapNodeV1Output;
 
 impl ChangeMapNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4175,6 +4539,10 @@ impl ChangeMapNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ChangeMapNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ChangeMapNodeV1Input::from(self.clone()).encode()
     }
@@ -4213,6 +4581,10 @@ pub struct ChangeMapChildV1 {
 }
 
 impl ChangeMapChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4244,6 +4616,10 @@ pub struct ChangeMapEntryV1 {
 }
 
 impl ChangeMapEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4292,6 +4668,10 @@ pub struct ApplicationMapNodeV1Output {
 pub type ApplicationMapNodeV1 = ApplicationMapNodeV1Output;
 
 impl ApplicationMapNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4362,6 +4742,10 @@ impl ApplicationMapNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ApplicationMapNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ApplicationMapNodeV1Input::from(self.clone()).encode()
     }
@@ -4400,6 +4784,10 @@ pub struct ApplicationMapChildV1 {
 }
 
 impl ApplicationMapChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4431,6 +4819,10 @@ pub struct ApplicationMapEntryV1 {
 }
 
 impl ApplicationMapEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4479,6 +4871,10 @@ pub struct ViewLineageMapNodeV1Output {
 pub type ViewLineageMapNodeV1 = ViewLineageMapNodeV1Output;
 
 impl ViewLineageMapNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4549,6 +4945,10 @@ impl ViewLineageMapNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ViewLineageMapNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ViewLineageMapNodeV1Input::from(self.clone()).encode()
     }
@@ -4587,6 +4987,10 @@ pub struct ViewLineageMapChildV1 {
 }
 
 impl ViewLineageMapChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4618,6 +5022,10 @@ pub struct ViewLineageMapEntryV1 {
 }
 
 impl ViewLineageMapEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4666,6 +5074,10 @@ pub struct ConflictSetNodeV1Output {
 pub type ConflictSetNodeV1 = ConflictSetNodeV1Output;
 
 impl ConflictSetNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4728,6 +5140,10 @@ impl ConflictSetNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ConflictSetNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ConflictSetNodeV1Input::from(self.clone()).encode()
     }
@@ -4766,6 +5182,10 @@ pub struct ConflictSetChildV1 {
 }
 
 impl ConflictSetChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4810,6 +5230,10 @@ pub struct ContentSetNodeV1Output {
 pub type ContentSetNodeV1 = ContentSetNodeV1Output;
 
 impl ContentSetNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4872,6 +5296,10 @@ impl ContentSetNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentSetNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentSetNodeV1Input::from(self.clone()).encode()
     }
@@ -4910,6 +5338,10 @@ pub struct ContentSetChildV1 {
 }
 
 impl ContentSetChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -4954,6 +5386,10 @@ pub struct RetainedSetNodeV1Output {
 pub type RetainedSetNodeV1 = RetainedSetNodeV1Output;
 
 impl RetainedSetNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5016,6 +5452,10 @@ impl RetainedSetNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RetainedSetNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RetainedSetNodeV1Input::from(self.clone()).encode()
     }
@@ -5054,6 +5494,10 @@ pub struct RetainedSetChildV1 {
 }
 
 impl RetainedSetChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5098,6 +5542,10 @@ pub struct ProjectedCommitSetNodeV1Output {
 pub type ProjectedCommitSetNodeV1 = ProjectedCommitSetNodeV1Output;
 
 impl ProjectedCommitSetNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5160,6 +5608,10 @@ impl ProjectedCommitSetNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ProjectedCommitSetNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ProjectedCommitSetNodeV1Input::from(self.clone()).encode()
     }
@@ -5198,6 +5650,10 @@ pub struct ProjectedCommitSetChildV1 {
 }
 
 impl ProjectedCommitSetChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5242,6 +5698,10 @@ pub struct ChangeSetNodeV1Output {
 pub type ChangeSetNodeV1 = ChangeSetNodeV1Output;
 
 impl ChangeSetNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5304,6 +5764,10 @@ impl ChangeSetNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ChangeSetNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ChangeSetNodeV1Input::from(self.clone()).encode()
     }
@@ -5342,6 +5806,10 @@ pub struct ChangeSetChildV1 {
 }
 
 impl ChangeSetChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5386,6 +5854,10 @@ pub struct HistoryMapNodeV1Output {
 pub type HistoryMapNodeV1 = HistoryMapNodeV1Output;
 
 impl HistoryMapNodeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5456,6 +5928,10 @@ impl HistoryMapNodeV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        HistoryMapNodeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         HistoryMapNodeV1Input::from(self.clone()).encode()
     }
@@ -5494,6 +5970,10 @@ pub struct HistoryMapChildV1 {
 }
 
 impl HistoryMapChildV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5525,6 +6005,10 @@ pub struct HistoryKeyV1 {
 }
 
 impl HistoryKeyV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5555,6 +6039,10 @@ pub struct SetEntryV1 {
 }
 
 impl SetEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5611,6 +6099,10 @@ pub struct RepositoryStateV1Output {
 pub type RepositoryStateV1 = RepositoryStateV1Output;
 
 impl RepositoryStateV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5668,6 +6160,10 @@ impl RepositoryStateV1Output {
             projected_commits,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RepositoryStateV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RepositoryStateV1Input::from(self.clone()).encode()
     }
@@ -5723,6 +6219,10 @@ pub struct ViewLabelManifestV1Output {
 pub type ViewLabelManifestV1 = ViewLabelManifestV1Output;
 
 impl ViewLabelManifestV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5761,6 +6261,10 @@ impl ViewLabelManifestV1Output {
         }
         Ok(Self { wire_tag, labels })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ViewLabelManifestV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ViewLabelManifestV1Input::from(self.clone()).encode()
     }
@@ -5793,6 +6297,10 @@ pub struct ViewLabelManifestEntryV1 {
 }
 
 impl ViewLabelManifestEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5865,6 +6373,10 @@ pub struct LabelAnnotationV1 {
 }
 
 impl LabelAnnotationV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5918,6 +6430,10 @@ pub struct RepositoryEnvelopeV1Output {
 pub type RepositoryEnvelopeV1 = RepositoryEnvelopeV1Output;
 
 impl RepositoryEnvelopeV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -5954,6 +6470,10 @@ impl RepositoryEnvelopeV1Output {
             labels,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RepositoryEnvelopeV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RepositoryEnvelopeV1Input::from(self.clone()).encode()
     }
@@ -5997,6 +6517,10 @@ pub struct EditV1Output {
 pub type EditV1 = EditV1Output;
 
 impl EditV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6040,6 +6564,10 @@ impl EditV1Output {
             operation,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        EditV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         EditV1Input::from(self.clone()).encode()
     }
@@ -6074,6 +6602,10 @@ pub enum EditOperationV1 {
 }
 
 impl EditOperationV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6158,6 +6690,10 @@ pub struct GuardedTextEditV1Output {
 pub type GuardedTextEditV1 = GuardedTextEditV1Output;
 
 impl GuardedTextEditV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6209,6 +6745,10 @@ impl GuardedTextEditV1Output {
             end_anchor,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        GuardedTextEditV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         GuardedTextEditV1Input::from(self.clone()).encode()
     }
@@ -6262,6 +6802,10 @@ pub struct ExactFileEditV1Output {
 pub type ExactFileEditV1 = ExactFileEditV1Output;
 
 impl ExactFileEditV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6314,6 +6858,10 @@ impl ExactFileEditV1Output {
             replacement,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ExactFileEditV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ExactFileEditV1Input::from(self.clone()).encode()
     }
@@ -6353,6 +6901,10 @@ pub struct SegmentPrefixV1Output {
 pub type SegmentPrefixV1 = SegmentPrefixV1Output;
 
 impl SegmentPrefixV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6389,6 +6941,10 @@ impl SegmentPrefixV1Output {
         }
         Ok(Self { magic, version })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        SegmentPrefixV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         SegmentPrefixV1Input::from(self.clone()).encode()
     }
@@ -6426,6 +6982,10 @@ pub struct SegmentIndexEntryV1 {
 }
 
 impl SegmentIndexEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6490,6 +7050,10 @@ pub struct SegmentIndexPageV1 {
 }
 
 impl SegmentIndexPageV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6527,6 +7091,10 @@ pub struct SegmentIndexKeyV1 {
 }
 
 impl SegmentIndexKeyV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6560,6 +7128,10 @@ pub struct SegmentDirectoryEntryV1 {
 }
 
 impl SegmentDirectoryEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6599,6 +7171,10 @@ pub struct SegmentDirectoryV1 {
 }
 
 impl SegmentDirectoryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6654,6 +7230,10 @@ pub struct SegmentFooterV1Output {
 pub type SegmentFooterV1 = SegmentFooterV1Output;
 
 impl SegmentFooterV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6711,6 +7291,10 @@ impl SegmentFooterV1Output {
             body_digest,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        SegmentFooterV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         SegmentFooterV1Input::from(self.clone()).encode()
     }
@@ -6762,6 +7346,10 @@ pub struct ActiveLogHeaderV1Output {
 pub type ActiveLogHeaderV1 = ActiveLogHeaderV1Output;
 
 impl ActiveLogHeaderV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6804,6 +7392,10 @@ impl ActiveLogHeaderV1Output {
             base_generation,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ActiveLogHeaderV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ActiveLogHeaderV1Input::from(self.clone()).encode()
     }
@@ -6848,6 +7440,10 @@ pub struct ActiveLogFrameFieldsV1Output {
 pub type ActiveLogFrameFieldsV1 = ActiveLogFrameFieldsV1Output;
 
 impl ActiveLogFrameFieldsV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6887,6 +7483,10 @@ impl ActiveLogFrameFieldsV1Output {
             index_length,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ActiveLogFrameFieldsV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ActiveLogFrameFieldsV1Input::from(self.clone()).encode()
     }
@@ -6923,6 +7523,10 @@ pub struct ActiveLogFrameHeaderV1 {
 }
 
 impl ActiveLogFrameHeaderV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6964,6 +7568,10 @@ pub struct ActiveLogFrameTrailerV1Output {
 pub type ActiveLogFrameTrailerV1 = ActiveLogFrameTrailerV1Output;
 
 impl ActiveLogFrameTrailerV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -6997,6 +7605,10 @@ impl ActiveLogFrameTrailerV1Output {
             chain_digest,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ActiveLogFrameTrailerV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ActiveLogFrameTrailerV1Input::from(self.clone()).encode()
     }
@@ -7043,6 +7655,10 @@ pub struct SegmentCatalogRecordV1Output {
 pub type SegmentCatalogRecordV1 = SegmentCatalogRecordV1Output;
 
 impl SegmentCatalogRecordV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7104,6 +7720,10 @@ impl SegmentCatalogRecordV1Output {
             stored_length,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        SegmentCatalogRecordV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         SegmentCatalogRecordV1Input::from(self.clone()).encode()
     }
@@ -7155,6 +7775,10 @@ pub struct PhysicalCatalogSnapshotV1Output {
 pub type PhysicalCatalogSnapshotV1 = PhysicalCatalogSnapshotV1Output;
 
 impl PhysicalCatalogSnapshotV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7211,6 +7835,10 @@ impl PhysicalCatalogSnapshotV1Output {
             content,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        PhysicalCatalogSnapshotV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         PhysicalCatalogSnapshotV1Input::from(self.clone()).encode()
     }
@@ -7250,6 +7878,10 @@ pub struct PhysicalSegmentDescriptorV1 {
 }
 
 impl PhysicalSegmentDescriptorV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7290,6 +7922,10 @@ pub struct PhysicalContentGenerationV1 {
 }
 
 impl PhysicalContentGenerationV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7324,6 +7960,10 @@ pub struct PhysicalCatalogRefV1 {
 }
 
 impl PhysicalCatalogRefV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7363,6 +8003,10 @@ pub struct PhysicalCatalogHeadV1Output {
 pub type PhysicalCatalogHeadV1 = PhysicalCatalogHeadV1Output;
 
 impl PhysicalCatalogHeadV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7415,6 +8059,10 @@ impl PhysicalCatalogHeadV1Output {
             head,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        PhysicalCatalogHeadV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         PhysicalCatalogHeadV1Input::from(self.clone()).encode()
     }
@@ -7454,6 +8102,10 @@ pub struct RemoteCatalogHeadV1Output {
 pub type RemoteCatalogHeadV1 = RemoteCatalogHeadV1Output;
 
 impl RemoteCatalogHeadV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7496,6 +8148,10 @@ impl RemoteCatalogHeadV1Output {
             head,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RemoteCatalogHeadV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RemoteCatalogHeadV1Input::from(self.clone()).encode()
     }
@@ -7537,6 +8193,10 @@ pub struct RepackIntentFieldsV1Output {
 pub type RepackIntentFieldsV1 = RepackIntentFieldsV1Output;
 
 impl RepackIntentFieldsV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7592,6 +8252,10 @@ impl RepackIntentFieldsV1Output {
             new,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RepackIntentFieldsV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RepackIntentFieldsV1Input::from(self.clone()).encode()
     }
@@ -7627,6 +8291,10 @@ pub struct RepackIntentV1 {
 }
 
 impl RepackIntentV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7671,6 +8339,10 @@ pub struct ContentGenerationCheckV1Output {
 pub type ContentGenerationCheckV1 = ContentGenerationCheckV1Output;
 
 impl ContentGenerationCheckV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7724,6 +8396,10 @@ impl ContentGenerationCheckV1Output {
             files,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentGenerationCheckV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentGenerationCheckV1Input::from(self.clone()).encode()
     }
@@ -7759,6 +8435,10 @@ pub struct FileStampV1 {
 }
 
 impl FileStampV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7798,6 +8478,10 @@ pub struct ContentGenerationEntryV1 {
 }
 
 impl ContentGenerationEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7859,6 +8543,10 @@ pub struct ContentGenerationShardRefV1 {
 }
 
 impl ContentGenerationShardRefV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7915,6 +8603,10 @@ pub struct ContentGenerationManifestV1Output {
 pub type ContentGenerationManifestV1 = ContentGenerationManifestV1Output;
 
 impl ContentGenerationManifestV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -7977,6 +8669,10 @@ impl ContentGenerationManifestV1Output {
             manifest_digest,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentGenerationManifestV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentGenerationManifestV1Input::from(self.clone()).encode()
     }
@@ -8020,6 +8716,10 @@ pub struct ContentGenerationIndexDigestInputV1 {
 }
 
 impl ContentGenerationIndexDigestInputV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8080,6 +8780,10 @@ pub struct ContentGenerationShardV1Output {
 pub type ContentGenerationShardV1 = ContentGenerationShardV1Output;
 
 impl ContentGenerationShardV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8136,6 +8840,10 @@ impl ContentGenerationShardV1Output {
             entries,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentGenerationShardV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentGenerationShardV1Input::from(self.clone()).encode()
     }
@@ -8185,6 +8893,10 @@ pub struct RepositoryHeadV1Output {
 pub type RepositoryHeadV1 = RepositoryHeadV1Output;
 
 impl RepositoryHeadV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8241,6 +8953,10 @@ impl RepositoryHeadV1Output {
             receipts,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RepositoryHeadV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RepositoryHeadV1Input::from(self.clone()).encode()
     }
@@ -8282,6 +8998,10 @@ pub struct PublishReceiptV1 {
 }
 
 impl PublishReceiptV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8328,6 +9048,10 @@ pub struct PublishKeyInputV1 {
 }
 
 impl PublishKeyInputV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8366,6 +9090,10 @@ pub struct PublishRequestInputV1 {
 }
 
 impl PublishRequestInputV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8411,6 +9139,10 @@ pub struct PublishReceiptIdInputV1 {
 }
 
 impl PublishReceiptIdInputV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8463,6 +9195,10 @@ pub struct ContentEnvelopeHeaderV1Output {
 pub type ContentEnvelopeHeaderV1 = ContentEnvelopeHeaderV1Output;
 
 impl ContentEnvelopeHeaderV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8511,6 +9247,10 @@ impl ContentEnvelopeHeaderV1Output {
             logical_length,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentEnvelopeHeaderV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentEnvelopeHeaderV1Input::from(self.clone()).encode()
     }
@@ -8560,6 +9300,10 @@ pub struct ContentChunkManifestV1Output {
 pub type ContentChunkManifestV1 = ContentChunkManifestV1Output;
 
 impl ContentChunkManifestV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8624,6 +9368,10 @@ impl ContentChunkManifestV1Output {
             parts,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentChunkManifestV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentChunkManifestV1Input::from(self.clone()).encode()
     }
@@ -8661,6 +9409,10 @@ pub struct ContentChunkRefV1 {
 }
 
 impl ContentChunkRefV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8692,6 +9444,10 @@ pub struct ContentPartRefV1 {
 }
 
 impl ContentPartRefV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8731,6 +9487,10 @@ pub struct ContentChunkPartV1Output {
 pub type ContentChunkPartV1 = ContentChunkPartV1Output;
 
 impl ContentChunkPartV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8781,6 +9541,10 @@ impl ContentChunkPartV1Output {
             chunks,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        ContentChunkPartV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         ContentChunkPartV1Input::from(self.clone()).encode()
     }
@@ -8812,6 +9576,10 @@ pub struct InventoryEntryV1 {
 }
 
 impl InventoryEntryV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8859,6 +9627,10 @@ pub struct SnapshotManifestV1Output {
 pub type SnapshotManifestV1 = SnapshotManifestV1Output;
 
 impl SnapshotManifestV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -8929,6 +9701,10 @@ impl SnapshotManifestV1Output {
             contents,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        SnapshotManifestV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         SnapshotManifestV1Input::from(self.clone()).encode()
     }
@@ -8984,6 +9760,10 @@ pub struct OwnershipManifestV1Output {
 pub type OwnershipManifestV1 = OwnershipManifestV1Output;
 
 impl OwnershipManifestV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9051,6 +9831,10 @@ impl OwnershipManifestV1Output {
             contents,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        OwnershipManifestV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         OwnershipManifestV1Input::from(self.clone()).encode()
     }
@@ -9102,6 +9886,10 @@ pub struct MaterializationProgressFieldsV1Output {
 pub type MaterializationProgressFieldsV1 = MaterializationProgressFieldsV1Output;
 
 impl MaterializationProgressFieldsV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9150,6 +9938,10 @@ impl MaterializationProgressFieldsV1Output {
             index,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        MaterializationProgressFieldsV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         MaterializationProgressFieldsV1Input::from(self.clone()).encode()
     }
@@ -9187,6 +9979,10 @@ pub struct MaterializationProgressRecordV1 {
 }
 
 impl MaterializationProgressRecordV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9230,6 +10026,10 @@ pub struct GitImportSourceV1Output {
 pub type GitImportSourceV1 = GitImportSourceV1Output;
 
 impl GitImportSourceV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9294,6 +10094,10 @@ impl GitImportSourceV1Output {
             refs,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        GitImportSourceV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         GitImportSourceV1Input::from(self.clone()).encode()
     }
@@ -9331,6 +10135,10 @@ pub struct GitImportRefV1 {
 }
 
 impl GitImportRefV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9380,6 +10188,10 @@ pub struct RepositoryLocationV1Output {
 pub type RepositoryLocationV1 = RepositoryLocationV1Output;
 
 impl RepositoryLocationV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9425,6 +10237,10 @@ impl RepositoryLocationV1Output {
             repository,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RepositoryLocationV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RepositoryLocationV1Input::from(self.clone()).encode()
     }
@@ -9461,6 +10277,10 @@ pub struct BundleFileV1 {
 }
 
 impl BundleFileV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9523,6 +10343,10 @@ pub struct BundleManifestV1Output {
 pub type BundleManifestV1 = BundleManifestV1Output;
 
 impl BundleManifestV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9604,6 +10428,10 @@ impl BundleManifestV1Output {
             content_chunks,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        BundleManifestV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         BundleManifestV1Input::from(self.clone()).encode()
     }
@@ -9655,6 +10483,10 @@ pub struct BundleContentChunkV1Output {
 pub type BundleContentChunkV1 = BundleContentChunkV1Output;
 
 impl BundleContentChunkV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9705,6 +10537,10 @@ impl BundleContentChunkV1Output {
             contents,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        BundleContentChunkV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         BundleContentChunkV1Input::from(self.clone()).encode()
     }
@@ -9746,6 +10582,10 @@ pub struct StoreMetadataV1Output {
 pub type StoreMetadataV1 = StoreMetadataV1Output;
 
 impl StoreMetadataV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9788,6 +10628,10 @@ impl StoreMetadataV1Output {
             store_id,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        StoreMetadataV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         StoreMetadataV1Input::from(self.clone()).encode()
     }
@@ -9821,6 +10665,10 @@ pub struct RepositoryRootV1 {
 }
 
 impl RepositoryRootV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9856,6 +10704,10 @@ pub struct MaterializedRootsV1 {
 }
 
 impl MaterializedRootsV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9894,6 +10746,10 @@ pub struct PendingRepositoryCasV1 {
 }
 
 impl PendingRepositoryCasV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -9932,6 +10788,10 @@ pub struct PendingRepositoryOperationV1 {
 }
 
 impl PendingRepositoryOperationV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -10007,6 +10867,10 @@ pub struct WorkspaceMetadataV1Output {
 pub type WorkspaceMetadataV1 = WorkspaceMetadataV1Output;
 
 impl WorkspaceMetadataV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -10133,6 +10997,10 @@ impl WorkspaceMetadataV1Output {
             pending_repository_operation,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        WorkspaceMetadataV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         WorkspaceMetadataV1Input::from(self.clone()).encode()
     }
@@ -10214,6 +11082,10 @@ pub struct WorkspacePinV1Output {
 pub type WorkspacePinV1 = WorkspacePinV1Output;
 
 impl WorkspacePinV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -10343,6 +11215,10 @@ impl WorkspacePinV1Output {
             pending_repository_cas,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        WorkspacePinV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         WorkspacePinV1Input::from(self.clone()).encode()
     }
@@ -10408,6 +11284,10 @@ pub struct RemoteConfigV1Output {
 pub type RemoteConfigV1 = RemoteConfigV1Output;
 
 impl RemoteConfigV1Input {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -10470,6 +11350,10 @@ impl RemoteConfigV1Output {
             head,
         })
     }
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        RemoteConfigV1Input::from(self.clone()).encode_measuring()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         RemoteConfigV1Input::from(self.clone()).encode()
     }
