@@ -124,7 +124,8 @@ top of them.
   [Authentication](#connection-lifecycle) for how "TLS required" turned out.
 - [x] **Embedder-started label writes (2026-11-06, for Gothab's ref writes).**
   `wheat_server::write::write`: label changes through the group commit, checked per
-  label against the head they join onto, idempotent by key (see
+  label against the head they join onto (or not, for `ExpectedLabel::Any`), idempotent
+  by key (see
   [Embedded in Gothab](#embedded-in-gothab)). Tests: `server_write_test.rs`,
   `group_commit_test.rs`'s `a_server_write_is_checked_against_the_tentative_head`.
 
@@ -1148,16 +1149,16 @@ are left alone.
 
 Gothab's own writes (ref updates from its web pages and API) go through
 `wheat_server::write::write` (2026-11-06), with no client session: a `ServerWrite` is
-a principal, the embedder's 16-byte idempotency key and label changes, each naming
-the view it expects (none: the label must not exist) and what the label becomes
-(none: delete). The write takes its turn in the repository's group commit like a
+a principal, the embedder's 16-byte idempotency key and label changes, each with
+what it expects the label to be (`ExpectedLabel`: absent, at a view, or `Any`, not
+checked) and what the label becomes (none: delete). The write takes its turn in the repository's group commit like a
 publish and is built in that turn on the head it joins onto, the tentative one
-while a batch is being written, so each expected view is checked against exactly
+while a batch is being written, so each expectation is checked against exactly
 that head; a mismatch is `WriteFailure::LabelMoved` with each label's actual view.
 The new envelope keeps the head's state, is validated as a publish of it, and moves
 labels forward unless `force_labels`. Its receipt binds the key to a digest of the
-changes (`server_write_request_digest`: the expected and new labels as two label
-manifests), so the same write sent again gets its first answer and the same key
+changes (`server_write_request_digest`: a `ServerWriteRequestInputV1`, the changes in
+name order), so the same write sent again gets its first answer and the same key
 for another write is refused. A quiesced network refuses it with its retry delay.
 Publish hooks are not told: the embedder tells its own listeners. Writes that add
 changes (server edits, merges) are to build on this.

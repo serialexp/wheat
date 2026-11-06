@@ -10,7 +10,10 @@ use wheat_server::access::Principal;
 use wheat_server::commit::CommitFailure;
 use wheat_server::quiesce::Quiesced;
 use wheat_server::registry::RepositoryEntry;
-use wheat_server::write::{LabelChange, ServerWrite, WriteFailure, write};
+use wheat_server::write::{
+    ExpectedLabel::{self, Absent, Any, View},
+    LabelChange, ServerWrite, WriteFailure, write,
+};
 use wheat_store::{
     LocalPublicationStore, PackedObjectStore, PublicationStore, RepositoryHead,
     RepositoryPublisher, RepositoryReader,
@@ -74,7 +77,7 @@ async fn server() -> Server {
     }
 }
 
-fn change(name: &str, expected: Option<ViewId>, new: Option<ViewId>) -> LabelChange {
+fn change(name: &str, expected: ExpectedLabel, new: Option<ViewId>) -> LabelChange {
     LabelChange {
         name: name.to_owned(),
         expected,
@@ -116,8 +119,8 @@ async fn a_write_creates_moves_and_deletes_labels() {
         server_write(
             1,
             vec![
-                change("main", None, Some(server.first)),
-                change(".pull/1/head", None, Some(server.second)),
+                change("main", Absent, Some(server.first)),
+                change(".pull/1/head", Absent, Some(server.second)),
             ],
         ),
     )
@@ -136,8 +139,8 @@ async fn a_write_creates_moves_and_deletes_labels() {
         server_write(
             2,
             vec![
-                change("main", Some(server.first), Some(server.second)),
-                change(".pull/1/head", Some(server.second), None),
+                change("main", View(server.first), Some(server.second)),
+                change(".pull/1/head", View(server.second), None),
             ],
         ),
     )
@@ -156,7 +159,7 @@ async fn a_label_not_where_the_write_expects_it_is_reported_with_its_view() {
     let server = server().await;
     let head = write(
         &server.entry,
-        server_write(1, vec![change("main", None, Some(server.first))]),
+        server_write(1, vec![change("main", Absent, Some(server.first))]),
     )
     .await
     .unwrap();
@@ -165,9 +168,9 @@ async fn a_label_not_where_the_write_expects_it_is_reported_with_its_view() {
         server_write(
             2,
             vec![
-                change("main", Some(server.base), Some(server.second)),
-                change("dev", Some(server.first), None),
-                change("other", None, Some(server.first)),
+                change("main", View(server.base), Some(server.second)),
+                change("dev", View(server.first), None),
+                change("other", Absent, Some(server.first)),
             ],
         ),
     )
@@ -186,7 +189,7 @@ async fn a_label_not_where_the_write_expects_it_is_reported_with_its_view() {
     // Creating a label that exists is refused the same way.
     let refused = write(
         &server.entry,
-        server_write(3, vec![change("main", None, Some(server.second))]),
+        server_write(3, vec![change("main", Absent, Some(server.second))]),
     )
     .await;
     assert!(matches!(
@@ -199,27 +202,96 @@ async fn a_label_not_where_the_write_expects_it_is_reported_with_its_view() {
 #[tokio::test]
 async fn a_write_sent_again_gets_its_first_answer() {
     let server = server().await;
-    let labels = vec![change("main", None, Some(server.first))];
+    let labels = vec![
+        change("main", Absent, Some(server.first)),
+        change("dev", Absent, Some(server.second)),
+    ];
     let first = write(&server.entry, server_write(7, labels.clone()))
         .await
         .unwrap();
-    // The label now exists, so only the receipt can answer this.
-    let again = write(&server.entry, server_write(7, labels)).await.unwrap();
+    // The labels now exist, so only the receipt can answer this, whatever order the
+    // changes are given in.
+    let reordered: Vec<_> = labels.iter().rev().cloned().collect();
+    let again = write(&server.entry, server_write(7, reordered))
+        .await
+        .unwrap();
     assert_eq!(again, first);
     assert_eq!(server.entry.heads.head().await.unwrap(), first);
-    // The same key for something else is refused.
-    let reused = write(
+    // The same key for something else is refused: other labels, or the same labels
+    // with another expectation.
+    let unchecked: Vec<_> = labels
+        .iter()
+        .cloned()
+        .map(|change| LabelChange {
+            expected: Any,
+            ..change
+        })
+        .collect();
+    for other in [vec![change("other", Absent, Some(server.first))], unchecked] {
+        let reused = write(&server.entry, server_write(7, other)).await;
+        assert!(
+            matches!(
+                reused,
+                Err(WriteFailure::Commit(CommitFailure::Rejected { .. }))
+            ),
+            "{reused:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unchecked_change_applies_wherever_the_label_is() {
+    let server = server().await;
+    let created = write(
         &server.entry,
-        server_write(7, vec![change("dev", None, Some(server.first))]),
+        server_write(1, vec![change("main", Any, Some(server.first))]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        labels(&server, created).await,
+        [("main".to_owned(), server.first)]
+    );
+    // Checked labels in the same write are still checked.
+    let refused = write(
+        &server.entry,
+        server_write(
+            2,
+            vec![
+                change("main", Any, Some(server.second)),
+                change("dev", View(server.base), Some(server.first)),
+            ],
+        ),
     )
     .await;
     assert!(
         matches!(
-            reused,
-            Err(WriteFailure::Commit(CommitFailure::Rejected { .. }))
+            &refused,
+            Err(WriteFailure::LabelMoved { labels, .. }) if *labels == [("dev".to_owned(), None)]
         ),
-        "{reused:?}"
+        "{refused:?}"
     );
+    let moved = write(
+        &server.entry,
+        server_write(3, vec![change("main", Any, Some(server.second))]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        labels(&server, moved).await,
+        [("main".to_owned(), server.second)]
+    );
+    // Deleting a label that is not there leaves the labels as they are.
+    let deleted = write(
+        &server.entry,
+        server_write(
+            4,
+            vec![change("main", Any, None), change("missing", Any, None)],
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(labels(&server, deleted).await.is_empty());
 }
 
 #[tokio::test]
@@ -227,11 +299,11 @@ async fn labels_move_forward_unless_forced_and_only_to_retained_views() {
     let server = server().await;
     write(
         &server.entry,
-        server_write(1, vec![change("main", None, Some(server.second))]),
+        server_write(1, vec![change("main", Absent, Some(server.second))]),
     )
     .await
     .unwrap();
-    let backward = vec![change("main", Some(server.second), Some(server.base))];
+    let backward = vec![change("main", View(server.second), Some(server.base))];
     let refused = write(&server.entry, server_write(2, backward.clone())).await;
     assert!(
         matches!(
@@ -256,7 +328,7 @@ async fn labels_move_forward_unless_forced_and_only_to_retained_views() {
     let unknown = ViewId::from_digest([9; 32]);
     let refused = write(
         &server.entry,
-        server_write(4, vec![change("other", None, Some(unknown))]),
+        server_write(4, vec![change("other", Absent, Some(unknown))]),
     )
     .await;
     assert!(
@@ -276,15 +348,15 @@ async fn concurrent_writes_join_and_are_checked_against_the_head_they_join() {
     let (a, b, c) = tokio::join!(
         write(
             &server.entry,
-            server_write(1, vec![change("a", None, Some(server.first))])
+            server_write(1, vec![change("a", Absent, Some(server.first))])
         ),
         write(
             &server.entry,
-            server_write(2, vec![change("b", None, Some(server.first))])
+            server_write(2, vec![change("b", Absent, Some(server.first))])
         ),
         write(
             &server.entry,
-            server_write(3, vec![change("a", None, Some(server.second))])
+            server_write(3, vec![change("a", Absent, Some(server.second))])
         ),
     );
     let landed = [&a, &c].iter().filter(|outcome| outcome.is_ok()).count();
@@ -309,11 +381,11 @@ async fn invalid_writes_and_quiesced_networks_are_refused() {
     for labels in [
         vec![],
         vec![
-            change("main", None, Some(server.first)),
-            change("main", None, Some(server.second)),
+            change("main", Absent, Some(server.first)),
+            change("main", Absent, Some(server.second)),
         ],
-        vec![change("main", None, None)],
-        vec![change("", None, Some(server.first))],
+        vec![change("main", Absent, None)],
+        vec![change("", Absent, Some(server.first))],
     ] {
         let refused = write(&server.entry, server_write(1, labels)).await;
         assert!(
@@ -324,7 +396,7 @@ async fn invalid_writes_and_quiesced_networks_are_refused() {
     let held = Quiesced::hold(Arc::clone(&server.entry)).await;
     let refused = write(
         &server.entry,
-        server_write(2, vec![change("main", None, Some(server.first))]),
+        server_write(2, vec![change("main", Absent, Some(server.first))]),
     )
     .await;
     assert!(
@@ -334,7 +406,7 @@ async fn invalid_writes_and_quiesced_networks_are_refused() {
     drop(held);
     write(
         &server.entry,
-        server_write(2, vec![change("main", None, Some(server.first))]),
+        server_write(2, vec![change("main", Absent, Some(server.first))]),
     )
     .await
     .unwrap();

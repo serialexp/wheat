@@ -422,7 +422,8 @@ fn uuid_array(value: wire::Uuid128) -> Result<[u8; 16], StoreRecordError> {
 /// BLAKE3 of `input` after `tag`, cut to its first 16 bytes.
 fn digest16(tag: &[u8], input: Result<Vec<u8>, impl std::fmt::Debug>) -> [u8; 16] {
     // Every input below is fixed-size apart from a `uint32`-counted principal name,
-    // which `publish_key_digest` bounds, so encoding cannot fail.
+    // which `publish_key_digest` bounds, and a server write's `uint32`-counted label
+    // changes, which cannot outnumber that, so encoding cannot fail.
     let input = input.expect("a publish digest input encodes");
     let mut hash = blake3::Hasher::new();
     hash.update(tag);
@@ -467,23 +468,39 @@ pub fn publish_request_digest(
     )
 }
 
-/// What a server write (`wheat_server::write`) asks for: the labels it expects, the
-/// labels it writes, and whether it may move them backward. A label it expects absent
-/// is in neither manifest's `expected`, one it deletes in neither's `new`, so the two
-/// manifests, each a self-delimiting canonical encoding, say exactly which change was
-/// asked for.
+/// What a server write (`wheat_server::write`) asks for: each label it changes, by
+/// name, with what it expects the label to be and what the label becomes (`None`
+/// deletes it), and whether it may move labels backward. The order of `changes` does
+/// not matter; each name is given once.
 #[must_use]
-pub fn server_write_request_digest(
-    expected: &crate::ViewLabelManifestRecord,
-    new: &crate::ViewLabelManifestRecord,
+pub fn server_write_request_digest<'a>(
+    changes: impl IntoIterator<Item = (&'a str, crate::ExpectedLabel, Option<&'a crate::ViewLabel>)>,
     force_labels: bool,
 ) -> [u8; 16] {
-    let mut input = expected.canonical_bytes();
-    input.extend_from_slice(&new.canonical_bytes());
-    input.push(u8::from(force_labels));
+    let mut changes: Vec<wire::ServerWriteLabelChangeV1> = changes
+        .into_iter()
+        .map(|(name, expected, new)| {
+            let (expectation, expected_view) = match expected {
+                crate::ExpectedLabel::Absent => (0, None),
+                crate::ExpectedLabel::View(view) => (1, Some(view_wire(view))),
+                crate::ExpectedLabel::Any => (2, None),
+            };
+            wire::ServerWriteLabelChangeV1 {
+                name: name.to_owned(),
+                expectation,
+                expected_view,
+                new: new.map(|label| crate::wire::view_label_entry(name, label)),
+            }
+        })
+        .collect();
+    changes.sort_by(|a, b| a.name.cmp(&b.name));
     digest16(
         b"wheat-server-write-request-v1\0",
-        Ok::<_, std::convert::Infallible>(input),
+        wire::ServerWriteRequestInputV1 {
+            changes,
+            force_labels,
+        }
+        .encode(),
     )
 }
 

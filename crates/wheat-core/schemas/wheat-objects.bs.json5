@@ -1078,6 +1078,26 @@
         { name: "envelope", type: "Digest256" },
       ],
     },
+    // What an embedder's label write asks for, as its receipt's `request`: hashed
+    // after "wheat-server-write-request-v1\0" and cut to 16 bytes, never stored.
+    // `changes` are in name order, each name once.
+    ServerWriteRequestInputV1: {
+      sequence: [
+        { name: "changes", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ServerWriteLabelChangeV1" } },
+        { name: "force_labels", type: "bool" },
+      ],
+    },
+    // `expectation` is 0 when the label must be absent, 1 when it must be at
+    // `expected_view` (present exactly then), 2 when it is not checked. `new` is
+    // what the label becomes, named `name`; absent when it is deleted.
+    ServerWriteLabelChangeV1: {
+      sequence: [
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "expectation", type: "uint8" },
+        { name: "expected_view", type: "optional", value_type: "ViewId" },
+        { name: "new", type: "optional", value_type: "ViewLabelManifestEntryV1" },
+      ],
+    },
     // The fixed header in front of every stored content envelope's payload.
     // `codec` is the physical codec (0 raw, 1 zstd, 2 delta, 3 zstd'd delta);
     // `stored_length` payload bytes follow.

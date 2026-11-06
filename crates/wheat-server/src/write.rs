@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+pub use wheat_core::ExpectedLabel;
 use wheat_core::{ViewId, ViewLabel, ViewLabelManifestRecord, server_write_request_digest};
 use wheat_store::{RepositoryHead, RepositoryStage};
 
@@ -25,9 +26,8 @@ const STAGED_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LabelChange {
     pub name: String,
-    /// The view the label must be at on the head the write joins onto; `None` when
-    /// it must not exist.
-    pub expected: Option<ViewId>,
+    /// What the label must be on the head the write joins onto.
+    pub expected: ExpectedLabel,
     /// What the label becomes; `None` deletes it. A [`ViewLabel`], so a tag keeps its
     /// annotation.
     pub new: Option<ViewLabel>,
@@ -49,8 +49,8 @@ pub struct ServerWrite {
 /// Why a write was not made.
 #[derive(Clone, Debug)]
 pub enum WriteFailure {
-    /// The changes are not a write: none, a label named twice, or one that neither
-    /// exists before nor after.
+    /// The changes are not a write: none, a label named twice, one expected absent
+    /// and deleted, or a label that is not valid.
     Invalid(String),
     /// Labels are not where the write expects them: each with its view on the head
     /// the write would have joined onto (none when absent). `head` is the durable
@@ -101,7 +101,7 @@ pub async fn write(
     accepted.durable().await.map_err(WriteFailure::Commit)
 }
 
-/// What `write` asks for, digested: its expected labels and its new ones as manifests.
+/// What `write` asks for, digested, once its changes are checked to be a write.
 fn request_digest(write: &ServerWrite) -> Result<[u8; 16], WriteFailure> {
     if write.labels.is_empty() {
         return Err(WriteFailure::Invalid(
@@ -116,34 +116,20 @@ fn request_digest(write: &ServerWrite) -> Result<[u8; 16], WriteFailure> {
                 change.name
             )));
         }
-        if change.expected.is_none() && change.new.is_none() {
+        if change.expected == ExpectedLabel::Absent && change.new.is_none() {
             return Err(WriteFailure::Invalid(format!(
                 "label {:?} neither exists before nor after the write",
                 change.name
             )));
         }
+        ViewLabelManifestRecord::validate_entry(&change.name, change.new.as_ref())
+            .map_err(|e| WriteFailure::Invalid(format!("the labels are not valid: {e}")))?;
     }
-    let manifest = |labels: Vec<(String, ViewLabel)>| {
-        ViewLabelManifestRecord::new(labels)
-            .map_err(|e| WriteFailure::Invalid(format!("the labels are not valid: {e}")))
-    };
-    let expected = manifest(
-        write
-            .labels
-            .iter()
-            .filter_map(|change| Some((change.name.clone(), ViewLabel::from(change.expected?))))
-            .collect(),
-    )?;
-    let new = manifest(
-        write
-            .labels
-            .iter()
-            .filter_map(|change| Some((change.name.clone(), change.new.clone()?)))
-            .collect(),
-    )?;
     Ok(server_write_request_digest(
-        &expected,
-        &new,
+        write
+            .labels
+            .iter()
+            .map(|change| (change.name.as_str(), change.expected, change.new.as_ref())),
         write.force_labels,
     ))
 }

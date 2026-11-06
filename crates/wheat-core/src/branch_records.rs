@@ -18,6 +18,29 @@ pub struct ViewLabel {
     pub annotation: Option<LabelAnnotation>,
 }
 
+/// What a label must be before a write changes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedLabel {
+    /// It must not exist.
+    Absent,
+    /// It must be at this view.
+    View(ViewId),
+    /// It is not checked: the write applies wherever the label is.
+    Any,
+}
+
+impl ExpectedLabel {
+    /// Whether a label at `actual` (none when absent) is as expected.
+    #[must_use]
+    pub fn admits(self, actual: Option<ViewId>) -> bool {
+        match self {
+            Self::Absent => actual.is_none(),
+            Self::View(view) => actual == Some(view),
+            Self::Any => true,
+        }
+    }
+}
+
 /// Who tagged a label, when, and why. It is stored rather than made at push time,
 /// so the Git tag object built from it has the same ID wherever it is pushed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,14 +113,8 @@ impl ViewLabelManifestRecord {
         let mut canonical = BTreeMap::new();
         for (name, label) in labels {
             let name = name.into();
-            validate_label_name(&name)?;
             let label = label.into();
-            if let Some(original_git_ref) = &label.original_git_ref {
-                validate_original_git_ref(original_git_ref)?;
-            }
-            if let Some(annotation) = &label.annotation {
-                annotation.validate()?;
-            }
+            Self::validate_entry(&name, Some(&label))?;
             if canonical.insert(name, label).is_some() {
                 return Err(CanonicalObjectError::InvalidCollection(
                     "duplicate view label manifest entry",
@@ -110,6 +127,24 @@ impl ViewLabelManifestRecord {
             }
         }
         Ok(Self { labels: canonical })
+    }
+
+    /// Checks one label a manifest could hold: its name, and the label when given.
+    pub fn validate_entry(
+        name: &str,
+        label: Option<&ViewLabel>,
+    ) -> Result<(), CanonicalObjectError> {
+        validate_label_name(name)?;
+        let Some(label) = label else {
+            return Ok(());
+        };
+        if let Some(original_git_ref) = &label.original_git_ref {
+            validate_original_git_ref(original_git_ref)?;
+        }
+        if let Some(annotation) = &label.annotation {
+            annotation.validate()?;
+        }
+        Ok(())
     }
 
     #[must_use]

@@ -9177,6 +9177,125 @@ impl PublishReceiptIdInputV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ServerWriteRequestInputV1 {
+    pub changes: Vec<ServerWriteLabelChangeV1>,
+    pub force_labels: bool,
+}
+
+impl ServerWriteRequestInputV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_u32_be(self.changes.len() as u32);
+        for item in &self.changes {
+            item.encode_into(encoder)?;
+        }
+        encoder.write_byte(if self.force_labels { 1 } else { 0 });
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_u32_be()? as usize;
+        let mut changes = Vec::with_capacity(decoder.capacity_hint_sized(length, 4));
+        for _ in 0..length {
+            let item = ServerWriteLabelChangeV1::decode_with_decoder(decoder)?;
+            changes.push(item);
+        }
+        let force_labels = decoder.read_byte()? != 0;
+        Ok(Self {
+            changes,
+            force_labels,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerWriteLabelChangeV1 {
+    pub name: std::string::String,
+    pub expectation: u8,
+    pub expected_view: Option<ViewId>,
+    pub new: Option<ViewLabelManifestEntryV1>,
+}
+
+impl ServerWriteLabelChangeV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_varlength(self.name.len() as u64, "leb128_canonical")?;
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.expectation);
+        if let Some(ref v) = self.expected_view {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        if let Some(ref v) = self.new {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes)
+            .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let expectation = decoder.read_byte()?;
+        let has_value = decoder.read_uint8()? != 0;
+        let expected_view = if has_value {
+            Some(ViewId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        let has_value = decoder.read_uint8()? != 0;
+        let new = if has_value {
+            Some(ViewLabelManifestEntryV1::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            name,
+            expectation,
+            expected_view,
+            new,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContentEnvelopeHeaderV1Input {
     pub codec: u8,
     pub stored_length: u64,

@@ -320,7 +320,7 @@ async fn build_labels<S: RepositoryStore>(
         .iter()
         .filter_map(|change| {
             let actual = labels.get(&change.name).map(|label| label.view);
-            (actual != change.expected).then(|| (change.name.clone(), actual))
+            (!change.expected.admits(actual)).then(|| (change.name.clone(), actual))
         })
         .collect();
     if !moved.is_empty() {

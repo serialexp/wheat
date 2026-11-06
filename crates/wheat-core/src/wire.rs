@@ -1528,22 +1528,31 @@ pub(crate) fn view_label_manifest_record_bytes(record: &crate::ViewLabelManifest
             labels: record
                 .labels
                 .iter()
-                .map(|(name, label)| wire::ViewLabelManifestEntryV1 {
-                    name: name.clone(),
-                    view: view_id(label.view),
-                    original_git_refs: label.original_git_ref.iter().cloned().collect(),
-                    annotation: label.annotation.as_ref().map(|annotation| {
-                        wire::LabelAnnotationV1 {
-                            tagger: actor(&annotation.tagger),
-                            tagged_at: timestamp(annotation.tagged_at),
-                            message: annotation.message.clone(),
-                        }
-                    }),
-                })
+                .map(|(name, label)| view_label_entry(name, label))
                 .collect(),
         }
         .into(),
     ))
+}
+
+/// A label as a manifest entry.
+pub(crate) fn view_label_entry(
+    name: &str,
+    label: &crate::ViewLabel,
+) -> wire::ViewLabelManifestEntryV1 {
+    wire::ViewLabelManifestEntryV1 {
+        name: name.to_owned(),
+        view: view_id(label.view),
+        original_git_refs: label.original_git_ref.iter().cloned().collect(),
+        annotation: label
+            .annotation
+            .as_ref()
+            .map(|annotation| wire::LabelAnnotationV1 {
+                tagger: actor(&annotation.tagger),
+                tagged_at: timestamp(annotation.tagged_at),
+                message: annotation.message.clone(),
+            }),
+    }
 }
 
 pub(crate) fn repository_envelope_record_bytes(

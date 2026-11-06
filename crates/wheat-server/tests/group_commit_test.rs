@@ -386,9 +386,9 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
 /// batch's head, not the durable one.
 #[tokio::test]
 async fn a_server_write_is_checked_against_the_tentative_head() {
-    use wheat_server::write::{LabelChange, ServerWrite, WriteFailure, write};
+    use wheat_server::write::{ExpectedLabel, LabelChange, ServerWrite, WriteFailure, write};
     let server = server().await;
-    let label = |key: u8, expected: Option<ViewId>, new: Option<ViewId>| ServerWrite {
+    let label = |key: u8, expected: ExpectedLabel, new: Option<ViewId>| ServerWrite {
         principal: Principal {
             name: "gothab".into(),
         },
@@ -401,19 +401,31 @@ async fn a_server_write_is_checked_against_the_tentative_head() {
         force_labels: false,
     };
     let entry = Arc::clone(&server.entry);
-    let create =
-        tokio::spawn(async move { write(&entry, label(1, None, Some(server.greeting))).await });
+    let create = tokio::spawn(async move {
+        write(
+            &entry,
+            label(1, ExpectedLabel::Absent, Some(server.greeting)),
+        )
+        .await
+    });
     // The first write's batch is being written; the label exists only in it.
     server.gate.arrived.notified().await;
     assert_eq!(server.heads.read().unwrap(), server.initial);
-    let refused = write(&server.entry, label(2, None, Some(server.base))).await;
+    let refused = write(
+        &server.entry,
+        label(2, ExpectedLabel::Absent, Some(server.base)),
+    )
+    .await;
     assert!(
         matches!(&refused, Err(WriteFailure::LabelMoved { labels, .. }) if labels == &[("a".to_owned(), Some(server.greeting))]),
         "{refused:?}"
     );
     let entry = Arc::clone(&server.entry);
     let greeting = server.greeting;
-    let delete = tokio::spawn(async move { write(&entry, label(3, Some(greeting), None)).await });
+    let delete =
+        tokio::spawn(
+            async move { write(&entry, label(3, ExpectedLabel::View(greeting), None)).await },
+        );
     server.gate.permits.add_permits(2);
     let created = create.await.unwrap().unwrap();
     let deleted = delete.await.unwrap().unwrap();
