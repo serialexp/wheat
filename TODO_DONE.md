@@ -302,6 +302,10 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **The workspace registry syncs on every command (2026-11-06).** Decided
+  2026-11-06 (Bart: leave it): `WorkspaceRegistry::publish` keeps syncing the
+  `workspaces` directory even when the pin is unchanged, so an earlier rename whose
+  sync was cut off becomes durable. It costs one drive flush (2–9 ms) per command.
 - `[x]` **Read-only commands still sync (2026-10-05).** Done 2026-11-06 (Bart: sync
   the directories only for the first write): an open that created none of
   `storage/packed`'s directories marks them pending, and the first put, loose write

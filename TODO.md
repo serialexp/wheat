@@ -202,12 +202,6 @@ Security, most serious first:
 
 Performance, most serious first:
 
-- `[ ]` **The workspace registry syncs on every command (2026-11-06).**
-  `WorkspaceRegistry::publish` (`workspace_registry.rs`) fsyncs the store's
-  `workspaces` directory even when the pin it would write is already there, to make
-  an earlier rename durable if its sync was cut off. It is the last fsync a
-  read-only `wheat status` makes now that the packed store syncs only before its
-  first write. Same trade as that one: needs Bart's call.
 - `[ ]` **Fetch and publish benches slower than on 2026-10-26 (2026-10-30).**
   `fetch_incremental.total.wall` went from 17.3 s (2026-10-26) to 29–31 s, its
   `publish.wall` from 0.023 s to about 0.07 s, and `remote_latency.many.publish.wall`
