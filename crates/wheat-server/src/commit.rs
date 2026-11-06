@@ -32,6 +32,7 @@ use wheat_store::{
 };
 
 use crate::hooks::{Announcement, ProposedPublish, PublishHooks, Published, PublishedBatch};
+use crate::naming::Named;
 use crate::receipt::{PublishKey, Recorded};
 use crate::registry::RepositoryEntry;
 
@@ -108,6 +109,9 @@ struct Batch {
     /// announced publish, in `publications` order.
     hooks: Option<Arc<dyn PublishHooks>>,
     announced: Vec<Option<ProposedPublish>>,
+    /// What the batch's publishes named and uploaded, when the network is told
+    /// ([`crate::naming`]).
+    named: Option<Named>,
 }
 
 /// A publish accepted into a batch, or one sent again and answered as the first
@@ -179,7 +183,8 @@ pub async fn previous(
 /// is never joined: it replaces exactly the head it names. Each label the publish
 /// moves must move forward unless `force_labels`. Refusals report the durable head,
 /// the one the client can fetch. `announcement`'s hooks are told about the publish
-/// once its batch is durable.
+/// once its batch is durable. `named` is what the publish named and uploaded, named
+/// again as its batch commits if that was long ago (see [`crate::naming`]).
 ///
 /// A publish whose key was accepted meanwhile, by another session sending it again,
 /// is answered as that one is instead.
@@ -193,6 +198,7 @@ pub async fn accept<S: RepositoryStore + 'static>(
     force: bool,
     force_labels: bool,
     announcement: Option<Announcement>,
+    named: Option<Named>,
 ) -> Result<Accepted, CommitFailure> {
     let mut turn = entry
         .commit
@@ -232,6 +238,7 @@ pub async fn accept<S: RepositoryStore + 'static>(
         force,
         publication,
         announcement,
+        named,
     );
     Ok(Accepted::waiting(receiver, false))
 }
@@ -288,7 +295,7 @@ pub(crate) async fn accept_labels<S: RepositoryStore + 'static>(
     let publication = staged.take().await.map_err(|e| {
         CommitFailure::Internal(format!("server write: take the staged write: {e}"))
     })?;
-    let receiver = turn.accept(entry, key, current, joined, false, publication, None);
+    let receiver = turn.accept(entry, key, current, joined, false, publication, None, None);
     Ok(Accepted::waiting(receiver, false))
 }
 
@@ -499,6 +506,7 @@ impl CommitState {
         forced: bool,
         publication: Arc<StagedPublication>,
         announcement: Option<Announcement>,
+        named: Option<Named>,
     ) -> oneshot::Receiver<CommitOutcome> {
         let (sender, receiver) = oneshot::channel();
         debug_assert_eq!(self.tentative.unwrap_or(built_on), built_on);
@@ -511,6 +519,7 @@ impl CommitState {
             members: Vec::new(),
             hooks: None,
             announced: Vec::new(),
+            named: None,
         });
         batch.target = joined;
         batch.forced |= forced;
@@ -521,6 +530,12 @@ impl CommitState {
             batch.hooks.get_or_insert(announcement.hooks);
             announcement.publish
         }));
+        if let Some(named) = named {
+            match &mut batch.named {
+                Some(joined) => joined.join(named),
+                None => batch.named = Some(named),
+            }
+        }
         self.tentative = Some(joined);
         if !self.committing {
             self.committing = true;
@@ -693,6 +708,7 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
 
     let mut built_on = batch.built_on;
     let mut target = batch.target;
+    let mut named_since = batch.named.as_ref().map(|named| named.since);
     for _ in 0..MAX_COMMIT_ATTEMPTS {
         let head = read_head(entry).await?;
         if head.envelope != built_on {
@@ -708,6 +724,26 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
                 .instrument(debug_span!("publish_rejoin"))
                 .await?;
             built_on = head.envelope;
+        }
+        // Last before the head moves, so what it names is stamped after any mark that
+        // reads the heads too early to see this one, less the grace.
+        if let (Some(since), Some(named), Some(naming)) =
+            (&mut named_since, &batch.named, &entry.network.naming)
+            && since.elapsed() >= naming.renew_after()
+        {
+            let at = tokio::time::Instant::now();
+            let renamed = naming
+                .named(&named.ids)
+                .instrument(debug_span!("publish_rename", ids = named.ids.len()))
+                .await;
+            if let Err(e) = renamed {
+                warn!(error = %e, "publish: naming a batch's content again failed");
+                return Err(CommitFailure::Failed {
+                    head,
+                    message: format!("naming the published content failed: {e}; publish again"),
+                });
+            }
+            *since = at;
         }
         let new_head = RepositoryHead {
             generation: head.generation + 1,

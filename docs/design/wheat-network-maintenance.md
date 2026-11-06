@@ -3,11 +3,12 @@
 Status: partial — Phase 0 (the admin surface), Phases 1 (export), 2 (import and
 adoption) and 3 (delete while served) landed, so a network can be moved; Phase 2b
 and GC (4–6) designed, not yet implemented; Gothab's content GC (2026-11-06) is
-designed and being built. Bart answered questions 1–5 on 2026-10-27; a
+built on Wheat's side (marking, sweeping, and naming what publishes rely on), with
+three gaps recorded below. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
-Last updated: 2026-11-06
+Last updated: 2026-11-07
 
 ## Implementation status
 
@@ -464,6 +465,36 @@ Bart deferred to @wise-walrus with a lean to G1 (a); walrus relayed these answer
   delta bases. A failure, including an ID Gothab has no row for (reclaimed since the
   publish found it), refuses the publish as retryable.
 
+#### Naming what reading needs (2026-11-07)
+
+Naming a record is not enough when what reading it needs is old: a chunked blob's
+chunks and parts, a part's chunks, or a delta's base. Suppose a head is committed
+after a mark read the heads. The manifest it relies on survives on its fresh stamp,
+while chunks it shares with dead content are swept. Bart chose (2026-11-07) that Wheat
+names the closure, so Gothab's `named` only stamps rows. As built:
+
+- `ContentStore::needed_to_read(ids, bases)` (`wheat-store/src/content_closure.rs`)
+  gives `ids` and everything reading them needs. It reads each record's header and a
+  delta's base reference in one ranged read (`record_references`), a chunked blob's
+  manifest whole, and each part once. Chunks and parts are stored whole, so they are
+  not read. Of `bases`, a chunked one is left out, since a chunked blob is no delta's
+  base.
+- `wheat_server::naming::ContentNaming { renew_after(), named(ids) }`, set with
+  `Network::with_naming` or `OpenNetworks::with_naming`. A publish takes the instant
+  before it plans its content. Once it is checked, it names the content its state adds
+  that was stored already, the manifests it uploaded, and its uploads' delta bases,
+  all through `needed_to_read`. It does this before it joins the commit.
+  A failure answers the publish with the error status ("publish again"), and nothing
+  is kept. A server write adds no content and names nothing.
+- A batch keeps what its publishes named and uploaded, and the oldest of their
+  instants. Just before its head compare-and-swap, if that instant is older than
+  `renew_after` (half the grace), it names all of it again; a failure fails the
+  batch. Uploads are stored by then, and their put stamps are newer than the instant.
+- Cost per publish: one ranged read per added ID found stored and per delta base,
+  one read per uploaded or existing manifest and per part, and one `named` call.
+  A renewal adds a second call, without reads. `tests/content_blobs.rs` counts the
+  reads, and `tests/naming_test.rs` covers the hook end to end.
+
 ### Timing and races
 
 - A stamp taken before the head moves can be older than a mark that begins before
@@ -486,7 +517,16 @@ Bart deferred to @wise-walrus with a lean to G1 (a); walrus relayed these answer
   20 forks one change past the newest add 85 reads to its 951 (budget 10 a fork); a
   sweep of 110,220 listed IDs reclaims the 100,200 dead in 0.29 s with 10 inventory
   calls.
-- [ ] The `ContentNaming` hook in wheat-server's publish path, with the G/2 renaming.
+- [x] The `ContentNaming` hook in wheat-server's publish path, with the G/2 renaming,
+  naming what reading the named content needs (2026-11-07, above).
+- [ ] **Gap — a chunk stored as a delta.** A chunk whose bytes equal content stored
+  earlier as a delta is reused as that delta, and naming does not read chunks, so
+  its base is not named (TODO.md).
+- [ ] **Gap — a join after a forced publish.** The union can re-add content a forced
+  publish dropped before a mark began, which nothing names (TODO.md).
+- [ ] **Delta bases at publish come from the base view.** So publishes hardly ever
+  store deltas, and naming has few bases to name; a perf gap of publishing, not of GC
+  (TODO.md).
 
 ## Review (2026-10-27)
 

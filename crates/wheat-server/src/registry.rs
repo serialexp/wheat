@@ -298,7 +298,12 @@ impl Registry {
         store: Box<dyn RepositoryStore>,
         heads: impl HeadStore + 'static,
     ) -> Self {
-        Self::fixed([(name, RepositoryEntry::new(store, heads))])
+        Self::single_entry(name, RepositoryEntry::new(store, heads))
+    }
+
+    /// A registry serving `entry` alone, as `name`.
+    pub fn single_entry(name: String, entry: RepositoryEntry) -> Self {
+        Self::fixed([(name, entry)])
     }
 
     /// A registry serving the repositories in `repos_dir` (a

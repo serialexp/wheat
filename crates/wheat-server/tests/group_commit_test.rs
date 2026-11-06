@@ -316,6 +316,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -340,6 +341,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -351,6 +353,7 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
         b,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -454,6 +457,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -466,6 +470,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -499,6 +504,7 @@ async fn a_failed_batch_fails_the_batch_joined_onto_it() {
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -529,6 +535,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -541,6 +548,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -567,6 +575,7 @@ async fn a_committer_that_panics_fails_its_publishes_and_the_next_publish_still_
         c,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -595,6 +604,7 @@ async fn a_batch_is_joined_with_a_head_another_process_published_meanwhile() {
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -669,6 +679,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -682,6 +693,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -701,6 +713,7 @@ async fn a_publish_sent_again_while_it_is_written_waits_for_it_and_is_published_
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -732,6 +745,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -748,6 +762,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -772,6 +787,7 @@ async fn a_publish_sent_again_after_it_is_published_gets_its_own_head() {
         first,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -873,6 +889,7 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -899,6 +916,7 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
         proposed,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -931,6 +949,7 @@ async fn a_head_store_that_fences_this_host_out_fails_the_publish_unacknowledged
         false,
         false,
         announcement(&hooks, initial, proposed),
+        None,
     )
     .await
     .unwrap();
@@ -956,6 +975,7 @@ async fn a_head_store_that_fences_this_host_out_fails_the_publish_unacknowledged
         false,
         false,
         announcement(&hooks, initial, next),
+        None,
     )
     .await
     .unwrap();
@@ -983,6 +1003,7 @@ async fn a_quiesce_waits_for_the_batch_being_written_after_its_publish_went_away
         proposed,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -1023,6 +1044,7 @@ async fn a_publish_key_used_for_a_different_publish_is_refused() {
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1051,6 +1073,7 @@ async fn a_publish_key_used_for_a_different_publish_is_refused() {
             a,
             false,
             false,
+            None,
             None,
         )
         .await
@@ -1152,6 +1175,7 @@ async fn a_backward_label_move_is_refused_unless_the_publish_forces_labels() {
             force,
             force_labels,
             None,
+            None,
         )
         .await;
         if force_labels {
@@ -1191,6 +1215,7 @@ async fn forward_moves_and_new_or_deleted_labels_are_accepted() {
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap()
@@ -1228,6 +1253,7 @@ async fn forcing_labels_permits_only_its_own_publish() {
         false,
         true,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1250,6 +1276,7 @@ async fn forcing_labels_permits_only_its_own_publish() {
             false,
             false,
             None,
+            None,
         )
         .await,
         "label other would move",
@@ -1266,6 +1293,7 @@ async fn forcing_labels_permits_only_its_own_publish() {
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -1300,6 +1328,7 @@ async fn a_label_moved_differently_by_an_accepted_publish_refuses_the_publish_as
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1312,6 +1341,7 @@ async fn a_label_moved_differently_by_an_accepted_publish_refuses_the_publish_as
             deleting,
             false,
             false,
+            None,
             None,
         )
         .await,
@@ -1336,6 +1366,7 @@ async fn a_label_moved_differently_by_another_process_refuses_the_batch_as_stale
         moving,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -1370,6 +1401,7 @@ async fn a_publish_key_reused_with_a_different_force_labels_is_refused() {
         a,
         false,
         false,
+        None,
         None,
     )
     .await
@@ -1441,6 +1473,7 @@ async fn each_durable_batch_is_announced_with_what_each_publish_stored() {
         false,
         false,
         announcement(&hooks, initial, first),
+        None,
     )
     .await
     .unwrap();
@@ -1455,6 +1488,7 @@ async fn each_durable_batch_is_announced_with_what_each_publish_stored() {
         false,
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1467,6 +1501,7 @@ async fn each_durable_batch_is_announced_with_what_each_publish_stored() {
         false,
         false,
         announcement(&hooks, initial, b),
+        None,
     )
     .await
     .unwrap();

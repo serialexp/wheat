@@ -3,6 +3,30 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Found while naming published content (2026-11-07)
+
+- [ ] **A publish's delta bases come from the base view's tree, so there are
+  hardly any.** `compute_delta_base_map` (`crates/wheat-server/src/publish.rs`) diffs
+  the old and new states' `base_view` trees, but a change leaves the base view as it
+  is (`RepositoryStateRecord::base_view`), so an ordinary publish finds no base and
+  stores every changed file whole. The bases should come from the trees the changes
+  rewrite (each changed path's previous content). Measure what deltas would save on
+  a blob store before choosing. Content naming already names whatever bases the map
+  gives (`crates/wheat-server/tests/naming_test.rs`).
+- [ ] **A chunk equal to a stored delta is named without its base.** Naming a
+  publish's content (`ContentStore::needed_to_read`) does not read chunks, since
+  chunks are stored whole. But a chunk whose bytes equal a file stored earlier as a
+  delta is found stored and reused as that delta, and its base is not named. Gothab
+  records each row's delta base at put (`record_info`), so its `named` could stamp
+  those bases too; or the closure could read chunk headers, one request per chunk.
+- [ ] **A publish joined after a forced publish can bring back content no head
+  holds.** A publish names what its state adds over the head it planned against.
+  Suppose a forced publish drops content X from the head before a collection's mark
+  begins, and an earlier-planned publish then commits onto it after the mark began.
+  The union re-adds X, which nothing names, so X can be swept. The next collection
+  would find X marked but gone. Decide whether to name what a join adds over the head
+  it lands on, at accept.
+
 ## Found while placing long files (2026-11-05)
 
 - [ ] **Increment validation takes a chunked blob's manifest for the blob.**

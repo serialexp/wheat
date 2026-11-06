@@ -20,6 +20,7 @@ use crate::blocking::drive;
 use crate::commit::{self, Accepted, CommitFailure};
 use crate::connection::ConnectionError;
 use crate::hooks::{Announcement, ProposedPublish, PublishHooks};
+use crate::naming::Named;
 use crate::network::Network;
 use crate::receipt::PublishKey;
 use crate::registry::RepositoryEntry;
@@ -213,6 +214,9 @@ pub async fn handle_publish(
     }
 
     // --- Content transfer phase ---
+    // Every stamp the publish's content gets is newer than this (see
+    // `crate::naming`).
+    let planned = tokio::time::Instant::now();
     let plan = {
         let (staged, network) = (Arc::clone(&staged), entry.network.clone());
         let current = current_head.envelope;
@@ -226,15 +230,31 @@ pub async fn handle_publish(
         return reject(ws, op_id, current_head, "content identity mismatch").await;
     };
 
-    // Scoped, so the plan is not held through the commit.
-    {
-        let ContentPlan { missing, base_map } = plan;
-        if let Some(refusal) =
-            receive_content(ws, &staged, op_id, missing.into(), &base_map).await?
+    // Scoped, so the plan is not held through the commit. What the publish relies
+    // on and uploads is kept only for a network that is told it.
+    let relied = {
+        let ContentPlan {
+            missing,
+            base_map,
+            relied_on,
+            bases,
+            uploaded,
+        } = plan;
+        let mut manifests = Vec::new();
+        if let Some(refusal) = receive_content(
+            ws,
+            &staged,
+            op_id,
+            missing.into(),
+            &base_map,
+            &mut manifests,
+        )
+        .await?
         {
             return reject(ws, op_id, current_head, &refusal).await;
         }
-    }
+        (relied_on, bases, manifests, uploaded)
+    };
 
     // Nothing more is needed; the client may commit.
     send(
@@ -307,6 +327,48 @@ pub async fn handle_publish(
         }
     };
 
+    // The content the publish relies on without writing it, named before the
+    // publish joins the commit.
+    let named = match (&entry.network.naming, relied) {
+        (Some(naming), (relied_on, bases, manifests, uploaded)) => {
+            let needed = {
+                let network = entry.network.clone();
+                drive(move || async move {
+                    network
+                        .content
+                        .needed_to_read(relied_on.into_iter().chain(manifests), bases)
+                })
+                .await?
+            };
+            let named = match needed {
+                Ok(needed) => naming
+                    .named(&needed)
+                    .instrument(debug_span!("publish_name", ids = needed.len()))
+                    .await
+                    .map(|()| needed)
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let mut ids = match named {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!(op_id, error = %e, "publish: naming its content failed");
+                    let failed = CommitFailure::Failed {
+                        head: *current_head,
+                        message: format!("naming the published content failed: {e}; publish again"),
+                    };
+                    return answer(ws, op_id, key, Err(failed)).await;
+                }
+            };
+            ids.extend(uploaded);
+            Some(Named {
+                since: planned,
+                ids,
+            })
+        }
+        (None, _) => None,
+    };
+
     send(
         ws,
         &WheatProtocolMessage::PublishProgress(PublishProgressOutput {
@@ -328,6 +390,7 @@ pub async fn handle_publish(
         force,
         force_labels,
         announcement,
+        named,
     )
     .await
 }
@@ -351,6 +414,7 @@ async fn commit(
     force: bool,
     force_labels: bool,
     announcement: Option<Announcement>,
+    named: Option<Named>,
 ) -> Result<Option<RepositoryHead>, ConnectionError> {
     let accepted = commit::accept(
         entry,
@@ -361,6 +425,7 @@ async fn commit(
         force,
         force_labels,
         announcement,
+        named,
     )
     .await;
     answer(ws, op_id, key, accepted).await
@@ -708,6 +773,7 @@ async fn receive_content(
     op_id: u64,
     mut queue: VecDeque<ContentId>,
     base_map: &Arc<HashMap<ContentId, ContentId>>,
+    manifests: &mut Vec<ContentId>,
 ) -> Result<Option<String>, ConnectionError> {
     let mut arrivals = ManifestArrivals::new(MAX_ANSWER_MANIFEST_BYTES);
     // Parts and chunks are stored whole.
@@ -728,7 +794,9 @@ async fn receive_content(
             let next =
                 next.map_err(|e| ConnectionError::Internal(format!("content lookup failed: {e}")))?;
             if next.is_empty() {
-                if let Some(refusal) = store_manifests(staged, arrivals.take()).await? {
+                let held = arrivals.take();
+                manifests.extend(held.iter().map(|(id, _)| *id));
+                if let Some(refusal) = store_manifests(staged, held).await? {
                     return Ok(Some(refusal));
                 }
                 continue;
@@ -861,6 +929,12 @@ async fn store_manifests(
 struct ContentPlan {
     missing: Vec<ContentId>,
     base_map: Arc<HashMap<ContentId, ContentId>>,
+    /// When the network is told what publishes rely on ([`crate::naming`]): the
+    /// content it adds that was stored already, the bases of what it uploads, and
+    /// what it uploads, pushed or asked for.
+    relied_on: Vec<ContentId>,
+    bases: Vec<ContentId>,
+    uploaded: Vec<ContentId>,
 }
 
 /// Finds the content `proposed` adds over `current` that `network` lacks, and stages
@@ -908,10 +982,18 @@ async fn plan_content(
         .filter(|id| !existing.contains(id))
         .copied()
         .collect();
+    let relied_on: Vec<ContentId> = if network.naming.is_some() {
+        existing.into_iter().collect()
+    } else {
+        Vec::new()
+    };
     if missing.is_empty() {
         return Ok(Some(ContentPlan {
             missing,
             base_map: Arc::default(),
+            relied_on,
+            bases: Vec::new(),
+            uploaded: Vec::new(),
         }));
     }
 
@@ -919,6 +1001,15 @@ async fn plan_content(
     // the old ContentId as a delta base for each new ContentId. This
     // produces much smaller stored objects for typical edits.
     let base_map = compute_delta_base_map(staged, &reader, &current_state, &state).await;
+    let (bases, uploaded) = if network.naming.is_some() {
+        let bases = missing
+            .iter()
+            .filter_map(|id| base_map.get(id).copied())
+            .collect();
+        (bases, missing.clone())
+    } else {
+        Default::default()
+    };
 
     // Take what the client pushed; ask only for the rest. What the walk did not
     // need is dropped with `pushed`, rather than held to the commit.
@@ -940,6 +1031,9 @@ async fn plan_content(
     Ok(Some(ContentPlan {
         missing: asked,
         base_map: Arc::new(base_map),
+        relied_on,
+        bases,
+        uploaded,
     }))
 }
 

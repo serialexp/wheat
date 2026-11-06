@@ -32,21 +32,30 @@ pub fn edit(path: &str, value: &[u8]) -> RevisionEdits {
     edits([(path, value)])
 }
 
-/// Edits that write each value to its path.
+/// Edits that write each value to its path, which holds nothing yet.
 pub fn edits<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> RevisionEdits {
+    rewrites(files.into_iter().map(|(path, value)| (path, None, value)))
+}
+
+/// Edits that write each value to its path, which holds the value before it (or
+/// nothing).
+pub fn rewrites<'a>(
+    files: impl IntoIterator<Item = (&'a str, Option<&'a [u8]>, &'a [u8])>,
+) -> RevisionEdits {
     let mut revision = RevisionEdits {
         edits: Default::default(),
         transition: EditTransition::default(),
     };
-    for (path, value) in files {
+    let file = |value: &[u8]| FileValue {
+        content: ContentId::of(value),
+        kind: FileKind::Regular,
+    };
+    for (path, before, value) in files {
         let record = EditRecord::new(
             path,
             EditOperation::ExactFile {
-                expected: None,
-                replacement: Some(FileValue {
-                    content: ContentId::of(value),
-                    kind: FileKind::Regular,
-                }),
+                expected: before.map(file),
+                replacement: Some(file(value)),
             },
         )
         .unwrap();

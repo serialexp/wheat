@@ -24,6 +24,8 @@ mod embedding_test;
 mod fetch_test;
 #[path = "../group_commit_test.rs"]
 mod group_commit_test;
+#[path = "../naming_test.rs"]
+mod naming_test;
 #[path = "../protocol_test.rs"]
 mod protocol_test;
 #[path = "../publish_test.rs"]

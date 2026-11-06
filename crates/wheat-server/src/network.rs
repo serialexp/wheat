@@ -23,6 +23,7 @@ use wheat_store::{
     RepositoryStoreError, StoredObject, StoredWrite,
 };
 
+use crate::naming::ContentNaming;
 use crate::quiesce::Writers;
 
 /// A fork network's stores, shared by the repositories of it that are open.
@@ -32,7 +33,12 @@ pub struct Network(Arc<NetworkStores>);
 impl Network {
     /// A network of its own for `store`, which no other [`Network`] uses.
     pub fn new(store: Box<dyn RepositoryStore>) -> Self {
-        Self(Arc::new(NetworkStores::new(store, None)))
+        Self(Arc::new(NetworkStores::new(store, None, None)))
+    }
+
+    /// As [`Self::new`], telling `naming` the content each publish relies on.
+    pub fn with_naming(store: Box<dyn RepositoryStore>, naming: Arc<dyn ContentNaming>) -> Self {
+        Self(Arc::new(NetworkStores::new(store, Some(naming), None)))
     }
 }
 
@@ -100,6 +106,9 @@ pub struct NetworkStores {
     /// The publishes and committers writing to the store, held still by
     /// [`crate::registry::Registry::quiesce`].
     pub(crate) writers: Writers,
+    /// Told the content each publish relies on, when the content store is
+    /// collected by age.
+    pub naming: Option<Arc<dyn ContentNaming>>,
     /// Tells [`OpenNetworks`] the network closed. Fields drop in order, so it does
     /// so once the store is closed.
     _closed: Option<Closed>,
@@ -112,11 +121,16 @@ impl NetworkStores {
         self.writers.is_quiesced()
     }
 
-    fn new(store: Box<dyn RepositoryStore>, closed: Option<Closed>) -> Self {
+    fn new(
+        store: Box<dyn RepositoryStore>,
+        naming: Option<Arc<dyn ContentNaming>>,
+        closed: Option<Closed>,
+    ) -> Self {
         Self {
             content: store.content_store(),
             store,
             writers: Writers::default(),
+            naming,
             _closed: closed,
         }
     }
@@ -125,12 +139,15 @@ impl NetworkStores {
 /// The networks an opener has open, by key (a network ID, say).
 pub struct OpenNetworks<K> {
     slots: Arc<Mutex<HashMap<K, Arc<Slot>>>>,
+    /// Set on every network opened.
+    naming: Option<Arc<dyn ContentNaming>>,
 }
 
 impl<K> Default for OpenNetworks<K> {
     fn default() -> Self {
         Self {
             slots: Arc::default(),
+            naming: None,
         }
     }
 }
@@ -139,6 +156,18 @@ impl<K> Clone for OpenNetworks<K> {
     fn clone(&self) -> Self {
         Self {
             slots: Arc::clone(&self.slots),
+            naming: self.naming.clone(),
+        }
+    }
+}
+
+impl<K> OpenNetworks<K> {
+    /// Networks that tell `naming` the content each publish relies on.
+    #[must_use]
+    pub fn with_naming(naming: Arc<dyn ContentNaming>) -> Self {
+        Self {
+            slots: Arc::default(),
+            naming: Some(naming),
         }
     }
 }
@@ -210,7 +239,7 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> OpenNetworks<K> {
             let key = key.clone();
             move || close(&slots, &slot, &key)
         })));
-        let stores = Arc::new(NetworkStores::new(store, Some(closed)));
+        let stores = Arc::new(NetworkStores::new(store, self.naming.clone(), Some(closed)));
         *state = Some(Arc::downgrade(&stores));
         Ok(Network(stores))
     }
