@@ -15,6 +15,7 @@ use wheat_store::{
 use crate::{
     authoring_metadata::display_timestamp,
     frontier_service::LabelFrontiers,
+    hidden_labels::LabelFilter,
     label_move,
     local::{LocalRepository, runtime},
     outcome::{CliFailure, Success},
@@ -70,6 +71,8 @@ pub struct LabelList {
     pub schema_version: u32,
     pub head: HeadDocument,
     pub labels: Vec<LabelEntry>,
+    /// Hidden labels the listing left out ([`crate::hidden_labels`]).
+    pub hidden_not_listed: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -100,8 +103,9 @@ pub fn parse_expected_head(value: &str) -> Result<RepositoryHead> {
     })
 }
 
-pub fn list(repository: &LocalRepository) -> Result<Success> {
-    let document = runtime()?.block_on(load(repository))?;
+/// Lists the labels `filter` shows, in name order.
+pub fn list(repository: &LocalRepository, filter: &LabelFilter) -> Result<Success> {
+    let document = runtime()?.block_on(load(repository, filter))?;
     let mut human = String::new();
     for label in &document.labels {
         write!(human, "{}\t{}", label.name, label.view)?;
@@ -117,6 +121,14 @@ pub fn list(repository: &LocalRepository) -> Result<Success> {
             )?;
         }
         human.push('\n');
+    }
+    match document.hidden_not_listed {
+        0 => {}
+        1 => human.push_str("1 hidden label not listed; --hidden lists it\n"),
+        count => writeln!(
+            human,
+            "{count} hidden labels not listed; --hidden lists them"
+        )?,
     }
     Success::new("labels", &document, human)
 }
@@ -378,19 +390,21 @@ fn ensure_expected(expected: RepositoryHead, observed: RepositoryHead) -> Result
     Ok(())
 }
 
-async fn load(repository: &LocalRepository) -> Result<LabelList> {
+async fn load(repository: &LocalRepository, filter: &LabelFilter) -> Result<LabelList> {
     let head = repository.heads.read()?;
     let reader = RepositoryReader::new(&repository.objects, &repository.content);
     let envelope = reader.envelope(head.envelope).await?;
     let manifest = reader.view_label_manifest(envelope.labels).await?;
-    let labels = manifest
+    let labels: Vec<LabelEntry> = manifest
         .labels
         .iter()
+        .filter(|(name, _)| filter.shows(name))
         .map(|(name, label)| LabelEntry::new(name.clone(), label))
         .collect::<Result<_>>()?;
     Ok(LabelList {
         schema_version: 1,
         head: head.into(),
+        hidden_not_listed: manifest.labels.len() - labels.len(),
         labels,
     })
 }

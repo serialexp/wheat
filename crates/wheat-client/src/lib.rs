@@ -14,6 +14,7 @@ pub mod dot_git;
 pub mod edit_move;
 pub mod frontier_service;
 pub mod git_pull;
+pub mod hidden_labels;
 pub mod history;
 pub mod ignore_import;
 pub mod import_trace;

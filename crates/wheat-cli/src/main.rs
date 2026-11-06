@@ -42,8 +42,8 @@ use wheat_client::outcome::{CliFailure, OutputFormat, Success};
 use wheat_client::{
     active_changes, authoring, authoring_metadata, blame_inspection, conflict_inspection,
     credential, diff_render, discovery, dot_git, edit_move, frontier_service, git_pull,
-    ignore_import, import_trace, inspection, label_move, label_service, local, log_inspection,
-    materialization, prompt, remote, remote_config, repack, rewrite_transaction,
+    hidden_labels, ignore_import, import_trace, inspection, label_move, label_service, local,
+    log_inspection, materialization, prompt, remote, remote_config, repack, rewrite_transaction,
     selection_recovery, squash, squash_attribution, store_analyze, store_lookup, workspace,
     workspace_clone, workspace_diff, workspace_lifecycle, workspace_metadata,
     workspace_registry_service, workspace_scan, workspace_status,
@@ -118,8 +118,10 @@ enum Command {
     Blame(BlameArgs),
     /// List changes active relative to this workspace's authoring basis.
     Changes,
-    /// List native short labels in deterministic name order.
-    Labels,
+    /// List native short labels in deterministic name order. Hidden labels, named
+    /// with a leading dot, are left out unless `--hidden` is given or the remote
+    /// shows them (`wheat remote labels`).
+    Labels(LabelsArgs),
     /// Create, rename, or delete native short labels.
     #[command(subcommand)]
     Label(LabelCommand),
@@ -181,6 +183,31 @@ enum Command {
     Pull(NativePullArgs),
     /// Publish local state to a wheat-server via the native protocol.
     Publish(NativePublishArgs),
+    /// Settings of this store's native remote.
+    #[command(subcommand)]
+    Remote(RemoteCommand),
+}
+
+#[derive(Debug, Args)]
+struct LabelsArgs {
+    /// List hidden labels too.
+    #[arg(long)]
+    hidden: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum RemoteCommand {
+    /// List, add or remove the glob patterns of hidden labels (named with a leading
+    /// dot) that `wheat labels` lists anyway. `*` stays within one `/`-separated
+    /// component and `**` crosses them: `.gothab/pr/*`.
+    Labels {
+        /// Show the hidden labels this pattern matches.
+        #[arg(long, value_name = "GLOB")]
+        add: Vec<String>,
+        /// Stop showing them by this pattern.
+        #[arg(long, value_name = "GLOB")]
+        remove: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -736,6 +763,10 @@ struct NativeCloneArgs {
     url: String,
     /// Workspace directory. Defaults to a directory named after the repository.
     workspace: Option<PathBuf>,
+    /// Show the hidden labels (named with a leading dot) this glob pattern matches;
+    /// kept on the remote binding (`wheat remote labels`).
+    #[arg(long = "label", value_name = "GLOB")]
+    labels: Vec<String>,
     #[command(flatten)]
     dot_git: DotGitArgs,
 }
@@ -902,7 +933,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Log(_) => "log",
         Command::Blame(_) => "blame",
         Command::Changes => "changes",
-        Command::Labels => "labels",
+        Command::Labels(_) => "labels",
         Command::Label(LabelCommand::Create { .. }) => "label.create",
         Command::Label(LabelCommand::Rename { .. }) => "label.rename",
         Command::Label(LabelCommand::Move { .. }) => "label.move",
@@ -935,6 +966,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Fetch(_) => "fetch",
         Command::Pull(_) => "pull",
         Command::Publish(_) => "publish",
+        Command::Remote(RemoteCommand::Labels { .. }) => "remote.labels",
     }
 }
 
@@ -1151,12 +1183,20 @@ fn execute(cli: Cli) -> Result<Success> {
             let human = active_changes::render_human(&document)?;
             Success::new("changes", &document, human)
         }
-        Command::Labels => {
+        Command::Labels(arguments) => {
             let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
             let local = open(&store_root)?;
             let _operation =
                 rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
-            label_service::list(&local)
+            let filter = hidden_labels::LabelFilter::of_store(&store_root, arguments.hidden)?;
+            label_service::list(&local, &filter)
+        }
+        Command::Remote(RemoteCommand::Labels { add, remove }) => {
+            let store_root = resolve_store_root(&requested_workspace, cli.store.as_deref())?;
+            let local = open(&store_root)?;
+            let _operation =
+                rewrite_transaction::StoreOperationGuard::acquire(&store_root, &local)?;
+            hidden_labels::edit_shown(&store_root, &add, &remove)
         }
         Command::Label(arguments) => {
             let explicit_store = cli.store.as_deref().map(canonical_store_path).transpose()?;
@@ -2773,7 +2813,7 @@ fn native_clone(
                 ));
             }
         }
-        return workspace_clone::clone_local(&source, &workspace_root, dot_git);
+        return workspace_clone::clone_local(&source, &workspace_root, &arguments.labels, dot_git);
     }
     let parsed = remote::parse_wheat_url(&arguments.url)?;
 
@@ -2788,6 +2828,8 @@ fn native_clone(
     });
 
     ensure_fresh_workspace(&workspace_root)?;
+    // Checked before anything is created.
+    let filter = hidden_labels::LabelFilter::new(&shown_patterns(&arguments.labels), false)?;
 
     let existing_store = if let Some(store) = explicit_store {
         let store = canonical_store_path(store)?;
@@ -2803,7 +2845,12 @@ fn native_clone(
         store_lookup::find_remote_store(&store_home()?, &parsed)?
     };
     if let Some(store_root) = existing_store {
-        return workspace_clone::clone_local(&store_root, &workspace_root, dot_git);
+        return workspace_clone::clone_local(
+            &store_root,
+            &workspace_root,
+            &arguments.labels,
+            dot_git,
+        );
     }
 
     // Ask the helper before creating anything, so a failure leaves no store.
@@ -2852,16 +2899,7 @@ fn native_clone(
         ));
 
         remote::close(&mut session).await?;
-        // The active label is main when the remote has one, else its first label, else
-        // main for an empty repository.
-        let label = if labels.contains_key("main") {
-            "main".to_string()
-        } else {
-            labels
-                .into_keys()
-                .next()
-                .unwrap_or_else(|| "main".to_string())
-        };
+        let label = filter.default_label(labels.keys());
         Ok::<_, anyhow::Error>((state, label, fetched, content_count))
     })?;
     // Release the packed store's process lock; the workspace reopens the store below.
@@ -2879,7 +2917,8 @@ fn native_clone(
     let canonical_store = canonical_store_path(&store_root)?;
 
     // Write remote config.
-    let remote_cfg = remote_config::RemoteConfig::new(&arguments.url, &head);
+    let mut remote_cfg = remote_config::RemoteConfig::new(&arguments.url, &head);
+    remote_cfg.shown_hidden_labels = shown_patterns(&arguments.labels);
     remote_cfg.write(&store_root)?;
 
     // Initialize workspace and materialize. If multiple descendant
@@ -2949,6 +2988,12 @@ fn native_clone(
         }),
         human,
     )
+}
+
+/// `patterns` as a remote binding keeps them: sorted, without repeats.
+fn shown_patterns(patterns: &[String]) -> Vec<String> {
+    let patterns: std::collections::BTreeSet<&String> = patterns.iter().collect();
+    patterns.into_iter().cloned().collect()
 }
 
 fn native_fetch(

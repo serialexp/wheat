@@ -8,6 +8,7 @@ use crate::{
     discovery::{canonical_store_path, discover_workspace},
     dot_git::DotGitGate,
     frontier_service,
+    hidden_labels::{self, LabelFilter},
     local::{open, runtime},
     materialization::materialize_resolved,
     outcome::Success,
@@ -16,7 +17,14 @@ use crate::{
     workspace_registry_service,
 };
 
-pub fn clone_local(source: &Path, workspace_root: &Path, dot_git: DotGitGate) -> Result<Success> {
+/// A new workspace on the store at or of `source`. `shown` adds hidden label patterns
+/// to the store's remote binding first ([`crate::hidden_labels`]).
+pub fn clone_local(
+    source: &Path,
+    workspace_root: &Path,
+    shown: &[String],
+    dot_git: DotGitGate,
+) -> Result<Success> {
     ensure_fresh_workspace(workspace_root)?;
     let store_root = match discover_workspace(source) {
         Ok(context) => context.store_root,
@@ -35,18 +43,17 @@ pub fn clone_local(source: &Path, workspace_root: &Path, dot_git: DotGitGate) ->
     let repository = open(&store_root)?;
     let _operation =
         crate::rewrite_transaction::StoreOperationGuard::acquire(&store_root, &repository)?;
+    if !shown.is_empty() {
+        hidden_labels::update_shown(&store_root, shown, &[])?;
+    }
+    let filter = LabelFilter::of_store(&store_root, false)?;
     let head = repository.heads.read()?;
     let rt = runtime()?;
     let (label, resolved) = rt.block_on(async {
         let reader = RepositoryReader::new(&repository.objects, &repository.content);
         let envelope = reader.envelope(head.envelope).await?;
         let labels = reader.view_label_manifest(envelope.labels).await?;
-        let label = labels
-            .labels
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "main".to_owned());
+        let label = filter.default_label(labels.labels.keys());
         let resolved = match frontier_service::resolve(&repository, &label, None).await {
             Ok(resolved) => resolved,
             Err(_) => {

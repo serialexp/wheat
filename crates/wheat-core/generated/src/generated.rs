@@ -11385,24 +11385,26 @@ impl From<WorkspacePinV1Input> for WorkspacePinV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RemoteConfigV1Input {
+pub struct RemoteConfigV2Input {
     pub display_url: std::string::String,
     pub canonical_identity: std::string::String,
     pub head: RepositoryRootV1,
+    pub shown_hidden_labels: Vec<std::string::String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RemoteConfigV1Output {
+pub struct RemoteConfigV2Output {
     pub magic: u32,
     pub version: u16,
     pub display_url: std::string::String,
     pub canonical_identity: std::string::String,
     pub head: RepositoryRootV1,
+    pub shown_hidden_labels: Vec<std::string::String>,
 }
 
-pub type RemoteConfigV1 = RemoteConfigV1Output;
+pub type RemoteConfigV2 = RemoteConfigV2Output;
 
-impl RemoteConfigV1Input {
+impl RemoteConfigV2Input {
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
         self.encode()
     }
@@ -11415,7 +11417,7 @@ impl RemoteConfigV1Input {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_u32_be(1464357443);
-        encoder.write_u16_be(1);
+        encoder.write_u16_be(2);
         encoder.write_varlength(self.display_url.len() as u64, "leb128_canonical")?;
         let string_bytes: &[u8] = self.display_url.as_bytes();
         for &b in string_bytes.iter() {
@@ -11427,11 +11429,18 @@ impl RemoteConfigV1Input {
             encoder.write_byte(b);
         }
         self.head.encode_into(encoder)?;
+        encoder.write_varlength(self.shown_hidden_labels.len() as u64, "leb128_canonical")?;
+        for item in &self.shown_hidden_labels {
+            encoder.write_varlength(item.len() as u64, "leb128_canonical")?;
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
         Ok(())
     }
 }
 
-impl RemoteConfigV1Output {
+impl RemoteConfigV2Output {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
         Self::decode_with_decoder(&mut decoder)
@@ -11446,9 +11455,9 @@ impl RemoteConfigV1Output {
             )));
         }
         let version = decoder.read_u16_be()?;
-        if version != 1u16 {
+        if version != 2u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 1, got {}",
+                "expected 2, got {}",
                 version
             )));
         }
@@ -11461,44 +11470,56 @@ impl RemoteConfigV1Output {
         let canonical_identity = std::string::String::from_utf8(bytes)
             .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let head = RepositoryRootV1::decode_with_decoder(decoder)?;
+        let length = decoder.read_varlength("leb128_canonical")? as usize;
+        let mut shown_hidden_labels = Vec::with_capacity(decoder.capacity_hint(length));
+        for _ in 0..length {
+            let str_len = decoder.read_varlength("leb128_canonical")? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes)
+                .map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            shown_hidden_labels.push(item);
+        }
         Ok(Self {
             magic,
             version,
             display_url,
             canonical_identity,
             head,
+            shown_hidden_labels,
         })
     }
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
-        RemoteConfigV1Input::from(self.clone()).encode_measuring()
+        RemoteConfigV2Input::from(self.clone()).encode_measuring()
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        RemoteConfigV1Input::from(self.clone()).encode()
+        RemoteConfigV2Input::from(self.clone()).encode()
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        RemoteConfigV1Input::from(self.clone()).encode_into(encoder)
+        RemoteConfigV2Input::from(self.clone()).encode_into(encoder)
     }
 }
 
-impl From<RemoteConfigV1Output> for RemoteConfigV1Input {
-    fn from(o: RemoteConfigV1Output) -> Self {
+impl From<RemoteConfigV2Output> for RemoteConfigV2Input {
+    fn from(o: RemoteConfigV2Output) -> Self {
         Self {
             display_url: o.display_url,
             canonical_identity: o.canonical_identity,
             head: o.head,
+            shown_hidden_labels: o.shown_hidden_labels,
         }
     }
 }
 
-impl From<RemoteConfigV1Input> for RemoteConfigV1Output {
-    fn from(i: RemoteConfigV1Input) -> Self {
+impl From<RemoteConfigV2Input> for RemoteConfigV2Output {
+    fn from(i: RemoteConfigV2Input) -> Self {
         Self {
             magic: 1464357443u32,
-            version: 1u16,
+            version: 2u16,
             display_url: i.display_url,
             canonical_identity: i.canonical_identity,
             head: i.head,
+            shown_hidden_labels: i.shown_hidden_labels,
         }
     }
 }

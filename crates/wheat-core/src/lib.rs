@@ -31,7 +31,7 @@ mod wire;
 
 pub use branch_records::{
     ExpectedLabel, LabelAnnotation, MAX_LABEL_ANNOTATION_MESSAGE_BYTES, MAX_LABELS,
-    RepositoryEnvelopeRecord, ViewLabel, ViewLabelManifestRecord,
+    RepositoryEnvelopeRecord, ViewLabel, ViewLabelManifestRecord, is_hidden_label,
 };
 pub use collection::{
     ApplicationMapChild, ApplicationMapNode, ChangeMapChild, ChangeMapNode, ChangeSetChild,

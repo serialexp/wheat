@@ -6157,6 +6157,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "futures",
+ "globset",
  "libc",
  "rusqlite",
  "rustls",

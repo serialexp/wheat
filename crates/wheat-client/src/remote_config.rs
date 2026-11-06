@@ -34,6 +34,9 @@ pub struct RemoteConfig {
     pub last_fetched_generation: u64,
     /// Hex-encoded envelope ID of the exact last-observed remote head.
     pub last_fetched_envelope: String,
+    /// Glob patterns of the hidden labels label listings show, sorted
+    /// ([`crate::hidden_labels`]).
+    pub shown_hidden_labels: Vec<String>,
 }
 
 impl RemoteConfig {
@@ -53,6 +56,7 @@ impl RemoteConfig {
             canonical_identity: remote.canonical_identity().to_owned(),
             last_fetched_generation: head.generation,
             last_fetched_envelope: head.envelope.to_string(),
+            shown_hidden_labels: Vec::new(),
         })
     }
 
@@ -124,11 +128,20 @@ impl RemoteConfig {
                 path.display()
             );
         }
+        if !stored.shown_hidden_labels.is_sorted_by(|a, b| a < b) {
+            bail!(
+                "hidden label patterns are not sorted and unique in {}",
+                path.display()
+            );
+        }
+        crate::hidden_labels::compile(&stored.shown_hidden_labels)
+            .with_context(|| format!("invalid hidden label patterns in {}", path.display()))?;
         Ok(Some(Self {
             url: stored.display_url,
             canonical_identity: stored.canonical_identity,
             last_fetched_generation: stored.head.generation,
             last_fetched_envelope: stored.head.envelope.to_string(),
+            shown_hidden_labels: stored.shown_hidden_labels,
         }))
     }
 
@@ -139,6 +152,10 @@ impl RemoteConfig {
             bail!("canonical remote identity does not match display URL");
         }
         let head = self.last_fetched_head()?;
+        if !self.shown_hidden_labels.is_sorted_by(|a, b| a < b) {
+            bail!("hidden label patterns must be sorted and unique");
+        }
+        crate::hidden_labels::compile(&self.shown_hidden_labels)?;
 
         let data = encode_remote_config(&RemoteConfigRecord {
             display_url: self.url.clone(),
@@ -147,6 +164,7 @@ impl RemoteConfig {
                 generation: head.generation,
                 envelope: head.envelope,
             },
+            shown_hidden_labels: self.shown_hidden_labels.clone(),
         })?;
         if data.len() as u64 > MAX_REMOTE_CONFIG_BYTES {
             bail!("encoded remote config exceeds {MAX_REMOTE_CONFIG_BYTES} bytes");
@@ -204,7 +222,8 @@ mod tests {
     fn writes_config_and_round_trips_exact_head() {
         let directory = tempfile::tempdir().unwrap();
         let remote = parse_wheat_url("wheat+tls://EXAMPLE.com/Owner/Repo").unwrap();
-        let config = RemoteConfig::new("wheat+tls://EXAMPLE.com/Owner/Repo", &head(7));
+        let mut config = RemoteConfig::new("wheat+tls://EXAMPLE.com/Owner/Repo", &head(7));
+        config.shown_hidden_labels = vec![".gothab/**".to_owned(), ".pr/*".to_owned()];
         assert!(config.has_same_identity(&remote));
         config.write(directory.path()).unwrap();
 
@@ -217,6 +236,7 @@ mod tests {
         );
         assert_eq!(stored.head.generation, 7);
         assert_eq!(stored.head.envelope, head(7).envelope);
+        assert_eq!(stored.shown_hidden_labels, [".gothab/**", ".pr/*"]);
 
         let loaded = RemoteConfig::read(directory.path()).unwrap().unwrap();
         assert_eq!(loaded, config);
@@ -243,6 +263,7 @@ mod tests {
                     generation: 1,
                     envelope: head(1).envelope,
                 },
+                shown_hidden_labels: Vec::new(),
             })
             .unwrap()
         };

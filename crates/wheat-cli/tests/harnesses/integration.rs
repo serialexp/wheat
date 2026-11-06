@@ -56,6 +56,8 @@ mod git_push_tag;
 mod git_round_trip;
 #[path = "../git_wide_directory.rs"]
 mod git_wide_directory;
+#[path = "../hidden_labels.rs"]
+mod hidden_labels;
 #[path = "../immutable_diff.rs"]
 mod immutable_diff;
 #[path = "../integrate.rs"]

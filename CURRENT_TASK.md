@@ -14,13 +14,13 @@ it together later (v0.3.5), only on Bart's go-ahead.
   the embedder opens a stage, builds into it, then submits it. Still open: what a
   build write's receipt binds the key to (an embedder digest, the key only, or an
   operation digest).
-- Hidden labels (leading dot: not fetched by clone, fetch or pull unless asked, still
-  GC roots): Bart chose (2026-11-07) client-side filtering, asked for with a
-  persisted `--label PATTERN` on the remote binding. Labels travel only inside
-  the envelope's manifest; publish sends the whole manifest against `last_fetched`,
-  so a client that drops hidden labels must put them back, as last fetched, before a
-  fetch union and in a publish. Choices: client-side vs server-side filtering, and a
-  persisted `--label PATTERN` on the remote binding vs a one-off flag vs config.
+- Hidden labels: done. Bart chose (2026-11-07) that they stay in the local head
+  exactly as on the remote (clone, fetch and publish move them as before) and are
+  only left out of `wheat labels`, which lists them with `--hidden`; glob patterns
+  on the remote binding (`wheat clone --label GLOB`, `wheat remote labels
+  --add/--remove GLOB`) list what they match; naming one directly always works.
+  `remote.meta` is now `RemoteConfigV2` (`shown_hidden_labels`); older files no
+  longer decode.
 - GC: Gothab content first. Designed in `wheat-network-maintenance.md`, "Gothab's
   content (2026-11-06)"; G1–G4 decided through walrus (last-named time, stamped at
   put, references recorded at put, mark per host and sweep in Gothab's worker).
@@ -34,12 +34,11 @@ it together later (v0.3.5), only on Bart's go-ahead.
   isn't named with its base, a join after a forced publish can re-add unnamed
   content, publish delta bases come from the base view (so there are hardly any), and
   a store failure during upload drops the connection instead of answering "publish
-  again".
+  again" (fixed, db896bc).
 - Secret-sweep API (walrus's request, Bart okayed 2026-11-07): done, 86c9e4e
   (`RepositoryBrowser::state_trees`/`state_edits`, bench case `state_scan`); walrus
   told.
-- Next, in order: a store failure during upload answers "publish again" (Bart: fix
-  now), hidden labels, then the two-step stage.
+- Next: the two-step stage.
 
 ## 2026-10-30/31: Wheat hardening for the Gothab integration (@calm-lynx)
 

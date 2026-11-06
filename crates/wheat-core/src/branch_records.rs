@@ -95,6 +95,14 @@ impl From<ViewId> for ViewLabel {
 /// built or decoded, so whoever receives one can read it whole.
 pub const MAX_LABELS: usize = 10_000;
 
+/// Whether `name` is a hidden label, one named with a leading dot (`.gothab/pr/12`).
+/// A hidden label is a label like any other: published, fetched, joined, and a root
+/// of what a repository keeps. Clients just don't list it unless asked to.
+#[must_use]
+pub fn is_hidden_label(name: &str) -> bool {
+    name.starts_with('.')
+}
+
 /// Canonical mapping from native labels to repository views.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewLabelManifestRecord {

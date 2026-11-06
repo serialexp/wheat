@@ -370,13 +370,14 @@ pub struct WorkspacePinRecord {
     pub pending_repository_cas: Option<PendingRepositoryCasRecord>,
 }
 
-/// `remote.meta` in a store: the remote it talks to and the remote head it last
-/// observed.
+/// `remote.meta` in a store: the remote it talks to, the remote head it last
+/// observed, and the glob patterns of hidden labels that label listings show.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteConfigRecord {
     pub display_url: String,
     pub canonical_identity: String,
     pub head: RepositoryRootRecord,
+    pub shown_hidden_labels: Vec<String>,
 }
 
 fn digest(bytes: [u8; 32]) -> wire::Digest256 {
@@ -1224,21 +1225,23 @@ pub fn decode_workspace_pin(bytes: &[u8]) -> Result<WorkspacePinRecord, StoreRec
 
 pub fn encode_remote_config(record: &RemoteConfigRecord) -> Result<Vec<u8>, StoreRecordError> {
     encoded(
-        wire::RemoteConfigV1Input {
+        wire::RemoteConfigV2Input {
             display_url: record.display_url.clone(),
             canonical_identity: record.canonical_identity.clone(),
             head: root_wire(record.head),
+            shown_hidden_labels: record.shown_hidden_labels.clone(),
         }
         .encode(),
     )
 }
 pub fn decode_remote_config(bytes: &[u8]) -> Result<RemoteConfigRecord, StoreRecordError> {
-    let w = wire::RemoteConfigV1::decode(bytes).map_err(decode_error)?;
+    let w = wire::RemoteConfigV2::decode(bytes).map_err(decode_error)?;
     let reencoded = w.encode();
     let record = RemoteConfigRecord {
         display_url: w.display_url,
         canonical_identity: w.canonical_identity,
         head: root_domain(w.head)?,
+        shown_hidden_labels: w.shown_hidden_labels,
     };
     checked(bytes, record, reencoded)
 }

@@ -1346,15 +1346,17 @@
         { name: "pending_repository_cas", type: "optional", value_type: "PendingRepositoryCasV1" },
       ],
     },
-    // `remote.meta` in a store: the remote it fetches from and publishes to, and
-    // the exact remote head it last observed.
-    RemoteConfigV1: {
+    // `remote.meta` in a store: the remote it fetches from and publishes to, the
+    // exact remote head it last observed, and the glob patterns of the hidden labels
+    // (named with a leading dot) that label listings show anyway.
+    RemoteConfigV2: {
       sequence: [
         { name: "magic", type: "uint32", const: 0x57485243 },
-        { name: "version", type: "uint16", const: 1 },
+        { name: "version", type: "uint16", const: 2 },
         { name: "display_url", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "canonical_identity", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
         { name: "head", type: "RepositoryRootV1" },
+        { name: "shown_hidden_labels", type: "array", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", items: { type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" } },
       ],
     },
   },

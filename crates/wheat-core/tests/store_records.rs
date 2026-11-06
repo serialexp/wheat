@@ -375,8 +375,9 @@ fn pin(full: bool) -> WorkspacePinRecord {
 fn tampered(bytes: &[u8]) -> [Vec<u8>; 2] {
     let mut trailing = bytes.to_vec();
     trailing.push(0);
+    // One past the record's own version, which no decoder accepts.
     let mut version = bytes.to_vec();
-    version[5] = 2;
+    version[5] += 1;
     [trailing, version]
 }
 
@@ -529,6 +530,7 @@ fn remote_config_round_trips_and_refuses_tampering() {
         display_url: "wheat://example.com/team/repo".into(),
         canonical_identity: "wheat://example.com:443/team/repo".into(),
         head: root(3),
+        shown_hidden_labels: vec![".gothab/pr/*".into()],
     };
     let bytes = encode_remote_config(&record).unwrap();
     assert_eq!(decode_remote_config(&bytes).unwrap(), record);
@@ -558,6 +560,7 @@ fn client_control_records_have_distinct_magics() {
             display_url: String::new(),
             canonical_identity: String::new(),
             head: root(1),
+            shown_hidden_labels: Vec::new(),
         })
         .unwrap(),
         encode_repository_head(&RepositoryHeadRecord {
