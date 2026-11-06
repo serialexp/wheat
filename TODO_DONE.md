@@ -2,6 +2,15 @@
 
 Finished items, moved here from `TODO.md` under the same headings.
 
+## Found while naming published content (2026-11-07)
+
+- `[x]` **A store failure during a publish's upload drops the connection.** A store
+  failure while a publish uploads (a stage written early, a manifest stored, a read)
+  is now answered with the error status and "publish again", as one at commit is;
+  only a broken connection or protocol ends the session. The store's own reason is
+  kept in the message, which used to say only "content storage failed".
+  `naming_test::a_publish_whose_upload_cannot_be_stored_is_refused_to_be_sent_again`.
+
 ## Hosting on Gothab (2026-10-26)
 
 - `[x]` **A label's changes in order, read on the server.** Gothab's history pages

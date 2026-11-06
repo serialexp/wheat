@@ -19,6 +19,7 @@ use crate::access::Principal;
 use crate::blocking::drive;
 use crate::commit::{self, Accepted, CommitFailure};
 use crate::connection::ConnectionError;
+use crate::error_text::chain;
 use crate::hooks::{Announcement, ProposedPublish, PublishHooks};
 use crate::naming::Named;
 use crate::network::Network;
@@ -200,7 +201,7 @@ pub async fn handle_publish(
     ));
 
     // --- Object transfer phase ---
-    if let Some(refusal) = receive_objects(
+    let received = receive_objects(
         ws,
         &staged,
         op_id,
@@ -208,9 +209,11 @@ pub async fn handle_publish(
         proposed_envelope_id,
         pushed.objects,
     )
-    .await?
-    {
-        return reject(ws, op_id, current_head, &refusal).await;
+    .await;
+    match received {
+        Ok(None) => {}
+        Ok(Some(refusal)) => return reject(ws, op_id, current_head, &refusal).await,
+        Err(error) => return upload_failed(ws, op_id, key, current_head, error).await,
     }
 
     // --- Content transfer phase ---
@@ -224,7 +227,13 @@ pub async fn handle_publish(
         drive(move || async move {
             plan_content(&staged, &network, current, proposed_envelope_id, pushed).await
         })
-        .await??
+        .await
+        .map_err(ConnectionError::from)
+        .flatten()
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => return upload_failed(ws, op_id, key, current_head, error).await,
     };
     let Some(plan) = plan else {
         return reject(ws, op_id, current_head, "content identity mismatch").await;
@@ -241,7 +250,7 @@ pub async fn handle_publish(
             uploaded,
         } = plan;
         let mut manifests = Vec::new();
-        if let Some(refusal) = receive_content(
+        let received = receive_content(
             ws,
             &staged,
             op_id,
@@ -249,9 +258,11 @@ pub async fn handle_publish(
             &base_map,
             &mut manifests,
         )
-        .await?
-        {
-            return reject(ws, op_id, current_head, &refusal).await;
+        .await;
+        match received {
+            Ok(None) => {}
+            Ok(Some(refusal)) => return reject(ws, op_id, current_head, &refusal).await,
+            Err(error) => return upload_failed(ws, op_id, key, current_head, error).await,
         }
         (relied_on, bases, manifests, uploaded)
     };
@@ -294,11 +305,14 @@ pub async fn handle_publish(
                         .await
                         .map_err(|e| e.to_string())
                 })
-                .await?
+                .await
             };
             let labels = match read {
-                Ok(labels) => labels,
-                Err(e) => {
+                Ok(Ok(labels)) => labels,
+                Err(error) => {
+                    return upload_failed(ws, op_id, key, current_head, error.into()).await;
+                }
+                Ok(Err(e)) => {
                     let message = format!("cannot compare with the head this publish names: {e}");
                     return reject(ws, op_id, current_head, &message).await;
                 }
@@ -338,16 +352,19 @@ pub async fn handle_publish(
                         .content
                         .needed_to_read(relied_on.into_iter().chain(manifests), bases)
                 })
-                .await?
+                .await
             };
             let named = match needed {
-                Ok(needed) => naming
+                Err(error) => {
+                    return upload_failed(ws, op_id, key, current_head, error.into()).await;
+                }
+                Ok(Ok(needed)) => naming
                     .named(&needed)
                     .instrument(debug_span!("publish_name", ids = needed.len()))
                     .await
                     .map(|()| needed)
                     .map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
+                Ok(Err(e)) => Err(e.to_string()),
             };
             let mut ids = match named {
                 Ok(ids) => ids,
@@ -480,6 +497,26 @@ async fn answer(
         }
         Err(CommitFailure::Internal(message)) => Err(ConnectionError::Internal(message)),
     }
+}
+
+/// Answers a publish whose upload failed. A failure of the store (an early stage
+/// write, a manifest, a read) leaves nothing of the publish kept, so the client is
+/// told to send it again; a broken connection or protocol ends the session.
+async fn upload_failed(
+    ws: &mut impl Transport,
+    op_id: u64,
+    key: PublishKey,
+    head: &RepositoryHead,
+    error: ConnectionError,
+) -> Result<Option<RepositoryHead>, ConnectionError> {
+    let ConnectionError::Internal(message) = error else {
+        return Err(error);
+    };
+    let failed = CommitFailure::Failed {
+        head: *head,
+        message: format!("{message}; publish again"),
+    };
+    answer(ws, op_id, key, Err(failed)).await
 }
 
 /// Send the publish back as stale: the client must fetch first.
@@ -791,8 +828,9 @@ async fn receive_content(
                 .await?
             };
             arrivals = back;
-            let next =
-                next.map_err(|e| ConnectionError::Internal(format!("content lookup failed: {e}")))?;
+            let next = next.map_err(|e| {
+                ConnectionError::Internal(format!("content lookup failed: {}", chain(&e)))
+            })?;
             if next.is_empty() {
                 let held = arrivals.take();
                 manifests.extend(held.iter().map(|(id, _)| *id));
@@ -915,7 +953,8 @@ async fn store_manifests(
                 }
                 Err(error) => {
                     return Err(ConnectionError::Internal(format!(
-                        "failed to store the manifest of {id}: {error}"
+                        "failed to store the manifest of {id}: {}",
+                        chain(&error)
                     )));
                 }
             }
@@ -948,22 +987,18 @@ async fn plan_content(
     mut pushed: HashMap<ContentId, Vec<u8>>,
 ) -> Result<Option<ContentPlan>, ConnectionError> {
     let reader = RepositoryReader::new(staged, staged.content());
-    let envelope_record = reader
-        .envelope(proposed)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed envelope: {e}")))?;
-    let state = reader
-        .state(envelope_record.state)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read proposed state: {e}")))?;
-    let current_envelope = reader
-        .envelope(current)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read current envelope: {e}")))?;
-    let current_state = reader
-        .state(current_envelope.state)
-        .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to read current state: {e}")))?;
+    let envelope_record = reader.envelope(proposed).await.map_err(|e| {
+        ConnectionError::Internal(format!("failed to read proposed envelope: {}", chain(&e)))
+    })?;
+    let state = reader.state(envelope_record.state).await.map_err(|e| {
+        ConnectionError::Internal(format!("failed to read proposed state: {}", chain(&e)))
+    })?;
+    let current_envelope = reader.envelope(current).await.map_err(|e| {
+        ConnectionError::Internal(format!("failed to read current envelope: {}", chain(&e)))
+    })?;
+    let current_state = reader.state(current_envelope.state).await.map_err(|e| {
+        ConnectionError::Internal(format!("failed to read current state: {}", chain(&e)))
+    })?;
 
     // A head is only accepted once all its content is stored, so only content the
     // current head lacks can be missing (transition validation relies on the same).
@@ -972,11 +1007,12 @@ async fn plan_content(
     let candidates = wheat_store::ContentSetStore::new(staged)
         .added(current_state.required_content, state.required_content)
         .await
-        .map_err(|e| ConnectionError::Internal(format!("failed to compare content sets: {e}")))?;
-    let existing = network
-        .content
-        .existing_ids(&candidates)
-        .map_err(|e| ConnectionError::Internal(format!("content existence check failed: {e}")))?;
+        .map_err(|e| {
+            ConnectionError::Internal(format!("failed to compare content sets: {}", chain(&e)))
+        })?;
+    let existing = network.content.existing_ids(&candidates).map_err(|e| {
+        ConnectionError::Internal(format!("content existence check failed: {}", chain(&e)))
+    })?;
     let missing: Vec<ContentId> = candidates
         .iter()
         .filter(|id| !existing.contains(id))
@@ -1023,10 +1059,9 @@ async fn plan_content(
             return Ok(None);
         };
         let base = base_map.get(&id).copied();
-        staged
-            .put_content([(content, base)])
-            .await
-            .map_err(|e| ConnectionError::Internal(format!("failed to store content: {e}")))?;
+        staged.put_content([(content, base)]).await.map_err(|e| {
+            ConnectionError::Internal(format!("failed to store content: {}", chain(&e)))
+        })?;
     }
     Ok(Some(ContentPlan {
         missing: asked,
@@ -1061,7 +1096,7 @@ async fn stage_content(
             (content, base)
         });
         staged.put_content(blobs).await.map_err(|e| {
-            ConnectionError::Internal(format!("failed to store content batch: {e}"))
+            ConnectionError::Internal(format!("failed to store content batch: {}", chain(&e)))
         })?;
         Ok(true)
     })

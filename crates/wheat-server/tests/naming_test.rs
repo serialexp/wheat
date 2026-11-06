@@ -1,6 +1,7 @@
 //! Content naming: a network collected by age is told what each publish relies on
 //! without writing it, before the publish joins the commit, and told again as the
-//! batch commits when that was long ago.
+//! batch commits when that was long ago. A naming or a store write refused while
+//! content is being reclaimed asks the client to publish again.
 
 use crate::support;
 
@@ -8,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,15 +35,19 @@ use support::{
 
 const REPO: &str = "test/repo";
 
-/// Content blobs in memory.
+/// Content blobs in memory, refusing every write while `refuse` is set.
 #[derive(Debug, Default)]
 struct Blobs {
     records: Mutex<HashMap<ContentId, Vec<u8>>>,
+    refuse: AtomicBool,
 }
 
 #[async_trait]
 impl ContentBlobStore for Blobs {
     async fn put(&self, id: ContentId, record: Vec<u8>) -> io::Result<()> {
+        if self.refuse.load(Ordering::Relaxed) {
+            return Err(io::Error::other("the row is being reclaimed"));
+        }
         self.records.lock().unwrap().insert(id, record);
         Ok(())
     }
@@ -121,6 +127,7 @@ struct Served {
     /// `big.bin`, chunked, before and after.
     big: ContentId,
     big_changed: ContentId,
+    blobs: Arc<Blobs>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
@@ -133,7 +140,8 @@ async fn serve(naming: Arc<Recording>) -> Served {
     let client_dir = tempfile::tempdir().unwrap();
     let objects =
         LooseObjectStore::with_durability(dir.path().join("objects"), Durability::Deferred);
-    let content = ContentStore::over_blobs(Arc::new(Blobs::default()));
+    let blobs = Arc::new(Blobs::default());
+    let content = ContentStore::over_blobs(Arc::clone(&blobs) as Arc<dyn ContentBlobStore>);
     let heads = LocalPublicationStore::new(dir.path().join("repository.head"));
     let client_objects =
         LooseObjectStore::with_durability(client_dir.path().join("objects"), Durability::Deferred);
@@ -220,13 +228,15 @@ async fn serve(naming: Arc<Recording>) -> Served {
         small_changed: id(&small_changed),
         big: id(&big),
         big_changed: id(&big_changed),
+        blobs,
         client,
         _shutdown: shutdown,
         _dirs: (dir, client_dir),
     }
 }
 
-/// Answers the content phase, sending a long blob as its manifest, and commits.
+/// Answers the content phase, sending a long blob as its manifest, and commits; or
+/// the result the server answers with during the upload.
 async fn upload_and_commit(
     ws: &mut support::Ws,
     op_id: u64,
@@ -258,6 +268,7 @@ async fn upload_and_commit(
                 .await;
             }
             WheatProtocolMessage::ContentComplete(_) => break,
+            WheatProtocolMessage::PublishResult(result) => return result,
             other => panic!("expected ContentNeeded or ContentComplete, got {other:?}"),
         }
     }
@@ -391,4 +402,33 @@ async fn a_publish_whose_naming_fails_is_refused_to_be_sent_again() {
     let head = served.heads.read().unwrap();
     assert_eq!((head.generation, head.envelope), served.head);
     assert_eq!(naming.calls.lock().unwrap().len(), 1);
+}
+
+/// The manifest of the long blob is stored while the publish uploads, before any
+/// commit: a refused write there is answered, and nothing of the publish is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publish_whose_upload_cannot_be_stored_is_refused_to_be_sent_again() {
+    let served = serve(recording(Duration::from_secs(3600), false)).await;
+    served.blobs.refuse.store(true, Ordering::Relaxed);
+    let result = publish(&served).await;
+    assert!(
+        matches!(result.status, PublishResultStatus::PublishStatusError(_)),
+        "{:?}: {}",
+        result.status,
+        result.message
+    );
+    assert!(
+        result.message.contains("the row is being reclaimed")
+            && result.message.contains("publish again"),
+        "{}",
+        result.message
+    );
+    let head = served.heads.read().unwrap();
+    assert_eq!((head.generation, head.envelope), served.head);
+
+    // Sent again once the store takes writes, it is published.
+    served.blobs.refuse.store(false, Ordering::Relaxed);
+    let result = publish(&served).await;
+    assert!(published(&result), "{}", result.message);
+    assert_eq!(served.heads.read().unwrap().envelope, served.proposed);
 }

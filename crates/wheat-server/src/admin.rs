@@ -24,6 +24,7 @@ use uuid::Uuid;
 use wheat_protocol::{AdminCommand, AdminRepositoryName, Uuid128};
 use wheat_store::RepositoryDirectory;
 
+use crate::error_text::chain;
 use crate::registry::{DirectoryHandle, Registry};
 
 /// Finished operations kept for asking about.
@@ -407,18 +408,6 @@ where
     crate::blocking::drive(work)
         .await
         .map_err(|error| chain(&error))?
-}
-
-/// `error` and its sources, as one line.
-fn chain(error: &dyn Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
 }
 
 #[cfg(test)]

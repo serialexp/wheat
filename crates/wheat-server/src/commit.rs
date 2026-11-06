@@ -31,6 +31,7 @@ use wheat_store::{
     RepositoryStoreError, RepositoryUnionError, StagedPublication, StoredWrite,
 };
 
+use crate::error_text::chain;
 use crate::hooks::{Announcement, ProposedPublish, PublishHooks, Published, PublishedBatch};
 use crate::naming::Named;
 use crate::receipt::{PublishKey, Recorded};
@@ -698,10 +699,11 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
     let stored = match stored {
         Ok(stored) => stored,
         Err(e) => {
-            warn!(error = %e, "publish: storing a batch failed");
+            let error = chain(&e);
+            warn!(error, "publish: storing a batch failed");
             return Err(CommitFailure::Failed {
                 head: read_head(entry).await?,
-                message: format!("storing the published objects failed: {e}"),
+                message: format!("storing the published objects failed: {error}"),
             });
         }
     };
@@ -772,7 +774,7 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
             Err(e) => {
                 return Err(CommitFailure::Failed {
                     head,
-                    message: format!("head advance failed: {e}"),
+                    message: format!("head advance failed: {}", chain(&e)),
                 });
             }
         }
@@ -818,7 +820,7 @@ async fn rejoin(
     .await;
     stored.map_err(|e| CommitFailure::Failed {
         head,
-        message: format!("storing the published objects failed: {e}"),
+        message: format!("storing the published objects failed: {}", chain(&e)),
     })?;
     Ok(joined)
 }

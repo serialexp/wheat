@@ -15,6 +15,7 @@ mod blocking;
 pub mod commit;
 pub mod config;
 pub mod connection;
+mod error_text;
 pub mod fetch;
 pub mod heads;
 pub mod hooks;
