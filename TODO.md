@@ -213,11 +213,6 @@ Performance, most serious first:
   directory an earlier, interrupted open created, so dropping it for read-only
   commands needs a decision: only sync what this open created, or sync only before
   the first write.
-- `[ ]` **Materialization still syncs every staged file (2026-10-05).** After
-  batching, a switch replacing 20,000 files takes about 6.4 s, about 4 s of it the
-  staged files' own fsyncs (32 at a time). One `syncfs` per batch would replace
-  them, but it flushes the whole filesystem, so on a busy disk it may cost more.
-  Needs Bart's call; measure with bench `materialize_wide`.
 - `[ ]` **Fetch and publish benches slower than on 2026-10-26 (2026-10-30).**
   `fetch_incremental.total.wall` went from 17.3 s (2026-10-26) to 29–31 s, its
   `publish.wall` from 0.023 s to about 0.07 s, and `remote_latency.many.publish.wall`

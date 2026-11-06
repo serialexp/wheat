@@ -302,6 +302,12 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **Materialization still syncs every staged file (2026-10-05).** Done
+  2026-11-06 (Bart: batch the syncs, as elsewhere): a batch's leaves are written
+  under their writing names, made durable by one `syncfs`, then renamed to their
+  staged names, so a staged name still only holds a synced leaf. `materialize_wide`
+  (release, load average 4–8): switching 20,000 files took 6.6 and 5.9 s, now
+  2.7–3.6 s. `syncfs` also flushes whatever else is dirty on the filesystem.
 - `[x]` **`wheat status` re-reads and re-hashes every file (scanner only).** Done
   2026-11-06: a stat cache (`.wheat/stat.sqlite`, `stat_cache.rs`) lets status read
   only files whose stat changed, and a long binary file's samples show it modified

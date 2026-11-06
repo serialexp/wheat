@@ -1702,16 +1702,17 @@ fn writing_name(staged: &str) -> String {
     format!("writing-{staged}")
 }
 
-/// Writes `leaves` on up to `STAGING_WORKERS` threads, so the filesystem can
-/// commit their syncs together.
+/// Writes `leaves` under their writing names on up to `STAGING_WORKERS` threads,
+/// makes them all durable with one sync of the filesystem, then renames each to its
+/// staged name. One `syncfs` flushes the batch's data once, where a sync per leaf
+/// flushed the drive once per leaf; it also flushes whatever else is dirty on the
+/// filesystem.
 #[tracing::instrument(name = "materialization_write_leaves", level = "debug", skip_all)]
 fn write_staged_leaves(tx: &File, content: &ContentStore, leaves: &[StagedLeaf<'_>]) -> Result<()> {
     let next = AtomicUsize::new(0);
     let write = || -> Result<()> {
         while let Some(leaf) = leaves.get(next.fetch_add(1, Ordering::Relaxed)) {
-            let writing = writing_name(leaf.name);
-            create_leaf_at(tx, &writing, leaf, content)?;
-            rename_noreplace(tx, &writing, tx, leaf.name)?;
+            create_leaf_at(tx, &writing_name(leaf.name), leaf, content)?;
         }
         Ok(())
     };
@@ -1726,7 +1727,14 @@ fn write_staged_leaves(tx: &File, content: &ContentStore, leaves: &[StagedLeaf<'
             result = result.and(helper);
         }
         result
-    })
+    })?;
+    tracing::debug_span!("materialization_sync_leaves")
+        .in_scope(|| sys::sync_filesystem(tx))
+        .context("sync staged leaves")?;
+    for leaf in leaves {
+        rename_noreplace(tx, &writing_name(leaf.name), tx, leaf.name)?;
+    }
+    Ok(())
 }
 
 /// Checks that the workspace still holds the install's old value and prepares its
@@ -2940,7 +2948,6 @@ fn create_leaf_at(
                 LeafSource::Marker(marker) => file.write_all(marker)?,
                 LeafSource::Content(id) => copy_content(content.reader(*id)?, &mut file)?,
             }
-            file.sync_all()?;
         }
     }
     Ok(())

@@ -261,6 +261,12 @@ mod linux {
         }
     }
 
+    /// Waits until every dirty write on the filesystem holding `file` is durable:
+    /// one flush for many files' data, where a sync per file flushes once each.
+    pub fn sync_filesystem(file: &File) -> io::Result<()> {
+        check(unsafe { libc::syncfs(file.as_raw_fd()) })
+    }
+
     /// Lists a directory this process holds open, through `/proc/self/fd`. The
     /// duplicate descriptor is owned (and close-on-exec), so it is closed on every
     /// path, errors included.
@@ -361,6 +367,10 @@ mod unsupported {
         _destination_name: &str,
         _how: Rename,
     ) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn sync_filesystem(_file: &File) -> io::Result<()> {
         unsupported()
     }
 
