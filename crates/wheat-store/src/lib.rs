@@ -190,7 +190,10 @@ mod content_blobs;
 mod content_store;
 mod content_stream;
 pub use content_arrivals::{ManifestArrivalError, ManifestArrivals};
-pub use content_blobs::{BlobPage, BlobRead, ContentBlobStore, record_logical_length};
+pub use content_blobs::{
+    BlobPage, BlobRead, ContentBlobStore, RecordInfo, RecordReferences, record_info,
+    record_logical_length,
+};
 pub use content_store::{ContentItem, ContentStore, ContentStoreError};
 pub use content_stream::{ContentReader, ContentWriter};
 

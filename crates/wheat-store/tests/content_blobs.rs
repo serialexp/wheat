@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use wheat_core::{ContentId, VerifiedContent};
 use wheat_store::{
     BlobPage, BlobRead, ContentBlobStore, ContentItem, ContentStore, ContentStoreError,
-    PackedObjectStore, RepositoryStore, SeparateRepositoryStore, record_logical_length,
+    PackedObjectStore, RecordReferences, RepositoryStore, SeparateRepositoryStore, record_info,
+    record_logical_length,
 };
 
 /// Blobs in memory, as an embedder would write them, counting what is read and how
@@ -367,4 +368,90 @@ async fn a_records_length_comes_from_the_record_alone() {
     }
     assert!(record_logical_length(empty, b"").is_err());
     assert!(record_logical_length(empty, b"not a record").is_err());
+}
+
+/// A record names the content it needs to be read: none when whole, its base when a
+/// delta, its chunks or parts when a chunked blob's manifest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_records_references_come_from_the_record_alone() {
+    use std::io::Write;
+
+    let blobs = Arc::new(MemoryBlobs::default());
+    let content = over(&blobs);
+    let small = content.put(&vec![7_u8; 256 * 1024]).unwrap();
+    let base = noise(10, 64 * 1024);
+    let mut changed = base.clone();
+    changed[1000..1010].copy_from_slice(b"0123456789");
+    let base_id = content.put(&base).unwrap();
+    let delta = VerifiedContent::new(changed.as_slice());
+    content.put_with_base(delta, base_id).unwrap();
+    let long = noise(11, 20 << 20);
+    let mut writer = content.writer();
+    writer.write_all(&long).unwrap();
+    let chunked = writer.finish(None).unwrap();
+
+    let info = |id| record_info(id, &blobs.record(id).unwrap()).unwrap();
+    assert_eq!(info(small).references, RecordReferences::None);
+    assert_eq!(info(small).logical_length, 256 * 1024);
+    assert_eq!(
+        info(delta.id()).references,
+        RecordReferences::Delta { base: base_id }
+    );
+    let RecordReferences::Chunks(chunks) = info(chunked).references else {
+        panic!("a chunked blob's record lists its chunks");
+    };
+    // Its chunks are every other record the long blob wrote, in order.
+    let mut read = Vec::new();
+    for chunk in &chunks {
+        read.extend_from_slice(&content.get(*chunk).unwrap());
+    }
+    assert!(read == long);
+    assert_eq!(blobs.records.lock().unwrap().len(), 4 + chunks.len());
+
+    // A long blob's manifest lists parts; one is written here as the store would.
+    let part_length =
+        wheat_core::MIN_CONTENT_PART_CHUNKS as u64 * u64::from(wheat_core::MIN_CONTENT_CHUNK_BYTES);
+    let parts: Vec<_> = (0..3_u8)
+        .map(|n| wheat_core::ContentPartRecord {
+            id: ContentId::from_digest([n + 1; 32]),
+            length: part_length,
+        })
+        .collect();
+    let manifest =
+        wheat_core::encode_content_chunk_manifest(&wheat_core::ContentChunkManifestRecord {
+            logical_length: 3 * part_length,
+            entries: wheat_core::ContentManifestEntries::Parts(parts.clone()),
+        })
+        .unwrap();
+    let mut record =
+        wheat_core::encode_content_envelope_header(&wheat_core::ContentEnvelopeHeaderRecord {
+            codec: 5,
+            stored_length: manifest.len() as u64,
+            logical_length: 3 * part_length,
+        })
+        .unwrap();
+    record.extend_from_slice(&manifest);
+    let long_id = ContentId::from_digest([9; 32]);
+    let info = record_info(long_id, &record).unwrap();
+    assert_eq!(info.logical_length, 3 * part_length);
+    assert_eq!(
+        info.references,
+        RecordReferences::Parts(parts.iter().map(|part| part.id).collect())
+    );
+    // A delta too short to name its base, and a manifest that does not decode, are
+    // refused.
+    let delta_record = blobs.record(delta.id()).unwrap();
+    let header = wheat_core::CONTENT_ENVELOPE_HEADER_ENCODED_SIZE;
+    let mut cut =
+        wheat_core::encode_content_envelope_header(&wheat_core::ContentEnvelopeHeaderRecord {
+            codec: delta_record[5],
+            stored_length: 16,
+            logical_length: changed.len() as u64,
+        })
+        .unwrap();
+    cut.extend_from_slice(&delta_record[header..header + 16]);
+    assert!(record_info(delta.id(), &cut).is_err());
+    let mut garbled = record.clone();
+    garbled[header] ^= 0xff;
+    assert!(record_info(long_id, &garbled).is_err());
 }

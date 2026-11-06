@@ -3,7 +3,7 @@
 Status: partial — Phase 0 (the admin surface), Phases 1 (export), 2 (import and
 adoption) and 3 (delete while served) landed, so a network can be moved; Phase 2b
 and GC (4–6) designed, not yet implemented; Gothab's content GC (2026-11-06) is
-designed with open questions G1–G4. Bart answered questions 1–5 on 2026-10-27; a
+designed and being built. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
@@ -128,7 +128,8 @@ and move them from Outstanding to Done.
 - [ ] **Gothab content GC (2026-11-06, was deferred).** Bart put it first, ahead of
   pool GC (Phase 4) and the directory's content GC (Phase 5). Mark every Wheat head
   of the instance, sweep Gothab's blob store through a delete hook; see
-  [Gothab's content](#gothabs-content-2026-11-06). Open: questions G1–G4.
+  [Gothab's content](#gothabs-content-2026-11-06). G1–G4 decided 2026-11-06; the
+  steps are listed there.
 - [ ] **Defer — remote packed stores.** `remote_packed` has no retirement at all
   (append-only catalog, one S3 key per blob).
 
@@ -427,23 +428,58 @@ uploading it (`existing_ids`), so it must be rescued. Two cases:
   So what a publish uploads must rescue its delta bases and chunks too, and content
   uploaded for a publish still in progress (named by no head yet) is kept by age.
 
-### Open questions
+### Decisions (2026-11-06)
 
-- [ ] **G1 — how a rescue reaches the sweep across hosts.** (a) A publish hook with
-  the IDs a publish names and writes; Gothab stores a last-named time per content
-  (a column of `wheat_content_sizes`), and the sweep reclaims only content unmarked
-  and last named before the mark began. Publishes never wait. (b) An instance-wide
-  hold: every host's publish gate refuses Wheat publishes from the start of marking
-  to the end of the sweep. Bart leans to (a); asked @wise-walrus 2026-11-06.
-- [ ] **G2 — the age of an upload.** `BlobPage` has no times. (a) The same
-  last-named time, set when a record is put; (b) the blob store's own modification
-  time, added to `BlobPage`.
-- [ ] **G3 — finding delta bases and chunks.** (a) Read each marked record's header
-  with `get_range` (one ranged read per marked ID, plus each manifest); (b) Gothab
-  records the base and kind with the row when a record is put, so marking reads
-  Postgres instead.
-- [ ] **G4 — where it runs.** A gitd admin task on each host for the mark, and
-  Gothab's maintenance worker for the merge and sweep, or another split.
+Bart deferred to @wise-walrus with a lean to G1 (a); walrus relayed these answers.
+
+- **G1 — a last-named time.** Gothab keeps `last_named_at` on `wheat_content_sizes`.
+  Its `ContentBlobStore::put` stamps everything a publish writes (deltas, chunks,
+  manifests). A Wheat hook names what a publish references without writing: content
+  found already stored, and each upload's delta base. The alternative, an
+  instance-wide hold, was not taken.
+- **G2 — the stamp at put is the upload's age.** `BlobPage` stays without times.
+- **G3 — recorded at put.** gitd stores each record's references (delta base, a
+  manifest's chunks or parts) on its row, decoded by a Wheat function so the format
+  has one decoder; marking reads them from Postgres.
+- **G4 — split.** Each gitd marks the networks it serves (an admin task) and writes
+  a mergeable mark run; Gothab's maintenance worker, under a lock, merges the runs
+  and sweeps, holding no pools.
+
+### API
+
+- `wheat_store::record_info(id, record) -> RecordInfo { logical_length, references }`,
+  `RecordReferences::{None, Delta { base }, Chunks(ids), Parts(ids)}`, for put time.
+  A part is an ordinary blob, so its chunks are found while sweeping, by reading it.
+- `ContentMarks` (SQLite at a path): `create`, `mark_heads(objects, envelopes)` (the
+  union of each state's `required_content`, set nodes visited once), `write_run`
+  (a BinSchema header and sorted IDs) and `merge(path, runs)`.
+- `sweep(blobs, marks, inventory)`: closes the marks over `inventory.references`
+  (and parts read from `blobs`) to a fixed point, then pages `list_page` and calls
+  `inventory.reclaim(id)` for each ID not marked.
+- A `ContentNaming` hook on wheat-server's network, `named(ids)`, called before a
+  publish or server write joins the commit with what its state adds and its uploads'
+  delta bases. A failure, including an ID Gothab has no row for (reclaimed since the
+  publish found it), refuses the publish as retryable.
+
+### Timing and races
+
+- A stamp taken before the head moves can be older than a mark that begins before
+  the commit and so misses the head. The sweep therefore reclaims only content last
+  named before the mark's start minus a grace G, and Wheat names a batch member's
+  content again when its stamp is older than G/2 as the batch commits. Every head
+  committed after the mark started then has its content stamped after start − G.
+  G is configurable, an hour by default; each host reads its heads after the start.
+- Gothab serializes put and reclaim per ID on the row: reclaim locks the row, checks
+  it old, deletes the blob, then the row; put upserts the row first, then writes.
+
+### Outstanding (Gothab content GC)
+
+- [ ] `record_info` and `RecordReferences`.
+- [ ] `ContentMarks`: mark, runs, merge.
+- [ ] `sweep` with the `ContentInventory` trait.
+- [ ] The `ContentNaming` hook in wheat-server's publish path, with the G/2 renaming.
+- [ ] Bench case: marking many heads that share history, and a sweep over a mostly
+  dead inventory, counting reads and calls.
 
 ## Review (2026-10-27)
 

@@ -112,6 +112,38 @@ fn malformed(id: ContentId, reason: &'static str) -> ContentStoreError {
 /// read; it is checked against the record's length and its codec's bounds, but the
 /// payload is not checked against it, as reading the content does.
 pub fn record_logical_length(id: ContentId, record: &[u8]) -> Result<u64, ContentStoreError> {
+    Ok(record_info(id, record)?.logical_length)
+}
+
+/// The other content a stored record needs to be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordReferences {
+    /// It is stored whole.
+    None,
+    /// It is a delta against `base`, which must be kept while it is.
+    Delta { base: ContentId },
+    /// It is a chunked blob's manifest listing these chunks, in order.
+    Chunks(Vec<ContentId>),
+    /// It is a long chunked blob's manifest listing these parts, in order. Each part
+    /// is an ordinary blob whose content lists more chunks
+    /// ([`wheat_core::ContentChunkPartRecord`]), found only by reading it.
+    Parts(Vec<ContentId>),
+}
+
+/// What a stored record says about itself, from the record alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordInfo {
+    /// As [`record_logical_length`].
+    pub logical_length: u64,
+    pub references: RecordReferences,
+}
+
+/// The logical length of `id`'s stored `record` and the content it refers to, for an
+/// embedder to keep with the record when it is put: content GC follows a record's
+/// references without reading it. The header is checked as by
+/// [`record_logical_length`]; a chunk manifest is decoded and checked whole, and a
+/// delta's payload is not decoded beyond its base.
+pub fn record_info(id: ContentId, record: &[u8]) -> Result<RecordInfo, ContentStoreError> {
     let header = checked_header(
         id,
         record.get(..codec::ENVELOPE_HEADER_LEN).unwrap_or(record),
@@ -120,7 +152,44 @@ pub fn record_logical_length(id: ContentId, record: &[u8]) -> Result<u64, Conten
     header
         .validate(record.len() as u64, usize::MAX)
         .map_err(|error| codec_error(id, usize::MAX, error))?;
-    Ok(header.logical_length)
+    let payload = &record[codec::ENVELOPE_HEADER_LEN..];
+    let references = match header.codec {
+        codec::Codec::Raw | codec::Codec::Zstd => RecordReferences::None,
+        codec::Codec::Delta | codec::Codec::DeltaZstd => {
+            let base: [u8; 32] = payload
+                .get(..crate::delta::BASE_REFERENCE_SIZE)
+                .and_then(|base| base.try_into().ok())
+                .ok_or_else(|| malformed(id, "delta payload too short for base reference"))?;
+            RecordReferences::Delta {
+                base: ContentId::from_digest(base),
+            }
+        }
+        codec::Codec::Chunked => {
+            let manifest = wheat_core::decode_content_chunk_manifest(payload)
+                .map_err(|_| malformed(id, "invalid chunk manifest"))?;
+            if manifest.logical_length != header.logical_length {
+                return Err(malformed(id, "chunk manifest length differs"));
+            }
+            match manifest.entries {
+                wheat_core::ContentManifestEntries::Chunks(chunks) => {
+                    RecordReferences::Chunks(chunks.into_iter().map(|chunk| chunk.id).collect())
+                }
+                wheat_core::ContentManifestEntries::Parts(parts) => {
+                    RecordReferences::Parts(parts.into_iter().map(|part| part.id).collect())
+                }
+            }
+        }
+        codec::Codec::ZstdBlock => {
+            return Err(malformed(
+                id,
+                "a block-compressed record is not stored alone",
+            ));
+        }
+    };
+    Ok(RecordInfo {
+        logical_length: header.logical_length,
+        references,
+    })
 }
 
 fn checked_header(
