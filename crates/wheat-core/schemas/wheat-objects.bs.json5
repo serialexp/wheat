@@ -1078,15 +1078,22 @@
         { name: "envelope", type: "Digest256" },
       ],
     },
-    // What an embedder's write asks for, as its receipt's `request`: hashed after
-    // "wheat-server-write-request-v2\0" and cut to 16 bytes, never stored.
-    // `changes` are in name order, each name once. `built` is the state a stage's
-    // write built, absent for a write of labels alone.
-    ServerWriteRequestInputV2: {
+    // What an embedder's label write asks for, as its receipt's `request`: hashed
+    // after "wheat-server-write-request-v1\0" and cut to 16 bytes, never stored.
+    // `changes` are in name order, each name once.
+    ServerWriteRequestInputV1: {
       sequence: [
         { name: "changes", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "ServerWriteLabelChangeV1" } },
         { name: "force_labels", type: "bool" },
-        { name: "built", type: "optional", value_type: "RepositoryStateId" },
+      ],
+    },
+    // What an embedder's stage submit asks for, as its receipt's `request`: hashed
+    // after "wheat-server-stage-request-v1\0" and cut to 16 bytes, never stored.
+    // `intent` is the embedder's digest of the operation it built and the labels it
+    // moves, so a stage rebuilt for it after a crash asks for the same.
+    ServerStageRequestInputV1: {
+      sequence: [
+        { name: "intent", type: "Digest256" },
       ],
     },
     // `expectation` is 0 when the label must be absent, 1 when it must be at

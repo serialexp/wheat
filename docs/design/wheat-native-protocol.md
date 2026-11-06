@@ -1160,7 +1160,7 @@ while a batch is being written, so each expectation is checked against exactly
 that head; a mismatch is `WriteFailure::LabelMoved` with each label's actual view.
 The new envelope keeps the head's state, is validated as a publish of it, and moves
 labels forward unless `force_labels`. Its receipt binds the key to a digest of the
-changes (`server_write_request_digest`: a `ServerWriteRequestInputV2`, the changes in
+changes (`server_write_request_digest`: a `ServerWriteRequestInputV1`, the changes in
 name order), so the same write sent again gets its first answer and the same key
 for another write is refused. A quiesced network refuses it with its retry delay.
 Publish hooks are not told: the embedder tells its own listeners.
@@ -1180,12 +1180,24 @@ recorded differently on both sides is `Stale`. Then the write's label changes ar
 made there, checked against that head. The tip must keep the base's labels, so
 labels move in the write alone.
 
-The receipt digests the label changes and the built state. Bart chose this over a
-digest the embedder supplies, or the key alone. The same stage submitted again gets
-its first answer. Since change IDs are random, a stage rebuilt the same way is
-another request, and is refused under that key. A submit refused before it was
-accepted (labels moved, stale, its content not named) may be made again; one whose
-batch failed took the stage's objects with it. When the network names content, a
+A submit's receipt binds its key to the embedder's `intent` alone
+(`server_stage_request_digest`, a `ServerStageRequestInputV1`). `intent` is Gothab's
+digest of the operation, its frozen inputs, and the labels it moves with their
+expectations. Bart first chose a digest of the label changes and the built state
+(2026-11-07). Walrus then pointed out that a retry after gitd crashes rebuilds the
+stage, and change IDs are random, so that digest refused the retry as a reused key
+with no way to tell it had landed. Asked, Codex and Antigravity both recommended the
+embedder's digest over returning the first head with the refusal, which would turn a
+real key collision into a false success. Bart chose that, with a lookup. Wheat
+cannot check that `intent` matches what was built; that is the embedder's to keep.
+
+A submit, or `published(entry, principal, key, intent)` before building, finds a
+receipt for the key first. With that intent it answers the head the receipt names,
+waiting for the batch if the first submit is still in one. With another intent it
+refuses as reused. Receipts last `PUBLISH_RECEIPT_RETENTION_SECONDS` (a day), so
+after that a retry cannot tell whether its submit landed. A submit refused before it
+was accepted (labels moved, stale, its content not named) may be made again on the
+same stage; one whose batch failed took the stage's objects with it. When the network names content, a
 submit names what the built state adds over the base, closure included, before it
 joins, with the stage's opening as its instant. Bench case `server_stage`: at 1,000
 and 10,000 changes, an edit reads 108 and 125 objects and a merge 122 and 147.

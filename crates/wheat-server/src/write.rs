@@ -22,7 +22,8 @@ use tokio::time::Instant;
 use tracing::{Instrument as _, debug_span, warn};
 pub use wheat_core::ExpectedLabel;
 use wheat_core::{
-    RepositoryStateId, ViewId, ViewLabel, ViewLabelManifestRecord, server_write_request_digest,
+    ViewId, ViewLabel, ViewLabelManifestRecord, server_stage_request_digest,
+    server_write_request_digest,
 };
 use wheat_store::{
     PersistedRepositoryMutator, PublicationError, PublicationStore, RepositoryHead,
@@ -100,7 +101,7 @@ pub async fn write(
     entry: &Arc<RepositoryEntry>,
     write: ServerWrite,
 ) -> Result<RepositoryHead, WriteFailure> {
-    let request = request_digest(&write, None)?;
+    let request = request_digest(&write)?;
     // Held until the write is answered, so a quiesce waits for it.
     let writing = begin(entry)?;
     let staged = Arc::new(RepositoryStage::new(
@@ -168,11 +169,10 @@ pub struct ServerStage {
     _writing: Writing,
 }
 
-/// The state a stage's tip holds, and the content it needs over the base's when the
-/// network is told what publishes rely on.
+/// The content a stage's tip needs over its base's, when the network is told what
+/// publishes rely on.
 #[derive(Clone)]
 struct BuiltState {
-    state: RepositoryStateId,
     needed: Vec<wheat_core::ContentId>,
 }
 
@@ -333,17 +333,30 @@ impl ServerStage {
     /// The labels move as [`write()`] moves them, there. The tip must keep the base's
     /// labels: labels move in the write alone.
     ///
-    /// The receipt binds `write.key` to the label changes and the built state, so the
-    /// stage submitted again gets the first answer, and another stage under that key
-    /// is refused. A submit refused before it was accepted (labels moved, stale,
-    /// rejected, its content not named) may be made again; one whose batch failed
-    /// took the stage's objects with it, so build in a new stage, under a new key.
+    /// `intent` is the embedder's digest of what it asks for: the operation it built,
+    /// with the inputs it built it from, and the labels it moves, with what it
+    /// expects each to be. The receipt binds `write.key` to `intent` alone, since a
+    /// stage's objects differ each time it is built. A submit whose key was published
+    /// with that intent, by this stage or one built for it before, gets that head
+    /// without joining anything ([`published`]); with another intent it is refused.
+    /// A submit refused before it was accepted (labels moved, stale, rejected, its
+    /// content not named) may be made again on the same stage; one whose batch failed
+    /// took the stage's objects with it, so build again in a new stage.
     ///
     /// When the network is told what publishes rely on, what the built state adds
     /// over the base is named first ([`crate::naming`]); a failure is
     /// [`CommitFailure::Failed`].
     #[tracing::instrument(name = "server_stage_submit", level = "debug", skip_all)]
-    pub async fn submit(&self, write: ServerWrite) -> Result<RepositoryHead, WriteFailure> {
+    pub async fn submit(
+        &self,
+        write: ServerWrite,
+        intent: [u8; 32],
+    ) -> Result<RepositoryHead, WriteFailure> {
+        check(&write)?;
+        let request = server_stage_request_digest(intent);
+        if let Some(head) = previous(&self.entry, &write.principal, write.key, request).await? {
+            return Ok(head);
+        }
         let base = self.inner.base;
         let tip = self.inner.tip.get();
         let mut submitted = self.submitted.lock().await;
@@ -365,7 +378,6 @@ impl ServerStage {
                 built
             }
         };
-        let request = request_digest(&write, Some(built.state))?;
         let named = match &self.entry.network.naming {
             None => None,
             Some(naming) => {
@@ -397,8 +409,8 @@ impl ServerStage {
     }
 }
 
-/// The state the stage's `tip` holds once it is checked to keep `base`'s labels and,
-/// when `naming`, the content that state needs over `base`'s, closure included.
+/// The stage's `tip`, checked to keep `base`'s labels: when `naming`, the content its
+/// state needs over `base`'s, closure included.
 async fn built(
     inner: &StageInner,
     base: RepositoryHead,
@@ -426,10 +438,7 @@ async fn built(
         ));
     }
     if !naming {
-        return Ok(BuiltState {
-            state: after.state,
-            needed: Vec::new(),
-        });
+        return Ok(BuiltState { needed: Vec::new() });
     }
     let reader = &reader;
     let required = |state| async move {
@@ -448,18 +457,75 @@ async fn built(
         .content()
         .needed_to_read(added, [])
         .map_err(|e| internal("find what the built content needs", &e))?;
-    Ok(BuiltState {
-        state: after.state,
-        needed,
-    })
+    Ok(BuiltState { needed })
 }
 
-/// What `write` asks for, digested, once its changes are checked to be a write;
-/// `built` is the state a stage built for it.
-fn request_digest(
-    write: &ServerWrite,
-    built: Option<RepositoryStateId>,
-) -> Result<[u8; 16], WriteFailure> {
+/// The head a stage submit by `principal` with `key` and `intent` was published in,
+/// waiting for its batch if it is in one; `None` if none was. Lets an embedder that
+/// lost the answer, as when it crashed after the submit, find it before building the
+/// stage again. A key published with another intent is refused as reused.
+///
+/// A head keeps receipts for [`wheat_store::PUBLISH_RECEIPT_RETENTION_SECONDS`]
+/// only: once a submit's receipt has expired, this answers `None` whether or not it
+/// was published, so an embedder's retries must come sooner.
+pub async fn published(
+    entry: &Arc<RepositoryEntry>,
+    principal: &Principal,
+    key: [u8; 16],
+    intent: [u8; 32],
+) -> Result<Option<RepositoryHead>, WriteFailure> {
+    previous(entry, principal, key, server_stage_request_digest(intent)).await
+}
+
+/// The head the write by `principal` with `key` asking for `request` was published
+/// in, waiting for it if it is still in a batch.
+async fn previous(
+    entry: &Arc<RepositoryEntry>,
+    principal: &Principal,
+    key: [u8; 16],
+    request: [u8; 16],
+) -> Result<Option<RepositoryHead>, WriteFailure> {
+    let key = PublishKey::server_write(principal, key, request)
+        .map_err(|e| WriteFailure::Invalid(format!("the principal cannot be bound: {e}")))?;
+    let (durable, receipt) = entry
+        .heads
+        .head_with_receipt(key.key())
+        .await
+        .map_err(|e| {
+            WriteFailure::Commit(CommitFailure::Internal(format!(
+                "server write: read the head: {}",
+                chain(&e)
+            )))
+        })?;
+    match commit::previous(entry, durable, receipt.as_ref(), &key)
+        .await
+        .map_err(WriteFailure::Commit)?
+    {
+        Some(accepted) => accepted
+            .durable()
+            .await
+            .map(Some)
+            .map_err(WriteFailure::Commit),
+        None => Ok(None),
+    }
+}
+
+/// What a label `write` asks for, digested, once its changes are checked to be a
+/// write.
+fn request_digest(write: &ServerWrite) -> Result<[u8; 16], WriteFailure> {
+    check(write)?;
+    Ok(server_write_request_digest(
+        write
+            .labels
+            .iter()
+            .map(|change| (change.name.as_str(), change.expected, change.new.as_ref())),
+        write.force_labels,
+    ))
+}
+
+/// Refuses changes that are not a write: none, a label named twice, one expected
+/// absent and deleted, or a label that is not valid.
+fn check(write: &ServerWrite) -> Result<(), WriteFailure> {
     if write.labels.is_empty() {
         return Err(WriteFailure::Invalid(
             "a write changes at least one label".into(),
@@ -482,12 +548,5 @@ fn request_digest(
         ViewLabelManifestRecord::validate_entry(&change.name, change.new.as_ref())
             .map_err(|e| WriteFailure::Invalid(format!("the labels are not valid: {e}")))?;
     }
-    Ok(server_write_request_digest(
-        write
-            .labels
-            .iter()
-            .map(|change| (change.name.as_str(), change.expected, change.new.as_ref())),
-        write.force_labels,
-        built,
-    ))
+    Ok(())
 }

@@ -9177,13 +9177,12 @@ impl PublishReceiptIdInputV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ServerWriteRequestInputV2 {
+pub struct ServerWriteRequestInputV1 {
     pub changes: Vec<ServerWriteLabelChangeV1>,
     pub force_labels: bool,
-    pub built: Option<RepositoryStateId>,
 }
 
-impl ServerWriteRequestInputV2 {
+impl ServerWriteRequestInputV1 {
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
         self.encode()
     }
@@ -9200,12 +9199,6 @@ impl ServerWriteRequestInputV2 {
             item.encode_into(encoder)?;
         }
         encoder.write_byte(if self.force_labels { 1 } else { 0 });
-        if let Some(ref v) = self.built {
-            encoder.write_uint8(1);
-            v.encode_into(encoder)?;
-        } else {
-            encoder.write_uint8(0);
-        }
         Ok(())
     }
 
@@ -9222,17 +9215,42 @@ impl ServerWriteRequestInputV2 {
             changes.push(item);
         }
         let force_labels = decoder.read_byte()? != 0;
-        let has_value = decoder.read_uint8()? != 0;
-        let built = if has_value {
-            Some(RepositoryStateId::decode_with_decoder(decoder)?)
-        } else {
-            None
-        };
         Ok(Self {
             changes,
             force_labels,
-            built,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerStageRequestInputV1 {
+    pub intent: Digest256,
+}
+
+impl ServerStageRequestInputV1 {
+    pub fn encode_measuring(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        self.intent.encode_into(encoder)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let intent = Digest256::decode_with_decoder(decoder)?;
+        Ok(Self { intent })
     }
 }
 

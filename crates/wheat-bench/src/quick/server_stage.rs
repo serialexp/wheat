@@ -123,6 +123,13 @@ fn label_write(key: usize, name: &str, view: ViewId) -> ServerWrite {
     }
 }
 
+/// What the submit under key `key` asks for.
+fn intent(key: usize) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(&(key as u64).to_be_bytes());
+    bytes
+}
+
 /// Builds, in `stage`, change number `index` adding one file on `view`; answers the
 /// view after it.
 async fn edit_in(stage: &ServerStage, view: ViewId, index: usize) -> Result<ViewId> {
@@ -201,7 +208,10 @@ async fn measure(
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let edited = edit_in(&stage, effective, extra).await?;
         stage
-            .submit(label_write(extra, &format!("{step}/edited"), edited))
+            .submit(
+                label_write(extra, &format!("{step}/edited"), edited),
+                intent(extra),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         recorder.wall(&format!("{step}.edit"), started.elapsed().as_secs_f64());
@@ -216,7 +226,10 @@ async fn measure(
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             let side = edit_in(&stage, effective, extra).await?;
             stage
-                .submit(label_write(extra, &format!("{step}/{name}"), side))
+                .submit(
+                    label_write(extra, &format!("{step}/{name}"), side),
+                    intent(extra),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             sides.push(side);
@@ -239,7 +252,10 @@ async fn measure(
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))??;
         stage
-            .submit(label_write(extra, &format!("{step}/merged"), merged))
+            .submit(
+                label_write(extra, &format!("{step}/merged"), merged),
+                intent(extra),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         recorder.wall(&format!("{step}.merge"), started.elapsed().as_secs_f64());

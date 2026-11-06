@@ -10,10 +10,11 @@ it together later (v0.3.5), only on Bart's go-ahead.
   091359c, the request digest a `ServerWriteRequestInputV1`). Binschema pin moved to
   1141fb2 (efd5ee6; additive `encode_measuring` only). Rebuild binschema with nvm's
   node (`~/.nvm/versions/node/v24.22.0/bin`) and `node_modules/.bin/tsc`.
-- Server edits and merges: done. Bart chose (2026-11-07) a two-step stage, with
-  Wheat's digest (the label changes plus the built state) for retries:
+- Server edits and merges: done. Bart chose (2026-11-07) a two-step stage:
   `open_stage`, `ServerStage::build` (the store's mutator over the stage),
-  `ServerStage::submit(write)`. Documented in `wheat-native-protocol.md`, "Embedded
+  `ServerStage::submit(write, intent)`. Retries: Wheat's digest at first, then (after
+  walrus's crash-retry gap, with Codex and Antigravity consulted) the embedder's
+  `intent` digest plus a `published(entry, principal, key, intent)` lookup. Documented in `wheat-native-protocol.md`, "Embedded
   in Gothab"; bench case `server_stage`.
 - Hidden labels: done. Bart chose (2026-11-07) that they stay in the local head
   exactly as on the remote (clone, fetch and publish move them as before) and are

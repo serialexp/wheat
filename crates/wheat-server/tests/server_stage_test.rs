@@ -22,7 +22,7 @@ use wheat_server::quiesce::Quiesced;
 use wheat_server::registry::RepositoryEntry;
 use wheat_server::write::{
     ExpectedLabel::{self, Absent, View},
-    LabelChange, ServerStage, ServerWrite, WriteFailure, open_stage, write,
+    LabelChange, ServerStage, ServerWrite, WriteFailure, open_stage, published, write,
 };
 use wheat_store::{
     LabelMove, LocalPublicationStore, MerkleTreeStore, PackedObjectStore, RepositoryHead,
@@ -30,6 +30,9 @@ use wheat_store::{
 };
 
 use support::edit;
+
+/// What the tests' submits ask for.
+const INTENT: [u8; 32] = [7; 32];
 
 /// Records each naming; refuses them while `fail` is set.
 #[derive(Default)]
@@ -215,7 +218,7 @@ async fn an_edit_built_in_a_stage_is_published_with_its_label() {
     assert_eq!(server.entry.heads.head().await.unwrap(), base);
 
     let submit = server_write(1, vec![change("main", View(server.first), Some(edited))]);
-    let published = stage.submit(submit.clone()).await.unwrap();
+    let published = stage.submit(submit.clone(), INTENT).await.unwrap();
     assert_eq!(published.generation, base.generation + 1);
     assert_eq!(
         labels(&server, published).await,
@@ -229,25 +232,63 @@ async fn an_edit_built_in_a_stage_is_published_with_its_label() {
         [Some(ContentId::of(b"one")), Some(ContentId::of(b"new"))]
     );
 
-    // The stage submitted again gets its first answer; another stage built the same
-    // way under that key is refused, since its change is another.
-    assert_eq!(stage.submit(submit).await.unwrap(), published);
+    // The stage submitted again gets its first answer.
+    assert_eq!(stage.submit(submit, INTENT).await.unwrap(), published);
+}
+
+#[tokio::test]
+async fn a_stage_rebuilt_for_the_same_intent_gets_the_first_answer() {
+    let server = server(None).await;
+    let principal = server_write(1, Vec::new()).principal;
+    assert_eq!(
+        published(&server.entry, &principal, [1; 16], INTENT)
+            .await
+            .unwrap(),
+        None
+    );
+    let stage = open_stage(&server.entry).await.unwrap();
+    let edited = edit_in(&stage, server.first, "new.txt", b"new").await;
+    let first = stage
+        .submit(
+            server_write(1, vec![change("main", View(server.first), Some(edited))]),
+            INTENT,
+        )
+        .await
+        .unwrap();
+    drop(stage);
+
+    // As after a crash: the answer is found by key and intent before building again.
+    assert_eq!(
+        published(&server.entry, &principal, [1; 16], INTENT)
+            .await
+            .unwrap(),
+        Some(first)
+    );
+    // And a stage built again, whose change is another, gets the first answer too,
+    // though the label it names has moved.
     let again = open_stage(&server.entry).await.unwrap();
     let rebuilt = edit_in(&again, server.first, "new.txt", b"new").await;
-    let reused = again
-        .submit(server_write(
-            1,
-            vec![change("main", View(server.first), Some(rebuilt))],
-        ))
-        .await;
-    assert!(
-        matches!(
-            reused,
-            Err(WriteFailure::Commit(CommitFailure::Rejected { .. }))
-        ),
-        "{reused:?}"
+    assert_ne!(rebuilt, edited);
+    let rebuilt_write = server_write(1, vec![change("main", View(server.first), Some(rebuilt))]);
+    assert_eq!(
+        again.submit(rebuilt_write.clone(), INTENT).await.unwrap(),
+        first
     );
-    assert_eq!(server.entry.heads.head().await.unwrap(), published);
+    // The key with another intent is refused, by the lookup and by a submit.
+    let other = [8; 32];
+    for refused in [
+        published(&server.entry, &principal, [1; 16], other).await,
+        again.submit(rebuilt_write, other).await.map(Some),
+    ] {
+        assert!(
+            matches!(
+                refused,
+                Err(WriteFailure::Commit(CommitFailure::Rejected { .. }))
+            ),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(server.entry.heads.head().await.unwrap(), first);
 }
 
 #[tokio::test]
@@ -279,10 +320,10 @@ async fn a_merge_built_in_a_stage_joins_what_was_published_meanwhile() {
 
     // The label is checked against the head the submit joins onto.
     let refused = stage
-        .submit(server_write(
-            3,
-            vec![change("release", Absent, Some(merged))],
-        ))
+        .submit(
+            server_write(3, vec![change("release", Absent, Some(merged))]),
+            INTENT,
+        )
         .await;
     assert!(
         matches!(&refused, Err(WriteFailure::LabelMoved { labels, .. }) if *labels == [("release".to_owned(), Some(first))]),
@@ -290,13 +331,16 @@ async fn a_merge_built_in_a_stage_joins_what_was_published_meanwhile() {
     );
     // Refused before it was accepted, so the stage may be submitted again.
     let published = stage
-        .submit(server_write(
-            3,
-            vec![
-                change("main", View(first), Some(merged)),
-                change("feature", View(other), None),
-            ],
-        ))
+        .submit(
+            server_write(
+                3,
+                vec![
+                    change("main", View(first), Some(merged)),
+                    change("feature", View(other), None),
+                ],
+            ),
+            INTENT,
+        )
         .await
         .unwrap();
     assert_eq!(published.generation, meanwhile.generation + 1);
@@ -342,7 +386,10 @@ async fn a_stage_moves_labels_only_in_its_write() {
         .await
         .unwrap();
     let refused = stage
-        .submit(server_write(1, vec![change("dev", Absent, Some(edited))]))
+        .submit(
+            server_write(1, vec![change("dev", Absent, Some(edited))]),
+            INTENT,
+        )
         .await;
     assert!(
         matches!(&refused, Err(WriteFailure::Invalid(message)) if message.contains("move labels in the write")),
@@ -379,7 +426,7 @@ async fn a_submit_names_what_its_state_adds() {
     let submit = server_write(1, vec![change("main", View(server.first), Some(edited))]);
 
     naming.fail.store(true, Ordering::Relaxed);
-    let refused = stage.submit(submit.clone()).await;
+    let refused = stage.submit(submit.clone(), INTENT).await;
     assert!(
         matches!(&refused, Err(WriteFailure::Commit(CommitFailure::Failed { message, .. })) if message.contains("submit the stage again")),
         "{refused:?}"
@@ -387,7 +434,7 @@ async fn a_submit_names_what_its_state_adds() {
     assert_eq!(server.entry.heads.head().await.unwrap(), stage.base());
 
     naming.fail.store(false, Ordering::Relaxed);
-    let published = stage.submit(submit).await.unwrap();
+    let published = stage.submit(submit, INTENT).await.unwrap();
     assert_eq!(
         labels(&server, published).await,
         [

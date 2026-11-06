@@ -471,14 +471,12 @@ pub fn publish_request_digest(
 
 /// What a server write (`wheat_server::write`) asks for: each label it changes, by
 /// name, with what it expects the label to be and what the label becomes (`None`
-/// deletes it), whether it may move labels backward, and the state a stage built,
-/// if it was a stage's. The order of `changes` does not matter; each name is given
-/// once.
+/// deletes it), and whether it may move labels backward. The order of `changes` does
+/// not matter; each name is given once.
 #[must_use]
 pub fn server_write_request_digest<'a>(
     changes: impl IntoIterator<Item = (&'a str, crate::ExpectedLabel, Option<&'a crate::ViewLabel>)>,
     force_labels: bool,
-    built: Option<crate::RepositoryStateId>,
 ) -> [u8; 16] {
     let mut changes: Vec<wire::ServerWriteLabelChangeV1> = changes
         .into_iter()
@@ -498,13 +496,25 @@ pub fn server_write_request_digest<'a>(
         .collect();
     changes.sort_by(|a, b| a.name.cmp(&b.name));
     digest16(
-        b"wheat-server-write-request-v2\0",
-        wire::ServerWriteRequestInputV2 {
+        b"wheat-server-write-request-v1\0",
+        wire::ServerWriteRequestInputV1 {
             changes,
             force_labels,
-            built: built.map(|state| wire::RepositoryStateId {
-                digest: digest(*state.as_bytes()),
-            }),
+        }
+        .encode(),
+    )
+}
+
+/// What a stage submit (`wheat_server::write::ServerStage::submit`) asks for: the
+/// embedder's `intent`, its digest of the operation the stage built and the labels
+/// the submit moves. A stage's objects differ each time it is built, so they are
+/// not part of it.
+#[must_use]
+pub fn server_stage_request_digest(intent: [u8; 32]) -> [u8; 16] {
+    digest16(
+        b"wheat-server-stage-request-v1\0",
+        wire::ServerStageRequestInputV1 {
+            intent: digest(intent),
         }
         .encode(),
     )
