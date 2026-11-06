@@ -9177,12 +9177,13 @@ impl PublishReceiptIdInputV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ServerWriteRequestInputV1 {
+pub struct ServerWriteRequestInputV2 {
     pub changes: Vec<ServerWriteLabelChangeV1>,
     pub force_labels: bool,
+    pub built: Option<RepositoryStateId>,
 }
 
-impl ServerWriteRequestInputV1 {
+impl ServerWriteRequestInputV2 {
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
         self.encode()
     }
@@ -9199,6 +9200,12 @@ impl ServerWriteRequestInputV1 {
             item.encode_into(encoder)?;
         }
         encoder.write_byte(if self.force_labels { 1 } else { 0 });
+        if let Some(ref v) = self.built {
+            encoder.write_uint8(1);
+            v.encode_into(encoder)?;
+        } else {
+            encoder.write_uint8(0);
+        }
         Ok(())
     }
 
@@ -9215,9 +9222,16 @@ impl ServerWriteRequestInputV1 {
             changes.push(item);
         }
         let force_labels = decoder.read_byte()? != 0;
+        let has_value = decoder.read_uint8()? != 0;
+        let built = if has_value {
+            Some(RepositoryStateId::decode_with_decoder(decoder)?)
+        } else {
+            None
+        };
         Ok(Self {
             changes,
             force_labels,
+            built,
         })
     }
 }

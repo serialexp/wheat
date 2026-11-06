@@ -261,11 +261,23 @@ impl From<CommitFailure> for LabelRefusal {
     }
 }
 
+/// What a stage built, for [`accept_labels`] to join before it changes labels.
+pub(crate) struct Built {
+    /// The envelope the stage opened on.
+    pub(crate) base: RepositoryEnvelopeId,
+    /// The stage's tip: the built state, with `base`'s labels.
+    pub(crate) tip: RepositoryEnvelopeId,
+    /// What the built state relies on, named.
+    pub(crate) named: Option<Named>,
+}
+
 /// Accepts a server write of `changes` into the next batch: built in its turn on the
 /// head it joins onto (the tentative one while a batch is being written), so each
-/// change's `expected` is checked against exactly that head. The new envelope keeps
-/// that head's state and replaces its labels; it is validated as a publish of it,
-/// and each label must move forward unless `force_labels`. Answered as a publish sent
+/// change's `expected` is checked against exactly that head. When a stage `built`
+/// the write, its tip is first joined onto that head as a publish from its base is;
+/// otherwise the head's state is kept. The new envelope has that state and the head's
+/// labels with `changes` made; it is validated as a publish following the head, and
+/// each label must move forward unless `force_labels`. Answered as a publish sent
 /// again when its key was accepted before. Staged into `staged`.
 #[tracing::instrument(name = "server_write_accept", level = "debug", skip_all)]
 pub(crate) async fn accept_labels<S: RepositoryStore + 'static>(
@@ -274,6 +286,7 @@ pub(crate) async fn accept_labels<S: RepositoryStore + 'static>(
     key: PublishKey,
     changes: Arc<Vec<crate::write::LabelChange>>,
     force_labels: bool,
+    built: Option<Built>,
 ) -> Result<Accepted, LabelRefusal> {
     let mut turn = entry
         .commit
@@ -288,25 +301,40 @@ pub(crate) async fn accept_labels<S: RepositoryStore + 'static>(
     let current = turn.tentative.unwrap_or(durable.envelope);
     let pending = turn.pending();
     let stage = Arc::clone(staged);
+    let (tip, named) = match built {
+        Some(built) => (Some((built.base, built.tip)), built.named),
+        None => (None, None),
+    };
     let joined = crate::blocking::drive(move || async move {
-        build_labels(&pending, &stage, durable, current, &changes, force_labels).await
+        build_labels(
+            &pending,
+            &stage,
+            durable,
+            current,
+            tip,
+            &changes,
+            force_labels,
+        )
+        .await
     })
     .await
     .map_err(|e| CommitFailure::Internal(format!("server write: build and validate: {e}")))??;
     let publication = staged.take().await.map_err(|e| {
         CommitFailure::Internal(format!("server write: take the staged write: {e}"))
     })?;
-    let receiver = turn.accept(entry, key, current, joined, false, publication, None, None);
+    let receiver = turn.accept(entry, key, current, joined, false, publication, None, named);
     Ok(Accepted::waiting(receiver, false))
 }
 
-/// `current` with `changes` made to its labels, staged into `staged` and validated as
-/// following `current`.
+/// `current`, with the stage's `built` tip (built on its base) joined onto it, and
+/// with `changes` made to its labels; staged into `staged` and validated as following
+/// `current`.
 async fn build_labels<S: RepositoryStore>(
     pending: &PendingPublications,
     staged: &RepositoryStage<S>,
     durable: RepositoryHead,
     current: RepositoryEnvelopeId,
+    built: Option<(RepositoryEnvelopeId, RepositoryEnvelopeId)>,
     changes: &[crate::write::LabelChange],
     force_labels: bool,
 ) -> Result<RepositoryEnvelopeId, LabelRefusal> {
@@ -315,10 +343,21 @@ async fn build_labels<S: RepositoryStore>(
     };
     let view = pending.over(staged);
     let reader = RepositoryReader::new(&view, view.content());
+    // The tip keeps its base's labels, so the join has the current head's labels: the
+    // ones each change's `expected` is checked against.
+    let onto = match built {
+        None => current,
+        Some((base, tip)) if base == current => tip,
+        Some((base, tip)) => reader
+            .union_envelopes(Some(base), tip, current)
+            .instrument(debug_span!("server_write_join"))
+            .await
+            .map_err(|e| join_failure(e, durable))?,
+    };
     let envelope = reader
-        .envelope(current)
+        .envelope(onto)
         .await
-        .map_err(|e| internal("read the current envelope", &e))?;
+        .map_err(|e| internal("read the joined envelope", &e))?;
     let mut labels = reader
         .view_label_manifest(envelope.labels)
         .await

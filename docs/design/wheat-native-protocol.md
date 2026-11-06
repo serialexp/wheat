@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-11-06
+Last updated: 2026-11-07
 
 ## Implementation status
 
@@ -128,6 +128,12 @@ top of them.
   by key (see
   [Embedded in Gothab](#embedded-in-gothab)). Tests: `server_write_test.rs`,
   `group_commit_test.rs`'s `a_server_write_is_checked_against_the_tentative_head`.
+- [x] **Embedder-started writes of new changes (2026-11-07, for Gothab's edits and
+  merges).** Bart chose a two-step stage: `wheat_server::write::open_stage`, then
+  `ServerStage::build` with the store's mutator over the stage, then
+  `ServerStage::submit` with label changes, joined onto the current head as a publish
+  from the stage's base is (see [Embedded in Gothab](#embedded-in-gothab)). Tests:
+  `server_stage_test.rs`; bench case `server_stage`.
 
 ### Outstanding
 
@@ -148,9 +154,6 @@ top of them.
   per-repository `read` / `publish` / `force` access is checked before every
   operation, and a repository without access answers like a missing one.
   Publish gates are not started.)
-- [ ] **Embedder-started writes of new changes.** Server edits and merges: a builder
-  that stages new objects and content on a base head, joined onto the current head
-  as a publish is, a label moved on both sides refusing it as `LabelMoved`.
 - [ ] **Phase 2 — Gothab integration.** Let gothab-server (or gitd's successor)
   serve wheat repositories through the native protocol alongside Git projections,
   with one canonical store per repository. (2026-10-30: decided to serve them
@@ -1157,11 +1160,35 @@ while a batch is being written, so each expectation is checked against exactly
 that head; a mismatch is `WriteFailure::LabelMoved` with each label's actual view.
 The new envelope keeps the head's state, is validated as a publish of it, and moves
 labels forward unless `force_labels`. Its receipt binds the key to a digest of the
-changes (`server_write_request_digest`: a `ServerWriteRequestInputV1`, the changes in
+changes (`server_write_request_digest`: a `ServerWriteRequestInputV2`, the changes in
 name order), so the same write sent again gets its first answer and the same key
 for another write is refused. A quiesced network refuses it with its retry delay.
-Publish hooks are not told: the embedder tells its own listeners. Writes that add
-changes (server edits, merges) are to build on this.
+Publish hooks are not told: the embedder tells its own listeners.
+
+Writes that add changes, Gothab's web edits and pull-request merges, are built first
+(2026-11-07; Bart chose a two-step stage over a builder Wheat calls or operations Wheat
+owns). `open_stage` opens a `ServerStage` on the durable head and holds a slot among
+the network's writers until the stage is dropped, so a quiesce waits for it.
+`ServerStage::build` runs the embedder's closure on a blocking thread with a
+`StageBuilder`. The builder gives the ordinary `PersistedRepositoryMutator` over the
+stage: `create`, `create_on_frontier`, `revise`, `integrate` and `resolve_conflict`,
+expected at the stage's tip. Its `publish` moves the tip in memory only, and content
+its edits put is stored at once. `ServerStage::submit(write)` then takes its turn
+like a label write. The tip is joined onto the head the write joins onto, as a
+publish from the stage's base is, so publishes accepted since join it. A change
+recorded differently on both sides is `Stale`. Then the write's label changes are
+made there, checked against that head. The tip must keep the base's labels, so
+labels move in the write alone.
+
+The receipt digests the label changes and the built state. Bart chose this over a
+digest the embedder supplies, or the key alone. The same stage submitted again gets
+its first answer. Since change IDs are random, a stage rebuilt the same way is
+another request, and is refused under that key. A submit refused before it was
+accepted (labels moved, stale, its content not named) may be made again; one whose
+batch failed took the stage's objects with it. When the network names content, a
+submit names what the built state adds over the base, closure included, before it
+joins, with the stage's opening as its instant. Bench case `server_stage`: at 1,000
+and 10,000 changes, an edit reads 108 and 125 objects and a merge 122 and 147.
 
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new

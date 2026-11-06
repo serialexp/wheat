@@ -492,7 +492,9 @@ names the closure, so Gothab's `named` only stamps rows. As built:
   that was stored already, the manifests it uploaded, and its uploads' delta bases,
   all through `needed_to_read`. It does this before it joins the commit.
   A failure answers the publish with the error status ("publish again"), and nothing
-  is kept. A server write adds no content and names nothing.
+  is kept. A server write of labels adds no content and names nothing. A stage's submit names
+  what its built state adds over its base, closure included, with the stage's opening
+  as its instant (`wheat_server::write`).
 - A batch keeps what its publishes named and uploaded, and the oldest of their
   instants. Just before its head compare-and-swap, if that instant is older than
   `renew_after` (half the grace), it names all of it again; a failure fails the

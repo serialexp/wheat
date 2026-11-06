@@ -10,10 +10,11 @@ it together later (v0.3.5), only on Bart's go-ahead.
   091359c, the request digest a `ServerWriteRequestInputV1`). Binschema pin moved to
   1141fb2 (efd5ee6; additive `encode_measuring` only). Rebuild binschema with nvm's
   node (`~/.nvm/versions/node/v24.22.0/bin`) and `node_modules/.bin/tsc`.
-- Server edits and merges (the builder): Bart chose (2026-11-07) a two-step stage:
-  the embedder opens a stage, builds into it, then submits it. Still open: what a
-  build write's receipt binds the key to (an embedder digest, the key only, or an
-  operation digest).
+- Server edits and merges: done. Bart chose (2026-11-07) a two-step stage, with
+  Wheat's digest (the label changes plus the built state) for retries:
+  `open_stage`, `ServerStage::build` (the store's mutator over the stage),
+  `ServerStage::submit(write)`. Documented in `wheat-native-protocol.md`, "Embedded
+  in Gothab"; bench case `server_stage`.
 - Hidden labels: done. Bart chose (2026-11-07) that they stay in the local head
   exactly as on the remote (clone, fetch and publish move them as before) and are
   only left out of `wheat labels`, which lists them with `--hidden`; glob patterns
@@ -38,7 +39,7 @@ it together later (v0.3.5), only on Bart's go-ahead.
 - Secret-sweep API (walrus's request, Bart okayed 2026-11-07): done, 86c9e4e
   (`RepositoryBrowser::state_trees`/`state_edits`, bench case `state_scan`); walrus
   told.
-- Next: the two-step stage.
+- Next: nothing of Bart's order is left; waiting on Bart for the v0.3.5 tag.
 
 ## 2026-10-30/31: Wheat hardening for the Gothab integration (@calm-lynx)
 

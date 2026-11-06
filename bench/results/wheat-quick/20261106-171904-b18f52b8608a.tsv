@@ -1,0 +1,28 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261106-171904
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	b18f52b8608a
+# scale	full
+# scratch_fs	ext4
+# server_stage	{"checkpoints":[1000,10000]}
+measurement	value	unit
+server_stage.total.wall	32.605555166	s
+server_stage.total.peak_rss	139362304	bytes
+server_stage.n1000.edit.wall	0.007858344	s
+server_stage.n1000.edit.reads	108	count
+server_stage.n1000.merge.wall	0.007373802	s
+server_stage.n1000.merge.reads	122	count
+server_stage.n10000.edit.wall	0.008161265	s
+server_stage.n10000.edit.reads	125	count
+server_stage.n10000.merge.wall	0.005936085	s
+server_stage.n10000.merge.reads	147	count
+server_stage.edit.read_growth_per_bit	4.738435116933039	percent
+server_stage.merge.read_growth_per_bit	6.1686474521307595	percent
+run.total_time	32.613177686	s
+process.peak_rss	139362304	bytes
+suite.cases	1	count
+suite.case_failures	0	count

@@ -1,18 +1,41 @@
-//! Writes an embedder starts, with no client session: Gothab's ref writes, for
-//! example. A write takes its turn in the repository's group commit as a publish
-//! does, so it is serialized with live publishes and made durable in their batches,
-//! and its key makes it idempotent as a publish key does (see [`crate::receipt`]).
-//! No publish hooks run: the embedder tells its own listeners.
+//! Writes an embedder starts, with no client session: Gothab's ref writes, edits
+//! and merges, for example. A write takes its turn in the repository's group commit
+//! as a publish does, so it is serialized with live publishes and made durable in
+//! their batches, and its key makes it idempotent as a publish key does (see
+//! [`crate::receipt`]). No publish hooks run: the embedder tells its own listeners.
+//!
+//! [`write()`] changes labels alone. An edit or a merge is built first, in a
+//! [`ServerStage`] opened on the durable head: [`ServerStage::build`] gives the
+//! store's [`PersistedRepositoryMutator`] over the stage, whose `publish` moves the
+//! stage's tip in memory only. [`ServerStage::submit`] then joins the tip onto the
+//! head as a publish from the stage's base is, and makes the write's label changes
+//! there.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
+use tokio::time::Instant;
+use tracing::{Instrument as _, debug_span, warn};
 pub use wheat_core::ExpectedLabel;
-use wheat_core::{ViewId, ViewLabel, ViewLabelManifestRecord, server_write_request_digest};
-use wheat_store::{RepositoryHead, RepositoryStage};
+use wheat_core::{
+    RepositoryStateId, ViewId, ViewLabel, ViewLabelManifestRecord, server_write_request_digest,
+};
+use wheat_store::{
+    PersistedRepositoryMutator, PublicationError, PublicationStore, RepositoryHead,
+    RepositoryReader, RepositoryStage,
+};
 
 use crate::{
     access::Principal,
-    commit::{self, CommitFailure, LabelRefusal},
+    commit::{self, Built, CommitFailure, LabelRefusal},
+    error_text::chain,
+    naming::Named,
+    network::Network,
+    quiesce::Writing,
     receipt::PublishKey,
     registry::RepositoryEntry,
 };
@@ -21,6 +44,11 @@ use crate::{
 /// envelope.
 const STAGED_OBJECTS: usize = 16;
 const STAGED_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most objects, and bytes, a [`ServerStage`] holds before storing them early:
+/// as many as a publish's stage.
+const STAGE_OBJECTS: usize = 65_536;
+const STAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// One label a write changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,26 +100,48 @@ pub async fn write(
     entry: &Arc<RepositoryEntry>,
     write: ServerWrite,
 ) -> Result<RepositoryHead, WriteFailure> {
-    let request = request_digest(&write)?;
-    let key = PublishKey::server_write(&write.principal, write.key, request)
-        .map_err(|e| WriteFailure::Invalid(format!("the principal cannot be bound: {e}")))?;
+    let request = request_digest(&write, None)?;
     // Held until the write is answered, so a quiesce waits for it.
-    let Some(_writing) = entry.network.writers.begin() else {
-        return Err(WriteFailure::Quiesced {
-            retry_after: entry.network.writers.retry_after(),
-        });
-    };
+    let writing = begin(entry)?;
     let staged = Arc::new(RepositoryStage::new(
         entry.network.clone(),
         STAGED_OBJECTS,
         STAGED_BYTES,
     ));
+    let answer = accept(entry, &staged, write, request, None).await;
+    drop(writing);
+    answer
+}
+
+/// A slot among the repository's writers, or why there is none.
+fn begin(entry: &RepositoryEntry) -> Result<Writing, WriteFailure> {
+    entry
+        .network
+        .writers
+        .begin()
+        .ok_or_else(|| WriteFailure::Quiesced {
+            retry_after: entry.network.writers.retry_after(),
+        })
+}
+
+/// Accepts `write`, asking for `request`, with what a stage `built`, and waits for its
+/// batch.
+async fn accept(
+    entry: &Arc<RepositoryEntry>,
+    staged: &Arc<RepositoryStage<Network>>,
+    write: ServerWrite,
+    request: [u8; 16],
+    built: Option<Built>,
+) -> Result<RepositoryHead, WriteFailure> {
+    let key = PublishKey::server_write(&write.principal, write.key, request)
+        .map_err(|e| WriteFailure::Invalid(format!("the principal cannot be bound: {e}")))?;
     let accepted = commit::accept_labels(
         entry,
-        &staged,
+        staged,
         key,
         Arc::new(write.labels),
         write.force_labels,
+        built,
     )
     .await
     .map_err(|refusal| match refusal {
@@ -101,8 +151,315 @@ pub async fn write(
     accepted.durable().await.map_err(WriteFailure::Commit)
 }
 
-/// What `write` asks for, digested, once its changes are checked to be a write.
-fn request_digest(write: &ServerWrite) -> Result<[u8; 16], WriteFailure> {
+/// Where an edit or a merge is built before it is submitted: a repository stage
+/// opened on the durable head, whose tip is that head until a build publishes into
+/// it. It holds a slot among the repository's writers until it is submitted or
+/// dropped, so a quiesce waits for it; keep it for one request. Dropped unsubmitted,
+/// it leaves what it stored early, and the content its builds wrote, for a collection
+/// to reclaim.
+pub struct ServerStage {
+    entry: Arc<RepositoryEntry>,
+    inner: Arc<StageInner>,
+    /// Before anything was written into the stage: each stamp of its content is newer.
+    opened: Instant,
+    /// What the tip last submitted holds, kept for submitting it again: the objects
+    /// staged for it go with the write once it is accepted.
+    submitted: tokio::sync::Mutex<Option<(RepositoryHead, BuiltState)>>,
+    _writing: Writing,
+}
+
+/// The state a stage's tip holds, and the content it needs over the base's when the
+/// network is told what publishes rely on.
+#[derive(Clone)]
+struct BuiltState {
+    state: RepositoryStateId,
+    needed: Vec<wheat_core::ContentId>,
+}
+
+struct StageInner {
+    stage: Arc<RepositoryStage<Network>>,
+    base: RepositoryHead,
+    tip: StageHead,
+}
+
+/// A stage's tip, the head its builds read and publish to. Publishing to it moves it
+/// in memory; nothing about it is durable.
+#[derive(Debug)]
+pub struct StageHead(Mutex<RepositoryHead>);
+
+impl StageHead {
+    fn get(&self) -> RepositoryHead {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl PublicationStore for StageHead {
+    fn read(&self) -> Result<RepositoryHead, PublicationError> {
+        Ok(self.get())
+    }
+
+    fn initialize(&self, _: RepositoryHead) -> Result<(), PublicationError> {
+        Err(PublicationError::Io(std::io::Error::other(
+            "a stage starts on the head it was opened on",
+        )))
+    }
+
+    fn compare_and_advance(
+        &self,
+        expected: RepositoryHead,
+        proposed: RepositoryHead,
+    ) -> Result<(), PublicationError> {
+        let mut tip = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if *tip != expected {
+            return Err(PublicationError::Stale {
+                expected,
+                actual: *tip,
+            });
+        }
+        if proposed.generation != expected.generation + 1 {
+            return Err(PublicationError::InvalidGeneration);
+        }
+        *tip = proposed;
+        Ok(())
+    }
+}
+
+/// What a build is given: the stage, to read and to mutate.
+pub struct StageBuilder {
+    inner: Arc<StageInner>,
+}
+
+/// The mutator a build is given, over the stage and its tip.
+pub type StageMutator<'a> = PersistedRepositoryMutator<'a, RepositoryStage<Network>, StageHead>;
+
+impl StageBuilder {
+    /// The stage's tip: what a mutation is `expected` to build on.
+    #[must_use]
+    pub fn head(&self) -> RepositoryHead {
+        self.inner.tip.get()
+    }
+
+    /// The store's mutator over the stage; its `publish` moves the tip.
+    #[must_use]
+    pub fn mutator(&self) -> StageMutator<'_> {
+        PersistedRepositoryMutator::new(
+            self.inner.stage.as_ref(),
+            self.inner.stage.content(),
+            &self.inner.tip,
+        )
+    }
+
+    /// The stage read: the durable store with what was built into it.
+    #[must_use]
+    pub fn reader(&self) -> RepositoryReader<'_, RepositoryStage<Network>> {
+        RepositoryReader::new(self.inner.stage.as_ref(), self.inner.stage.content())
+    }
+
+    /// The network's content, where a build puts what its edits write. A put is
+    /// stored at once, not staged.
+    #[must_use]
+    pub fn content(&self) -> &wheat_store::ContentStore {
+        self.inner.stage.content()
+    }
+}
+
+/// Opens a stage on `entry`'s durable head.
+#[tracing::instrument(name = "server_stage_open", level = "debug", skip_all)]
+pub async fn open_stage(entry: &Arc<RepositoryEntry>) -> Result<ServerStage, WriteFailure> {
+    let writing = begin(entry)?;
+    let opened = Instant::now();
+    let base = entry.heads.head().await.map_err(|e| {
+        WriteFailure::Commit(CommitFailure::Internal(format!(
+            "server stage: read the head: {}",
+            chain(&e)
+        )))
+    })?;
+    Ok(ServerStage {
+        entry: Arc::clone(entry),
+        inner: Arc::new(StageInner {
+            stage: Arc::new(RepositoryStage::new(
+                entry.network.clone(),
+                STAGE_OBJECTS,
+                STAGE_BYTES,
+            )),
+            base,
+            tip: StageHead(Mutex::new(base)),
+        }),
+        opened,
+        submitted: tokio::sync::Mutex::new(None),
+        _writing: writing,
+    })
+}
+
+impl ServerStage {
+    /// The durable head the stage was opened on.
+    #[must_use]
+    pub fn base(&self) -> RepositoryHead {
+        self.inner.base
+    }
+
+    /// The stage's tip: the base, or what a build last published into it.
+    #[must_use]
+    pub fn head(&self) -> RepositoryHead {
+        self.inner.tip.get()
+    }
+
+    /// Runs `work` with a [`StageBuilder`] on a thread for blocking work, since the
+    /// stores read and write the disk synchronously, and answers what it returns.
+    pub async fn build<T, F, Fut>(&self, work: F) -> Result<T, WriteFailure>
+    where
+        F: FnOnce(StageBuilder) -> Fut + Send + 'static,
+        Fut: Future<Output = T>,
+        T: Send + 'static,
+    {
+        let builder = StageBuilder {
+            inner: Arc::clone(&self.inner),
+        };
+        crate::blocking::drive(move || work(builder))
+            .await
+            .map_err(|e| {
+                WriteFailure::Commit(CommitFailure::Internal(format!(
+                    "server stage: the build stopped: {e}"
+                )))
+            })
+    }
+}
+
+impl ServerStage {
+    /// Submits what the stage built with `write`'s label changes, and answers the
+    /// head they were published in. The stage's tip is joined onto the head the write
+    /// joins onto as a publish from the stage's base would be, so publishes accepted
+    /// since join it; a change both recorded differently is [`CommitFailure::Stale`].
+    /// The labels move as [`write()`] moves them, there. The tip must keep the base's
+    /// labels: labels move in the write alone.
+    ///
+    /// The receipt binds `write.key` to the label changes and the built state, so the
+    /// stage submitted again gets the first answer, and another stage under that key
+    /// is refused. A submit refused before it was accepted (labels moved, stale,
+    /// rejected, its content not named) may be made again; one whose batch failed
+    /// took the stage's objects with it, so build in a new stage, under a new key.
+    ///
+    /// When the network is told what publishes rely on, what the built state adds
+    /// over the base is named first ([`crate::naming`]); a failure is
+    /// [`CommitFailure::Failed`].
+    #[tracing::instrument(name = "server_stage_submit", level = "debug", skip_all)]
+    pub async fn submit(&self, write: ServerWrite) -> Result<RepositoryHead, WriteFailure> {
+        let base = self.inner.base;
+        let tip = self.inner.tip.get();
+        let mut submitted = self.submitted.lock().await;
+        let built = match &*submitted {
+            Some((at, built)) if *at == tip => built.clone(),
+            _ => {
+                let inner = Arc::clone(&self.inner);
+                let naming = self.entry.network.naming.is_some();
+                let built = crate::blocking::drive(move || async move {
+                    built(&inner, base, tip, naming).await
+                })
+                .await
+                .map_err(|e| {
+                    WriteFailure::Commit(CommitFailure::Internal(format!(
+                        "server stage: read what was built: {e}"
+                    )))
+                })??;
+                *submitted = Some((tip, built.clone()));
+                built
+            }
+        };
+        let request = request_digest(&write, Some(built.state))?;
+        let named = match &self.entry.network.naming {
+            None => None,
+            Some(naming) => {
+                if let Err(e) = naming
+                    .named(&built.needed)
+                    .instrument(debug_span!("server_stage_name", ids = built.needed.len()))
+                    .await
+                {
+                    warn!(error = %e, "server stage: naming its content failed");
+                    return Err(WriteFailure::Commit(CommitFailure::Failed {
+                        head: base,
+                        message: format!(
+                            "naming the built content failed: {e}; submit the stage again"
+                        ),
+                    }));
+                }
+                Some(Named {
+                    since: self.opened,
+                    ids: built.needed,
+                })
+            }
+        };
+        let built = Built {
+            base: base.envelope,
+            tip: tip.envelope,
+            named,
+        };
+        accept(&self.entry, &self.inner.stage, write, request, Some(built)).await
+    }
+}
+
+/// The state the stage's `tip` holds once it is checked to keep `base`'s labels and,
+/// when `naming`, the content that state needs over `base`'s, closure included.
+async fn built(
+    inner: &StageInner,
+    base: RepositoryHead,
+    tip: RepositoryHead,
+    naming: bool,
+) -> Result<BuiltState, WriteFailure> {
+    let internal = |what: &str, e: &dyn std::error::Error| {
+        WriteFailure::Commit(CommitFailure::Internal(format!(
+            "server stage: {what}: {}",
+            chain(e)
+        )))
+    };
+    let reader = RepositoryReader::new(inner.stage.as_ref(), inner.stage.content());
+    let before = reader
+        .envelope(base.envelope)
+        .await
+        .map_err(|e| internal("read the base", &e))?;
+    let after = reader
+        .envelope(tip.envelope)
+        .await
+        .map_err(|e| internal("read the tip", &e))?;
+    if after.labels != before.labels {
+        return Err(WriteFailure::Invalid(
+            "a stage keeps its base's labels: move labels in the write".into(),
+        ));
+    }
+    if !naming {
+        return Ok(BuiltState {
+            state: after.state,
+            needed: Vec::new(),
+        });
+    }
+    let reader = &reader;
+    let required = |state| async move {
+        reader
+            .state(state)
+            .await
+            .map(|state| state.required_content)
+            .map_err(|e| internal("read a state", &e))
+    };
+    let added = wheat_store::ContentSetStore::new(inner.stage.as_ref())
+        .added(required(before.state).await?, required(after.state).await?)
+        .await
+        .map_err(|e| internal("compare the content sets", &e))?;
+    let needed = inner
+        .stage
+        .content()
+        .needed_to_read(added, [])
+        .map_err(|e| internal("find what the built content needs", &e))?;
+    Ok(BuiltState {
+        state: after.state,
+        needed,
+    })
+}
+
+/// What `write` asks for, digested, once its changes are checked to be a write;
+/// `built` is the state a stage built for it.
+fn request_digest(
+    write: &ServerWrite,
+    built: Option<RepositoryStateId>,
+) -> Result<[u8; 16], WriteFailure> {
     if write.labels.is_empty() {
         return Err(WriteFailure::Invalid(
             "a write changes at least one label".into(),
@@ -131,5 +488,6 @@ fn request_digest(write: &ServerWrite) -> Result<[u8; 16], WriteFailure> {
             .iter()
             .map(|change| (change.name.as_str(), change.expected, change.new.as_ref())),
         write.force_labels,
+        built,
     ))
 }
