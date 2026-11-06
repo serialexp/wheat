@@ -196,7 +196,9 @@ pub use content_blobs::{
     BlobPage, BlobRead, ContentBlobStore, RecordInfo, RecordReferences, record_info,
     record_logical_length,
 };
-pub use content_gc::{ContentInventory, ContentMarks, GcError, MarkCounts, SweepCounts, sweep};
+pub use content_gc::{
+    ContentInventory, ContentMarks, GcError, MarkCounts, SWEEP_PAGE_IDS, SweepCounts, sweep,
+};
 pub use content_store::{ContentItem, ContentStore, ContentStoreError};
 pub use content_stream::{ContentReader, ContentWriter};
 

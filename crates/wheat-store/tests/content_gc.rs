@@ -95,6 +95,10 @@ struct Inventory {
     reclaimed: Mutex<BTreeSet<ContentId>>,
     /// An ID the embedder has lost its row for.
     forgotten: Option<ContentId>,
+    /// An ID named since the mark began, which it keeps.
+    named: Option<ContentId>,
+    /// The longest batch it was asked to reclaim.
+    largest_reclaim: Mutex<usize>,
 }
 
 #[async_trait]
@@ -114,10 +118,20 @@ impl ContentInventory for Inventory {
             .collect())
     }
 
-    async fn reclaim(&self, id: ContentId) -> std::io::Result<()> {
-        self.blobs.records.lock().unwrap().remove(&id);
-        self.reclaimed.lock().unwrap().insert(id);
-        Ok(())
+    async fn reclaim(&self, ids: &[ContentId]) -> std::io::Result<Vec<ContentId>> {
+        let mut largest = self.largest_reclaim.lock().unwrap();
+        *largest = (*largest).max(ids.len());
+        let reclaimed: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != self.named)
+            .collect();
+        let mut records = self.blobs.records.lock().unwrap();
+        for id in &reclaimed {
+            records.remove(id);
+        }
+        self.reclaimed.lock().unwrap().extend(&reclaimed);
+        Ok(reclaimed)
     }
 }
 
@@ -126,7 +140,14 @@ fn inventory(blobs: &Arc<Blobs>) -> Inventory {
         blobs: Arc::clone(blobs),
         reclaimed: Mutex::default(),
         forgotten: None,
+        named: None,
+        largest_reclaim: Mutex::default(),
     }
+}
+
+/// When the test's collection began: before anything was marked.
+fn started() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_762_400_000_123)
 }
 
 /// `len` bytes that don't compress, from `seed`.
@@ -249,7 +270,7 @@ async fn instance() -> Instance {
 
 /// One host's finished marks of `networks`.
 async fn marked(path: &Path, content: &ContentStore, networks: &[&Network]) -> std::path::PathBuf {
-    let mut marks = ContentMarks::create(path).unwrap();
+    let mut marks = ContentMarks::create(path, started()).unwrap();
     for network in networks {
         let reader = RepositoryReader::new(&network.objects, content);
         marks.mark_heads(&reader, [network.head]).await.unwrap();
@@ -278,15 +299,38 @@ async fn a_sweep_reclaims_only_what_no_head_needs() {
         &[&instance.b],
     )
     .await;
-    let mut marks =
-        ContentMarks::merge(&dir.path().join("all.marks"), &[&host_a, &host_b]).unwrap();
+    let mut marks = ContentMarks::merge(
+        &dir.path().join("all.marks"),
+        started(),
+        &[&host_a, &host_b],
+    )
+    .unwrap();
+    assert_eq!(marks.started(), started());
     let blobs: Arc<dyn ContentBlobStore> = instance.blobs.clone();
-    let inventory = inventory(&instance.blobs);
+    // One dead record was named since the mark began: the inventory keeps it.
+    let named = *instance.dead.iter().next().unwrap();
+    let inventory = Inventory {
+        named: Some(named),
+        ..inventory(&instance.blobs)
+    };
     let counts = sweep(&blobs, &mut marks, &inventory).await.unwrap();
 
-    assert_eq!(*inventory.reclaimed.lock().unwrap(), instance.dead);
-    assert_eq!(stored(&instance.blobs), instance.kept);
-    assert_eq!(counts.reclaimed, instance.dead.len() as u64);
+    let mut reclaimed = instance.dead.clone();
+    reclaimed.remove(&named);
+    let mut kept = instance.kept.clone();
+    kept.insert(named);
+    assert_eq!(*inventory.reclaimed.lock().unwrap(), reclaimed);
+    assert_eq!(stored(&instance.blobs), kept);
+    assert_eq!(counts.reclaimed, reclaimed.len() as u64);
+    assert_eq!(counts.kept, 1); // A listed page's unmarked IDs go to the inventory at once: this store lists
+    // two IDs a page.
+    assert!(
+        (1..=counts.pages).contains(&counts.reclaim_calls),
+        "{counts:?}"
+    );
+    assert_eq!(counts.pages, counts.listed.div_ceil(2), "{counts:?}");
+    // Never more than a page; the bench case counts the calls at scale.
+    assert!((1..=2).contains(&*inventory.largest_reclaim.lock().unwrap()));
     assert_eq!(
         counts.listed,
         (instance.kept.len() + instance.dead.len()) as u64
@@ -312,7 +356,7 @@ async fn a_sweep_reclaims_only_what_no_head_needs() {
 async fn heads_sharing_content_sets_are_walked_once() {
     let instance = instance().await;
     let dir = tempfile::tempdir().unwrap();
-    let mut marks = ContentMarks::create(&dir.path().join("marks")).unwrap();
+    let mut marks = ContentMarks::create(&dir.path().join("marks"), started()).unwrap();
     let reader = RepositoryReader::new(&instance.a.objects, &instance.content);
     let first = marks.mark_heads(&reader, [instance.a.head]).await.unwrap();
     assert_eq!(first.heads, 1);
@@ -332,17 +376,17 @@ async fn collection_fails_closed() {
     let before = stored(&instance.blobs);
 
     // A head that cannot be read stops marking.
-    let mut marks = ContentMarks::create(&dir.path().join("missing")).unwrap();
+    let mut marks = ContentMarks::create(&dir.path().join("missing"), started()).unwrap();
     let reader = RepositoryReader::new(&instance.a.objects, &instance.content);
     let unknown = instance.b.head;
     assert!(marks.mark_heads(&reader, [unknown]).await.is_err());
 
     // An unfinished mark file is neither opened, merged nor swept against.
     let unfinished = dir.path().join("unfinished");
-    let mut open = ContentMarks::create(&unfinished).unwrap();
+    let mut open = ContentMarks::create(&unfinished, started()).unwrap();
     open.mark_heads(&reader, [instance.a.head]).await.unwrap();
     assert!(ContentMarks::open(&unfinished).is_err());
-    assert!(ContentMarks::merge(&dir.path().join("merged"), &[&unfinished]).is_err());
+    assert!(ContentMarks::merge(&dir.path().join("merged"), started(), &[&unfinished]).is_err());
     assert!(matches!(
         sweep(&blobs, &mut open, &inventory(&instance.blobs)).await,
         Err(GcError::File(_))
@@ -357,7 +401,14 @@ async fn collection_fails_closed() {
         &[&instance.a, &instance.b],
     )
     .await;
+    // A file marked for an earlier collection is not merged into a later one.
+    let later = started() + std::time::Duration::from_secs(60);
+    assert!(matches!(
+        ContentMarks::merge(&dir.path().join("later"), later, &[&path]),
+        Err(GcError::File(_))
+    ));
     let mut marks = ContentMarks::open(&path).unwrap();
+    assert_eq!(marks.started(), started());
     let forgetful = Inventory {
         forgotten: instance.kept.iter().next().copied(),
         ..inventory(&instance.blobs)

@@ -17,6 +17,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -36,10 +37,11 @@ use crate::{
 const INSERT_BATCH: usize = 4096;
 /// Marked IDs whose references are asked for at once.
 const REFERENCE_BATCH: usize = 1024;
-/// IDs asked for per listed page.
-const LIST_PAGE: usize = 1000;
+/// IDs asked for per listed page, and so the most one [`ContentInventory::reclaim`]
+/// is given.
+pub const SWEEP_PAGE_IDS: usize = 1000;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = "
 CREATE TABLE marked (
     id BLOB PRIMARY KEY NOT NULL,
@@ -47,6 +49,7 @@ CREATE TABLE marked (
 ) WITHOUT ROWID;
 CREATE INDEX unexpanded ON marked (id) WHERE expanded = 0;
 CREATE TABLE visited (node BLOB PRIMARY KEY NOT NULL) WITHOUT ROWID;
+CREATE TABLE started (one INTEGER PRIMARY KEY CHECK (one = 1), at_ms INTEGER NOT NULL);
 CREATE TABLE finished (one INTEGER PRIMARY KEY CHECK (one = 1), marked INTEGER NOT NULL);
 ";
 
@@ -94,9 +97,14 @@ pub struct SweepCounts {
     pub referenced: u64,
     /// Long blobs' parts read for their chunks.
     pub parts_read: u64,
-    /// IDs the blob store listed, and those reclaimed.
+    /// IDs the blob store listed, in this many pages; of those marked by nothing,
+    /// the ones the inventory reclaimed and the ones it kept (named since the mark
+    /// began), in this many inventory calls, at most one a page.
     pub listed: u64,
+    pub pages: u64,
     pub reclaimed: u64,
+    pub kept: u64,
+    pub reclaim_calls: u64,
 }
 
 /// The embedder's record of its blob store, for [`sweep`].
@@ -108,8 +116,9 @@ pub trait ContentInventory: Send + Sync {
     async fn references(&self, ids: &[ContentId])
     -> io::Result<Vec<(ContentId, RecordReferences)>>;
 
-    /// `id` is marked by no head: delete it, unless it was named since the mark began.
-    async fn reclaim(&self, id: ContentId) -> io::Result<()>;
+    /// `ids`, at most [`SWEEP_PAGE_IDS`] of one listed page, are marked by no head:
+    /// delete each, unless it was named since the mark began. Answers those deleted.
+    async fn reclaim(&self, ids: &[ContentId]) -> io::Result<Vec<ContentId>>;
 }
 
 /// A disk-backed set of marked content IDs (SQLite), with the content set nodes
@@ -118,6 +127,7 @@ pub struct ContentMarks {
     connection: Connection,
     path: PathBuf,
     finished: bool,
+    started: SystemTime,
 }
 
 impl std::fmt::Debug for ContentMarks {
@@ -125,41 +135,58 @@ impl std::fmt::Debug for ContentMarks {
         f.debug_struct("ContentMarks")
             .field("path", &self.path)
             .field("finished", &self.finished)
+            .field("started", &self.started)
             .finish_non_exhaustive()
     }
 }
 
 impl ContentMarks {
-    /// A new, empty mark file at `path`, which must not exist.
-    pub fn create(path: &Path) -> Result<Self, GcError> {
+    /// A new, empty mark file at `path`, which must not exist, for the collection
+    /// that began at `started`: the heads marked into it must be read after then.
+    /// The file records it, to the millisecond, so a worker can refuse a file of an
+    /// earlier collection ([`Self::started`]).
+    pub fn create(path: &Path, started: SystemTime) -> Result<Self, GcError> {
         if path.exists() {
             return Err(GcError::File(format!("{} already exists", path.display())));
         }
+        let at_ms = unix_ms(started)?;
         let connection = Connection::open(path)?;
         // Marks need not survive a crash: a file is used only once finished, and
         // `seal` makes everything durable before it records that.
         connection.pragma_update(None, "journal_mode", "MEMORY")?;
         connection.pragma_update(None, "synchronous", "OFF")?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute(
+            "INSERT INTO started (one, at_ms) VALUES (1, ?1)",
+            params![at_ms],
+        )?;
         connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
             finished: false,
+            started: from_unix_ms(at_ms),
         })
     }
 
     /// A finished mark file, to sweep against.
     pub fn open(path: &Path) -> Result<Self, GcError> {
-        let connection = Self::open_finished(path)?;
+        let (connection, started) = Self::open_finished(path)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
             finished: true,
+            started,
         })
     }
 
-    fn open_finished(path: &Path) -> Result<Connection, GcError> {
+    /// When the collection this file marks for began, as [`Self::create`] was told.
+    #[must_use]
+    pub fn started(&self) -> SystemTime {
+        self.started
+    }
+
+    fn open_finished(path: &Path) -> Result<(Connection, SystemTime), GcError> {
         if !path.is_file() {
             return Err(GcError::File(format!("{} does not exist", path.display())));
         }
@@ -180,15 +207,25 @@ impl ContentMarks {
                 path.display()
             )));
         }
-        Ok(connection)
+        let at_ms: i64 = connection.query_row("SELECT at_ms FROM started", [], |row| row.get(0))?;
+        Ok((connection, from_unix_ms(at_ms)))
     }
 
-    /// The union of finished mark files at `inputs`, as a new finished file at `path`.
-    pub fn merge(path: &Path, inputs: &[&Path]) -> Result<Self, GcError> {
-        let mut marks = Self::create(path)?;
+    /// The union of finished mark files at `inputs`, as a new finished file at `path`
+    /// for the collection that began at `started`. An input marked for a collection
+    /// that began earlier is refused: its heads may have been read before `started`.
+    pub fn merge(path: &Path, started: SystemTime, inputs: &[&Path]) -> Result<Self, GcError> {
+        let mut marks = Self::create(path, started)?;
         for input in inputs {
-            // Opened first, so an unfinished input is refused before it is read.
-            drop(Self::open_finished(input)?);
+            // Opened first, so an unfinished or earlier input is refused before it is
+            // read.
+            let (_, input_started) = Self::open_finished(input)?;
+            if input_started < marks.started {
+                return Err(GcError::File(format!(
+                    "{} was marked for a collection that began before this one",
+                    input.display()
+                )));
+            }
             let name = input
                 .to_str()
                 .ok_or_else(|| GcError::File(format!("{} is not UTF-8", input.display())))?;
@@ -515,17 +552,27 @@ pub async fn sweep(
     }
 
     let mut cursor = None;
+    let mut unmarked = Vec::with_capacity(SWEEP_PAGE_IDS);
     loop {
         let page = blobs
-            .list_page(cursor, LIST_PAGE)
+            .list_page(cursor, SWEEP_PAGE_IDS)
             .await?
             .ok_or(GcError::NotListed)?;
         counts.listed += page.ids.len() as u64;
+        counts.pages += 1;
+        unmarked.clear();
         for id in page.ids {
             if !marks.contains(id)? {
-                inventory.reclaim(id).await?;
-                counts.reclaimed += 1;
+                unmarked.push(id);
             }
+        }
+        // A store may answer a longer page than asked: each call stays within the
+        // bound.
+        for batch in unmarked.chunks(SWEEP_PAGE_IDS) {
+            counts.reclaim_calls += 1;
+            let reclaimed = inventory.reclaim(batch).await?.len() as u64;
+            counts.reclaimed += reclaimed;
+            counts.kept += batch.len() as u64 - reclaimed.min(batch.len() as u64);
         }
         match page.next {
             Some(next) => cursor = Some(next),
@@ -533,4 +580,16 @@ pub async fn sweep(
         }
     }
     Ok(counts)
+}
+
+/// `time` in milliseconds since the Unix epoch, as a mark file records it.
+fn unix_ms(time: SystemTime) -> Result<i64, GcError> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .ok_or_else(|| GcError::File("a collection's start must be after 1970".into()))
+}
+
+fn from_unix_ms(at_ms: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(at_ms.unsigned_abs())
 }

@@ -92,12 +92,19 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         (measured.marked as f64 / REFERENCE_BATCH as f64).ceil(),
         "count",
     );
+    // One reclaim call per listed page at most, not one per ID.
+    recorder.at_most(
+        &format!("{step}.sweep.reclaim_calls"),
+        (measured.listed as f64 / wheat_store::SWEEP_PAGE_IDS as f64).ceil(),
+        "count",
+    );
     Ok(recorder.finish())
 }
 
 struct Measured {
     newest_reads: u64,
     marked: u64,
+    listed: u64,
 }
 
 /// Marks `heads` into a new file at `path`: the reads and the file.
@@ -108,7 +115,7 @@ async fn mark<O: ImmutableObjectStore>(
     heads: &[RepositoryEnvelopeId],
 ) -> Result<(u64, wheat_store::MarkCounts, ContentMarks)> {
     objects.take();
-    let mut marks = ContentMarks::create(path)?;
+    let mut marks = ContentMarks::create(path, std::time::SystemTime::now())?;
     let counts = marks.mark_heads(reader, heads.iter().copied()).await?;
     Ok((objects.take().0, counts, marks))
 }
@@ -260,6 +267,7 @@ async fn measure(
         ("listed", swept.listed),
         ("reclaimed", swept.reclaimed),
         ("reference_calls", swept.reference_calls),
+        ("reclaim_calls", swept.reclaim_calls),
     ] {
         recorder.value(&format!("{step}.sweep.{name}"), value as f64, "count");
     }
@@ -274,6 +282,7 @@ async fn measure(
     Ok(Measured {
         newest_reads,
         marked,
+        listed: swept.listed,
     })
 }
 
@@ -343,8 +352,9 @@ impl ContentInventory for Inventory {
         Ok(ids.iter().map(|id| (*id, RecordReferences::None)).collect())
     }
 
-    async fn reclaim(&self, _: ContentId) -> io::Result<()> {
-        self.reclaimed.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+    async fn reclaim(&self, ids: &[ContentId]) -> io::Result<Vec<ContentId>> {
+        self.reclaimed
+            .fetch_add(ids.len() as u64, Ordering::Relaxed);
+        Ok(ids.to_vec())
     }
 }

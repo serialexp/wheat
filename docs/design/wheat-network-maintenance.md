@@ -460,6 +460,13 @@ Bart deferred to @wise-walrus with a lean to G1 (a); walrus relayed these answer
 - `sweep(blobs, marks, inventory)`: closes the marks over `inventory.references`
   (and parts read from `blobs`) to a fixed point, then pages `list_page` and calls
   `inventory.reclaim(id)` for each ID not marked.
+- Changed at walrus's request (2026-11-07). `reclaim(ids)` takes a listed page's
+  unmarked IDs at once (at most `SWEEP_PAGE_IDS`, 1,000) and answers those it deleted;
+  `SweepCounts` counts pages, reclaim calls, and what the inventory kept. One call
+  per ID meant a Postgres round trip each, millions after a large delete. A mark
+  file records the collection's start (`ContentMarks::create(path, started)`,
+  `started()`), and `merge(path, started, inputs)` refuses an input marked for a
+  collection that began earlier.
 - A `ContentNaming` hook on wheat-server's network, `named(ids)`, called before a
   publish or server write joins the commit with what its state adds and its uploads'
   delta bases. A failure, including an ID Gothab has no row for (reclaimed since the
@@ -516,7 +523,8 @@ names the closure, so Gothab's `named` only stamps rows. As built:
   along the history reads 5,106 objects, 51% of marking each alone (budget 60%);
   20 forks one change past the newest add 85 reads to its 951 (budget 10 a fork); a
   sweep of 110,220 listed IDs reclaims the 100,200 dead in 0.29 s with 10 inventory
-  calls.
+  calls. With batched reclaims (2026-11-07) that is 111 reclaim calls, within the
+  budget of one a listed page.
 - [x] The `ContentNaming` hook in wheat-server's publish path, with the G/2 renaming,
   naming what reading the named content needs (2026-11-07, above).
 - [ ] **Gap — a chunk stored as a delta.** A chunk whose bytes equal content stored
