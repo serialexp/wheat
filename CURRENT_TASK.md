@@ -10,12 +10,13 @@ it together later (v0.3.5), only on Bart's go-ahead.
   091359c, the request digest a `ServerWriteRequestInputV1`). Binschema pin moved to
   1141fb2 (efd5ee6; additive `encode_measuring` only). Rebuild binschema with nvm's
   node (`~/.nvm/versions/node/v24.22.0/bin`) and `node_modules/.bin/tsc`.
-- Server edits and merges (the builder): waiting on Bart, asked 2026-11-06 and not
-  answered. Choices: a builder closure, a two-step stage, or Wheat-owned operations;
-  and what a build write's receipt binds the key to (an embedder digest, the key
-  only, or an operation digest).
+- Server edits and merges (the builder): Bart chose (2026-11-07) a two-step stage:
+  the embedder opens a stage, builds into it, then submits it. Still open: what a
+  build write's receipt binds the key to (an embedder digest, the key only, or an
+  operation digest).
 - Hidden labels (leading dot: not fetched by clone, fetch or pull unless asked, still
-  GC roots): waiting on Bart (asked 2026-11-06, no answer). Labels travel only inside
+  GC roots): Bart chose (2026-11-07) client-side filtering, asked for with a
+  persisted `--label PATTERN` on the remote binding. Labels travel only inside
   the envelope's manifest; publish sends the whole manifest against `last_fetched`,
   so a client that drops hidden labels must put them back, as last fetched, before a
   fetch union and in a publish. Choices: client-side vs server-side filtering, and a
@@ -33,9 +34,12 @@ it together later (v0.3.5), only on Bart's go-ahead.
   isn't named with its base, a join after a forced publish can re-add unnamed
   content, publish delta bases come from the base view (so there are hardly any), and
   a store failure during upload drops the connection instead of answering "publish
-  again" (asked Bart whether to fix now).
-- Walrus asked (2026-11-07) for a secret-sweep API: `state_trees`/`state_edits`,
-  paged with stable cursors. Outside Bart's order; asked Bart.
+  again".
+- Secret-sweep API (walrus's request, Bart okayed 2026-11-07): done, 86c9e4e
+  (`RepositoryBrowser::state_trees`/`state_edits`, bench case `state_scan`); walrus
+  told.
+- Next, in order: a store failure during upload answers "publish again" (Bart: fix
+  now), hidden labels, then the two-step stage.
 
 ## 2026-10-30/31: Wheat hardening for the Gothab integration (@calm-lynx)
 
