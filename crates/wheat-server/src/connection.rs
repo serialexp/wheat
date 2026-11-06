@@ -629,11 +629,14 @@ async fn run_session(
                 let key = PublishKey::new(&principal, &req)?;
                 // Read head fresh for each publish attempt, with the receipt that
                 // answers a publish sent again.
+                // A receipt the head store may have trimmed early cannot answer, so the
+                // publish is published again: a join of what it holds.
                 let (head, receipt) = entry
                     .heads
                     .head_with_receipt(key.key())
                     .await
                     .map_err(|e| ConnectionError::Internal(format!("failed to read head: {e}")))?;
+                let receipt = receipt.found().copied();
                 let publisher = crate::publish::Publisher {
                     repository: &repository,
                     principal: &principal,

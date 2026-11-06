@@ -876,16 +876,17 @@ async fn read_receipt(
     entry: &RepositoryEntry,
     key: &PublishKey,
 ) -> Result<(RepositoryHead, Option<PublishReceiptRecord>), CommitFailure> {
-    entry
+    let (head, lookup) = entry
         .heads
         .head_with_receipt(key.key())
         .await
-        .map_err(|e| CommitFailure::Internal(format!("publish: read the head: {e}")))
+        .map_err(|e| CommitFailure::Internal(format!("publish: read the head: {e}")))?;
+    Ok((head, lookup.found().copied()))
 }
 
 /// Seconds since the Unix epoch, which receipts are recorded at. A clock before the
 /// epoch counts as the epoch: the receipts then expire early, never late.
-fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())

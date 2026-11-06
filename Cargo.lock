@@ -6284,6 +6284,7 @@ dependencies = [
  "uuid",
  "wheat-core",
  "wheat-protocol",
+ "wheat-server",
  "wheat-store",
  "wheat-trace",
 ]

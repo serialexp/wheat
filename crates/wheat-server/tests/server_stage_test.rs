@@ -14,19 +14,21 @@ use wheat_core::{
     ApplicationContext, ChangeId, ChangeMetadata, ChangeProposal, ContentId, Repository,
     RevisionEdits, RevisionMetadata, Tree, ViewId, ViewLabel,
 };
+use wheat_core::{PublishReceiptRecord, RepositoryEnvelopeId};
 use wheat_server::access::Principal;
 use wheat_server::commit::CommitFailure;
+use wheat_server::heads::{HeadStore, ReceiptLookup, conformance::check_head_store};
 use wheat_server::naming::ContentNaming;
 use wheat_server::network::Network;
 use wheat_server::quiesce::Quiesced;
 use wheat_server::registry::RepositoryEntry;
 use wheat_server::write::{
     ExpectedLabel::{self, Absent, View},
-    LabelChange, ServerStage, ServerWrite, WriteFailure, open_stage, published, write,
+    LabelChange, ServerStage, ServerWrite, Submission, WriteFailure, open_stage, published, write,
 };
 use wheat_store::{
-    LabelMove, LocalPublicationStore, MerkleTreeStore, PackedObjectStore, RepositoryHead,
-    RepositoryPublisher, RepositoryReader,
+    LabelMove, LocalPublicationStore, MerkleTreeStore, PackedObjectStore, PublicationError,
+    PublicationStore, RepositoryHead, RepositoryPublisher, RepositoryReader,
 };
 
 use support::edit;
@@ -70,6 +72,12 @@ struct Server {
 /// A repository with two changes made apart on its base view, labelled, whose network
 /// tells `naming` when given.
 async fn server(naming: Option<Arc<Recording>>) -> Server {
+    server_in(naming, None).await
+}
+
+/// [`server`], keeping its head in a [`CappedHeads`] holding `limit` receipts when
+/// given.
+async fn server_in(naming: Option<Arc<Recording>>, limit: Option<usize>) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let objects = PackedObjectStore::open(dir.path().join("storage")).unwrap();
     let content = objects.content_store();
@@ -100,9 +108,16 @@ async fn server(naming: Option<Arc<Recording>>) -> Server {
         Some(naming) => Network::with_naming(Box::new(objects.clone()), naming),
         None => Network::new(Box::new(objects.clone())),
     };
+    let entry = match limit {
+        None => RepositoryEntry::in_network(network, heads),
+        Some(limit) => {
+            let initial = PublicationStore::read(&heads).unwrap();
+            RepositoryEntry::in_network(network, CappedHeads::new(initial, limit))
+        }
+    };
     let server = Server {
         _dir: dir,
-        entry: Arc::new(RepositoryEntry::in_network(network, heads)),
+        entry: Arc::new(entry),
         objects,
         base,
         first,
@@ -121,6 +136,94 @@ async fn server(naming: Option<Arc<Recording>>) -> Server {
     .await
     .unwrap();
     server
+}
+
+/// A head store keeping at most `limit` receipts, dropping the oldest past it however
+/// young, as the local one does past `MAX_PUBLISH_RECEIPTS`.
+struct CappedHeads {
+    limit: usize,
+    /// The limit it declares, which is `limit` unless a test has it lie.
+    declared: Option<usize>,
+    table: Mutex<(RepositoryHead, Vec<PublishReceiptRecord>)>,
+}
+
+impl CappedHeads {
+    fn new(head: RepositoryHead, limit: usize) -> Self {
+        Self {
+            limit,
+            declared: Some(limit),
+            table: Mutex::new((head, Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl HeadStore for CappedHeads {
+    fn receipt_limit(&self) -> Option<usize> {
+        self.declared
+    }
+
+    async fn head(&self) -> Result<RepositoryHead, PublicationError> {
+        Ok(self.table.lock().unwrap().0)
+    }
+
+    async fn head_with_receipt(
+        &self,
+        key: &[u8; 16],
+    ) -> Result<(RepositoryHead, ReceiptLookup), PublicationError> {
+        let table = self.table.lock().unwrap();
+        let (head, receipts) = &*table;
+        let lookup = match receipts.iter().find(|receipt| &receipt.key == key) {
+            Some(receipt) => ReceiptLookup::Found(*receipt),
+            None if self.declared.is_some() && receipts.len() >= self.limit => {
+                ReceiptLookup::Trimmed {
+                    oldest_kept: receipts[0].recorded_at,
+                }
+            }
+            None => ReceiptLookup::Absent,
+        };
+        Ok((*head, lookup))
+    }
+
+    async fn advance(
+        &self,
+        expected: RepositoryHead,
+        proposed: RepositoryHead,
+        receipts: &[PublishReceiptRecord],
+        _now: u64,
+    ) -> Result<(), PublicationError> {
+        let mut table = self.table.lock().unwrap();
+        if table.0 != expected {
+            return Err(PublicationError::Stale {
+                expected,
+                actual: table.0,
+            });
+        }
+        table.0 = proposed;
+        table.1.extend_from_slice(receipts);
+        let over = table.1.len().saturating_sub(self.limit);
+        table.1.drain(..over);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_capped_head_store_keeps_receipts_as_it_promises() {
+    let initial = RepositoryHead::initial(RepositoryEnvelopeId::from_digest([1; 32]));
+    check_head_store(&CappedHeads::new(initial, 3)).await;
+}
+
+#[tokio::test]
+#[should_panic(
+    expected = "a store keeps every young receipt while it holds no more than its limit (None)"
+)]
+async fn a_store_that_caps_receipts_it_says_it_keeps_fails_the_check() {
+    let initial = RepositoryHead::initial(RepositoryEnvelopeId::from_digest([1; 32]));
+    check_head_store(&CappedHeads {
+        declared: None,
+        ..CappedHeads::new(initial, wheat_core::MAX_PUBLISH_RECEIPTS)
+    })
+    .await;
 }
 
 fn change(name: &str, expected: ExpectedLabel, new: Option<ViewId>) -> LabelChange {
@@ -244,7 +347,7 @@ async fn a_stage_rebuilt_for_the_same_intent_gets_the_first_answer() {
         published(&server.entry, &principal, [1; 16], INTENT)
             .await
             .unwrap(),
-        None
+        Submission::NotPublished
     );
     let stage = open_stage(&server.entry).await.unwrap();
     let edited = edit_in(&stage, server.first, "new.txt", b"new").await;
@@ -262,7 +365,7 @@ async fn a_stage_rebuilt_for_the_same_intent_gets_the_first_answer() {
         published(&server.entry, &principal, [1; 16], INTENT)
             .await
             .unwrap(),
-        Some(first)
+        Submission::Published(first)
     );
     // And a stage built again, whose change is another, gets the first answer too,
     // though the label it names has moved.
@@ -278,7 +381,10 @@ async fn a_stage_rebuilt_for_the_same_intent_gets_the_first_answer() {
     let other = [8; 32];
     for refused in [
         published(&server.entry, &principal, [1; 16], other).await,
-        again.submit(rebuilt_write, other).await.map(Some),
+        again
+            .submit(rebuilt_write, other)
+            .await
+            .map(Submission::Published),
     ] {
         assert!(
             matches!(
@@ -289,6 +395,44 @@ async fn a_stage_rebuilt_for_the_same_intent_gets_the_first_answer() {
         );
     }
     assert_eq!(server.entry.heads.head().await.unwrap(), first);
+}
+
+#[tokio::test]
+async fn a_submit_whose_receipt_a_capped_store_dropped_is_unknown() {
+    // The store keeps one receipt.
+    let server = server_in(None, Some(1)).await;
+    let principal = server_write(1, Vec::new()).principal;
+    let submit = async |key: u8, path: &'static str, from: ViewId| {
+        let stage = open_stage(&server.entry).await.unwrap();
+        let edited = edit_in(&stage, from, path, b"new").await;
+        stage
+            .submit(
+                server_write(key, vec![change("main", View(from), Some(edited))]),
+                INTENT,
+            )
+            .await
+            .unwrap();
+        edited
+    };
+    let first = submit(1, "first.txt", server.first).await;
+    let head = server.entry.heads.head().await.unwrap();
+    assert_eq!(
+        published(&server.entry, &principal, [1; 16], INTENT)
+            .await
+            .unwrap(),
+        Submission::Published(head)
+    );
+    // A second submit's receipt takes its place while the first's is young.
+    submit(2, "second.txt", first).await;
+    for key in [[1; 16], [9; 16]] {
+        assert_eq!(
+            published(&server.entry, &principal, key, INTENT)
+                .await
+                .unwrap(),
+            Submission::Unknown,
+            "{key:?}"
+        );
+    }
 }
 
 #[tokio::test]

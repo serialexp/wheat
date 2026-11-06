@@ -16,6 +16,12 @@ it together later (v0.3.5), only on Bart's go-ahead.
   walrus's crash-retry gap, with Codex and Antigravity consulted) the embedder's
   `intent` digest plus a `published(entry, principal, key, intent)` lookup. Documented in `wheat-native-protocol.md`, "Embedded
   in Gothab"; bench case `server_stage`.
+- Receipt limits in the `HeadStore` contract: Bart chose (2026-11-07) that Gothab
+  drops its copied 1024 cap and keeps receipts by age, with the limit declared
+  (`HeadStore::receipt_limit`), `ReceiptLookup::Trimmed` from a capped store,
+  `published` answering `Submission::Unknown`, and a conformance check
+  (`heads::conformance::check_head_store`, feature `conformance`) Gothab runs.
+  The local file head keeps its 1024 cap (`Some(1024)`).
 - Hidden labels: done. Bart chose (2026-11-07) that they stay in the local head
   exactly as on the remote (clone, fetch and publish move them as before) and are
   only left out of `wheat labels`, which lists them with `--hidden`; glob patterns

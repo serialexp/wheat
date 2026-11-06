@@ -26,14 +26,15 @@ use wheat_core::{
     server_write_request_digest,
 };
 use wheat_store::{
-    PersistedRepositoryMutator, PublicationError, PublicationStore, RepositoryHead,
-    RepositoryReader, RepositoryStage,
+    PUBLISH_RECEIPT_RETENTION_SECONDS, PersistedRepositoryMutator, PublicationError,
+    PublicationStore, RepositoryHead, RepositoryReader, RepositoryStage,
 };
 
 use crate::{
     access::Principal,
     commit::{self, Built, CommitFailure, LabelRefusal},
     error_text::chain,
+    heads::ReceiptLookup,
     naming::Named,
     network::Network,
     quiesce::Writing,
@@ -354,7 +355,11 @@ impl ServerStage {
     ) -> Result<RepositoryHead, WriteFailure> {
         check(&write)?;
         let request = server_stage_request_digest(intent);
-        if let Some(head) = previous(&self.entry, &write.principal, write.key, request).await? {
+        // A receipt the head store may have trimmed is not an answer: only
+        // `published` can say so, and a fresh submit to a store that is full looks
+        // the same.
+        if let (Some(head), _) = previous(&self.entry, &write.principal, write.key, request).await?
+        {
             return Ok(head);
         }
         let base = self.inner.base;
@@ -460,31 +465,59 @@ async fn built(
     Ok(BuiltState { needed })
 }
 
-/// The head a stage submit by `principal` with `key` and `intent` was published in,
-/// waiting for its batch if it is in one; `None` if none was. Lets an embedder that
-/// lost the answer, as when it crashed after the submit, find it before building the
-/// stage again. A key published with another intent is refused as reused.
+/// What [`published`] found of a stage submit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Submission {
+    /// The submit was published in this head.
+    Published(RepositoryHead),
+    /// It was not published, or its receipt has expired (see [`published`]).
+    NotPublished,
+    /// The head store may have dropped its receipt early, to stay within its
+    /// [`HeadStore::receipt_limit`](crate::heads::HeadStore::receipt_limit): whether it
+    /// was published cannot be told. Submitting it again may apply it twice.
+    Unknown,
+}
+
+/// What became of a stage submit by `principal` with `key` and `intent`, waiting for
+/// its batch if it is in one. Lets an embedder that lost the answer, as when it
+/// crashed after the submit, find it before building the stage again. A key published
+/// with another intent is refused as reused.
 ///
-/// A head keeps receipts for [`wheat_store::PUBLISH_RECEIPT_RETENTION_SECONDS`]
-/// only: once a submit's receipt has expired, this answers `None` whether or not it
-/// was published, so an embedder's retries must come sooner.
+/// A head keeps receipts for [`wheat_store::PUBLISH_RECEIPT_RETENTION_SECONDS`]: once
+/// a submit's receipt has expired, this answers [`Submission::NotPublished`] whether
+/// or not it was published, so an embedder's retries must come sooner. A head store
+/// with a receipt limit may drop one sooner, and this then answers
+/// [`Submission::Unknown`] rather than `NotPublished`.
 pub async fn published(
     entry: &Arc<RepositoryEntry>,
     principal: &Principal,
     key: [u8; 16],
     intent: [u8; 32],
-) -> Result<Option<RepositoryHead>, WriteFailure> {
-    previous(entry, principal, key, server_stage_request_digest(intent)).await
+) -> Result<Submission, WriteFailure> {
+    let request = server_stage_request_digest(intent);
+    Ok(match previous(entry, principal, key, request).await? {
+        (Some(head), _) => Submission::Published(head),
+        (None, ReceiptLookup::Trimmed { oldest_kept })
+            if commit::unix_seconds().saturating_sub(oldest_kept)
+                < PUBLISH_RECEIPT_RETENTION_SECONDS =>
+        {
+            Submission::Unknown
+        }
+        // Whatever was dropped was recorded before the oldest receipt kept, so it
+        // would have expired by now anyway.
+        (None, _) => Submission::NotPublished,
+    })
 }
 
 /// The head the write by `principal` with `key` asking for `request` was published
-/// in, waiting for it if it is still in a batch.
+/// in, waiting for it if it is still in a batch, and what the head store held under
+/// the key.
 async fn previous(
     entry: &Arc<RepositoryEntry>,
     principal: &Principal,
     key: [u8; 16],
     request: [u8; 16],
-) -> Result<Option<RepositoryHead>, WriteFailure> {
+) -> Result<(Option<RepositoryHead>, ReceiptLookup), WriteFailure> {
     let key = PublishKey::server_write(principal, key, request)
         .map_err(|e| WriteFailure::Invalid(format!("the principal cannot be bound: {e}")))?;
     let (durable, receipt) = entry
@@ -497,16 +530,16 @@ async fn previous(
                 chain(&e)
             )))
         })?;
-    match commit::previous(entry, durable, receipt.as_ref(), &key)
+    match commit::previous(entry, durable, receipt.found(), &key)
         .await
         .map_err(WriteFailure::Commit)?
     {
         Some(accepted) => accepted
             .durable()
             .await
-            .map(Some)
+            .map(|head| (Some(head), receipt))
             .map_err(WriteFailure::Commit),
-        None => Ok(None),
+        None => Ok((None, receipt)),
     }
 }
 

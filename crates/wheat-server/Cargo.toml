@@ -4,6 +4,10 @@ version.workspace = true
 edition = "2024"
 autotests = false
 
+[features]
+# `heads::conformance`, a check an embedder runs against its own head store.
+conformance = []
+
 [[bin]]
 name = "wheat-server"
 path = "src/main.rs"
@@ -36,6 +40,8 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.28", features = ["connect"] }
+# The integration tests run the conformance check against Wheat's own head stores.
+wheat-server = { path = ".", features = ["conformance"] }
 
 [lints]
 workspace = true

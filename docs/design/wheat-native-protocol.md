@@ -564,7 +564,9 @@ The server binds each key to the principal that sent it, and records the
 receipts in the repository head, in the same write that moves the head, so
 a receipt survives a restart and is seen by every server sharing the store.
 The head keeps receipts for 24 hours and at most 1024 of them, dropping the
-oldest first; a retry later than that is published again. A retry is
+oldest first; a retry later than that is published again. That count limit is the
+standalone server's file head's own; an embedder's `HeadStore` declares its own
+(see "Embedded in Gothab"). A retry is
 answered `already_committed` with the head the publish went into, whatever
 the head is now. One that arrives while the first sending is still being
 made durable waits for it. The check comes before the push is used, so a
@@ -1201,6 +1203,22 @@ same stage; one whose batch failed took the stage's objects with it. When the ne
 submit names what the built state adds over the base, closure included, before it
 joins, with the stage's opening as its instant. Bench case `server_stage`: at 1,000
 and 10,000 changes, an edit reads 108 and 125 objects and a merge 122 and 147.
+
+How many receipts a head store keeps is part of the `HeadStore` contract
+(2026-11-07). Walrus pointed out that Gothab's store had copied the local head's
+1024 cap on top of the day's retention. On a busy repository a landed submit's
+receipt could then be trimmed before a slow retry asked, and the retry would apply
+the change again. Bart chose to have Gothab keep receipts by age alone, and to put
+that in the contract. A store keeps each receipt for at least the retention, unless
+it declares a limit (`HeadStore::receipt_limit`, `None` for none). A store with a
+limit (the local file head, `Some(1024)`, since it rewrites every receipt with each
+publish) answers a key it may have dropped early with `ReceiptLookup::Trimmed`
+rather than `Absent`. `published` then answers `Submission::Unknown` rather than
+`NotPublished`, so an embedder does not resubmit blindly. A submit or a publish
+treats `Trimmed` as absent, since a fresh key to a full store looks the same. The
+`conformance` feature's `heads::conformance::check_head_store` records 1,025 young
+receipts and checks the store keeps them as it declares; Gothab runs it against its
+own store, and Wheat against its table double and the local head.
 
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new

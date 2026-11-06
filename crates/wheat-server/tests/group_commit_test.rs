@@ -19,7 +19,7 @@ use wheat_core::{
 use wheat_protocol::{Digest256, PublishRequestOutput, Uuid128};
 use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
-use wheat_server::heads::HeadStore;
+use wheat_server::heads::{HeadStore, ReceiptLookup, conformance::check_head_store};
 use wheat_server::hooks::{Announcement, ProposedPublish, PublishHooks, PublishedBatch};
 use wheat_server::network::Network;
 use wheat_server::quiesce::Quiesced;
@@ -660,7 +660,7 @@ async fn previous(
         .head_with_receipt(key.key())
         .await
         .unwrap();
-    commit::previous(&server.entry, head, receipt.as_ref(), key).await
+    commit::previous(&server.entry, head, receipt.found(), key).await
 }
 
 #[tokio::test]
@@ -830,6 +830,10 @@ impl TableHeads {
 
 #[async_trait]
 impl HeadStore for TableHeads {
+    fn receipt_limit(&self) -> Option<usize> {
+        None
+    }
+
     async fn head(&self) -> Result<RepositoryHead, PublicationError> {
         Ok(self.0.lock().unwrap().head)
     }
@@ -837,9 +841,15 @@ impl HeadStore for TableHeads {
     async fn head_with_receipt(
         &self,
         key: &[u8; 16],
-    ) -> Result<(RepositoryHead, Option<PublishReceiptRecord>), PublicationError> {
+    ) -> Result<(RepositoryHead, ReceiptLookup), PublicationError> {
         let table = self.0.lock().unwrap();
-        Ok((table.head, table.receipts.get(key).copied()))
+        let lookup = table
+            .receipts
+            .get(key)
+            .map_or(ReceiptLookup::Absent, |receipt| {
+                ReceiptLookup::Found(*receipt)
+            });
+        Ok((table.head, lookup))
     }
 
     async fn advance(
@@ -868,6 +878,16 @@ impl HeadStore for TableHeads {
         table.advances += 1;
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn a_head_store_of_its_own_and_the_local_one_keep_receipts_as_promised() {
+    let initial = server().await.initial;
+    check_head_store(&TableHeads::new(initial)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let local = LocalPublicationStore::new(dir.path().join("repository.head"));
+    local.initialize(initial).unwrap();
+    check_head_store(&local).await;
 }
 
 #[tokio::test]
@@ -901,7 +921,7 @@ async fn a_head_store_of_its_own_serves_publishes_and_answers_them_sent_again() 
         .await
         .unwrap();
     assert_eq!(
-        receipt.map(|receipt| receipt.generation),
+        receipt.found().map(|receipt| receipt.generation),
         Some(head.generation)
     );
 
