@@ -23,8 +23,13 @@ it together later (v0.3.5), only on Bart's go-ahead.
 - GC: Gothab content first. Designed in `wheat-network-maintenance.md`, "Gothab's
   content (2026-11-06)"; G1–G4 decided through walrus (last-named time, stamped at
   put, references recorded at put, mark per host and sweep in Gothab's worker).
-  Done: `record_info` (fdf8ded), `ContentMarks`/`sweep` with the bench case. Next:
-  the `ContentNaming` hook in wheat-server's publish path with the G/2 renaming.
+  Done: `record_info` (fdf8ded), `ContentMarks`/`sweep` with the bench case
+  (a472476), and naming (847bc74 `needed_to_read`, 678df28 the `ContentNaming`
+  hook with renewal at commit). Bart chose (2026-11-07) that Wheat names the whole
+  closure (chunks, parts, delta bases), so Gothab's `named` only stamps rows. Open,
+  in TODO.md: a chunk reused as a stored delta isn't named with its base, a join
+  after a forced publish can re-add unnamed content, and publish delta bases come
+  from the base view (so there are hardly any).
 
 ## 2026-10-30/31: Wheat hardening for the Gothab integration (@calm-lynx)
 
