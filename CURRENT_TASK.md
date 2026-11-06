@@ -1,5 +1,29 @@
 # Current task
 
+## 2026-11-06: Gothab Phase 6 pieces (@calm-lynx)
+
+Bart's order: blame (471446a, `wheat blame`), forks (nothing on Wheat's side; walrus
+writes Gothab's opener), the embedder write, hidden labels, then GC. Tag all of
+it together later (v0.3.5), only on Bart's go-ahead.
+
+- Embedder label write: done (0f5775c; `ExpectedLabel::{Absent, View, Any}` in
+  091359c, the request digest a `ServerWriteRequestInputV1`). Binschema pin moved to
+  1141fb2 (efd5ee6; additive `encode_measuring` only). Rebuild binschema with nvm's
+  node (`~/.nvm/versions/node/v24.22.0/bin`) and `node_modules/.bin/tsc`.
+- Server edits and merges (the builder): waiting on Bart, asked 2026-11-06 and not
+  answered. Choices: a builder closure, a two-step stage, or Wheat-owned operations;
+  and what a build write's receipt binds the key to (an embedder digest, the key
+  only, or an operation digest).
+- Hidden labels (leading dot: not fetched by clone, fetch or pull unless asked, still
+  GC roots): waiting on Bart (asked 2026-11-06, no answer). Labels travel only inside
+  the envelope's manifest; publish sends the whole manifest against `last_fetched`,
+  so a client that drops hidden labels must put them back, as last fetched, before a
+  fetch union and in a publish. Choices: client-side vs server-side filtering, and a
+  persisted `--label PATTERN` on the remote binding vs a one-off flag vs config.
+- GC: Gothab content first. Designed in `wheat-network-maintenance.md`, "Gothab's
+  content (2026-11-06)", with open questions G1–G4 (sent to walrus). Bart leans to
+  G1 (a), the last-named time.
+
 ## 2026-10-30/31: Wheat hardening for the Gothab integration (@calm-lynx)
 
 Bart: I coordinate the Wheat–Gothab integration, backend move first. @wise-walrus

@@ -2,11 +2,12 @@
 
 Status: partial — Phase 0 (the admin surface), Phases 1 (export), 2 (import and
 adoption) and 3 (delete while served) landed, so a network can be moved; Phase 2b
-and GC (4–6) designed, not yet implemented. Bart answered questions 1–5 on 2026-10-27; a
+and GC (4–6) designed, not yet implemented; Gothab's content GC (2026-11-06) is
+designed with open questions G1–G4. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
-Last updated: 2026-10-29
+Last updated: 2026-11-06
 
 ## Implementation status
 
@@ -124,9 +125,10 @@ and move them from Outstanding to Done.
   records.
 - [ ] **Phase 6 — leftovers.** Networks and heads no name refers to (crash debris,
   see the fork-networks doc's Layout), past an age.
-- [ ] **Defer — Gothab.** Gothab's content is in its blob store and its heads in its
-  database; its GC marks the same way but sweeps through its own inventory. Revisit
-  with Gothab's opener.
+- [ ] **Gothab content GC (2026-11-06, was deferred).** Bart put it first, ahead of
+  pool GC (Phase 4) and the directory's content GC (Phase 5). Mark every Wheat head
+  of the instance, sweep Gothab's blob store through a delete hook; see
+  [Gothab's content](#gothabs-content-2026-11-06). Open: questions G1–G4.
 - [ ] **Defer — remote packed stores.** `remote_packed` has no retirement at all
   (append-only catalog, one S3 key per blob).
 
@@ -387,6 +389,61 @@ lookups in this process. Since GC removes only records no head reaches, a reader
 affected only when it reads an unreachable record (a superseded envelope, question
 4). No further grace period is proposed for the in-process server; an external
 reader of the files (backup by file copy) must not run during a collection.
+
+## Gothab's content (2026-11-06)
+
+Gothab keeps every Wheat repository's content in one instance-wide blob store
+(`ContentBlobStore`: put, get, get_range, list_page) and a `wheat_content_sizes`
+row per content; heads are in its Postgres, and each fork network's structure pool
+is on the disk of the one gitd host that serves it. Deleting a repository, or a
+network's last one, leaves its content, and nothing reclaims it. Bart chose
+(2026-11-06) to collect this first, before pool GC.
+
+### Shape
+
+1. **Mark, per host (Wheat).** For the heads a host serves, the union of each
+   state's `required_content`, skipping set nodes already visited by ID (states
+   share most of their sets), into a disk-backed mark set. Then, to a fixed point,
+   what reading a marked record needs: a delta record's base, and a chunk manifest's
+   chunks and parts (`wheat-large-content.md`). Fails closed, as above: an unreadable
+   head, set node or record stops the collection with nothing deleted.
+2. **Merge (Gothab).** Each host's mark set as a sorted ID stream; Gothab unions
+   them, so the sweep sees every head of the instance.
+3. **Sweep (Wheat logic, Gothab's inventory).** Walk `list_page` and, for each ID
+   not marked and not rescued (below), call the embedder's
+   `reclaim(id)`, which deletes the blob and its `wheat_content_sizes` row.
+
+### Publishes during a collection
+
+As in open question 7, a publish may name content the mark did not find, without
+uploading it (`existing_ids`), so it must be rescued. Two cases:
+
+- **Content a publish names.** Publish validation already computes what the new
+  state's `required_content` adds (`increment_validation.rs`, step 7,
+  `added_content`), bounded by the publish.
+- **Records a publish writes.** A put replaces a stored record (`content_blobs.rs`),
+  and a delta's base need not be required by any state. A publish that stores X as
+  a delta of an unmarked Y while a collection runs makes X unreadable if Y is swept.
+  So what a publish uploads must rescue its delta bases and chunks too, and content
+  uploaded for a publish still in progress (named by no head yet) is kept by age.
+
+### Open questions
+
+- [ ] **G1 — how a rescue reaches the sweep across hosts.** (a) A publish hook with
+  the IDs a publish names and writes; Gothab stores a last-named time per content
+  (a column of `wheat_content_sizes`), and the sweep reclaims only content unmarked
+  and last named before the mark began. Publishes never wait. (b) An instance-wide
+  hold: every host's publish gate refuses Wheat publishes from the start of marking
+  to the end of the sweep. Bart leans to (a); asked @wise-walrus 2026-11-06.
+- [ ] **G2 — the age of an upload.** `BlobPage` has no times. (a) The same
+  last-named time, set when a record is put; (b) the blob store's own modification
+  time, added to `BlobPage`.
+- [ ] **G3 — finding delta bases and chunks.** (a) Read each marked record's header
+  with `get_range` (one ranged read per marked ID, plus each manifest); (b) Gothab
+  records the base and kind with the row when a record is put, so marking reads
+  Postgres instead.
+- [ ] **G4 — where it runs.** A gitd admin task on each host for the mark, and
+  Gothab's maintenance worker for the merge and sweep, or another split.
 
 ## Review (2026-10-27)
 
