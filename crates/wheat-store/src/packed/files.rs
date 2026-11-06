@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 
 use super::catalog::{
     BULK_FILE_PREFIX, CATALOG_LOCK_FILE, CATALOGS_DIRECTORY, LOCATOR_FILE, NEXT_ACTIVE_FILE,
-    SEGMENTS_DIRECTORY, is_temporary_file_name,
+    SEGMENTS_DIRECTORY, SESSION_FILE, is_temporary_file_name,
 };
 
 const PACKED_DIRECTORY: &str = "packed";
@@ -27,7 +27,7 @@ pub(crate) enum StoreFile {
     /// Replaced or appended to as the store is written (the catalog head, the active
     /// segment), and anything this module does not know, which is copied to be safe.
     Mutable,
-    /// Not the store's state: its lock, the locator index (rebuilt when the copy is
+    /// Not the store's state: its lock, the marker of an open session, the locator index (rebuilt when the copy is
     /// opened), the record of its last content check (its file times do not carry
     /// over), and the temporary and unpublished files opening a store removes.
     Skipped,
@@ -73,6 +73,7 @@ pub(crate) fn classify(relative: &Path) -> StoreFile {
 /// Whether `name`, in the catalog's directory, is something other than its state.
 fn is_packed_leftover(name: &str) -> bool {
     name == CATALOG_LOCK_FILE
+        || name == SESSION_FILE
         || name == NEXT_ACTIVE_FILE
         || name.starts_with(LOCATOR_FILE)
         || is_temporary_file_name(name)
@@ -96,6 +97,7 @@ mod tests {
             ("content-generations/checked", StoreFile::Skipped),
             ("content-generations/checked.partial", StoreFile::Skipped),
             ("packed/catalog.lock", StoreFile::Skipped),
+            ("packed/catalog.session", StoreFile::Skipped),
             ("packed/catalog-locator.sqlite3", StoreFile::Skipped),
             ("packed/catalog-locator.sqlite3-wal", StoreFile::Skipped),
             ("packed/active.segment.next", StoreFile::Skipped),

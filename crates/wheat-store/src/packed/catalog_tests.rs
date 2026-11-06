@@ -519,6 +519,61 @@ fn immutable_only_store_is_preserved_and_gains_an_active_pack() {
     assert!(root.path().join("active.segment").exists());
 }
 
+/// Ancestor syncs and locator checks `run` made.
+fn syncs_and_checks<T>(run: impl FnOnce() -> T) -> (T, (usize, usize)) {
+    let before = (TEST_ANCESTOR_SYNCS.get(), TEST_LOCATOR_CHECKS.get());
+    let value = run();
+    let after = (TEST_ANCESTOR_SYNCS.get(), TEST_LOCATOR_CHECKS.get());
+    (value, (after.0 - before.0, after.1 - before.1))
+}
+
+#[test]
+fn an_open_after_a_clean_end_syncs_only_before_its_first_write() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join(SESSION_FILE);
+    // A new store's directories are synced at once.
+    let (store, counts) =
+        syncs_and_checks(|| PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap());
+    assert_eq!(counts, (1, 0));
+    assert!(marker.exists());
+    store.close().unwrap();
+    assert!(!marker.exists());
+
+    let (mut store, counts) =
+        syncs_and_checks(|| PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap());
+    assert_eq!(counts, (0, 0), "a read-only open syncs and checks nothing");
+    let value = record(b"first write");
+    let (_, counts) = syncs_and_checks(|| store.get(CONTENT_NAMESPACE, value.digest).unwrap());
+    assert_eq!(counts, (0, 0));
+    let (_, counts) = syncs_and_checks(|| store.put_records(&[value]).unwrap());
+    assert_eq!(counts, (1, 0), "the first write syncs the directories");
+    let (_, counts) = syncs_and_checks(|| store.put_records(&[record(b"second")]).unwrap());
+    assert_eq!(counts, (0, 0), "once");
+    // Dropped without `close`, as a command does: still a clean end.
+    drop(store);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn an_open_after_an_unclean_end_checks_the_locator_and_syncs_at_once() {
+    let root = tempfile::tempdir().unwrap();
+    let value = record(b"before the crash");
+    {
+        let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+        store.put_records(&[value]).unwrap();
+    }
+    // What a process killed while it had the catalog open leaves.
+    fs::write(root.path().join(SESSION_FILE), b"").unwrap();
+    let (mut store, counts) =
+        syncs_and_checks(|| PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap());
+    assert_eq!(counts, (1, 1));
+    assert_value(&mut store, value);
+    drop(store);
+    let (_, counts) =
+        syncs_and_checks(|| PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap());
+    assert_eq!(counts, (0, 0), "the checked open ended cleanly");
+}
+
 #[test]
 fn missing_corrupt_stale_or_old_schema_locator_rebuilds_with_active_state() {
     for mode in 0..4 {

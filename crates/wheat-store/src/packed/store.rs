@@ -675,7 +675,7 @@ impl PackedObjectStore {
         // Bind authority before expensive generation, then generate/stage only
         // after the caller's capacity gate has admitted execution.
         {
-            let catalog = self
+            let mut catalog = self
                 .catalog()
                 .map_err(|error| RepackError::Corrupt(error.to_string()))?;
             if catalog.physical_authority().map_err(repack_catalog_error)?
@@ -683,6 +683,7 @@ impl PackedObjectStore {
             {
                 return Err(RepackError::StaleAuthority);
             }
+            catalog.prepare_write().map_err(repack_catalog_error)?;
         }
         let RepackPlan {
             physical_authority,

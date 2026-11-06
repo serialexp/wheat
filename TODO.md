@@ -202,30 +202,18 @@ Security, most serious first:
 
 Performance, most serious first:
 
-- `[ ]` **Read-only commands still sync (2026-10-05).**
-  `PackedCatalog::open_with_target` (`packed/catalog.rs`) calls
-  `sync_created_ancestors` on each open, which syncs every directory from
-  `storage/packed` up to `/`, whether or not it created anything. Measured on NVMe
-  ext4: the extra ancestors cost about 2 µs each; the first sync of a run costs
-  2–9 ms because it flushes the drive's cache of everything the system wrote
-  since the last flush (a bare `fsync` of an untouched directory does the same).
-  So `wheat status` pays one drive flush. Re-syncing on open also makes durable a
-  directory an earlier, interrupted open created, so dropping it for read-only
-  commands needs a decision: only sync what this open created, or sync only before
-  the first write.
+- `[ ]` **The workspace registry syncs on every command (2026-11-06).**
+  `WorkspaceRegistry::publish` (`workspace_registry.rs`) fsyncs the store's
+  `workspaces` directory even when the pin it would write is already there, to make
+  an earlier rename durable if its sync was cut off. It is the last fsync a
+  read-only `wheat status` makes now that the packed store syncs only before its
+  first write. Same trade as that one: needs Bart's call.
 - `[ ]` **Fetch and publish benches slower than on 2026-10-26 (2026-10-30).**
   `fetch_incremental.total.wall` went from 17.3 s (2026-10-26) to 29–31 s, its
   `publish.wall` from 0.023 s to about 0.07 s, and `remote_latency.many.publish.wall`
   from 0.25 s to 0.3–0.7 s. The same tree with the fetch code from before the blocking
   change measures the same, so the change is elsewhere, or the machine was busier
   (other agents building). Re-measure on a quiet machine and bisect if it holds.
-- `[ ]` **Every command `quick_check`s the packed locator (2026-11-06).**
-  `open_index` (`packed/catalog.rs`) runs `PRAGMA quick_check` on
-  `catalog-locator.sqlite3` at each open, which reads the whole database: 15 ms of a
-  92 ms warm `wheat status` at 20,000 files (2.6 MB locator), growing with the store's
-  objects (span `locator_quick_check`). The locator is derived and rebuilt when it
-  disagrees with the segments, so whether it needs the check on every open is Bart's
-  call.
 - `[ ]` **Content paths outside the protocol hold a blob whole (scanner only).**
   Since step 3 of `docs/design/wheat-large-content.md` (2026-11-01) publish and fetch
   move a blob over 16 MiB as its manifest and chunks, and hold at most 16 MiB of one

@@ -55,6 +55,10 @@ pub(super) const LOCATOR_FILE: &str = "catalog-locator.sqlite3";
 pub(super) const SEGMENTS_DIRECTORY: &str = "segments";
 pub(super) const CATALOGS_DIRECTORY: &str = "catalog";
 const ACTIVE_FILE: &str = "active.segment";
+/// Present while a catalog is open, under its lock: an open that finds it knows the
+/// last one did not end cleanly. It is never synced, so a power loss may take it
+/// with it; a process that crashed or was killed leaves it.
+pub(crate) const SESSION_FILE: &str = "catalog.session";
 /// The fresh active segment `retire_active` builds before renaming it into place.
 pub(super) const NEXT_ACTIVE_FILE: &str = "active.segment.next";
 pub(super) const BULK_FILE_PREFIX: &str = "bulk-";
@@ -252,7 +256,6 @@ pub(crate) struct PackedCatalog {
     root: PathBuf,
     segments: PathBuf,
     catalogs: PathBuf,
-    _lock: File,
     index: Connection,
     /// A second connection to the locator, for appends: an [`AppendJob`] takes it
     /// and writes its rows while `index` serves reads.
@@ -289,6 +292,38 @@ pub(crate) struct PackedCatalog {
     close_failpoint: Option<CloseFailpoint>,
     #[cfg(test)]
     repack_failpoint: Option<RepackFailpoint>,
+    /// The directories from `root` up to `/` exist from an earlier open but were not
+    /// synced by this one; the first write syncs them (see [`Self::prepare_write`]).
+    ancestors_pending: bool,
+    /// Dropped after the locator's connections, so the marker goes only once
+    /// everything else is closed.
+    session: Session,
+    /// The process-exclusive lock, dropped last: no other open sees this one's
+    /// marker or starts before it is gone.
+    _lock: File,
+}
+
+/// Removes the session marker when the catalog that wrote it closes or drops.
+struct Session {
+    path: PathBuf,
+}
+
+impl Session {
+    /// Whether the last catalog at `root` ended without closing, and the marker for
+    /// this one. Called under the catalog's lock.
+    fn begin(root: &Path) -> Result<(bool, Self), CatalogError> {
+        let path = root.join(SESSION_FILE);
+        let unclean = path.try_exists()?;
+        File::create(&path)?;
+        Ok((unclean, Self { path }))
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // A marker that cannot be removed only makes the next open check the locator.
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// A [`PackedCatalog`] shared between threads. Writers take turns on `writer`; a
@@ -622,12 +657,13 @@ impl PackedCatalog {
         trace: Option<Arc<PackedStoreTraceCounters>>,
     ) -> Result<Self, CatalogError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
         let segments = root.join(SEGMENTS_DIRECTORY);
         let catalogs = root.join(CATALOGS_DIRECTORY);
-        fs::create_dir_all(&segments)?;
-        fs::create_dir_all(&catalogs)?;
-        sync_created_ancestors(&root, durability)?;
+        let mut created = false;
+        for directory in [&segments, &catalogs] {
+            created |= !directory.try_exists()?;
+            fs::create_dir_all(directory)?;
+        }
 
         let lock = OpenOptions::new()
             .create(true)
@@ -636,6 +672,15 @@ impl PackedCatalog {
             .write(true)
             .open(root.join(CATALOG_LOCK_FILE))?;
         try_lock_exclusive(&lock)?;
+        let (unclean, session) = Session::begin(&root)?;
+        // A new store's directories are synced at once. After a crash, recovery below
+        // may write, and an open that created the directories may have crashed before
+        // syncing them. Otherwise nothing is written yet, and a read-only command
+        // never pays for the sync.
+        let ancestors_pending = !(created || unclean);
+        if !ancestors_pending {
+            sync_created_ancestors(&root, durability)?;
+        }
 
         // Recovery is deliberately completed under the writer lock before the
         // disposable locator is opened or trusted.
@@ -665,10 +710,10 @@ impl PackedCatalog {
         let index_path = root.join(LOCATOR_FILE);
         let index_was_missing = !index_path.exists();
         let mut index_recreated = false;
-        let index = open_index(&index_path, durability).or_else(|_| {
+        let index = open_index(&index_path, durability, unclean).or_else(|_| {
             remove_index_files(&index_path)?;
             index_recreated = true;
-            open_index(&index_path, durability)
+            open_index(&index_path, durability, false)
         })?;
         if index_was_missing || index_recreated {
             durability.sync_directory(&root)?;
@@ -715,6 +760,8 @@ impl PackedCatalog {
             close_failpoint: None,
             #[cfg(test)]
             repack_failpoint: None,
+            ancestors_pending,
+            session,
         };
         let authority = (durable_head, catalog.active.state());
         let checkpoint = catalog.read_checkpoint();
@@ -865,6 +912,17 @@ impl PackedCatalog {
         Ok(added)
     }
 
+    /// Makes the directories from the catalog's root up to `/` durable, once, before
+    /// the first write of an open that did not sync them: anything this store writes
+    /// is only as durable as the directories holding it.
+    pub(crate) fn prepare_write(&mut self) -> Result<(), CatalogError> {
+        if self.ancestors_pending {
+            sync_created_ancestors(&self.root, self.durability)?;
+            self.ancestors_pending = false;
+        }
+        Ok(())
+    }
+
     /// Prepares the `records` this catalog lacks, for [`Self::next_append`].
     fn begin_durable_put<'a>(
         &mut self,
@@ -873,6 +931,7 @@ impl PackedCatalog {
         if self.poisoned {
             return Err(CatalogError::Poisoned);
         }
+        self.prepare_write()?;
         if records.is_empty() {
             return Ok(DurablePut {
                 prepared: Vec::new(),
@@ -1078,6 +1137,7 @@ impl PackedCatalog {
         if self.poisoned {
             return Err(CatalogError::Poisoned);
         }
+        self.prepare_write()?;
         let mut added = Vec::new();
         if let Some(trace) = &self.trace {
             trace.deferred_put(records.len());
@@ -2327,6 +2387,8 @@ impl PackedCatalog {
                 close_failpoint: _,
             #[cfg(test)]
                 repack_failpoint: _,
+            ancestors_pending: _,
+            session,
         } = self;
 
         // `index` closes last: the last connection to close folds the write-ahead
@@ -2339,12 +2401,19 @@ impl PackedCatalog {
         };
         let append_closed = append_index.map_or(Ok(()), close);
         let index_closed = close(index);
+        let closed = append_closed.and(index_closed);
+        if closed.is_err() {
+            // Not a clean close: the next open checks the locator.
+            std::mem::forget(session);
+        } else {
+            drop(session);
+        }
         drop(active);
         drop(_lock);
         drop(catalogs);
         drop(segments);
         drop(root);
-        append_closed.and(index_closed)
+        closed
     }
 
     fn recount_locator_rows(&self) -> Result<u64, CatalogError> {
@@ -2562,7 +2631,14 @@ fn retire_active(
     Ok(())
 }
 
-fn open_index(path: &Path, durability: Durability) -> Result<Connection, CatalogError> {
+/// The locator database at `path`, created when new. `check` runs SQLite's
+/// `quick_check` over it, which reads the whole file, so only an open after a session
+/// that ended without closing asks for it.
+fn open_index(
+    path: &Path,
+    durability: Durability,
+    check: bool,
+) -> Result<Connection, CatalogError> {
     let connection = connect_index(path, durability)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 0 {
@@ -2570,10 +2646,14 @@ fn open_index(path: &Path, durability: Durability) -> Result<Connection, Catalog
     } else if version != SCHEMA_VERSION {
         return Err(CatalogError::Corrupt("locator schema version"));
     }
-    let integrity: String = tracing::debug_span!("locator_quick_check")
-        .in_scope(|| connection.query_row("PRAGMA quick_check", [], |row| row.get(0)))?;
-    if integrity != "ok" {
-        return Err(CatalogError::Corrupt("locator database integrity"));
+    if check {
+        #[cfg(test)]
+        TEST_LOCATOR_CHECKS.set(TEST_LOCATOR_CHECKS.get() + 1);
+        let integrity: String = tracing::debug_span!("locator_quick_check")
+            .in_scope(|| connection.query_row("PRAGMA quick_check", [], |row| row.get(0)))?;
+        if integrity != "ok" {
+            return Err(CatalogError::Corrupt("locator database integrity"));
+        }
     }
     Ok(connection)
 }
@@ -3198,7 +3278,16 @@ fn remove_durable_file(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Ancestor syncs and locator checks made on this thread, for tests.
+    pub(crate) static TEST_ANCESTOR_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static TEST_LOCATOR_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn sync_created_ancestors(root: &Path, durability: Durability) -> Result<(), CatalogError> {
+    #[cfg(test)]
+    TEST_ANCESTOR_SYNCS.set(TEST_ANCESTOR_SYNCS.get() + 1);
     let mut ancestor = Some(root);
     while let Some(path) = ancestor {
         let path = if path.as_os_str().is_empty() {

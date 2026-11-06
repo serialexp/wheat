@@ -302,6 +302,16 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Security and performance scan (2026-09-26)
 
+- `[x]` **Read-only commands still sync (2026-10-05).** Done 2026-11-06 (Bart: sync
+  the directories only for the first write): an open that created none of
+  `storage/packed`'s directories marks them pending, and the first put, loose write
+  or repack syncs them up to `/`. An open after an unclean end syncs them at once,
+  since recovery may write. A read-only status makes no packed-store sync now.
+- `[x]` **Every command `quick_check`s the packed locator (2026-11-06).** Done
+  2026-11-06 (Bart: drop it unless there was an unclean shutdown): an open catalog
+  keeps an unsynced `catalog.session` marker, removed when it closes or drops; an
+  open that finds one runs the check. It cost about 0.1 µs per object (60 ms at
+  684k objects).
 - `[x]` **Materialization still syncs every staged file (2026-10-05).** Done
   2026-11-06 (Bart: batch the syncs, as elsewhere): a batch's leaves are written
   under their writing names, made durable by one `syncfs`, then renamed to their

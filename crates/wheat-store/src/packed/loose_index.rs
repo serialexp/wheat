@@ -91,6 +91,7 @@ impl PackedCatalog {
         kind: LooseKind,
         ids: &[[u8; 32]],
     ) -> Result<Vec<[u8; 32]>, CatalogError> {
+        self.prepare_write()?;
         self.fully_synced(|index| {
             let transaction = index.transaction()?;
             let mut recorded = Vec::new();
