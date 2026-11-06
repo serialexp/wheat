@@ -446,7 +446,11 @@ where
         Ok(node)
     }
 
-    async fn read_at(&self, id: C::Id, position: usize) -> Result<Node<C::Id, C::Value>, Error> {
+    pub(crate) async fn read_at(
+        &self,
+        id: C::Id,
+        position: usize,
+    ) -> Result<Node<C::Id, C::Value>, Error> {
         self.decode_at(&self.objects.get(id.into()).await?, position)
     }
 
@@ -455,7 +459,7 @@ where
         validate_node_at(node, position, C::Key::LEN, C::BUCKET)
     }
 
-    async fn root(&self, id: C::Id) -> Result<Node<C::Id, C::Value>, Error> {
+    pub(crate) async fn root(&self, id: C::Id) -> Result<Node<C::Id, C::Value>, Error> {
         let node = self.read_at(id, 0).await?;
         if node.prefix.is_empty()
             && node.value.is_none()

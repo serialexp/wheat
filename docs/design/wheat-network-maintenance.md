@@ -450,9 +450,12 @@ Bart deferred to @wise-walrus with a lean to G1 (a); walrus relayed these answer
 - `wheat_store::record_info(id, record) -> RecordInfo { logical_length, references }`,
   `RecordReferences::{None, Delta { base }, Chunks(ids), Parts(ids)}`, for put time.
   A part is an ordinary blob, so its chunks are found while sweeping, by reading it.
-- `ContentMarks` (SQLite at a path): `create`, `mark_heads(objects, envelopes)` (the
-  union of each state's `required_content`, set nodes visited once), `write_run`
-  (a BinSchema header and sorted IDs) and `merge(path, runs)`.
+- `ContentMarks` (SQLite at a path): `create`, `mark_heads(reader, envelopes)` (the
+  union of each state's `required_content`, set nodes visited once), `finish` and
+  `merge(path, files)`. Changed from the shape first sent (a run file of sorted IDs):
+  the finished SQLite file is what a host ships, and the worker merges files with
+  `ATTACH`, so there is no run format to define. A file is used only once finished;
+  marks are written unsynced and synced before the finished row is.
 - `sweep(blobs, marks, inventory)`: closes the marks over `inventory.references`
   (and parts read from `blobs`) to a fixed point, then pages `list_page` and calls
   `inventory.reclaim(id)` for each ID not marked.
@@ -474,12 +477,16 @@ Bart deferred to @wise-walrus with a lean to G1 (a); walrus relayed these answer
 
 ### Outstanding (Gothab content GC)
 
-- [ ] `record_info` and `RecordReferences`.
-- [ ] `ContentMarks`: mark, runs, merge.
-- [ ] `sweep` with the `ContentInventory` trait.
+- [x] `record_info` and `RecordReferences` (fdf8ded).
+- [x] `ContentMarks`: mark, finish, merge, with `sweep` and the `ContentInventory`
+  trait (`wheat-store/src/content_gc.rs`, `tests/content_gc.rs`). A child is checked
+  against the visited set before it is read, so a shared subtree costs no read.
+- [x] Bench case `content_gc` (2026-11-06, 10,000 changes): marking 20 heads spread
+  along the history reads 5,106 objects, 51% of marking each alone (budget 60%);
+  20 forks one change past the newest add 85 reads to its 951 (budget 10 a fork); a
+  sweep of 110,220 listed IDs reclaims the 100,200 dead in 0.29 s with 10 inventory
+  calls.
 - [ ] The `ContentNaming` hook in wheat-server's publish path, with the G/2 renaming.
-- [ ] Bench case: marking many heads that share history, and a sweep over a mostly
-  dead inventory, counting reads and calls.
 
 ## Review (2026-10-27)
 

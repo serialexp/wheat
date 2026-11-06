@@ -32,6 +32,8 @@ mod commit_writer;
 mod content_batch;
 #[path = "../content_blobs.rs"]
 mod content_blobs;
+#[path = "../content_gc.rs"]
+mod content_gc;
 #[path = "../content_generation_read_latency.rs"]
 mod content_generation_read_latency;
 #[path = "../content_map.rs"]

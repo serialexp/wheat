@@ -272,3 +272,63 @@ pub(crate) fn committed_at(index: usize) -> Timestamp {
         offset_minutes: 0,
     }
 }
+
+/// Creates change number `index`, writing `new` over `expected` at `path`, on the
+/// frontier of `effective` and publishes it. Returns the new head and view.
+pub(crate) async fn write_at<O, P>(
+    mutator: &PersistedRepositoryMutator<'_, O, P>,
+    content: &ContentStore,
+    (head, base, effective): (RepositoryHead, ViewId, ViewId),
+    index: usize,
+    path: &str,
+    expected: Option<&[u8]>,
+    new: &[u8],
+) -> Result<(RepositoryHead, ViewId)>
+where
+    O: ImmutableObjectStore,
+    P: PublicationStore,
+{
+    let value_of = |bytes: &[u8]| FileValue {
+        content: ContentId::of(bytes),
+        kind: FileKind::Regular,
+    };
+    content.put(new)?;
+    let record = EditRecord::new(
+        path,
+        EditOperation::ExactFile {
+            expected: expected.map(value_of),
+            replacement: Some(value_of(new)),
+        },
+    )?;
+    let id = record.id();
+    let (prepared, outcome) = mutator
+        .create_on_frontier(
+            head,
+            base,
+            effective,
+            ChangeProposal {
+                id: change_id(index),
+                metadata: ChangeMetadata {
+                    title: format!("Change {index}"),
+                    creator: author(),
+                    ..ChangeMetadata::default()
+                },
+                dependencies: Default::default(),
+                revision_metadata: RevisionMetadata {
+                    author: author(),
+                    committer: author(),
+                    committed_at: committed_at(index),
+                    ..RevisionMetadata::default()
+                },
+                edits: RevisionEdits {
+                    edits: [(id, record)].into(),
+                    transition: EditTransition {
+                        added: [id].into(),
+                        ..EditTransition::default()
+                    },
+                },
+            },
+        )
+        .await?;
+    Ok((mutator.publish(prepared).await?, outcome.resulting_view))
+}

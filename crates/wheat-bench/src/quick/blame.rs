@@ -14,19 +14,14 @@
 use std::{fs, num::NonZeroUsize, path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
-use wheat_core::{
-    ChangeMetadata, ChangeProposal, ContentId, EditOperation, EditRecord, EditTransition, FileKind,
-    FileValue, RevisionEdits, RevisionMetadata, ViewId,
-};
 use wheat_store::{
-    BlameLimits, BlameOrigin, ContentStore, ImmutableObjectStore, LocalPublicationStore,
-    PathHistoryIndex, PersistedRepositoryMutator, PublicationStore, RepositoryBrowser,
-    RepositoryHead, RepositoryReader,
+    BlameLimits, BlameOrigin, LocalPublicationStore, PathHistoryIndex, PersistedRepositoryMutator,
+    RepositoryBrowser, RepositoryReader,
 };
 
 use super::{
     CaseContext, CaseOutput, Recorder,
-    history::{Counting, Scratch, author, change_id, committed_at},
+    history::{Counting, Scratch, change_id, write_at},
 };
 use crate::measure;
 
@@ -247,64 +242,4 @@ fn file_path(file: usize) -> String {
 /// What change `index` writes to a cold file.
 fn value(index: usize) -> String {
     format!("change {index}\n")
-}
-
-/// Creates change number `index`, writing `new` over `expected` at `path`, on the
-/// frontier of `effective` and publishes it. Returns the new head and view.
-async fn write_at<O, P>(
-    mutator: &PersistedRepositoryMutator<'_, O, P>,
-    content: &ContentStore,
-    (head, base, effective): (RepositoryHead, ViewId, ViewId),
-    index: usize,
-    path: &str,
-    expected: Option<&[u8]>,
-    new: &[u8],
-) -> Result<(RepositoryHead, ViewId)>
-where
-    O: ImmutableObjectStore,
-    P: PublicationStore,
-{
-    let value_of = |bytes: &[u8]| FileValue {
-        content: ContentId::of(bytes),
-        kind: FileKind::Regular,
-    };
-    content.put(new)?;
-    let record = EditRecord::new(
-        path,
-        EditOperation::ExactFile {
-            expected: expected.map(value_of),
-            replacement: Some(value_of(new)),
-        },
-    )?;
-    let id = record.id();
-    let (prepared, outcome) = mutator
-        .create_on_frontier(
-            head,
-            base,
-            effective,
-            ChangeProposal {
-                id: change_id(index),
-                metadata: ChangeMetadata {
-                    title: format!("Change {index}"),
-                    creator: author(),
-                    ..ChangeMetadata::default()
-                },
-                dependencies: Default::default(),
-                revision_metadata: RevisionMetadata {
-                    author: author(),
-                    committer: author(),
-                    committed_at: committed_at(index),
-                    ..RevisionMetadata::default()
-                },
-                edits: RevisionEdits {
-                    edits: [(id, record)].into(),
-                    transition: EditTransition {
-                        added: [id].into(),
-                        ..EditTransition::default()
-                    },
-                },
-            },
-        )
-        .await?;
-    Ok((mutator.publish(prepared).await?, outcome.resulting_view))
 }
