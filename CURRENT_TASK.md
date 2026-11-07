@@ -33,6 +33,8 @@ it together later (v0.3.5), only on Bart's go-ahead.
   guard in `workspace_lifecycle.rs`); test `wheat-cli/tests/store_in_workspace.rs`.
   Open for Bart: such a workspace only works at the path where it was made (metadata
   records the absolute store path); making it survive a move is a separate change.
+  Walrus (2026-11-08): Gothab CI never moves a checkout, so it doesn't need that. It
+  will use the flag once a tagged release's run completes.
 - Hidden labels: done. Bart chose (2026-11-07) that they stay in the local head
   exactly as on the remote (clone, fetch and publish move them as before) and are
   only left out of `wheat labels`, which lists them with `--hidden`; glob patterns

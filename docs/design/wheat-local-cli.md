@@ -183,7 +183,9 @@ both lists.
 - [ ] **Decide: should a workspace that holds its own store survive a move?** Its
   metadata records the store's absolute path, which the registry, rewrite
   transactions and materialization all check, so today it works only where it was
-  made. See "Repository layout decision".
+  made. Gothab's CI doesn't need it (2026-11-08): job containers mount the work
+  directory at the same path, Firecracker jobs clone inside the VM, and checkouts are
+  deleted, never moved. See "Repository layout decision".
 - [ ] **Import keeps annotated tag data.** Import turns `refs/tags/X` into label
   `tags/X` but drops the tag object's tagger, date and message, so pushing an
   imported tag back needs the label re-created with `-m` and gives a different tag
