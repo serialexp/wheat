@@ -214,6 +214,39 @@ enum RemoteCommand {
 struct InitArgs {
     /// Workspace to initialize. Defaults to the current directory.
     workspace: Option<PathBuf>,
+    #[command(flatten)]
+    store: StoreInWorkspaceArgs,
+}
+
+/// For commands that create a store with a new workspace.
+#[derive(Debug, Args)]
+struct StoreInWorkspaceArgs {
+    /// Keep the new store inside the workspace, in `.wheat/store`, instead of under
+    /// the store home, so the workspace directory holds everything (as a CI job that
+    /// keeps only its checkout needs). Such a workspace can't be unregistered: delete
+    /// its directory instead.
+    #[arg(long)]
+    store_in_workspace: bool,
+}
+
+impl StoreInWorkspaceArgs {
+    /// Where the new store goes, given the global `--store`.
+    fn location<'a>(
+        &self,
+        explicit_store: Option<&'a Path>,
+    ) -> Result<workspace_lifecycle::StoreLocation<'a>> {
+        use workspace_lifecycle::StoreLocation;
+        Ok(match (self.store_in_workspace, explicit_store) {
+            (true, Some(_)) => {
+                return Err(CliFailure::invalid(
+                    "--store-in-workspace makes a new store, so it takes no --store",
+                ));
+            }
+            (true, None) => StoreLocation::InWorkspace,
+            (false, Some(store)) => StoreLocation::Explicit(store),
+            (false, None) => StoreLocation::Home,
+        })
+    }
 }
 
 /// For commands that write repository files into the workspace.
@@ -778,6 +811,8 @@ struct NativeCloneArgs {
     #[arg(long)]
     view: Option<String>,
     #[command(flatten)]
+    store: StoreInWorkspaceArgs,
+    #[command(flatten)]
     dot_git: DotGitArgs,
 }
 
@@ -989,7 +1024,7 @@ fn execute(cli: Cli) -> Result<Success> {
                 .workspace
                 .as_deref()
                 .unwrap_or(&requested_workspace),
-            cli.store.as_deref(),
+            arguments.store.location(cli.store.as_deref())?,
         ),
         Command::Materialize(dot_git) => materialize_active_workspace(
             &requested_workspace,
@@ -1843,8 +1878,11 @@ fn import(
     )
 }
 
-fn init_workspace(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Success> {
-    let initialized = workspace_lifecycle::init(workspace_root, explicit_store)?;
+fn init_workspace(
+    workspace_root: &Path,
+    location: workspace_lifecycle::StoreLocation<'_>,
+) -> Result<Success> {
+    let initialized = workspace_lifecycle::init(workspace_root, location)?;
     let view = initialized.view;
     Success::new(
         "init",
@@ -2849,7 +2887,13 @@ fn native_clone(
         Some(view) => workspace_clone::CloneStart::View(view),
         None => workspace_clone::CloneStart::DefaultLabel,
     };
+    let location = arguments.store.location(explicit_store)?;
     if let Some(source) = workspace_clone::local_source(&arguments.url) {
+        if arguments.store.store_in_workspace {
+            return Err(CliFailure::invalid(
+                "--store-in-workspace needs a native remote: a clone of a local store shares that store",
+            ));
+        }
         let workspace_root = arguments.workspace.unwrap_or_else(|| {
             let name = source
                 .file_name()
@@ -2891,7 +2935,9 @@ fn native_clone(
     // Checked before anything is created.
     let filter = hidden_labels::LabelFilter::new(&shown_patterns(&arguments.labels), false)?;
 
-    let existing_store = if let Some(store) = explicit_store {
+    let existing_store = if let workspace_lifecycle::StoreLocation::InWorkspace = location {
+        None
+    } else if let Some(store) = explicit_store {
         let store = canonical_store_path(store)?;
         let config = remote_config::RemoteConfig::read(&store)?
             .context("explicit Wheat store has no native remote configuration")?;
@@ -2916,7 +2962,8 @@ fn native_clone(
 
     // Ask the helper before creating anything, so a failure leaves no store.
     let token = credential::token_for(&UserConfig::from_environment()?, None, &parsed)?;
-    let store_root = allocate_store_root()?;
+    let new_store = workspace_lifecycle::NewStore::place(&workspace_root, location)?;
+    let store_root = new_store.root().to_path_buf();
     if store_root.exists() {
         return Err(CliFailure::invalid(format!(
             "Wheat store destination already exists: {}",
@@ -2994,6 +3041,7 @@ fn native_clone(
     );
     workspace_registry_service::reconcile(&workspace_root, &store_root, &workspace)?;
     workspace.initialize(&workspace_root)?;
+    new_store.keep();
     let (view, materialized_root) = materialize_resolved(
         &workspace_root,
         Some(&store_root),

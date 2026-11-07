@@ -667,7 +667,8 @@ mod tests {
             let root = dir.path().join("workspace");
             let store = dir.path().join("store");
             let user = UserConfig::in_home(&dir.path().join("config"));
-            workspace_lifecycle::init(&root, Some(&store)).unwrap();
+            workspace_lifecycle::init(&root, workspace_lifecycle::StoreLocation::Explicit(&store))
+                .unwrap();
             authoring_metadata::set(&user, None, true, ConfigKey::ActorName, "Test").unwrap();
             authoring_metadata::set(
                 &user,

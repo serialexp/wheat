@@ -27,6 +27,12 @@ it together later (v0.3.5), only on Bart's go-ahead.
   `wheat switch --view V`, `wheat clone URL DIR --view V`; `WorkspaceMetadataV2`
   with an optional label; status JSON schema 3; test `wheat-cli/tests/pinned_view.rs`.
   Documented in `wheat-local-cli.md`. Walrus to be told once committed.
+- A workspace that holds its own store (walrus: CI job containers mount only the
+  checkout): Bart (2026-11-08) "give it --store-in-workspace". `clone`/`init
+  --store-in-workspace` put the store at `.wheat/store` (`StoreLocation`, `NewStore`
+  guard in `workspace_lifecycle.rs`); test `wheat-cli/tests/store_in_workspace.rs`.
+  Open for Bart: such a workspace only works at the path where it was made (metadata
+  records the absolute store path); making it survive a move is a separate change.
 - Hidden labels: done. Bart chose (2026-11-07) that they stay in the local head
   exactly as on the remote (clone, fetch and publish move them as before) and are
   only left out of `wheat labels`, which lists them with `--hidden`; glob patterns

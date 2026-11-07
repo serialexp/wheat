@@ -1,4 +1,8 @@
-use std::{fmt::Write as _, fs, path::Path};
+use std::{
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
@@ -8,7 +12,9 @@ use crate::{
     materialization::WorkspaceLock,
     outcome::{CliFailure, Success},
     sys::{self, EntryKind},
-    workspace_metadata::{StoreMetadata, WORKSPACE_METADATA_FILE, WorkspaceMetadata},
+    workspace_metadata::{
+        StoreMetadata, WORKSPACE_METADATA_FILE, WORKSPACE_STORE_DIR, WorkspaceMetadata,
+    },
     workspace_registry::WorkspaceRegistry,
 };
 
@@ -27,15 +33,87 @@ pub struct Initialized {
     pub materialized_root: std::path::PathBuf,
 }
 
-/// Creates a store (at `explicit_store`, or a new one under the store home) and a
-/// workspace on its `main` label at `workspace_root`, which must not be a workspace
-/// yet.
-pub fn init(workspace_root: &Path, explicit_store: Option<&Path>) -> Result<Initialized> {
+/// Where a new workspace's new store goes.
+#[derive(Clone, Copy, Debug)]
+pub enum StoreLocation<'a> {
+    /// Exactly this directory.
+    Explicit(&'a Path),
+    /// A new directory under the store home (`WHEAT_STORE_HOME`).
+    Home,
+    /// The workspace's own `.wheat/store`, so the workspace directory holds everything,
+    /// as a CI job that can keep only its checkout needs.
+    InWorkspace,
+}
+
+/// The place picked for a new workspace's new store. Dropped before [`Self::keep`], it
+/// undoes what [`Self::place`] made, so a failed `init` or `clone` can be run again:
+/// an in-workspace store goes with the `.wheat` directory made for it. A store
+/// elsewhere is left where it is.
+pub struct NewStore {
+    root: PathBuf,
+    /// The `.wheat` directory made to hold an in-workspace store.
+    made_control: Option<PathBuf>,
+}
+
+impl NewStore {
+    /// The root for a new store at `location`, for a workspace at `workspace_root`
+    /// that is fresh ([`ensure_fresh_workspace`]). For [`StoreLocation::InWorkspace`]
+    /// this creates the workspace directory and its `.wheat` directory.
+    pub fn place(workspace_root: &Path, location: StoreLocation<'_>) -> Result<Self> {
+        Ok(match location {
+            StoreLocation::Explicit(store) => Self {
+                root: store.to_path_buf(),
+                made_control: None,
+            },
+            StoreLocation::Home => Self {
+                root: crate::discovery::allocate_store_root()?,
+                made_control: None,
+            },
+            StoreLocation::InWorkspace => {
+                initialize_workspace_directory(workspace_root)?;
+                let control = workspace_root.join(".wheat");
+                fs::create_dir(&control).with_context(|| {
+                    format!("create workspace control directory {}", control.display())
+                })?;
+                Self {
+                    root: control.join(WORKSPACE_STORE_DIR),
+                    made_control: Some(control),
+                }
+            }
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The workspace was made: keep the store.
+    pub fn keep(mut self) -> PathBuf {
+        self.made_control = None;
+        std::mem::take(&mut self.root)
+    }
+}
+
+impl Drop for NewStore {
+    fn drop(&mut self) {
+        if let Some(control) = self.made_control.take() {
+            let _ = fs::remove_dir_all(control);
+        }
+    }
+}
+
+/// Creates a store at `location` and a workspace on its `main` label at
+/// `workspace_root`, which must not be a workspace yet.
+pub fn init(workspace_root: &Path, location: StoreLocation<'_>) -> Result<Initialized> {
     ensure_fresh_workspace(workspace_root)?;
-    let store_root = match explicit_store {
-        Some(store) => store.to_path_buf(),
-        None => crate::discovery::allocate_store_root()?,
-    };
+    let store = NewStore::place(workspace_root, location)?;
+    let initialized = init_at(workspace_root, store.root())?;
+    store.keep();
+    Ok(initialized)
+}
+
+fn init_at(workspace_root: &Path, store_root: &Path) -> Result<Initialized> {
+    let store_root = store_root.to_path_buf();
     crate::local::initialize(&store_root)?;
     let store = StoreMetadata::create(&store_root)?;
     let canonical_store = canonical_store_path(&store_root)?;
@@ -189,6 +267,14 @@ pub fn unregister(workspace: &Path, explicit_store: Option<&Path>) -> Result<Suc
             && metadata.store.store_id == context.workspace.store.store_id,
         "workspace identity changed before unregister"
     );
+    if holds_store(&context.root) {
+        return Err(CliFailure::invalid(format!(
+            "this workspace keeps its own store in .wheat/{WORKSPACE_STORE_DIR}, which \
+             unregistering would delete with the workspace's control directory; delete the \
+             workspace directory {} instead",
+            context.root.display()
+        )));
+    }
     let registry = WorkspaceRegistry::new(&context.store_root, metadata.store.store_id)?;
     let pin = registry.read(metadata.workspace_id)?;
     ensure!(
@@ -218,6 +304,11 @@ pub fn unregister(workspace: &Path, explicit_store: Option<&Path>) -> Result<Suc
             context.root.display()
         ),
     )
+}
+
+/// Whether the workspace at `root` keeps its own store (`--store-in-workspace`).
+fn holds_store(root: &Path) -> bool {
+    root.join(".wheat").join(WORKSPACE_STORE_DIR).exists()
 }
 
 fn ensure_control_directory_owned(control: &fs::File) -> Result<()> {

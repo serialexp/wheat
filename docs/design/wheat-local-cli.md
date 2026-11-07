@@ -2,7 +2,7 @@
 
 Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, `add --all`, and explicit revision collapse are landed; extended configuration keys are stored but not yet read; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-11-07
+Last updated: 2026-11-08
 
 ## Implementation status
 
@@ -174,8 +174,16 @@ both lists.
   checking out the view that triggered it. Extended beyond the original plan: the
   workspace metadata is `WorkspaceMetadataV2` with an optional label, and status
   JSON is schema 3. See "Repository labels and integration workflow".
+- [x] **A workspace that holds its own store.** (2026-11-08) `wheat clone URL DIR
+  --store-in-workspace` and `wheat init DIR --store-in-workspace` put the new store in
+  `DIR/.wheat/store` instead of under the store home, for a CI job container that
+  mounts only its checkout. See "Repository layout decision".
 
 ### Outstanding
+- [ ] **Decide: should a workspace that holds its own store survive a move?** Its
+  metadata records the store's absolute path, which the registry, rewrite
+  transactions and materialization all check, so today it works only where it was
+  made. See "Repository layout decision".
 - [ ] **Import keeps annotated tag data.** Import turns `refs/tags/X` into label
   `tags/X` but drops the tag object's tagger, date and message, so pushing an
   imported tag back needs the label re-created with `-m` and gives a different tag
@@ -380,6 +388,19 @@ The current loose layout uses `.wheat/`, while packed Git imports currently plac
 `repository.head` and `storage/` at the destination root. That is useful
 prototype evidence but not yet a workspace contract. Materialization should not
 cement either layout accidentally; the open question must be resolved first.
+
+**Follow-up (2026-11-08):** separate authority is the default, and embedded authority
+is available on request. `--store-in-workspace` on `clone` and `init` makes the new
+store at `.wheat/store`, so the workspace directory holds everything. A CI job that
+mounts only its checkout into a container needs that. Workspace scans already leave
+`.wheat` out, so status never reads the store. The flag makes a new store, so it
+refuses `--store`, and `clone` doesn't look for a store under the store home that
+already tracks the remote. A local-path source is refused, because a local clone
+shares the source's store. A clone that fails after creating the store removes
+`.wheat` again, so the same command can be rerun. `workspace unregister` refuses:
+deleting the control directory would delete the store with it, so the way to drop
+such a workspace is to delete its directory. The workspace records the store's
+absolute path like any other, so it works only at the path where it was made.
 
 ## Materialization and restore
 

@@ -20,6 +20,9 @@ use wheat_store::RepositoryHead;
 pub const STORE_METADATA_FILE: &str = "store.meta";
 /// A workspace's metadata, in its `.wheat` directory.
 pub const WORKSPACE_METADATA_FILE: &str = "workspace.meta";
+/// Where a workspace made with `--store-in-workspace` keeps its store, in its `.wheat`
+/// directory, which workspace scans leave out.
+pub const WORKSPACE_STORE_DIR: &str = "store";
 /// The most bytes a store or workspace metadata file may hold.
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
@@ -309,11 +312,31 @@ impl WorkspaceMetadata {
         })?)
     }
 
+    /// Creates the workspace's `.wheat` directory and its metadata. The directory may
+    /// already exist only to hold the workspace's own store, and nothing else.
     pub fn initialize(&self, root: &Path) -> Result<()> {
         let control = root.join(".wheat");
         let bytes = self.encode()?;
-        fs::create_dir(&control)
-            .with_context(|| format!("create workspace control directory {}", control.display()))?;
+        match fs::create_dir(&control) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let mut entries = fs::read_dir(&control)
+                    .with_context(|| format!("read {}", control.display()))?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<io::Result<Vec<_>>>()?;
+                entries.sort();
+                anyhow::ensure!(
+                    entries == [WORKSPACE_STORE_DIR],
+                    "workspace control directory {} already exists",
+                    control.display()
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create workspace control directory {}", control.display())
+                });
+            }
+        }
         write_new(&Self::path(root), &bytes)
     }
 

@@ -108,6 +108,8 @@ mod squash;
 mod stat_cache;
 #[path = "../store_analyze.rs"]
 mod store_analyze;
+#[path = "../store_in_workspace.rs"]
+mod store_in_workspace;
 #[path = "../unsupported_platform.rs"]
 mod unsupported_platform;
 #[path = "../untracked_status.rs"]
