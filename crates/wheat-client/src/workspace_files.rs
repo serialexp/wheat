@@ -641,14 +641,19 @@ mod platform {
         Ok(*hasher.finalize().as_bytes())
     }
 
+    // `st_dev` and `st_mode` are u64 and u32 on Linux but i32 and u16 on
+    // macOS. They are cast the way std's `MetadataExt::dev` and `mode` cast
+    // them, so this stamp equals `stamp_of_metadata`'s for the same file on
+    // every platform; on Linux the casts are no-ops.
+    #[allow(clippy::unnecessary_cast)]
     fn stamp_of_stat(stat: &libc::stat) -> FileStamp {
         FileStamp {
             size: stat.st_size as u64,
             mtime_ns: stat.st_mtime * 1_000_000_000 + stat.st_mtime_nsec,
             ctime_ns: stat.st_ctime * 1_000_000_000 + stat.st_ctime_nsec,
             inode: stat.st_ino,
-            device: stat.st_dev,
-            mode: stat.st_mode,
+            device: stat.st_dev as u64,
+            mode: stat.st_mode as u32,
         }
     }
 
