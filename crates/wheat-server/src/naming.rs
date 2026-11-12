@@ -34,6 +34,12 @@ pub trait ContentNaming: Send + Sync {
     /// `ids`, each stored, are relied on by a publish about to commit: stamp each.
     /// Fails if one is not stored any more; the publish is then refused as failed,
     /// and sending it again uploads it.
+    ///
+    /// Stamp, too, what reading each of `ids` needs that Wheat did not list: the delta
+    /// base recorded on its row (`wheat_store::record_info`), and that base's, and so
+    /// on. Wheat lists what it read, but a chunk is stored whole and is not read, and a
+    /// chunk whose bytes equal content stored earlier as a delta is that delta; naming
+    /// it names its base only through the row's recorded references.
     async fn named(&self, ids: &[ContentId]) -> io::Result<()>;
 }
 

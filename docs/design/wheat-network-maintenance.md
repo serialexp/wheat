@@ -478,7 +478,9 @@ Naming a record is not enough when what reading it needs is old: a chunked blob'
 chunks and parts, a part's chunks, or a delta's base. Suppose a head is committed
 after a mark read the heads. The manifest it relies on survives on its fresh stamp,
 while chunks it shares with dead content are swept. Bart chose (2026-11-07) that Wheat
-names the closure, so Gothab's `named` only stamps rows. As built:
+names the closure, so Gothab's `named` only stamps rows. As built (except that, from
+2026-11-12, `named` also follows each row's recorded delta base, for a chunk stored as
+a delta, which Wheat does not read):
 
 - `ContentStore::needed_to_read(ids, bases)` (`wheat-store/src/content_closure.rs`)
   gives `ids` and everything reading them needs. It reads each record's header and a
@@ -544,7 +546,12 @@ names the closure, so Gothab's `named` only stamps rows. As built:
   what reading needs").
 - [ ] **Gap — a chunk stored as a delta.** A chunk whose bytes equal content stored
   earlier as a delta is reused as that delta, and naming does not read chunks, so
-  its base is not named (TODO.md).
+  its base is not named. Bart chose (2026-11-12) that Gothab's `named` follows the
+  delta base recorded on each named row, transitively, rather than Wheat reading
+  every chunk's header (a request per reused chunk) or the sweep rooting recently
+  named rows (it races a row named after the roots are listed). This reverses, for
+  delta bases only, the 2026-11-07 choice that `named` only stamps rows. Wheat's
+  side is the `ContentNaming::named` contract; Gothab implements it (TODO.md).
 - [ ] **Delta bases at publish come from the base view.** So publishes hardly ever
   store deltas, and naming has few bases to name; a perf gap of publishing, not of GC
   (TODO.md).

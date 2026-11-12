@@ -16,9 +16,10 @@ the same commit.
 - [ ] **A chunk equal to a stored delta is named without its base.** Naming a
   publish's content (`ContentStore::needed_to_read`) does not read chunks, since
   chunks are stored whole. But a chunk whose bytes equal a file stored earlier as a
-  delta is found stored and reused as that delta, and its base is not named. Gothab
-  records each row's delta base at put (`record_info`), so its `named` could stamp
-  those bases too; or the closure could read chunk headers, one request per chunk.
+  delta is found stored and reused as that delta, and its base is not named. Bart
+  chose (2026-11-12) that Gothab's `named` follows each named row's recorded delta
+  base (`record_info`), transitively. Wheat's side, the `ContentNaming::named`
+  contract, is written; open until Gothab implements it.
 
 ## Found while placing long files (2026-11-05)
 
