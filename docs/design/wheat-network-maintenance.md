@@ -4,11 +4,11 @@ Status: partial — Phase 0 (the admin surface), Phases 1 (export), 2 (import an
 adoption) and 3 (delete while served) landed, so a network can be moved; Phase 2b
 and GC (4–6) designed, not yet implemented; Gothab's content GC (2026-11-06) is
 built on Wheat's side (marking, sweeping, and naming what publishes rely on), with
-three gaps recorded below. Bart answered questions 1–5 on 2026-10-27; a
+two gaps recorded below. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
-Last updated: 2026-11-07
+Last updated: 2026-11-12
 
 ## Implementation status
 
@@ -499,9 +499,17 @@ names the closure, so Gothab's `named` only stamps rows. As built:
   instants. Just before its head compare-and-swap, if that instant is older than
   `renew_after` (half the grace), it names all of it again; a failure fails the
   batch. Uploads are stored by then, and their put stamps are newer than the instant.
+- Just before its compare-and-swap, a batch names what the new head's
+  `required_content` adds over the head it replaces that it didn't name already,
+  with what reading that needs (2026-11-12). That is content a join brought back:
+  a forced publish dropped it from the head, so no mark that read that head saw it,
+  and no publish named it. The check covers a join at accept, a re-join after
+  another process moved the head, and server writes.
 - Cost per publish: one ranged read per added ID found stored and per delta base,
   one read per uploaded or existing manifest and per part, and one `named` call.
-  A renewal adds a second call, without reads. `tests/content_blobs.rs` counts the
+  A renewal adds a second call, without reads. Each batch adds one content-set diff
+  between the two heads, which skips shared subtrees, and a naming call only when
+  that diff holds something unnamed. `tests/content_blobs.rs` counts the
   reads, and `tests/naming_test.rs` covers the hook end to end.
 
 ### Timing and races
@@ -529,11 +537,14 @@ names the closure, so Gothab's `named` only stamps rows. As built:
   budget of one a listed page.
 - [x] The `ContentNaming` hook in wheat-server's publish path, with the G/2 renaming,
   naming what reading the named content needs (2026-11-07, above).
+- [x] **Gap closed — a join after a forced publish (2026-11-12).** The union could
+  re-add content that a forced publish dropped before a mark began, and nothing
+  named it. Now each batch names, just before its compare-and-swap, what the new head
+  requires over the one it replaces that the batch didn't name already (see "Naming
+  what reading needs").
 - [ ] **Gap — a chunk stored as a delta.** A chunk whose bytes equal content stored
   earlier as a delta is reused as that delta, and naming does not read chunks, so
   its base is not named (TODO.md).
-- [ ] **Gap — a join after a forced publish.** The union can re-add content a forced
-  publish dropped before a mark began, which nothing names (TODO.md).
 - [ ] **Delta bases at publish come from the base view.** So publishes hardly ever
   store deltas, and naming has few bases to name; a perf gap of publishing, not of GC
   (TODO.md).

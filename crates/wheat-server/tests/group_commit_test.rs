@@ -21,6 +21,7 @@ use wheat_server::access::Principal;
 use wheat_server::commit::{self, CommitFailure};
 use wheat_server::heads::{HeadStore, ReceiptLookup, conformance::check_head_store};
 use wheat_server::hooks::{Announcement, ProposedPublish, PublishHooks, PublishedBatch};
+use wheat_server::naming::{ContentNaming, Named};
 use wheat_server::network::Network;
 use wheat_server::quiesce::Quiesced;
 use wheat_server::receipt::PublishKey;
@@ -126,6 +127,8 @@ struct Server {
     /// The head `entry` serves, as another process sharing it would move it.
     heads: LocalPublicationStore,
     initial: RepositoryHead,
+    /// The repository without its change, stored and named by no head.
+    unchanged: RepositoryEnvelopeId,
     /// The repository's base view, and the view with its one change.
     base: ViewId,
     greeting: ViewId,
@@ -133,6 +136,11 @@ struct Server {
 
 /// A repository with one change, served through a [`GatedStore`].
 async fn server() -> Server {
+    server_with(None).await
+}
+
+/// As [`server`], telling `naming` what publishes rely on.
+async fn server_with(naming: Option<Arc<dyn ContentNaming>>) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let objects = PackedObjectStore::open(dir.path().join("storage")).unwrap();
     let content = objects.content_store();
@@ -140,6 +148,7 @@ async fn server() -> Server {
     content.put(b"hello wheat").unwrap();
     let mut repo = Repository::new(Tree::new());
     let basis = repo.base_view().id;
+    let unchanged = repo.clone();
     let (_, greeting) = repo
         .create_change(
             basis,
@@ -154,6 +163,19 @@ async fn server() -> Server {
         .await
         .unwrap();
     let initial = heads.read().unwrap();
+    // The repository before its change, stored but no head: a forced publish of it
+    // drops the change and its content.
+    let publisher = RepositoryPublisher::new(&objects, &content, &heads);
+    let closure = publisher.prepare(&unchanged).await.unwrap();
+    let unchanged = publisher
+        .prepare_envelope(
+            closure.state.id,
+            &ViewLabelManifestRecord {
+                labels: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
 
     let gate = Arc::new(Gate {
         arrived: Notify::new(),
@@ -169,9 +191,16 @@ async fn server() -> Server {
         _dir: dir,
         objects,
         gate,
-        entry: Arc::new(RepositoryEntry::new(Box::new(store), heads.clone())),
+        entry: Arc::new(match naming {
+            Some(naming) => RepositoryEntry::in_network(
+                Network::with_naming(Box::new(store), naming),
+                heads.clone(),
+            ),
+            None => RepositoryEntry::new(Box::new(store), heads.clone()),
+        }),
         heads,
         initial,
+        unchanged,
         base: basis,
         greeting: greeting.resulting_view,
     }
@@ -383,6 +412,83 @@ async fn publishes_accepted_while_a_batch_is_written_share_the_next_head_advance
     let reader = RepositoryReader::new(&server.objects, &server.entry.network.content);
     let state = reader.envelope(a_head.envelope).await.unwrap().state;
     reader.validate_complete(state).await.unwrap();
+}
+
+/// Records what it is told to name.
+#[derive(Default)]
+struct Naming {
+    calls: Mutex<Vec<Vec<ContentId>>>,
+}
+
+#[async_trait]
+impl ContentNaming for Naming {
+    fn renew_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(3600)
+    }
+
+    async fn named(&self, ids: &[ContentId]) -> std::io::Result<()> {
+        self.calls.lock().unwrap().push(ids.to_vec());
+        Ok(())
+    }
+}
+
+/// A forced publish drops the change, and with it `greeting.txt`'s content, from the
+/// head. A publish planned before it named only what it adds over the head it was
+/// planned against; joined onto the forced head, it brings the change and its content
+/// back. A collection whose mark read the forced head never saw that content, and no
+/// publish named it, so the batch names it as it commits.
+#[tokio::test]
+async fn a_publish_joined_onto_a_forced_head_names_the_content_it_brings_back() {
+    let naming = Arc::new(Naming::default());
+    let server = server_with(Some(naming.clone())).await;
+    let initial = server.initial;
+    let (stage, proposed) = propose(&server, initial, "later.txt").await;
+    let later = VerifiedContent::new(b"later.txt".to_vec()).id();
+    let greeting = VerifiedContent::new(b"hello wheat".to_vec()).id();
+
+    let forced = commit::accept(
+        &server.entry,
+        &new_stage(&server.entry.network),
+        forcing_key(1, server.unchanged, true, false),
+        initial.envelope,
+        server.unchanged,
+        true,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    server.gate.permits.add_permits(1);
+    assert_eq!(forced.durable().await.unwrap().envelope, server.unchanged);
+    // The forced head adds nothing over the one it replaces, so nothing is named.
+    assert!(naming.calls.lock().unwrap().is_empty());
+
+    // Named as the publish would have, over the head it planned against.
+    let named = Named {
+        since: tokio::time::Instant::now(),
+        ids: vec![later],
+    };
+    let accepted = commit::accept(
+        &server.entry,
+        &stage,
+        key(2, proposed),
+        initial.envelope,
+        proposed,
+        false,
+        false,
+        None,
+        Some(named),
+    )
+    .await
+    .unwrap();
+    server.gate.permits.add_permits(1);
+    let head = accepted.durable().await.unwrap();
+    // The forced head holds nothing the publish lacks, so the union is the publish.
+    assert_eq!(head.envelope, proposed);
+
+    let calls = naming.calls.lock().unwrap().clone();
+    assert_eq!(calls, [vec![greeting]], "only what the join brought back");
 }
 
 /// A server write accepted while a batch is being written is checked against that

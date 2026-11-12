@@ -15,6 +15,7 @@
 //! [`PublishHooks::published`] is told about it, before the next batch is written.
 
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,18 +23,19 @@ use std::{
 use tokio::sync::{Mutex, oneshot};
 use tracing::{Instrument as _, debug_span, warn};
 use wheat_core::{
-    PublishReceiptRecord, RepositoryEnvelopeId, RepositoryEnvelopeRecord, ViewId,
+    ContentId, PublishReceiptRecord, RepositoryEnvelopeId, RepositoryEnvelopeRecord, ViewId,
     ViewLabelManifestRecord,
 };
 use wheat_store::{
-    Arrival, ImmutableObjectStore, MergeBudget, PendingPublications, PublicationError,
-    RepositoryHead, RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryStore,
-    RepositoryStoreError, RepositoryUnionError, StagedPublication, StoredWrite,
+    Arrival, ContentSetStore, ImmutableObjectStore, MergeBudget, PendingPublications,
+    PublicationError, RepositoryHead, RepositoryPublicationError, RepositoryReader,
+    RepositoryStage, RepositoryStore, RepositoryStoreError, RepositoryUnionError,
+    StagedPublication, StoredWrite,
 };
 
 use crate::error_text::chain;
 use crate::hooks::{Announcement, ProposedPublish, PublishHooks, Published, PublishedBatch};
-use crate::naming::Named;
+use crate::naming::{ContentNaming, Named};
 use crate::receipt::{PublishKey, Recorded};
 use crate::registry::RepositoryEntry;
 
@@ -750,6 +752,8 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
     let mut built_on = batch.built_on;
     let mut target = batch.target;
     let mut named_since = batch.named.as_ref().map(|named| named.since);
+    // The head and target whose difference was last named.
+    let mut checked = None;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
         let head = read_head(entry).await?;
         if head.envelope != built_on {
@@ -785,6 +789,14 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
                 });
             }
             *since = at;
+        }
+        if let Some(naming) = &entry.network.naming
+            && checked != Some((head.envelope, target))
+        {
+            name_what_the_head_lacks(entry, naming.as_ref(), head, target, batch.named.as_ref())
+                .instrument(debug_span!("publish_name_joined"))
+                .await?;
+            checked = Some((head.envelope, target));
         }
         let new_head = RepositoryHead {
             generation: head.generation + 1,
@@ -822,6 +834,70 @@ async fn commit_batch(entry: &RepositoryEntry, batch: &Batch) -> Result<Durable,
         head: read_head(entry).await?,
         message: "the head kept moving under this publish; try again".to_string(),
     })
+}
+
+/// Names the content `target` requires that `head` lacks and the batch did not name,
+/// with what reading it needs, just before the head moves from `head` to `target`.
+///
+/// A publish names what its state adds over the head it planned against, and a stage
+/// what it adds over its base. Joined onto a head that dropped some of that (a forced
+/// publish), the union brings it back: content no head held when a collection's mark
+/// began, which no publish named, so the sweep could reclaim it under the new head.
+/// Usually the difference is what the batch named, and nothing more is named.
+async fn name_what_the_head_lacks(
+    entry: &RepositoryEntry,
+    naming: &dyn ContentNaming,
+    head: RepositoryHead,
+    target: RepositoryEnvelopeId,
+    named: Option<&Named>,
+) -> Result<(), CommitFailure> {
+    let network = entry.network.clone();
+    let added = crate::blocking::drive(move || async move {
+        // Only read through: nothing is staged.
+        let stage = RepositoryStage::new(&*network.store, 1, 1);
+        let reader = RepositoryReader::new(&stage, stage.content());
+        let mut required = Vec::with_capacity(2);
+        for envelope in [head.envelope, target] {
+            let envelope = reader.envelope(envelope).await.map_err(|e| chain(&e))?;
+            let state = reader.state(envelope.state).await.map_err(|e| chain(&e))?;
+            required.push(state.required_content);
+        }
+        ContentSetStore::new(&stage)
+            .added(required[0], required[1])
+            .await
+            .map_err(|e| chain(&e))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|added| added)
+    .map_err(|e| CommitFailure::Internal(format!("publish: compare the heads' content: {e}")))?;
+    let named: HashSet<ContentId> = named
+        .map(|named| named.ids.iter().copied().collect())
+        .unwrap_or_default();
+    let unnamed: Vec<ContentId> = added.into_iter().filter(|id| !named.contains(id)).collect();
+    if unnamed.is_empty() {
+        return Ok(());
+    }
+    let network = entry.network.clone();
+    let needed =
+        crate::blocking::drive(move || async move { network.content.needed_to_read(unnamed, []) })
+            .await
+            .map_err(|e| {
+                CommitFailure::Internal(format!("publish: read what joined content needs: {e}"))
+            })?;
+    let failed = |message: String| CommitFailure::Failed {
+        head,
+        message: format!("naming the published content failed: {message}; publish again"),
+    };
+    let needed = needed.map_err(|e| failed(e.to_string()))?;
+    naming
+        .named(&needed)
+        .instrument(debug_span!("publish_name", ids = needed.len()))
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "publish: naming what a join brought back failed");
+            failed(e.to_string())
+        })
 }
 
 /// `target`, built on `built_on`, joined with `head` and stored.

@@ -10,6 +10,14 @@ Finished items, moved here from `TODO.md` under the same headings.
   only a broken connection or protocol ends the session. The store's own reason is
   kept in the message, which used to say only "content storage failed".
   `naming_test::a_publish_whose_upload_cannot_be_stored_is_refused_to_be_sent_again`.
+- `[x]` **A publish joined after a forced publish can bring back content no head
+  holds.** (2026-11-12) Just before a batch's head compare-and-swap, the committer
+  names what the new head's `required_content` adds over the head it replaces that
+  the batch did not name already, with what reading it needs. That covers a join at
+  accept, a re-join after another process moved the head, and server writes. It
+  costs one content-set diff per batch, which skips shared subtrees, and a naming
+  call only when the diff holds something the batch didn't name.
+  `group_commit_test::a_publish_joined_onto_a_forced_head_names_the_content_it_brings_back`.
 
 ## Hosting on Gothab (2026-10-26)
 

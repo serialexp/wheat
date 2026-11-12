@@ -19,13 +19,6 @@ the same commit.
   delta is found stored and reused as that delta, and its base is not named. Gothab
   records each row's delta base at put (`record_info`), so its `named` could stamp
   those bases too; or the closure could read chunk headers, one request per chunk.
-- [ ] **A publish joined after a forced publish can bring back content no head
-  holds.** A publish names what its state adds over the head it planned against.
-  Suppose a forced publish drops content X from the head before a collection's mark
-  begins, and an earlier-planned publish then commits onto it after the mark began.
-  The union re-adds X, which nothing names, so X can be swept. The next collection
-  would find X marked but gone. Decide whether to name what a join adds over the head
-  it lands on, at accept.
 
 ## Found while placing long files (2026-11-05)
 
