@@ -31,6 +31,9 @@ pub enum Operation {
     Adopt { source: String, name: String },
     /// Delete the repository `repository`, with its network when it is the last in it.
     Delete { repository: String },
+    /// Count what the network `repository` belongs to holds that nothing reaches. Only a
+    /// dry run exists so far.
+    GcDryRun { repository: String },
 }
 
 /// How an operation ended.
@@ -81,6 +84,11 @@ fn command(operation: &Operation) -> AdminCommand {
                 repository: repository.clone(),
             })
         }
+        Operation::GcDryRun { repository } => AdminCommand::AdminGcCommand(AdminGcCommandOutput {
+            command_kind: 5,
+            repository: repository.clone(),
+            dry_run: true,
+        }),
         Operation::Adopt { source, name } => {
             AdminCommand::AdminAdoptCommand(AdminAdoptCommandOutput {
                 command_kind: 3,

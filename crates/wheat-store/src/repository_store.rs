@@ -15,7 +15,7 @@ use wheat_core::{ContentChunkManifestRecord, ContentId, ObjectId, VerifiedConten
 
 use crate::{
     BatchObjectStore, ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError,
-    StoredObject,
+    StoredInventory, StoredObject,
     batch::stored_object,
     content_store::{ContentBackend, ContentItem, StoredContent},
 };
@@ -45,6 +45,12 @@ pub trait RepositoryStore: ImmutableObjectStore {
         objects: &[(ObjectId, Vec<u8>)],
         content: &[ContentItem<'_>],
     ) -> Result<StoredWrite, RepositoryStoreError>;
+
+    /// What the store holds, listed, when it can: the pool structure GC counts
+    /// ([`crate::analyze_structure`]). `None` for a store that cannot list its objects.
+    fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        None
+    }
 }
 
 /// What a write added to a store: each object and content it did not hold before,
@@ -267,6 +273,10 @@ impl<P: RepositoryStore, C: RepositoryStore> RepositoryStore for NetworkStore<P,
         }
         Ok(write)
     }
+
+    fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        self.pool.structural_inventory()
+    }
 }
 
 #[async_trait]
@@ -282,6 +292,9 @@ impl<T: RepositoryStore + ?Sized> RepositoryStore for &T {
     ) -> Result<StoredWrite, RepositoryStoreError> {
         (**self).put_publication(objects, content).await
     }
+    fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        (**self).structural_inventory()
+    }
 }
 
 #[async_trait]
@@ -296,6 +309,9 @@ impl<T: RepositoryStore + ?Sized> RepositoryStore for Arc<T> {
         content: &[ContentItem<'_>],
     ) -> Result<StoredWrite, RepositoryStoreError> {
         (**self).put_publication(objects, content).await
+    }
+    fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        (**self).structural_inventory()
     }
 }
 
@@ -342,6 +358,9 @@ impl RepositoryStore for Box<dyn RepositoryStore> {
         content: &[ContentItem<'_>],
     ) -> Result<StoredWrite, RepositoryStoreError> {
         (**self).put_publication(objects, content).await
+    }
+    fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        (**self).structural_inventory()
     }
 }
 

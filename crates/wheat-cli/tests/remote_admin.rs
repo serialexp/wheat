@@ -373,3 +373,52 @@ fn deleting_a_served_repository_ends_a_move() {
     );
     assert!(stderr.contains("no such repository"), "{stderr}");
 }
+/// A dry run counts the objects of superseded publishes that no head reaches, and
+/// changes nothing: the repository serves the same afterwards.
+#[test]
+fn a_dry_run_counts_what_publishes_left_unreachable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    write_config(&config);
+    let exchange = root.path().join("exchange");
+    fs::create_dir(&exchange).unwrap();
+    let stores = root.path().join("admin-stores");
+
+    let (server, repos) = serve(root.path(), "repos", &exchange, ServerConfig::new());
+    let url = format!("wheat://{}", server.addr);
+    let workspace = clone(root.path(), &config, &format!("{url}/team/repo"), "work");
+    for name in ["one", "two", "three"] {
+        publish(&config, &workspace, name);
+    }
+
+    let gc = ["admin", "--server", &url, "gc", "team/repo"];
+    // Collecting is not there yet: the flag is required.
+    fails(root.path(), &stores, &config, &gc);
+
+    let counted = ok_json(
+        root.path(),
+        &stores,
+        &config,
+        &[gc.as_slice(), &["--dry-run"]].concat(),
+    );
+    let message = counted["message"].as_str().unwrap();
+    assert!(message.contains("nothing was changed"), "{message}");
+    assert!(message.contains("RepositoryEnvelope"), "{message}");
+    let unreachable = message
+        .lines()
+        .find(|line| line.contains("are reached by none"))
+        .unwrap();
+    assert!(
+        !unreachable.contains("; 0 objects"),
+        "three publishes leave garbage: {message}"
+    );
+    // Counting again finds the same: it deleted nothing.
+    let again = ok_json(
+        root.path(),
+        &stores,
+        &config,
+        &[gc.as_slice(), &["--dry-run"]].concat(),
+    );
+    assert_eq!(again["message"], counted["message"]);
+    assert!(repos.join("networks").is_dir());
+}

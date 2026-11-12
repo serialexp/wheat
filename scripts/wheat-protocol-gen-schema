@@ -16,7 +16,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCHEMA="${REPO_ROOT}/crates/wheat-core/schemas/wheat-protocol.bs.json5"
 OUT_DIR="${REPO_ROOT}/crates/wheat-protocol/generated"
 BINSCHEMA_REPO="${BINSCHEMA_REPO:-${HOME}/Projects/binschema}"
-BINSCHEMA_REVISION="1141fb2d02f249fa4ea083e51954a7f08ae4abc6"
+BINSCHEMA_REVISION="b85ce74d6275c2e0ba2fdc25e7ac299d7be5d671"
 BINSCHEMA_CLI="${BINSCHEMA_REPO}/packages/binschema/dist/cli/index.js"
 
 if [[ ! -f "${BINSCHEMA_CLI}" ]]; then

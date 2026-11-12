@@ -599,6 +599,17 @@
       ],
     },
 
+    // Counts what a repository's network holds that no repository of it reaches: the
+    // garbage every publish leaves behind. Only a dry run exists so far; it deletes
+    // nothing and holds no publishes.
+    AdminGcCommand: {
+      sequence: [
+        { name: "command_kind", type: "uint8", const: 5 },
+        { name: "repository", type: "string", kind: "length_prefixed", length_type: "varlength", length_encoding: "leb128_canonical", encoding: "utf8" },
+        { name: "dry_run", type: "bool" },
+      ],
+    },
+
     AdminCommand: {
       type: "discriminated_union",
       discriminator: { peek: "uint8" },
@@ -607,6 +618,7 @@
         { type: "AdminImportCommand", when: "value == 2" },
         { type: "AdminAdoptCommand",  when: "value == 3" },
         { type: "AdminDeleteCommand", when: "value == 4" },
+        { type: "AdminGcCommand",     when: "value == 5" },
       ],
     },
 

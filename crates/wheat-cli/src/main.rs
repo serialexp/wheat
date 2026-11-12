@@ -374,6 +374,15 @@ enum AdminAction {
         /// The repository's name, as `owner/repo`.
         name: String,
     },
+    /// Count what the repository's network holds that no head of it reaches: the
+    /// garbage every publish leaves. Only a dry run exists so far.
+    Gc {
+        /// A repository of the network, as `owner/repo`.
+        repository: String,
+        /// Count the garbage and delete nothing (required until collecting exists).
+        #[arg(long, required = true)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -914,6 +923,7 @@ fn admin(arguments: AdminArgs) -> Result<Success> {
         AdminAction::Import { .. } => "admin.import",
         AdminAction::Adopt { .. } => "admin.adopt",
         AdminAction::Delete { .. } => "admin.delete",
+        AdminAction::Gc { .. } => "admin.gc",
     };
     let operation = match arguments.action {
         AdminAction::Export { repository, bundle } => Operation::Export { repository, bundle },
@@ -933,6 +943,7 @@ fn admin(arguments: AdminArgs) -> Result<Success> {
         },
         AdminAction::Adopt { source, name } => Operation::Adopt { source, name },
         AdminAction::Delete { repository } => Operation::Delete { repository },
+        AdminAction::Gc { repository, .. } => Operation::GcDryRun { repository },
     };
     let url = remote::parse_admin_url(&arguments.server)?;
     let token = credential::token_for(&UserConfig::from_environment()?, None, &url)?;
@@ -1000,6 +1011,7 @@ fn command_name(command: &Command) -> &'static str {
             AdminAction::Import { .. } => "admin.import",
             AdminAction::Adopt { .. } => "admin.adopt",
             AdminAction::Delete { .. } => "admin.delete",
+            AdminAction::Gc { .. } => "admin.gc",
         },
         Command::Workspace(WorkspaceCommand::List) => "workspace.list",
         Command::Workspace(WorkspaceCommand::Unregister) => "workspace.unregister",

@@ -54,6 +54,7 @@ mod sharded_manifest;
 mod snapshot_export;
 mod state_scan;
 mod status_scale;
+mod structure_gc;
 mod transition_validate;
 mod workspace;
 
@@ -112,6 +113,7 @@ pub const CASES: &[&str] = &[
     path_history::NAME,
     blame::NAME,
     content_gc::NAME,
+    structure_gc::NAME,
     state_scan::NAME,
     server_stage::NAME,
     status_scale::NAME,
@@ -287,6 +289,7 @@ pub fn run_case(
         path_history::NAME => path_history::run(&context),
         blame::NAME => blame::run(&context),
         content_gc::NAME => content_gc::run(&context),
+        structure_gc::NAME => structure_gc::run(&context),
         state_scan::NAME => state_scan::run(&context),
         server_stage::NAME => server_stage::run(&context),
         status_scale::NAME => status_scale::run(&context),

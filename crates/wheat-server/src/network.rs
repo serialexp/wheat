@@ -17,10 +17,11 @@ use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
 use async_trait::async_trait;
-use wheat_core::ObjectId;
+use wheat_core::{ObjectId, RepositoryEnvelopeId};
 use wheat_store::{
     ContentItem, ContentStore, ImmutableObjectStore, ObjectStoreError, RepositoryStore,
-    RepositoryStoreError, StoredObject, StoredWrite,
+    RepositoryStoreError, SnapshotError, SnapshotLimits, StoredInventory, StoredObject,
+    StoredWrite, StructureReport, analyze_structure,
 };
 
 use crate::naming::ContentNaming;
@@ -96,6 +97,10 @@ impl RepositoryStore for Network {
     ) -> Result<StoredWrite, RepositoryStoreError> {
         self.store.put_publication(objects, content).await
     }
+
+    fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        self.store.structural_inventory()
+    }
 }
 
 /// What a [`Network`] holds.
@@ -115,6 +120,20 @@ pub struct NetworkStores {
 }
 
 impl NetworkStores {
+    /// Counts what the store holds that none of `heads`, the heads of every repository
+    /// of the network, reaches: the garbage publishes leave behind (see
+    /// [`wheat_store::analyze_structure`]). Changes nothing and holds no publishes, so
+    /// what a publish writes meanwhile may count as unreachable. `None` when the store
+    /// cannot list what it holds.
+    pub async fn analyze_structure(
+        &self,
+        heads: &[RepositoryEnvelopeId],
+        limits: SnapshotLimits,
+    ) -> Option<Result<StructureReport, SnapshotError>> {
+        let inventory = self.store.structural_inventory()?;
+        Some(analyze_structure(&self.store, inventory, heads, limits).await)
+    }
+
     /// Whether a repository of the network is quiesced, so none takes publishes.
     #[must_use]
     pub fn is_quiesced(&self) -> bool {

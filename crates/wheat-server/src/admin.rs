@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 use wheat_protocol::{AdminCommand, AdminRepositoryName, Uuid128};
-use wheat_store::RepositoryDirectory;
+use wheat_store::{PublicationStore, RepositoryDirectory, SnapshotLimits};
 
 use crate::error_text::chain;
 use crate::registry::{DirectoryHandle, Registry};
@@ -169,6 +169,10 @@ enum Job {
     Delete {
         repository: String,
     },
+    /// Counts the garbage in the repository's network; deletes nothing.
+    GcDryRun {
+        repository: String,
+    },
 }
 
 /// Starts `command` on a task of its own and returns its operation ID. The caller has
@@ -225,6 +229,12 @@ fn parse(exchange: Option<&Path>, command: AdminCommand) -> Result<Job, StartErr
         AdminCommand::AdminDeleteCommand(command) => Ok(Job::Delete {
             repository: command.repository,
         }),
+        AdminCommand::AdminGcCommand(command) if command.dry_run => Ok(Job::GcDryRun {
+            repository: command.repository,
+        }),
+        AdminCommand::AdminGcCommand(_) => Err(StartError::Unsupported(
+            "collecting garbage is not available yet; ask for a dry run",
+        )),
     }
 }
 
@@ -291,6 +301,7 @@ async fn run(
                 .map_err(|error| format!("{repository}: {error}"))?;
             Ok(format!("deleted {repository}\n"))
         }
+        Job::GcDryRun { repository } => gc_dry_run(registry, &directory, &repository, &phase).await,
         Job::Adopt { source, name } => {
             phase("adopting");
             let content = directory.content.content_store();
@@ -388,6 +399,67 @@ async fn export(
         message.push_str(&format!("repository {id} {name}\n"));
     }
     Ok(message)
+}
+
+/// Counts what the network of `repository` holds that no head of it reaches. Changes
+/// nothing and holds no publishes: a publish that lands meanwhile can have its new
+/// objects counted as unreachable.
+async fn gc_dry_run(
+    registry: &Arc<Registry>,
+    directory: &DirectoryHandle,
+    repository: &str,
+    phase: &(dyn Fn(&str) + Sync),
+) -> Result<String, String> {
+    let repositories = directory.repositories.clone();
+    let located = {
+        let repositories = repositories.clone();
+        let repository = repository.to_owned();
+        spawn_blocking(move || repositories.locate(&repository))
+            .await
+            .map_err(|error| chain(&error))?
+            .map_err(|error| chain(&error))?
+    }
+    .ok_or_else(|| format!("there is no repository {repository}"))?;
+    // The entry keeps the network's store open for as long as it is held.
+    let entry = registry
+        .get(repository)
+        .await
+        .map_err(|error| chain(&error))?
+        .ok_or_else(|| format!("there is no repository {repository}"))?;
+
+    phase("reading the heads");
+    // Every head of the network is a root, named or not.
+    let heads = {
+        let network = repositories.network(located.network);
+        spawn_blocking(move || {
+            network
+                .repositories()?
+                .into_iter()
+                .map(|id| {
+                    network
+                        .publications(id)
+                        .read()
+                        .map(|head| head.envelope)
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|error| chain(&error))?
+        .map_err(|error| chain(&error))?
+    };
+
+    phase("walking the heads");
+    let report = entry
+        .network
+        .analyze_structure(&heads, SnapshotLimits::default())
+        .await
+        .ok_or_else(|| "this network's store cannot list what it holds".to_owned())?
+        .map_err(|error| chain(&error))?;
+    Ok(format!(
+        "network {} (dry run: nothing was changed)\n{report}",
+        located.network
+    ))
 }
 
 /// How long copying `bytes` of a network's files is expected to take, for the clients

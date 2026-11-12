@@ -33,7 +33,7 @@ pub enum StoredRecord {
 }
 
 /// A store that can list what it holds.
-pub trait StoredInventory {
+pub trait StoredInventory: Send + Sync {
     /// Calls `visit` for each record the store holds, in no order. A record kept in
     /// two places may be listed twice. Fails if the store changed in a way that makes
     /// the listing incomplete, so that it can be run again.
@@ -84,6 +84,49 @@ impl StructureReport {
     }
 }
 
+/// A line per kind of object, then the totals, so an operator sees where the garbage is.
+impl std::fmt::Display for StructureReport {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reachable = self.total_reachable();
+        let unreachable = self.total_unreachable();
+        writeln!(
+            out,
+            "{} heads reach {} objects ({} bytes); {} objects ({} bytes) are reached by none",
+            self.roots, reachable.records, reachable.bytes, unreachable.records, unreachable.bytes
+        )?;
+        let kinds: std::collections::BTreeSet<u16> = self
+            .reachable
+            .keys()
+            .chain(self.unreachable.keys())
+            .copied()
+            .collect();
+        for kind in kinds {
+            let name = ObjectKind::from_code(kind)
+                .map_or_else(|| format!("kind {kind}"), |kind| format!("{kind:?}"));
+            let reached = self.reachable.get(&kind).copied().unwrap_or_default();
+            let unreached = self.unreachable.get(&kind).copied().unwrap_or_default();
+            writeln!(
+                out,
+                "  {name}: {} reached ({} bytes), {} unreachable ({} bytes)",
+                reached.records, reached.bytes, unreached.records, unreached.bytes
+            )?;
+        }
+        writeln!(
+            out,
+            "content kept in the pool: {} records ({} bytes), not counted above",
+            self.content.records, self.content.bytes
+        )?;
+        if self.unlisted > 0 {
+            writeln!(
+                out,
+                "{} reached objects are not in the store's listing",
+                self.unlisted
+            )?;
+        }
+        Ok(())
+    }
+}
+
 fn sum(counts: &BTreeMap<u16, Counts>) -> Counts {
     counts.values().fold(Counts::default(), |mut total, each| {
         total.add(each.records, each.bytes);
@@ -103,16 +146,49 @@ pub async fn analyze_structure<O: ImmutableObjectStore + ?Sized>(
     roots: &[RepositoryEnvelopeId],
     limits: SnapshotLimits,
 ) -> Result<StructureReport, SnapshotError> {
+    let walk = walk_heads(objects, roots, limits).await?;
+    let connection = walk.connection();
+    load_inventory(connection, inventory)?;
+    summarize(connection, roots.len())
+}
+
+/// Objects the walk handles per SQLite transaction.
+const WALK_TRANSACTION_OBJECTS: usize = 4096;
+
+/// Marks every object the closure of each of `roots` reaches.
+#[tracing::instrument(level = "debug", skip_all)]
+async fn walk_heads<O: ImmutableObjectStore + ?Sized>(
+    objects: &O,
+    roots: &[RepositoryEnvelopeId],
+    limits: SnapshotLimits,
+) -> Result<ClosureWalk, SnapshotError> {
     let mut walk = ClosureWalk::new(limits)?;
     for root in roots {
         walk.enqueue_object((*root).into())?;
     }
+    // The walk is a statement or several per object, each its own transaction
+    // unless grouped, and a transaction's commit is most of what a statement costs.
+    walk.connection().execute_batch("BEGIN")?;
+    let mut since_commit = 0_usize;
     while let Some(visit) = walk.next_object()? {
         let stored = objects.get(visit.id).await?;
         walk.follow(&stored, &visit)?;
+        since_commit += 1;
+        if since_commit == WALK_TRANSACTION_OBJECTS {
+            walk.connection().execute_batch("COMMIT; BEGIN")?;
+            since_commit = 0;
+        }
     }
+    walk.connection().execute_batch("COMMIT")?;
+    Ok(walk)
+}
 
-    let connection = walk.connection();
+/// Puts what `inventory` lists into the scratch `stored` table.
+#[tracing::instrument(level = "debug", skip_all)]
+fn load_inventory(
+    connection: &rusqlite::Connection,
+    inventory: &dyn StoredInventory,
+) -> Result<(), SnapshotError> {
     connection.execute_batch(
         "CREATE TABLE stored (
              content INTEGER NOT NULL,
@@ -148,9 +224,17 @@ pub async fn analyze_structure<O: ImmutableObjectStore + ?Sized>(
         return Err(error.into());
     }
     connection.execute_batch("COMMIT")?;
+    Ok(())
+}
 
+/// Groups the `stored` table by kind and by whether the walk reached it.
+#[tracing::instrument(level = "debug", skip_all)]
+fn summarize(
+    connection: &rusqlite::Connection,
+    roots: usize,
+) -> Result<StructureReport, SnapshotError> {
     let mut report = StructureReport {
-        roots: roots.len(),
+        roots,
         ..StructureReport::default()
     };
     let mut statement = connection.prepare(

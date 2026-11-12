@@ -1764,6 +1764,10 @@ impl StoredInventory for PackedObjectStore {
 
 #[async_trait]
 impl RepositoryStore for PackedObjectStore {
+    fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        Some(self)
+    }
+
     fn content_store(&self) -> ContentStore {
         PackedObjectStore::content_store(self)
     }

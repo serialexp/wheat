@@ -1,14 +1,14 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
 Status: partial — Phase 0 (the admin surface), Phases 1 (export), 2 (import and
-adoption) and 3 (delete while served) landed, so a network can be moved; Phase 2b
-and GC (4–6) designed, not yet implemented; Gothab's content GC (2026-11-06) is
-built on Wheat's side (marking, sweeping, and naming what publishes rely on), with
+adoption) and 3 (delete while served) landed, so a network can be moved, and Phase 4a (the pool GC
+dry run, 2026-11-12); Phase 2b and the collections (4b–6) are designed, not yet
+implemented; Gothab's content GC (2026-11-06) is built on Wheat's side (marking, sweeping, and naming what publishes rely on), with
 two gaps recorded below. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
-Last updated: 2026-11-12
+Last updated: 2026-11-13
 
 ## Implementation status
 
@@ -33,6 +33,22 @@ and move them from Outstanding to Done.
   4, option A.
 - [x] **Decision — import keeps IDs (2026-10-27).** Open question 5, option A.
 
+- [x] **Phase 4a — pool GC, the dry run (2026-11-12).**
+  `analyze_structure` (`wheat-store/src/structure_gc.rs`) walks the closure of every
+  head it is given, lists what a packed store holds (`StoredInventory`, which
+  `PackedObjectStore` implements and `RepositoryStore::structural_inventory` exposes)
+  and reports objects reached and not reached per kind, with the pool's own content
+  counted apart. It deletes nothing and holds no writers, so a publish landing meanwhile
+  can have its new objects counted as unreachable. The embedder supplies the heads
+  (`NetworkStores::analyze_structure`); `wheat admin gc --dry-run <repository>` supplies
+  every head file of the repository's network, named or not (`AdminGcCommand`, protocol
+  schema). A store opened deferred keeps what it writes out of its catalog until it is
+  closed, so only a durable store lists completely. Measured at 10,000 changes plus 20
+  forks, 191,007 objects reachable and 156,847 not (68% of the bytes): reads equal the
+  reachable count, which is the bench budget; the walk takes 10 s (25 s before its
+  SQLite writes were grouped into transactions of 4,096 objects) and peak RSS stays
+  150 MiB. Bench case `structure_gc`, results under `bench/results/wheat-quick/`. The
+  binschema pin in the generator scripts moved to b85ce74 with it.
 - [x] **Decision — a move refuses writes (2026-10-28).** Open question 6: from
   export until the source is deleted the network refuses publishes with a retryable
   error carrying a retry delay from the move's expected duration.
@@ -118,9 +134,13 @@ and move them from Outstanding to Done.
 - [ ] **Phase 2b — the bucket transport.** Export to and import from an
   S3-compatible bucket: immutable store files once by name, content once by ID,
   shared by every export to the bucket.
-- [ ] **Phase 4 — pool GC.** Per network: mark every head's closure, rewrite
-  segments keeping only marked records, retire unmarked loose objects and the pool's
-  content records.
+- [ ] **Phase 4b — pool GC, the collection.** Per network: mark every head's
+  closure, validate each head completely, hold the network's writers
+  ([`Registry::quiesce`], Bart 2026-11-12: the collection is run when the repository
+  is nearly always inactive), rewrite segments keeping only marked records, retire
+  unmarked loose objects and the pool's content records, recover from a crash through
+  `repack.intent`. Runs from `wheat admin gc` (without `--dry-run`) and as a library
+  function Gothab's worker calls per pool.
 - [ ] **Phase 5 — content GC.** Across the directory: mark every head's
   `required_content` plus delta bases, rebuild the content store keeping only marked
   records.
