@@ -114,11 +114,13 @@ pub use revision_merge::{MergeBudget, MergeWork};
 mod semantic_checks;
 mod sets;
 mod snapshot;
+mod structure_gc;
 pub use snapshot::{
     ContentBatch, InventoryEntry, MemorySnapshotSink, NativeSnapshot, ObjectBatch, SnapshotError,
     SnapshotId, SnapshotLimits, SnapshotManifest, SnapshotSink, SnapshotSource, export_snapshot,
     export_snapshot_to, restore_snapshot, restore_snapshot_from,
 };
+pub use structure_gc::{Counts, StoredInventory, StoredRecord, StructureReport, analyze_structure};
 mod structural_delta;
 pub use structural_delta::{
     DeltaStep, StructuralDelta, StructuralDeltaError, StructuralDeltaLimits, StructuralDeltaStats,

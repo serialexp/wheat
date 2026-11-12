@@ -123,6 +123,24 @@ struct RepackInventoryEntry {
     logical_length: u64,
 }
 
+/// A record a segment holds, as its index lists it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ListedRecord {
+    pub namespace: u8,
+    pub kind: u16,
+    pub digest: [u8; 32],
+    pub logical_length: u64,
+}
+
+fn listed(entry: &SegmentIndexEntry) -> ListedRecord {
+    ListedRecord {
+        namespace: entry.namespace,
+        kind: entry.kind,
+        digest: entry.digest,
+        logical_length: entry.logical_length,
+    }
+}
+
 /// A validated loose metadata object offered to repack for absorption.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LooseMetadataRecord {
@@ -1804,6 +1822,25 @@ impl PackedCatalog {
             .ok_or(CatalogError::Corrupt("physical byte count overflow"))?;
         self.sealed_sources.push(source);
         Ok(())
+    }
+
+    /// The sealed segments, by ID. A segment is immutable, so its records can be read
+    /// later one segment at a time without holding the catalog meanwhile; one a
+    /// repack replaced is gone then ([`Self::sealed_records`]).
+    pub(crate) fn sealed_segment_ids(&mut self) -> Result<Vec<[u8; 32]>, CatalogError> {
+        self.load_sealed_readers()?;
+        Ok(self.sealed_sources.iter().map(|s| s.segment).collect())
+    }
+
+    /// The records of sealed `segment`, or `None` once it is not one of the catalog's.
+    pub(crate) fn sealed_records(&self, segment: [u8; 32]) -> Option<Vec<ListedRecord>> {
+        let reader = self.sealed_readers.get(&segment)?;
+        Some(reader.authenticated_entries().iter().map(listed).collect())
+    }
+
+    /// The records the active segment holds.
+    pub(crate) fn active_records(&self) -> Vec<ListedRecord> {
+        self.active.entries().iter().map(listed).collect()
     }
 
     pub(crate) fn physical_stats(&mut self) -> Result<(usize, u64, u64), CatalogError> {

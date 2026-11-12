@@ -21,8 +21,8 @@ use wheat_core::{
 
 use super::{
     catalog::{
-        CatalogError, ExclusiveCatalog, LooseKind, LooseMetadataRecord, MetadataRepackInput,
-        PackedCatalog, SharedCatalog,
+        CatalogError, ExclusiveCatalog, ListedRecord, LooseKind, LooseMetadataRecord,
+        MetadataRepackInput, PackedCatalog, SharedCatalog,
     },
     generation_reader::GenerationReader,
     loose_files::LooseDirectories,
@@ -35,8 +35,9 @@ use crate::{
     ContentRepackPlan, ContentStore, ContentStoreError, Durability, ImmutableObjectStore,
     LocalPublicationStore, LooseObjectStore, ObjectKind, ObjectStoreError,
     PreparedContentGeneration, PublicationStore, RepositoryHead, RepositoryReader, RepositoryStore,
-    RepositoryStoreError, StoredObject, StoredWrite, content_generation_index_path,
-    content_generation_shard_manifest_path, content_generation_shard_pack_path,
+    RepositoryStoreError, StoredInventory, StoredObject, StoredRecord, StoredWrite,
+    content_generation_index_path, content_generation_shard_manifest_path,
+    content_generation_shard_pack_path,
     content_repack::{plan_content_repack, prepare_content_repack},
     metadata_repack::{HistoryPlan, HistoryPlanLimits, MetadataDeltaPlan, plan_history_deltas},
     read_content_generation,
@@ -866,6 +867,27 @@ impl PackedObjectStore {
     }
 
     /// Every loose metadata object, verified, as repack inventory.
+    /// `record`, as a segment index lists it, in the form the inventory gives.
+    fn stored_record(record: ListedRecord) -> Result<Option<StoredRecord>, ObjectStoreError> {
+        Ok(match record.namespace {
+            super::segment::METADATA_NAMESPACE => Some(StoredRecord::Object {
+                id: ObjectId::from_digest(record.digest),
+                kind: ObjectKind::from_code(record.kind).ok_or_else(|| {
+                    ObjectStoreError::Integrity(format!(
+                        "a segment lists an object of unknown kind {}",
+                        record.kind
+                    ))
+                })?,
+                bytes: record.logical_length,
+            }),
+            super::segment::CONTENT_NAMESPACE => Some(StoredRecord::Content {
+                id: wheat_core::ContentId::from_digest(record.digest),
+                bytes: record.logical_length,
+            }),
+            _ => None,
+        })
+    }
+
     fn loose_metadata_inventory(&self) -> Result<Vec<LooseMetadataRecord>, RepackError> {
         let loose = &self.engine.objects;
         let ids = loose
@@ -1692,6 +1714,53 @@ fn content_catalog_error(id: ContentId, error: CatalogError) -> ContentStoreErro
 
 /// Writers for the objects of a publication too large for a segment.
 const LOOSE_WRITE_CONCURRENCY: usize = 8;
+
+impl StoredInventory for PackedObjectStore {
+    /// The records of every segment and the loose objects. The catalog is held for
+    /// one segment at a time, not for the listing; a repack between two segments
+    /// fails the listing, which can be run again.
+    fn for_each_record(&self, visit: &mut dyn FnMut(StoredRecord)) -> Result<(), ObjectStoreError> {
+        let (segments, active) = {
+            let mut catalog = self.catalog()?;
+            let segments = catalog.sealed_segment_ids().map_err(object_catalog_error)?;
+            (segments, catalog.active_records())
+        };
+        for record in active {
+            if let Some(record) = Self::stored_record(record)? {
+                visit(record);
+            }
+        }
+        for segment in segments {
+            let records = self.catalog()?.sealed_records(segment).ok_or_else(|| {
+                ObjectStoreError::Backend(
+                    "the store was repacked while its records were listed; list them again".into(),
+                )
+            })?;
+            for record in records {
+                if let Some(record) = Self::stored_record(record)? {
+                    visit(record);
+                }
+            }
+        }
+        for record in self
+            .loose_metadata_inventory()
+            .map_err(|error| ObjectStoreError::Backend(error.to_string()))?
+        {
+            let kind = ObjectKind::from_code(record.kind).ok_or_else(|| {
+                ObjectStoreError::Integrity(format!(
+                    "a loose object has unknown kind {}",
+                    record.kind
+                ))
+            })?;
+            visit(StoredRecord::Object {
+                id: ObjectId::from_digest(record.digest),
+                kind,
+                bytes: record.logical_length,
+            });
+        }
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl RepositoryStore for PackedObjectStore {

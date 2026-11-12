@@ -506,7 +506,7 @@ const VISITS_PER_OBJECT: usize = 2;
 /// An object is visited once for each place it is reached: once as a plain reference,
 /// and once for each key path it sits under as a radix node (a node lists its keys
 /// relative to that path). The first visit records it in the inventory.
-struct ClosureWalk {
+pub(crate) struct ClosureWalk {
     connection: Connection,
     _file: NamedTempFile,
     limits: SnapshotLimits,
@@ -518,10 +518,10 @@ struct ClosureWalk {
 }
 
 /// One visit of an object: read it, record it if it is the first, and follow it.
-struct Visit {
-    id: ObjectId,
+pub(crate) struct Visit {
+    pub(crate) id: ObjectId,
     /// Whether this is the object's first visit, the one that records it.
-    first: bool,
+    pub(crate) first: bool,
     /// The key bytes above it, when it was reached as a radix node.
     radix_path: Option<RadixPath>,
 }
@@ -577,7 +577,7 @@ fn digest(bytes: &[u8]) -> Result<[u8; 32], SnapshotError> {
 }
 
 impl ClosureWalk {
-    fn new(limits: SnapshotLimits) -> Result<Self, SnapshotError> {
+    pub(crate) fn new(limits: SnapshotLimits) -> Result<Self, SnapshotError> {
         let file = NamedTempFile::new().map_err(SnapshotError::ScratchFile)?;
         let connection = Connection::open(file.path())?;
         // `pending` and `pending_contents` are stacks: the walk pops the highest
@@ -613,7 +613,7 @@ impl ClosureWalk {
         })
     }
 
-    fn enqueue_object(&mut self, id: ObjectId) -> Result<(), SnapshotError> {
+    pub(crate) fn enqueue_object(&mut self, id: ObjectId) -> Result<(), SnapshotError> {
         self.enqueue_object_at(id, None)
     }
 
@@ -674,6 +674,12 @@ impl ClosureWalk {
         Ok(())
     }
 
+    /// The scratch file's connection, whose `objects` table holds every object the
+    /// walk reached.
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
     fn check_inventory_limits(&self) -> Result<(), SnapshotError> {
         if self.object_count > self.limits.max_objects
             || self.content_count > self.limits.max_contents
@@ -694,7 +700,7 @@ impl ClosureWalk {
         Ok(())
     }
 
-    fn next_object(&self) -> Result<Option<Visit>, SnapshotError> {
+    pub(crate) fn next_object(&self) -> Result<Option<Visit>, SnapshotError> {
         // Every change a RETURNING statement makes happens on its first step, so
         // stopping after the one row it returns is fine.
         let mut statement = self.connection.prepare_cached(
@@ -778,7 +784,11 @@ impl ClosureWalk {
 
     /// Enqueues everything `stored` refers to from where `visit` reached it. A radix
     /// node reached only as a plain reference (a value elsewhere) lists nothing.
-    fn follow(&mut self, stored: &StoredObject, visit: &Visit) -> Result<(), SnapshotError> {
+    pub(crate) fn follow(
+        &mut self,
+        stored: &StoredObject,
+        visit: &Visit,
+    ) -> Result<(), SnapshotError> {
         object_graph::for_each_reference(stored, visit.radix_path(), |reference| match reference {
             Reference::Object(id) => self.enqueue_object(id),
             Reference::RadixRoot(id) => self.enqueue_radix_root(id),

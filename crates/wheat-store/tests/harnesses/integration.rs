@@ -138,6 +138,8 @@ mod snapshot_restore;
 mod state_scan;
 #[path = "../structural_delta.rs"]
 mod structural_delta;
+#[path = "../structure_gc.rs"]
+mod structure_gc;
 #[path = "../transition_validation.rs"]
 mod transition_validation;
 #[path = "../two_phase_mutation_publication.rs"]
