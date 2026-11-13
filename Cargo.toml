@@ -12,7 +12,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.6"
+version = "0.3.7"
 
 # Workspace-wide clippy policy.
 #

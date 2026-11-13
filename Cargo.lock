@@ -6085,7 +6085,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-bench"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6123,7 +6123,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-cli"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6151,7 +6151,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-client"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6179,7 +6179,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "blake3",
  "proc-macro2",
@@ -6196,7 +6196,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-desktop"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "mimalloc",
@@ -6212,7 +6212,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-git"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "gix",
@@ -6231,7 +6231,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-ignore"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "globset",
  "tempfile",
@@ -6239,7 +6239,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-protocol"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "wheat-protocol-binschema-generated",
 ]
@@ -6260,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-remote"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "futures",
@@ -6279,7 +6279,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-server"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6310,7 +6310,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-store"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "blake3",
@@ -6337,7 +6337,7 @@ dependencies = [
 
 [[package]]
 name = "wheat-trace"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "serde",
  "serde_json",
